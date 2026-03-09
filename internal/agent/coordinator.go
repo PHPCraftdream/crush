@@ -940,7 +940,7 @@ func (c *coordinator) buildProvider(providerCfg config.ProviderConfig, model con
 	case hyper.Name:
 		return c.buildHyperProvider(baseURL, apiKey)
 	case cliprovider.ProviderType:
-		return cliprovider.New(c.cfg.WorkingDir(), c.permissions.SkipRequests, c.permissions), nil
+		return cliprovider.New(c.cfg.WorkingDir(), c.permissions.SkipRequests, c.permissions, c.sessions), nil
 	default:
 		return nil, fmt.Errorf("provider type not supported: %q", providerCfg.Type)
 	}

@@ -23,15 +23,18 @@ import { makeSession, makeMessage, makeConfig } from "./helpers/fixtures";
 
 function makeTwoModelConfig() {
   return makeConfig({
+    enabled: true,
     models: {
       large: { Provider: "cliprovider", Model: "claude-cli" },
       small: { Provider: "glm", Model: "glm-5" },
     },
     providers: {
       cliprovider: {
+        enabled: true,
         models: [{ id: "claude-cli", name: "claude-cli", contextWindow: 200000 }],
       },
       glm: {
+        enabled: true,
         models: [{ id: "glm-5", name: "glm-5", contextWindow: 128000 }],
       },
     },
@@ -108,10 +111,10 @@ test("switching large model sends set_session_models and response appears in cha
   await setupSessionAndConfig(page, "mc-cli", "CLI Claude Chat");
 
   await expect(
-    page.locator("header button[title='Large (strong) model']")
+    page.locator("button[title='Large (strong) model']")
   ).toBeVisible({ timeout: 3000 });
-  await page.locator("header button[title='Large (strong) model']").click();
-  await page.locator("div.absolute").getByText("claude-cli").click();
+  await page.locator("button[title='Large (strong) model']").click();
+  await page.locator('[data-testid="model-dropdown"]').getByText("claude-cli").click();
 
   // Verify set_session_models was sent
   const modelsCmd = await waitForWSSend(page, "set_session_models");
@@ -130,7 +133,7 @@ test("switching large model sends set_session_models and response appears in cha
   });
 
   await expect(
-    page.locator("header button[title='Large (strong) model']").filter({ hasText: "claude-cli" })
+    page.locator("button[title='Large (strong) model']").filter({ hasText: "claude-cli" })
   ).toBeVisible({ timeout: 2000 });
 
   // Send a message — no override in payload
@@ -162,8 +165,8 @@ test("switching large model sends set_session_models and response appears in cha
 test("switching small model sends set_session_models and response appears in chat", async ({ page }) => {
   await setupSessionAndConfig(page, "mc-glm", "GLM Chat");
 
-  await page.locator("header button[title='Small (fast) model']").click();
-  await page.locator("div.absolute").getByText("glm-5").click();
+  await page.locator("button[title='Small (fast) model']").click();
+  await page.locator('[data-testid="model-dropdown"]').getByText("glm-5").click();
 
   const modelsCmd = await waitForWSSend(page, "set_session_models");
   const mp = modelsCmd.payload as { smallModel: { provider: string; model: string } };
@@ -215,8 +218,8 @@ test("switching model mid-session: set_session_models sent each time, no send_me
   await expect(page.getByText("Reply one.")).toBeVisible({ timeout: 3000 });
 
   // Switch large model to glm-5
-  await page.locator("header button[title='Large (strong) model']").click();
-  await page.locator("div.absolute").getByText("glm-5").click();
+  await page.locator("button[title='Large (strong) model']").click();
+  await page.locator('[data-testid="model-dropdown"]').getByText("glm-5").click();
   await waitForWSSend(page, "set_session_models");
 
   // Second message — still no override in payload
@@ -262,7 +265,7 @@ test("agent error event shows inline error banner in chat", async ({ page }) => 
   });
 
   // Error banner with ⚠ icon should appear in the chat area
-  await expect(page.getByText(/Unknown error|⚠/)).toBeVisible({ timeout: 3000 });
+  await expect(page.getByText("Unknown error")).toBeVisible({ timeout: 3000 });
 });
 
 test("error banner shows the error message text", async ({ page }) => {
@@ -284,37 +287,28 @@ test("error banner can be dismissed with × button", async ({ page }) => {
   await sendMockWSMessage(page, { type: "error" });
   await expect(page.getByText(/Unknown error/)).toBeVisible({ timeout: 3000 });
 
-  // Click the ✕ dismiss button in the error banner
-  await page.locator("button", { hasText: "×" }).click();
+  // Click the dismiss button in the error banner
+  await page.getByRole("button", { name: "Dismiss", exact: true }).click();
   await expect(page.getByText(/Unknown error/)).not.toBeVisible({ timeout: 2000 });
 });
 
 test("error banner disappears after 8 seconds automatically", async ({ page }) => {
-  // Use fake timers to avoid real 8-second wait
-  await page.addInitScript(() => {
-    // Speed up setTimeout
-    const origSetTimeout = window.setTimeout;
-    (window as unknown as Record<string, unknown>)["__origSetTimeout"] = origSetTimeout;
+  await setupMockWS(page);
+  await page.route("/auth/check", (route) => route.fulfill({ status: 200, body: "OK" }));
+  await page.clock.install();
+  await page.goto("/");
+  await sendMockWSMessage(page, {
+    type: "sessions_list",
+    payload: [makeSession({ ID: "mc-err3", Title: "Auto Dismiss" })],
   });
-
-  await setupSessionAndConfig(page, "mc-err3", "Auto Dismiss");
+  await sendMockWSMessage(page, { type: "config", payload: makeConfig() });
+  await expect(page.getByText("Auto Dismiss").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("Auto Dismiss").first().click();
 
   await sendMockWSMessage(page, { type: "error" });
-  await expect(page.getByText(/Unknown error/)).toBeVisible({ timeout: 3000 });
+  await expect(page.getByText("Unknown error")).toBeVisible({ timeout: 3000 });
 
-  // Fast-forward time by 10 seconds
-  await page.evaluate(() => {
-    // Trigger all timeouts immediately
-    const callbacks: Array<() => void> = [];
-    const orig = window.setTimeout;
-    (window as unknown as Record<string, unknown>)["setTimeout"] = (fn: () => void) => {
-      callbacks.push(fn);
-      return 0;
-    };
-    // Restore and fire
-    (window as unknown as Record<string, unknown>)["setTimeout"] = orig;
-    callbacks.forEach((fn) => fn());
-  });
+  await page.clock.fastForward(9000);
 
-  await expect(page.getByText(/Unknown error/)).not.toBeVisible({ timeout: 3000 });
+  await expect(page.getByText("Unknown error")).not.toBeVisible({ timeout: 3000 });
 });

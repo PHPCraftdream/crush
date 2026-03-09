@@ -30,6 +30,7 @@ import (
 
 	"github.com/bmatcuk/doublestar/v4"
 	"github.com/charmbracelet/crush/internal/permission"
+	"github.com/charmbracelet/crush/internal/session"
 	"github.com/google/uuid"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -80,7 +81,8 @@ func (s *crushMCPServer) mcpURL() string {
 // perms.Request before execution so crush's permission dialog appears.
 // The token is accepted via Authorization: Bearer header OR ?token= query param.
 // If token is empty a cryptographically random one is generated.
-func newCrushMCPServer(ctx context.Context, perms permission.Service, workingDir string, token string) (*crushMCPServer, error) {
+// sessions and sessionID are used by the todos tool to persist task updates.
+func newCrushMCPServer(ctx context.Context, perms permission.Service, sessions session.Service, sessionID string, workingDir string, token string) (*crushMCPServer, error) {
 	if token == "" {
 		// 32-byte random token → 64-char hex string.
 		tokenBytes := make([]byte, 32)
@@ -96,7 +98,7 @@ func newCrushMCPServer(ctx context.Context, perms permission.Service, workingDir
 		Version: "1.0",
 	}, nil)
 
-	registerMCPTools(srv, perms, workingDir)
+	registerMCPTools(srv, perms, sessions, sessionID, workingDir)
 
 	rawHandler := mcp.NewStreamableHTTPHandler(
 		func(*http.Request) *mcp.Server { return srv },
@@ -143,12 +145,15 @@ func newCrushMCPServer(ctx context.Context, perms permission.Service, workingDir
 
 // registerMCPTools adds crush tool implementations to the MCP server.
 // Each tool requests permission via perms.Request before executing.
-func registerMCPTools(srv *mcp.Server, perms permission.Service, workingDir string) {
+func registerMCPTools(srv *mcp.Server, perms permission.Service, sessions session.Service, sessionID string, workingDir string) {
 	registerBashTool(srv, perms, workingDir)
 	registerViewTool(srv, perms, workingDir)
 	registerWriteTool(srv, perms, workingDir)
 	registerGlobTool(srv, perms, workingDir)
 	registerGrepTool(srv, perms, workingDir)
+	if sessions != nil && sessionID != "" {
+		registerTodosTool(srv, sessions, sessionID)
+	}
 }
 
 // ── bash ─────────────────────────────────────────────────────────────────────
@@ -378,6 +383,69 @@ func registerGrepTool(srv *mcp.Server, perms permission.Service, workingDir stri
 		}
 		slog.Debug("cliprovider: MCP Grep ok", "results_len", len(out))
 		return toolText(out), nil, nil
+	})
+}
+
+// ── todos ─────────────────────────────────────────────────────────────────────
+
+type mcpTodoItem struct {
+	Content    string `json:"content"     description:"What needs to be done (imperative form)"`
+	Status     string `json:"status"      description:"Task status: pending, in_progress, or completed"`
+	ActiveForm string `json:"active_form" description:"Present continuous form (e.g. 'Running tests')"`
+}
+
+type mcpTodosInput struct {
+	Todos []mcpTodoItem `json:"todos" description:"The updated todo list"`
+}
+
+func registerTodosTool(srv *mcp.Server, sessions session.Service, sessionID string) {
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "todos",
+		Description: "Update the task list for the current session. Use this to create, update or complete tasks so the user can track progress.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, input mcpTodosInput) (*mcp.CallToolResult, any, error) {
+		slog.Debug("cliprovider: MCP todos called", "session", sessionID, "count", len(input.Todos))
+
+		sess, err := sessions.Get(ctx, sessionID)
+		if err != nil {
+			return toolError("failed to get session: " + err.Error()), nil, nil
+		}
+
+		todos := make([]session.Todo, len(input.Todos))
+		completedCount := 0
+		for i, item := range input.Todos {
+			switch item.Status {
+			case "pending", "in_progress", "completed":
+			default:
+				return toolError(fmt.Sprintf("invalid status %q for todo %q", item.Status, item.Content)), nil, nil
+			}
+			todos[i] = session.Todo{
+				Content:    item.Content,
+				Status:     session.TodoStatus(item.Status),
+				ActiveForm: item.ActiveForm,
+			}
+			if item.Status == "completed" {
+				completedCount++
+			}
+		}
+
+		sess.Todos = todos
+		if _, err := sessions.Save(ctx, sess); err != nil {
+			return toolError("failed to save todos: " + err.Error()), nil, nil
+		}
+
+		pendingCount := 0
+		inProgressCount := 0
+		for _, t := range todos {
+			switch t.Status {
+			case session.TodoStatusPending:
+				pendingCount++
+			case session.TodoStatusInProgress:
+				inProgressCount++
+			}
+		}
+
+		slog.Debug("cliprovider: MCP todos saved", "pending", pendingCount, "in_progress", inProgressCount, "completed", completedCount)
+		return toolText(fmt.Sprintf("Todo list updated. Status: %d pending, %d in progress, %d completed", pendingCount, inProgressCount, completedCount)), nil, nil
 	})
 }
 

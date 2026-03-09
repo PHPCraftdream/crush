@@ -4,7 +4,7 @@ test("shows login page initially", async ({ page }) => {
   // Intercept auth check to return not authed
   await page.route("/auth/check", (route) => route.fulfill({ status: 401 }));
   await page.goto("/");
-  await expect(page.getByPlaceholder("Access token")).toBeVisible();
+  await expect(page.locator('input[type="password"]')).toBeVisible();
 });
 
 test("shows Connect button on login page", async ({ page }) => {
@@ -19,7 +19,7 @@ test("shows error for invalid token", async ({ page }) => {
     route.fulfill({ status: 401, body: "Unauthorized" })
   );
   await page.goto("/");
-  await page.getByPlaceholder("Access token").fill("wrong-token");
+  await page.locator('input[type="password"]').fill("wrong-token");
   await page.getByText("Connect").click();
   await expect(page.getByText("Invalid token")).toBeVisible();
 });
@@ -38,8 +38,8 @@ test("navigates to app on valid token", async ({ page }) => {
   );
   // Block WS connection from erroring out visibly
   await page.goto("/");
-  await page.getByPlaceholder("Access token").fill("valid-token");
+  await page.locator('input[type="password"]').fill("valid-token");
   await page.getByText("Connect").click();
   // After successful auth, login page should disappear
-  await expect(page.getByPlaceholder("Access token")).not.toBeVisible({ timeout: 3000 });
+  await expect(page.locator('input[type="password"]')).not.toBeVisible({ timeout: 3000 });
 });

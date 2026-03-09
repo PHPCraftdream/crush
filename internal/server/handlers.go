@@ -1,18 +1,24 @@
 package server
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"slices"
 
 	appPkg "github.com/charmbracelet/crush/internal/app"
 	"github.com/charmbracelet/crush/internal/agent"
+	"github.com/charmbracelet/crush/internal/agent/cliprovider"
 	"github.com/charmbracelet/crush/internal/agent/tools/mcp"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/permission"
 	"github.com/charmbracelet/crush/internal/session"
+	"github.com/charmbracelet/crush/internal/skills"
+
+	"charm.land/catwalk/pkg/catwalk"
 )
 
 // handleIncoming dispatches an incoming WS message from a client.
@@ -99,6 +105,28 @@ func handleIncoming(ctx context.Context, a *appPkg.App, c *Client, raw []byte) {
 		go handleRemoveLSPServer(ctx, a, c, msg)
 	case CmdUpdateLSPServer:
 		go handleUpdateLSPServer(ctx, a, c, msg)
+	case CmdSetDebug:
+		go handleSetDebug(a, c, msg)
+	case CmdAddContextPath:
+		go handleAddContextPath(a, c, msg)
+	case CmdRemoveContextPath:
+		go handleRemoveContextPath(a, c, msg)
+	case CmdGetSkills:
+		go handleGetSkills(a, c, msg)
+	case CmdAddSkillsPath:
+		go handleAddSkillsPath(a, c, msg)
+	case CmdRemoveSkillsPath:
+		go handleRemoveSkillsPath(a, c, msg)
+	case CmdInitializeProject:
+		go handleInitializeProject(ctx, a, c, msg)
+	case CmdAddCustomProvider:
+		go handleAddCustomProvider(a, c, msg)
+	case CmdRemoveCustomProvider:
+		go handleRemoveCustomProvider(a, c, msg)
+	case CmdUpdateCustomProvider:
+		go handleUpdateCustomProvider(a, c, msg)
+	case CmdUpdateTodos:
+		go handleUpdateTodos(ctx, a, c, msg)
 	default:
 		slog.Debug("ws: unknown command", "type", msg.Type)
 		c.reply(msg.ID, EventError, nil, "unknown command: "+msg.Type)
@@ -404,7 +432,7 @@ func buildConfigWire(a *appPkg.App) (ConfigWire, bool) {
 	for _, p := range cfg.KnownProviders() {
 		id := string(p.ID)
 		if ep, ok := enabledIDs[id]; ok {
-			pw := ProviderWire{Name: p.Name, Enabled: true, Type: string(p.Type), Models: make([]ModelInfoWire, len(ep.Models))}
+			pw := ProviderWire{Name: p.Name, Enabled: true, Type: string(p.Type), APIKeySet: ep.APIKey != "", Models: make([]ModelInfoWire, len(ep.Models))}
 			for i, m := range ep.Models {
 				pw.Models[i] = ModelInfoWire{ID: m.ID, Name: m.Name, ContextWindow: m.ContextWindow}
 			}
@@ -420,7 +448,19 @@ func buildConfigWire(a *appPkg.App) (ConfigWire, bool) {
 
 	for _, ep := range cfg.EnabledProviders() {
 		if _, exists := wire.Providers[ep.ID]; !exists {
-			pw := ProviderWire{Name: ep.Name, Enabled: true, Type: string(ep.Type), Models: make([]ModelInfoWire, len(ep.Models))}
+			// Custom provider not in the known catalog.
+			// Built-in auto-detected providers (e.g. local-cli) are not user-added
+			// custom providers and must not appear in the Custom Providers modal.
+			isCustom := ep.Type != cliprovider.ProviderType
+			pw := ProviderWire{
+				Name:      ep.Name,
+				Enabled:   true,
+				Type:      string(ep.Type),
+				BaseURL:   ep.BaseURL,
+				IsCustom:  isCustom,
+				APIKeySet: ep.APIKey != "",
+				Models:    make([]ModelInfoWire, len(ep.Models)),
+			}
 			for i, m := range ep.Models {
 				pw.Models[i] = ModelInfoWire{ID: m.ID, Name: m.Name, ContextWindow: m.ContextWindow}
 			}
@@ -430,6 +470,12 @@ func buildConfigWire(a *appPkg.App) (ConfigWire, bool) {
 
 	wire.Yolo = a.Permissions.SkipRequests()
 	wire.Debug = cfg.Options.Debug
+	if cfg.Options != nil {
+		wire.DebugLSP = cfg.Options.DebugLSP
+		wire.ContextPaths = cfg.Options.ContextPaths
+		wire.SkillsPaths = cfg.Options.SkillsPaths
+		wire.InitializeAs = cfg.Options.InitializeAs
+	}
 	if cfg.Options != nil && cfg.Options.TUI != nil {
 		wire.Theme = cfg.Options.TUI.Theme
 	}
@@ -961,6 +1007,353 @@ func handleAddLSPServer(a *appPkg.App, c *Client, msg WSMessage) {
 	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
 }
 
+// ── Debug settings ────────────────────────────────────────────────────────────
+
+func handleSetDebug(a *appPkg.App, c *Client, msg WSMessage) {
+	var p SetDebugPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		c.reply(msg.ID, EventError, nil, "invalid payload")
+		return
+	}
+	cfg := a.Config()
+	if cfg == nil {
+		c.reply(msg.ID, EventError, nil, "config not available")
+		return
+	}
+	if cfg.Options == nil {
+		cfg.Options = &config.Options{}
+	}
+	cfg.Options.Debug = p.Debug
+	cfg.Options.DebugLSP = p.DebugLSP
+	if err := cfg.SetConfigField("options.debug", p.Debug); err != nil {
+		slog.Warn("ws: failed to persist debug setting", "err", err)
+	}
+	if err := cfg.SetConfigField("options.debug_lsp", p.DebugLSP); err != nil {
+		slog.Warn("ws: failed to persist debug_lsp setting", "err", err)
+	}
+	if wire, ok := buildConfigWire(a); ok {
+		c.hub.Broadcast(EventConfig, wire)
+	}
+	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
+}
+
+// ── Context paths ─────────────────────────────────────────────────────────────
+
+func handleAddContextPath(a *appPkg.App, c *Client, msg WSMessage) {
+	var p AddContextPathPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		c.reply(msg.ID, EventError, nil, "invalid payload")
+		return
+	}
+	if p.Path == "" {
+		c.reply(msg.ID, EventError, nil, "path is required")
+		return
+	}
+	cfg := a.Config()
+	if cfg == nil {
+		c.reply(msg.ID, EventError, nil, "config not available")
+		return
+	}
+	if cfg.Options == nil {
+		cfg.Options = &config.Options{}
+	}
+	if slices.Contains(cfg.Options.ContextPaths, p.Path) {
+		c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
+		return
+	}
+	cfg.Options.ContextPaths = append(cfg.Options.ContextPaths, p.Path)
+	if err := cfg.SetConfigField("options.context_paths", cfg.Options.ContextPaths); err != nil {
+		slog.Warn("ws: failed to persist context paths", "err", err)
+	}
+	if wire, ok := buildConfigWire(a); ok {
+		c.hub.Broadcast(EventConfig, wire)
+	}
+	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
+}
+
+func handleRemoveContextPath(a *appPkg.App, c *Client, msg WSMessage) {
+	var p RemoveContextPathPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		c.reply(msg.ID, EventError, nil, "invalid payload")
+		return
+	}
+	cfg := a.Config()
+	if cfg == nil {
+		c.reply(msg.ID, EventError, nil, "config not available")
+		return
+	}
+	if cfg.Options == nil {
+		c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
+		return
+	}
+	cfg.Options.ContextPaths = slices.DeleteFunc(cfg.Options.ContextPaths, func(s string) bool { return s == p.Path })
+	if err := cfg.SetConfigField("options.context_paths", cfg.Options.ContextPaths); err != nil {
+		slog.Warn("ws: failed to persist context paths", "err", err)
+	}
+	if wire, ok := buildConfigWire(a); ok {
+		c.hub.Broadcast(EventConfig, wire)
+	}
+	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
+}
+
+// ── Skills paths ──────────────────────────────────────────────────────────────
+
+func handleGetSkills(a *appPkg.App, c *Client, msg WSMessage) {
+	cfg := a.Config()
+	if cfg == nil {
+		c.reply(msg.ID, EventError, nil, "config not available")
+		return
+	}
+	paths := []string{}
+	if cfg.Options != nil {
+		paths = cfg.Options.SkillsPaths
+	}
+	discovered := skills.Discover(paths)
+	infos := make([]SkillInfo, 0, len(discovered))
+	for _, s := range discovered {
+		infos = append(infos, SkillInfo{
+			Name:        s.Name,
+			Description: s.Description,
+			Path:        s.Path,
+		})
+	}
+	c.reply(msg.ID, EventSkills, SkillsSnapshot{Skills: infos, Paths: paths}, "")
+}
+
+func handleAddSkillsPath(a *appPkg.App, c *Client, msg WSMessage) {
+	var p AddSkillsPathPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		c.reply(msg.ID, EventError, nil, "invalid payload")
+		return
+	}
+	if p.Path == "" {
+		c.reply(msg.ID, EventError, nil, "path is required")
+		return
+	}
+	cfg := a.Config()
+	if cfg == nil {
+		c.reply(msg.ID, EventError, nil, "config not available")
+		return
+	}
+	if cfg.Options == nil {
+		cfg.Options = &config.Options{}
+	}
+	if slices.Contains(cfg.Options.SkillsPaths, p.Path) {
+		c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
+		return
+	}
+	cfg.Options.SkillsPaths = append(cfg.Options.SkillsPaths, p.Path)
+	if err := cfg.SetConfigField("options.skills_paths", cfg.Options.SkillsPaths); err != nil {
+		slog.Warn("ws: failed to persist skills paths", "err", err)
+	}
+	if wire, ok := buildConfigWire(a); ok {
+		c.hub.Broadcast(EventConfig, wire)
+	}
+	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
+}
+
+func handleRemoveSkillsPath(a *appPkg.App, c *Client, msg WSMessage) {
+	var p RemoveSkillsPathPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		c.reply(msg.ID, EventError, nil, "invalid payload")
+		return
+	}
+	cfg := a.Config()
+	if cfg == nil {
+		c.reply(msg.ID, EventError, nil, "config not available")
+		return
+	}
+	if cfg.Options == nil {
+		c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
+		return
+	}
+	cfg.Options.SkillsPaths = slices.DeleteFunc(cfg.Options.SkillsPaths, func(s string) bool { return s == p.Path })
+	if err := cfg.SetConfigField("options.skills_paths", cfg.Options.SkillsPaths); err != nil {
+		slog.Warn("ws: failed to persist skills paths", "err", err)
+	}
+	if wire, ok := buildConfigWire(a); ok {
+		c.hub.Broadcast(EventConfig, wire)
+	}
+	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
+}
+
+// ── Project initialization ────────────────────────────────────────────────────
+
+func handleInitializeProject(ctx context.Context, a *appPkg.App, c *Client, msg WSMessage) {
+	cfg := a.Config()
+	if cfg == nil {
+		c.reply(msg.ID, EventError, nil, "config not available")
+		return
+	}
+	if a.AgentCoordinator == nil {
+		c.reply(msg.ID, EventError, nil, "agent not configured")
+		return
+	}
+
+	initPrompt, err := agent.InitializePrompt(*cfg)
+	if err != nil {
+		c.reply(msg.ID, EventError, nil, "failed to build initialization prompt: "+err.Error())
+		return
+	}
+
+	// Create a dedicated initialization session.
+	sess, err := a.Sessions.Create(ctx, "Project Initialization")
+	if err != nil {
+		c.reply(msg.ID, EventError, nil, "failed to create session: "+err.Error())
+		return
+	}
+
+	// Set default models from config.
+	if large, ok := cfg.Models[config.SelectedModelTypeLarge]; ok {
+		_ = a.Sessions.UpdateModels(ctx, sess.ID, large.Provider, large.Model, "", "")
+	}
+
+	// Build and save the system prompt.
+	if sp, buildErr := a.AgentCoordinator.BuildSystemPrompt(ctx); buildErr == nil && sp != "" {
+		_ = a.AgentCoordinator.UpdateSessionSystemPrompt(ctx, sess.ID, sp)
+	}
+
+	// Broadcast the new session before replying so the client can navigate.
+	if updated, fetchErr := a.Sessions.Get(ctx, sess.ID); fetchErr == nil {
+		c.hub.Broadcast(EventSessionCreated, updated)
+	}
+	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok", "sessionID": sess.ID}, "")
+
+	// Run the agent in a background context so closing the tab won't cancel it.
+	agentCtx := context.WithoutCancel(ctx)
+	c.hub.Broadcast(EventAgentBusy, AgentBusyPayload{SessionID: sess.ID, Busy: true})
+	_, runErr := a.AgentCoordinator.Run(agentCtx, sess.ID, initPrompt)
+	c.hub.Broadcast(EventAgentBusy, AgentBusyPayload{SessionID: sess.ID, Busy: false})
+	if runErr != nil {
+		slog.Error("ws: initialization run error", "err", runErr)
+	}
+	_ = config.MarkProjectInitialized(cfg)
+}
+
+// ── Custom providers ──────────────────────────────────────────────────────────
+
+func handleAddCustomProvider(a *appPkg.App, c *Client, msg WSMessage) {
+	var p AddCustomProviderPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		c.reply(msg.ID, EventError, nil, "invalid payload")
+		return
+	}
+	if p.ID == "" || p.BaseURL == "" {
+		c.reply(msg.ID, EventError, nil, "id and baseUrl are required")
+		return
+	}
+	cfg := a.Config()
+	if cfg == nil {
+		c.reply(msg.ID, EventError, nil, "config not available")
+		return
+	}
+	if _, exists := cfg.Providers.Get(p.ID); exists {
+		c.reply(msg.ID, EventError, nil, fmt.Sprintf("provider %q already exists", p.ID))
+		return
+	}
+	models := make([]catwalk.Model, len(p.Models))
+	for i, m := range p.Models {
+		models[i] = catwalk.Model{
+			ID:            m.ID,
+			Name:          m.Name,
+			ContextWindow: m.ContextWindow,
+			CostPer1MIn:   m.CostPer1MIn,
+			CostPer1MOut:  m.CostPer1MOut,
+		}
+	}
+	providerCfg := config.ProviderConfig{
+		ID:      p.ID,
+		Name:    cmp.Or(p.Name, p.ID),
+		Type:    catwalk.Type(cmp.Or(p.Type, "openai-compat")),
+		BaseURL: p.BaseURL,
+		APIKey:  p.APIKey,
+		Models:  models,
+	}
+	cfg.Providers.Set(p.ID, providerCfg)
+	if err := cfg.SetConfigField(fmt.Sprintf("providers.%s", p.ID), providerCfg); err != nil {
+		slog.Warn("ws: failed to persist custom provider", "id", p.ID, "err", err)
+	}
+	if wire, ok := buildConfigWire(a); ok {
+		c.hub.Broadcast(EventConfig, wire)
+	}
+	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
+}
+
+func handleRemoveCustomProvider(a *appPkg.App, c *Client, msg WSMessage) {
+	var p RemoveCustomProviderPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		c.reply(msg.ID, EventError, nil, "invalid payload")
+		return
+	}
+	if p.ID == "" {
+		c.reply(msg.ID, EventError, nil, "id is required")
+		return
+	}
+	cfg := a.Config()
+	if cfg == nil {
+		c.reply(msg.ID, EventError, nil, "config not available")
+		return
+	}
+	cfg.Providers.Del(p.ID)
+	if err := cfg.RemoveConfigField(fmt.Sprintf("providers.%s", p.ID)); err != nil {
+		slog.Warn("ws: failed to remove custom provider", "id", p.ID, "err", err)
+	}
+	if wire, ok := buildConfigWire(a); ok {
+		c.hub.Broadcast(EventConfig, wire)
+	}
+	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
+}
+
+func handleUpdateCustomProvider(a *appPkg.App, c *Client, msg WSMessage) {
+	var p UpdateCustomProviderPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		c.reply(msg.ID, EventError, nil, "invalid payload")
+		return
+	}
+	if p.OldID == "" || p.ID == "" || p.BaseURL == "" {
+		c.reply(msg.ID, EventError, nil, "oldId, id and baseUrl are required")
+		return
+	}
+	cfg := a.Config()
+	if cfg == nil {
+		c.reply(msg.ID, EventError, nil, "config not available")
+		return
+	}
+	// Remove the old entry.
+	cfg.Providers.Del(p.OldID)
+	if p.OldID != p.ID {
+		if err := cfg.RemoveConfigField(fmt.Sprintf("providers.%s", p.OldID)); err != nil {
+			slog.Warn("ws: failed to remove old custom provider", "id", p.OldID, "err", err)
+		}
+	}
+	// Build updated models.
+	models := make([]catwalk.Model, len(p.Models))
+	for i, m := range p.Models {
+		models[i] = catwalk.Model{
+			ID:            m.ID,
+			Name:          m.Name,
+			ContextWindow: m.ContextWindow,
+			CostPer1MIn:   m.CostPer1MIn,
+			CostPer1MOut:  m.CostPer1MOut,
+		}
+	}
+	providerCfg := config.ProviderConfig{
+		ID:      p.ID,
+		Name:    cmp.Or(p.Name, p.ID),
+		Type:    catwalk.Type(cmp.Or(p.Type, "openai-compat")),
+		BaseURL: p.BaseURL,
+		APIKey:  p.APIKey,
+		Models:  models,
+	}
+	cfg.Providers.Set(p.ID, providerCfg)
+	if err := cfg.SetConfigField(fmt.Sprintf("providers.%s", p.ID), providerCfg); err != nil {
+		slog.Warn("ws: failed to persist updated custom provider", "id", p.ID, "err", err)
+	}
+	if wire, ok := buildConfigWire(a); ok {
+		c.hub.Broadcast(EventConfig, wire)
+	}
+	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
+}
 func handleRemoveLSPServer(ctx context.Context, a *appPkg.App, c *Client, msg WSMessage) {
 	var p RemoveLSPServerPayload
 	if err := json.Unmarshal(msg.Payload, &p); err != nil {
@@ -1023,5 +1416,34 @@ func handleUpdateLSPServer(ctx context.Context, a *appPkg.App, c *Client, msg WS
 	}
 	a.LSPManager.RegisterServer(p.Name, lspCfg)
 	c.hub.Broadcast(EventLSPState, buildLSPSnapshot(cfg))
+	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
+}
+
+// ── Todos ─────────────────────────────────────────────────────────────────────
+
+func handleUpdateTodos(ctx context.Context, a *appPkg.App, c *Client, msg WSMessage) {
+	var p UpdateTodosPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		c.reply(msg.ID, EventError, nil, "invalid payload")
+		return
+	}
+	sess, err := a.Sessions.Get(ctx, p.SessionID)
+	if err != nil {
+		c.reply(msg.ID, EventError, nil, "session not found")
+		return
+	}
+	todos := make([]session.Todo, len(p.Todos))
+	for i, t := range p.Todos {
+		todos[i] = session.Todo{
+			Content:    t.Content,
+			Status:     session.TodoStatus(t.Status),
+			ActiveForm: t.ActiveForm,
+		}
+	}
+	sess.Todos = todos
+	if _, err := a.Sessions.Save(ctx, sess); err != nil {
+		c.reply(msg.ID, EventError, nil, "failed to save todos")
+		return
+	}
 	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
 }

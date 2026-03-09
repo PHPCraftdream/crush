@@ -1,5 +1,5 @@
 import { atom } from "nanostores";
-import type { Session, Message, PermissionRequest, ConfigPayload, LSPSnapshot, MCPState } from "./types";
+import type { Session, Message, PermissionRequest, ConfigPayload, LSPSnapshot, MCPState, Todo } from "./types";
 
 // ── Connection state ─────────────────────────────────────────────────────────
 export const $connected = atom(false);
@@ -141,6 +141,18 @@ export function getDefaultModelKey(role: "large" | "small", config: ConfigPayloa
 
 import { ws } from "./ws";
 
+export function updateTodos(sessionID: string, todos: Todo[]) {
+  // Optimistic local update
+  const sessions = $sessions.get();
+  const idx = sessions.findIndex((s) => s.ID === sessionID);
+  if (idx !== -1) {
+    const next = [...sessions];
+    next[idx] = { ...next[idx], Todos: todos };
+    $sessions.set(next);
+  }
+  ws.send("update_todos", { sessionID, todos });
+}
+
 export function setSessionModels(sessionID: string, largeKey: string | null, smallKey: string | null) {
   const parse = (key: string | null) => {
     if (!key) return null;
@@ -149,10 +161,26 @@ export function setSessionModels(sessionID: string, largeKey: string | null, sma
     return { provider: key.slice(0, idx), model: key.slice(idx + 3) };
   };
 
+  const large = parse(largeKey);
+  const small = parse(smallKey);
+
+  // Optimistic local update so the UI reflects the change immediately
+  const sessions = $sessions.get();
+  const idx = sessions.findIndex((s) => s.ID === sessionID);
+  if (idx !== -1) {
+    const next = [...sessions];
+    next[idx] = {
+      ...next[idx],
+      ...(large ? { LargeModelProvider: large.provider, LargeModelID: large.model } : {}),
+      ...(small ? { SmallModelProvider: small.provider, SmallModelID: small.model } : {}),
+    };
+    $sessions.set(next);
+  }
+
   ws.send("set_session_models", {
     sessionID,
-    largeModel: parse(largeKey),
-    smallModel: parse(smallKey),
+    largeModel: large,
+    smallModel: small,
   });
 }
 
@@ -331,4 +359,48 @@ export function updateQueuedMessage(sessionID: string, id: string, content: stri
   const msgs = (q.get(sessionID) ?? []).map((m) => m.id === id ? { ...m, content } : m);
   q.set(sessionID, msgs);
   $messageQueue.set(q);
+}
+
+// ── Settings actions ───────────────────────────────────────────────────────────
+
+export function setDebug(debug: boolean, debugLsp: boolean) {
+  ws.send("set_debug", { debug, debugLsp });
+}
+
+export function addContextPath(path: string) {
+  ws.send("add_context_path", { path });
+}
+
+export function removeContextPath(path: string) {
+  ws.send("remove_context_path", { path });
+}
+
+export function addSkillsPath(path: string) {
+  ws.send("add_skills_path", { path });
+}
+
+export function removeSkillsPath(path: string) {
+  ws.send("remove_skills_path", { path });
+}
+
+export function initializeProject(msgID?: string) {
+  ws.send("initialize_project", {}, msgID);
+}
+
+export function addCustomProvider(payload: {
+  id: string; name?: string; type: string; baseUrl: string; apiKey?: string;
+  models?: { id: string; name: string; contextWindow?: number; costPer1mIn?: number; costPer1mOut?: number }[];
+}, msgID?: string) {
+  ws.send("add_custom_provider", payload, msgID);
+}
+
+export function removeCustomProvider(id: string, msgID?: string) {
+  ws.send("remove_custom_provider", { id }, msgID);
+}
+
+export function updateCustomProvider(payload: {
+  oldId: string; id: string; name?: string; type: string; baseUrl: string; apiKey?: string;
+  models?: { id: string; name: string; contextWindow?: number; costPer1mIn?: number; costPer1mOut?: number }[];
+}, msgID?: string) {
+  ws.send("update_custom_provider", payload, msgID);
 }

@@ -72,7 +72,7 @@ test("model dropdown shows all available models", async ({ page }) => {
   // Both models should appear in dropdown
   await expect(page.getByText("claude-haiku-4").first()).toBeVisible({ timeout: 2000 });
   // Provider info shown below each model name
-  await expect(page.locator("div.absolute").getByText("anthropic").first()).toBeVisible();
+  await expect(page.locator('[data-testid="model-dropdown"]').getByText("anthropic").first()).toBeVisible();
 });
 
 test("model dropdown closes on outside click", async ({ page }) => {
@@ -107,6 +107,7 @@ test("search filters models by name", async ({ page }) => {
     payload: makeConfig({
       providers: {
         anthropic: {
+          enabled: true,
           models: [
             { id: "claude-opus-4", name: "claude-opus-4" },
             { id: "claude-haiku-4", name: "claude-haiku-4" },
@@ -124,7 +125,7 @@ test("search filters models by name", async ({ page }) => {
   await page.getByPlaceholder("Search models…").fill("haiku");
   await expect(page.getByText("claude-haiku-4").first()).toBeVisible({ timeout: 2000 });
   // gpt-4o doesn't match "haiku"
-  await expect(page.locator("div.absolute").getByText("gpt-4o")).not.toBeVisible();
+  await expect(page.locator('[data-testid="model-dropdown"]').getByText("gpt-4o")).not.toBeVisible();
 });
 
 test("search shows no results message when nothing matches", async ({ page }) => {
@@ -159,7 +160,7 @@ test("selecting a model from dropdown updates header display", async ({ page }) 
   // Open dropdown and select "small" model
   await page.locator("header button").filter({ hasText: "claude-opus-4" }).click();
   // Click the claude-haiku-4 option in the dropdown
-  await page.locator("div.absolute").getByText("claude-haiku-4").click();
+  await page.locator('[data-testid="model-dropdown"]').getByText("claude-haiku-4").click();
 
   // Header large model button now shows the selected model
   await expect(
@@ -185,7 +186,7 @@ test("each session has independent model selection", async ({ page }) => {
   await page.getByText("Session One").click();
   await expect(page.locator("header button").filter({ hasText: "claude-opus-4" })).toBeVisible({ timeout: 3000 });
   await page.locator("header button").filter({ hasText: "claude-opus-4" }).click();
-  await page.locator("div.absolute").getByText("claude-haiku-4").click();
+  await page.locator('[data-testid="model-dropdown"]').getByText("claude-haiku-4").click();
   await expect(
     page.locator("header button").filter({ hasText: "claude-haiku-4" }).first()
   ).toBeVisible({ timeout: 2000 });
@@ -258,7 +259,7 @@ test("header shows small model selector button when session is active", async ({
   await page.getByText("Small Model Session").first().click();
   // Small model button with ⚡ icon
   await expect(
-    page.locator("header button[title='Small (fast) model']")
+    page.locator("button[title='Small (fast) model']")
   ).toBeVisible({ timeout: 2000 });
 });
 
@@ -271,7 +272,7 @@ test("clicking small model button opens its own dropdown", async ({ page }) => {
   await sendMockWSMessage(page, { type: "config", payload: makeConfig() });
   await expect(page.getByText("Small DD").first()).toBeVisible({ timeout: 3000 });
   await page.getByText("Small DD").first().click();
-  await page.locator("header button[title='Small (fast) model']").click();
+  await page.locator("button[title='Small (fast) model']").click();
   await expect(page.getByPlaceholder("Search models…")).toBeVisible({ timeout: 2000 });
 });
 
@@ -286,6 +287,7 @@ test("selecting from small model dropdown updates small selector", async ({ page
     payload: makeConfig({
       providers: {
         anthropic: {
+          enabled: true,
           models: [
             { id: "claude-opus-4", name: "claude-opus-4" },
             { id: "claude-haiku-4", name: "claude-haiku-4" },
@@ -298,15 +300,15 @@ test("selecting from small model dropdown updates small selector", async ({ page
   await expect(page.getByText("Small Pick").first()).toBeVisible({ timeout: 3000 });
   await page.getByText("Small Pick").first().click();
   // Open small model dropdown
-  await page.locator("header button[title='Small (fast) model']").click();
+  await page.locator("button[title='Small (fast) model']").click();
   // Pick gpt-4o-mini
-  await page.locator("div.absolute").getByText("gpt-4o-mini").click();
+  await page.locator('[data-testid="model-dropdown"]').getByText("gpt-4o-mini").click();
   // Small model button now shows gpt-4o-mini
   await expect(
-    page.locator("header button[title='Small (fast) model']").filter({ hasText: "gpt-4o-mini" })
+    page.locator("button[title='Small (fast) model']").filter({ hasText: "gpt-4o-mini" })
   ).toBeVisible({ timeout: 2000 });
   // Large model button unchanged
   await expect(
-    page.locator("header button[title='Large (strong) model']").filter({ hasText: "claude-opus-4" })
+    page.locator("button[title='Large (strong) model']").filter({ hasText: "claude-opus-4" })
   ).toBeVisible({ timeout: 2000 });
 });

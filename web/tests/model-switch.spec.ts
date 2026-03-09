@@ -45,6 +45,7 @@ test("selecting large model sends set_session_models with provider and model", a
     payload: makeConfig({
       providers: {
         anthropic: {
+          enabled: true,
           models: [
             { id: "claude-opus-4", name: "claude-opus-4", contextWindow: 200000 },
             { id: "claude-haiku-4", name: "claude-haiku-4", contextWindow: 200000 },
@@ -56,9 +57,9 @@ test("selecting large model sends set_session_models with provider and model", a
   await expect(page.getByText("Large Switch").first()).toBeVisible({ timeout: 3000 });
   await page.getByText("Large Switch").first().click();
 
-  await expect(page.locator("header button[title='Large (strong) model']")).toBeVisible({ timeout: 3000 });
-  await page.locator("header button[title='Large (strong) model']").click();
-  await page.locator("div.absolute").getByText("claude-haiku-4").click();
+  await expect(page.locator("button[title='Large (strong) model']")).toBeVisible({ timeout: 3000 });
+  await page.locator("button[title='Large (strong) model']").click();
+  await page.locator('[data-testid="model-dropdown"]').getByText("claude-haiku-4").click();
 
   const cmd = await waitForWSSend(page, "set_session_models");
   const p = cmd.payload as { sessionID: string; largeModel: { provider: string; model: string }; smallModel: unknown };
@@ -77,21 +78,22 @@ test("selecting small model sends set_session_models with correct small provider
     payload: makeConfig({
       providers: {
         anthropic: {
+          enabled: true,
           models: [
             { id: "claude-opus-4", name: "claude-opus-4", contextWindow: 200000 },
             { id: "claude-haiku-4", name: "claude-haiku-4", contextWindow: 200000 },
           ],
         },
-        openai: { models: [{ id: "gpt-4o-mini", name: "gpt-4o-mini", contextWindow: 128000 }] },
+        openai: { enabled: true, models: [{ id: "gpt-4o-mini", name: "gpt-4o-mini", contextWindow: 128000 }] },
       },
     }),
   });
   await expect(page.getByText("Small Switch").first()).toBeVisible({ timeout: 3000 });
   await page.getByText("Small Switch").first().click();
 
-  await expect(page.locator("header button[title='Small (fast) model']")).toBeVisible({ timeout: 3000 });
-  await page.locator("header button[title='Small (fast) model']").click();
-  await page.locator("div.absolute").getByText("gpt-4o-mini").click();
+  await expect(page.locator("button[title='Small (fast) model']")).toBeVisible({ timeout: 3000 });
+  await page.locator("button[title='Small (fast) model']").click();
+  await page.locator('[data-testid="model-dropdown"]').getByText("gpt-4o-mini").click();
 
   const cmd = await waitForWSSend(page, "set_session_models");
   const p = cmd.payload as { sessionID: string; smallModel: { provider: string; model: string } };
@@ -110,12 +112,13 @@ test("set_session_models includes both models", async ({ page }) => {
     payload: makeConfig({
       providers: {
         anthropic: {
+          enabled: true,
           models: [
             { id: "claude-opus-4", name: "claude-opus-4", contextWindow: 200000 },
             { id: "claude-haiku-4", name: "claude-haiku-4", contextWindow: 200000 },
           ],
         },
-        openai: { models: [{ id: "gpt-4o-mini", name: "gpt-4o-mini", contextWindow: 128000 }] },
+        openai: { enabled: true, models: [{ id: "gpt-4o-mini", name: "gpt-4o-mini", contextWindow: 128000 }] },
       },
     }),
   });
@@ -123,13 +126,13 @@ test("set_session_models includes both models", async ({ page }) => {
   await page.getByText("Both Switch").first().click();
 
   // Pick large model
-  await page.locator("header button[title='Large (strong) model']").click();
-  await page.locator("div.absolute").getByText("claude-haiku-4").click();
+  await page.locator("button[title='Large (strong) model']").click();
+  await page.locator('[data-testid="model-dropdown"]').getByText("claude-haiku-4").click();
   await waitForWSSend(page, "set_session_models");
 
   // Pick small model — second set_session_models command
-  await page.locator("header button[title='Small (fast) model']").click();
-  await page.locator("div.absolute").getByText("gpt-4o-mini").click();
+  await page.locator("button[title='Small (fast) model']").click();
+  await page.locator('[data-testid="model-dropdown"]').getByText("gpt-4o-mini").click();
 
   const secondCmd = await page.waitForFunction(
     () => {
@@ -159,8 +162,8 @@ test("send_message does not include largeModel or smallModel overrides", async (
   await page.getByText("No Override").first().click();
 
   // Switch model
-  await page.locator("header button[title='Large (strong) model']").click();
-  await page.locator("div.absolute").getByText("claude-haiku-4").click();
+  await page.locator("button[title='Large (strong) model']").click();
+  await page.locator('[data-testid="model-dropdown"]').getByText("claude-haiku-4").click();
   await waitForWSSend(page, "set_session_models");
 
   // Send a message
@@ -219,7 +222,7 @@ test("session_updated with model fields updates header model button", async ({ p
 
   // Header large model button should now show claude-haiku-4
   await expect(
-    page.locator("header button[title='Large (strong) model']").filter({ hasText: "claude-haiku-4" })
+    page.locator("button[title='Large (strong) model']").filter({ hasText: "claude-haiku-4" })
   ).toBeVisible({ timeout: 2000 });
 });
 
@@ -239,6 +242,7 @@ test("switching model in session A does not affect session B", async ({ page }) 
     payload: makeConfig({
       providers: {
         anthropic: {
+          enabled: true,
           models: [
             { id: "claude-opus-4", name: "claude-opus-4", contextWindow: 200000 },
             { id: "claude-haiku-4", name: "claude-haiku-4", contextWindow: 200000 },
@@ -249,20 +253,20 @@ test("switching model in session A does not affect session B", async ({ page }) 
   });
 
   // Change Session A model
-  await expect(page.getByText("Session A")).toBeVisible({ timeout: 3000 });
-  await page.getByText("Session A").click();
-  await page.locator("header button[title='Large (strong) model']").click();
-  await page.locator("div.absolute").getByText("claude-haiku-4").click();
+  await expect(page.getByText("Session A").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("Session A").first().click();
+  await page.locator("button[title='Large (strong) model']").click();
+  await page.locator('[data-testid="model-dropdown"]').getByText("claude-haiku-4").click();
 
   // Session A button shows haiku
   await expect(
-    page.locator("header button[title='Large (strong) model']").filter({ hasText: "claude-haiku-4" })
+    page.locator("button[title='Large (strong) model']").filter({ hasText: "claude-haiku-4" })
   ).toBeVisible({ timeout: 2000 });
 
   // Switch to Session B — should show opus (default)
   await page.getByText("Session B").click();
   await expect(
-    page.locator("header button[title='Large (strong) model']").filter({ hasText: "claude-opus-4" })
+    page.locator("button[title='Large (strong) model']").filter({ hasText: "claude-opus-4" })
   ).toBeVisible({ timeout: 2000 });
 });
 
@@ -279,6 +283,7 @@ test("model override persists for subsequent messages via DB", async ({ page }) 
     payload: makeConfig({
       providers: {
         anthropic: {
+          enabled: true,
           models: [
             { id: "claude-opus-4", name: "claude-opus-4", contextWindow: 200000 },
             { id: "claude-haiku-4", name: "claude-haiku-4", contextWindow: 200000 },
@@ -291,8 +296,8 @@ test("model override persists for subsequent messages via DB", async ({ page }) 
   await page.getByText("Persist Session").first().click();
 
   // Switch model once
-  await page.locator("header button[title='Large (strong) model']").click();
-  await page.locator("div.absolute").getByText("claude-haiku-4").click();
+  await page.locator("button[title='Large (strong) model']").click();
+  await page.locator('[data-testid="model-dropdown"]').getByText("claude-haiku-4").click();
   await waitForWSSend(page, "set_session_models");
 
   // Simulate server confirming the session model update

@@ -22,6 +22,7 @@ import {
   setActiveSession,
   $recentLargeModels,
   $recentSmallModels,
+  trackModelUsage,
   dequeueNextMessage,
   applyTheme,
 } from "./store";
@@ -124,7 +125,11 @@ export function useWS() {
       }),
 
       ws.on("message_created", (msg: WSMessage) => {
-        upsertMessage(msg.payload as Message);
+        const m = msg.payload as Message;
+        upsertMessage(m);
+        if (m.Role === "assistant" && m.Provider && m.Model) {
+          trackModelUsage("large", `${m.Provider}:::${m.Model}`);
+        }
       }),
       ws.on("message_updated", (msg: WSMessage) =>
         upsertMessage(msg.payload as Message)
@@ -190,6 +195,7 @@ export function useWS() {
 
       ws.on("error", (msg: WSMessage) => {
         $agentError.set((msg.error as string) || "Unknown error");
+        setTimeout(() => $agentError.set(null), 8000);
       }),
     ];
 

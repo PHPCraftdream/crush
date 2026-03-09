@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useMemo, useCallback } from "react";
 import { useStore } from "@nanostores/react";
-import { CheckCheck, ScrollText, Plug, Sun, Moon, Code2 } from "lucide-react";
+import { CheckCheck, ScrollText, Plug, Sun, Moon, Code2, Settings, ServerCog } from "lucide-react";
 import {
   $sessions,
   $activeSessionID,
@@ -11,6 +11,8 @@ import {
 import { ws } from "../ws";
 import { MCPSettings } from "./MCPSettings";
 import { LSPSettings } from "./LSPSettings";
+import { SettingsModal } from "./SettingsModal";
+import { ProvidersModal } from "./ProvidersModal";
 import { buildModelList } from "./ModelSelector";
 import { getDefaultModelKey } from "../store";
 
@@ -182,6 +184,10 @@ export function Header() {
   const closeMCPSettings = useCallback(() => setShowMCPSettings(false), []);
   const [showLSPSettings, setShowLSPSettings] = useState(false);
   const closeLSPSettings = useCallback(() => setShowLSPSettings(false), []);
+  const [showSettings, setShowSettings] = useState(false);
+  const closeSettings = useCallback(() => setShowSettings(false), []);
+  const [showProviders, setShowProviders] = useState(false);
+  const closeProviders = useCallback(() => setShowProviders(false), []);
 
   const isDark = config?.theme === "dark";
   function toggleTheme() {
@@ -276,6 +282,24 @@ export function Header() {
         </button>
 
         <button
+          onClick={() => setShowProviders(true)}
+          title="Custom providers"
+          className="flex items-center gap-1.5 text-xs font-medium rounded-lg px-2.5 py-1.5 border transition-colors bg-base-overlay border-surface text-text-subtle hover:border-accent/50 hover:text-text"
+        >
+          <ServerCog size={13} />
+          <span>Providers</span>
+        </button>
+
+        <button
+          onClick={() => setShowSettings(true)}
+          title="Settings"
+          className="flex items-center gap-1.5 text-xs font-medium rounded-lg px-2.5 py-1.5 border transition-colors bg-base-overlay border-surface text-text-subtle hover:border-accent/50 hover:text-text"
+        >
+          <Settings size={13} />
+          <span>Settings</span>
+        </button>
+
+        <button
           onClick={toggleTheme}
           title={isDark ? "Switch to light theme" : "Switch to dark theme"}
           className="flex items-center justify-center w-8 h-8 rounded-lg border transition-colors bg-base-overlay border-surface text-text-subtle hover:border-accent/50 hover:text-text"
@@ -298,6 +322,8 @@ export function Header() {
     {showSystemPrompt && activeSessionID && <SystemPromptModal sessionID={activeSessionID} onClose={closeSystemPrompt} />}
     {showMCPSettings && <MCPSettings onClose={closeMCPSettings} />}
     {showLSPSettings && <LSPSettings onClose={closeLSPSettings} />}
+    {showSettings && <SettingsModal onClose={closeSettings} />}
+    {showProviders && <ProvidersModal onClose={closeProviders} />}
 </>
   );
 }

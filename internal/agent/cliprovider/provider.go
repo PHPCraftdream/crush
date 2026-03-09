@@ -24,7 +24,15 @@ import (
 	"charm.land/fantasy/object"
 	gopty "github.com/aymanbagabas/go-pty"
 	"github.com/charmbracelet/crush/internal/permission"
+	"github.com/charmbracelet/crush/internal/session"
 )
+
+// sessionIDContextKey is a private key type so it cannot collide with other packages.
+type sessionIDContextKey struct{}
+
+// SessionIDContextKey is the context key for the session ID, set by the agent
+// before calling Stream so the MCP todos tool knows which session to update.
+var SessionIDContextKey = sessionIDContextKey{}
 
 // ProviderType is the catwalk.Type value used for CLI providers.
 const ProviderType = "cli"
@@ -526,6 +534,7 @@ type cliProvider struct {
 	workingDir string
 	yoloFn     func() bool
 	perms      permission.Service
+	sessions   session.Service
 	specs      map[string]CLISpec
 }
 
@@ -533,12 +542,13 @@ type cliProvider struct {
 // workingDir is set as the working directory for every CLI invocation.
 // yoloFn is called at request time to decide whether to pass the auto-accept flag.
 // perms is used to show crush's permission dialog when UseCrushMCP specs are invoked.
-func New(workingDir string, yoloFn func() bool, perms permission.Service) fantasy.Provider {
+// sessions is used by the todos MCP tool to persist task lists.
+func New(workingDir string, yoloFn func() bool, perms permission.Service, sessions session.Service) fantasy.Provider {
 	specs := make(map[string]CLISpec, len(All))
 	for _, s := range All {
 		specs[s.ModelID] = s
 	}
-	return &cliProvider{workingDir: workingDir, yoloFn: yoloFn, perms: perms, specs: specs}
+	return &cliProvider{workingDir: workingDir, yoloFn: yoloFn, perms: perms, sessions: sessions, specs: specs}
 }
 
 func (p *cliProvider) Name() string { return ProviderID }
@@ -548,7 +558,7 @@ func (p *cliProvider) LanguageModel(_ context.Context, modelID string) (fantasy.
 	if !ok {
 		return nil, fmt.Errorf("unknown CLI model: %q", modelID)
 	}
-	return &cliModel{spec: spec, workingDir: p.workingDir, yoloFn: p.yoloFn, perms: p.perms}, nil
+	return &cliModel{spec: spec, workingDir: p.workingDir, yoloFn: p.yoloFn, perms: p.perms, sessions: p.sessions}, nil
 }
 
 type cliModel struct {
@@ -556,6 +566,7 @@ type cliModel struct {
 	workingDir string
 	yoloFn     func() bool
 	perms      permission.Service
+	sessions   session.Service
 }
 
 func (m *cliModel) Provider() string { return ProviderID }
@@ -600,6 +611,9 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 
 	args := m.spec.BuildArgs(yolo)
 
+	// Extract session ID from context (set by agent.go before calling Stream).
+	sessionID, _ := ctx.Value(SessionIDContextKey).(string)
+
 	// When running in non-yolo mode with a spec that opts into crush's MCP
 	// server, start an in-process MCP server and pass its config to the CLI
 	// so tool calls go through crush's permission dialog instead of the CLI's
@@ -613,7 +627,7 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 	var qwenMCPName string // registered name in ~/.qwen/settings.json; "" if not used
 	if m.spec.UseCrushMCP && !yolo && m.perms != nil {
 		var err error
-		mcpSrv, err = newCrushMCPServer(ctx, m.perms, m.workingDir, "")
+		mcpSrv, err = newCrushMCPServer(ctx, m.perms, m.sessions, sessionID, m.workingDir, "")
 		if err != nil {
 			slog.Warn("cliprovider: failed to start MCP server, falling back to CLI permissions", "err", err)
 		} else {
@@ -655,7 +669,7 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 	if mcpSrv != nil {
 		args = append(args,
 			"--allowedTools",
-			"mcp__crush__Bash,mcp__crush__Read,mcp__crush__Write,mcp__crush__Glob,mcp__crush__Grep",
+			"mcp__crush__Bash,mcp__crush__Read,mcp__crush__Write,mcp__crush__Glob,mcp__crush__Grep,mcp__crush__todos",
 		)
 	}
 
@@ -672,7 +686,7 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 			// Use the stable project ID as the token — it's unique per project and
 			// already stored in .crush/qwen-mcp-id, so no separate secret is needed.
 			var err error
-			mcpSrv, err = newCrushMCPServer(ctx, m.perms, m.workingDir, id)
+			mcpSrv, err = newCrushMCPServer(ctx, m.perms, m.sessions, sessionID, m.workingDir, id)
 			if err != nil {
 				slog.Warn("cliprovider: failed to start qwen MCP server", "err", err)
 			} else {
@@ -695,6 +709,7 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 						"mcp__"+id+"__Write",
 						"mcp__"+id+"__Glob",
 						"mcp__"+id+"__Grep",
+						"mcp__"+id+"__todos",
 					)
 				}
 			}

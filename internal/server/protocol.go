@@ -32,6 +32,7 @@ const (
 	EventResponse                = "response"
 	EventError                   = "error"
 	EventSystemPrompt            = "system_prompt"
+	EventSkills                  = "skills"
 )
 
 // Inbound command types (client → server).
@@ -124,6 +125,95 @@ type RenameSessionPayload struct {
 type AgentBusyPayload struct {
 	SessionID string
 	Busy      bool
+}
+
+// New command constants for settings management.
+const (
+	CmdSetDebug             = "set_debug"
+	CmdAddContextPath       = "add_context_path"
+	CmdRemoveContextPath    = "remove_context_path"
+	CmdGetSkills            = "get_skills"
+	CmdAddSkillsPath        = "add_skills_path"
+	CmdRemoveSkillsPath     = "remove_skills_path"
+	CmdInitializeProject    = "initialize_project"
+	CmdAddCustomProvider    = "add_custom_provider"
+	CmdRemoveCustomProvider = "remove_custom_provider"
+	CmdUpdateCustomProvider = "update_custom_provider"
+	CmdUpdateTodos          = "update_todos"
+)
+
+// SetDebugPayload controls debug logging options.
+type SetDebugPayload struct {
+	Debug    bool `json:"debug"`
+	DebugLSP bool `json:"debugLsp"`
+}
+
+// AddContextPathPayload adds a path to options.context_paths.
+type AddContextPathPayload struct {
+	Path string `json:"path"`
+}
+
+// RemoveContextPathPayload removes a path from options.context_paths.
+type RemoveContextPathPayload struct {
+	Path string `json:"path"`
+}
+
+// AddSkillsPathPayload adds a path to options.skills_paths.
+type AddSkillsPathPayload struct {
+	Path string `json:"path"`
+}
+
+// RemoveSkillsPathPayload removes a path from options.skills_paths.
+type RemoveSkillsPathPayload struct {
+	Path string `json:"path"`
+}
+
+// SkillInfo is the wire format for a single discovered skill.
+type SkillInfo struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Path        string `json:"path"`
+}
+
+// SkillsSnapshot is the full skills state.
+type SkillsSnapshot struct {
+	Skills []SkillInfo `json:"skills"`
+	Paths  []string    `json:"paths"`
+}
+
+// CustomModelPayload carries a model definition for custom providers.
+type CustomModelPayload struct {
+	ID            string  `json:"id"`
+	Name          string  `json:"name"`
+	ContextWindow int64   `json:"contextWindow,omitempty"`
+	CostPer1MIn   float64 `json:"costPer1mIn,omitempty"`
+	CostPer1MOut  float64 `json:"costPer1mOut,omitempty"`
+}
+
+// AddCustomProviderPayload adds a fully custom provider.
+type AddCustomProviderPayload struct {
+	ID      string               `json:"id"`
+	Name    string               `json:"name,omitempty"`
+	Type    string               `json:"type"`
+	BaseURL string               `json:"baseUrl"`
+	APIKey  string               `json:"apiKey,omitempty"`
+	Models  []CustomModelPayload `json:"models,omitempty"`
+}
+
+// RemoveCustomProviderPayload removes a custom provider by id.
+type RemoveCustomProviderPayload struct {
+	ID string `json:"id"`
+}
+
+// UpdateCustomProviderPayload updates an existing custom provider.
+type UpdateCustomProviderPayload struct {
+	OldID   string               `json:"oldId"`
+	ID      string               `json:"id"`
+	Name    string               `json:"name,omitempty"`
+	Type    string               `json:"type"`
+	BaseURL string               `json:"baseUrl"`
+	APIKey  string               `json:"apiKey,omitempty"`
+	Models  []CustomModelPayload `json:"models,omitempty"`
 }
 
 // MCPServerInfo is the wire format for a single MCP server state.
@@ -247,13 +337,17 @@ type UpdateMessageThinkingPayload struct {
 // ConfigWire is the frontend-facing config payload with PascalCase field names
 // matching the TypeScript ConfigPayload type.
 type ConfigWire struct {
-	Models             map[string]ModelEntryWire   `json:"models"`
-	Providers          map[string]ProviderWire     `json:"providers"`
-	Yolo               bool                        `json:"yolo"`
-	Debug              bool                        `json:"debug"`
-	Theme              string                      `json:"theme"`
-	RecentLargeModels  []ModelEntryWire            `json:"recentLargeModels,omitempty"`
-	RecentSmallModels  []ModelEntryWire            `json:"recentSmallModels,omitempty"`
+	Models            map[string]ModelEntryWire `json:"models"`
+	Providers         map[string]ProviderWire   `json:"providers"`
+	Yolo              bool                      `json:"yolo"`
+	Debug             bool                      `json:"debug"`
+	DebugLSP          bool                      `json:"debugLsp"`
+	Theme             string                    `json:"theme"`
+	RecentLargeModels []ModelEntryWire          `json:"recentLargeModels,omitempty"`
+	RecentSmallModels []ModelEntryWire          `json:"recentSmallModels,omitempty"`
+	ContextPaths      []string                  `json:"contextPaths,omitempty"`
+	SkillsPaths       []string                  `json:"skillsPaths,omitempty"`
+	InitializeAs      string                    `json:"initializeAs,omitempty"`
 }
 
 // ModelEntryWire represents a selected model entry (large/small/etc).
@@ -268,6 +362,9 @@ type ProviderWire struct {
 	Enabled   bool            `json:"enabled"`
 	Type      string          `json:"type,omitempty"`
 	Models    []ModelInfoWire `json:"models,omitempty"`
+	BaseURL   string          `json:"baseUrl,omitempty"`
+	IsCustom  bool            `json:"isCustom,omitempty"`
+	APIKeySet bool            `json:"apiKeySet,omitempty"`
 }
 
 // ModelInfoWire is a single available model from a provider.
@@ -346,4 +443,17 @@ type UpdateMCPServerPayload struct {
 	Env     map[string]string `json:"env,omitempty"`
 	Headers map[string]string `json:"headers,omitempty"`
 	Timeout int               `json:"timeout,omitempty"`
+}
+
+// UpdateTodosPayload replaces the todo list for a session.
+type UpdateTodosPayload struct {
+	SessionID string    `json:"sessionID"`
+	Todos     []TodoWire `json:"todos"`
+}
+
+// TodoWire mirrors session.Todo for the WebSocket protocol.
+type TodoWire struct {
+	Content    string `json:"content"`
+	Status     string `json:"status"`
+	ActiveForm string `json:"active_form,omitempty"`
 }

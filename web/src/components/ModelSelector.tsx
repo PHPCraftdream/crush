@@ -279,6 +279,7 @@ export function ModelSelector({ session, modelType }: { session: Session | null;
       </button>
       {open && (
         <div
+          data-testid="model-dropdown"
           style={{ position: "fixed", left: dropdownPos.left, bottom: dropdownPos.bottom, width: 520, zIndex: 9999 }}
           className="bg-canvas border border-surface rounded-xl shadow-xl overflow-hidden"
         >

@@ -45,6 +45,9 @@ function configWithDisabledProvider() {
   });
 }
 
+const dropdown = (page: import("@playwright/test").Page) =>
+  page.locator('[data-testid="model-dropdown"]');
+
 async function openLargeModelDropdown(page: import("@playwright/test").Page) {
   await page.goto("/");
   await sendMockWSMessage(page, {
@@ -54,7 +57,8 @@ async function openLargeModelDropdown(page: import("@playwright/test").Page) {
   await sendMockWSMessage(page, { type: "config", payload: configWithDisabledProvider() });
   await expect(page.getByText("API Key Session").first()).toBeVisible({ timeout: 3000 });
   await page.getByText("API Key Session").first().click();
-  await page.locator("header button[title='Large (strong) model']").click();
+  await expect(page.locator("button[title='Large (strong) model']")).toBeVisible({ timeout: 3000 });
+  await page.locator("button[title='Large (strong) model']").click();
   await expect(page.getByPlaceholder("Search models…")).toBeVisible({ timeout: 2000 });
 }
 
@@ -62,24 +66,24 @@ async function openLargeModelDropdown(page: import("@playwright/test").Page) {
 
 test("disabled provider model shows add key hint", async ({ page }) => {
   await openLargeModelDropdown(page);
-  await expect(page.locator("div.z-50").getByText("+ add key")).toBeVisible({ timeout: 2000 });
+  await expect(dropdown(page).getByText("+ add key")).toBeVisible({ timeout: 2000 });
 });
 
 test("clicking disabled model opens API key form", async ({ page }) => {
   await openLargeModelDropdown(page);
   // Click the gpt-4o model (disabled provider)
-  await page.locator("div.z-50").getByText("gpt-4o").click();
+  await dropdown(page).getByText("gpt-4o").click();
   await expect(page.getByText("Enter API key")).toBeVisible({ timeout: 2000 });
   await expect(page.getByPlaceholder("sk-…")).toBeVisible();
 });
 
 test("saving API key sends set_provider_key", async ({ page }) => {
   await openLargeModelDropdown(page);
-  await page.locator("div.z-50").getByText("gpt-4o").click();
+  await dropdown(page).getByText("gpt-4o").click();
   await expect(page.getByPlaceholder("sk-…")).toBeVisible({ timeout: 2000 });
 
   await page.getByPlaceholder("sk-…").fill("sk-test-key-123");
-  await page.locator("div.z-50 button", { hasText: "Save" }).click();
+  await dropdown(page).locator("button", { hasText: "Save" }).click();
 
   const cmd = await waitForWSSend(page, "set_provider_key");
   const payload = cmd.payload as { providerID: string; apiKey: string };
@@ -89,16 +93,16 @@ test("saving API key sends set_provider_key", async ({ page }) => {
 
 test("Escape cancels API key form", async ({ page }) => {
   await openLargeModelDropdown(page);
-  await page.locator("div.z-50").getByText("gpt-4o").click();
+  await dropdown(page).getByText("gpt-4o").click();
   await expect(page.getByText("Enter API key")).toBeVisible({ timeout: 2000 });
 
-  await page.locator("div.z-50 button", { hasText: "Cancel" }).click();
+  await dropdown(page).locator("button", { hasText: "Cancel" }).click();
   await expect(page.getByText("Enter API key")).not.toBeVisible({ timeout: 2000 });
 });
 
 test("Enter key in API key input saves", async ({ page }) => {
   await openLargeModelDropdown(page);
-  await page.locator("div.z-50").getByText("gpt-4o").click();
+  await dropdown(page).getByText("gpt-4o").click();
   await page.getByPlaceholder("sk-…").fill("sk-enter-key");
   await page.getByPlaceholder("sk-…").press("Enter");
 
@@ -111,13 +115,13 @@ test("Enter key in API key input saves", async ({ page }) => {
 test("enabled provider shows Edit key and Remove key buttons", async ({ page }) => {
   await openLargeModelDropdown(page);
   // Anthropic is enabled — should show management buttons
-  await expect(page.locator("div.z-50").getByText("Edit key")).toBeVisible({ timeout: 2000 });
-  await expect(page.locator("div.z-50").getByText("Remove key")).toBeVisible();
+  await expect(dropdown(page).getByText("Edit key")).toBeVisible({ timeout: 2000 });
+  await expect(dropdown(page).getByText("Remove key")).toBeVisible();
 });
 
 test("clicking Remove key sends remove_provider_key", async ({ page }) => {
   await openLargeModelDropdown(page);
-  await page.locator("div.z-50").getByText("Remove key").click();
+  await dropdown(page).getByText("Remove key").click();
 
   const cmd = await waitForWSSend(page, "remove_provider_key");
   expect((cmd.payload as { providerID: string }).providerID).toBe("anthropic");
@@ -125,7 +129,7 @@ test("clicking Remove key sends remove_provider_key", async ({ page }) => {
 
 test("clicking Edit key opens API key form for enabled provider", async ({ page }) => {
   await openLargeModelDropdown(page);
-  await page.locator("div.z-50").getByText("Edit key").click();
+  await dropdown(page).getByText("Edit key").click();
 
   await expect(page.getByText("Enter API key")).toBeVisible({ timeout: 2000 });
   await expect(page.getByPlaceholder("sk-…")).toBeVisible();
@@ -135,6 +139,6 @@ test("clicking Edit key opens API key form for enabled provider", async ({ page 
 
 test("+ Add API key button opens form for disabled provider group", async ({ page }) => {
   await openLargeModelDropdown(page);
-  await page.locator("div.z-50").getByText("+ Add API key").click();
+  await dropdown(page).getByText("+ Add API key").click();
   await expect(page.getByText("Enter API key")).toBeVisible({ timeout: 2000 });
 });

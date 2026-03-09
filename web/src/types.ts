@@ -5,6 +5,7 @@ export type TodoStatus = "pending" | "in_progress" | "completed";
 export interface Todo {
   content: string;
   status: TodoStatus;
+  active_form?: string;
 }
 
 export interface Session {
@@ -106,14 +107,39 @@ export interface ModelInfo {
   provider: string;
 }
 
+export interface ProviderInfo {
+  name?: string;
+  enabled?: boolean;
+  type?: string;
+  models?: { id: string; name: string; contextWindow?: number }[];
+  baseUrl?: string;
+  isCustom?: boolean;
+  apiKeySet?: boolean;
+}
+
 export interface ConfigPayload {
   models?: Record<string, { Provider: string; Model: string }>;
-  providers?: Record<string, { name?: string; enabled?: boolean; type?: string; models?: { id: string; name: string; contextWindow?: number }[] }>;
+  providers?: Record<string, ProviderInfo>;
   yolo?: boolean;
   debug?: boolean;
+  debugLsp?: boolean;
   theme?: string;
   recentLargeModels?: Array<{ Provider: string; Model: string }>;
   recentSmallModels?: Array<{ Provider: string; Model: string }>;
+  contextPaths?: string[];
+  skillsPaths?: string[];
+  initializeAs?: string;
+}
+
+export interface SkillInfo {
+  name: string;
+  description: string;
+  path: string;
+}
+
+export interface SkillsSnapshot {
+  skills: SkillInfo[];
+  paths: string[];
 }
 
 export interface LSPServerInfo {

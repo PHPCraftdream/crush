@@ -191,6 +191,6 @@ test("both copy button and model name are visible on hover", async ({ page }) =>
   });
   await expect(page.getByText("Copyable assistant message")).toBeVisible({ timeout: 2000 });
   // Both Copy button and model name should always be visible
-  await expect(page.locator("text=Copy")).toBeVisible({ timeout: 2000 });
+  await expect(page.getByRole("button", { name: "Copy", exact: true })).toBeVisible({ timeout: 2000 });
   await expect(page.locator("text=claude-haiku-4")).toBeVisible({ timeout: 2000 });
 });

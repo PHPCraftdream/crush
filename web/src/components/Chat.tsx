@@ -3,6 +3,7 @@ import { useStore } from "@nanostores/react";
 import {
   $messages,
   $activeSessionID,
+  $sessions,
   $busySessions,
   $agentError,
   $selectedMessageIDs,
@@ -20,6 +21,7 @@ import { ChatInput } from "./ChatInput";
 import { PermissionDialog } from "./PermissionDialog";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { ChatToolbar } from "./ChatToolbar";
+import { TodoList } from "./TodoList";
 import { MessageSquare, Pencil, Sparkles, Square, Trash2, X } from "lucide-react";
 
 // ── Queued message item ───────────────────────────────────────────────────────
@@ -146,6 +148,10 @@ export function Chat() {
   const scrollRef = useRef<HTMLDivElement>(null);
   const isAtBottomRef = useRef(true);
 
+  const sessions = useStore($sessions);
+  const activeSession = sessions.find((s) => s.ID === activeSessionID) ?? null;
+  const todos = activeSession?.Todos ?? [];
+
   const isBusy = activeSessionID ? busySessions.has(activeSessionID) : false;
   const selectionActive = selectedIDs.size > 0;
   const queuedItems = activeSessionID ? (messageQueue.get(activeSessionID) ?? []) : [];
@@ -226,6 +232,7 @@ export function Chat() {
               <p className="text-[15px] text-red/80 leading-relaxed flex-1 break-words">{agentError}</p>
               <button
                 onClick={() => $agentError.set(null)}
+                aria-label="Dismiss"
                 className="text-red/40 hover:text-red/70 transition-colors shrink-0 text-xl leading-none mt-0.5"
               >
                 <X size={16} />
@@ -296,6 +303,10 @@ export function Chat() {
             Cancel
           </button>
         </div>
+      )}
+
+      {activeSessionID && todos.length > 0 && (
+        <TodoList sessionID={activeSessionID} todos={todos} />
       )}
 
       <ChatToolbar />
