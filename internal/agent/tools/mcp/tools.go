@@ -31,6 +31,19 @@ func Tools() iter.Seq2[string, []*Tool] {
 	return allTools.Seq2()
 }
 
+// GetServerToolNames returns the names of all tools registered for the given server.
+func GetServerToolNames(name string) []string {
+	tools, ok := allTools.Get(name)
+	if !ok {
+		return nil
+	}
+	names := make([]string, 0, len(tools))
+	for _, t := range tools {
+		names = append(names, t.Name)
+	}
+	return names
+}
+
 // RunTool runs an MCP tool with the given input parameters.
 func RunTool(ctx context.Context, cfg *config.Config, name, toolName string, input string) (ToolResult, error) {
 	var args map[string]any

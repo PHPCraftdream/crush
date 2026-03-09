@@ -158,13 +158,24 @@ export function setSessionModels(sessionID: string, largeKey: string | null, sma
 
 // ── Theme ─────────────────────────────────────────────────────────────────────
 
+const STORAGE_KEY_THEME = "crush_theme";
+
 export function applyTheme(theme: string) {
   if (theme === "dark") {
     document.documentElement.classList.add("dark");
   } else {
     document.documentElement.classList.remove("dark");
   }
+  try { localStorage.setItem(STORAGE_KEY_THEME, theme); } catch {}
 }
+
+// Apply saved theme immediately on module load (before WS connects)
+;(function () {
+  try {
+    const saved = localStorage.getItem(STORAGE_KEY_THEME);
+    if (saved) applyTheme(saved);
+  } catch {}
+})();
 
 export function setTheme(theme: "light" | "dark") {
   applyTheme(theme);

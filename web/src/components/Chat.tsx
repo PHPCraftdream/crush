@@ -18,55 +18,9 @@ import { ws } from "../ws";
 import { Message } from "./Message";
 import { ChatInput } from "./ChatInput";
 import { PermissionDialog } from "./PermissionDialog";
+import { ConfirmDialog } from "./ConfirmDialog";
+import { ChatToolbar } from "./ChatToolbar";
 import { MessageSquare, Pencil, Sparkles, Square, Trash2, X } from "lucide-react";
-
-// ── Confirmation dialog ───────────────────────────────────────────────────────
-
-function ConfirmDialog({
-  message,
-  onConfirm,
-  onCancel,
-}: {
-  message: string;
-  onConfirm: () => void;
-  onCancel: () => void;
-}) {
-  useEffect(() => {
-    function onKey(e: KeyboardEvent) {
-      if (e.key === "Escape") onCancel();
-    }
-    document.addEventListener("keydown", onKey);
-    return () => document.removeEventListener("keydown", onKey);
-  }, [onCancel]);
-
-  return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm"
-      onClick={onCancel}
-    >
-      <div
-        className="bg-white border border-surface rounded-2xl shadow-xl px-8 py-6 max-w-sm w-full mx-4"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <p className="text-text text-[15px] leading-relaxed mb-6">{message}</p>
-        <div className="flex gap-3 justify-end">
-          <button
-            onClick={onCancel}
-            className="px-4 py-2 text-sm text-text-subtle hover:text-text transition-colors rounded-xl hover:bg-base-overlay"
-          >
-            Cancel
-          </button>
-          <button
-            onClick={onConfirm}
-            className="px-4 py-2 text-sm bg-red text-white rounded-xl hover:opacity-90 transition-opacity font-medium"
-          >
-            Delete
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
 
 // ── Queued message item ───────────────────────────────────────────────────────
 
@@ -139,7 +93,7 @@ function QueuedMessageItem({
               </button>
               <button
                 onClick={save}
-                className="px-3 py-1 text-xs bg-accent text-white rounded-lg hover:opacity-90 transition-opacity"
+                className="px-3 py-1 text-xs bg-accent-fill text-white/90 rounded-lg hover:opacity-90 transition-opacity"
               >
                 Save
               </button>
@@ -149,7 +103,7 @@ function QueuedMessageItem({
           <>
             <div className="relative">
               {/* position badge */}
-              <span className="absolute -top-2.5 right-3 text-[10px] font-semibold text-text-subtle bg-white border border-surface rounded-full px-1.5 py-0.5 leading-none">
+              <span className="absolute -top-2.5 right-3 text-[10px] font-semibold text-text-subtle bg-canvas border border-surface rounded-full px-1.5 py-0.5 leading-none">
                 #{position}/{total}
               </span>
               <div className="bg-surface/60 border border-surface text-text-subtle rounded-2xl rounded-tr-sm px-5 py-3.5 text-[16px] leading-relaxed whitespace-pre-wrap">
@@ -196,6 +150,9 @@ export function Chat() {
   const selectionActive = selectedIDs.size > 0;
   const queuedItems = activeSessionID ? (messageQueue.get(activeSessionID) ?? []) : [];
 
+  // Last user message — Rerun button shown only here
+  const lastUserMsgID = [...messages].reverse().find((m) => m.Role === "user")?.ID ?? null;
+
   const [confirm, setConfirm] = useState<{ text: string; action: () => void } | null>(null);
 
   function handleScroll() {
@@ -214,7 +171,7 @@ export function Chat() {
     if (isAtBottomRef.current) {
       bottomRef.current?.scrollIntoView({ behavior: "smooth" });
     }
-  }, [messages, isBusy, agentError, queuedItems]);
+  }, [messages, isBusy, agentError]);
 
   function requestDeleteOne(id: string) {
     setConfirm({
@@ -232,7 +189,7 @@ export function Chat() {
   }
 
   return (
-    <div className="flex-1 flex flex-col overflow-hidden relative bg-white">
+    <div className="flex-1 flex flex-col overflow-hidden relative bg-canvas">
       <div ref={scrollRef} onScroll={handleScroll} className="flex-1 overflow-y-auto py-8 flex flex-col">
         {!activeSessionID ? (
           <div className="flex flex-col items-center justify-center flex-1 text-center px-8">
@@ -257,6 +214,7 @@ export function Chat() {
               message={m}
               onDeleteRequest={requestDeleteOne}
               selectionActive={selectionActive}
+              isLastUserMsg={m.ID === lastUserMsgID && !isBusy}
             />
           ))
         )}
@@ -294,30 +252,30 @@ export function Chat() {
           </div>
         )}
 
-        {/* Queued messages */}
-        {queuedItems.length > 0 && activeSessionID && (
-          <div className="mt-2">
-            <div className="flex items-center gap-2 px-10 py-1.5">
-              <div className="flex-1 h-px bg-surface" />
-              <span className="text-[11px] text-text-subtle font-medium uppercase tracking-wider">
-                Queue · {queuedItems.length}
-              </span>
-              <div className="flex-1 h-px bg-surface" />
-            </div>
-            {queuedItems.map((item, idx) => (
-              <QueuedMessageItem
-                key={item.id}
-                item={item}
-                sessionID={activeSessionID}
-                position={idx + 1}
-                total={queuedItems.length}
-              />
-            ))}
-          </div>
-        )}
-
         <div ref={bottomRef} className="h-8 shrink-0" />
       </div>
+
+      {/* Queued messages — outside scroll area so streaming content doesn't cause jitter */}
+      {queuedItems.length > 0 && activeSessionID && (
+        <div className="shrink-0 border-t border-surface bg-canvas">
+          <div className="flex items-center gap-2 px-10 py-1.5">
+            <div className="flex-1 h-px bg-surface/50" />
+            <span className="text-[11px] text-text-subtle font-medium uppercase tracking-wider">
+              Queue · {queuedItems.length}
+            </span>
+            <div className="flex-1 h-px bg-surface/50" />
+          </div>
+          {queuedItems.map((item, idx) => (
+            <QueuedMessageItem
+              key={item.id}
+              item={item}
+              sessionID={activeSessionID}
+              position={idx + 1}
+              total={queuedItems.length}
+            />
+          ))}
+        </div>
+      )}
 
       {/* Batch selection toolbar */}
       {selectionActive && (
@@ -340,12 +298,15 @@ export function Chat() {
         </div>
       )}
 
+      <ChatToolbar />
       <PermissionDialog />
       <ChatInput />
 
       {confirm && (
         <ConfirmDialog
+          title="Delete message"
           message={confirm.text}
+          confirmLabel="Delete"
           onConfirm={() => { confirm.action(); setConfirm(null); }}
           onCancel={() => setConfirm(null)}
         />

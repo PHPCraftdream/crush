@@ -3,13 +3,11 @@ import { useStore } from "@nanostores/react";
 import {
   $activeSessionID,
   $busySessions,
-  $messages,
   enqueueMessage,
-  resendLastUserMessage,
   sendWithSmallModel,
 } from "../store";
 import { ws } from "../ws";
-import { ListOrdered, RotateCcw, Send, SendHorizonal } from "lucide-react";
+import { ListOrdered, Send, SendHorizonal } from "lucide-react";
 
 export function ChatInput() {
   const [text, setText] = useState("");
@@ -24,9 +22,6 @@ export function ChatInput() {
   }, [activeSessionID]);
 
   const agentBusy = activeSessionID ? busySessions.has(activeSessionID) : false;
-
-  const messages = useStore($messages);
-  const hasUserMessage = messages.some((m) => m.Role === "user");
 
   const send = useCallback(() => {
     const msg = text.trim();
@@ -49,11 +44,6 @@ export function ChatInput() {
     if (textareaRef.current) textareaRef.current.style.height = "auto";
   }, [text, activeSessionID, agentBusy]);
 
-  const rerun = useCallback(() => {
-    if (!activeSessionID || agentBusy) return;
-    resendLastUserMessage();
-  }, [activeSessionID, agentBusy]);
-
   function onKey(e: React.KeyboardEvent<HTMLTextAreaElement>) {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
@@ -74,9 +64,9 @@ export function ChatInput() {
     : "Select or create a session";
 
   return (
-    <div className="px-8 py-6 border-t border-surface bg-white shrink-0">
+    <div className="px-8 pt-2 pb-6 bg-canvas shrink-0">
       <div className={`flex gap-4 items-end bg-base-overlay border rounded-2xl px-5 py-4 transition-all ${
-        activeSessionID ? "border-surface focus-within:border-accent/50 focus-within:shadow-md focus-within:bg-white" : "border-surface opacity-60"
+        activeSessionID ? "border-surface focus-within:border-accent/50 focus-within:shadow-md focus-within:bg-canvas" : "border-surface opacity-60"
       }`}>
         <textarea
           ref={textareaRef}
@@ -90,15 +80,6 @@ export function ChatInput() {
           className="flex-1 bg-transparent border-none outline-none resize-none text-text text-[16px] leading-relaxed min-h-[28px] max-h-80 overflow-y-auto disabled:cursor-not-allowed placeholder:text-text-subtle font-medium"
         />
         <div className="flex items-center gap-2 shrink-0">
-          {!agentBusy && hasUserMessage && (
-            <button
-              onClick={rerun}
-              title="Rerun last prompt"
-              className="p-2.5 text-text-subtle hover:text-accent hover:bg-accent/10 rounded-xl transition-all active:scale-95"
-            >
-              <RotateCcw size={18} />
-            </button>
-          )}
           {!agentBusy && (
             <button
               onClick={sendSmall}
@@ -115,7 +96,7 @@ export function ChatInput() {
             className={`font-bold rounded-xl px-5 py-2.5 text-sm disabled:opacity-30 active:scale-95 transition-all shadow-sm flex items-center gap-2 ${
               agentBusy
                 ? "bg-base-overlay border border-surface text-text-subtle hover:border-accent/50 hover:text-text"
-                : "bg-accent text-white hover:bg-accent/90"
+                : "bg-accent-fill text-white/90 hover:opacity-90"
             }`}
           >
             {agentBusy ? (

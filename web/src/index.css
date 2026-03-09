@@ -2,19 +2,58 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ── Color tokens ────────────────────────────────────────────────────────────
+   Light theme (default)
+   ───────────────────────────────────────────────────────────────────────── */
+:root {
+  --color-canvas:       #ffffff;
+  --color-base-subtle:  #f8fafc;
+  --color-base-overlay: #f1f5f9;
+  --color-surface:      #e2e8f0;
+  --color-text:         #0f172a;
+  --color-text-muted:   #475569;
+  --color-text-subtle:  #94a3b8;
+  --color-accent:       #4f46e5;
+  --color-accent-fill:  #4f46e5;
+  --color-green:        #16a34a;
+  --color-red:          #dc2626;
+  --color-red-fill:     #dc2626;
+  --color-yellow:       #d97706;
+  --color-yellow-fill:  #d97706;
+}
+
+/* ── Dark theme ──────────────────────────────────────────────────────────── */
+.dark {
+  --color-canvas:       #0d1117;
+  --color-base-subtle:  #161b22;
+  --color-base-overlay: #1c2128;
+  --color-surface:      #21262d;
+  --color-text:         #c9d1d9;
+  --color-text-muted:   #8b949e;
+  --color-text-subtle:  #6e7681;
+  --color-accent:       #818cf8;
+  --color-accent-fill:  #4338ca;
+  --color-green:        #3fb950;
+  --color-red:          #f87171;
+  --color-red-fill:     #b91c1c;
+  --color-yellow:       #d29922;
+  --color-yellow-fill:  #854d0e;
+}
+
 @layer base {
   html, body, #root {
     @apply h-full m-0 p-0;
   }
 
   body {
-    @apply bg-white text-text text-base leading-relaxed font-sans antialiased;
+    @apply bg-canvas text-text text-base leading-relaxed font-sans antialiased;
   }
 
+  /* Light scrollbar */
   ::-webkit-scrollbar { width: 10px; height: 10px; }
-  ::-webkit-scrollbar-track { background: #f1f5f9; border-radius: 9999px; }
-  ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 9999px; border: 2px solid #f1f5f9; }
-  ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+  ::-webkit-scrollbar-track { background: var(--color-base-overlay); border-radius: 9999px; }
+  ::-webkit-scrollbar-thumb { background: var(--color-surface); border-radius: 9999px; border: 2px solid var(--color-base-overlay); }
+  ::-webkit-scrollbar-thumb:hover { background: var(--color-text-subtle); }
 }
 
 @layer components {
@@ -35,12 +74,16 @@
   .md ol { @apply pl-7 my-3 list-decimal; }
   .md li { @apply my-1.5; }
   .md blockquote {
-    @apply my-4 pl-5 border-l-4 border-accent/30 text-text-muted italic;
+    @apply my-4 pl-5 border-l-4 text-text-muted italic;
+    border-color: color-mix(in srgb, var(--color-accent) 30%, transparent);
   }
   .md table { @apply border-collapse w-full my-4 text-[15px]; }
   .md th { @apply border border-surface bg-base-overlay px-4 py-2.5 text-left font-semibold; }
   .md td { @apply border border-surface px-4 py-2.5; }
-  .md a { @apply text-accent underline underline-offset-2 hover:text-accent/80; }
+  .md a {
+    @apply text-accent underline underline-offset-2;
+    &:hover { color: color-mix(in srgb, var(--color-accent) 80%, transparent); }
+  }
   .md strong { @apply font-semibold text-text; }
   .md hr { @apply my-6 border-surface; }
 

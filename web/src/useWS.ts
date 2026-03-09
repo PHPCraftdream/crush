@@ -63,6 +63,11 @@ export function useWS() {
         $busySessions.set(new Set());
         ws.send("list_sessions");
         ws.send("get_config");
+        // Persist any theme set on the login page (before WS was available)
+        const localTheme = localStorage.getItem("crush_theme");
+        if (localTheme) {
+          ws.send("set_theme", { theme: localTheme });
+        }
       }),
 
       ws.on("_disconnected", () => {
@@ -145,8 +150,11 @@ export function useWS() {
         if (cfg.yolo !== undefined && localStorage.getItem("crush_yolo") === null) {
           $yolo.set(cfg.yolo);
         }
-        // Apply saved theme
-        if (cfg.theme) {
+        // Apply server theme only if no local preference (first-ever visit).
+        // If the user set a theme on the login page, it's already in localStorage
+        // and was just pushed to the server above — don't let the echoed config
+        // overwrite the local choice.
+        if (cfg.theme && !localStorage.getItem("crush_theme")) {
           applyTheme(cfg.theme);
         }
         // Restore recent models from server (persisted across restarts)

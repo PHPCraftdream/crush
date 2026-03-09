@@ -4,14 +4,17 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
 import type { Message as Msg, ContentPart } from "../types";
-import { BrainCircuit, Check, Copy, Pencil, Trash2 } from "lucide-react";
+import { BrainCircuit, Check, Copy, Pencil, RotateCcw, Trash2 } from "lucide-react";
 import {
   $busySessions,
   $selectedMessageIDs,
   toggleMessageSelection,
   updateMessageContent,
   updateMessageThinking,
+  deleteMessagePart,
+  rerunFromMessage,
 } from "../store";
+import { ConfirmDialog } from "./ConfirmDialog";
 
 function formatDuration(seconds: number): string {
   if (seconds < 60) return `${seconds.toFixed(1)}s`;
@@ -105,9 +108,10 @@ interface MessageProps {
   message: Msg;
   onDeleteRequest: (id: string) => void;
   selectionActive: boolean;
+  isLastUserMsg?: boolean;
 }
 
-export function Message({ message, onDeleteRequest, selectionActive }: MessageProps) {
+export function Message({ message, onDeleteRequest, selectionActive, isLastUserMsg }: MessageProps) {
   const isUser = message.Role === "user";
   const copyText = extractText(message.Parts);
   const copyThinking = !isUser ? extractThinking(message.Parts) : "";
@@ -194,7 +198,7 @@ export function Message({ message, onDeleteRequest, selectionActive }: MessagePr
                 onChange={onTextareaInput}
                 onKeyDown={onEditKey}
                 rows={1}
-                className="bg-accent/10 border border-accent/40 text-text rounded-2xl rounded-tr-sm px-5 py-3.5 text-[16px] leading-relaxed resize-none outline-none focus:border-accent w-full min-w-[300px]"
+                className="bg-accent/10 border border-accent/40 text-text rounded-2xl rounded-tr-sm px-5 py-3.5 text-[18px] leading-relaxed resize-none outline-none focus:border-accent w-full min-w-[300px]"
                 style={{ overflow: "hidden" }}
               />
               <div className="flex gap-2 justify-end">
@@ -206,7 +210,7 @@ export function Message({ message, onDeleteRequest, selectionActive }: MessagePr
                 </button>
                 <button
                   onClick={commitEdit}
-                  className="px-3 py-1 text-xs bg-accent text-white rounded-lg hover:opacity-90 transition-opacity"
+                  className="px-3 py-1 text-xs bg-accent-fill text-white/90 rounded-lg hover:opacity-90 transition-opacity"
                 >
                   Save
                 </button>
@@ -214,14 +218,23 @@ export function Message({ message, onDeleteRequest, selectionActive }: MessagePr
             </div>
           ) : (
             <>
-              <div className="bg-accent text-white rounded-2xl rounded-tr-sm px-5 py-3.5 text-[16px] leading-relaxed shadow-md">
+              <div className="bg-accent-fill dark:bg-base-overlay text-white/90 dark:text-text rounded-2xl rounded-tr-sm px-5 py-3.5 text-[18px] leading-relaxed shadow-md dark:border dark:border-surface">
                 {message.Parts.map((part, i) => (
-                  <Part key={i} part={part} isUser messageID={message.ID} thinkingDone={false} />
+                  <Part key={i} part={part} index={i} isUser messageID={message.ID} thinkingDone={false} />
                 ))}
               </div>
               <div className="flex items-center justify-between mt-1.5 gap-2">
                 {copyText && <CopyButton text={copyText} className="text-text-subtle" />}
-                <div className="flex items-center gap-1 ml-auto opacity-0 group-hover/msg:opacity-100 transition-opacity">
+                <div className="flex items-center gap-1 ml-auto">
+                  {isLastUserMsg && (
+                    <button
+                      onClick={() => rerunFromMessage(message.ID)}
+                      title="Rerun — delete agent response and resend"
+                      className="p-1.5 text-text-subtle hover:text-accent transition-colors rounded"
+                    >
+                      <RotateCcw size={13} />
+                    </button>
+                  )}
                   <button
                     onClick={startEdit}
                     title="Edit message"
@@ -264,7 +277,7 @@ export function Message({ message, onDeleteRequest, selectionActive }: MessagePr
                 </button>
                 <button
                   onClick={commitEdit}
-                  className="px-3 py-1 text-xs bg-accent text-white rounded-lg hover:opacity-90 transition-opacity"
+                  className="px-3 py-1 text-xs bg-accent-fill text-white/90 rounded-lg hover:opacity-90 transition-opacity"
                 >
                   Save <span className="opacity-70">(Ctrl+Enter)</span>
                 </button>
@@ -276,7 +289,7 @@ export function Message({ message, onDeleteRequest, selectionActive }: MessagePr
                 {(() => {
                   const thinkingDone = message.Parts.some(p => p.type === "text" || p.type === "finish");
                   return message.Parts.map((part, i) => (
-                    <Part key={i} part={part} isUser={false} messageID={message.ID} thinkingDone={thinkingDone} />
+                    <Part key={i} part={part} index={i} isUser={false} messageID={message.ID} thinkingDone={thinkingDone} />
                   ));
                 })()}
               </div>
@@ -286,7 +299,7 @@ export function Message({ message, onDeleteRequest, selectionActive }: MessagePr
                   {copyAll && <CopyButton text={copyAll} label="Copy all" />}
                 </div>
                 <div className="flex items-center gap-1 ml-auto">
-                  <div className="flex items-center gap-1 opacity-0 group-hover/msg:opacity-100 transition-opacity">
+                  <div className="flex items-center gap-1">
                     <button
                       onClick={startEdit}
                       title="Edit message"
@@ -318,9 +331,10 @@ export function Message({ message, onDeleteRequest, selectionActive }: MessagePr
   );
 }
 
-function ThinkingPart({ thinking, messageID, done }: { thinking: string; messageID: string; done: boolean }) {
+function ThinkingPart({ thinking, messageID, partIndex, done }: { thinking: string; messageID: string; partIndex: number; done: boolean }) {
   const [editing, setEditing] = useState(false);
   const [value, setValue] = useState("");
+  const [confirmDelete, setConfirmDelete] = useState(false);
   const taRef = useRef<HTMLTextAreaElement>(null);
 
   function startEdit() {
@@ -370,8 +384,24 @@ function ThinkingPart({ thinking, messageID, done }: { thinking: string; message
           >
             <Pencil size={13} />
           </button>
+          <button
+            onClick={(e) => { e.preventDefault(); e.stopPropagation(); setConfirmDelete(true); }}
+            title="Delete thinking"
+            className="p-1 text-text-subtle hover:text-red transition-colors rounded"
+          >
+            <Trash2 size={13} />
+          </button>
         </div>
       </summary>
+      {confirmDelete && (
+        <ConfirmDialog
+          title="Delete thinking"
+          message="The model's reasoning will be removed from this message. This cannot be undone."
+          confirmLabel="Delete"
+          onConfirm={() => { deleteMessagePart(messageID, partIndex); setConfirmDelete(false); }}
+          onCancel={() => setConfirmDelete(false)}
+        />
+      )}
       {editing ? (
         <div className="p-4 bg-base-overlay border-t border-surface">
           <textarea
@@ -391,7 +421,7 @@ function ThinkingPart({ thinking, messageID, done }: { thinking: string; message
             </button>
             <button
               onClick={save}
-              className="px-3 py-1 text-xs bg-accent text-white rounded-lg hover:opacity-90 transition-opacity"
+              className="px-3 py-1 text-xs bg-accent-fill text-white/90 rounded-lg hover:opacity-90 transition-opacity"
             >
               Save <span className="opacity-70">(Ctrl+Enter)</span>
             </button>
@@ -406,7 +436,7 @@ function ThinkingPart({ thinking, messageID, done }: { thinking: string; message
   );
 }
 
-function Part({ part, isUser, messageID, thinkingDone }: { part: ContentPart; isUser: boolean; messageID: string; thinkingDone: boolean }) {
+function Part({ part, index, isUser, messageID, thinkingDone }: { part: ContentPart; index: number; isUser: boolean; messageID: string; thinkingDone: boolean }) {
   switch (part.type) {
     case "text":
       return isUser ? (
@@ -423,7 +453,7 @@ function Part({ part, isUser, messageID, thinkingDone }: { part: ContentPart; is
       );
 
     case "thinking":
-      return <ThinkingPart thinking={part.Thinking} messageID={messageID} done={thinkingDone} />;
+      return <ThinkingPart thinking={part.Thinking} messageID={messageID} partIndex={index} done={thinkingDone} />;
 
     case "tool_call":
       return (

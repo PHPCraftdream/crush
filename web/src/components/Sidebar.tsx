@@ -3,6 +3,7 @@ import { useStore } from "@nanostores/react";
 import { $sessions, $activeSessionID, $busySessions, setActiveSession, removeSession } from "../store";
 import { ws } from "../ws";
 import { MessageSquare, Plus, Pencil, X, Check } from "lucide-react";
+import { ConfirmDialog } from "./ConfirmDialog";
 
 function formatTokens(n: number): string {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M";
@@ -17,6 +18,7 @@ export function Sidebar() {
   const [editingID, setEditingID] = useState<string | null>(null);
   const [editTitle, setEditTitle] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
+  const [pendingDelete, setPendingDelete] = useState<{ id: string; title: string } | null>(null);
 
   useEffect(() => {
     if (editingID && inputRef.current) {
@@ -37,12 +39,15 @@ export function Sidebar() {
 
   function deleteSession(e: React.MouseEvent, id: string, title: string) {
     e.stopPropagation();
-    const confirmed = window.confirm(`Are you sure you want to delete "${title || "Untitled session"}"?`);
-    if (!confirmed) return;
+    setPendingDelete({ id, title: title || "Untitled session" });
+  }
 
-    ws.send("delete_session", { sessionID: id });
-    removeSession(id);
-    if (activeID === id) setActiveSession(null);
+  function confirmDelete() {
+    if (!pendingDelete) return;
+    ws.send("delete_session", { sessionID: pendingDelete.id });
+    removeSession(pendingDelete.id);
+    if (activeID === pendingDelete.id) setActiveSession(null);
+    setPendingDelete(null);
   }
 
   function startEditing(e: React.MouseEvent, id: string, title: string) {
@@ -74,7 +79,7 @@ export function Sidebar() {
         <button
           onClick={newSession}
           title="New session"
-          className="flex items-center gap-2 px-4 py-2 bg-accent text-white text-sm font-bold rounded-xl hover:bg-accent/90 active:scale-95 transition-all shadow-sm"
+          className="flex items-center gap-2 px-4 py-2 bg-accent-fill text-white/90 text-sm font-bold rounded-xl hover:bg-accent/90 active:scale-95 transition-all shadow-sm"
         >
           <Plus size={18} />
           New
@@ -105,8 +110,8 @@ export function Sidebar() {
                 onDoubleClick={(e) => startEditing(e, s.ID, s.Title)}
                 className={`group relative px-4 py-4 rounded-xl cursor-pointer transition-all mb-1 ${
                   isActive
-                    ? "bg-white shadow-sm border border-accent/20"
-                    : "hover:bg-white/50 border border-transparent"
+                    ? "bg-canvas shadow-sm border border-accent/20"
+                    : "hover:bg-canvas/50 border border-transparent"
                 }`}
               >
                 <div className="flex items-center gap-3 pr-12">
@@ -121,13 +126,13 @@ export function Sidebar() {
                         onChange={(e) => setEditTitle(e.target.value)}
                         onBlur={saveRename}
                         onKeyDown={handleKeyDown}
-                        className="text-base font-medium w-full bg-white border border-accent rounded-lg px-2 py-1 outline-none shadow-sm"
+                        className="text-base font-medium w-full bg-canvas border border-accent rounded-lg px-2 py-1 outline-none shadow-sm"
                         onClick={(e) => e.stopPropagation()}
                       />
                       <button
                         onClick={(e) => { e.stopPropagation(); saveRename(); }}
                         title="Save"
-                        className="w-7 h-7 flex items-center justify-center rounded-lg bg-accent text-white hover:bg-accent/90 shrink-0 shadow-sm"
+                        className="w-7 h-7 flex items-center justify-center rounded-lg bg-accent-fill text-white/90 hover:bg-accent/90 shrink-0 shadow-sm"
                       >
                         <Check size={14} />
                       </button>
@@ -180,6 +185,16 @@ export function Sidebar() {
           })
         )}
       </div>
+
+      {pendingDelete && (
+        <ConfirmDialog
+          title="Delete session"
+          message={`"${pendingDelete.title}" and all its messages will be permanently deleted.`}
+          confirmLabel="Delete"
+          onConfirm={confirmDelete}
+          onCancel={() => setPendingDelete(null)}
+        />
+      )}
     </aside>
   );
 }

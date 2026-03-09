@@ -7,6 +7,7 @@ import (
 
 	"github.com/charmbracelet/crush/internal/agent/tools/mcp"
 	appPkg "github.com/charmbracelet/crush/internal/app"
+	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/history"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/permission"
@@ -142,7 +143,7 @@ func subscribeAndBroadcast(ctx context.Context, a *appPkg.App, h *Hub) {
 				if !ok {
 					return
 				}
-				h.Broadcast(EventMCPState, buildMCPSnapshot())
+				h.Broadcast(EventMCPState, buildMCPSnapshot(a.Config()))
 			case <-ctx.Done():
 				return
 			}
@@ -175,16 +176,28 @@ func subscribeAndBroadcast(ctx context.Context, a *appPkg.App, h *Hub) {
 }
 
 // buildMCPSnapshot returns the current state of all MCP servers in wire format.
-func buildMCPSnapshot() MCPSnapshot {
+func buildMCPSnapshot(cfg *config.Config) MCPSnapshot {
 	all := mcp.GetStates()
 	servers := make([]MCPServerInfo, 0, len(all))
 	for name, info := range all {
-		servers = append(servers, MCPServerInfo{
+		srv := MCPServerInfo{
 			Name:      name,
 			Status:    info.State.String(),
 			Disabled:  info.State == mcp.StateDisabled,
 			ToolCount: info.Counts.Tools,
-		})
+			Tools:     mcp.GetServerToolNames(name),
+		}
+		if cfg != nil {
+			if mcpCfg, ok := cfg.MCP[name]; ok {
+				srv.ServerType = string(mcpCfg.Type)
+				srv.Command = mcpCfg.Command
+				srv.Args = mcpCfg.Args
+				srv.URL = mcpCfg.URL
+				srv.Env = mcpCfg.Env
+				srv.Headers = mcpCfg.Headers
+			}
+		}
+		servers = append(servers, srv)
 	}
 	return MCPSnapshot{Servers: servers}
 }

@@ -88,6 +88,8 @@ func handleIncoming(ctx context.Context, a *appPkg.App, c *Client, raw []byte) {
 		go handleAddMCPServer(ctx, a, c, msg)
 	case CmdRemoveMCPServer:
 		go handleRemoveMCPServer(a, c, msg)
+	case CmdUpdateMCPServer:
+		go handleUpdateMCPServer(ctx, a, c, msg)
 	default:
 		slog.Debug("ws: unknown command", "type", msg.Type)
 		c.reply(msg.ID, EventError, nil, "unknown command: "+msg.Type)
@@ -839,6 +841,43 @@ func handleRemoveMCPServer(a *appPkg.App, c *Client, msg WSMessage) {
 		return
 	}
 	if err := mcp.RemoveServer(cfg, p.Name); err != nil {
+		c.reply(msg.ID, EventError, nil, err.Error())
+		return
+	}
+	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
+}
+
+func handleUpdateMCPServer(ctx context.Context, a *appPkg.App, c *Client, msg WSMessage) {
+	var p UpdateMCPServerPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		c.reply(msg.ID, EventError, nil, "invalid payload")
+		return
+	}
+	if p.OldName == "" || p.Name == "" {
+		c.reply(msg.ID, EventError, nil, "oldName and name are required")
+		return
+	}
+	cfg := a.Config()
+	if cfg == nil {
+		c.reply(msg.ID, EventError, nil, "config not available")
+		return
+	}
+	// Remove old entry
+	if err := mcp.RemoveServer(cfg, p.OldName); err != nil {
+		c.reply(msg.ID, EventError, nil, err.Error())
+		return
+	}
+	// Add with new config
+	mcpCfg := config.MCPConfig{
+		Type:    config.MCPType(p.Type),
+		Command: p.Command,
+		Args:    p.Args,
+		URL:     p.URL,
+		Env:     p.Env,
+		Headers: p.Headers,
+		Timeout: p.Timeout,
+	}
+	if err := mcp.AddServer(ctx, cfg, p.Name, mcpCfg); err != nil {
 		c.reply(msg.ID, EventError, nil, err.Error())
 		return
 	}

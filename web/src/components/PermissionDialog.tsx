@@ -46,13 +46,13 @@ function PermissionCard({ perm }: { perm: PermissionRequest }) {
       <div className="flex gap-2 justify-end">
         <button
           onClick={deny}
-          className="bg-base-overlay border border-surface text-red rounded px-3 py-1 text-sm hover:bg-white transition-colors"
+          className="bg-base-overlay border border-surface text-red rounded px-3 py-1 text-sm hover:bg-canvas transition-colors"
         >
           Deny
         </button>
         <button
           onClick={() => grant(false)}
-          className="bg-base-overlay border border-surface text-green rounded px-3 py-1 text-sm hover:bg-white transition-colors"
+          className="bg-base-overlay border border-surface text-green rounded px-3 py-1 text-sm hover:bg-canvas transition-colors"
         >
           Allow
         </button>

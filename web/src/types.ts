@@ -127,6 +127,13 @@ export interface MCPServerInfo {
   status: string;
   disabled: boolean;
   toolCount: number;
+  tools?: string[];
+  serverType?: string;
+  command?: string;
+  args?: string[];
+  url?: string;
+  env?: Record<string, string>;
+  headers?: Record<string, string>;
 }
 
 export interface MCPState {

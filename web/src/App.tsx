@@ -13,7 +13,7 @@ function AuthedApp() {
   const connected = useStore($connected);
 
   return (
-    <div className="flex h-full overflow-hidden bg-white">
+    <div className="flex h-full overflow-hidden bg-canvas">
       {!connected && (
         <div className="fixed top-0 inset-x-0 bg-yellow text-base-subtle text-center py-1 text-sm font-semibold z-50">
           Reconnecting…

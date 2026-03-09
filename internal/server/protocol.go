@@ -128,10 +128,17 @@ type AgentBusyPayload struct {
 
 // MCPServerInfo is the wire format for a single MCP server state.
 type MCPServerInfo struct {
-	Name      string `json:"name"`
-	Status    string `json:"status"`
-	Disabled  bool   `json:"disabled"`
-	ToolCount int    `json:"toolCount"`
+	Name       string            `json:"name"`
+	Status     string            `json:"status"`
+	Disabled   bool              `json:"disabled"`
+	ToolCount  int               `json:"toolCount"`
+	Tools      []string          `json:"tools,omitempty"`
+	ServerType string            `json:"serverType,omitempty"`
+	Command    string            `json:"command,omitempty"`
+	Args       []string          `json:"args,omitempty"`
+	URL        string            `json:"url,omitempty"`
+	Env        map[string]string `json:"env,omitempty"`
+	Headers    map[string]string `json:"headers,omitempty"`
 }
 
 // MCPSnapshot is the full MCP state broadcast to clients.
@@ -148,6 +155,7 @@ const (
 	CmdSetMCPDisabled    = "set_mcp_disabled"
 	CmdAddMCPServer      = "add_mcp_server"
 	CmdRemoveMCPServer   = "remove_mcp_server"
+	CmdUpdateMCPServer   = "update_mcp_server"
 )
 
 type RemoveRecentModelPayload struct {
@@ -275,4 +283,18 @@ type AddMCPServerPayload struct {
 
 type RemoveMCPServerPayload struct {
 	Name string `json:"name"`
+}
+
+// UpdateMCPServerPayload updates an existing MCP server config by removing and re-adding it.
+// OldName identifies the server; other fields are the new config.
+type UpdateMCPServerPayload struct {
+	OldName string            `json:"oldName"`
+	Name    string            `json:"name"`
+	Type    string            `json:"type"`
+	Command string            `json:"command,omitempty"`
+	Args    []string          `json:"args,omitempty"`
+	URL     string            `json:"url,omitempty"`
+	Env     map[string]string `json:"env,omitempty"`
+	Headers map[string]string `json:"headers,omitempty"`
+	Timeout int               `json:"timeout,omitempty"`
 }
