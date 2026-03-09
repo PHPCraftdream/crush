@@ -47,8 +47,8 @@ async function setupSessionAndPermission(
     type: "sessions_list",
     payload: [makeSession({ ID: sessionID, Title: "Perm Session" })],
   });
-  await expect(page.getByText("Perm Session")).toBeVisible({ timeout: 3000 });
-  await page.getByText("Perm Session").click();
+  await expect(page.getByText("Perm Session").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("Perm Session").first().click();
   await sendMockWSMessage(page, { type: "permission_request", payload: perm });
   await expect(page.getByText(perm.ToolName as string)).toBeVisible({ timeout: 2000 });
 }
@@ -154,8 +154,8 @@ test("multiple permission requests show as stacked cards", async ({ page }) => {
     type: "sessions_list",
     payload: [makeSession({ ID: "pm-1", Title: "Multi Perm" })],
   });
-  await expect(page.getByText("Multi Perm")).toBeVisible({ timeout: 3000 });
-  await page.getByText("Multi Perm").click();
+  await expect(page.getByText("Multi Perm").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("Multi Perm").first().click();
 
   await sendMockWSMessage(page, {
     type: "permission_request",
@@ -176,8 +176,8 @@ test("allowing one card dismisses only that card, other remains", async ({ page 
     type: "sessions_list",
     payload: [makeSession({ ID: "pm-2", Title: "Selective Perm" })],
   });
-  await expect(page.getByText("Selective Perm")).toBeVisible({ timeout: 3000 });
-  await page.getByText("Selective Perm").click();
+  await expect(page.getByText("Selective Perm").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("Selective Perm").first().click();
 
   await sendMockWSMessage(page, {
     type: "permission_request",

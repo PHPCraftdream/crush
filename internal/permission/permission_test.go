@@ -8,246 +8,202 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestPermissionService_AllowedCommands(t *testing.T) {
-	tests := []struct {
-		name         string
-		allowedTools []string
-		toolName     string
-		action       string
-		expected     bool
-	}{
-		{
-			name:         "tool in allowlist",
-			allowedTools: []string{"bash", "view"},
-			toolName:     "bash",
-			action:       "execute",
-			expected:     true,
-		},
-		{
-			name:         "tool:action in allowlist",
-			allowedTools: []string{"bash:execute", "edit:create"},
-			toolName:     "bash",
-			action:       "execute",
-			expected:     true,
-		},
-		{
-			name:         "tool not in allowlist",
-			allowedTools: []string{"view", "ls"},
-			toolName:     "bash",
-			action:       "execute",
-			expected:     false,
-		},
-		{
-			name:         "tool:action not in allowlist",
-			allowedTools: []string{"bash:read", "edit:create"},
-			toolName:     "bash",
-			action:       "execute",
-			expected:     false,
-		},
-		{
-			name:         "empty allowlist",
-			allowedTools: []string{},
-			toolName:     "bash",
-			action:       "execute",
-			expected:     false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			service := NewPermissionService("/tmp", false, tt.allowedTools)
-
-			// Create a channel to capture the permission request
-			// Since we're testing the allowlist logic, we need to simulate the request
-			ps := service.(*permissionService)
-
-			// Test the allowlist logic directly
-			commandKey := tt.toolName + ":" + tt.action
-			allowed := false
-			for _, cmd := range ps.allowedTools {
-				if cmd == commandKey || cmd == tt.toolName {
-					allowed = true
-					break
-				}
-			}
-
-			if allowed != tt.expected {
-				t.Errorf("expected %v, got %v for tool %s action %s with allowlist %v",
-					tt.expected, allowed, tt.toolName, tt.action, tt.allowedTools)
-			}
-		})
-	}
+// newTestService creates a permission service with no DB (in-memory only).
+func newTestService(t *testing.T, skip bool, allowedTools []string) Service {
+	t.Helper()
+	return NewPermissionService(t.Context(), "/tmp", skip, allowedTools, nil)
 }
 
 func TestPermissionService_SkipMode(t *testing.T) {
-	service := NewPermissionService("/tmp", true, []string{})
-
-	result, err := service.Request(t.Context(), CreatePermissionRequest{
-		SessionID:   "test-session",
-		ToolName:    "bash",
-		Action:      "execute",
-		Description: "test command",
-		Path:        "/tmp",
+	svc := newTestService(t, true, nil)
+	result, err := svc.Request(t.Context(), CreatePermissionRequest{
+		SessionID: "s1", ToolName: "bash", Action: "run", Path: "/tmp",
 	})
-	if err != nil {
-		t.Errorf("unexpected error: %v", err)
+	require.NoError(t, err)
+	assert.True(t, result)
+}
+
+func TestPermissionService_AllowedTools(t *testing.T) {
+	tests := []struct {
+		allowedTools []string
+		toolName     string
+		action       string
+		want         bool
+	}{
+		{[]string{"bash"}, "bash", "run", true},
+		{[]string{"bash:run"}, "bash", "run", true},
+		{[]string{"bash:read"}, "bash", "run", false},
+		{[]string{"view"}, "bash", "run", false},
+		{nil, "bash", "run", false},
 	}
-	if !result {
-		t.Error("expected permission to be granted in skip mode")
+	for _, tt := range tests {
+		svc := newTestService(t, false, tt.allowedTools)
+		ps := svc.(*permissionService)
+		key := tt.toolName + ":" + tt.action
+		got := false
+		for _, a := range ps.allowedTools {
+			if a == key || a == tt.toolName {
+				got = true
+				break
+			}
+		}
+		assert.Equal(t, tt.want, got, "tool=%s action=%s allowed=%v", tt.toolName, tt.action, tt.allowedTools)
 	}
 }
 
-func TestPermissionService_SequentialProperties(t *testing.T) {
-	t.Run("Sequential permission requests with persistent grants", func(t *testing.T) {
-		service := NewPermissionService("/tmp", false, []string{})
+func TestPermissionService_Grant_OnceOnly(t *testing.T) {
+	svc := newTestService(t, false, nil)
+	events := svc.Subscribe(t.Context())
 
-		req1 := CreatePermissionRequest{
-			SessionID:   "session1",
-			ToolName:    "file_tool",
-			Description: "Read file",
-			Action:      "read",
-			Params:      map[string]string{"file": "test.txt"},
-			Path:        "/tmp/test.txt",
-		}
-
-		var result1 bool
-		var wg sync.WaitGroup
-		wg.Add(1)
-
-		events := service.Subscribe(t.Context())
-
-		go func() {
-			defer wg.Done()
-			result1, _ = service.Request(t.Context(), req1)
-		}()
-
-		var permissionReq PermissionRequest
-		event := <-events
-
-		permissionReq = event.Payload
-		service.GrantPersistent(permissionReq)
-
-		wg.Wait()
-		assert.True(t, result1, "First request should be granted")
-
-		// Second identical request should be automatically approved due to persistent permission
-		req2 := CreatePermissionRequest{
-			SessionID:   "session1",
-			ToolName:    "file_tool",
-			Description: "Read file again",
-			Action:      "read",
-			Params:      map[string]string{"file": "test.txt"},
-			Path:        "/tmp/test.txt",
-		}
-		result2, err := service.Request(t.Context(), req2)
-		require.NoError(t, err)
-		assert.True(t, result2, "Second request should be auto-approved")
-	})
-	t.Run("Sequential requests with temporary grants", func(t *testing.T) {
-		service := NewPermissionService("/tmp", false, []string{})
-
-		req := CreatePermissionRequest{
-			SessionID:   "session2",
-			ToolName:    "file_tool",
-			Description: "Write file",
-			Action:      "write",
-			Params:      map[string]string{"file": "test.txt"},
-			Path:        "/tmp/test.txt",
-		}
-
-		events := service.Subscribe(t.Context())
-		var result1 bool
-		var wg sync.WaitGroup
-
-		wg.Go(func() {
-			result1, _ = service.Request(t.Context(), req)
+	var wg sync.WaitGroup
+	var result1 bool
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		result1, _ = svc.Request(t.Context(), CreatePermissionRequest{
+			SessionID: "s1", ToolName: "bash", Action: "run", Path: "/tmp",
 		})
+	}()
 
-		var permissionReq PermissionRequest
-		event := <-events
-		permissionReq = event.Payload
+	ev := <-events
+	svc.Grant(ev.Payload)
+	wg.Wait()
+	assert.True(t, result1)
 
-		service.Grant(permissionReq)
-		wg.Wait()
-		assert.True(t, result1, "First request should be granted")
-
-		var result2 bool
-
-		wg.Go(func() {
-			result2, _ = service.Request(t.Context(), req)
+	// Next identical request must ask again (no persistence).
+	var result2 bool
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		result2, _ = svc.Request(t.Context(), CreatePermissionRequest{
+			SessionID: "s1", ToolName: "bash", Action: "run", Path: "/tmp",
 		})
+	}()
+	ev = <-events
+	svc.Deny(ev.Payload)
+	wg.Wait()
+	assert.False(t, result2, "temporary grant must not persist")
+}
 
-		event = <-events
-		permissionReq = event.Payload
-		service.Deny(permissionReq)
-		wg.Wait()
-		assert.False(t, result2, "Second request should be denied")
+// TestAlwaysAllow_SameSession verifies that GrantPersistent auto-approves
+// subsequent requests within the same session.
+func TestAlwaysAllow_SameSession(t *testing.T) {
+	svc := newTestService(t, false, nil)
+	events := svc.Subscribe(t.Context())
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		svc.Request(t.Context(), CreatePermissionRequest{ //nolint:errcheck
+			SessionID: "s1", ToolName: "bash", Action: "run", Path: "/tmp",
+		})
+	}()
+
+	ev := <-events
+	// Simulate handler: only sends ID (the real production path).
+	svc.GrantPersistent(PermissionRequest{ID: ev.Payload.ID})
+	wg.Wait()
+
+	// Same session — must be auto-approved without blocking.
+	result, err := svc.Request(t.Context(), CreatePermissionRequest{
+		SessionID: "s1", ToolName: "bash", Action: "run", Path: "/tmp",
 	})
-	t.Run("Concurrent requests with different outcomes", func(t *testing.T) {
-		service := NewPermissionService("/tmp", false, []string{})
+	require.NoError(t, err)
+	assert.True(t, result, "same-session subsequent request must be auto-approved")
+}
 
-		events := service.Subscribe(t.Context())
+// TestAlwaysAllow_CrossSession verifies that GrantPersistent auto-approves
+// requests from a different session (the core "always allow" contract).
+func TestAlwaysAllow_CrossSession(t *testing.T) {
+	svc := newTestService(t, false, nil)
+	events := svc.Subscribe(t.Context())
 
-		var wg sync.WaitGroup
-		results := make([]bool, 3)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		svc.Request(t.Context(), CreatePermissionRequest{ //nolint:errcheck
+			SessionID: "session-A", ToolName: "bash", Action: "run", Path: "/tmp",
+		})
+	}()
 
-		requests := []CreatePermissionRequest{
-			{
-				SessionID:   "concurrent1",
-				ToolName:    "tool1",
-				Action:      "action1",
-				Path:        "/tmp/file1.txt",
-				Description: "First concurrent request",
-			},
-			{
-				SessionID:   "concurrent2",
-				ToolName:    "tool2",
-				Action:      "action2",
-				Path:        "/tmp/file2.txt",
-				Description: "Second concurrent request",
-			},
-			{
-				SessionID:   "concurrent3",
-				ToolName:    "tool3",
-				Action:      "action3",
-				Path:        "/tmp/file3.txt",
-				Description: "Third concurrent request",
-			},
-		}
+	ev := <-events
+	// Handler sends only ID — simulates production WebSocket handler.
+	svc.GrantPersistent(PermissionRequest{ID: ev.Payload.ID})
+	wg.Wait()
 
-		for i, req := range requests {
-			wg.Add(1)
-			go func(index int, request CreatePermissionRequest) {
-				defer wg.Done()
-				result, _ := service.Request(t.Context(), request)
-				results[index] = result
-			}(i, req)
-		}
-
-		for range 3 {
-			event := <-events
-			switch event.Payload.ToolName {
-			case "tool1":
-				service.Grant(event.Payload)
-			case "tool2":
-				service.GrantPersistent(event.Payload)
-			case "tool3":
-				service.Deny(event.Payload)
-			}
-		}
-		wg.Wait()
-		grantedCount := 0
-		for _, result := range results {
-			if result {
-				grantedCount++
-			}
-		}
-
-		assert.Equal(t, 2, grantedCount, "Should have 2 granted and 1 denied")
-		secondReq := requests[1]
-		secondReq.Description = "Repeat of second request"
-		result, err := service.Request(t.Context(), secondReq)
-		require.NoError(t, err)
-		assert.True(t, result, "Repeated request should be auto-approved due to persistent permission")
+	// Different session — must still be auto-approved.
+	result, err := svc.Request(t.Context(), CreatePermissionRequest{
+		SessionID: "session-B", ToolName: "bash", Action: "run", Path: "/tmp",
 	})
+	require.NoError(t, err)
+	assert.True(t, result, "cross-session request must be auto-approved after GrantPersistent")
+}
+
+// TestAlwaysAllow_DifferentTool verifies that persistent grants are scoped
+// to the specific tool+action+path combination.
+func TestAlwaysAllow_DifferentTool(t *testing.T) {
+	svc := newTestService(t, false, nil)
+	events := svc.Subscribe(t.Context())
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		svc.Request(t.Context(), CreatePermissionRequest{ //nolint:errcheck
+			SessionID: "s1", ToolName: "bash", Action: "run", Path: "/tmp",
+		})
+	}()
+
+	ev := <-events
+	svc.GrantPersistent(PermissionRequest{ID: ev.Payload.ID})
+	wg.Wait()
+
+	// Different tool — must NOT be auto-approved.
+	var result2 bool
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		result2, _ = svc.Request(t.Context(), CreatePermissionRequest{
+			SessionID: "s1", ToolName: "write", Action: "run", Path: "/tmp",
+		})
+	}()
+	ev = <-events
+	svc.Deny(ev.Payload)
+	wg.Wait()
+	assert.False(t, result2, "different tool must not be auto-approved")
+}
+
+// TestAlwaysAllow_DifferentPath verifies path scoping.
+func TestAlwaysAllow_DifferentPath(t *testing.T) {
+	svc := newTestService(t, false, nil)
+	events := svc.Subscribe(t.Context())
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		svc.Request(t.Context(), CreatePermissionRequest{ //nolint:errcheck
+			SessionID: "s1", ToolName: "bash", Action: "run", Path: "/tmp/project",
+		})
+	}()
+
+	ev := <-events
+	svc.GrantPersistent(PermissionRequest{ID: ev.Payload.ID})
+	wg.Wait()
+
+	// Different path — must NOT be auto-approved.
+	var result2 bool
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		result2, _ = svc.Request(t.Context(), CreatePermissionRequest{
+			SessionID: "s1", ToolName: "bash", Action: "run", Path: "/other",
+		})
+	}()
+	ev = <-events
+	svc.Deny(ev.Payload)
+	wg.Wait()
+	assert.False(t, result2, "different path must not be auto-approved")
 }

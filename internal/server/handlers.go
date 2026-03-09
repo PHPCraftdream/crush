@@ -59,6 +59,16 @@ func handleIncoming(ctx context.Context, a *appPkg.App, c *Client, raw []byte) {
 		go handleSetProviderKey(a, c, msg)
 	case CmdRemoveProviderKey:
 		go handleRemoveProviderKey(a, c, msg)
+	case CmdDeleteMessage:
+		go handleDeleteMessage(ctx, a, c, msg)
+	case CmdDeleteMessages:
+		go handleDeleteMessages(ctx, a, c, msg)
+	case CmdUpdateMessageContent:
+		go handleUpdateMessageContent(ctx, a, c, msg)
+	case CmdGetSystemPrompt:
+		go handleGetSystemPrompt(ctx, a, c, msg)
+	case CmdSetSystemPrompt:
+		go handleSetSystemPrompt(ctx, a, c, msg)
 	default:
 		slog.Debug("ws: unknown command", "type", msg.Type)
 		c.reply(msg.ID, EventError, nil, "unknown command: "+msg.Type)
@@ -247,6 +257,17 @@ func handleCreateSession(ctx context.Context, a *appPkg.App, c *Client, msg WSMe
 			// Re-fetch to get updated state with models
 			if updated, err := a.Sessions.Get(ctx, sess.ID); err == nil {
 				sess = updated
+			}
+		}
+	}
+
+	// Generate and save the system prompt for the new session.
+	if a.AgentCoordinator != nil {
+		if sp, err := a.AgentCoordinator.BuildSystemPrompt(ctx); err == nil && sp != "" {
+			if err := a.AgentCoordinator.UpdateSessionSystemPrompt(ctx, sess.ID, sp); err == nil {
+				if updated, err := a.Sessions.Get(ctx, sess.ID); err == nil {
+					sess = updated
+				}
 			}
 		}
 	}
@@ -452,6 +473,100 @@ func handleRenameSession(ctx context.Context, a *appPkg.App, c *Client, msg WSMe
 		return
 	}
 	c.hub.Broadcast(EventSessionUpdated, sess)
+}
+
+func handleDeleteMessage(ctx context.Context, a *appPkg.App, c *Client, msg WSMessage) {
+	var p DeleteMessagePayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		c.reply(msg.ID, EventError, nil, "invalid payload")
+		return
+	}
+	// Delete publishes DeletedEvent internally; events.go broadcasts EventMessageDeleted.
+	if err := a.Messages.Delete(ctx, p.MessageID); err != nil {
+		c.reply(msg.ID, EventError, nil, err.Error())
+		return
+	}
+	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
+}
+
+func handleDeleteMessages(ctx context.Context, a *appPkg.App, c *Client, msg WSMessage) {
+	var p DeleteMessagesPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		c.reply(msg.ID, EventError, nil, "invalid payload")
+		return
+	}
+	for _, id := range p.MessageIDs {
+		if err := a.Messages.Delete(ctx, id); err != nil {
+			slog.Warn("ws: failed to delete message", "id", id, "err", err)
+		}
+	}
+	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
+}
+
+func handleUpdateMessageContent(ctx context.Context, a *appPkg.App, c *Client, msg WSMessage) {
+	var p UpdateMessageContentPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		c.reply(msg.ID, EventError, nil, "invalid payload")
+		return
+	}
+	m, err := a.Messages.Get(ctx, p.MessageID)
+	if err != nil {
+		c.reply(msg.ID, EventError, nil, err.Error())
+		return
+	}
+	// Replace text parts with the new content, keep all other parts intact
+	newParts := make([]message.ContentPart, 0, len(m.Parts))
+	replaced := false
+	for _, part := range m.Parts {
+		if _, ok := part.(message.TextContent); ok && !replaced {
+			newParts = append(newParts, message.TextContent{Text: p.Content})
+			replaced = true
+		} else if _, ok := part.(message.TextContent); ok {
+			// skip additional text parts — merged into first
+		} else {
+			newParts = append(newParts, part)
+		}
+	}
+	if !replaced {
+		newParts = append([]message.ContentPart{message.TextContent{Text: p.Content}}, newParts...)
+	}
+	m.Parts = newParts
+	if err := a.Messages.Update(ctx, m); err != nil {
+		c.reply(msg.ID, EventError, nil, err.Error())
+		return
+	}
+	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
+}
+
+func handleGetSystemPrompt(ctx context.Context, a *appPkg.App, c *Client, msg WSMessage) {
+	var p GetSystemPromptPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil || p.SessionID == "" {
+		c.reply(msg.ID, EventError, nil, "invalid payload: sessionID required")
+		return
+	}
+	sess, err := a.Sessions.Get(ctx, p.SessionID)
+	if err != nil {
+		c.reply(msg.ID, EventError, nil, err.Error())
+		return
+	}
+	c.reply(msg.ID, EventSystemPrompt, map[string]string{"sessionID": p.SessionID, "content": sess.SystemPrompt}, "")
+}
+
+func handleSetSystemPrompt(ctx context.Context, a *appPkg.App, c *Client, msg WSMessage) {
+	var p SetSystemPromptPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil || p.SessionID == "" {
+		c.reply(msg.ID, EventError, nil, "invalid payload")
+		return
+	}
+	if a.AgentCoordinator == nil {
+		c.reply(msg.ID, EventError, nil, "agent not configured")
+		return
+	}
+	if err := a.AgentCoordinator.UpdateSessionSystemPrompt(ctx, p.SessionID, p.Content); err != nil {
+		c.reply(msg.ID, EventError, nil, err.Error())
+		return
+	}
+	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
 }
 
 func handleSetTheme(a *appPkg.App, c *Client, msg WSMessage) {

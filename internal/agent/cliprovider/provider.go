@@ -73,10 +73,22 @@ type CLISpec struct {
 	// provider is running in non-yolo mode, tool calls are routed through
 	// crush's permission system instead of the CLI's own permission handling.
 	UseCrushMCP bool
+	// AlwaysStdin forces the prompt to be delivered via stdin instead of a
+	// CLI flag, and disables PTY mode (using a regular pipe instead).
+	// Use this for CLIs that detect TTY on stdout and switch to interactive
+	// mode rather than emitting JSON, even when --output-format stream-json
+	// is specified.
+	AlwaysStdin bool
+	// QwenMCPIntegration starts crush's MCP server and registers it in
+	// ~/.qwen/settings.json under a stable per-project ID stored in
+	// <workingDir>/.crush/qwen-mcp-id. The entry is removed when the CLI
+	// process exits. The MCP server runs without Bearer-token auth because
+	// qwen's settings format does not support custom HTTP headers.
+	QwenMCPIntegration bool
 }
 
-// streamEvent is a generic JSON envelope for both Claude and Gemini
-// stream-json output. Only the fields relevant to text extraction are parsed.
+// streamEvent is the JSON envelope for Claude CLI stream-json output.
+// Only the fields relevant to text extraction are parsed.
 type streamEvent struct {
 	Type string `json:"type"`
 	// stream_event: raw Anthropic API SSE event forwarded by claude CLI (--verbose).
@@ -85,8 +97,8 @@ type streamEvent struct {
 		Type  string `json:"type"`
 		Index int    `json:"index"`
 		Delta struct {
-			Type     string `json:"type"`    // "text_delta" or "thinking_delta"
-			Text     string `json:"text"`    // text_delta content
+			Type     string `json:"type"`     // "text_delta" or "thinking_delta"
+			Text     string `json:"text"`     // text_delta content
 			Thinking string `json:"thinking"` // thinking_delta content
 		} `json:"delta"`
 		ContentBlock struct {
@@ -100,15 +112,6 @@ type streamEvent struct {
 			Text string `json:"text"`
 		} `json:"content"`
 	} `json:"message"`
-	// Gemini candidates
-	Candidates []struct {
-		Content struct {
-			Parts []struct {
-				Text string `json:"text"`
-			} `json:"parts"`
-		} `json:"content"`
-	} `json:"candidates"`
-	Text  string `json:"text"`
 	// Claude CLI result event usage (snake_case).
 	Usage struct {
 		InputTokens              int64 `json:"input_tokens"`
@@ -116,12 +119,27 @@ type streamEvent struct {
 		CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
 		CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
 	} `json:"usage"`
-	// Gemini CLI final chunk usage (camelCase).
-	UsageMetadata struct {
-		PromptTokenCount     int64 `json:"promptTokenCount"`
-		CandidatesTokenCount int64 `json:"candidatesTokenCount"`
-		TotalTokenCount      int64 `json:"totalTokenCount"`
-	} `json:"usageMetadata"`
+}
+
+// geminiCLIEvent is the JSONL envelope emitted by `gemini --output-format stream-json`.
+//
+// Actual format (verified against @google/gemini-cli v0.32+):
+//
+//	{"type":"init","session_id":"...","model":"..."}
+//	{"type":"message","role":"user","content":"..."}
+//	{"type":"message","role":"assistant","content":"<delta text>","delta":true}
+//	{"type":"result","status":"success","stats":{"total_tokens":N,"input_tokens":N,"output_tokens":N}}
+type geminiCLIEvent struct {
+	Type    string `json:"type"`
+	Role    string `json:"role"`
+	Content string `json:"content"`
+	Delta   bool   `json:"delta"`
+	Status  string `json:"status"`
+	Stats   struct {
+		TotalTokens  int64 `json:"total_tokens"`
+		InputTokens  int64 `json:"input_tokens"`
+		OutputTokens int64 `json:"output_tokens"`
+	} `json:"stats"`
 }
 
 // claudePartParser returns a stateful parser for Claude CLI stream-json output.
@@ -168,23 +186,23 @@ func claudePartParser() func([]byte) (fantasy.StreamPart, bool) {
 }
 
 // geminiPartParser returns a parser for Gemini CLI stream-json output.
-// Gemini emits per-chunk events; each contains only the new text delta.
+//
+// Gemini CLI (--output-format stream-json) emits JSONL events where assistant
+// text arrives as:
+//
+//	{"type":"message","role":"assistant","content":"<delta>","delta":true}
+//
+// Each event carries an incremental text delta.  Non-assistant events
+// (init, user message echo, result) are silently skipped.
 func geminiPartParser() func([]byte) (fantasy.StreamPart, bool) {
 	const id = "0"
 	return func(line []byte) (fantasy.StreamPart, bool) {
-		var ev streamEvent
+		var ev geminiCLIEvent
 		if json.Unmarshal(line, &ev) != nil {
 			return fantasy.StreamPart{}, false
 		}
-		for _, c := range ev.Candidates {
-			for _, p := range c.Content.Parts {
-				if p.Text != "" {
-					return fantasy.StreamPart{Type: fantasy.StreamPartTypeTextDelta, ID: id, Delta: p.Text}, true
-				}
-			}
-		}
-		if ev.Text != "" {
-			return fantasy.StreamPart{Type: fantasy.StreamPartTypeTextDelta, ID: id, Delta: ev.Text}, true
+		if ev.Type == "message" && ev.Role == "assistant" && ev.Content != "" {
+			return fantasy.StreamPart{Type: fantasy.StreamPartTypeTextDelta, ID: id, Delta: ev.Content}, true
 		}
 		return fantasy.StreamPart{}, false
 	}
@@ -215,20 +233,23 @@ func claudeParseUsageLine(line []byte) (fantasy.Usage, bool) {
 	}, true
 }
 
-// geminiParseUsageLine extracts token usage from a Gemini CLI stream-json
-// output. Gemini includes usageMetadata in the final chunk of the stream.
+// geminiParseUsageLine extracts token usage from the Gemini CLI result event.
+//
+// The Gemini CLI emits a final event:
+//
+//	{"type":"result","status":"success","stats":{"total_tokens":N,"input_tokens":N,"output_tokens":N}}
 func geminiParseUsageLine(line []byte) (fantasy.Usage, bool) {
-	var ev streamEvent
+	var ev geminiCLIEvent
 	if json.Unmarshal(line, &ev) != nil {
 		return fantasy.Usage{}, false
 	}
-	if ev.UsageMetadata.TotalTokenCount == 0 {
+	if ev.Type != "result" || ev.Stats.TotalTokens == 0 {
 		return fantasy.Usage{}, false
 	}
 	return fantasy.Usage{
-		InputTokens:  ev.UsageMetadata.PromptTokenCount,
-		OutputTokens: ev.UsageMetadata.CandidatesTokenCount,
-		TotalTokens:  ev.UsageMetadata.TotalTokenCount,
+		InputTokens:  ev.Stats.InputTokens,
+		OutputTokens: ev.Stats.OutputTokens,
+		TotalTokens:  ev.Stats.TotalTokens,
 	}, true
 }
 
@@ -245,6 +266,86 @@ func claudeArgs(model string, extra ...string) func(bool) []string {
 		args = append(args, extra...)
 		if yolo {
 			args = append(args, "--dangerously-skip-permissions")
+		}
+		return args
+	}
+}
+
+// codexEvent is the top-level JSONL envelope emitted by `codex exec --json`.
+type codexEvent struct {
+	Type string `json:"type"`
+	// item.started / item.completed
+	Item struct {
+		Type            string `json:"type"`   // "agent_message" | "command_execution" | "reasoning" | ...
+		Text            string `json:"text"`   // agent_message: full response text
+		Command         string `json:"command"` // command_execution: command string
+		AggregatedOutput string `json:"aggregated_output"` // command_execution: combined stdout+stderr
+	} `json:"item"`
+	// turn.completed usage
+	Usage struct {
+		InputTokens       int64 `json:"input_tokens"`
+		CachedInputTokens int64 `json:"cached_input_tokens"`
+		OutputTokens      int64 `json:"output_tokens"`
+	} `json:"usage"`
+}
+
+// codexPartParser returns a stateful parser for `codex exec --json` JSONL output.
+// Text is NOT streamed token-by-token; the full response arrives in a single
+// item.completed event with type "agent_message". We emit it as one TextDelta.
+func codexPartParser() func([]byte) (fantasy.StreamPart, bool) {
+	const id = "0"
+	return func(line []byte) (fantasy.StreamPart, bool) {
+		var ev codexEvent
+		if json.Unmarshal(line, &ev) != nil {
+			return fantasy.StreamPart{}, false
+		}
+		if ev.Type == "item.completed" && ev.Item.Type == "agent_message" && ev.Item.Text != "" {
+			return fantasy.StreamPart{Type: fantasy.StreamPartTypeTextDelta, ID: id, Delta: ev.Item.Text}, true
+		}
+		return fantasy.StreamPart{}, false
+	}
+}
+
+// codexParseUsageLine extracts token usage from a Codex `turn.completed` event.
+func codexParseUsageLine(line []byte) (fantasy.Usage, bool) {
+	var ev codexEvent
+	if json.Unmarshal(line, &ev) != nil {
+		return fantasy.Usage{}, false
+	}
+	if ev.Type != "turn.completed" {
+		return fantasy.Usage{}, false
+	}
+	inputTotal := ev.Usage.InputTokens + ev.Usage.CachedInputTokens
+	if inputTotal == 0 && ev.Usage.OutputTokens == 0 {
+		return fantasy.Usage{}, false
+	}
+	return fantasy.Usage{
+		InputTokens:  inputTotal,
+		OutputTokens: ev.Usage.OutputTokens,
+		TotalTokens:  inputTotal + ev.Usage.OutputTokens,
+	}, true
+}
+
+// codexArgs returns a BuildArgs func for a codex CLI model.
+func codexArgs(model string) func(bool) []string {
+	return func(yolo bool) []string {
+		args := []string{"exec", "--json", "-m", model}
+		if yolo {
+			args = append(args, "--dangerously-bypass-approvals-and-sandbox")
+		}
+		return args
+	}
+}
+
+// qwenArgs returns a BuildArgs func for the qwen CLI model.
+func qwenArgs() func(bool) []string {
+	return func(yolo bool) []string {
+		args := []string{
+			"--output-format", "stream-json",
+			"--include-partial-messages",
+		}
+		if yolo {
+			args = append(args, "--approval-mode", "yolo")
 		}
 		return args
 	}
@@ -281,7 +382,7 @@ var All = []CLISpec{
 	{
 		ModelID:        "cli-claude-opus",
 		ModelName:      "Claude Opus (CLI)",
-		ContextWindow:  1_000_000,
+		ContextWindow:  200_000,
 		Binary:         "claude",
 		PromptFlag:     "-p",
 		BuildArgs:      claudeArgs("opus"),
@@ -303,7 +404,7 @@ var All = []CLISpec{
 	{
 		ModelID:        "cli-claude-opus-thinking",
 		ModelName:      "Claude Opus Thinking (CLI)",
-		ContextWindow:  1_000_000,
+		ContextWindow:  200_000,
 		Binary:         "claude",
 		PromptFlag:     "-p",
 		BuildArgs:      claudeArgs("opus", "--effort", "high"),
@@ -316,20 +417,91 @@ var All = []CLISpec{
 		ModelName:      "Gemini 3 Flash (CLI)",
 		ContextWindow:  1_000_000,
 		Binary:         "gemini",
-		PromptFlag:     "-p",
 		BuildArgs:      geminiArgs("gemini-3-flash"),
 		NewPartParser:  geminiPartParser,
 		ParseUsageLine: geminiParseUsageLine,
+		AlwaysStdin:    true,
 	},
 	{
 		ModelID:        "cli-gemini-pro",
 		ModelName:      "Gemini 3.1 Pro (CLI)",
 		ContextWindow:  1_000_000,
 		Binary:         "gemini",
-		PromptFlag:     "-p",
 		BuildArgs:      geminiArgs("gemini-3.1-pro-preview"),
 		NewPartParser:  geminiPartParser,
 		ParseUsageLine: geminiParseUsageLine,
+		AlwaysStdin:    true,
+	},
+	{
+		ModelID:            "cli-qwen",
+		ModelName:          "Qwen 3.5 Plus (CLI)",
+		ContextWindow:      1_000_000,
+		Binary:             "qwen",
+		BuildArgs:          qwenArgs(),
+		NewPartParser:      claudePartParser,
+		ParseUsageLine:     claudeParseUsageLine,
+		AlwaysStdin:        true,
+		QwenMCPIntegration: true,
+	},
+	{
+		ModelID:        "cli-codex",
+		ModelName:      "Codex (gpt-5.3-codex, CLI)",
+		ContextWindow:  400_000,
+		Binary:         "codex",
+		BuildArgs:      codexArgs("gpt-5.3-codex"),
+		NewPartParser:  codexPartParser,
+		ParseUsageLine: codexParseUsageLine,
+		AlwaysStdin:    true,
+	},
+	{
+		ModelID:        "cli-codex-gpt-5-4",
+		ModelName:      "Codex (gpt-5.4, CLI)",
+		ContextWindow:  272_000,
+		Binary:         "codex",
+		BuildArgs:      codexArgs("gpt-5.4"),
+		NewPartParser:  codexPartParser,
+		ParseUsageLine: codexParseUsageLine,
+		AlwaysStdin:    true,
+	},
+	{
+		ModelID:        "cli-codex-gpt-5-2",
+		ModelName:      "Codex (gpt-5.2-codex, CLI)",
+		ContextWindow:  400_000,
+		Binary:         "codex",
+		BuildArgs:      codexArgs("gpt-5.2-codex"),
+		NewPartParser:  codexPartParser,
+		ParseUsageLine: codexParseUsageLine,
+		AlwaysStdin:    true,
+	},
+	{
+		ModelID:        "cli-codex-max",
+		ModelName:      "Codex Max (gpt-5.1-codex-max, CLI)",
+		ContextWindow:  400_000,
+		Binary:         "codex",
+		BuildArgs:      codexArgs("gpt-5.1-codex-max"),
+		NewPartParser:  codexPartParser,
+		ParseUsageLine: codexParseUsageLine,
+		AlwaysStdin:    true,
+	},
+	{
+		ModelID:        "cli-codex-gpt-5-2-base",
+		ModelName:      "Codex (gpt-5.2, CLI)",
+		ContextWindow:  400_000,
+		Binary:         "codex",
+		BuildArgs:      codexArgs("gpt-5.2"),
+		NewPartParser:  codexPartParser,
+		ParseUsageLine: codexParseUsageLine,
+		AlwaysStdin:    true,
+	},
+	{
+		ModelID:        "cli-codex-mini",
+		ModelName:      "Codex Mini (gpt-5.1-codex-mini, CLI)",
+		ContextWindow:  400_000,
+		Binary:         "codex",
+		BuildArgs:      codexArgs("gpt-5.1-codex-mini"),
+		NewPartParser:  codexPartParser,
+		ParseUsageLine: codexParseUsageLine,
+		AlwaysStdin:    true,
 	},
 }
 
@@ -436,10 +608,11 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 	// (before the closure runs), deleting the config file before claude CLI
 	// can read it.
 	var mcpSrv *crushMCPServer
-	var mcpTmpCfg string // path to temp MCP config file; "" if not used
+	var mcpTmpCfg string  // path to temp MCP config file (claude-style); "" if not used
+	var qwenMCPName string // registered name in ~/.qwen/settings.json; "" if not used
 	if m.spec.UseCrushMCP && !yolo && m.perms != nil {
 		var err error
-		mcpSrv, err = newCrushMCPServer(ctx, m.perms, m.workingDir)
+		mcpSrv, err = newCrushMCPServer(ctx, m.perms, m.workingDir, "")
 		if err != nil {
 			slog.Warn("cliprovider: failed to start MCP server, falling back to CLI permissions", "err", err)
 		} else {
@@ -485,8 +658,50 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 		)
 	}
 
-	useStdin := len(prompt) > maxPromptArgLen
-	if !useStdin {
+	// Qwen MCP integration: register crush's MCP server in ~/.qwen/settings.json
+	// using a stable per-project ID stored in <workingDir>/.crush/qwen-mcp-id.
+	// Qwen doesn't support --mcp-config, so we write the settings directly.
+	// No Bearer token is used (qwen's format doesn't support custom headers);
+	// the server is localhost-only with a random port.
+	if m.spec.QwenMCPIntegration && m.perms != nil {
+		id, idErr := qwenMCPID(m.workingDir)
+		if idErr != nil {
+			slog.Warn("cliprovider: failed to get qwen MCP ID", "err", idErr)
+		} else {
+			// Use the stable project ID as the token — it's unique per project and
+			// already stored in .crush/qwen-mcp-id, so no separate secret is needed.
+			var err error
+			mcpSrv, err = newCrushMCPServer(ctx, m.perms, m.workingDir, id)
+			if err != nil {
+				slog.Warn("cliprovider: failed to start qwen MCP server", "err", err)
+			} else {
+				// Remove stale entry first, then register with current URL+token.
+				deregisterQwenMCP(id)
+				if regErr := registerQwenMCP(id, mcpSrv.mcpURL()); regErr != nil {
+					slog.Warn("cliprovider: failed to register qwen MCP server", "err", regErr)
+					mcpSrv.stop()
+					mcpSrv = nil
+				} else {
+					qwenMCPName = id
+					args = append(args, "--allowed-mcp-server-names", id)
+					// Restrict qwen to only crush MCP tools so its built-in
+					// tools (read_file, glob, etc.) cannot bypass crush's
+					// permission system.
+					args = append(args,
+						"--allowed-tools",
+						"mcp__"+id+"__Bash",
+						"mcp__"+id+"__Read",
+						"mcp__"+id+"__Write",
+						"mcp__"+id+"__Glob",
+						"mcp__"+id+"__Grep",
+					)
+				}
+			}
+		}
+	}
+
+	useStdin := m.spec.AlwaysStdin || len(prompt) > maxPromptArgLen
+	if !useStdin && m.spec.PromptFlag != "" {
 		args = append(args, m.spec.PromptFlag, prompt)
 	}
 
@@ -602,6 +817,9 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 		}
 		if mcpTmpCfg != "" {
 			defer os.Remove(mcpTmpCfg)
+		}
+		if qwenMCPName != "" {
+			defer deregisterQwenMCP(qwenMCPName)
 		}
 
 		const textID = "0"

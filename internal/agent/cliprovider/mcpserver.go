@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -33,7 +34,9 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// crushMCPServer is an in-process MCP HTTP server with Bearer-token auth.
+// crushMCPServer is an in-process MCP HTTP server with token auth.
+// The token is accepted via Authorization: Bearer header (Claude CLI)
+// or as a ?token= query parameter (Qwen CLI, which cannot set headers).
 type crushMCPServer struct {
 	addr    string // "127.0.0.1:PORT"
 	token   string
@@ -66,16 +69,26 @@ func (s *crushMCPServer) mcpConfigJSON() ([]byte, error) {
 	return json.MarshalIndent(cfg, "", "  ")
 }
 
+// mcpURL returns the URL with the token embedded as a query parameter,
+// for clients (e.g. qwen CLI) that cannot set custom HTTP headers.
+func (s *crushMCPServer) mcpURL() string {
+	return "http://" + s.addr + "/mcp?token=" + s.token
+}
+
 // newCrushMCPServer starts a local MCP HTTP server and returns it.
 // The server exposes crush's core tools; each tool call goes through
 // perms.Request before execution so crush's permission dialog appears.
-func newCrushMCPServer(ctx context.Context, perms permission.Service, workingDir string) (*crushMCPServer, error) {
-	// 32-byte random token → 64-char hex string.
-	tokenBytes := make([]byte, 32)
-	if _, err := rand.Read(tokenBytes); err != nil {
-		return nil, fmt.Errorf("cliprovider: generate MCP token: %w", err)
+// The token is accepted via Authorization: Bearer header OR ?token= query param.
+// If token is empty a cryptographically random one is generated.
+func newCrushMCPServer(ctx context.Context, perms permission.Service, workingDir string, token string) (*crushMCPServer, error) {
+	if token == "" {
+		// 32-byte random token → 64-char hex string.
+		tokenBytes := make([]byte, 32)
+		if _, err := rand.Read(tokenBytes); err != nil {
+			return nil, fmt.Errorf("cliprovider: generate MCP token: %w", err)
+		}
+		token = hex.EncodeToString(tokenBytes)
 	}
-	token := hex.EncodeToString(tokenBytes)
 
 	srv := mcp.NewServer(&mcp.Implementation{
 		Name:    "crush",
@@ -94,10 +107,10 @@ func newCrushMCPServer(ctx context.Context, perms permission.Service, workingDir
 		},
 	)
 
-	// Bearer-token auth middleware.
+	// Auth middleware: accept token via Authorization header or ?token= query param.
 	bearer := "Bearer " + token
-	authedHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") != bearer {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != bearer && r.URL.Query().Get("token") != token {
 			slog.Debug("cliprovider: MCP request rejected — bad token",
 				"remote", r.RemoteAddr, "path", r.URL.Path)
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
@@ -112,7 +125,7 @@ func newCrushMCPServer(ctx context.Context, perms permission.Service, workingDir
 		return nil, fmt.Errorf("cliprovider: start MCP listener: %w", err)
 	}
 
-	httpSrv := &http.Server{Handler: http.StripPrefix("/mcp", authedHandler)}
+	httpSrv := &http.Server{Handler: http.StripPrefix("/mcp", handler)}
 	go func() {
 		if err := httpSrv.Serve(ln); err != nil && err != http.ErrServerClosed {
 			slog.Debug("cliprovider: MCP server stopped", "err", err)
@@ -406,13 +419,125 @@ func resolvePath(path, workingDir string) string {
 }
 
 func runShell(ctx context.Context, command, dir string) (string, error) {
-	cmd := exec.CommandContext(ctx, "bash", "-c", command)
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		cmd = exec.CommandContext(ctx, "cmd.exe", "/c", command)
+	} else {
+		cmd = exec.CommandContext(ctx, "bash", "-c", command)
+	}
 	cmd.Dir = dir
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
 	err := cmd.Run()
 	return buf.String(), err
+}
+
+// ── qwen MCP registration ─────────────────────────────────────────────────────
+
+// qwenMCPID returns a stable MCP server name for the given workingDir.
+// If <workingDir>/.crush/ already exists, the ID is stored there in qwen-mcp-id.
+// Otherwise a temp file keyed by workingDir is used so we never create .crush/
+// in directories that don't already have a crush project.
+func qwenMCPID(workingDir string) (string, error) {
+	var idFile string
+	crushDir := filepath.Join(workingDir, ".crush")
+	if info, err := os.Stat(crushDir); err == nil && info.IsDir() {
+		// .crush/ exists — this is a crush project directory, store ID there.
+		idFile = filepath.Join(crushDir, "qwen-mcp-id")
+	} else {
+		// No .crush/ here — use a temp file keyed by a hash of the path so
+		// the ID remains stable across crush restarts without polluting the dir.
+		h := fmt.Sprintf("%x", []byte(workingDir))
+		if len(h) > 16 {
+			h = h[:16]
+		}
+		idFile = filepath.Join(os.TempDir(), "crush-qwen-mcp-"+h)
+	}
+	if data, err := os.ReadFile(idFile); err == nil {
+		if id := strings.TrimSpace(string(data)); id != "" {
+			return id, nil
+		}
+	}
+	// Generate a short stable ID for this project.
+	id := "crush-" + uuid.New().String()[:8]
+	if err := os.WriteFile(idFile, []byte(id), 0o644); err != nil {
+		return "", fmt.Errorf("cliprovider: write qwen-mcp-id: %w", err)
+	}
+	slog.Info("cliprovider: created qwen MCP ID", "id", id, "file", idFile)
+	return id, nil
+}
+
+// qwenSettingsPath returns the path to ~/.qwen/settings.json.
+func qwenSettingsPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".qwen", "settings.json"), nil
+}
+
+// registerQwenMCP adds the crush MCP server to ~/.qwen/settings.json.
+// It removes any stale entry with the same name first, then writes the new URL.
+// The token is embedded in the URL as a query parameter (?token=...) since
+// qwen's settings format does not support custom HTTP headers.
+func registerQwenMCP(serverName, url string) error {
+	path, err := qwenSettingsPath()
+	if err != nil {
+		return err
+	}
+	var settings map[string]any
+	if data, rerr := os.ReadFile(path); rerr == nil {
+		_ = json.Unmarshal(data, &settings)
+	}
+	if settings == nil {
+		settings = map[string]any{}
+	}
+	mcpServers, _ := settings["mcpServers"].(map[string]any)
+	if mcpServers == nil {
+		mcpServers = map[string]any{}
+	}
+	mcpServers[serverName] = map[string]any{
+		"httpUrl": url,
+	}
+	settings["mcpServers"] = mcpServers
+	data, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return err
+	}
+	slog.Info("cliprovider: registered qwen MCP server", "name", serverName, "url", url)
+	return os.WriteFile(path, data, 0o644)
+}
+
+// deregisterQwenMCP removes the crush MCP entry from ~/.qwen/settings.json.
+func deregisterQwenMCP(serverName string) {
+	path, err := qwenSettingsPath()
+	if err != nil {
+		return
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var settings map[string]any
+	if json.Unmarshal(data, &settings) != nil {
+		return
+	}
+	mcpServers, _ := settings["mcpServers"].(map[string]any)
+	if mcpServers == nil {
+		return
+	}
+	delete(mcpServers, serverName)
+	if len(mcpServers) == 0 {
+		delete(settings, "mcpServers")
+	} else {
+		settings["mcpServers"] = mcpServers
+	}
+	if data, err = json.MarshalIndent(settings, "", "  "); err != nil {
+		return
+	}
+	_ = os.WriteFile(path, data, 0o644)
+	slog.Info("cliprovider: deregistered qwen MCP server", "name", serverName)
 }
 
 func sliceLines(content string, start, end int) string {

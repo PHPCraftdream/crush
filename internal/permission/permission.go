@@ -77,6 +77,13 @@ type permissionService struct {
 }
 
 func (s *permissionService) GrantPersistent(permission PermissionRequest) {
+	// The handler may send only the ID; fill in the rest from activeRequest.
+	s.activeRequestMu.Lock()
+	if s.activeRequest != nil && s.activeRequest.ID == permission.ID {
+		permission = *s.activeRequest
+	}
+	s.activeRequestMu.Unlock()
+
 	s.notificationBroker.Publish(pubsub.CreatedEvent, PermissionNotification{
 		ToolCallID: permission.ToolCallID,
 		Granted:    true,
@@ -86,15 +93,19 @@ func (s *permissionService) GrantPersistent(permission PermissionRequest) {
 		respCh <- true
 	}
 
+	// Persistent permissions match any session (SessionID="").
+	persistent := permission
+	persistent.SessionID = ""
 	s.sessionPermissionsMu.Lock()
-	s.sessionPermissions = append(s.sessionPermissions, permission)
+	s.sessionPermissions = append(s.sessionPermissions, persistent)
 	s.sessionPermissionsMu.Unlock()
 
 	// Persist to DB so it survives restarts.
-	if s.q != nil {
+	// Guard: only persist if we have a valid permission (activeRequest matched).
+	if s.q != nil && permission.ToolName != "" && permission.Action != "" {
 		if err := s.q.CreateSessionPermission(context.Background(), db.CreateSessionPermissionParams{
 			ID:        uuid.New().String(),
-			SessionID: permission.SessionID,
+			SessionID: "",
 			ToolName:  permission.ToolName,
 			Action:    permission.Action,
 			Path:      permission.Path,
@@ -150,10 +161,6 @@ func (s *permissionService) Request(ctx context.Context, opts CreatePermissionRe
 		return true, nil
 	}
 
-	// tell the UI that a permission was requested
-	s.notificationBroker.Publish(pubsub.CreatedEvent, PermissionNotification{
-		ToolCallID: opts.ToolCallID,
-	})
 	s.requestMu.Lock()
 	defer s.requestMu.Unlock()
 
@@ -200,8 +207,29 @@ func (s *permissionService) Request(ctx context.Context, opts CreatePermissionRe
 	}
 
 	s.sessionPermissionsMu.RLock()
+	slog.Debug("permission: checking persistent grants",
+		"count", len(s.sessionPermissions),
+		"req_tool", permission.ToolName,
+		"req_action", permission.Action,
+		"req_session", permission.SessionID,
+		"req_path", permission.Path,
+	)
 	for _, p := range s.sessionPermissions {
-		if p.ToolName == permission.ToolName && p.Action == permission.Action && p.SessionID == permission.SessionID && p.Path == permission.Path {
+		// Skip empty/corrupt entries loaded from DB.
+		if p.ToolName == "" || p.Action == "" {
+			continue
+		}
+		sessionMatch := p.SessionID == "" || p.SessionID == permission.SessionID
+		toolMatch := p.ToolName == permission.ToolName
+		actionMatch := p.Action == permission.Action
+		pathMatch := p.Path == permission.Path
+		slog.Debug("permission: comparing grant",
+			"grant_tool", p.ToolName, "tool_match", toolMatch,
+			"grant_action", p.Action, "action_match", actionMatch,
+			"grant_session", p.SessionID, "session_match", sessionMatch,
+			"grant_path", p.Path, "path_match", pathMatch,
+		)
+		if toolMatch && actionMatch && sessionMatch && pathMatch {
 			s.sessionPermissionsMu.RUnlock()
 			s.notificationBroker.Publish(pubsub.CreatedEvent, PermissionNotification{
 				ToolCallID: opts.ToolCallID,
@@ -225,6 +253,15 @@ func (s *permissionService) Request(ctx context.Context, opts CreatePermissionRe
 
 	select {
 	case <-ctx.Done():
+		s.notificationBroker.Publish(pubsub.CreatedEvent, PermissionNotification{
+			ToolCallID: permission.ToolCallID,
+			Denied:     true,
+		})
+		s.activeRequestMu.Lock()
+		if s.activeRequest != nil && s.activeRequest.ID == permission.ID {
+			s.activeRequest = nil
+		}
+		s.activeRequestMu.Unlock()
 		return false, ctx.Err()
 	case granted := <-respCh:
 		return granted, nil
@@ -267,11 +304,12 @@ func NewPermissionService(ctx context.Context, workingDir string, skip bool, all
 		if rows, err := q.ListAllSessionPermissions(ctx); err == nil {
 			for _, r := range rows {
 				svc.sessionPermissions = append(svc.sessionPermissions, PermissionRequest{
-					ID:        r.ID,
-					SessionID: r.SessionID,
-					ToolName:  r.ToolName,
-					Action:    r.Action,
-					Path:      r.Path,
+					ID:       r.ID,
+					// SessionID is intentionally empty: persistent permissions
+					// match requests from any session.
+					ToolName: r.ToolName,
+					Action:   r.Action,
+					Path:     r.Path,
 				})
 			}
 		} else {

@@ -183,5 +183,30 @@ export function removeProviderKey(providerID: string) {
   ws.send("remove_provider_key", { providerID });
 }
 
+export function deleteMessage(messageID: string) {
+  ws.send("delete_message", { messageID });
+}
+
+export function deleteMessages(messageIDs: string[]) {
+  ws.send("delete_messages", { messageIDs });
+}
+
+export function updateMessageContent(messageID: string, content: string) {
+  ws.send("update_message_content", { messageID, content });
+}
+
+// ── Batch selection ───────────────────────────────────────────────────────────
+export const $selectedMessageIDs = atom<Set<string>>(new Set());
+
+export function toggleMessageSelection(id: string) {
+  const s = new Set($selectedMessageIDs.get());
+  if (s.has(id)) s.delete(id); else s.add(id);
+  $selectedMessageIDs.set(s);
+}
+
+export function clearSelection() {
+  $selectedMessageIDs.set(new Set());
+}
+
 // Last agent error to display in chat
 export const $agentError = atom<string | null>(null);

@@ -53,4 +53,5 @@ type Session struct {
 	LargeModelID        sql.NullString `json:"large_model_id"`
 	SmallModelProvider  sql.NullString `json:"small_model_provider"`
 	SmallModelID        sql.NullString `json:"small_model_id"`
+	SystemPrompt        string         `json:"system_prompt"`
 }

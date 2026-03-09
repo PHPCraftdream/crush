@@ -17,7 +17,7 @@ test("session list appears after connect", async ({ page }) => {
     type: "sessions_list",
     payload: [makeSession({ ID: "s1", Title: "Alpha Session" })],
   });
-  await expect(page.getByText("Alpha Session")).toBeVisible({ timeout: 3000 });
+  await expect(page.getByText("Alpha Session").first()).toBeVisible({ timeout: 3000 });
 });
 
 test("shows message count in sidebar", async ({ page }) => {
@@ -100,7 +100,7 @@ test("session_updated event updates session title", async ({ page }) => {
     type: "session_updated",
     payload: makeSession({ ID: "upd-1", Title: "New Title" }),
   });
-  await expect(page.getByText("New Title")).toBeVisible({ timeout: 2000 });
+  await expect(page.getByText("New Title").first()).toBeVisible({ timeout: 2000 });
   await expect(page.getByText("Old Title")).not.toBeVisible();
 });
 
@@ -130,8 +130,8 @@ test("selecting a session shows empty chat placeholder", async ({ page }) => {
     type: "sessions_list",
     payload: [makeSession({ ID: "sel-1", Title: "Empty Session" })],
   });
-  await expect(page.getByText("Empty Session")).toBeVisible({ timeout: 3000 });
-  await page.getByText("Empty Session").click();
+  await expect(page.getByText("Empty Session").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("Empty Session").first().click();
   await expect(page.getByText("No messages yet")).toBeVisible({ timeout: 2000 });
 });
 
@@ -141,8 +141,8 @@ test("selecting a session shows its messages from messages_list", async ({ page 
     type: "sessions_list",
     payload: [makeSession({ ID: "sel-2", Title: "Has Messages" })],
   });
-  await expect(page.getByText("Has Messages")).toBeVisible({ timeout: 3000 });
-  await page.getByText("Has Messages").click();
+  await expect(page.getByText("Has Messages").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("Has Messages").first().click();
   await sendMockWSMessage(page, {
     type: "messages_list",
     payload: [
@@ -203,8 +203,8 @@ test("selecting a session updates the header title", async ({ page }) => {
     type: "sessions_list",
     payload: [makeSession({ ID: "hdr-1", Title: "Header Test Session" })],
   });
-  await expect(page.getByText("Header Test Session")).toBeVisible({ timeout: 3000 });
-  await page.getByText("Header Test Session").click();
+  await expect(page.getByText("Header Test Session").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("Header Test Session").first().click();
   await expect(
     page.locator("header h1").getByText("Header Test Session")
   ).toBeVisible({ timeout: 2000 });
@@ -259,7 +259,7 @@ test("delete button sends delete_session command", async ({ page }) => {
     type: "sessions_list",
     payload: [makeSession({ ID: "del-x", Title: "To Delete" })],
   });
-  await expect(page.getByText("To Delete")).toBeVisible({ timeout: 3000 });
+  await expect(page.getByText("To Delete").first()).toBeVisible({ timeout: 3000 });
   // Hover the session row to reveal delete button, then scope click to that row
   // The text lives two divs inside the session row (.group div)
   const row = page.locator("aside").getByText("To Delete").locator("../..");
@@ -295,7 +295,7 @@ test("clicking header title opens rename input", async ({ page }) => {
     type: "sessions_list",
     payload: [makeSession({ ID: "ren-1", Title: "Old Name" })],
   });
-  await expect(page.getByText("Old Name")).toBeVisible({ timeout: 3000 });
+  await expect(page.getByText("Old Name").first()).toBeVisible({ timeout: 3000 });
   await page.getByText("Old Name").first().click();
   // After selecting, click the header title to start rename
   await page.locator("header button[title='Click to rename']").click();
@@ -308,7 +308,7 @@ test("renaming session sends rename_session command", async ({ page }) => {
     type: "sessions_list",
     payload: [makeSession({ ID: "ren-2", Title: "Original Title" })],
   });
-  await expect(page.getByText("Original Title")).toBeVisible({ timeout: 3000 });
+  await expect(page.getByText("Original Title").first()).toBeVisible({ timeout: 3000 });
   await page.getByText("Original Title").first().click();
   await page.locator("header button[title='Click to rename']").click();
   await page.locator("header input").fill("Renamed Title");
@@ -324,7 +324,7 @@ test("pressing Escape cancels rename without sending command", async ({ page }) 
     type: "sessions_list",
     payload: [makeSession({ ID: "ren-3", Title: "Stay The Same" })],
   });
-  await expect(page.getByText("Stay The Same")).toBeVisible({ timeout: 3000 });
+  await expect(page.getByText("Stay The Same").first()).toBeVisible({ timeout: 3000 });
   await page.getByText("Stay The Same").first().click();
   await page.locator("header button[title='Click to rename']").click();
   await page.locator("header input").fill("Attempted Change");
@@ -341,7 +341,7 @@ test("session_updated event updates title in header", async ({ page }) => {
     type: "sessions_list",
     payload: [makeSession({ ID: "ren-4", Title: "Before Update" })],
   });
-  await expect(page.getByText("Before Update")).toBeVisible({ timeout: 3000 });
+  await expect(page.getByText("Before Update").first()).toBeVisible({ timeout: 3000 });
   await page.getByText("Before Update").first().click();
   await sendMockWSMessage(page, {
     type: "session_updated",
@@ -360,7 +360,7 @@ test("header shows summarized indicator when session has SummaryMessageID", asyn
     type: "sessions_list",
     payload: [makeSession({ ID: "sum-1", Title: "Summarized Session", SummaryMessageID: "msg-sum-1", PromptTokens: 5000, CompletionTokens: 1000 })],
   });
-  await expect(page.getByText("Summarized Session")).toBeVisible({ timeout: 3000 });
-  await page.getByText("Summarized Session").click();
+  await expect(page.getByText("Summarized Session").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("Summarized Session").first().click();
   await expect(page.getByTitle("Session has been summarized")).toBeVisible({ timeout: 2000 });
 });

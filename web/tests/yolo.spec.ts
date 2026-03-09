@@ -172,8 +172,8 @@ test("Yolo can be toggled while a session is active", async ({ page }) => {
     type: "sessions_list",
     payload: [makeSession({ ID: "yolo-sess", Title: "Active Session" })],
   });
-  await expect(page.getByText("Active Session")).toBeVisible({ timeout: 3000 });
-  await page.getByText("Active Session").click();
+  await expect(page.getByText("Active Session").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("Active Session").first().click();
   await expect(page.getByPlaceholder("Message… (Enter to send)")).toBeEnabled({ timeout: 2000 });
 
   // Toggle yolo while session is active

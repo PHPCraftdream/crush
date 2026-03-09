@@ -41,7 +41,7 @@ INSERT INTO sessions (
     ?,
     ?,
     ?
-) RETURNING id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id
+) RETURNING id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id, system_prompt
 `
 
 type CreateSessionParams struct {
@@ -89,6 +89,7 @@ func (q *Queries) CreateSession(ctx context.Context, arg CreateSessionParams) (S
 		&i.LargeModelID,
 		&i.SmallModelProvider,
 		&i.SmallModelID,
+		&i.SystemPrompt,
 	)
 	return i, err
 }
@@ -104,7 +105,7 @@ func (q *Queries) DeleteSession(ctx context.Context, id string) error {
 }
 
 const getSessionByID = `-- name: GetSessionByID :one
-SELECT id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id
+SELECT id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id, system_prompt
 FROM sessions
 WHERE id = ? LIMIT 1
 `
@@ -128,12 +129,13 @@ func (q *Queries) GetSessionByID(ctx context.Context, id string) (Session, error
 		&i.LargeModelID,
 		&i.SmallModelProvider,
 		&i.SmallModelID,
+		&i.SystemPrompt,
 	)
 	return i, err
 }
 
 const listSessions = `-- name: ListSessions :many
-SELECT id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id
+SELECT id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id, system_prompt
 FROM sessions
 WHERE parent_session_id is NULL
 ORDER BY updated_at DESC
@@ -164,6 +166,7 @@ func (q *Queries) ListSessions(ctx context.Context) ([]Session, error) {
 			&i.LargeModelID,
 			&i.SmallModelProvider,
 			&i.SmallModelID,
+			&i.SystemPrompt,
 		); err != nil {
 			return nil, err
 		}
@@ -188,7 +191,7 @@ SET
     cost = ?,
     todos = ?
 WHERE id = ?
-RETURNING id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id
+RETURNING id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id, system_prompt
 `
 
 type UpdateSessionParams struct {
@@ -228,6 +231,7 @@ func (q *Queries) UpdateSession(ctx context.Context, arg UpdateSessionParams) (S
 		&i.LargeModelID,
 		&i.SmallModelProvider,
 		&i.SmallModelID,
+		&i.SystemPrompt,
 	)
 	return i, err
 }
@@ -288,5 +292,23 @@ func (q *Queries) UpdateSessionTitleAndUsage(ctx context.Context, arg UpdateSess
 		arg.Cost,
 		arg.ID,
 	)
+	return err
+}
+
+const updateSessionSystemPrompt = `-- name: UpdateSessionSystemPrompt :exec
+UPDATE sessions
+SET
+    system_prompt = ?,
+    updated_at = strftime('%s', 'now')
+WHERE id = ?
+`
+
+type UpdateSessionSystemPromptParams struct {
+	SystemPrompt string `json:"system_prompt"`
+	ID           string `json:"id"`
+}
+
+func (q *Queries) UpdateSessionSystemPrompt(ctx context.Context, arg UpdateSessionSystemPromptParams) error {
+	_, err := q.db.ExecContext(ctx, updateSessionSystemPrompt, arg.SystemPrompt, arg.ID)
 	return err
 }

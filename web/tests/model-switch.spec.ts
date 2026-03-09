@@ -53,8 +53,8 @@ test("selecting large model sends set_session_models with provider and model", a
       },
     }),
   });
-  await expect(page.getByText("Large Switch")).toBeVisible({ timeout: 3000 });
-  await page.getByText("Large Switch").click();
+  await expect(page.getByText("Large Switch").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("Large Switch").first().click();
 
   await expect(page.locator("header button[title='Large (strong) model']")).toBeVisible({ timeout: 3000 });
   await page.locator("header button[title='Large (strong) model']").click();
@@ -86,8 +86,8 @@ test("selecting small model sends set_session_models with correct small provider
       },
     }),
   });
-  await expect(page.getByText("Small Switch")).toBeVisible({ timeout: 3000 });
-  await page.getByText("Small Switch").click();
+  await expect(page.getByText("Small Switch").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("Small Switch").first().click();
 
   await expect(page.locator("header button[title='Small (fast) model']")).toBeVisible({ timeout: 3000 });
   await page.locator("header button[title='Small (fast) model']").click();
@@ -119,8 +119,8 @@ test("set_session_models includes both models", async ({ page }) => {
       },
     }),
   });
-  await expect(page.getByText("Both Switch")).toBeVisible({ timeout: 3000 });
-  await page.getByText("Both Switch").click();
+  await expect(page.getByText("Both Switch").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("Both Switch").first().click();
 
   // Pick large model
   await page.locator("header button[title='Large (strong) model']").click();
@@ -155,8 +155,8 @@ test("send_message does not include largeModel or smallModel overrides", async (
     payload: [makeSession({ ID: "sw-no-ov", Title: "No Override" })],
   });
   await sendMockWSMessage(page, { type: "config", payload: makeConfig() });
-  await expect(page.getByText("No Override")).toBeVisible({ timeout: 3000 });
-  await page.getByText("No Override").click();
+  await expect(page.getByText("No Override").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("No Override").first().click();
 
   // Switch model
   await page.locator("header button[title='Large (strong) model']").click();
@@ -181,8 +181,8 @@ test("send_message never contains model overrides even on default model", async 
     payload: [makeSession({ ID: "sw-def", Title: "Default Model" })],
   });
   await sendMockWSMessage(page, { type: "config", payload: makeConfig() });
-  await expect(page.getByText("Default Model")).toBeVisible({ timeout: 3000 });
-  await page.getByText("Default Model").click();
+  await expect(page.getByText("Default Model").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("Default Model").first().click();
 
   await page.getByPlaceholder("Message… (Enter to send)").fill("hello default");
   await page.getByRole("button", { name: "Send", exact: true }).click();
@@ -203,8 +203,8 @@ test("session_updated with model fields updates header model button", async ({ p
     payload: [makeSession({ ID: "sw-upd", Title: "Update Model" })],
   });
   await sendMockWSMessage(page, { type: "config", payload: makeConfig() });
-  await expect(page.getByText("Update Model")).toBeVisible({ timeout: 3000 });
-  await page.getByText("Update Model").click();
+  await expect(page.getByText("Update Model").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("Update Model").first().click();
 
   // Server sends session_updated with model fields filled in
   await sendMockWSMessage(page, {
@@ -287,8 +287,8 @@ test("model override persists for subsequent messages via DB", async ({ page }) 
       },
     }),
   });
-  await expect(page.getByText("Persist Session")).toBeVisible({ timeout: 3000 });
-  await page.getByText("Persist Session").click();
+  await expect(page.getByText("Persist Session").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("Persist Session").first().click();
 
   // Switch model once
   await page.locator("header button[title='Large (strong) model']").click();

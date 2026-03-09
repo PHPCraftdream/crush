@@ -54,6 +54,8 @@ type Session struct {
 	LargeModelID       string
 	SmallModelProvider string
 	SmallModelID       string
+
+	SystemPrompt string
 }
 
 type Service interface {
@@ -66,6 +68,7 @@ type Service interface {
 	Save(ctx context.Context, session Session) (Session, error)
 	UpdateTitleAndUsage(ctx context.Context, sessionID, title string, promptTokens, completionTokens int64, cost float64) error
 	UpdateModels(ctx context.Context, sessionID, largeProvider, largeModel, smallProvider, smallModel string) error
+	UpdateSystemPrompt(ctx context.Context, sessionID, prompt string) error
 	Delete(ctx context.Context, id string) error
 
 	// Agent tool session management
@@ -201,6 +204,20 @@ func (s *service) UpdateTitleAndUsage(ctx context.Context, sessionID, title stri
 	})
 }
 
+// UpdateSystemPrompt saves a custom system prompt for a session.
+func (s *service) UpdateSystemPrompt(ctx context.Context, sessionID, prompt string) error {
+	if err := s.q.UpdateSessionSystemPrompt(ctx, db.UpdateSessionSystemPromptParams{
+		ID:           sessionID,
+		SystemPrompt: prompt,
+	}); err != nil {
+		return err
+	}
+	if sess, err := s.Get(ctx, sessionID); err == nil {
+		s.Publish(pubsub.UpdatedEvent, sess)
+	}
+	return nil
+}
+
 // UpdateModels updates the models associated with a session.
 func (s *service) UpdateModels(ctx context.Context, sessionID, largeProvider, largeModel, smallProvider, smallModel string) error {
 	err := s.q.UpdateSessionModels(ctx, db.UpdateSessionModelsParams{
@@ -256,6 +273,8 @@ func (s service) fromDBItem(item db.Session) Session {
 		LargeModelID:       item.LargeModelID.String,
 		SmallModelProvider: item.SmallModelProvider.String,
 		SmallModelID:       item.SmallModelID.String,
+
+		SystemPrompt: item.SystemPrompt,
 	}
 }
 

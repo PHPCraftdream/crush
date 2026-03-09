@@ -31,6 +31,7 @@ const (
 	EventConfig                  = "config"
 	EventResponse                = "response"
 	EventError                   = "error"
+	EventSystemPrompt            = "system_prompt"
 )
 
 // Inbound command types (client → server).
@@ -49,6 +50,11 @@ const (
 	CmdRenameSession                = "rename_session"
 	CmdSetSessionModels             = "set_session_models"
 	CmdRemoveRecentModel            = "remove_recent_model"
+	CmdDeleteMessage                = "delete_message"
+	CmdDeleteMessages               = "delete_messages"
+	CmdUpdateMessageContent         = "update_message_content"
+	CmdGetSystemPrompt              = "get_system_prompt"
+	CmdSetSystemPrompt              = "set_system_prompt"
 )
 
 // Payload structs for inbound commands.
@@ -152,6 +158,19 @@ type RemoveProviderKeyPayload struct {
 	ProviderID string `json:"providerID"`
 }
 
+type DeleteMessagePayload struct {
+	MessageID string `json:"messageID"`
+}
+
+type DeleteMessagesPayload struct {
+	MessageIDs []string `json:"messageIDs"`
+}
+
+type UpdateMessageContentPayload struct {
+	MessageID string `json:"messageID"`
+	Content   string `json:"content"`
+}
+
 // ConfigWire is the frontend-facing config payload with PascalCase field names
 // matching the TypeScript ConfigPayload type.
 type ConfigWire struct {
@@ -181,4 +200,13 @@ type ModelInfoWire struct {
 	ID            string `json:"id"`
 	Name          string `json:"name"`
 	ContextWindow int64  `json:"contextWindow,omitempty"`
+}
+
+type GetSystemPromptPayload struct {
+	SessionID string `json:"sessionID"`
+}
+
+type SetSystemPromptPayload struct {
+	SessionID string `json:"sessionID"`
+	Content   string `json:"content"`
 }

@@ -27,8 +27,8 @@ test("message input enables after selecting a session", async ({ page }) => {
     type: "sessions_list",
     payload: [makeSession({ ID: "inp-1", Title: "Input Session" })],
   });
-  await expect(page.getByText("Input Session")).toBeVisible({ timeout: 3000 });
-  await page.getByText("Input Session").click();
+  await expect(page.getByText("Input Session").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("Input Session").first().click();
   await expect(
     page.getByPlaceholder("Message… (Enter to send)")
   ).toBeEnabled({ timeout: 2000 });
@@ -40,8 +40,8 @@ test("Send button enables when text entered with active session", async ({ page 
     type: "sessions_list",
     payload: [makeSession({ ID: "btn-1", Title: "Btn Session" })],
   });
-  await expect(page.getByText("Btn Session")).toBeVisible({ timeout: 3000 });
-  await page.getByText("Btn Session").click();
+  await expect(page.getByText("Btn Session").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("Btn Session").first().click();
   await expect(page.getByPlaceholder("Message… (Enter to send)")).toBeEnabled({ timeout: 2000 });
   await page.getByPlaceholder("Message… (Enter to send)").fill("hello");
   await expect(page.getByRole("button", { name: "Send", exact: true })).toBeEnabled({ timeout: 2000 });
@@ -53,8 +53,8 @@ test("Send button stays disabled with only whitespace", async ({ page }) => {
     type: "sessions_list",
     payload: [makeSession({ ID: "ws-1", Title: "WS Session" })],
   });
-  await expect(page.getByText("WS Session")).toBeVisible({ timeout: 3000 });
-  await page.getByText("WS Session").click();
+  await expect(page.getByText("WS Session").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("WS Session").first().click();
   await expect(page.getByPlaceholder("Message… (Enter to send)")).toBeEnabled({ timeout: 2000 });
   await page.getByPlaceholder("Message… (Enter to send)").fill("   ");
   await expect(page.getByRole("button", { name: "Send", exact: true })).toBeDisabled();
@@ -68,8 +68,8 @@ test("user message appears in chat area", async ({ page }) => {
     type: "sessions_list",
     payload: [makeSession({ ID: "msg-1", Title: "User Msg Session" })],
   });
-  await expect(page.getByText("User Msg Session")).toBeVisible({ timeout: 3000 });
-  await page.getByText("User Msg Session").click();
+  await expect(page.getByText("User Msg Session").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("User Msg Session").first().click();
   await sendMockWSMessage(page, {
     type: "messages_list",
     payload: [
@@ -89,8 +89,8 @@ test("assistant message appears in chat area", async ({ page }) => {
     type: "sessions_list",
     payload: [makeSession({ ID: "asst-1", Title: "Asst Msg Session" })],
   });
-  await expect(page.getByText("Asst Msg Session")).toBeVisible({ timeout: 3000 });
-  await page.getByText("Asst Msg Session").click();
+  await expect(page.getByText("Asst Msg Session").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("Asst Msg Session").first().click();
   await sendMockWSMessage(page, {
     type: "messages_list",
     payload: [
@@ -110,8 +110,8 @@ test("message_created event shows new message immediately", async ({ page }) => 
     type: "sessions_list",
     payload: [makeSession({ ID: "live-1", Title: "Live Chat" })],
   });
-  await expect(page.getByText("Live Chat")).toBeVisible({ timeout: 3000 });
-  await page.getByText("Live Chat").click();
+  await expect(page.getByText("Live Chat").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("Live Chat").first().click();
   await sendMockWSMessage(page, { type: "messages_list", payload: [] });
 
   await sendMockWSMessage(page, {
@@ -132,8 +132,8 @@ test("message_updated event updates message content", async ({ page }) => {
     type: "sessions_list",
     payload: [makeSession({ ID: "upd-1", Title: "Update Chat" })],
   });
-  await expect(page.getByText("Update Chat")).toBeVisible({ timeout: 3000 });
-  await page.getByText("Update Chat").click();
+  await expect(page.getByText("Update Chat").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("Update Chat").first().click();
   await sendMockWSMessage(page, {
     type: "messages_list",
     payload: [
@@ -166,8 +166,8 @@ test("tool_call part renders tool name", async ({ page }) => {
     type: "sessions_list",
     payload: [makeSession({ ID: "tc-1", Title: "Tool Chat" })],
   });
-  await expect(page.getByText("Tool Chat")).toBeVisible({ timeout: 3000 });
-  await page.getByText("Tool Chat").click();
+  await expect(page.getByText("Tool Chat").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("Tool Chat").first().click();
   await expect(page.getByPlaceholder("Message… (Enter to send)")).toBeEnabled({ timeout: 2000 });
   await sendMockWSMessage(page, {
     type: "messages_list",
@@ -190,8 +190,8 @@ test("tool_result part renders result content", async ({ page }) => {
     type: "sessions_list",
     payload: [makeSession({ ID: "tr-1", Title: "Result Chat" })],
   });
-  await expect(page.getByText("Result Chat")).toBeVisible({ timeout: 3000 });
-  await page.getByText("Result Chat").click();
+  await expect(page.getByText("Result Chat").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("Result Chat").first().click();
   await sendMockWSMessage(page, {
     type: "messages_list",
     payload: [
@@ -221,8 +221,8 @@ test("typing indicator appears when session is busy", async ({ page }) => {
     type: "sessions_list",
     payload: [makeSession({ ID: "busy-1", Title: "Busy Session" })],
   });
-  await expect(page.getByText("Busy Session")).toBeVisible({ timeout: 3000 });
-  await page.getByText("Busy Session").click();
+  await expect(page.getByText("Busy Session").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("Busy Session").first().click();
   await sendMockWSMessage(page, {
     type: "agent_busy",
     payload: { SessionID: "busy-1", Busy: true },
@@ -238,8 +238,8 @@ test("Stop button replaces Send when session is busy", async ({ page }) => {
     type: "sessions_list",
     payload: [makeSession({ ID: "stop-1", Title: "Stop Me" })],
   });
-  await expect(page.getByText("Stop Me")).toBeVisible({ timeout: 3000 });
-  await page.getByText("Stop Me").click();
+  await expect(page.getByText("Stop Me").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("Stop Me").first().click();
   // Wait for session to be active before sending busy event
   await expect(page.getByPlaceholder("Message… (Enter to send)")).toBeEnabled({ timeout: 2000 });
   await sendMockWSMessage(page, {
@@ -258,8 +258,8 @@ test("typing indicator disappears when session is no longer busy", async ({
     type: "sessions_list",
     payload: [makeSession({ ID: "done-1", Title: "Done Session" })],
   });
-  await expect(page.getByText("Done Session")).toBeVisible({ timeout: 3000 });
-  await page.getByText("Done Session").click();
+  await expect(page.getByText("Done Session").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("Done Session").first().click();
   await sendMockWSMessage(page, {
     type: "agent_busy",
     payload: { SessionID: "done-1", Busy: true },
@@ -282,8 +282,8 @@ test("Shift+Enter inserts newline instead of sending", async ({ page }) => {
     type: "sessions_list",
     payload: [makeSession({ ID: "key-1", Title: "Key Session" })],
   });
-  await expect(page.getByText("Key Session")).toBeVisible({ timeout: 3000 });
-  await page.getByText("Key Session").click();
+  await expect(page.getByText("Key Session").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("Key Session").first().click();
   const textarea = page.getByPlaceholder("Message… (Enter to send)");
   await textarea.fill("line one");
   await textarea.press("Shift+Enter");
@@ -301,8 +301,8 @@ test("Enter sends send_message command with sessionID and content", async ({ pag
     type: "sessions_list",
     payload: [makeSession({ ID: "send-1", Title: "Send Test" })],
   });
-  await expect(page.getByText("Send Test")).toBeVisible({ timeout: 3000 });
-  await page.getByText("Send Test").click();
+  await expect(page.getByText("Send Test").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("Send Test").first().click();
   await expect(page.getByPlaceholder("Message… (Enter to send)")).toBeEnabled({ timeout: 2000 });
   await page.getByPlaceholder("Message… (Enter to send)").fill("hello server");
   await page.getByRole("button", { name: "Send", exact: true }).click();
@@ -317,8 +317,8 @@ test("textarea clears after send", async ({ page }) => {
     type: "sessions_list",
     payload: [makeSession({ ID: "clr-1", Title: "Clear Test" })],
   });
-  await expect(page.getByText("Clear Test")).toBeVisible({ timeout: 3000 });
-  await page.getByText("Clear Test").click();
+  await expect(page.getByText("Clear Test").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("Clear Test").first().click();
   await expect(page.getByPlaceholder("Message… (Enter to send)")).toBeEnabled({ timeout: 2000 });
   await page.getByPlaceholder("Message… (Enter to send)").fill("will be cleared");
   await page.getByRole("button", { name: "Send", exact: true }).click();
@@ -331,8 +331,8 @@ test("Stop button sends cancel_agent command", async ({ page }) => {
     type: "sessions_list",
     payload: [makeSession({ ID: "canc-1", Title: "Cancel Session" })],
   });
-  await expect(page.getByText("Cancel Session")).toBeVisible({ timeout: 3000 });
-  await page.getByText("Cancel Session").click();
+  await expect(page.getByText("Cancel Session").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("Cancel Session").first().click();
   await expect(page.getByPlaceholder("Message… (Enter to send)")).toBeEnabled({ timeout: 2000 });
   await sendMockWSMessage(page, {
     type: "agent_busy",

@@ -29,8 +29,8 @@ test("assistant message with Model shows model name on hover", async ({ page }) 
     type: "sessions_list",
     payload: [makeSession({ ID: "mm-1", Title: "Model Label" })],
   });
-  await expect(page.getByText("Model Label")).toBeVisible({ timeout: 3000 });
-  await page.getByText("Model Label").click();
+  await expect(page.getByText("Model Label").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("Model Label").first().click();
   await sendMockWSMessage(page, {
     type: "messages_list",
     payload: [
@@ -52,8 +52,8 @@ test("user message does NOT show a model name", async ({ page }) => {
     type: "sessions_list",
     payload: [makeSession({ ID: "mm-2", Title: "User No Model" })],
   });
-  await expect(page.getByText("User No Model")).toBeVisible({ timeout: 3000 });
-  await page.getByText("User No Model").click();
+  await expect(page.getByText("User No Model").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("User No Model").first().click();
   await sendMockWSMessage(page, {
     type: "messages_list",
     payload: [
@@ -77,8 +77,8 @@ test("assistant message without Model field shows no model label", async ({ page
     type: "sessions_list",
     payload: [makeSession({ ID: "mm-3", Title: "No Model Field" })],
   });
-  await expect(page.getByText("No Model Field")).toBeVisible({ timeout: 3000 });
-  await page.getByText("No Model Field").click();
+  await expect(page.getByText("No Model Field").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("No Model Field").first().click();
   await sendMockWSMessage(page, {
     type: "messages_list",
     payload: [
@@ -104,8 +104,8 @@ test("each assistant message shows its own model name", async ({ page }) => {
     type: "sessions_list",
     payload: [makeSession({ ID: "mm-4", Title: "Multi Model" })],
   });
-  await expect(page.getByText("Multi Model")).toBeVisible({ timeout: 3000 });
-  await page.getByText("Multi Model").click();
+  await expect(page.getByText("Multi Model").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("Multi Model").first().click();
   await sendMockWSMessage(page, {
     type: "messages_list",
     payload: [
@@ -137,8 +137,8 @@ test("model name updates when message_updated brings a new Model value", async (
     type: "sessions_list",
     payload: [makeSession({ ID: "mm-5", Title: "Stream Model" })],
   });
-  await expect(page.getByText("Stream Model")).toBeVisible({ timeout: 3000 });
-  await page.getByText("Stream Model").click();
+  await expect(page.getByText("Stream Model").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("Stream Model").first().click();
 
   // Partial message with no Model yet
   await sendMockWSMessage(page, {
@@ -176,8 +176,8 @@ test("both copy button and model name are visible on hover", async ({ page }) =>
     type: "sessions_list",
     payload: [makeSession({ ID: "mm-6", Title: "Copy+Model" })],
   });
-  await expect(page.getByText("Copy+Model")).toBeVisible({ timeout: 3000 });
-  await page.getByText("Copy+Model").click();
+  await expect(page.getByText("Copy+Model").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("Copy+Model").first().click();
   await sendMockWSMessage(page, {
     type: "messages_list",
     payload: [

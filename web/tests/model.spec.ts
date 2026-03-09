@@ -33,7 +33,7 @@ test("header shows model selector button when session is active", async ({
     type: "config",
     payload: makeConfig(),
   });
-  await page.getByText("Model Session").click();
+  await page.getByText("Model Session").first().click();
   // The model name appears in a clickable button with dropdown arrow
   await expect(
     page.locator("header button").filter({ hasText: "claude-opus-4" })
@@ -49,8 +49,8 @@ test("clicking model button opens dropdown", async ({ page }) => {
     payload: [makeSession({ ID: "dd-1", Title: "DD Session" })],
   });
   await sendMockWSMessage(page, { type: "config", payload: makeConfig() });
-  await expect(page.getByText("DD Session")).toBeVisible({ timeout: 3000 });
-  await page.getByText("DD Session").click();
+  await expect(page.getByText("DD Session").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("DD Session").first().click();
   await expect(page.locator("header button").filter({ hasText: "claude-opus-4" })).toBeVisible({ timeout: 3000 });
 
   await page.locator("header button").filter({ hasText: "claude-opus-4" }).click();
@@ -64,8 +64,8 @@ test("model dropdown shows all available models", async ({ page }) => {
     payload: [makeSession({ ID: "all-1", Title: "All Models" })],
   });
   await sendMockWSMessage(page, { type: "config", payload: makeConfig() });
-  await expect(page.getByText("All Models")).toBeVisible({ timeout: 3000 });
-  await page.getByText("All Models").click();
+  await expect(page.getByText("All Models").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("All Models").first().click();
   await expect(page.locator("header button").filter({ hasText: "claude-opus-4" })).toBeVisible({ timeout: 3000 });
 
   await page.locator("header button").filter({ hasText: "claude-opus-4" }).click();
@@ -82,8 +82,8 @@ test("model dropdown closes on outside click", async ({ page }) => {
     payload: [makeSession({ ID: "cls-1", Title: "Close Test" })],
   });
   await sendMockWSMessage(page, { type: "config", payload: makeConfig() });
-  await expect(page.getByText("Close Test")).toBeVisible({ timeout: 3000 });
-  await page.getByText("Close Test").click();
+  await expect(page.getByText("Close Test").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("Close Test").first().click();
   await expect(page.locator("header button").filter({ hasText: "claude-opus-4" })).toBeVisible({ timeout: 3000 });
 
   await page.locator("header button").filter({ hasText: "claude-opus-4" }).click();
@@ -116,8 +116,8 @@ test("search filters models by name", async ({ page }) => {
       },
     }),
   });
-  await expect(page.getByText("Search Session")).toBeVisible({ timeout: 3000 });
-  await page.getByText("Search Session").click();
+  await expect(page.getByText("Search Session").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("Search Session").first().click();
   await expect(page.locator("header button").filter({ hasText: "claude-opus-4" })).toBeVisible({ timeout: 3000 });
   await page.locator("header button").filter({ hasText: "claude-opus-4" }).click();
 
@@ -134,8 +134,8 @@ test("search shows no results message when nothing matches", async ({ page }) =>
     payload: [makeSession({ ID: "nores-1", Title: "No Results" })],
   });
   await sendMockWSMessage(page, { type: "config", payload: makeConfig() });
-  await expect(page.getByText("No Results")).toBeVisible({ timeout: 3000 });
-  await page.getByText("No Results").click();
+  await expect(page.getByText("No Results").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("No Results").first().click();
   await expect(page.locator("header button").filter({ hasText: "claude-opus-4" })).toBeVisible({ timeout: 3000 });
   await page.locator("header button").filter({ hasText: "claude-opus-4" }).click();
 
@@ -152,8 +152,8 @@ test("selecting a model from dropdown updates header display", async ({ page }) 
     payload: [makeSession({ ID: "pick-1", Title: "Pick Session" })],
   });
   await sendMockWSMessage(page, { type: "config", payload: makeConfig() });
-  await expect(page.getByText("Pick Session")).toBeVisible({ timeout: 3000 });
-  await page.getByText("Pick Session").click();
+  await expect(page.getByText("Pick Session").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("Pick Session").first().click();
   await expect(page.locator("header button").filter({ hasText: "claude-opus-4" })).toBeVisible({ timeout: 3000 });
 
   // Open dropdown and select "small" model
@@ -214,8 +214,8 @@ test("settings shows session model dropdowns when session is active", async ({
     payload: [makeSession({ ID: "st-1", Title: "Settings Session" })],
   });
   await sendMockWSMessage(page, { type: "config", payload: makeConfig() });
-  await expect(page.getByText("Settings Session")).toBeVisible({ timeout: 3000 });
-  await page.getByText("Settings Session").click();
+  await expect(page.getByText("Settings Session").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("Settings Session").first().click();
   await page.getByTitle("Settings").click();
 
   await expect(page.getByText("Session Models")).toBeVisible({ timeout: 2000 });
@@ -230,8 +230,8 @@ test("settings model select changes displayed model", async ({ page }) => {
     payload: [makeSession({ ID: "st-2", Title: "Model Change" })],
   });
   await sendMockWSMessage(page, { type: "config", payload: makeConfig() });
-  await expect(page.getByText("Model Change")).toBeVisible({ timeout: 3000 });
-  await page.getByText("Model Change").click();
+  await expect(page.getByText("Model Change").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("Model Change").first().click();
   await page.getByTitle("Settings").click();
 
   // Change large model to "small" key
@@ -254,8 +254,8 @@ test("header shows small model selector button when session is active", async ({
     payload: [makeSession({ ID: "sm-1", Title: "Small Model Session" })],
   });
   await sendMockWSMessage(page, { type: "config", payload: makeConfig() });
-  await expect(page.getByText("Small Model Session")).toBeVisible({ timeout: 3000 });
-  await page.getByText("Small Model Session").click();
+  await expect(page.getByText("Small Model Session").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("Small Model Session").first().click();
   // Small model button with ⚡ icon
   await expect(
     page.locator("header button[title='Small (fast) model']")
@@ -269,8 +269,8 @@ test("clicking small model button opens its own dropdown", async ({ page }) => {
     payload: [makeSession({ ID: "sm-2", Title: "Small DD" })],
   });
   await sendMockWSMessage(page, { type: "config", payload: makeConfig() });
-  await expect(page.getByText("Small DD")).toBeVisible({ timeout: 3000 });
-  await page.getByText("Small DD").click();
+  await expect(page.getByText("Small DD").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("Small DD").first().click();
   await page.locator("header button[title='Small (fast) model']").click();
   await expect(page.getByPlaceholder("Search models…")).toBeVisible({ timeout: 2000 });
 });
@@ -295,8 +295,8 @@ test("selecting from small model dropdown updates small selector", async ({ page
       },
     }),
   });
-  await expect(page.getByText("Small Pick")).toBeVisible({ timeout: 3000 });
-  await page.getByText("Small Pick").click();
+  await expect(page.getByText("Small Pick").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("Small Pick").first().click();
   // Open small model dropdown
   await page.locator("header button[title='Small (fast) model']").click();
   // Pick gpt-4o-mini

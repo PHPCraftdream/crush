@@ -56,8 +56,8 @@ async function setupSessionAndConfig(
     payload: [makeSession({ ID: sessionID, Title: title })],
   });
   await sendMockWSMessage(page, { type: "config", payload: makeTwoModelConfig() });
-  await expect(page.getByText(title)).toBeVisible({ timeout: 3000 });
-  await page.getByText(title).click();
+  await expect(page.getByText(title).first()).toBeVisible({ timeout: 3000 });
+  await page.getByText(title).first().click();
 }
 
 async function getLastSentMessage(page: import("@playwright/test").Page) {

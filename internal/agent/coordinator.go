@@ -66,6 +66,9 @@ type Coordinator interface {
 	Summarize(context.Context, string) error
 	Model() Model
 	UpdateModels(ctx context.Context) error
+	GetSystemPrompt() string
+	BuildSystemPrompt(ctx context.Context) (string, error)
+	UpdateSessionSystemPrompt(ctx context.Context, sessionID, prompt string) error
 }
 
 type coordinator struct {
@@ -227,18 +230,34 @@ func (c *coordinator) runInternal(ctx context.Context, sessionID string, prompt 
 		}
 	}
 
+	// Use per-session system prompt from DB; generate and persist it if missing.
+	var sessionSystemPrompt string
+	if sess, err := c.sessions.Get(ctx, sessionID); err == nil {
+		if sess.SystemPrompt != "" {
+			sessionSystemPrompt = sess.SystemPrompt
+		} else if c.prompt != nil {
+			if built, buildErr := c.prompt.Build(ctx, c.currentAgent.Model().ModelCfg.Provider, c.currentAgent.Model().ModelCfg.Model, *c.cfg); buildErr == nil && built != "" {
+				sessionSystemPrompt = built
+				if saveErr := c.sessions.UpdateSystemPrompt(ctx, sessionID, built); saveErr != nil {
+					slog.Warn("coordinator: failed to save system prompt to session", "sessionID", sessionID, "err", saveErr)
+				}
+			}
+		}
+	}
+
 	run := func() (*fantasy.AgentResult, error) {
 		return c.currentAgent.Run(ctx, SessionAgentCall{
-			SessionID:        sessionID,
-			Prompt:           prompt,
-			Attachments:      attachments,
-			MaxOutputTokens:  maxTokens,
-			ProviderOptions:  mergedOptions,
-			Temperature:      temp,
-			TopP:             topP,
-			TopK:             topK,
-			FrequencyPenalty: freqPenalty,
-			PresencePenalty:  presPenalty,
+			SessionID:            sessionID,
+			Prompt:               prompt,
+			Attachments:          attachments,
+			MaxOutputTokens:      maxTokens,
+			ProviderOptions:      mergedOptions,
+			Temperature:          temp,
+			TopP:                 topP,
+			TopK:                 topK,
+			FrequencyPenalty:     freqPenalty,
+			PresencePenalty:      presPenalty,
+			SystemPromptOverride: sessionSystemPrompt,
 		})
 	}
 	result, originalErr := run()
@@ -960,6 +979,22 @@ func (c *coordinator) IsSessionBusy(sessionID string) bool {
 
 func (c *coordinator) Model() Model {
 	return c.currentAgent.Model()
+}
+
+func (c *coordinator) GetSystemPrompt() string {
+	return c.currentAgent.SystemPrompt()
+}
+
+func (c *coordinator) BuildSystemPrompt(ctx context.Context) (string, error) {
+	if c.prompt == nil {
+		return "", nil
+	}
+	model := c.currentAgent.Model()
+	return c.prompt.Build(ctx, model.ModelCfg.Provider, model.ModelCfg.Model, *c.cfg)
+}
+
+func (c *coordinator) UpdateSessionSystemPrompt(ctx context.Context, sessionID, prompt string) error {
+	return c.sessions.UpdateSystemPrompt(ctx, sessionID, prompt)
 }
 
 func (c *coordinator) UpdateModels(ctx context.Context) error {

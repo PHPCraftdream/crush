@@ -25,6 +25,8 @@ export interface Session {
   LargeModelID: string;
   SmallModelProvider: string;
   SmallModelID: string;
+
+  SystemPrompt: string;
 }
 
 export type MessageRole = "user" | "assistant" | "tool" | "system";

@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useMemo } from "react";
+import { useState, useRef, useEffect, useMemo, useCallback } from "react";
 import { useStore } from "@nanostores/react";
 import {
   $sessions,
@@ -18,6 +18,97 @@ import {
 } from "../store";
 import { ws } from "../ws";
 import type { ConfigPayload, Session } from "../types";
+
+// ── System Prompt Modal ───────────────────────────────────────────────────────
+
+function SystemPromptModal({ sessionID, onClose }: { sessionID: string; onClose: () => void }) {
+  const [original, setOriginal] = useState<string>("");
+  const [draft, setDraft] = useState<string>("");
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+
+  const dirty = draft !== original;
+
+  useEffect(() => {
+    const unsub = ws.on("system_prompt", (msg) => {
+      const p = msg.payload as { content?: string } | undefined;
+      const c = p?.content ?? "";
+      setOriginal(c);
+      setDraft(c);
+      setLoading(false);
+      unsub();
+    });
+    ws.send("get_system_prompt", { sessionID });
+
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") onClose();
+    }
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [sessionID, onClose]);
+
+  function save() {
+    setSaving(true);
+    ws.send("set_system_prompt", { sessionID, content: draft });
+    setOriginal(draft);
+    setSaving(false);
+  }
+
+  function reset() {
+    setDraft(original);
+  }
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm"
+      onClick={onClose}
+    >
+      <div
+        className="bg-white border border-surface rounded-2xl shadow-xl flex flex-col w-full max-w-3xl mx-4 max-h-[85vh]"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between px-6 py-4 border-b border-surface shrink-0">
+          <h2 className="text-base font-semibold text-text">System Prompt</h2>
+          <button
+            onClick={onClose}
+            className="text-text-subtle hover:text-text transition-colors text-xl leading-none"
+          >
+            ×
+          </button>
+        </div>
+        <div className="flex-1 overflow-hidden p-4">
+          {loading ? (
+            <p className="text-text-subtle text-sm p-2">Loading…</p>
+          ) : (
+            <textarea
+              className="w-full h-full min-h-[400px] text-xs font-mono text-text bg-base-overlay border border-surface rounded-xl p-3 resize-none outline-none focus:border-accent/50 leading-relaxed"
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              spellCheck={false}
+            />
+          )}
+        </div>
+        <div className="flex items-center justify-end gap-3 px-6 py-4 border-t border-surface shrink-0">
+          {dirty && (
+            <button
+              onClick={reset}
+              className="px-4 py-2 text-sm text-text-subtle hover:text-text transition-colors rounded-xl hover:bg-base-overlay"
+            >
+              Reset
+            </button>
+          )}
+          <button
+            onClick={save}
+            disabled={!dirty || saving}
+            className="px-4 py-2 text-sm font-medium bg-accent text-white rounded-xl hover:opacity-90 transition-opacity disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            Save
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 function formatTokens(n: number): string {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M";
@@ -426,12 +517,14 @@ export function Header() {
   const busySessions = useStore($busySessions);
   const yolo = useStore($yolo);
   const config = useStore($config);
+  const [showSystemPrompt, setShowSystemPrompt] = useState(false);
+  const closeSystemPrompt = useCallback(() => setShowSystemPrompt(false), []);
 
   const activeSession = sessions.find((s) => s.ID === activeSessionID) ?? null;
   const isBusy = activeSessionID ? busySessions.has(activeSessionID) : false;
+
   const totalTokens = activeSession ? activeSession.PromptTokens + activeSession.CompletionTokens : 0;
   const isSummarized = !!activeSession?.SummaryMessageID;
-
 
   // Determine context window from the effective large model of the active session.
   // Use the same key-resolution logic as ModelSelector so the % always matches
@@ -449,6 +542,12 @@ export function Header() {
     return allModels.find(x => x.key === effectiveLargeKey)?.contextWindow ?? 0;
   }, [effectiveLargeKey, allModels]);
 
+  // Display name of the currently active large model (for progress indicator)
+  const activeLargeModelName = useMemo(() => {
+    if (!effectiveLargeKey) return null;
+    return allModels.find(x => x.key === effectiveLargeKey)?.name ?? null;
+  }, [effectiveLargeKey, allModels]);
+
   const contextPct = contextWindow > 0 ? Math.min(100, Math.round((totalTokens / contextWindow) * 100)) : null;
 
   // Color ramp: green → yellow → red
@@ -459,6 +558,7 @@ export function Header() {
   }
 
   return (
+    <>
     <header className="flex items-center gap-6 px-8 py-8 border-b border-surface bg-white shrink-0">
       <div className="flex-1 min-w-0">
         <SessionTitle session={activeSession} />
@@ -496,8 +596,21 @@ export function Header() {
           <span>Yolo</span>
         </button>
 
+        <button
+          onClick={() => setShowSystemPrompt(true)}
+          disabled={!activeSessionID}
+          title="View / edit system prompt"
+          className="flex items-center gap-1.5 text-xs font-medium rounded-lg px-2.5 py-1.5 border transition-colors bg-base-overlay border-surface text-text-subtle hover:border-accent/50 hover:text-text disabled:opacity-40 disabled:cursor-not-allowed"
+        >
+          <span>📋</span>
+          <span>Prompt</span>
+        </button>
+
         {isBusy && (
-          <div className="flex items-center gap-1.5 animate-pulse-dots px-2" title="Agent is working…">
+          <div className="flex items-center gap-2 animate-pulse-dots px-2" title={activeLargeModelName ? `Running ${activeLargeModelName}…` : "Agent is working…"}>
+            {activeLargeModelName && (
+              <span className="text-xs text-text-subtle font-medium">{activeLargeModelName}</span>
+            )}
             <span className="w-2 h-2 rounded-full bg-accent inline-block" />
             <span className="w-2 h-2 rounded-full bg-accent inline-block" />
             <span className="w-2 h-2 rounded-full bg-accent inline-block" />
@@ -505,5 +618,7 @@ export function Header() {
         )}
       </div>
     </header>
+    {showSystemPrompt && activeSessionID && <SystemPromptModal sessionID={activeSessionID} onClose={closeSystemPrompt} />}
+    </>
   );
 }

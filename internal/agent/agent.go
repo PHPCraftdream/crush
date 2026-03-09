@@ -60,16 +60,19 @@ var summaryPrompt []byte
 var thinkTagRegex = regexp.MustCompile(`<think>.*?</think>`)
 
 type SessionAgentCall struct {
-	SessionID        string
-	Prompt           string
-	ProviderOptions  fantasy.ProviderOptions
-	Attachments      []message.Attachment
-	MaxOutputTokens  int64
-	Temperature      *float64
-	TopP             *float64
-	TopK             *int64
-	FrequencyPenalty *float64
-	PresencePenalty  *float64
+	SessionID            string
+	Prompt               string
+	ProviderOptions      fantasy.ProviderOptions
+	Attachments          []message.Attachment
+	MaxOutputTokens      int64
+	Temperature          *float64
+	TopP                 *float64
+	TopK                 *int64
+	FrequencyPenalty     *float64
+	PresencePenalty      *float64
+	// SystemPromptOverride, if non-empty, replaces the agent's global system prompt
+	// for this single call. Used to apply per-session system prompts from the DB.
+	SystemPromptOverride string
 }
 
 type SessionAgent interface {
@@ -78,6 +81,7 @@ type SessionAgent interface {
 	SetTools(tools []fantasy.AgentTool)
 	SetSystemPrompt(systemPrompt string)
 	SetSystemPromptPrefix(prefix string)
+	SystemPrompt() string
 	Cancel(sessionID string)
 	CancelAll()
 	IsSessionBusy(sessionID string) bool
@@ -168,6 +172,11 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	largeModel := a.largeModel.Get()
 	systemPrompt := a.systemPrompt.Get()
 	promptPrefix := a.systemPromptPrefix.Get()
+
+	// Per-session system prompt overrides the global one when set.
+	if call.SystemPromptOverride != "" {
+		systemPrompt = call.SystemPromptOverride
+	}
 
 	slog.Info("SessionAgent.Run: starting", "sessionID", call.SessionID, "model", largeModel.ModelCfg.Model, "promptLen", len(systemPrompt))
 
@@ -1071,6 +1080,10 @@ func (a *sessionAgent) SetSystemPrompt(systemPrompt string) {
 
 func (a *sessionAgent) SetSystemPromptPrefix(prefix string) {
 	a.systemPromptPrefix.Set(prefix)
+}
+
+func (a *sessionAgent) SystemPrompt() string {
+	return a.systemPrompt.Get()
 }
 
 func (a *sessionAgent) Model() Model {

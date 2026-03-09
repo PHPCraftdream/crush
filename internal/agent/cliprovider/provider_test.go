@@ -457,48 +457,52 @@ func TestClaudePartParser(t *testing.T) {
 func TestGeminiPartParser(t *testing.T) {
 	parse := geminiPartParser()
 
-	// Candidates-style event
-	ev1, _ := json.Marshal(map[string]any{
-		"candidates": []map[string]any{
-			{
-				"content": map[string]any{
-					"parts": []map[string]any{
-						{"text": "Hello"},
-					},
-					"role": "model",
-				},
-			},
-		},
+	// init event is skipped
+	ev, _ := json.Marshal(map[string]any{
+		"type": "init", "session_id": "x", "model": "auto-gemini-3",
 	})
-	part, ok := parse(ev1)
+	if _, ok := parse(ev); ok {
+		t.Error("init event should be skipped")
+	}
+
+	// user message echo is skipped
+	ev, _ = json.Marshal(map[string]any{
+		"type": "message", "role": "user", "content": "hello",
+	})
+	if _, ok := parse(ev); ok {
+		t.Error("user message should be skipped")
+	}
+
+	// assistant delta yields TextDelta
+	ev, _ = json.Marshal(map[string]any{
+		"type": "message", "role": "assistant", "content": "Hello!", "delta": true,
+	})
+	part, ok := parse(ev)
 	if !ok {
-		t.Fatal("expected part from candidates event")
+		t.Fatal("expected part from assistant delta event")
 	}
 	if part.Type != fantasy.StreamPartTypeTextDelta {
 		t.Errorf("part.Type = %v, want TextDelta", part.Type)
 	}
-	if part.Delta != "Hello" {
-		t.Errorf("part.Delta = %q, want %q", part.Delta, "Hello")
+	if part.Delta != "Hello!" {
+		t.Errorf("part.Delta = %q, want %q", part.Delta, "Hello!")
 	}
 
-	// Direct text field
-	ev2, _ := json.Marshal(map[string]any{
-		"text": "world",
+	// result event is skipped (handled by ParseUsageLine)
+	ev, _ = json.Marshal(map[string]any{
+		"type": "result", "status": "success",
+		"stats": map[string]any{"total_tokens": 100},
 	})
-	part, ok = parse(ev2)
-	if !ok {
-		t.Fatal("expected part from text event")
-	}
-	if part.Delta != "world" {
-		t.Errorf("part.Delta = %q, want %q", part.Delta, "world")
+	if _, ok := parse(ev); ok {
+		t.Error("result event should be skipped by part parser")
 	}
 
-	// Empty event
-	ev3, _ := json.Marshal(map[string]any{
-		"type": "metadata",
+	// assistant message with empty content is skipped
+	ev, _ = json.Marshal(map[string]any{
+		"type": "message", "role": "assistant", "content": "", "delta": true,
 	})
-	if _, ok := parse(ev3); ok {
-		t.Error("empty event should be skipped")
+	if _, ok := parse(ev); ok {
+		t.Error("assistant message with empty content should be skipped")
 	}
 
 	// Invalid JSON
@@ -574,6 +578,474 @@ func TestAllSpecsHavePartParser(t *testing.T) {
 	for _, spec := range All {
 		if spec.NewPartParser == nil {
 			t.Errorf("spec %q has nil NewPartParser", spec.ModelID)
+		}
+	}
+}
+
+// ── QwenArgs ────────────────────────────────────────────────────────────────
+
+func TestQwenArgs(t *testing.T) {
+	fn := qwenArgs()
+
+	args := fn(false)
+	if !contains(args, "--output-format") || !contains(args, "stream-json") {
+		t.Errorf("qwenArgs(false) = %v, missing --output-format stream-json", args)
+	}
+	if !contains(args, "--include-partial-messages") {
+		t.Errorf("qwenArgs(false) = %v, missing --include-partial-messages", args)
+	}
+	if contains(args, "--approval-mode") {
+		t.Errorf("qwenArgs(false) must not include --approval-mode: %v", args)
+	}
+
+	argsYolo := fn(true)
+	if !contains(argsYolo, "--approval-mode") || !contains(argsYolo, "yolo") {
+		t.Errorf("qwenArgs(true) = %v, missing --approval-mode yolo", argsYolo)
+	}
+}
+
+// ── CodexArgs ────────────────────────────────────────────────────────────────
+
+func TestCodexArgs(t *testing.T) {
+	fn := codexArgs("gpt-5.3-codex")
+
+	args := fn(false)
+	if !contains(args, "exec") {
+		t.Errorf("codexArgs(false) = %v, missing 'exec'", args)
+	}
+	if !contains(args, "--json") {
+		t.Errorf("codexArgs(false) = %v, missing '--json'", args)
+	}
+	if !contains(args, "-m") || !contains(args, "gpt-5.3-codex") {
+		t.Errorf("codexArgs(false) = %v, missing -m gpt-5.3-codex", args)
+	}
+	if contains(args, "--dangerously-bypass-approvals-and-sandbox") {
+		t.Errorf("codexArgs(false) must not include --dangerously-bypass-approvals-and-sandbox: %v", args)
+	}
+
+	argsYolo := fn(true)
+	if !contains(argsYolo, "--dangerously-bypass-approvals-and-sandbox") {
+		t.Errorf("codexArgs(true) = %v, missing --dangerously-bypass-approvals-and-sandbox", argsYolo)
+	}
+}
+
+func TestCodexArgsAllModels(t *testing.T) {
+	models := []string{
+		"gpt-5.3-codex",
+		"gpt-5.4",
+		"gpt-5.2-codex",
+		"gpt-5.1-codex-max",
+		"gpt-5.2",
+		"gpt-5.1-codex-mini",
+	}
+	for _, model := range models {
+		fn := codexArgs(model)
+		args := fn(false)
+		if !contains(args, model) {
+			t.Errorf("codexArgs(%q)(false) = %v, missing model name", model, args)
+		}
+		argsYolo := fn(true)
+		if !contains(argsYolo, "--dangerously-bypass-approvals-and-sandbox") {
+			t.Errorf("codexArgs(%q)(true) = %v, missing yolo flag", model, argsYolo)
+		}
+	}
+}
+
+// ── CodexPartParser ──────────────────────────────────────────────────────────
+
+func TestCodexPartParser(t *testing.T) {
+	parse := codexPartParser()
+
+	// thread.started is skipped
+	ev, _ := json.Marshal(map[string]any{"type": "thread.started", "thread_id": "x"})
+	if _, ok := parse(ev); ok {
+		t.Error("thread.started should be skipped")
+	}
+
+	// turn.started is skipped
+	ev, _ = json.Marshal(map[string]any{"type": "turn.started"})
+	if _, ok := parse(ev); ok {
+		t.Error("turn.started should be skipped")
+	}
+
+	// item.started is skipped
+	ev, _ = json.Marshal(map[string]any{
+		"type": "item.started",
+		"item": map[string]any{"type": "command_execution", "command": "ls"},
+	})
+	if _, ok := parse(ev); ok {
+		t.Error("item.started should be skipped")
+	}
+
+	// item.completed command_execution is skipped
+	ev, _ = json.Marshal(map[string]any{
+		"type": "item.completed",
+		"item": map[string]any{
+			"type":              "command_execution",
+			"command":           "ls",
+			"aggregated_output": "file.txt",
+			"exit_code":         0,
+		},
+	})
+	if _, ok := parse(ev); ok {
+		t.Error("item.completed command_execution should be skipped")
+	}
+
+	// item.completed agent_message yields TextDelta
+	ev, _ = json.Marshal(map[string]any{
+		"type": "item.completed",
+		"item": map[string]any{
+			"type": "agent_message",
+			"text": "Here is the answer.",
+		},
+	})
+	part, ok := parse(ev)
+	if !ok {
+		t.Fatal("item.completed agent_message should yield a part")
+	}
+	if part.Type != fantasy.StreamPartTypeTextDelta {
+		t.Errorf("part.Type = %v, want TextDelta", part.Type)
+	}
+	if part.Delta != "Here is the answer." {
+		t.Errorf("part.Delta = %q, want %q", part.Delta, "Here is the answer.")
+	}
+
+	// item.completed agent_message with empty text is skipped
+	ev, _ = json.Marshal(map[string]any{
+		"type": "item.completed",
+		"item": map[string]any{"type": "agent_message", "text": ""},
+	})
+	if _, ok := parse(ev); ok {
+		t.Error("agent_message with empty text should be skipped")
+	}
+
+	// turn.completed is skipped (usage handled by ParseUsageLine)
+	ev, _ = json.Marshal(map[string]any{
+		"type":  "turn.completed",
+		"usage": map[string]any{"input_tokens": 100, "output_tokens": 50},
+	})
+	if _, ok := parse(ev); ok {
+		t.Error("turn.completed should be skipped by part parser")
+	}
+
+	// invalid JSON is skipped
+	if _, ok := parse([]byte("{bad json")); ok {
+		t.Error("invalid JSON should be skipped")
+	}
+}
+
+// ── CodexParseUsageLine ──────────────────────────────────────────────────────
+
+func TestCodexParseUsageLine(t *testing.T) {
+	// turn.completed with all token fields
+	ev, _ := json.Marshal(map[string]any{
+		"type": "turn.completed",
+		"usage": map[string]any{
+			"input_tokens":        8520,
+			"cached_input_tokens": 6528,
+			"output_tokens":       9,
+		},
+	})
+	usage, ok := codexParseUsageLine(ev)
+	if !ok {
+		t.Fatal("expected usage from turn.completed")
+	}
+	if usage.InputTokens != 8520+6528 {
+		t.Errorf("InputTokens = %d, want %d", usage.InputTokens, 8520+6528)
+	}
+	if usage.OutputTokens != 9 {
+		t.Errorf("OutputTokens = %d, want %d", usage.OutputTokens, 9)
+	}
+	if usage.TotalTokens != 8520+6528+9 {
+		t.Errorf("TotalTokens = %d, want %d", usage.TotalTokens, 8520+6528+9)
+	}
+
+	// non-turn.completed events are skipped
+	ev, _ = json.Marshal(map[string]any{"type": "item.completed"})
+	if _, ok := codexParseUsageLine(ev); ok {
+		t.Error("item.completed should not produce usage")
+	}
+
+	// turn.completed with zero usage is skipped
+	ev, _ = json.Marshal(map[string]any{"type": "turn.completed", "usage": map[string]any{}})
+	if _, ok := codexParseUsageLine(ev); ok {
+		t.Error("turn.completed with zero usage should be skipped")
+	}
+
+	// invalid JSON is skipped
+	if _, ok := codexParseUsageLine([]byte("not json")); ok {
+		t.Error("invalid JSON should be skipped")
+	}
+}
+
+// ── ClaudeParseUsageLine ─────────────────────────────────────────────────────
+
+func TestClaudeParseUsageLine(t *testing.T) {
+	// result event with full usage
+	ev, _ := json.Marshal(map[string]any{
+		"type": "result",
+		"usage": map[string]any{
+			"input_tokens":                100,
+			"output_tokens":               50,
+			"cache_creation_input_tokens": 200,
+			"cache_read_input_tokens":     300,
+		},
+	})
+	usage, ok := claudeParseUsageLine(ev)
+	if !ok {
+		t.Fatal("expected usage from result event")
+	}
+	if usage.InputTokens != 100+200+300 {
+		t.Errorf("InputTokens = %d, want %d (sum of all input variants)", usage.InputTokens, 100+200+300)
+	}
+	if usage.OutputTokens != 50 {
+		t.Errorf("OutputTokens = %d, want %d", usage.OutputTokens, 50)
+	}
+	if usage.TotalTokens != 100+200+300+50 {
+		t.Errorf("TotalTokens = %d, want %d", usage.TotalTokens, 100+200+300+50)
+	}
+
+	// non-result events are skipped
+	ev, _ = json.Marshal(map[string]any{"type": "stream_event"})
+	if _, ok := claudeParseUsageLine(ev); ok {
+		t.Error("stream_event should not produce usage")
+	}
+
+	// result with zero usage is skipped
+	ev, _ = json.Marshal(map[string]any{"type": "result", "usage": map[string]any{}})
+	if _, ok := claudeParseUsageLine(ev); ok {
+		t.Error("result with zero usage should be skipped")
+	}
+}
+
+// ── GeminiParseUsageLine ─────────────────────────────────────────────────────
+
+func TestGeminiParseUsageLine(t *testing.T) {
+	// result event with stats
+	ev, _ := json.Marshal(map[string]any{
+		"type":   "result",
+		"status": "success",
+		"stats": map[string]any{
+			"total_tokens":  10267,
+			"input_tokens":  10100,
+			"output_tokens": 42,
+		},
+	})
+	usage, ok := geminiParseUsageLine(ev)
+	if !ok {
+		t.Fatal("expected usage from gemini result event")
+	}
+	if usage.InputTokens != 10100 {
+		t.Errorf("InputTokens = %d, want 10100", usage.InputTokens)
+	}
+	if usage.OutputTokens != 42 {
+		t.Errorf("OutputTokens = %d, want 42", usage.OutputTokens)
+	}
+	if usage.TotalTokens != 10267 {
+		t.Errorf("TotalTokens = %d, want 10267", usage.TotalTokens)
+	}
+
+	// non-result events are skipped
+	ev, _ = json.Marshal(map[string]any{"type": "message", "role": "assistant", "content": "hi"})
+	if _, ok := geminiParseUsageLine(ev); ok {
+		t.Error("message event should not produce usage")
+	}
+
+	// result with zero tokens is skipped
+	ev, _ = json.Marshal(map[string]any{"type": "result", "status": "success", "stats": map[string]any{}})
+	if _, ok := geminiParseUsageLine(ev); ok {
+		t.Error("result with zero tokens should be skipped")
+	}
+}
+
+// ── Integration: stream with codex JSONL output ──────────────────────────────
+
+func TestStreamWithCodexParser(t *testing.T) {
+	jsonLines := strings.Join([]string{
+		`{"type":"thread.started","thread_id":"t1"}`,
+		`{"type":"turn.started"}`,
+		`{"type":"item.started","item":{"type":"command_execution","command":"ls"}}`,
+		`{"type":"item.completed","item":{"type":"command_execution","command":"ls","aggregated_output":"file.txt","exit_code":0}}`,
+		`{"type":"item.completed","item":{"type":"agent_message","text":"The directory contains file.txt"}}`,
+		`{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":50,"output_tokens":20}}`,
+	}, "\n") + "\n"
+
+	tmpDir := t.TempDir()
+	tmpFile := filepath.Join(tmpDir, "codex.jsonl")
+	if err := os.WriteFile(tmpFile, []byte(jsonLines), 0o644); err != nil {
+		t.Fatalf("write temp file: %v", err)
+	}
+
+	readCmd := "cat " + strings.ReplaceAll(tmpFile, "\\", "/")
+	spec := CLISpec{
+		ModelID:       "test-codex",
+		ModelName:     "Test Codex",
+		Binary:        "bash",
+		PromptFlag:    "-p",
+		BuildArgs:     func(bool) []string { return []string{"-c", readCmd} },
+		NewPartParser: codexPartParser,
+		ParseUsageLine: codexParseUsageLine,
+	}
+	m := &cliModel{spec: spec, workingDir: tmpDir}
+	stream, err := m.Stream(context.Background(), fantasy.Call{
+		Prompt: fantasy.Prompt{fantasy.NewUserMessage("x")},
+	})
+	if err != nil {
+		t.Fatalf("Stream() error: %v", err)
+	}
+
+	var text strings.Builder
+	var finalUsage fantasy.Usage
+	var finished bool
+	for part := range stream {
+		switch part.Type {
+		case fantasy.StreamPartTypeTextDelta:
+			text.WriteString(part.Delta)
+		case fantasy.StreamPartTypeFinish:
+			finished = true
+			finalUsage = part.Usage
+		case fantasy.StreamPartTypeError:
+			t.Fatalf("unexpected error: %v", part.Error)
+		}
+	}
+
+	if !finished {
+		t.Error("expected finish part")
+	}
+	want := "The directory contains file.txt"
+	if text.String() != want {
+		t.Errorf("text = %q, want %q", text.String(), want)
+	}
+	if finalUsage.InputTokens != 150 {
+		t.Errorf("InputTokens = %d, want 150 (100+50)", finalUsage.InputTokens)
+	}
+	if finalUsage.OutputTokens != 20 {
+		t.Errorf("OutputTokens = %d, want 20", finalUsage.OutputTokens)
+	}
+}
+
+// ── Integration: stream with Gemini JSONL output ─────────────────────────────
+
+func TestStreamWithGeminiParser(t *testing.T) {
+	jsonLines := strings.Join([]string{
+		`{"type":"init","session_id":"abc","model":"auto-gemini-3"}`,
+		`{"type":"message","role":"user","content":"hello"}`,
+		`{"type":"message","role":"assistant","content":"Hello ","delta":true}`,
+		`{"type":"message","role":"assistant","content":"world!","delta":true}`,
+		`{"type":"result","status":"success","stats":{"total_tokens":15,"input_tokens":10,"output_tokens":5}}`,
+	}, "\n") + "\n"
+
+	tmpDir := t.TempDir()
+	tmpFile := filepath.Join(tmpDir, "gemini.jsonl")
+	if err := os.WriteFile(tmpFile, []byte(jsonLines), 0o644); err != nil {
+		t.Fatalf("write temp file: %v", err)
+	}
+
+	readCmd := "cat " + strings.ReplaceAll(tmpFile, "\\", "/")
+	spec := CLISpec{
+		ModelID:        "test-gemini",
+		ModelName:      "Test Gemini",
+		Binary:         "bash",
+		PromptFlag:     "-p",
+		BuildArgs:      func(bool) []string { return []string{"-c", readCmd} },
+		NewPartParser:  geminiPartParser,
+		ParseUsageLine: geminiParseUsageLine,
+	}
+	m := &cliModel{spec: spec, workingDir: tmpDir}
+	stream, err := m.Stream(context.Background(), fantasy.Call{
+		Prompt: fantasy.Prompt{fantasy.NewUserMessage("x")},
+	})
+	if err != nil {
+		t.Fatalf("Stream() error: %v", err)
+	}
+
+	var text strings.Builder
+	var finalUsage fantasy.Usage
+	var finished bool
+	for part := range stream {
+		switch part.Type {
+		case fantasy.StreamPartTypeTextDelta:
+			text.WriteString(part.Delta)
+		case fantasy.StreamPartTypeFinish:
+			finished = true
+			finalUsage = part.Usage
+		case fantasy.StreamPartTypeError:
+			t.Fatalf("unexpected error: %v", part.Error)
+		}
+	}
+
+	if !finished {
+		t.Error("expected finish part")
+	}
+	if text.String() != "Hello world!" {
+		t.Errorf("text = %q, want %q", text.String(), "Hello world!")
+	}
+	if finalUsage.TotalTokens != 15 {
+		t.Errorf("TotalTokens = %d, want 15", finalUsage.TotalTokens)
+	}
+	if finalUsage.InputTokens != 10 {
+		t.Errorf("InputTokens = %d, want 10", finalUsage.InputTokens)
+	}
+	if finalUsage.OutputTokens != 5 {
+		t.Errorf("OutputTokens = %d, want 5", finalUsage.OutputTokens)
+	}
+}
+
+// ── Spec invariants ──────────────────────────────────────────────────────────
+
+func TestAllSpecsHaveUniqueIDs(t *testing.T) {
+	seen := make(map[string]bool)
+	for _, spec := range All {
+		if seen[spec.ModelID] {
+			t.Errorf("duplicate ModelID: %q", spec.ModelID)
+		}
+		seen[spec.ModelID] = true
+	}
+}
+
+func TestCodexSpecsHaveAlwaysStdin(t *testing.T) {
+	for _, spec := range All {
+		if spec.Binary == "codex" && !spec.AlwaysStdin {
+			t.Errorf("codex spec %q must have AlwaysStdin=true", spec.ModelID)
+		}
+	}
+}
+
+func TestQwenSpecHasAlwaysStdin(t *testing.T) {
+	for _, spec := range All {
+		if spec.Binary == "qwen" && !spec.AlwaysStdin {
+			t.Errorf("qwen spec %q must have AlwaysStdin=true", spec.ModelID)
+		}
+	}
+}
+
+func TestCodexSpecsHaveCorrectBinary(t *testing.T) {
+	codexIDs := []string{
+		"cli-codex",
+		"cli-codex-gpt-5-4",
+		"cli-codex-gpt-5-2",
+		"cli-codex-max",
+		"cli-codex-gpt-5-2-base",
+		"cli-codex-mini",
+	}
+	specsByID := make(map[string]CLISpec)
+	for _, s := range All {
+		specsByID[s.ModelID] = s
+	}
+	for _, id := range codexIDs {
+		spec, ok := specsByID[id]
+		if !ok {
+			t.Errorf("missing expected codex spec %q", id)
+			continue
+		}
+		if spec.Binary != "codex" {
+			t.Errorf("spec %q has Binary=%q, want 'codex'", id, spec.Binary)
+		}
+		if spec.NewPartParser == nil {
+			t.Errorf("spec %q has nil NewPartParser", id)
+		}
+		if spec.ParseUsageLine == nil {
+			t.Errorf("spec %q has nil ParseUsageLine", id)
 		}
 	}
 }

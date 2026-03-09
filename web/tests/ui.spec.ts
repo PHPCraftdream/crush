@@ -46,8 +46,8 @@ test("header shows token usage for active session", async ({ page }) => {
     type: "sessions_list",
     payload: [makeSession({ ID: "tok-1", Title: "Token Session", PromptTokens: 1200, CompletionTokens: 800 })],
   });
-  await expect(page.getByText("Token Session")).toBeVisible({ timeout: 3000 });
-  await page.getByText("Token Session").click();
+  await expect(page.getByText("Token Session").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("Token Session").first().click();
   // 1200 + 800 = 2000 → formatTokens → "2.0k" — badge has a title containing "tokens"
   await expect(page.locator("header span[title*='token']")).toBeVisible({ timeout: 2000 });
   await expect(page.locator("header").getByText(/2\.0k/)).toBeVisible({ timeout: 2000 });
@@ -59,8 +59,8 @@ test("header shows busy dots when agent is working", async ({ page }) => {
     type: "sessions_list",
     payload: [makeSession({ ID: "hdr-busy", Title: "Busy Header" })],
   });
-  await expect(page.getByText("Busy Header")).toBeVisible({ timeout: 3000 });
-  await page.getByText("Busy Header").click();
+  await expect(page.getByText("Busy Header").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("Busy Header").first().click();
   await sendMockWSMessage(page, {
     type: "agent_busy",
     payload: { SessionID: "hdr-busy", Busy: true },
@@ -120,7 +120,7 @@ test("sidebar shows busy pulse for busy session", async ({ page }) => {
     type: "agent_busy",
     payload: { SessionID: "sb-busy", Busy: true },
   });
-  const sessionItem = page.getByText("Busy One").locator("..");
+  const sessionItem = page.getByText("Busy One").first().locator("..");
   await expect(sessionItem.locator(".animate-pulse")).toBeVisible({ timeout: 2000 });
 });
 
@@ -134,7 +134,7 @@ test("sidebar busy pulse disappears when agent done", async ({ page }) => {
     type: "agent_busy",
     payload: { SessionID: "sb-done", Busy: true },
   });
-  const sessionItem = page.getByText("Done Session").locator("..");
+  const sessionItem = page.getByText("Done Session").first().locator("..");
   await expect(sessionItem.locator(".animate-pulse")).toBeVisible({ timeout: 2000 });
 
   await sendMockWSMessage(page, {
@@ -190,8 +190,8 @@ test("permission dialog appears on permission_request", async ({ page }) => {
     type: "sessions_list",
     payload: [makeSession({ ID: "perm-1", Title: "Perm Session" })],
   });
-  await expect(page.getByText("Perm Session")).toBeVisible({ timeout: 3000 });
-  await page.getByText("Perm Session").click();
+  await expect(page.getByText("Perm Session").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("Perm Session").first().click();
   await sendMockWSMessage(page, {
     type: "permission_request",
     payload: {
@@ -218,8 +218,8 @@ test("permission dialog disappears on permission_notification", async ({ page })
     type: "sessions_list",
     payload: [makeSession({ ID: "perm-2", Title: "Perm2" })],
   });
-  await expect(page.getByText("Perm2")).toBeVisible({ timeout: 3000 });
-  await page.getByText("Perm2").click();
+  await expect(page.getByText("Perm2").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("Perm2").first().click();
   await sendMockWSMessage(page, {
     type: "permission_request",
     payload: {
