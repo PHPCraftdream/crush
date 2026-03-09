@@ -305,7 +305,7 @@ export function Chat() {
         </div>
       )}
 
-      {activeSessionID && todos.length > 0 && (
+      {activeSessionID && (
         <TodoList sessionID={activeSessionID} todos={todos} />
       )}
 

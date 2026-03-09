@@ -67,8 +67,59 @@ function TodoRow({
   return (
     <div
       data-testid="todo-row"
-      className="group flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-base-overlay transition-colors"
+      className="group flex items-center gap-1.5 px-2 py-1.5 rounded-lg hover:bg-base-overlay transition-colors"
     >
+      {/* Actions — LEFT side, visible on hover */}
+      <div className="flex items-center gap-0.5 shrink-0">
+        {editing ? (
+          <button
+            data-testid="todo-save"
+            onClick={commitEdit}
+            title="Save"
+            className="w-5 h-5 flex items-center justify-center text-green hover:opacity-70 transition-opacity text-[13px] leading-none"
+          >
+            ✓
+          </button>
+        ) : (
+          <div className="flex items-center gap-0 opacity-0 group-hover:opacity-100 transition-opacity">
+            <button
+              data-testid="todo-edit"
+              onClick={startEdit}
+              title="Edit"
+              className="w-5 h-5 flex items-center justify-center text-text-subtle hover:text-accent transition-colors text-[12px] leading-none"
+            >
+              ✏
+            </button>
+            <button
+              data-testid="todo-move-up"
+              onClick={() => onMove(-1)}
+              disabled={index === 0}
+              title="Move up"
+              className="w-4 h-5 flex items-center justify-center text-text-subtle hover:text-text disabled:opacity-20 transition-colors text-[12px] leading-none"
+            >
+              ↑
+            </button>
+            <button
+              data-testid="todo-move-down"
+              onClick={() => onMove(1)}
+              disabled={index === total - 1}
+              title="Move down"
+              className="w-4 h-5 flex items-center justify-center text-text-subtle hover:text-text disabled:opacity-20 transition-colors text-[12px] leading-none"
+            >
+              ↓
+            </button>
+            <button
+              data-testid="todo-delete"
+              onClick={onDelete}
+              title="Delete"
+              className="w-5 h-5 flex items-center justify-center text-text-subtle hover:text-red transition-colors text-[14px] leading-none"
+            >
+              ×
+            </button>
+          </div>
+        )}
+      </div>
+
       {/* Status toggle */}
       <button
         data-testid="todo-status-btn"
@@ -101,59 +152,49 @@ function TodoRow({
           </span>
         )}
       </div>
+    </div>
+  );
+}
 
-      {/* Actions */}
-      <div className="flex items-center gap-0.5 shrink-0">
-        {editing ? (
-          /* Save button — always visible while editing */
-          <button
-            data-testid="todo-save"
-            onClick={commitEdit}
-            title="Save"
-            className="px-1 text-green hover:opacity-70 transition-opacity text-[14px] leading-none"
-          >
-            ✓
-          </button>
-        ) : (
-          /* Edit + reorder + delete — visible on row hover */
-          <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
-            <button
-              data-testid="todo-edit"
-              onClick={startEdit}
-              title="Edit"
-              className="px-1 text-text-subtle hover:text-accent transition-colors text-[13px] leading-none"
-            >
-              ✏
-            </button>
-            <button
-              data-testid="todo-move-up"
-              onClick={() => onMove(-1)}
-              disabled={index === 0}
-              title="Move up"
-              className="px-0.5 text-text-subtle hover:text-text disabled:opacity-20 transition-colors text-[13px] leading-none"
-            >
-              ↑
-            </button>
-            <button
-              data-testid="todo-move-down"
-              onClick={() => onMove(1)}
-              disabled={index === total - 1}
-              title="Move down"
-              className="px-0.5 text-text-subtle hover:text-text disabled:opacity-20 transition-colors text-[13px] leading-none"
-            >
-              ↓
-            </button>
-            <button
-              data-testid="todo-delete"
-              onClick={onDelete}
-              title="Delete"
-              className="px-1 text-text-subtle hover:text-red transition-colors text-[13px] leading-none ml-0.5"
-            >
-              ×
-            </button>
-          </div>
-        )}
-      </div>
+// ── New task input row ────────────────────────────────────────────────────────
+
+function AddTaskRow({
+  onAdd,
+  onCancel,
+}: {
+  onAdd: (content: string) => void;
+  onCancel: () => void;
+}) {
+  const [draft, setDraft] = useState("");
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    inputRef.current?.focus();
+  }, []);
+
+  function commit() {
+    const trimmed = draft.trim();
+    if (trimmed) onAdd(trimmed);
+    else onCancel();
+  }
+
+  function onKey(e: React.KeyboardEvent<HTMLInputElement>) {
+    if (e.key === "Enter") commit();
+    if (e.key === "Escape") onCancel();
+  }
+
+  return (
+    <div className="flex items-center gap-1.5 px-2 py-1.5">
+      <span className="text-text-subtle text-[15px] leading-none shrink-0 w-[58px]">○</span>
+      <input
+        ref={inputRef}
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onKeyDown={onKey}
+        onBlur={commit}
+        placeholder="New task…"
+        className="flex-1 min-w-0 text-sm bg-canvas border border-accent/40 rounded px-1.5 py-0.5 outline-none text-text placeholder:text-text-muted"
+      />
     </div>
   );
 }
@@ -162,10 +203,10 @@ function TodoRow({
 
 export function TodoList({ sessionID, todos }: { sessionID: string; todos: Todo[] }) {
   const [collapsed, setCollapsed] = useState(false);
-
-  if (todos.length === 0) return null;
+  const [addingNew, setAddingNew] = useState(false);
 
   const completed = todos.filter((t) => t.status === "completed").length;
+  const isEmpty = todos.length === 0;
 
   function update(next: Todo[]) {
     updateTodos(sessionID, next);
@@ -189,31 +230,58 @@ export function TodoList({ sessionID, todos }: { sessionID: string; todos: Todo[
     update(next);
   }
 
+  function addTask(content: string) {
+    update([...todos, { content, status: "pending", active_form: "" }]);
+    setAddingNew(false);
+  }
+
+  function startAdding() {
+    setCollapsed(false);
+    setAddingNew(true);
+  }
+
   return (
     <div
       data-testid="todo-list"
       className="shrink-0 border-t border-surface bg-base-subtle/40"
     >
       {/* Header */}
-      <button
-        data-testid="todo-list-toggle"
-        onClick={() => setCollapsed((c) => !c)}
-        className="w-full flex items-center gap-2 px-4 py-2 text-left hover:bg-base-overlay/50 transition-colors"
-      >
-        <span className={`text-text-subtle text-[11px] transition-transform inline-block ${collapsed ? "" : "rotate-90"}`}>
-          ▶
-        </span>
-        <span className="text-xs font-semibold text-text-subtle uppercase tracking-wider">
-          Tasks
-        </span>
-        <span className="text-xs text-text-muted ml-1">
-          {completed}/{todos.length}
-        </span>
-      </button>
+      <div className="flex items-center">
+        <button
+          data-testid="todo-list-toggle"
+          onClick={() => setCollapsed((c) => !c)}
+          className="flex-1 flex items-center gap-2 px-4 py-2 text-left hover:bg-base-overlay/50 transition-colors"
+        >
+          <span className={`text-text-subtle text-[11px] transition-transform inline-block ${collapsed ? "" : "rotate-90"}`}>
+            ▶
+          </span>
+          <span className="text-xs font-semibold text-text-subtle uppercase tracking-wider">
+            Tasks
+          </span>
+          {!isEmpty && (
+            <span className="text-xs text-text-muted ml-1">
+              {completed}/{todos.length}
+            </span>
+          )}
+        </button>
+
+        {/* Add task button */}
+        <button
+          data-testid="todo-add-btn"
+          onClick={startAdding}
+          title="Add task"
+          className="px-3 py-2 text-text-subtle hover:text-text transition-colors text-[18px] leading-none"
+        >
+          +
+        </button>
+      </div>
 
       {/* List */}
       {!collapsed && (
         <div className="px-2 pb-2">
+          {isEmpty && !addingNew && (
+            <p className="text-xs text-text-muted px-2 py-1">No tasks yet.</p>
+          )}
           {todos.map((t, i) => (
             <TodoRow
               key={i}
@@ -225,6 +293,12 @@ export function TodoList({ sessionID, todos }: { sessionID: string; todos: Todo[
               onMove={(dir) => moveTodo(i, dir)}
             />
           ))}
+          {addingNew && (
+            <AddTaskRow
+              onAdd={addTask}
+              onCancel={() => setAddingNew(false)}
+            />
+          )}
         </div>
       )}
     </div>
