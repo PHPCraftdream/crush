@@ -26,20 +26,20 @@ type CreatePermissionRequest struct {
 }
 
 type PermissionNotification struct {
-	ToolCallID string `json:"tool_call_id"`
-	Granted    bool   `json:"granted"`
-	Denied     bool   `json:"denied"`
+	ToolCallID string
+	Granted    bool
+	Denied     bool
 }
 
 type PermissionRequest struct {
-	ID          string `json:"id"`
-	SessionID   string `json:"session_id"`
-	ToolCallID  string `json:"tool_call_id"`
-	ToolName    string `json:"tool_name"`
-	Description string `json:"description"`
-	Action      string `json:"action"`
-	Params      any    `json:"params"`
-	Path        string `json:"path"`
+	ID          string
+	SessionID   string
+	ToolCallID  string
+	ToolName    string
+	Description string
+	Action      string
+	Params      any
+	Path        string
 }
 
 type Service interface {

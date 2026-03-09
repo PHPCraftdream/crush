@@ -1,33 +1,26 @@
 package cmd
 
 import (
-	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
+	"time"
 
-	tea "charm.land/bubbletea/v2"
-	"charm.land/lipgloss/v2"
-	"github.com/charmbracelet/colorprofile"
 	"github.com/charmbracelet/crush/internal/app"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/db"
 	"github.com/charmbracelet/crush/internal/event"
 	"github.com/charmbracelet/crush/internal/projects"
-	"github.com/charmbracelet/crush/internal/ui/common"
-	ui "github.com/charmbracelet/crush/internal/ui/model"
+	"github.com/charmbracelet/crush/internal/server"
 	"github.com/charmbracelet/crush/internal/version"
 	"github.com/charmbracelet/fang"
-	uv "github.com/charmbracelet/ultraviolet"
-	"github.com/charmbracelet/x/ansi"
-	"github.com/charmbracelet/x/exp/charmtone"
 	"github.com/charmbracelet/x/term"
+	crushweb "github.com/charmbracelet/crush/web"
+	"github.com/pkg/browser"
 	"github.com/spf13/cobra"
 )
 
@@ -37,6 +30,9 @@ func init() {
 	rootCmd.PersistentFlags().BoolP("debug", "d", false, "Debug")
 	rootCmd.Flags().BoolP("help", "h", false, "Help")
 	rootCmd.Flags().BoolP("yolo", "y", false, "Automatically accept all permissions (dangerous mode)")
+	rootCmd.Flags().StringP("host", "H", "localhost", "Web mode: host to listen on")
+	rootCmd.Flags().IntP("port", "p", 0, "Web mode: port to listen on (0 = random free port)")
+	rootCmd.Flags().Bool("no-open", false, "Web mode: do not open browser automatically")
 
 	rootCmd.AddCommand(
 		runCmd,
@@ -77,70 +73,48 @@ crush run "Explain the use of context in Go"
 crush -y
   `,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		app, err := setupAppWithProgressBar(cmd)
-		if err != nil {
-			return err
-		}
-		defer app.Shutdown()
-
-		event.AppInitialized()
-
-		// Set up the TUI.
-		var env uv.Environ = os.Environ()
-
-		com := common.DefaultCommon(app)
-		model := ui.New(com)
-
-		program := tea.NewProgram(
-			model,
-			tea.WithEnvironment(env),
-			tea.WithContext(cmd.Context()),
-			tea.WithFilter(ui.MouseEventFilter), // Filter mouse events based on focus state
-		)
-		go app.Subscribe(program)
-
-		if _, err := program.Run(); err != nil {
-			event.Error(err)
-			slog.Error("TUI run error", "error", err)
-			return errors.New("Crush crashed. If metrics are enabled, we were notified about it. If you'd like to report it, please copy the stacktrace above and open an issue at https://github.com/charmbracelet/crush/issues/new?template=bug.yml") //nolint:staticcheck
-		}
-		return nil
+		return runWebMode(cmd)
 	},
 }
 
-var heartbit = lipgloss.NewStyle().Foreground(charmtone.Dolly).SetString(`
-    ▄▄▄▄▄▄▄▄    ▄▄▄▄▄▄▄▄
-  ███████████  ███████████
-████████████████████████████
-████████████████████████████
-██████████▀██████▀██████████
-██████████ ██████ ██████████
-▀▀██████▄████▄▄████▄██████▀▀
-  ████████████████████████
-    ████████████████████
-       ▀▀██████████▀▀
-           ▀▀▀▀▀▀
-`)
+func runWebMode(cmd *cobra.Command) error {
+	host, _ := cmd.Flags().GetString("host")
+	port, _ := cmd.Flags().GetInt("port")
+	noOpen, _ := cmd.Flags().GetBool("no-open")
 
-// copied from cobra:
-const defaultVersionTemplate = `{{with .DisplayName}}{{printf "%s " .}}{{end}}{{printf "version %s" .Version}}
-`
+	a, err := setupApp(cmd)
+	if err != nil {
+		return err
+	}
+	defer a.Shutdown()
+
+	event.AppInitialized()
+
+	addr := fmt.Sprintf("%s:%d", host, port)
+	srv := server.New(a, addr, crushweb.FS())
+	token := srv.Token()
+
+	onReady := func(boundAddr string) {
+		url := fmt.Sprintf("http://%s", boundAddr)
+		fmt.Println()
+		fmt.Printf("  crush web UI  →  %s\n", url)
+		fmt.Printf("  Access token  →  %s\n", token)
+		fmt.Println()
+
+		if !noOpen {
+			go func() {
+				time.Sleep(200 * time.Millisecond)
+				if err := browser.OpenURL(url); err != nil {
+					slog.Debug("web: could not open browser", "err", err)
+				}
+			}()
+		}
+	}
+
+	return srv.Start(cmd.Context(), onReady)
+}
 
 func Execute() {
-	// NOTE: very hacky: we create a colorprofile writer with STDOUT, then make
-	// it forward to a bytes.Buffer, write the colored heartbit to it, and then
-	// finally prepend it in the version template.
-	// Unfortunately cobra doesn't give us a way to set a function to handle
-	// printing the version, and PreRunE runs after the version is already
-	// handled, so that doesn't work either.
-	// This is the only way I could find that works relatively well.
-	if term.IsTerminal(os.Stdout.Fd()) {
-		var b bytes.Buffer
-		w := colorprofile.NewWriter(os.Stdout, os.Environ())
-		w.Forward = &b
-		_, _ = w.WriteString(heartbit.String())
-		rootCmd.SetVersionTemplate(b.String() + "\n" + defaultVersionTemplate)
-	}
 	if err := fang.Execute(
 		context.Background(),
 		rootCmd,
@@ -149,34 +123,6 @@ func Execute() {
 	); err != nil {
 		os.Exit(1)
 	}
-}
-
-// supportsProgressBar tries to determine whether the current terminal supports
-// progress bars by looking into environment variables.
-func supportsProgressBar() bool {
-	if !term.IsTerminal(os.Stderr.Fd()) {
-		return false
-	}
-	termProg := os.Getenv("TERM_PROGRAM")
-	_, isWindowsTerminal := os.LookupEnv("WT_SESSION")
-
-	return isWindowsTerminal || strings.Contains(strings.ToLower(termProg), "ghostty")
-}
-
-func setupAppWithProgressBar(cmd *cobra.Command) (*app.App, error) {
-	app, err := setupApp(cmd)
-	if err != nil {
-		return nil, err
-	}
-
-	// Check if progress bar is enabled in config (defaults to true if nil)
-	progressEnabled := app.Config().Options.Progress == nil || *app.Config().Options.Progress
-	if progressEnabled && supportsProgressBar() {
-		_, _ = fmt.Fprintf(os.Stderr, ansi.SetIndeterminateProgressBar)
-		defer func() { _, _ = fmt.Fprintf(os.Stderr, ansi.ResetProgressBar) }()
-	}
-
-	return app, nil
 }
 
 // setupApp handles the common setup logic for both interactive and non-interactive modes.

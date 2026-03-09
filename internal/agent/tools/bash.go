@@ -17,6 +17,7 @@ import (
 	"github.com/charmbracelet/crush/internal/fsext"
 	"github.com/charmbracelet/crush/internal/permission"
 	"github.com/charmbracelet/crush/internal/shell"
+	"github.com/charmbracelet/crush/internal/stringext"
 )
 
 type BashParams struct {
@@ -415,10 +416,10 @@ func truncateOutput(content string) string {
 	}
 
 	halfLength := MaxOutputLength / 2
-	start := content[:halfLength]
-	end := content[len(content)-halfLength:]
+	start, startPos := stringext.TruncateAt(content, halfLength)
+	end, endStartPos := stringext.TruncateEndAt(content, halfLength)
 
-	truncatedLinesCount := countLines(content[halfLength : len(content)-halfLength])
+	truncatedLinesCount := countLines(content[startPos:endStartPos])
 	return fmt.Sprintf("%s\n\n... [%d lines truncated] ...\n\n%s", start, truncatedLinesCount, end)
 }
 

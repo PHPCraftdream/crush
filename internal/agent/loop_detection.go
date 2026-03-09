@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
+	"log/slog"
 
 	"charm.land/fantasy"
 )
@@ -23,6 +24,7 @@ func hasRepeatedToolCalls(steps []fantasy.StepResult, windowSize, maxRepeats int
 
 	window := steps[len(steps)-windowSize:]
 	counts := make(map[string]int)
+	toolNames := make(map[string]string) // signature -> tool names for logging
 
 	for _, step := range window {
 		sig := getToolInteractionSignature(step.Content)
@@ -30,7 +32,15 @@ func hasRepeatedToolCalls(steps []fantasy.StepResult, windowSize, maxRepeats int
 			continue
 		}
 		counts[sig]++
+		if _, exists := toolNames[sig]; !exists {
+			// Extract tool names for logging
+			calls := step.Content.ToolCalls()
+			if len(calls) > 0 {
+				toolNames[sig] = calls[0].ToolName
+			}
+		}
 		if counts[sig] > maxRepeats {
+			slog.Debug("Loop detected", "tool", toolNames[sig], "count", counts[sig], "threshold", maxRepeats)
 			return true
 		}
 	}

@@ -14,6 +14,7 @@ import (
 	md "github.com/JohannesKaufmann/html-to-markdown"
 	"github.com/PuerkitoBio/goquery"
 	"github.com/charmbracelet/crush/internal/permission"
+	"github.com/charmbracelet/crush/internal/stringext"
 )
 
 const FetchToolName = "fetch"
@@ -162,7 +163,7 @@ func NewFetchTool(permissions permission.Service, workingDir string, client *htt
 			}
 			// truncate content if it exceeds max read size
 			if int64(len(content)) > MaxReadSize {
-				content = content[:MaxReadSize]
+				content = stringext.Truncate(content, int(MaxReadSize))
 				content += fmt.Sprintf("\n\n[Content truncated to %d bytes]", MaxReadSize)
 			}
 

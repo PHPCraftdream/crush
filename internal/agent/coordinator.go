@@ -39,14 +39,23 @@ import (
 	"charm.land/fantasy/providers/openaicompat"
 	"charm.land/fantasy/providers/openrouter"
 	"charm.land/fantasy/providers/vercel"
+	"github.com/charmbracelet/crush/internal/agent/cliprovider"
 	openaisdk "github.com/openai/openai-go/v2/option"
 	"github.com/qjebbs/go-jsons"
 )
+
+// ModelOverride allows callers to specify per-run model overrides (provider + model ID).
+type ModelOverride struct {
+	Provider string
+	Model    string
+}
 
 type Coordinator interface {
 	// INFO: (kujtim) this is not used yet we will use this when we have multiple agents
 	// SetMainAgent(string)
 	Run(ctx context.Context, sessionID, prompt string, attachments ...message.Attachment) (*fantasy.AgentResult, error)
+	// RunWithOverrides is like Run but allows overriding the large and/or small model for this call.
+	RunWithOverrides(ctx context.Context, sessionID, prompt string, large, small *ModelOverride, attachments ...message.Attachment) (*fantasy.AgentResult, error)
 	Cancel(sessionID string)
 	CancelAll()
 	IsSessionBusy(sessionID string) bool
@@ -193,6 +202,120 @@ func (c *coordinator) Run(ctx context.Context, sessionID string, prompt string, 
 	}
 
 	return result, originalErr
+}
+
+// RunWithOverrides implements Coordinator. It is like Run but uses the given
+// large/small model overrides instead of the global config defaults.
+func (c *coordinator) RunWithOverrides(ctx context.Context, sessionID, prompt string, large, small *ModelOverride, attachments ...message.Attachment) (*fantasy.AgentResult, error) {
+	if err := c.readyWg.Wait(); err != nil {
+		return nil, err
+	}
+
+	// Get base model configs from global config.
+	largeCfg, ok := c.cfg.Models[config.SelectedModelTypeLarge]
+	if !ok {
+		return nil, errors.New("large model not selected")
+	}
+	smallCfg, ok := c.cfg.Models[config.SelectedModelTypeSmall]
+	if !ok {
+		return nil, errors.New("small model not selected")
+	}
+
+	// Apply per-call overrides.
+	if large != nil {
+		slog.Info("RunWithOverrides: applying large model override", "provider", large.Provider, "model", large.Model)
+		largeCfg.Provider = large.Provider
+		largeCfg.Model = large.Model
+	}
+	if small != nil {
+		slog.Info("RunWithOverrides: applying small model override", "provider", small.Provider, "model", small.Model)
+		smallCfg.Provider = small.Provider
+		smallCfg.Model = small.Model
+	}
+
+	largeModel, smallModel, err := c.buildModelsFromCfg(ctx, largeCfg, smallCfg, false)
+	if err != nil {
+		slog.Error("RunWithOverrides: failed to build override models, falling back to global config", "err", err)
+		// Fall back to global config so the user still gets a response.
+		return c.Run(ctx, sessionID, prompt, attachments...)
+	}
+	slog.Info("RunWithOverrides: using overridden models", "large", largeCfg.Model, "small", smallCfg.Model)
+	c.currentAgent.SetModels(largeModel, smallModel)
+
+	model := c.currentAgent.Model()
+	maxTokens := model.CatwalkCfg.DefaultMaxTokens
+	if model.ModelCfg.MaxTokens != 0 {
+		maxTokens = model.ModelCfg.MaxTokens
+	}
+
+	if !model.CatwalkCfg.SupportsImages && attachments != nil {
+		filteredAttachments := make([]message.Attachment, 0, len(attachments))
+		for _, att := range attachments {
+			if att.IsText() {
+				filteredAttachments = append(filteredAttachments, att)
+			}
+		}
+		attachments = filteredAttachments
+	}
+
+	providerCfg, ok := c.cfg.Providers.Get(model.ModelCfg.Provider)
+	if !ok {
+		return nil, errors.New("model provider not configured")
+	}
+
+	mergedOptions, temp, topP, topK, freqPenalty, presPenalty := mergeCallOptions(model, providerCfg)
+
+	if providerCfg.OAuthToken != nil && providerCfg.OAuthToken.IsExpired() {
+		slog.Debug("Token needs to be refreshed", "provider", providerCfg.ID)
+		if err := c.refreshOAuth2Token(ctx, providerCfg); err != nil {
+			return nil, err
+		}
+	}
+
+	run := func() (*fantasy.AgentResult, error) {
+		return c.currentAgent.Run(ctx, SessionAgentCall{
+			SessionID:        sessionID,
+			Prompt:           prompt,
+			Attachments:      attachments,
+			MaxOutputTokens:  maxTokens,
+			ProviderOptions:  mergedOptions,
+			Temperature:      temp,
+			TopP:             topP,
+			TopK:             topK,
+			FrequencyPenalty: freqPenalty,
+			PresencePenalty:  presPenalty,
+		})
+	}
+	result, originalErr := run()
+
+	if c.isUnauthorized(originalErr) {
+		switch {
+		case providerCfg.OAuthToken != nil:
+			slog.Debug("Received 401. Refreshing token and retrying", "provider", providerCfg.ID)
+			if err := c.refreshOAuth2Token(ctx, providerCfg); err != nil {
+				return nil, originalErr
+			}
+			return run()
+		case strings.Contains(providerCfg.APIKeyTemplate, "$"):
+			slog.Debug("Received 401. Refreshing API Key template and retrying", "provider", providerCfg.ID)
+			if err := c.refreshApiKeyTemplate(ctx, providerCfg); err != nil {
+				return nil, originalErr
+			}
+			return run()
+		default:
+			// Override model failed with auth error — fall back to global config.
+			slog.Error("RunWithOverrides: override model unauthorized, falling back to global config",
+				"provider", largeCfg.Provider, "model", largeCfg.Model, "err", originalErr)
+			return c.Run(ctx, sessionID, prompt, attachments...)
+		}
+	}
+
+	if originalErr != nil {
+		// Generic run failure — surface the error so the caller can handle it.
+		return nil, originalErr
+	}
+
+	return result, nil
 }
 
 func getProviderOptions(model Model, providerCfg config.ProviderConfig) fantasy.ProviderOptions {
@@ -503,7 +626,11 @@ func (c *coordinator) buildAgentModels(ctx context.Context, isSubAgent bool) (Mo
 	if !ok {
 		return Model{}, Model{}, errors.New("small model not selected")
 	}
+	return c.buildModelsFromCfg(ctx, largeModelCfg, smallModelCfg, isSubAgent)
+}
 
+// buildModelsFromCfg builds Model objects from explicit SelectedModel configs.
+func (c *coordinator) buildModelsFromCfg(ctx context.Context, largeModelCfg, smallModelCfg config.SelectedModel, isSubAgent bool) (Model, Model, error) {
 	largeProviderCfg, ok := c.cfg.Providers.Get(largeModelCfg.Provider)
 	if !ok {
 		return Model{}, Model{}, errors.New("large model provider not configured")
@@ -832,6 +959,8 @@ func (c *coordinator) buildProvider(providerCfg config.ProviderConfig, model con
 		return c.buildOpenaiCompatProvider(baseURL, apiKey, headers, providerCfg.ExtraBody, providerCfg.ID, isSubAgent)
 	case hyper.Name:
 		return c.buildHyperProvider(baseURL, apiKey)
+	case cliprovider.ProviderType:
+		return cliprovider.New(c.cfg.WorkingDir(), c.permissions.SkipRequests, c.permissions), nil
 	default:
 		return nil, fmt.Errorf("provider type not supported: %q", providerCfg.Type)
 	}

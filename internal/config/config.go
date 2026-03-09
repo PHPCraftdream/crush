@@ -200,8 +200,9 @@ type LSPConfig struct {
 type TUIOptions struct {
 	CompactMode bool   `json:"compact_mode,omitempty" jsonschema:"description=Enable compact mode for the TUI interface,default=false"`
 	DiffMode    string `json:"diff_mode,omitempty" jsonschema:"description=Diff mode for the TUI interface,enum=unified,enum=split"`
-	// Here we can add themes later or any TUI related options
-	//
+	// Theme overrides automatic terminal background detection.
+	// Valid values: "dark", "light", or "" (auto-detect).
+	Theme string `json:"theme,omitempty" jsonschema:"description=Color theme override,enum=dark,enum=light"`
 
 	Completions Completions `json:"completions,omitzero" jsonschema:"description=Completions UI options"`
 	Transparent *bool       `json:"transparent,omitempty" jsonschema:"description=Enable transparent background for the TUI interface,default=false"`
@@ -469,6 +470,14 @@ func (c *Config) SmallModel() *catwalk.Model {
 		return nil
 	}
 	return c.GetModel(model.Provider, model.Model)
+}
+
+func (c *Config) SetTheme(theme string) error {
+	if c.Options == nil {
+		c.Options = &Options{}
+	}
+	c.Options.TUI.Theme = theme
+	return c.SetConfigField("options.tui.theme", theme)
 }
 
 func (c *Config) SetCompactMode(enabled bool) error {

@@ -30,7 +30,6 @@ import (
 	"charm.land/fantasy/providers/openai"
 	"charm.land/fantasy/providers/openrouter"
 	"charm.land/fantasy/providers/vercel"
-	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/crush/internal/agent/hyper"
 	"github.com/charmbracelet/crush/internal/agent/tools"
 	"github.com/charmbracelet/crush/internal/agent/tools/mcp"
@@ -40,7 +39,6 @@ import (
 	"github.com/charmbracelet/crush/internal/permission"
 	"github.com/charmbracelet/crush/internal/session"
 	"github.com/charmbracelet/crush/internal/stringext"
-	"github.com/charmbracelet/x/exp/charmtone"
 )
 
 const (
@@ -239,6 +237,57 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 
 	var currentAssistant *message.Message
 	var shouldSummarize bool
+
+	// latestMsgCh holds at most one pending UI snapshot (latest-value semantics).
+	// A ticker goroutine drains it at ~20fps, decoupling the token arrival rate
+	// from the bubbletea render rate so streaming is visible in the UI.
+	latestMsgCh := make(chan message.Message, 1)
+	go func() {
+		ticker := time.NewTicker(50 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-genCtx.Done():
+				// Flush any final pending snapshot before exiting.
+				select {
+				case msg := <-latestMsgCh:
+					a.messages.Notify(msg)
+				default:
+				}
+				return
+			case <-ticker.C:
+				select {
+				case msg := <-latestMsgCh:
+					a.messages.Notify(msg)
+				default:
+				}
+			}
+		}
+	}()
+
+	// notifyUI enqueues the latest assistant snapshot for the ticker goroutine.
+	// It never blocks: if the channel already has a pending snapshot, the old
+	// one is discarded and replaced with the newest state.
+	notifyUI := func() error {
+		if currentAssistant == nil {
+			return nil
+		}
+		msg := currentAssistant.Clone()
+		select {
+		case latestMsgCh <- msg:
+		default:
+			// Channel full — discard stale snapshot and enqueue fresh one.
+			select {
+			case <-latestMsgCh:
+			default:
+			}
+			select {
+			case latestMsgCh <- msg:
+			default:
+			}
+		}
+		return nil
+	}
 	result, err := agent.Stream(genCtx, fantasy.AgentStreamCall{
 		Prompt:           message.PromptWithTextAttachments(call.Prompt, call.Attachments),
 		Files:            files,
@@ -305,12 +354,14 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			return callContext, prepared, err
 		},
 		OnReasoningStart: func(id string, reasoning fantasy.ReasoningContent) error {
+			slog.Debug("agent: OnReasoningStart called", "id", id)
 			currentAssistant.AppendReasoningContent(reasoning.Text)
 			return a.messages.Update(genCtx, *currentAssistant)
 		},
 		OnReasoningDelta: func(id string, text string) error {
+			slog.Debug("agent: OnReasoningDelta called", "len", len(text))
 			currentAssistant.AppendReasoningContent(text)
-			return a.messages.Update(genCtx, *currentAssistant)
+			return notifyUI()
 		},
 		OnReasoningEnd: func(id string, reasoning fantasy.ReasoningContent) error {
 			// handle anthropic signature
@@ -341,7 +392,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			}
 
 			currentAssistant.AppendContent(text)
-			return a.messages.Update(genCtx, *currentAssistant)
+			return notifyUI()
 		},
 		OnToolInputStart: func(id string, toolName string) error {
 			toolCall := message.ToolCall{
@@ -388,6 +439,12 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 				finishReason = message.FinishReasonToolUse
 			}
 			currentAssistant.AddFinish(finishReason, "", "")
+			// Drain any pending UI snapshot so the ticker goroutine does not
+			// publish a stale state after messages.Update writes the final one.
+			select {
+			case <-latestMsgCh:
+			default:
+			}
 			sessionLock.Lock()
 			defer sessionLock.Unlock()
 
@@ -495,23 +552,20 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 		var fantasyErr *fantasy.Error
 		var providerErr *fantasy.ProviderError
 		const defaultTitle = "Provider Error"
-		linkStyle := lipgloss.NewStyle().Foreground(charmtone.Guac).Underline(true)
 		if isCancelErr {
 			currentAssistant.AddFinish(message.FinishReasonCanceled, "User canceled request", "")
 		} else if isPermissionErr {
 			currentAssistant.AddFinish(message.FinishReasonPermissionDenied, "User denied permission", "")
 		} else if errors.Is(err, hyper.ErrNoCredits) {
 			url := hyper.BaseURL()
-			link := linkStyle.Hyperlink(url, "id=hyper").Render(url)
-			currentAssistant.AddFinish(message.FinishReasonError, "No credits", "You're out of credits. Add more at "+link)
+			currentAssistant.AddFinish(message.FinishReasonError, "No credits", "You're out of credits. Add more at "+url)
 		} else if errors.As(err, &providerErr) {
 			if providerErr.Message == "The requested model is not supported." {
 				url := "https://github.com/settings/copilot/features"
-				link := linkStyle.Hyperlink(url, "id=copilot").Render(url)
 				currentAssistant.AddFinish(
 					message.FinishReasonError,
 					"Copilot model not enabled",
-					fmt.Sprintf("%q is not enabled in Copilot. Go to the following page to enable it. Then, wait 5 minutes before trying again. %s", largeModel.CatwalkCfg.Name, link),
+					fmt.Sprintf("%q is not enabled in Copilot. Go to the following page to enable it. Then, wait 5 minutes before trying again. %s", largeModel.CatwalkCfg.Name, url),
 				)
 			} else {
 				currentAssistant.AddFinish(message.FinishReasonError, cmp.Or(stringext.Capitalize(providerErr.Title), defaultTitle), providerErr.Message)

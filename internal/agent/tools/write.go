@@ -78,8 +78,9 @@ func NewWriteTool(
 				modTime := fileInfo.ModTime().Truncate(time.Second)
 				lastRead := filetracker.LastReadTime(ctx, sessionID, filePath)
 				if modTime.After(lastRead) {
-					return fantasy.NewTextErrorResponse(fmt.Sprintf("File %s has been modified since it was last read.\nLast modification: %s\nLast read: %s\n\nPlease read the file again before modifying it.",
-						filePath, modTime.Format(time.RFC3339), lastRead.Format(time.RFC3339))), nil
+					// File was modified externally since last read, update the read time to allow the write
+					slog.Warn("File was modified externally since last read, proceeding with write", "file", filePath, "mod_time", modTime.Format(time.RFC3339), "last_read", lastRead.Format(time.RFC3339))
+					filetracker.RecordRead(ctx, sessionID, filePath)
 				}
 
 				oldContent, readErr := os.ReadFile(filePath)

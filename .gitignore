@@ -51,3 +51,8 @@ manpages/
 completions/crush.*sh
 .prettierignore
 .task
+/web/test-results/
+
+/web/dist/
+/web/node_modules/
+/chroma_data/

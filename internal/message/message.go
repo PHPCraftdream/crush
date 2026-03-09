@@ -24,6 +24,10 @@ type Service interface {
 	pubsub.Subscriber[Message]
 	Create(ctx context.Context, sessionID string, params CreateMessageParams) (Message, error)
 	Update(ctx context.Context, message Message) error
+	// Notify publishes a message update to the UI without writing to the database.
+	// Use this for high-frequency streaming updates where DB durability is not
+	// required on every token; call Update at the end to persist the final state.
+	Notify(message Message)
 	Get(ctx context.Context, id string) (Message, error)
 	List(ctx context.Context, sessionID string) ([]Message, error)
 	ListUserMessages(ctx context.Context, sessionID string) ([]Message, error)
@@ -109,6 +113,10 @@ func (s *service) DeleteSessionMessages(ctx context.Context, sessionID string) e
 		}
 	}
 	return nil
+}
+
+func (s *service) Notify(message Message) {
+	s.Publish(pubsub.UpdatedEvent, message.Clone())
 }
 
 func (s *service) Update(ctx context.Context, message Message) error {

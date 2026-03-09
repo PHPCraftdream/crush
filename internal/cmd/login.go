@@ -40,7 +40,7 @@ crush login copilot
 	},
 	Args: cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		app, err := setupAppWithProgressBar(cmd)
+		app, err := setupApp(cmd)
 		if err != nil {
 			return err
 		}

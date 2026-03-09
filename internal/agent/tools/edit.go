@@ -212,10 +212,9 @@ func deleteContent(edit editContext, filePath, oldString string, replaceAll bool
 
 	modTime := fileInfo.ModTime().Truncate(time.Second)
 	if modTime.After(lastRead) {
-		return fantasy.NewTextErrorResponse(
-			fmt.Sprintf("file %s has been modified since it was last read (mod time: %s, last read: %s)",
-				filePath, modTime.Format(time.RFC3339), lastRead.Format(time.RFC3339),
-			)), nil
+		// File was modified externally since last read, update the read time to allow the edit
+		slog.Warn("File was modified externally since last read, proceeding with edit", "file", filePath, "mod_time", modTime.Format(time.RFC3339), "last_read", lastRead.Format(time.RFC3339))
+		edit.filetracker.RecordRead(edit.ctx, sessionID, filePath)
 	}
 
 	content, err := os.ReadFile(filePath)
@@ -343,10 +342,8 @@ func replaceContent(edit editContext, filePath, oldString, newString string, rep
 
 	modTime := fileInfo.ModTime().Truncate(time.Second)
 	if modTime.After(lastRead) {
-		return fantasy.NewTextErrorResponse(
-			fmt.Sprintf("file %s has been modified since it was last read (mod time: %s, last read: %s)",
-				filePath, modTime.Format(time.RFC3339), lastRead.Format(time.RFC3339),
-			)), nil
+		// File was modified externally since last read, update the read time to allow the edit
+		edit.filetracker.RecordRead(edit.ctx, sessionID, filePath)
 	}
 
 	content, err := os.ReadFile(filePath)

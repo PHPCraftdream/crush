@@ -17,6 +17,7 @@ import (
 	"testing"
 
 	"charm.land/catwalk/pkg/catwalk"
+	"github.com/charmbracelet/crush/internal/agent/cliprovider"
 	"github.com/charmbracelet/crush/internal/agent/hyper"
 	"github.com/charmbracelet/crush/internal/csync"
 	"github.com/charmbracelet/crush/internal/env"
@@ -272,6 +273,27 @@ func (c *Config) configureProviders(env env.Env, resolver VariableResolver, know
 			}
 		}
 		c.Providers.Set(string(p.ID), prepared)
+	}
+
+	// Add locally available CLI models (claude, gemini, etc.) as a built-in provider.
+	// This runs after catwalk providers so CLI models appear alongside API models.
+	if specs := cliprovider.Available(); len(specs) > 0 {
+		models := make([]catwalk.Model, 0, len(specs))
+		for _, spec := range specs {
+			models = append(models, catwalk.Model{
+				ID:               spec.ModelID,
+				Name:             spec.ModelName,
+				ContextWindow:    spec.ContextWindow,
+				DefaultMaxTokens: 32768,
+			})
+		}
+		c.Providers.Set(cliprovider.ProviderID, ProviderConfig{
+			ID:     cliprovider.ProviderID,
+			Name:   "Local CLI",
+			Type:   cliprovider.ProviderType,
+			Models: models,
+		})
+		knownProviderNames[cliprovider.ProviderID] = true // skip custom-provider validation
 	}
 
 	// validate the custom providers

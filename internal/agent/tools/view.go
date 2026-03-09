@@ -19,6 +19,7 @@ import (
 	"github.com/charmbracelet/crush/internal/lsp"
 	"github.com/charmbracelet/crush/internal/permission"
 	"github.com/charmbracelet/crush/internal/skills"
+	"github.com/charmbracelet/crush/internal/stringext"
 )
 
 //go:embed view.md
@@ -275,7 +276,7 @@ func readTextFile(filePath string, offset, limit int) (string, bool, error) {
 	for len(lines) < limit && scanner.Scan() {
 		lineText := scanner.Text()
 		if len(lineText) > MaxLineLength {
-			lineText = lineText[:MaxLineLength] + "..."
+			lineText = stringext.Truncate(lineText, MaxLineLength) + "..."
 		}
 		lines = append(lines, lineText)
 	}

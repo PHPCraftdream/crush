@@ -14,10 +14,8 @@ import (
 	"sync"
 	"time"
 
-	tea "charm.land/bubbletea/v2"
 	"charm.land/catwalk/pkg/catwalk"
 	"charm.land/fantasy"
-	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/crush/internal/agent"
 	"github.com/charmbracelet/crush/internal/agent/tools/mcp"
 	"github.com/charmbracelet/crush/internal/config"
@@ -26,28 +24,17 @@ import (
 	"github.com/charmbracelet/crush/internal/filetracker"
 	"github.com/charmbracelet/crush/internal/format"
 	"github.com/charmbracelet/crush/internal/history"
-	"github.com/charmbracelet/crush/internal/log"
 	"github.com/charmbracelet/crush/internal/lsp"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/permission"
-	"github.com/charmbracelet/crush/internal/pubsub"
 	"github.com/charmbracelet/crush/internal/session"
 	"github.com/charmbracelet/crush/internal/shell"
-	"github.com/charmbracelet/crush/internal/ui/anim"
-	"github.com/charmbracelet/crush/internal/ui/styles"
+	"github.com/charmbracelet/crush/internal/stringext"
 	"github.com/charmbracelet/crush/internal/update"
 	"github.com/charmbracelet/crush/internal/version"
 	"github.com/charmbracelet/x/ansi"
-	"github.com/charmbracelet/x/exp/charmtone"
 	"github.com/charmbracelet/x/term"
 )
-
-// UpdateAvailableMsg is sent when a new version is available.
-type UpdateAvailableMsg struct {
-	CurrentVersion string
-	LatestVersion  string
-	IsDevelopment  bool
-}
 
 type App struct {
 	Sessions    session.Service
@@ -61,11 +48,6 @@ type App struct {
 	LSPManager *lsp.Manager
 
 	config *config.Config
-
-	serviceEventsWG *sync.WaitGroup
-	eventsCtx       context.Context
-	events          chan tea.Msg
-	tuiWG           *sync.WaitGroup
 
 	// global context and cleanup functions
 	globalCtx    context.Context
@@ -95,13 +77,7 @@ func New(ctx context.Context, conn *sql.DB, cfg *config.Config) (*App, error) {
 		globalCtx: ctx,
 
 		config: cfg,
-
-		events:          make(chan tea.Msg, 100),
-		serviceEventsWG: &sync.WaitGroup{},
-		tuiWG:           &sync.WaitGroup{},
 	}
-
-	app.setupEvents()
 
 	// Check for updates in the background.
 	go app.checkForUpdates(ctx)
@@ -159,39 +135,15 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt,
 
 	var (
 		spinner   *format.Spinner
-		stdoutTTY bool
 		stderrTTY bool
-		stdinTTY  bool
 		progress  bool
 	)
 
-	if f, ok := output.(*os.File); ok {
-		stdoutTTY = term.IsTerminal(f.Fd())
-	}
 	stderrTTY = term.IsTerminal(os.Stderr.Fd())
-	stdinTTY = term.IsTerminal(os.Stdin.Fd())
 	progress = app.config.Options.Progress == nil || *app.config.Options.Progress
 
 	if !hideSpinner && stderrTTY {
-		t := styles.DefaultStyles()
-
-		// Detect background color to set the appropriate color for the
-		// spinner's 'Generating...' text. Without this, that text would be
-		// unreadable in light terminals.
-		hasDarkBG := true
-		if f, ok := output.(*os.File); ok && stdinTTY && stdoutTTY {
-			hasDarkBG = lipgloss.HasDarkBackground(os.Stdin, f)
-		}
-		defaultFG := lipgloss.LightDark(hasDarkBG)(charmtone.Pepper, t.FgBase)
-
-		spinner = format.NewSpinner(ctx, cancel, anim.Settings{
-			Size:        10,
-			Label:       "Generating",
-			LabelColor:  defaultFG,
-			GradColorA:  t.Primary,
-			GradColorB:  t.Secondary,
-			CycleColors: true,
-		})
+		spinner = format.NewSpinner()
 		spinner.Start()
 	}
 
@@ -218,7 +170,7 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt,
 	var titleSuffix string
 
 	if len(prompt) > maxPromptLengthForTitle {
-		titleSuffix = prompt[:maxPromptLengthForTitle] + "..."
+		titleSuffix = stringext.Truncate(prompt, maxPromptLengthForTitle) + "..."
 	} else {
 		titleSuffix = prompt
 	}
@@ -417,71 +369,6 @@ func (app *App) GetDefaultSmallModel(providerID string) config.SelectedModel {
 	}
 }
 
-func (app *App) setupEvents() {
-	ctx, cancel := context.WithCancel(app.globalCtx)
-	app.eventsCtx = ctx
-	setupSubscriber(ctx, app.serviceEventsWG, "sessions", app.Sessions.Subscribe, app.events)
-	setupSubscriber(ctx, app.serviceEventsWG, "messages", app.Messages.Subscribe, app.events)
-	setupSubscriber(ctx, app.serviceEventsWG, "permissions", app.Permissions.Subscribe, app.events)
-	setupSubscriber(ctx, app.serviceEventsWG, "permissions-notifications", app.Permissions.SubscribeNotifications, app.events)
-	setupSubscriber(ctx, app.serviceEventsWG, "history", app.History.Subscribe, app.events)
-	setupSubscriber(ctx, app.serviceEventsWG, "mcp", mcp.SubscribeEvents, app.events)
-	setupSubscriber(ctx, app.serviceEventsWG, "lsp", SubscribeLSPEvents, app.events)
-	cleanupFunc := func(context.Context) error {
-		cancel()
-		app.serviceEventsWG.Wait()
-		return nil
-	}
-	app.cleanupFuncs = append(app.cleanupFuncs, cleanupFunc)
-}
-
-const subscriberSendTimeout = 2 * time.Second
-
-func setupSubscriber[T any](
-	ctx context.Context,
-	wg *sync.WaitGroup,
-	name string,
-	subscriber func(context.Context) <-chan pubsub.Event[T],
-	outputCh chan<- tea.Msg,
-) {
-	wg.Go(func() {
-		subCh := subscriber(ctx)
-		sendTimer := time.NewTimer(0)
-		<-sendTimer.C
-		defer sendTimer.Stop()
-
-		for {
-			select {
-			case event, ok := <-subCh:
-				if !ok {
-					slog.Debug("Subscription channel closed", "name", name)
-					return
-				}
-				var msg tea.Msg = event
-				if !sendTimer.Stop() {
-					select {
-					case <-sendTimer.C:
-					default:
-					}
-				}
-				sendTimer.Reset(subscriberSendTimeout)
-
-				select {
-				case outputCh <- msg:
-				case <-sendTimer.C:
-					slog.Debug("Message dropped due to slow consumer", "name", name)
-				case <-ctx.Done():
-					slog.Debug("Subscription cancelled", "name", name)
-					return
-				}
-			case <-ctx.Done():
-				slog.Debug("Subscription cancelled", "name", name)
-				return
-			}
-		}
-	})
-}
-
 func (app *App) InitCoderAgent(ctx context.Context) error {
 	coderAgentCfg := app.config.Agents[config.AgentCoder]
 	if coderAgentCfg.ID == "" {
@@ -503,38 +390,6 @@ func (app *App) InitCoderAgent(ctx context.Context) error {
 		return err
 	}
 	return nil
-}
-
-// Subscribe sends events to the TUI as tea.Msgs.
-func (app *App) Subscribe(program *tea.Program) {
-	defer log.RecoverPanic("app.Subscribe", func() {
-		slog.Info("TUI subscription panic: attempting graceful shutdown")
-		program.Quit()
-	})
-
-	app.tuiWG.Add(1)
-	tuiCtx, tuiCancel := context.WithCancel(app.globalCtx)
-	app.cleanupFuncs = append(app.cleanupFuncs, func(context.Context) error {
-		slog.Debug("Cancelling TUI message handler")
-		tuiCancel()
-		app.tuiWG.Wait()
-		return nil
-	})
-	defer app.tuiWG.Done()
-
-	for {
-		select {
-		case <-tuiCtx.Done():
-			slog.Debug("TUI message handler shutting down")
-			return
-		case msg, ok := <-app.events:
-			if !ok {
-				slog.Debug("TUI message channel closed")
-				return
-			}
-			program.Send(msg)
-		}
-	}
 }
 
 // Shutdown performs a graceful shutdown of the application.
@@ -591,10 +446,5 @@ func (app *App) checkForUpdates(ctx context.Context) {
 	info, err := update.Check(checkCtx, version.Version, update.Default)
 	if err != nil || !info.Available() {
 		return
-	}
-	app.events <- UpdateAvailableMsg{
-		CurrentVersion: info.Current,
-		LatestVersion:  info.Latest,
-		IsDevelopment:  info.IsDevelopment(),
 	}
 }

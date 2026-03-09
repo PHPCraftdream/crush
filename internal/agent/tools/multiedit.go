@@ -265,10 +265,9 @@ func processMultiEditExistingFile(edit editContext, params MultiEditParams, call
 	// Check if file was modified since last read.
 	modTime := fileInfo.ModTime().Truncate(time.Second)
 	if modTime.After(lastRead) {
-		return fantasy.NewTextErrorResponse(
-			fmt.Sprintf("file %s has been modified since it was last read (mod time: %s, last read: %s)",
-				params.FilePath, modTime.Format(time.RFC3339), lastRead.Format(time.RFC3339),
-			)), nil
+		// File was modified externally since last read, update the read time to allow the edit
+		slog.Warn("File was modified externally since last read, proceeding with edit", "file", params.FilePath, "mod_time", modTime.Format(time.RFC3339), "last_read", lastRead.Format(time.RFC3339))
+		edit.filetracker.RecordRead(edit.ctx, sessionID, params.FilePath)
 	}
 
 	// Read current file content
