@@ -388,6 +388,59 @@ func registerGrepTool(srv *mcp.Server, perms permission.Service, workingDir stri
 
 // ── todos ─────────────────────────────────────────────────────────────────────
 
+// mergeMCPTodos merges the CLI model's desired todo list with the current DB
+// state, applying two protective rules:
+//  1. Status protection: statuses can only advance (pending→in_progress→completed).
+//  2. User task preservation: DB tasks absent from model list are kept.
+func mergeMCPTodos(dbTodos []session.Todo, modelItems []mcpTodoItem) []session.Todo {
+	if len(dbTodos) == 0 {
+		todos := make([]session.Todo, len(modelItems))
+		for i, item := range modelItems {
+			todos[i] = session.Todo{Content: item.Content, Status: session.TodoStatus(item.Status), ActiveForm: item.ActiveForm}
+		}
+		return todos
+	}
+	dbByContent := make(map[string]session.Todo, len(dbTodos))
+	for _, t := range dbTodos {
+		dbByContent[t.Content] = t
+	}
+	modelByContent := make(map[string]bool, len(modelItems))
+	for _, item := range modelItems {
+		modelByContent[item.Content] = true
+	}
+	var result []session.Todo
+	for _, item := range modelItems {
+		wantStatus := session.TodoStatus(item.Status)
+		if dbTodo, exists := dbByContent[item.Content]; exists {
+			if mcpStatusLevel(dbTodo.Status) > mcpStatusLevel(wantStatus) {
+				slog.Info("cliprovider: MCP todos protecting status from regression",
+					"content", item.Content, "db_status", dbTodo.Status, "model_status", wantStatus)
+				wantStatus = dbTodo.Status
+			}
+		}
+		result = append(result, session.Todo{Content: item.Content, Status: wantStatus, ActiveForm: item.ActiveForm})
+	}
+	for _, dbTodo := range dbTodos {
+		if !modelByContent[dbTodo.Content] {
+			slog.Info("cliprovider: MCP todos keeping user task not in model list", "content", dbTodo.Content)
+			result = append(result, dbTodo)
+		}
+	}
+	return result
+}
+
+func mcpStatusLevel(s session.TodoStatus) int {
+	switch s {
+	case session.TodoStatusInProgress:
+		return 1
+	case session.TodoStatusCompleted:
+		return 2
+	default:
+		return 0
+	}
+}
+
+
 type mcpTodoItem struct {
 	Content    string `json:"content"     description:"What needs to be done (imperative form)"`
 	Status     string `json:"status"      description:"Task status: pending, in_progress, or completed"`
@@ -410,46 +463,40 @@ func registerTodosTool(srv *mcp.Server, sessions session.Service, sessionID stri
 			return toolError("failed to get session: " + err.Error()), nil, nil
 		}
 
-		todos := make([]session.Todo, len(input.Todos))
-		completedCount := 0
-		for i, item := range input.Todos {
+		// Validate statuses.
+		for _, item := range input.Todos {
 			switch item.Status {
 			case "pending", "in_progress", "completed":
 			default:
 				return toolError(fmt.Sprintf("invalid status %q for todo %q", item.Status, item.Content)), nil, nil
 			}
-			todos[i] = session.Todo{
-				Content:    item.Content,
-				Status:     session.TodoStatus(item.Status),
-				ActiveForm: item.ActiveForm,
-			}
-			if item.Status == "completed" {
-				completedCount++
-			}
 		}
+
+		// Merge with current DB todos: protect status from regression and keep user-added tasks.
+		todos := mergeMCPTodos(sess.Todos, input.Todos)
 
 		slog.Info("cliprovider: MCP todos tool updating todos",
 			"session", sessionID,
 			"prev", sess.Todos,
-			"new", todos,
+			"merged", todos,
 		)
 		sess.Todos = todos
 		if _, err := sessions.Save(ctx, sess); err != nil {
 			return toolError("failed to save todos: " + err.Error()), nil, nil
 		}
 
-		pendingCount := 0
-		inProgressCount := 0
+		completedCount, pendingCount, inProgressCount := 0, 0, 0
 		for _, t := range todos {
 			switch t.Status {
 			case session.TodoStatusPending:
 				pendingCount++
 			case session.TodoStatusInProgress:
 				inProgressCount++
+			case session.TodoStatusCompleted:
+				completedCount++
 			}
 		}
-
-		slog.Debug("cliprovider: MCP todos saved", "pending", pendingCount, "in_progress", inProgressCount, "completed", completedCount)
+				slog.Debug("cliprovider: MCP todos saved", "pending", pendingCount, "in_progress", inProgressCount, "completed", completedCount)
 		return toolText(fmt.Sprintf("Todo list updated. Status: %d pending, %d in progress, %d completed", pendingCount, inProgressCount, completedCount)), nil, nil
 	})
 }

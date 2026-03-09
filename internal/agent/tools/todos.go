@@ -34,6 +34,85 @@ type TodosResponseMetadata struct {
 	Total         int            `json:"total"`
 }
 
+// todoStatusLevel returns a numeric rank for a todo status so we can
+// enforce forward-only progression: pending(0) → in_progress(1) → completed(2).
+func todoStatusLevel(s session.TodoStatus) int {
+	switch s {
+	case session.TodoStatusInProgress:
+		return 1
+	case session.TodoStatusCompleted:
+		return 2
+	default:
+		return 0
+	}
+}
+
+// mergeTodos combines the model's desired todo list with the current DB state
+// applying two protective rules:
+//  1. Status protection: a task's status can only advance (pending → in_progress →
+//     completed). The model cannot revert a status the user manually set.
+//  2. User task preservation: tasks present in the DB but absent from the model's
+//     list are kept. This prevents the model from silently deleting tasks the
+//     user added manually.
+//
+// The model can still add new tasks (items in model list not in DB are appended).
+func mergeTodos(dbTodos []session.Todo, modelItems []TodoItem) ([]session.Todo, bool) {
+	if len(dbTodos) == 0 {
+		// Empty DB → accept model's list as-is (fresh start, no user edits to protect).
+		todos := make([]session.Todo, len(modelItems))
+		for i, item := range modelItems {
+			todos[i] = session.Todo{
+				Content:    item.Content,
+				Status:     session.TodoStatus(item.Status),
+				ActiveForm: item.ActiveForm,
+			}
+		}
+		return todos, true
+	}
+
+	dbByContent := make(map[string]session.Todo, len(dbTodos))
+	for _, t := range dbTodos {
+		dbByContent[t.Content] = t
+	}
+	modelByContent := make(map[string]bool, len(modelItems))
+	for _, item := range modelItems {
+		modelByContent[item.Content] = true
+	}
+
+	var result []session.Todo
+
+	// Process model's items first (preserve model ordering).
+	for _, item := range modelItems {
+		wantStatus := session.TodoStatus(item.Status)
+		if dbTodo, exists := dbByContent[item.Content]; exists {
+			// Task exists in DB: don't allow status regression.
+			if todoStatusLevel(dbTodo.Status) > todoStatusLevel(wantStatus) {
+				slog.Info("todos tool: protecting status from regression",
+					"content", item.Content,
+					"db_status", dbTodo.Status,
+					"model_status", wantStatus,
+				)
+				wantStatus = dbTodo.Status
+			}
+		}
+		result = append(result, session.Todo{
+			Content:    item.Content,
+			Status:     wantStatus,
+			ActiveForm: item.ActiveForm,
+		})
+	}
+
+	// Append DB tasks the model didn't mention (user-added tasks).
+	for _, dbTodo := range dbTodos {
+		if !modelByContent[dbTodo.Content] {
+			slog.Info("todos tool: keeping user task not mentioned by model", "content", dbTodo.Content)
+			result = append(result, dbTodo)
+		}
+	}
+
+	return result, false
+}
+
 func NewTodosTool(sessions session.Service) fantasy.AgentTool {
 	return fantasy.NewAgentTool(
 		TodosToolName,
@@ -49,12 +128,6 @@ func NewTodosTool(sessions session.Service) fantasy.AgentTool {
 				return fantasy.ToolResponse{}, fmt.Errorf("failed to get session: %w", err)
 			}
 
-			isNew := len(currentSession.Todos) == 0
-			oldStatusByContent := make(map[string]session.TodoStatus)
-			for _, todo := range currentSession.Todos {
-				oldStatusByContent[todo.Content] = todo.Status
-			}
-
 			for _, item := range params.Todos {
 				switch item.Status {
 				case "pending", "in_progress", "completed":
@@ -63,78 +136,60 @@ func NewTodosTool(sessions session.Service) fantasy.AgentTool {
 				}
 			}
 
-			todos := make([]session.Todo, len(params.Todos))
-			var justCompleted []string
-			var justStarted string
-			completedCount := 0
-
-			for i, item := range params.Todos {
-				todos[i] = session.Todo{
-					Content:    item.Content,
-					Status:     session.TodoStatus(item.Status),
-					ActiveForm: item.ActiveForm,
-				}
-
-				newStatus := session.TodoStatus(item.Status)
-				oldStatus, existed := oldStatusByContent[item.Content]
-
-				if newStatus == session.TodoStatusCompleted {
-					completedCount++
-					if existed && oldStatus != session.TodoStatusCompleted {
-						justCompleted = append(justCompleted, item.Content)
-					}
-				}
-
-				if newStatus == session.TodoStatusInProgress {
-					if !existed || oldStatus != session.TodoStatusInProgress {
-						if item.ActiveForm != "" {
-							justStarted = item.ActiveForm
-						} else {
-							justStarted = item.Content
-						}
-					}
-				}
-			}
+			todos, isNew := mergeTodos(currentSession.Todos, params.Todos)
 
 			slog.Info("todos tool: model updating todos",
 				"session", sessionID,
 				"prev", currentSession.Todos,
-				"new", todos,
+				"merged", todos,
 			)
-			currentSession.Todos = todos
-			_, err = sessions.Save(ctx, currentSession)
-			if err != nil {
-				return fantasy.ToolResponse{}, fmt.Errorf("failed to save todos: %w", err)
+
+			// Compute response metadata.
+			oldStatusByContent := make(map[string]session.TodoStatus)
+			for _, todo := range currentSession.Todos {
+				oldStatusByContent[todo.Content] = todo.Status
 			}
-
-			response := "Todo list updated successfully.\n\n"
-
-			pendingCount := 0
-			inProgressCount := 0
+			var justCompleted []string
+			var justStarted string
+			completedCount, pendingCount, inProgressCount := 0, 0, 0
 
 			for _, todo := range todos {
 				switch todo.Status {
-				case session.TodoStatusPending:
-					pendingCount++
+				case session.TodoStatusCompleted:
+					completedCount++
+					if old, existed := oldStatusByContent[todo.Content]; existed && old != session.TodoStatusCompleted {
+						justCompleted = append(justCompleted, todo.Content)
+					}
 				case session.TodoStatusInProgress:
 					inProgressCount++
+					if old, existed := oldStatusByContent[todo.Content]; !existed || old != session.TodoStatusInProgress {
+						if todo.ActiveForm != "" {
+							justStarted = todo.ActiveForm
+						} else {
+							justStarted = todo.Content
+						}
+					}
+				default:
+					pendingCount++
 				}
 			}
 
-			response += fmt.Sprintf("Status: %d pending, %d in progress, %d completed\n",
-				pendingCount, inProgressCount, completedCount)
+			currentSession.Todos = todos
+			if _, err = sessions.Save(ctx, currentSession); err != nil {
+				return fantasy.ToolResponse{}, fmt.Errorf("failed to save todos: %w", err)
+			}
 
+			response := fmt.Sprintf("Todo list updated successfully.\nStatus: %d pending, %d in progress, %d completed\n",
+				pendingCount, inProgressCount, completedCount)
 			response += "Todos have been modified successfully. Ensure that you continue to use the todo list to track your progress. Please proceed with the current tasks if applicable."
 
-			metadata := TodosResponseMetadata{
+			return fantasy.WithResponseMetadata(fantasy.NewTextResponse(response), TodosResponseMetadata{
 				IsNew:         isNew,
 				Todos:         todos,
 				JustCompleted: justCompleted,
 				JustStarted:   justStarted,
 				Completed:     completedCount,
 				Total:         len(todos),
-			}
-
-			return fantasy.WithResponseMetadata(fantasy.NewTextResponse(response), metadata), nil
+			}), nil
 		})
 }
