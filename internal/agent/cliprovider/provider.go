@@ -666,10 +666,15 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 	// (so calls reach our handlers), while the CLI's built-in tools remain
 	// blocked. Crush still shows its own permission dialog in the UI for each
 	// tool call via perms.Request() inside the MCP handlers.
+	// We also explicitly disallow TodoWrite so the model uses mcp__crush__todos
+	// (which persists tasks to the crush session) instead of the CLI-native
+	// TodoWrite tool that writes to a local file unknown to the crush UI.
 	if mcpSrv != nil {
 		args = append(args,
 			"--allowedTools",
 			"mcp__crush__Bash,mcp__crush__Read,mcp__crush__Write,mcp__crush__Glob,mcp__crush__Grep,mcp__crush__todos",
+			"--disallowedTools",
+			"TodoWrite",
 		)
 	}
 
