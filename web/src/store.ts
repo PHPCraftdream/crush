@@ -279,8 +279,9 @@ export function rerunFromMessage(messageID: string) {
     .trim();
   if (!text) return;
 
-  // Delete all messages that came after this user message (agent responses)
-  const toDelete = msgs.slice(idx + 1).map((m) => m.ID);
+  // Delete the user message itself and everything after it (agent responses),
+  // then resend — this avoids a duplicate since send_message creates a new entry.
+  const toDelete = msgs.slice(idx).map((m) => m.ID);
   if (toDelete.length > 0) {
     deleteMessages(toDelete);
   }
