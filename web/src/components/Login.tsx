@@ -14,7 +14,7 @@ export function Login() {
       const res = await fetch("/auth", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ token }),
+        body: JSON.stringify({ token: token.trim() }),
       });
       if (res.ok) {
         $authed.set(true);

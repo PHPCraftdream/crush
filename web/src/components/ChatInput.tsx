@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 import { useStore } from "@nanostores/react";
 import { $activeSessionID, $busySessions, $sessionLargeModel, $sessionSmallModel } from "../store";
 import { ws } from "../ws";
@@ -18,6 +18,12 @@ export function ChatInput() {
   const sessionLargeModels = useStore($sessionLargeModel);
   const sessionSmallModels = useStore($sessionSmallModel);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  useEffect(() => {
+    if (activeSessionID && textareaRef.current) {
+      textareaRef.current.focus();
+    }
+  }, [activeSessionID]);
 
   const agentBusy = activeSessionID ? busySessions.has(activeSessionID) : false;
 
@@ -69,6 +75,7 @@ export function ChatInput() {
           onKeyDown={onKey}
           placeholder={placeholder}
           disabled={!activeSessionID}
+          autoFocus
           rows={1}
           className="flex-1 bg-transparent border-none outline-none resize-none text-text text-sm leading-6 min-h-[24px] max-h-60 overflow-y-auto disabled:cursor-not-allowed placeholder:text-text-subtle"
         />
@@ -95,3 +102,4 @@ export function ChatInput() {
     </div>
   );
 }
+

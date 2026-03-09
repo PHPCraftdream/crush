@@ -6,6 +6,8 @@ import {
   $lspStates,
   $mcpState,
   $agentError,
+  $sessions,
+  $activeSessionID,
   setSessions,
   upsertSession,
   removeSession,
@@ -15,12 +17,36 @@ import {
   addPermission,
   removePermission,
   setSessionBusy,
+  setActiveSession,
 } from "./store";
 import type { WSMessage, Session, Message, PermissionRequest, ConfigPayload, LSPState, MCPState, AgentBusyPayload } from "./types";
+
+function getIDFromHash(): string | null {
+  const hash = window.location.hash; // #/uuid
+  if (hash.startsWith("#/")) {
+    return hash.slice(2);
+  }
+  return null;
+}
 
 export function useWS() {
   useEffect(() => {
     ws.connect();
+
+    const onHashChange = () => {
+      const id = getIDFromHash();
+      const currentActive = $activeSessionID.get();
+      if (id && id !== currentActive) {
+        const sessionExists = $sessions.get().some((s) => s.ID === id);
+        if (sessionExists) {
+          setActiveSession(id);
+          ws.send("load_messages", { sessionID: id });
+        }
+      } else if (!id && currentActive) {
+        setActiveSession(null);
+      }
+    };
+    window.addEventListener("hashchange", onHashChange);
 
     const offs = [
       ws.on("_connected", () => {
@@ -33,18 +59,54 @@ export function useWS() {
         $connected.set(false);
       }),
 
-      ws.on("session_created", (msg: WSMessage) =>
-        upsertSession(msg.payload as Session)
-      ),
+      ws.on("session_created", (msg: WSMessage) => {
+        const s = msg.payload as Session;
+        upsertSession(s);
+        // Always select newly created session (whether auto-created or manual)
+        setActiveSession(s.ID);
+        ws.send("load_messages", { sessionID: s.ID });
+      }),
       ws.on("session_updated", (msg: WSMessage) =>
         upsertSession(msg.payload as Session)
       ),
-      ws.on("session_deleted", (msg: WSMessage) =>
-        removeSession((msg.payload as { ID: string }).ID)
-      ),
-      ws.on("sessions_list", (msg: WSMessage) =>
-        setSessions((msg.payload as Session[]) ?? [])
-      ),
+      ws.on("session_deleted", (msg: WSMessage) => {
+        const id = (msg.payload as { ID: string }).ID;
+        removeSession(id);
+        if ($activeSessionID.get() === id) {
+          setActiveSession(null);
+        }
+      }),
+      ws.on("sessions_list", (msg: WSMessage) => {
+        const sessions = (msg.payload as Session[]) ?? [];
+        setSessions(sessions);
+
+        if (sessions.length === 0) {
+          // No sessions? Auto-create one.
+          ws.send("create_session");
+          return;
+        }
+
+        const hashID = getIDFromHash();
+        const activeID = $activeSessionID.get();
+
+        if (hashID) {
+          const session = sessions.find((s) => s.ID === hashID);
+          if (session) {
+            if (activeID !== hashID) {
+              setActiveSession(hashID);
+              ws.send("load_messages", { sessionID: hashID });
+            }
+            return;
+          }
+        }
+
+        // If no valid hash or session not found, pick the most recent one (first in list)
+        const latest = sessions[0];
+        if (latest && activeID !== latest.ID) {
+          setActiveSession(latest.ID);
+          ws.send("load_messages", { sessionID: latest.ID });
+        }
+      }),
 
       ws.on("message_created", (msg: WSMessage) =>
         upsertMessage(msg.payload as Message)
@@ -100,6 +162,7 @@ export function useWS() {
     ];
 
     return () => {
+      window.removeEventListener("hashchange", onHashChange);
       offs.forEach((off) => off());
       ws.disconnect();
     };

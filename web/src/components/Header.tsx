@@ -1,7 +1,6 @@
 import { useState, useRef, useEffect, useMemo } from "react";
 import { useStore } from "@nanostores/react";
 import { $sessions, $activeSessionID, $config, $busySessions, $sessionLargeModel, $sessionSmallModel, setSessionLargeModel, setSessionSmallModel } from "../store";
-import { Settings } from "./Settings";
 import { ws } from "../ws";
 import type { ConfigPayload } from "../types";
 
@@ -201,7 +200,6 @@ export function Header() {
   const sessions = useStore($sessions);
   const activeSessionID = useStore($activeSessionID);
   const busySessions = useStore($busySessions);
-  const [settingsOpen, setSettingsOpen] = useState(false);
 
   const activeSession = sessions.find((s) => s.ID === activeSessionID) ?? null;
   const isBusy = activeSessionID ? busySessions.has(activeSessionID) : false;
@@ -209,47 +207,35 @@ export function Header() {
   const isSummarized = !!activeSession?.SummaryMessageID;
 
   return (
-    <>
-      <header className="flex items-center gap-4 px-6 py-3.5 border-b border-surface bg-white shrink-0">
-        <div className="flex-1 min-w-0">
-          <SessionTitle session={activeSession} />
-        </div>
+    <header className="flex items-center gap-4 px-6 py-3.5 border-b border-surface bg-white shrink-0">
+      <div className="flex-1 min-w-0">
+        <SessionTitle session={activeSession} />
+      </div>
 
-        <div className="flex items-center gap-2 shrink-0">
-          <ModelSelector sessionID={activeSessionID} modelType="large" />
-          <ModelSelector sessionID={activeSessionID} modelType="small" />
+      <div className="flex items-center gap-2 shrink-0">
+        <ModelSelector sessionID={activeSessionID} modelType="large" />
+        <ModelSelector sessionID={activeSessionID} modelType="small" />
 
-          {activeSession && totalTokens > 0 && (
-            <span
-              className="text-xs text-text-subtle bg-base-overlay border border-surface rounded-lg px-2.5 py-1.5 flex items-center gap-1"
-              title="Total tokens used"
-            >
-              {formatTokens(totalTokens)} tok
-              {isSummarized && (
-                <span className="text-accent" title="Session has been summarized">∑</span>
-              )}
-            </span>
-          )}
-
-          {isBusy && (
-            <div className="flex items-center gap-1 animate-pulse-dots" title="Agent is working…">
-              <span className="w-1.5 h-1.5 rounded-full bg-accent inline-block" />
-              <span className="w-1.5 h-1.5 rounded-full bg-accent inline-block" />
-              <span className="w-1.5 h-1.5 rounded-full bg-accent inline-block" />
-            </div>
-          )}
-
-          <button
-            onClick={() => setSettingsOpen(o => !o)}
-            title="Settings"
-            className="w-8 h-8 flex items-center justify-center rounded-lg border border-surface bg-base-overlay text-text-muted hover:text-text hover:border-accent/50 transition-colors"
+        {activeSession && totalTokens > 0 && (
+          <span
+            className="text-xs text-text-subtle bg-base-overlay border border-surface rounded-lg px-2.5 py-1.5 flex items-center gap-1"
+            title="Total tokens used"
           >
-            ⚙
-          </button>
-        </div>
-      </header>
+            {formatTokens(totalTokens)} tok
+            {isSummarized && (
+              <span className="text-accent" title="Session has been summarized">∑</span>
+            )}
+          </span>
+        )}
 
-      {settingsOpen && <Settings onClose={() => setSettingsOpen(false)} />}
-    </>
+        {isBusy && (
+          <div className="flex items-center gap-1 animate-pulse-dots" title="Agent is working…">
+            <span className="w-1.5 h-1.5 rounded-full bg-accent inline-block" />
+            <span className="w-1.5 h-1.5 rounded-full bg-accent inline-block" />
+            <span className="w-1.5 h-1.5 rounded-full bg-accent inline-block" />
+          </div>
+        )}
+      </div>
+    </header>
   );
 }

@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/atotto/clipboard"
 	"github.com/charmbracelet/crush/internal/app"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/db"
@@ -98,7 +99,11 @@ func runWebMode(cmd *cobra.Command) error {
 		url := fmt.Sprintf("http://%s", boundAddr)
 		fmt.Println()
 		fmt.Printf("  crush web UI  →  %s\n", url)
-		fmt.Printf("  Access token  →  %s\n", token)
+		if err := clipboard.WriteAll(token); err == nil {
+			fmt.Printf("  Access token  →  %s (copied to clipboard)\n", token)
+		} else {
+			fmt.Printf("  Access token  →  %s\n", token)
+		}
 		fmt.Println()
 
 		if !noOpen {

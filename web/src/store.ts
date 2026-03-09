@@ -39,6 +39,11 @@ export function removeSession(id: string) {
 export function setActiveSession(id: string | null) {
   $activeSessionID.set(id);
   $messages.set([]);
+  if (id) {
+    window.location.hash = `#/${id}`;
+  } else {
+    window.location.hash = "";
+  }
 }
 
 export function setMessages(msgs: Message[]) {
