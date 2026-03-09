@@ -116,11 +116,23 @@ export interface ConfigPayload {
   recentSmallModels?: Array<{ Provider: string; Model: string }>;
 }
 
-export interface LSPState {
+export interface LSPServerInfo {
   name: string;
-  state: string;
+  state: string; // "disabled" | "unstarted" | "starting" | "ready" | "error" | "stopped"
+  disabled: boolean;
   diagnosticCount: number;
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  fileTypes?: string[];
 }
+
+export interface LSPSnapshot {
+  servers: LSPServerInfo[];
+}
+
+// Keep LSPState as alias for backwards compat
+export type LSPState = LSPServerInfo;
 
 export interface MCPServerInfo {
   name: string;

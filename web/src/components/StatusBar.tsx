@@ -1,5 +1,5 @@
 import { useStore } from "@nanostores/react";
-import { $lspStates, $mcpState, $connected } from "../store";
+import { $lspSnapshot, $mcpState, $connected } from "../store";
 
 function lspDot(state: string): string {
   switch (state) {
@@ -32,7 +32,8 @@ function mcpDot(status: string): string {
 }
 
 export function StatusBar() {
-  const lspStates = useStore($lspStates);
+  const lspSnapshot = useStore($lspSnapshot);
+  const lspStates = lspSnapshot?.servers ?? [];
   const mcpState = useStore($mcpState);
   const connected = useStore($connected);
 

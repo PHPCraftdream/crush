@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useMemo, useCallback } from "react";
 import { useStore } from "@nanostores/react";
-import { CheckCheck, ScrollText, Plug, Sun, Moon } from "lucide-react";
+import { CheckCheck, ScrollText, Plug, Sun, Moon, Code2 } from "lucide-react";
 import {
   $sessions,
   $activeSessionID,
@@ -10,6 +10,7 @@ import {
 } from "../store";
 import { ws } from "../ws";
 import { MCPSettings } from "./MCPSettings";
+import { LSPSettings } from "./LSPSettings";
 import { buildModelList } from "./ModelSelector";
 import { getDefaultModelKey } from "../store";
 
@@ -179,6 +180,8 @@ export function Header() {
   const closeSystemPrompt = useCallback(() => setShowSystemPrompt(false), []);
   const [showMCPSettings, setShowMCPSettings] = useState(false);
   const closeMCPSettings = useCallback(() => setShowMCPSettings(false), []);
+  const [showLSPSettings, setShowLSPSettings] = useState(false);
+  const closeLSPSettings = useCallback(() => setShowLSPSettings(false), []);
 
   const isDark = config?.theme === "dark";
   function toggleTheme() {
@@ -264,6 +267,15 @@ export function Header() {
         </button>
 
         <button
+          onClick={() => setShowLSPSettings(true)}
+          title="LSP server settings"
+          className="flex items-center gap-1.5 text-xs font-medium rounded-lg px-2.5 py-1.5 border transition-colors bg-base-overlay border-surface text-text-subtle hover:border-accent/50 hover:text-text"
+        >
+          <Code2 size={13} />
+          <span>LSP</span>
+        </button>
+
+        <button
           onClick={toggleTheme}
           title={isDark ? "Switch to light theme" : "Switch to dark theme"}
           className="flex items-center justify-center w-8 h-8 rounded-lg border transition-colors bg-base-overlay border-surface text-text-subtle hover:border-accent/50 hover:text-text"
@@ -285,6 +297,7 @@ export function Header() {
     </header>
     {showSystemPrompt && activeSessionID && <SystemPromptModal sessionID={activeSessionID} onClose={closeSystemPrompt} />}
     {showMCPSettings && <MCPSettings onClose={closeMCPSettings} />}
+    {showLSPSettings && <LSPSettings onClose={closeLSPSettings} />}
 </>
   );
 }

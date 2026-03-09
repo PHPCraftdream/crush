@@ -1,5 +1,5 @@
 import { atom } from "nanostores";
-import type { Session, Message, PermissionRequest, ConfigPayload, LSPState, MCPState } from "./types";
+import type { Session, Message, PermissionRequest, ConfigPayload, LSPSnapshot, MCPState } from "./types";
 
 // ── Connection state ─────────────────────────────────────────────────────────
 export const $connected = atom(false);
@@ -11,7 +11,7 @@ export const $activeSessionID = atom<string | null>(null);
 export const $messages = atom<Message[]>([]);
 export const $permissions = atom<PermissionRequest[]>([]);
 export const $config = atom<ConfigPayload | null>(null);
-export const $lspStates = atom<LSPState[]>([]);
+export const $lspSnapshot = atom<LSPSnapshot | null>(null);
 export const $mcpState = atom<MCPState | null>(null);
 export const $busySessions = atom<Set<string>>(new Set());
 

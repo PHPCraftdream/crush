@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 
 	appPkg "github.com/charmbracelet/crush/internal/app"
@@ -90,6 +91,14 @@ func handleIncoming(ctx context.Context, a *appPkg.App, c *Client, raw []byte) {
 		go handleRemoveMCPServer(a, c, msg)
 	case CmdUpdateMCPServer:
 		go handleUpdateMCPServer(ctx, a, c, msg)
+	case CmdSetLSPDisabled:
+		go handleSetLSPDisabled(ctx, a, c, msg)
+	case CmdAddLSPServer:
+		go handleAddLSPServer(a, c, msg)
+	case CmdRemoveLSPServer:
+		go handleRemoveLSPServer(ctx, a, c, msg)
+	case CmdUpdateLSPServer:
+		go handleUpdateLSPServer(ctx, a, c, msg)
 	default:
 		slog.Debug("ws: unknown command", "type", msg.Type)
 		c.reply(msg.ID, EventError, nil, "unknown command: "+msg.Type)
@@ -881,5 +890,138 @@ func handleUpdateMCPServer(ctx context.Context, a *appPkg.App, c *Client, msg WS
 		c.reply(msg.ID, EventError, nil, err.Error())
 		return
 	}
+	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
+}
+
+func handleSetLSPDisabled(ctx context.Context, a *appPkg.App, c *Client, msg WSMessage) {
+	var p SetLSPDisabledPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		c.reply(msg.ID, EventError, nil, "invalid payload")
+		return
+	}
+	cfg := a.Config()
+	if cfg == nil {
+		c.reply(msg.ID, EventError, nil, "config not available")
+		return
+	}
+	lspCfg, ok := cfg.LSP[p.Name]
+	if !ok {
+		c.reply(msg.ID, EventError, nil, fmt.Sprintf("LSP server %q not found", p.Name))
+		return
+	}
+	lspCfg.Disabled = p.Disabled
+	cfg.LSP[p.Name] = lspCfg
+	if err := cfg.SetConfigField(fmt.Sprintf("lsp.%s.disabled", p.Name), p.Disabled); err != nil {
+		slog.Warn("ws: failed to persist LSP disabled state", "name", p.Name, "err", err)
+	}
+	if p.Disabled {
+		a.LSPManager.UnregisterServer(ctx, p.Name)
+	} else {
+		a.LSPManager.RegisterServer(p.Name, lspCfg)
+	}
+	c.hub.Broadcast(EventLSPState, buildLSPSnapshot(cfg))
+	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
+}
+
+func handleAddLSPServer(a *appPkg.App, c *Client, msg WSMessage) {
+	var p AddLSPServerPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		c.reply(msg.ID, EventError, nil, "invalid payload")
+		return
+	}
+	if p.Name == "" || p.Command == "" {
+		c.reply(msg.ID, EventError, nil, "name and command are required")
+		return
+	}
+	cfg := a.Config()
+	if cfg == nil {
+		c.reply(msg.ID, EventError, nil, "config not available")
+		return
+	}
+	if cfg.LSP == nil {
+		cfg.LSP = make(config.LSPs)
+	}
+	if _, exists := cfg.LSP[p.Name]; exists {
+		c.reply(msg.ID, EventError, nil, fmt.Sprintf("LSP server %q already exists", p.Name))
+		return
+	}
+	lspCfg := config.LSPConfig{
+		Command:   p.Command,
+		Args:      p.Args,
+		Env:       p.Env,
+		FileTypes: p.FileTypes,
+		Timeout:   p.Timeout,
+	}
+	cfg.LSP[p.Name] = lspCfg
+	if err := cfg.SetConfigField(fmt.Sprintf("lsp.%s", p.Name), lspCfg); err != nil {
+		slog.Warn("ws: failed to persist new LSP server", "name", p.Name, "err", err)
+	}
+	a.LSPManager.RegisterServer(p.Name, lspCfg)
+	c.hub.Broadcast(EventLSPState, buildLSPSnapshot(cfg))
+	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
+}
+
+func handleRemoveLSPServer(ctx context.Context, a *appPkg.App, c *Client, msg WSMessage) {
+	var p RemoveLSPServerPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		c.reply(msg.ID, EventError, nil, "invalid payload")
+		return
+	}
+	cfg := a.Config()
+	if cfg == nil {
+		c.reply(msg.ID, EventError, nil, "config not available")
+		return
+	}
+	if _, exists := cfg.LSP[p.Name]; !exists {
+		c.reply(msg.ID, EventError, nil, fmt.Sprintf("LSP server %q not found", p.Name))
+		return
+	}
+	a.LSPManager.UnregisterServer(ctx, p.Name)
+	delete(cfg.LSP, p.Name)
+	if err := cfg.RemoveConfigField(fmt.Sprintf("lsp.%s", p.Name)); err != nil {
+		slog.Warn("ws: failed to remove LSP from config", "name", p.Name, "err", err)
+	}
+	c.hub.Broadcast(EventLSPState, buildLSPSnapshot(cfg))
+	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
+}
+
+func handleUpdateLSPServer(ctx context.Context, a *appPkg.App, c *Client, msg WSMessage) {
+	var p UpdateLSPServerPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		c.reply(msg.ID, EventError, nil, "invalid payload")
+		return
+	}
+	if p.OldName == "" || p.Name == "" || p.Command == "" {
+		c.reply(msg.ID, EventError, nil, "oldName, name and command are required")
+		return
+	}
+	cfg := a.Config()
+	if cfg == nil {
+		c.reply(msg.ID, EventError, nil, "config not available")
+		return
+	}
+	// Remove old entry
+	a.LSPManager.UnregisterServer(ctx, p.OldName)
+	delete(cfg.LSP, p.OldName)
+	if err := cfg.RemoveConfigField(fmt.Sprintf("lsp.%s", p.OldName)); err != nil {
+		slog.Warn("ws: failed to remove old LSP from config", "name", p.OldName, "err", err)
+	}
+	// Add new entry
+	lspCfg := config.LSPConfig{
+		Command:   p.Command,
+		Args:      p.Args,
+		Env:       p.Env,
+		FileTypes: p.FileTypes,
+		Timeout:   p.Timeout,
+	}
+	if cfg.LSP == nil {
+		cfg.LSP = make(config.LSPs)
+	}
+	cfg.LSP[p.Name] = lspCfg
+	if err := cfg.SetConfigField(fmt.Sprintf("lsp.%s", p.Name), lspCfg); err != nil {
+		slog.Warn("ws: failed to persist updated LSP server", "name", p.Name, "err", err)
+	}
+	a.LSPManager.RegisterServer(p.Name, lspCfg)
+	c.hub.Broadcast(EventLSPState, buildLSPSnapshot(cfg))
 	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
 }

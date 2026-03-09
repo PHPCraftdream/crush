@@ -156,7 +156,56 @@ const (
 	CmdAddMCPServer      = "add_mcp_server"
 	CmdRemoveMCPServer   = "remove_mcp_server"
 	CmdUpdateMCPServer   = "update_mcp_server"
+	CmdSetLSPDisabled    = "set_lsp_disabled"
+	CmdAddLSPServer      = "add_lsp_server"
+	CmdRemoveLSPServer   = "remove_lsp_server"
+	CmdUpdateLSPServer   = "update_lsp_server"
 )
+
+// LSPServerInfo is the wire format for a single LSP server state.
+type LSPServerInfo struct {
+	Name            string            `json:"name"`
+	State           string            `json:"state"`
+	Disabled        bool              `json:"disabled"`
+	DiagnosticCount int               `json:"diagnosticCount"`
+	Command         string            `json:"command,omitempty"`
+	Args            []string          `json:"args,omitempty"`
+	Env             map[string]string `json:"env,omitempty"`
+	FileTypes       []string          `json:"fileTypes,omitempty"`
+}
+
+// LSPSnapshot is the full LSP state broadcast to clients.
+type LSPSnapshot struct {
+	Servers []LSPServerInfo `json:"servers"`
+}
+
+type SetLSPDisabledPayload struct {
+	Name     string `json:"name"`
+	Disabled bool   `json:"disabled"`
+}
+
+type AddLSPServerPayload struct {
+	Name      string            `json:"name"`
+	Command   string            `json:"command"`
+	Args      []string          `json:"args,omitempty"`
+	Env       map[string]string `json:"env,omitempty"`
+	FileTypes []string          `json:"fileTypes,omitempty"`
+	Timeout   int               `json:"timeout,omitempty"`
+}
+
+type RemoveLSPServerPayload struct {
+	Name string `json:"name"`
+}
+
+type UpdateLSPServerPayload struct {
+	OldName   string            `json:"oldName"`
+	Name      string            `json:"name"`
+	Command   string            `json:"command"`
+	Args      []string          `json:"args,omitempty"`
+	Env       map[string]string `json:"env,omitempty"`
+	FileTypes []string          `json:"fileTypes,omitempty"`
+	Timeout   int               `json:"timeout,omitempty"`
+}
 
 type RemoveRecentModelPayload struct {
 	ModelType string `json:"modelType"` // "large" or "small"

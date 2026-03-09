@@ -3,7 +3,7 @@ import { ws } from "./ws";
 import {
   $connected,
   $config,
-  $lspStates,
+  $lspSnapshot,
   $mcpState,
   $agentError,
   $yolo,
@@ -25,7 +25,7 @@ import {
   dequeueNextMessage,
   applyTheme,
 } from "./store";
-import type { WSMessage, Session, Message, PermissionRequest, ConfigPayload, LSPState, MCPState, AgentBusyPayload } from "./types";
+import type { WSMessage, Session, Message, PermissionRequest, ConfigPayload, LSPSnapshot, MCPState, AgentBusyPayload } from "./types";
 
 function getIDFromHash(): string | null {
   const hash = window.location.hash; // #/uuid
@@ -169,16 +169,7 @@ export function useWS() {
       }),
 
       ws.on("lsp_state", (msg: WSMessage) => {
-        const incoming = msg.payload as LSPState;
-        const current = $lspStates.get();
-        const idx = current.findIndex((l) => l.name === incoming.name);
-        if (idx === -1) {
-          $lspStates.set([...current, incoming]);
-        } else {
-          const next = [...current];
-          next[idx] = incoming;
-          $lspStates.set(next);
-        }
+        $lspSnapshot.set(msg.payload as LSPSnapshot);
       }),
 
       ws.on("mcp_state", (msg: WSMessage) =>

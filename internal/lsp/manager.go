@@ -319,6 +319,31 @@ func handles(server *powernapconfig.ServerConfig, filePath, workDir string) bool
 		hasRootMarkers(workDir, server.RootMarkers)
 }
 
+// RegisterServer adds or updates an LSP server in the powernap manager.
+// The change takes effect the next time a matching file is opened.
+func (s *Manager) RegisterServer(name string, cfg config.LSPConfig) {
+	s.manager.AddServer(name, &powernapconfig.ServerConfig{
+		Command:     cfg.Command,
+		Args:        cfg.Args,
+		Environment: cfg.Env,
+		FileTypes:   cfg.FileTypes,
+		RootMarkers: cfg.RootMarkers,
+		InitOptions: cfg.InitOptions,
+		Settings:    cfg.Options,
+	})
+}
+
+// UnregisterServer removes an LSP server from the powernap manager and stops
+// the client if it is currently running.
+func (s *Manager) UnregisterServer(ctx context.Context, name string) {
+	s.manager.RemoveServer(name)
+	if client, ok := s.clients.Get(name); ok {
+		_ = client.Close(ctx)
+		client.SetServerState(StateStopped)
+		s.clients.Del(name)
+	}
+}
+
 // KillAll force-kills all the LSP clients.
 //
 // This is generally faster than [Manager.StopAll] because it doesn't wait for
