@@ -140,6 +140,7 @@ export function getDefaultModelKey(role: "large" | "small", config: ConfigPayloa
 }
 
 import { ws } from "./ws";
+import { logClientEvent } from "./telemetry";
 
 export function updateTodos(sessionID: string, todos: Todo[]) {
   // Optimistic local update
@@ -150,6 +151,7 @@ export function updateTodos(sessionID: string, todos: Todo[]) {
     next[idx] = { ...next[idx], Todos: todos };
     $sessions.set(next);
   }
+  logClientEvent("update_todos", { sessionID, count: todos.length, todos: todos.map((t) => ({ content: t.content, status: t.status })) });
   ws.send("update_todos", { sessionID, todos });
 }
 
@@ -286,6 +288,7 @@ export function rerunFromMessage(messageID: string) {
     deleteMessages(toDelete);
   }
 
+  logClientEvent("rerun_message", { sessionID, contentPreview: text.slice(0, 200) });
   ws.send("send_message", { sessionID, content: text });
 }
 

@@ -1440,7 +1440,13 @@ func handleUpdateTodos(ctx context.Context, a *appPkg.App, c *Client, msg WSMess
 			ActiveForm: t.ActiveForm,
 		}
 	}
+	prev := sess.Todos
 	sess.Todos = todos
+	slog.Info("ws: user updated todos",
+		"session", p.SessionID,
+		"prev_count", len(prev),
+		"new_count", len(todos),
+	)
 	if _, err := a.Sessions.Save(ctx, sess); err != nil {
 		c.reply(msg.ID, EventError, nil, "failed to save todos")
 		return

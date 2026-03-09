@@ -4,6 +4,7 @@ import (
 	"context"
 	_ "embed"
 	"fmt"
+	"log/slog"
 
 	"charm.land/fantasy"
 	"github.com/charmbracelet/crush/internal/session"
@@ -95,6 +96,11 @@ func NewTodosTool(sessions session.Service) fantasy.AgentTool {
 				}
 			}
 
+			slog.Info("todos tool: model updating todos",
+				"session", sessionID,
+				"prev", currentSession.Todos,
+				"new", todos,
+			)
 			currentSession.Todos = todos
 			_, err = sessions.Save(ctx, currentSession)
 			if err != nil {

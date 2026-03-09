@@ -428,6 +428,11 @@ func registerTodosTool(srv *mcp.Server, sessions session.Service, sessionID stri
 			}
 		}
 
+		slog.Info("cliprovider: MCP todos tool updating todos",
+			"session", sessionID,
+			"prev", sess.Todos,
+			"new", todos,
+		)
 		sess.Todos = todos
 		if _, err := sessions.Save(ctx, sess); err != nil {
 			return toolError("failed to save todos: " + err.Error()), nil, nil
