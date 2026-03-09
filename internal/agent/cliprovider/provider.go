@@ -18,6 +18,7 @@ import (
 	"os/exec"
 	"regexp"
 	"strings"
+	"sync"
 
 	"charm.land/fantasy"
 	"charm.land/fantasy/object"
@@ -751,14 +752,18 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 					waitCh <- ptycmd.Wait()
 					_ = p.Close() // EOF for scanner (required on Windows ConPTY)
 				}()
+				var ptyKillOnce sync.Once
 				proc = procHandle{
 					stdout:   p,
 					usingPTY: true,
 					kill: func() {
-						if ptycmd.Process != nil {
-							_ = ptycmd.Process.Kill()
-						}
-						<-waitCh // drain so goroutine can finish
+						// Use sync.Once so this is safe to call from multiple goroutines
+						// (context-cancel watcher + scanner loop) without double-draining waitCh.
+						ptyKillOnce.Do(func() {
+							if ptycmd.Process != nil {
+								_ = ptycmd.Process.Kill()
+							}
+						})
 					},
 					wait: func() (string, error) {
 						return "", <-waitCh
@@ -793,10 +798,12 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 			stdout:   pipe,
 			usingPTY: false,
 			kill: func() {
+				// Just kill the process; do NOT call cmd.Wait() here.
+				// exec.CommandContext already handles killing on ctx cancellation.
+				// wait() below is the only place cmd.Wait() is called.
 				if cmd.Process != nil {
 					_ = cmd.Process.Kill()
 				}
-				_ = cmd.Wait()
 			},
 			wait: func() (string, error) {
 				return strings.TrimSpace(stderrBuf.String()), cmd.Wait()
@@ -821,6 +828,21 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 		if qwenMCPName != "" {
 			defer deregisterQwenMCP(qwenMCPName)
 		}
+
+		// Kill the subprocess immediately when ctx is cancelled, even while
+		// scanner.Scan() is blocking between CLI output lines (e.g. during a
+		// long MCP tool call). Without this goroutine the cancellation would
+		// only be observed at the next ctx.Done() check inside the scan loop,
+		// which requires a new line to arrive first.
+		killDone := make(chan struct{})
+		defer close(killDone)
+		go func() {
+			select {
+			case <-ctx.Done():
+				proc.kill()
+			case <-killDone:
+			}
+		}()
 
 		const textID = "0"
 		if !yield(fantasy.StreamPart{Type: fantasy.StreamPartTypeTextStart, ID: textID}) {

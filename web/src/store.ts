@@ -156,6 +156,21 @@ export function setSessionModels(sessionID: string, largeKey: string | null, sma
   });
 }
 
+// ── Theme ─────────────────────────────────────────────────────────────────────
+
+export function applyTheme(theme: string) {
+  if (theme === "dark") {
+    document.documentElement.classList.add("dark");
+  } else {
+    document.documentElement.classList.remove("dark");
+  }
+}
+
+export function setTheme(theme: "light" | "dark") {
+  applyTheme(theme);
+  ws.send("set_theme", { theme });
+}
+
 // ── Yolo mode ────────────────────────────────────────────────────────────────
 const STORAGE_KEY_YOLO = "crush_yolo";
 
@@ -195,6 +210,61 @@ export function updateMessageContent(messageID: string, content: string) {
   ws.send("update_message_content", { messageID, content });
 }
 
+export function updateMessageThinking(messageID: string, thinking: string) {
+  ws.send("update_message_thinking", { messageID, thinking });
+}
+
+export function summarizeSession(sessionID: string) {
+  ws.send("summarize_session", { sessionID });
+}
+
+export function deleteMessagePart(messageID: string, partIndex: number) {
+  ws.send("delete_message_part", { messageID, partIndex });
+}
+
+export function updateMessagePart(messageID: string, partIndex: number, content: string) {
+  ws.send("update_message_part", { messageID, partIndex, content });
+}
+
+export function rerunFromMessage(messageID: string) {
+  const msgs = $messages.get();
+  const sessionID = $activeSessionID.get();
+  if (!sessionID) return;
+
+  const idx = msgs.findIndex((m) => m.ID === messageID);
+  if (idx === -1) return;
+
+  const text = msgs[idx].Parts.filter((p) => p.type === "text")
+    .map((p) => (p as { type: "text"; Text: string }).Text)
+    .join("\n")
+    .trim();
+  if (!text) return;
+
+  // Delete all messages that came after this user message (agent responses)
+  const toDelete = msgs.slice(idx + 1).map((m) => m.ID);
+  if (toDelete.length > 0) {
+    deleteMessages(toDelete);
+  }
+
+  ws.send("send_message", { sessionID, content: text });
+}
+
+export function sendWithSmallModel(sessionID: string, content: string) {
+  const config = $config.get();
+  const sess = $sessions.get().find((s) => s.ID === sessionID);
+  let smallModel: { provider: string; model: string } | undefined;
+  if (sess && sess.SmallModelID) {
+    smallModel = { provider: sess.SmallModelProvider, model: sess.SmallModelID };
+  } else if (config?.models?.small) {
+    smallModel = { provider: config.models.small.Provider, model: config.models.small.Model };
+  }
+  const payload: Record<string, unknown> = { sessionID, content };
+  if (smallModel) {
+    payload.largeModel = smallModel;
+  }
+  ws.send("send_message", payload);
+}
+
 // ── Batch selection ───────────────────────────────────────────────────────────
 export const $selectedMessageIDs = atom<Set<string>>(new Set());
 
@@ -210,3 +280,44 @@ export function clearSelection() {
 
 // Last agent error to display in chat
 export const $agentError = atom<string | null>(null);
+
+// ── Message queue (client-side) ────────────────────────────────────────────────
+export interface QueuedMessage {
+  id: string;
+  content: string;
+}
+
+export const $messageQueue = atom<Map<string, QueuedMessage[]>>(new Map());
+
+let _queueIDCounter = 0;
+function newQueueID() { return `q-${++_queueIDCounter}`; }
+
+export function enqueueMessage(sessionID: string, content: string) {
+  const q = new Map($messageQueue.get());
+  q.set(sessionID, [...(q.get(sessionID) ?? []), { id: newQueueID(), content }]);
+  $messageQueue.set(q);
+}
+
+export function dequeueNextMessage(sessionID: string): string | undefined {
+  const q = new Map($messageQueue.get());
+  const msgs = q.get(sessionID) ?? [];
+  if (!msgs.length) return undefined;
+  const [first, ...rest] = msgs;
+  if (!rest.length) q.delete(sessionID); else q.set(sessionID, rest);
+  $messageQueue.set(q);
+  return first.content;
+}
+
+export function removeQueuedMessage(sessionID: string, id: string) {
+  const q = new Map($messageQueue.get());
+  const msgs = (q.get(sessionID) ?? []).filter((m) => m.id !== id);
+  if (!msgs.length) q.delete(sessionID); else q.set(sessionID, msgs);
+  $messageQueue.set(q);
+}
+
+export function updateQueuedMessage(sessionID: string, id: string, content: string) {
+  const q = new Map($messageQueue.get());
+  const msgs = (q.get(sessionID) ?? []).map((m) => m.id === id ? { ...m, content } : m);
+  q.set(sessionID, msgs);
+  $messageQueue.set(q);
+}

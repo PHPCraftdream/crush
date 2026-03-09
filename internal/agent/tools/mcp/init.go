@@ -196,46 +196,9 @@ func Initialize(ctx context.Context, permissions permission.Service, cfg *config
 				}
 			}()
 
-			// createSession handles its own timeout internally.
-			session, err := createSession(ctx, name, m, cfg.Resolver())
-			if err != nil {
-				return
+			if _, err := startServer(ctx, cfg, name, m); err != nil {
+				slog.Error("Failed to initialize MCP server", "name", name, "err", err)
 			}
-
-			tools, err := getTools(ctx, session)
-			if err != nil {
-				slog.Error("Error listing tools", "error", err)
-				updateState(name, StateError, err, nil, Counts{})
-				session.Close()
-				return
-			}
-
-			prompts, err := getPrompts(ctx, session)
-			if err != nil {
-				slog.Error("Error listing prompts", "error", err)
-				updateState(name, StateError, err, nil, Counts{})
-				session.Close()
-				return
-			}
-
-			resources, err := getResources(ctx, session)
-			if err != nil {
-				slog.Error("Error listing resources", "error", err)
-				updateState(name, StateError, err, nil, Counts{})
-				session.Close()
-				return
-			}
-
-			toolCount := updateTools(cfg, name, tools)
-			updatePrompts(name, prompts)
-			resourceCount := updateResources(name, resources)
-			sessions.Set(name, session)
-
-			updateState(name, StateConnected, nil, session, Counts{
-				Tools:     toolCount,
-				Prompts:   len(prompts),
-				Resources: resourceCount,
-			})
 		}(name, m)
 	}
 	wg.Wait()
@@ -251,6 +214,168 @@ func WaitForInit(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// startServer connects to an MCP server, lists its capabilities, and stores them.
+// It must be called from a goroutine; state updates are handled internally.
+func startServer(ctx context.Context, cfg *config.Config, name string, mcpCfg config.MCPConfig) (*ClientSession, error) {
+	session, err := createSession(ctx, name, mcpCfg, cfg.Resolver())
+	if err != nil {
+		return nil, err
+	}
+
+	tools, err := getTools(ctx, session)
+	if err != nil {
+		slog.Error("Error listing tools", "error", err, "name", name)
+		updateState(name, StateError, err, nil, Counts{})
+		session.Close()
+		return nil, err
+	}
+
+	prompts, err := getPrompts(ctx, session)
+	if err != nil {
+		slog.Error("Error listing prompts", "error", err, "name", name)
+		updateState(name, StateError, err, nil, Counts{})
+		session.Close()
+		return nil, err
+	}
+
+	resources, err := getResources(ctx, session)
+	if err != nil {
+		slog.Error("Error listing resources", "error", err, "name", name)
+		updateState(name, StateError, err, nil, Counts{})
+		session.Close()
+		return nil, err
+	}
+
+	toolCount := updateTools(cfg, name, tools)
+	updatePrompts(name, prompts)
+	resourceCount := updateResources(name, resources)
+	sessions.Set(name, session)
+
+	updateState(name, StateConnected, nil, session, Counts{
+		Tools:     toolCount,
+		Prompts:   len(prompts),
+		Resources: resourceCount,
+	})
+	return session, nil
+}
+
+// DisableServer disables an MCP server: closes its session, removes its tools,
+// and persists the disabled flag to config.
+func DisableServer(ctx context.Context, cfg *config.Config, name string) error {
+	mcpCfg, ok := cfg.MCP[name]
+	if !ok {
+		return fmt.Errorf("MCP server %q not found", name)
+	}
+
+	// Close existing session if any
+	if sess, ok := sessions.Get(name); ok {
+		_ = sess.Close()
+		sessions.Del(name)
+	}
+	allTools.Del(name)
+
+	// Update in-memory config
+	mcpCfg.Disabled = true
+	cfg.MCP[name] = mcpCfg
+
+	// Persist to config file
+	if err := cfg.SetConfigField(fmt.Sprintf("mcp.%s.disabled", name), true); err != nil {
+		slog.Warn("Failed to persist MCP disabled state", "name", name, "err", err)
+	}
+
+	updateState(name, StateDisabled, nil, nil, Counts{})
+	return nil
+}
+
+// EnableServer re-enables a disabled MCP server and starts a new session.
+func EnableServer(ctx context.Context, cfg *config.Config, name string) error {
+	mcpCfg, ok := cfg.MCP[name]
+	if !ok {
+		return fmt.Errorf("MCP server %q not found", name)
+	}
+
+	// Update in-memory config
+	mcpCfg.Disabled = false
+	cfg.MCP[name] = mcpCfg
+
+	// Persist to config file
+	if err := cfg.SetConfigField(fmt.Sprintf("mcp.%s.disabled", name), false); err != nil {
+		slog.Warn("Failed to persist MCP enabled state", "name", name, "err", err)
+	}
+
+	updateState(name, StateStarting, nil, nil, Counts{})
+	go func() {
+		if _, err := startServer(ctx, cfg, name, mcpCfg); err != nil {
+			slog.Error("Failed to enable MCP server", "name", name, "err", err)
+		}
+	}()
+	return nil
+}
+
+// AddServer validates and adds a new MCP server. It attempts to connect; if
+// successful the server is added to the in-memory config and persisted to disk.
+func AddServer(ctx context.Context, cfg *config.Config, name string, mcpCfg config.MCPConfig) error {
+	if _, exists := cfg.MCP[name]; exists {
+		return fmt.Errorf("MCP server %q already exists", name)
+	}
+
+	// Ensure MCP map is initialised
+	if cfg.MCP == nil {
+		cfg.MCP = make(config.MCPs)
+	}
+
+	// Optimistically add to in-memory so startServer can read DisabledTools etc.
+	cfg.MCP[name] = mcpCfg
+	updateState(name, StateStarting, nil, nil, Counts{})
+
+	sess, err := startServer(ctx, cfg, name, mcpCfg)
+	if err != nil {
+		delete(cfg.MCP, name)
+		states.Del(name)
+		return fmt.Errorf("failed to connect to MCP server %q: %w", name, err)
+	}
+	_ = sess
+
+	// Persist to config file
+	if err := cfg.SetConfigField(fmt.Sprintf("mcp.%s", name), mcpCfg); err != nil {
+		slog.Warn("Failed to persist new MCP server", "name", name, "err", err)
+	}
+
+	return nil
+}
+
+// RemoveServer removes an MCP server, closes its session, and removes it from config.
+func RemoveServer(cfg *config.Config, name string) error {
+	if _, exists := cfg.MCP[name]; !exists {
+		return fmt.Errorf("MCP server %q not found", name)
+	}
+
+	// Close session
+	if sess, ok := sessions.Get(name); ok {
+		_ = sess.Close()
+		sessions.Del(name)
+	}
+	allTools.Del(name)
+
+	// Remove from in-memory config
+	delete(cfg.MCP, name)
+
+	// Remove from states and broadcast deletion
+	states.Del(name)
+	broker.Publish(pubsub.DeletedEvent, Event{
+		Type:  EventStateChanged,
+		Name:  name,
+		State: StateDisabled,
+	})
+
+	// Remove from persisted config
+	if err := cfg.RemoveConfigField(fmt.Sprintf("mcp.%s", name)); err != nil {
+		slog.Warn("Failed to remove MCP from config", "name", name, "err", err)
+	}
+
+	return nil
 }
 
 func getOrRenewClient(ctx context.Context, cfg *config.Config, name string) (*ClientSession, error) {

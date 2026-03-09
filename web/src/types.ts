@@ -110,6 +110,8 @@ export interface ConfigPayload {
   models?: Record<string, { Provider: string; Model: string }>;
   providers?: Record<string, { name?: string; enabled?: boolean; type?: string; models?: { id: string; name: string; contextWindow?: number }[] }>;
   yolo?: boolean;
+  debug?: boolean;
+  theme?: string;
   recentLargeModels?: Array<{ Provider: string; Model: string }>;
   recentSmallModels?: Array<{ Provider: string; Model: string }>;
 }
@@ -120,8 +122,15 @@ export interface LSPState {
   diagnosticCount: number;
 }
 
+export interface MCPServerInfo {
+  name: string;
+  status: string;
+  disabled: boolean;
+  toolCount: number;
+}
+
 export interface MCPState {
-  servers: { name: string; status: string }[];
+  servers: MCPServerInfo[];
 }
 
 export interface AgentBusyPayload {

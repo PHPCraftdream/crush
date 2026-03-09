@@ -179,7 +179,12 @@ func buildMCPSnapshot() MCPSnapshot {
 	all := mcp.GetStates()
 	servers := make([]MCPServerInfo, 0, len(all))
 	for name, info := range all {
-		servers = append(servers, MCPServerInfo{Name: name, Status: info.State.String()})
+		servers = append(servers, MCPServerInfo{
+			Name:      name,
+			Status:    info.State.String(),
+			Disabled:  info.State == mcp.StateDisabled,
+			ToolCount: info.Counts.Tools,
+		})
 	}
 	return MCPSnapshot{Servers: servers}
 }

@@ -6,12 +6,50 @@ import rehypeHighlight from "rehype-highlight";
 import type { Message as Msg, ContentPart } from "../types";
 import { BrainCircuit, Check, Copy, Pencil, Trash2 } from "lucide-react";
 import {
+  $busySessions,
   $selectedMessageIDs,
   toggleMessageSelection,
   updateMessageContent,
+  updateMessageThinking,
 } from "../store";
 
-function CopyButton({ text, className = "" }: { text: string; className?: string }) {
+function formatDuration(seconds: number): string {
+  if (seconds < 60) return `${seconds.toFixed(1)}s`;
+  const m = Math.floor(seconds / 60);
+  const s = Math.floor(seconds % 60);
+  return `${m}m ${s}s`;
+}
+
+function DurationBadge({ message }: { message: Msg }) {
+  const isFinished = message.Parts.some((p) => p.type === "finish");
+  const busySessions = useStore($busySessions);
+  // Only tick when the session is actively processing — old interrupted messages
+  // have no finish part but are also not running anymore.
+  const isLive = !isFinished && busySessions.has(message.SessionID);
+  const [elapsed, setElapsed] = useState(0);
+
+  useEffect(() => {
+    if (!isLive) return;
+    const start = message.CreatedAt; // Unix seconds
+    const tick = () => setElapsed(Date.now() / 1000 - start);
+    tick();
+    const id = setInterval(tick, 100);
+    return () => clearInterval(id);
+  }, [isLive, message.CreatedAt]);
+
+  const duration = isFinished || !isLive
+    ? message.UpdatedAt - message.CreatedAt
+    : elapsed;
+  if (duration < 0.5) return null;
+
+  return (
+    <span className="text-xs text-text-subtle font-mono tabular-nums" title="Generation time">
+      {formatDuration(duration)}
+    </span>
+  );
+}
+
+function CopyButton({ text, className = "", label = "Copy" }: { text: string; className?: string; label?: string }) {
   const [copied, setCopied] = useState(false);
 
   function copy() {
@@ -24,7 +62,7 @@ function CopyButton({ text, className = "" }: { text: string; className?: string
   return (
     <button
       onClick={copy}
-      title="Copy"
+      title={label}
       className={`inline-flex items-center gap-1.5 text-sm text-text-subtle hover:text-text transition-colors font-medium ${className}`}
     >
       {copied ? (
@@ -35,7 +73,7 @@ function CopyButton({ text, className = "" }: { text: string; className?: string
       ) : (
         <>
           <Copy size={14} />
-          <span>Copy</span>
+          <span>{label}</span>
         </>
       )}
     </button>
@@ -49,6 +87,20 @@ function extractText(parts: ContentPart[]): string {
     .join("\n");
 }
 
+function extractThinking(parts: ContentPart[]): string {
+  return parts
+    .filter((p) => p.type === "thinking")
+    .map((p) => (p as { type: "thinking"; Thinking: string }).Thinking)
+    .join("\n");
+}
+
+function extractAll(parts: ContentPart[]): string {
+  const thinking = extractThinking(parts);
+  const text = extractText(parts);
+  if (thinking && text) return `<thinking>\n${thinking}\n</thinking>\n\n${text}`;
+  return thinking || text;
+}
+
 interface MessageProps {
   message: Msg;
   onDeleteRequest: (id: string) => void;
@@ -58,6 +110,8 @@ interface MessageProps {
 export function Message({ message, onDeleteRequest, selectionActive }: MessageProps) {
   const isUser = message.Role === "user";
   const copyText = extractText(message.Parts);
+  const copyThinking = !isUser ? extractThinking(message.Parts) : "";
+  const copyAll = !isUser && copyThinking ? extractAll(message.Parts) : "";
   const selectedIDs = useStore($selectedMessageIDs);
   const isSelected = selectedIDs.has(message.ID);
 
@@ -162,7 +216,7 @@ export function Message({ message, onDeleteRequest, selectionActive }: MessagePr
             <>
               <div className="bg-accent text-white rounded-2xl rounded-tr-sm px-5 py-3.5 text-[16px] leading-relaxed shadow-md">
                 {message.Parts.map((part, i) => (
-                  <Part key={i} part={part} isUser />
+                  <Part key={i} part={part} isUser messageID={message.ID} thinkingDone={false} />
                 ))}
               </div>
               <div className="flex items-center justify-between mt-1.5 gap-2">
@@ -219,12 +273,18 @@ export function Message({ message, onDeleteRequest, selectionActive }: MessagePr
           ) : (
             <>
               <div className="text-text text-[17px] leading-relaxed">
-                {message.Parts.map((part, i) => (
-                  <Part key={i} part={part} isUser={false} />
-                ))}
+                {(() => {
+                  const thinkingDone = message.Parts.some(p => p.type === "text" || p.type === "finish");
+                  return message.Parts.map((part, i) => (
+                    <Part key={i} part={part} isUser={false} messageID={message.ID} thinkingDone={thinkingDone} />
+                  ));
+                })()}
               </div>
               <div className="flex items-center justify-between mt-3">
-                {copyText && <CopyButton text={copyText} />}
+                <div className="flex items-center gap-3">
+                  {copyText && <CopyButton text={copyText} />}
+                  {copyAll && <CopyButton text={copyAll} label="Copy all" />}
+                </div>
                 <div className="flex items-center gap-1 ml-auto">
                   <div className="flex items-center gap-1 opacity-0 group-hover/msg:opacity-100 transition-opacity">
                     <button
@@ -242,6 +302,7 @@ export function Message({ message, onDeleteRequest, selectionActive }: MessagePr
                       <Trash2 size={13} />
                     </button>
                   </div>
+                  <DurationBadge message={message} />
                   {message.Model && (
                     <span className="text-xs text-text-subtle font-mono ml-2">
                       {message.Model}
@@ -257,7 +318,95 @@ export function Message({ message, onDeleteRequest, selectionActive }: MessagePr
   );
 }
 
-function Part({ part, isUser }: { part: ContentPart; isUser: boolean }) {
+function ThinkingPart({ thinking, messageID, done }: { thinking: string; messageID: string; done: boolean }) {
+  const [editing, setEditing] = useState(false);
+  const [value, setValue] = useState("");
+  const taRef = useRef<HTMLTextAreaElement>(null);
+
+  function startEdit() {
+    setValue(thinking);
+    setEditing(true);
+  }
+
+  useEffect(() => {
+    if (editing && taRef.current) {
+      taRef.current.focus();
+      taRef.current.selectionStart = taRef.current.value.length;
+      taRef.current.style.height = "auto";
+      taRef.current.style.height = taRef.current.scrollHeight + "px";
+    }
+  }, [editing]);
+
+  function save() {
+    const trimmed = value.trim();
+    if (trimmed && trimmed !== thinking) {
+      updateMessageThinking(messageID, trimmed);
+    }
+    setEditing(false);
+  }
+
+  function onKey(e: React.KeyboardEvent<HTMLTextAreaElement>) {
+    if (e.key === "Escape") setEditing(false);
+    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) save();
+  }
+
+  function onInput(e: React.ChangeEvent<HTMLTextAreaElement>) {
+    setValue(e.target.value);
+    e.target.style.height = "auto";
+    e.target.style.height = e.target.scrollHeight + "px";
+  }
+
+  return (
+    <details className="my-3 border border-surface rounded-xl overflow-hidden shadow-sm">
+      <summary className="px-5 py-3 cursor-pointer select-none text-base text-text-muted bg-base-subtle hover:bg-base-overlay transition-colors flex items-center gap-2.5 font-medium">
+        <span className="text-accent/70"><BrainCircuit size={18} /></span>
+        <span>{done ? "Thoughts" : "Thinking…"}</span>
+        <div className="ml-auto flex items-center gap-0.5 opacity-0 group-hover/msg:opacity-100">
+          <CopyButton text={thinking} className="px-1.5 py-1 text-xs" />
+          <button
+            onClick={(e) => { e.preventDefault(); e.stopPropagation(); startEdit(); }}
+            title="Edit thinking"
+            className="p-1 text-text-subtle hover:text-accent transition-colors rounded"
+          >
+            <Pencil size={13} />
+          </button>
+        </div>
+      </summary>
+      {editing ? (
+        <div className="p-4 bg-base-overlay border-t border-surface">
+          <textarea
+            ref={taRef}
+            value={value}
+            onChange={onInput}
+            onKeyDown={onKey}
+            className="w-full bg-base-subtle border border-accent/40 text-text-muted rounded-lg px-4 py-3 text-[14px] font-mono leading-relaxed resize-none outline-none focus:border-accent"
+            style={{ overflow: "hidden" }}
+          />
+          <div className="flex gap-2 mt-2">
+            <button
+              onClick={() => setEditing(false)}
+              className="px-3 py-1 text-xs text-text-subtle hover:text-text transition-colors rounded-lg hover:bg-base-overlay"
+            >
+              Cancel <span className="opacity-50">(Esc)</span>
+            </button>
+            <button
+              onClick={save}
+              className="px-3 py-1 text-xs bg-accent text-white rounded-lg hover:opacity-90 transition-opacity"
+            >
+              Save <span className="opacity-70">(Ctrl+Enter)</span>
+            </button>
+          </div>
+        </div>
+      ) : (
+        <pre className="p-5 bg-base-overlay text-[14px] font-mono whitespace-pre-wrap overflow-x-auto text-text-muted border-t border-surface leading-relaxed">
+          {thinking}
+        </pre>
+      )}
+    </details>
+  );
+}
+
+function Part({ part, isUser, messageID, thinkingDone }: { part: ContentPart; isUser: boolean; messageID: string; thinkingDone: boolean }) {
   switch (part.type) {
     case "text":
       return isUser ? (
@@ -274,17 +423,7 @@ function Part({ part, isUser }: { part: ContentPart; isUser: boolean }) {
       );
 
     case "thinking":
-      return (
-        <details className="my-3 border border-surface rounded-xl overflow-hidden shadow-sm">
-          <summary className="px-5 py-3 cursor-pointer select-none text-base text-text-muted bg-base-subtle hover:bg-base-overlay transition-colors flex items-center gap-2.5 font-medium">
-            <span className="text-accent/70"><BrainCircuit size={18} /></span>
-            <span>Thinking…</span>
-          </summary>
-          <pre className="p-5 bg-base-overlay text-[14px] font-mono whitespace-pre-wrap overflow-x-auto text-text-muted border-t border-surface leading-relaxed">
-            {part.Thinking}
-          </pre>
-        </details>
-      );
+      return <ThinkingPart thinking={part.Thinking} messageID={messageID} done={thinkingDone} />;
 
     case "tool_call":
       return (

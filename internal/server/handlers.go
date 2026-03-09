@@ -7,6 +7,7 @@ import (
 
 	appPkg "github.com/charmbracelet/crush/internal/app"
 	"github.com/charmbracelet/crush/internal/agent"
+	"github.com/charmbracelet/crush/internal/agent/tools/mcp"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/permission"
@@ -65,10 +66,28 @@ func handleIncoming(ctx context.Context, a *appPkg.App, c *Client, raw []byte) {
 		go handleDeleteMessages(ctx, a, c, msg)
 	case CmdUpdateMessageContent:
 		go handleUpdateMessageContent(ctx, a, c, msg)
+	case CmdUpdateMessageThinking:
+		go handleUpdateMessageThinking(ctx, a, c, msg)
 	case CmdGetSystemPrompt:
 		go handleGetSystemPrompt(ctx, a, c, msg)
 	case CmdSetSystemPrompt:
 		go handleSetSystemPrompt(ctx, a, c, msg)
+	case CmdSummarizeSession:
+		go handleSummarizeSession(ctx, a, c, msg)
+	case CmdDeleteMessagePart:
+		go handleDeleteMessagePart(ctx, a, c, msg)
+	case CmdUpdateMessagePart:
+		go handleUpdateMessagePart(ctx, a, c, msg)
+	case CmdLogClientEvent:
+		go handleLogClientEvent(a, c, msg)
+	case CmdLogClientError:
+		go handleLogClientError(c, msg)
+	case CmdSetMCPDisabled:
+		go handleSetMCPDisabled(ctx, a, c, msg)
+	case CmdAddMCPServer:
+		go handleAddMCPServer(ctx, a, c, msg)
+	case CmdRemoveMCPServer:
+		go handleRemoveMCPServer(a, c, msg)
 	default:
 		slog.Debug("ws: unknown command", "type", msg.Type)
 		c.reply(msg.ID, EventError, nil, "unknown command: "+msg.Type)
@@ -131,12 +150,17 @@ func handleSendMessage(ctx context.Context, a *appPkg.App, c *Client, msg WSMess
 		slog.Info("ws: final models for run", "sessionID", p.SessionID, "large", largeOverride.Model)
 	}
 
+	// Decouple the agent run from the WebSocket connection lifetime.
+	// Without this, closing/refreshing the browser tab would cancel the agent.
+	// Explicit cancellation is still available via Cancel(sessionID).
+	agentCtx := context.WithoutCancel(ctx)
+
 	c.hub.Broadcast(EventAgentBusy, AgentBusyPayload{SessionID: p.SessionID, Busy: true})
 	var err error
 	if largeOverride != nil || smallOverride != nil {
-		_, err = a.AgentCoordinator.RunWithOverrides(ctx, p.SessionID, p.Content, largeOverride, smallOverride, attachments...)
+		_, err = a.AgentCoordinator.RunWithOverrides(agentCtx, p.SessionID, p.Content, largeOverride, smallOverride, attachments...)
 	} else {
-		_, err = a.AgentCoordinator.Run(ctx, p.SessionID, p.Content, attachments...)
+		_, err = a.AgentCoordinator.Run(agentCtx, p.SessionID, p.Content, attachments...)
 	}
 	c.hub.Broadcast(EventAgentBusy, AgentBusyPayload{SessionID: p.SessionID, Busy: false})
 
@@ -184,6 +208,10 @@ func handleSetSessionModels(ctx context.Context, a *appPkg.App, c *Client, msg W
 	// Broadcast updated session so clients can refresh their model selectors.
 	if sess, err := a.Sessions.Get(ctx, p.SessionID); err == nil {
 		c.hub.Broadcast(EventSessionUpdated, sess)
+	}
+	// Broadcast updated config so all clients see the new recent-models list immediately.
+	if wire, ok := buildConfigWire(a); ok {
+		c.hub.Broadcast(EventConfig, wire)
 	}
 	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
 }
@@ -390,6 +418,10 @@ func buildConfigWire(a *appPkg.App) (ConfigWire, bool) {
 	}
 
 	wire.Yolo = a.Permissions.SkipRequests()
+	wire.Debug = cfg.Options.Debug
+	if cfg.Options != nil && cfg.Options.TUI != nil {
+		wire.Theme = cfg.Options.TUI.Theme
+	}
 
 	for _, m := range cfg.RecentModels[config.SelectedModelTypeLarge] {
 		wire.RecentLargeModels = append(wire.RecentLargeModels, ModelEntryWire{Provider: m.Provider, Model: m.Model})
@@ -538,6 +570,44 @@ func handleUpdateMessageContent(ctx context.Context, a *appPkg.App, c *Client, m
 	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
 }
 
+func handleUpdateMessageThinking(ctx context.Context, a *appPkg.App, c *Client, msg WSMessage) {
+	var p UpdateMessageThinkingPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		c.reply(msg.ID, EventError, nil, "invalid payload")
+		return
+	}
+	m, err := a.Messages.Get(ctx, p.MessageID)
+	if err != nil {
+		c.reply(msg.ID, EventError, nil, err.Error())
+		return
+	}
+	found := false
+	for i, part := range m.Parts {
+		if rc, ok := part.(message.ReasoningContent); ok {
+			m.Parts[i] = message.ReasoningContent{
+				Thinking:         p.Thinking,
+				Signature:        rc.Signature,
+				ThoughtSignature: rc.ThoughtSignature,
+				ToolID:           rc.ToolID,
+				ResponsesData:    rc.ResponsesData,
+				StartedAt:        rc.StartedAt,
+				FinishedAt:       rc.FinishedAt,
+			}
+			found = true
+			break
+		}
+	}
+	if !found {
+		c.reply(msg.ID, EventError, nil, "message has no thinking part")
+		return
+	}
+	if err := a.Messages.Update(ctx, m); err != nil {
+		c.reply(msg.ID, EventError, nil, err.Error())
+		return
+	}
+	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
+}
+
 func handleGetSystemPrompt(ctx context.Context, a *appPkg.App, c *Client, msg WSMessage) {
 	var p GetSystemPromptPayload
 	if err := json.Unmarshal(msg.Payload, &p); err != nil || p.SessionID == "" {
@@ -569,6 +639,124 @@ func handleSetSystemPrompt(ctx context.Context, a *appPkg.App, c *Client, msg WS
 	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
 }
 
+func handleDeleteMessagePart(ctx context.Context, a *appPkg.App, c *Client, msg WSMessage) {
+	var p DeleteMessagePartPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil || p.MessageID == "" {
+		c.reply(msg.ID, EventError, nil, "invalid payload")
+		return
+	}
+	m, err := a.Messages.Get(ctx, p.MessageID)
+	if err != nil {
+		c.reply(msg.ID, EventError, nil, err.Error())
+		return
+	}
+	if p.PartIndex < 0 || p.PartIndex >= len(m.Parts) {
+		c.reply(msg.ID, EventError, nil, "part index out of range")
+		return
+	}
+	m.Parts = append(m.Parts[:p.PartIndex], m.Parts[p.PartIndex+1:]...)
+	if err := a.Messages.Update(ctx, m); err != nil {
+		c.reply(msg.ID, EventError, nil, err.Error())
+		return
+	}
+	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
+}
+
+func handleUpdateMessagePart(ctx context.Context, a *appPkg.App, c *Client, msg WSMessage) {
+	var p UpdateMessagePartPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil || p.MessageID == "" {
+		c.reply(msg.ID, EventError, nil, "invalid payload")
+		return
+	}
+	m, err := a.Messages.Get(ctx, p.MessageID)
+	if err != nil {
+		c.reply(msg.ID, EventError, nil, err.Error())
+		return
+	}
+	if p.PartIndex < 0 || p.PartIndex >= len(m.Parts) {
+		c.reply(msg.ID, EventError, nil, "part index out of range")
+		return
+	}
+	switch part := m.Parts[p.PartIndex].(type) {
+	case message.TextContent:
+		m.Parts[p.PartIndex] = message.TextContent{Text: p.Content}
+	case message.ReasoningContent:
+		m.Parts[p.PartIndex] = message.ReasoningContent{
+			Thinking:         p.Content,
+			Signature:        part.Signature,
+			ThoughtSignature: part.ThoughtSignature,
+			ToolID:           part.ToolID,
+			ResponsesData:    part.ResponsesData,
+			StartedAt:        part.StartedAt,
+			FinishedAt:       part.FinishedAt,
+		}
+	case message.ToolCall:
+		m.Parts[p.PartIndex] = message.ToolCall{
+			ID:       part.ID,
+			Name:     part.Name,
+			Input:    p.Content,
+			Finished: part.Finished,
+		}
+	case message.ToolResult:
+		m.Parts[p.PartIndex] = message.ToolResult{
+			ToolCallID: part.ToolCallID,
+			Name:       part.Name,
+			Content:    p.Content,
+			IsError:    part.IsError,
+		}
+	default:
+		c.reply(msg.ID, EventError, nil, "part type not editable")
+		return
+	}
+	if err := a.Messages.Update(ctx, m); err != nil {
+		c.reply(msg.ID, EventError, nil, err.Error())
+		return
+	}
+	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
+}
+
+func handleSummarizeSession(ctx context.Context, a *appPkg.App, c *Client, msg WSMessage) {
+	var p SummarizeSessionPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil || p.SessionID == "" {
+		c.reply(msg.ID, EventError, nil, "invalid payload")
+		return
+	}
+	if a.AgentCoordinator == nil {
+		c.reply(msg.ID, EventError, nil, "agent not configured")
+		return
+	}
+	agentCtx := context.WithoutCancel(ctx)
+	c.hub.Broadcast(EventAgentBusy, AgentBusyPayload{SessionID: p.SessionID, Busy: true})
+	err := a.AgentCoordinator.Summarize(agentCtx, p.SessionID)
+	c.hub.Broadcast(EventAgentBusy, AgentBusyPayload{SessionID: p.SessionID, Busy: false})
+	if err != nil {
+		slog.Error("ws: summarize error", "err", err)
+		c.reply(msg.ID, EventError, nil, err.Error())
+		return
+	}
+	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
+}
+
+func handleLogClientEvent(a *appPkg.App, c *Client, msg WSMessage) {
+	cfg := a.Config()
+	if cfg == nil || !cfg.Options.Debug {
+		return
+	}
+	var p LogClientEventPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		return
+	}
+	slog.Debug("client event", "event", p.Event, "details", p.Details)
+}
+
+func handleLogClientError(c *Client, msg WSMessage) {
+	var p LogClientErrorPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		return
+	}
+	slog.Error("client error", "message", p.Message, "source", p.Source, "stack", p.Stack)
+}
+
 func handleSetTheme(a *appPkg.App, c *Client, msg WSMessage) {
 	var p SetThemePayload
 	if err := json.Unmarshal(msg.Payload, &p); err != nil {
@@ -579,5 +767,80 @@ func handleSetTheme(a *appPkg.App, c *Client, msg WSMessage) {
 		c.reply(msg.ID, EventError, nil, err.Error())
 		return
 	}
-	c.reply(msg.ID, EventResponse, map[string]string{"theme": p.Theme}, "")
+	if wire, ok := buildConfigWire(a); ok {
+		c.hub.Broadcast(EventConfig, wire)
+	}
+}
+
+func handleSetMCPDisabled(ctx context.Context, a *appPkg.App, c *Client, msg WSMessage) {
+	var p SetMCPDisabledPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		c.reply(msg.ID, EventError, nil, "invalid payload")
+		return
+	}
+	cfg := a.Config()
+	if cfg == nil {
+		c.reply(msg.ID, EventError, nil, "config not available")
+		return
+	}
+	var err error
+	if p.Disabled {
+		err = mcp.DisableServer(ctx, cfg, p.Name)
+	} else {
+		err = mcp.EnableServer(ctx, cfg, p.Name)
+	}
+	if err != nil {
+		c.reply(msg.ID, EventError, nil, err.Error())
+		return
+	}
+	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
+}
+
+func handleAddMCPServer(ctx context.Context, a *appPkg.App, c *Client, msg WSMessage) {
+	var p AddMCPServerPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		c.reply(msg.ID, EventError, nil, "invalid payload")
+		return
+	}
+	if p.Name == "" {
+		c.reply(msg.ID, EventError, nil, "name is required")
+		return
+	}
+	cfg := a.Config()
+	if cfg == nil {
+		c.reply(msg.ID, EventError, nil, "config not available")
+		return
+	}
+	mcpCfg := config.MCPConfig{
+		Type:    config.MCPType(p.Type),
+		Command: p.Command,
+		Args:    p.Args,
+		URL:     p.URL,
+		Env:     p.Env,
+		Headers: p.Headers,
+		Timeout: p.Timeout,
+	}
+	if err := mcp.AddServer(ctx, cfg, p.Name, mcpCfg); err != nil {
+		c.reply(msg.ID, EventError, nil, err.Error())
+		return
+	}
+	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
+}
+
+func handleRemoveMCPServer(a *appPkg.App, c *Client, msg WSMessage) {
+	var p RemoveMCPServerPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		c.reply(msg.ID, EventError, nil, "invalid payload")
+		return
+	}
+	cfg := a.Config()
+	if cfg == nil {
+		c.reply(msg.ID, EventError, nil, "config not available")
+		return
+	}
+	if err := mcp.RemoveServer(cfg, p.Name); err != nil {
+		c.reply(msg.ID, EventError, nil, err.Error())
+		return
+	}
+	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
 }

@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, useMemo, useCallback } from "react";
 import { useStore } from "@nanostores/react";
+import { CheckCheck, Minimize2, ScrollText, ShieldOff, Zap } from "lucide-react";
 import {
   $sessions,
   $activeSessionID,
@@ -15,6 +16,7 @@ import {
   setYolo,
   setProviderKey,
   removeProviderKey,
+  summarizeSession,
 } from "../store";
 import { ws } from "../ws";
 import type { ConfigPayload, Session } from "../types";
@@ -525,6 +527,7 @@ export function Header() {
 
   const totalTokens = activeSession ? activeSession.PromptTokens + activeSession.CompletionTokens : 0;
   const isSummarized = !!activeSession?.SummaryMessageID;
+  const hasMessages = (activeSession?.MessageCount ?? 0) > 0;
 
   // Determine context window from the effective large model of the active session.
   // Use the same key-resolution logic as ModelSelector so the % always matches
@@ -578,10 +581,20 @@ export function Header() {
               <span className={`font-semibold ${pctColor(contextPct)}`}>{contextPct}%</span>
             )}
             {isSummarized && (
-              <span className="text-accent" title="Session has been summarized">∑</span>
+              <span title="Session has been summarized"><CheckCheck size={13} className="text-accent" /></span>
             )}
           </span>
         )}
+
+        <button
+          onClick={() => activeSessionID && summarizeSession(activeSessionID)}
+          disabled={!activeSessionID || isBusy || !hasMessages}
+          title="Force context summarization — compresses conversation history to free up context window"
+          className="flex items-center gap-1.5 text-xs font-medium rounded-lg px-2.5 py-1.5 border transition-colors bg-base-overlay border-surface text-text-subtle hover:border-accent/50 hover:text-text disabled:opacity-40 disabled:cursor-not-allowed"
+        >
+          <Minimize2 size={13} />
+          <span>Compact</span>
+        </button>
 
         <button
           onClick={() => setYolo(!yolo)}
@@ -592,7 +605,7 @@ export function Header() {
               : "bg-base-overlay border-surface text-text-subtle hover:border-accent/50 hover:text-text"
           }`}
         >
-          <span>{yolo ? "⚡" : "🔒"}</span>
+          {yolo ? <Zap size={13} /> : <ShieldOff size={13} />}
           <span>Yolo</span>
         </button>
 
@@ -602,7 +615,7 @@ export function Header() {
           title="View / edit system prompt"
           className="flex items-center gap-1.5 text-xs font-medium rounded-lg px-2.5 py-1.5 border transition-colors bg-base-overlay border-surface text-text-subtle hover:border-accent/50 hover:text-text disabled:opacity-40 disabled:cursor-not-allowed"
         >
-          <span>📋</span>
+          <ScrollText size={13} />
           <span>Prompt</span>
         </button>
 

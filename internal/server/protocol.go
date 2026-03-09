@@ -53,8 +53,12 @@ const (
 	CmdDeleteMessage                = "delete_message"
 	CmdDeleteMessages               = "delete_messages"
 	CmdUpdateMessageContent         = "update_message_content"
+	CmdUpdateMessageThinking        = "update_message_thinking"
 	CmdGetSystemPrompt              = "get_system_prompt"
 	CmdSetSystemPrompt              = "set_system_prompt"
+	CmdSummarizeSession             = "summarize_session"
+	CmdDeleteMessagePart            = "delete_message_part"
+	CmdUpdateMessagePart            = "update_message_part"
 )
 
 // Payload structs for inbound commands.
@@ -124,8 +128,10 @@ type AgentBusyPayload struct {
 
 // MCPServerInfo is the wire format for a single MCP server state.
 type MCPServerInfo struct {
-	Name   string `json:"name"`
-	Status string `json:"status"`
+	Name      string `json:"name"`
+	Status    string `json:"status"`
+	Disabled  bool   `json:"disabled"`
+	ToolCount int    `json:"toolCount"`
 }
 
 // MCPSnapshot is the full MCP state broadcast to clients.
@@ -134,9 +140,14 @@ type MCPSnapshot struct {
 }
 
 const (
-	CmdSetYolo          = "set_yolo"
-	CmdSetProviderKey   = "set_provider_key"
+	CmdSetYolo           = "set_yolo"
+	CmdSetProviderKey    = "set_provider_key"
 	CmdRemoveProviderKey = "remove_provider_key"
+	CmdLogClientEvent    = "log_client_event"
+	CmdLogClientError    = "log_client_error"
+	CmdSetMCPDisabled    = "set_mcp_disabled"
+	CmdAddMCPServer      = "add_mcp_server"
+	CmdRemoveMCPServer   = "remove_mcp_server"
 )
 
 type RemoveRecentModelPayload struct {
@@ -171,12 +182,19 @@ type UpdateMessageContentPayload struct {
 	Content   string `json:"content"`
 }
 
+type UpdateMessageThinkingPayload struct {
+	MessageID string `json:"messageID"`
+	Thinking  string `json:"thinking"`
+}
+
 // ConfigWire is the frontend-facing config payload with PascalCase field names
 // matching the TypeScript ConfigPayload type.
 type ConfigWire struct {
 	Models             map[string]ModelEntryWire   `json:"models"`
 	Providers          map[string]ProviderWire     `json:"providers"`
 	Yolo               bool                        `json:"yolo"`
+	Debug              bool                        `json:"debug"`
+	Theme              string                      `json:"theme"`
 	RecentLargeModels  []ModelEntryWire            `json:"recentLargeModels,omitempty"`
 	RecentSmallModels  []ModelEntryWire            `json:"recentSmallModels,omitempty"`
 }
@@ -209,4 +227,52 @@ type GetSystemPromptPayload struct {
 type SetSystemPromptPayload struct {
 	SessionID string `json:"sessionID"`
 	Content   string `json:"content"`
+}
+
+type SummarizeSessionPayload struct {
+	SessionID string `json:"sessionID"`
+}
+
+type LogClientEventPayload struct {
+	Event   string         `json:"event"`
+	Details map[string]any `json:"details,omitempty"`
+}
+
+type LogClientErrorPayload struct {
+	Message string `json:"message"`
+	Source  string `json:"source,omitempty"`
+	Stack   string `json:"stack,omitempty"`
+}
+
+type DeleteMessagePartPayload struct {
+	MessageID string `json:"messageID"`
+	PartIndex int    `json:"partIndex"`
+}
+
+type UpdateMessagePartPayload struct {
+	MessageID string `json:"messageID"`
+	PartIndex int    `json:"partIndex"`
+	Content   string `json:"content"`
+}
+
+type SetMCPDisabledPayload struct {
+	Name     string `json:"name"`
+	Disabled bool   `json:"disabled"`
+}
+
+// AddMCPServerPayload carries a new MCP server definition.
+// The JSON format mirrors MCPConfig with an extra "name" field.
+type AddMCPServerPayload struct {
+	Name    string `json:"name"`
+	Type    string `json:"type"`
+	Command string `json:"command,omitempty"`
+	Args    []string `json:"args,omitempty"`
+	URL     string `json:"url,omitempty"`
+	Env     map[string]string `json:"env,omitempty"`
+	Headers map[string]string `json:"headers,omitempty"`
+	Timeout int    `json:"timeout,omitempty"`
+}
+
+type RemoveMCPServerPayload struct {
+	Name string `json:"name"`
 }

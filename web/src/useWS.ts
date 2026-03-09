@@ -9,6 +9,7 @@ import {
   $yolo,
   $sessions,
   $activeSessionID,
+  $busySessions,
   setSessions,
   upsertSession,
   removeSession,
@@ -19,9 +20,10 @@ import {
   removePermission,
   setSessionBusy,
   setActiveSession,
-  trackModelUsage,
   $recentLargeModels,
   $recentSmallModels,
+  dequeueNextMessage,
+  applyTheme,
 } from "./store";
 import type { WSMessage, Session, Message, PermissionRequest, ConfigPayload, LSPState, MCPState, AgentBusyPayload } from "./types";
 
@@ -55,6 +57,10 @@ export function useWS() {
     const offs = [
       ws.on("_connected", () => {
         $connected.set(true);
+        // Reset busy state on reconnect — the replay buffer will re-set any
+        // sessions that are truly still running. Without this, a server restart
+        // leaves sessions stuck in "busy" forever.
+        $busySessions.set(new Set());
         ws.send("list_sessions");
         ws.send("get_config");
       }),
@@ -113,12 +119,7 @@ export function useWS() {
       }),
 
       ws.on("message_created", (msg: WSMessage) => {
-        const m = msg.payload as Message;
-        upsertMessage(m);
-        // Track model as recently used when assistant responds successfully
-        if (m.Role === "assistant" && m.Provider && m.Model) {
-          trackModelUsage("large", `${m.Provider}:::${m.Model}`);
-        }
+        upsertMessage(msg.payload as Message);
       }),
       ws.on("message_updated", (msg: WSMessage) =>
         upsertMessage(msg.payload as Message)
@@ -143,6 +144,10 @@ export function useWS() {
         // Sync yolo from server only on initial load (localStorage takes priority on reconnect)
         if (cfg.yolo !== undefined && localStorage.getItem("crush_yolo") === null) {
           $yolo.set(cfg.yolo);
+        }
+        // Apply saved theme
+        if (cfg.theme) {
+          applyTheme(cfg.theme);
         }
         // Restore recent models from server (persisted across restarts)
         if (cfg.recentLargeModels?.length) {
@@ -175,6 +180,13 @@ export function useWS() {
       ws.on("agent_busy", (msg: WSMessage) => {
         const p = msg.payload as AgentBusyPayload;
         setSessionBusy(p.SessionID, p.Busy);
+        // When the agent finishes, auto-send the next queued message (if any).
+        if (!p.Busy) {
+          const next = dequeueNextMessage(p.SessionID);
+          if (next) {
+            ws.send("send_message", { sessionID: p.SessionID, content: next });
+          }
+        }
       }),
 
       ws.on("error", (msg: WSMessage) => {
