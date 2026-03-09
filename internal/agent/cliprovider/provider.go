@@ -94,6 +94,16 @@ type CLISpec struct {
 	// process exits. The MCP server runs without Bearer-token auth because
 	// qwen's settings format does not support custom HTTP headers.
 	QwenMCPIntegration bool
+	// GeminiMCPIntegration starts crush's MCP server and registers it in
+	// ~/.gemini/settings.json under a stable per-project ID stored in
+	// <workingDir>/.crush/gemini-mcp-id. The entry is removed when the CLI
+	// process exits. Uses Authorization: Bearer header and trust:true to
+	// bypass Gemini's own confirmation prompts.
+	GeminiMCPIntegration bool
+	// CodexMCPIntegration starts crush's MCP server and passes its URL to
+	// codex via a -c flag (inline config override), so no persistent changes
+	// are made to ~/.codex/config.toml.
+	CodexMCPIntegration bool
 }
 
 // streamEvent is the JSON envelope for Claude CLI stream-json output.
@@ -422,24 +432,26 @@ var All = []CLISpec{
 		UseCrushMCP:    true,
 	},
 	{
-		ModelID:        "cli-gemini-flash",
-		ModelName:      "Gemini 3 Flash (CLI)",
-		ContextWindow:  1_000_000,
-		Binary:         "gemini",
-		BuildArgs:      geminiArgs("gemini-3-flash"),
-		NewPartParser:  geminiPartParser,
-		ParseUsageLine: geminiParseUsageLine,
-		AlwaysStdin:    true,
+		ModelID:              "cli-gemini-flash",
+		ModelName:            "Gemini 3 Flash (CLI)",
+		ContextWindow:        1_000_000,
+		Binary:               "gemini",
+		BuildArgs:            geminiArgs("gemini-3-flash"),
+		NewPartParser:        geminiPartParser,
+		ParseUsageLine:       geminiParseUsageLine,
+		AlwaysStdin:          true,
+		GeminiMCPIntegration: true,
 	},
 	{
-		ModelID:        "cli-gemini-pro",
-		ModelName:      "Gemini 3.1 Pro (CLI)",
-		ContextWindow:  1_000_000,
-		Binary:         "gemini",
-		BuildArgs:      geminiArgs("gemini-3.1-pro-preview"),
-		NewPartParser:  geminiPartParser,
-		ParseUsageLine: geminiParseUsageLine,
-		AlwaysStdin:    true,
+		ModelID:              "cli-gemini-pro",
+		ModelName:            "Gemini 3.1 Pro (CLI)",
+		ContextWindow:        1_000_000,
+		Binary:               "gemini",
+		BuildArgs:            geminiArgs("gemini-3.1-pro-preview"),
+		NewPartParser:        geminiPartParser,
+		ParseUsageLine:       geminiParseUsageLine,
+		AlwaysStdin:          true,
+		GeminiMCPIntegration: true,
 	},
 	{
 		ModelID:            "cli-qwen",
@@ -453,64 +465,70 @@ var All = []CLISpec{
 		QwenMCPIntegration: true,
 	},
 	{
-		ModelID:        "cli-codex",
-		ModelName:      "Codex (gpt-5.3-codex, CLI)",
-		ContextWindow:  400_000,
-		Binary:         "codex",
-		BuildArgs:      codexArgs("gpt-5.3-codex"),
-		NewPartParser:  codexPartParser,
-		ParseUsageLine: codexParseUsageLine,
-		AlwaysStdin:    true,
+		ModelID:             "cli-codex",
+		ModelName:           "Codex (gpt-5.3-codex, CLI)",
+		ContextWindow:       400_000,
+		Binary:              "codex",
+		BuildArgs:           codexArgs("gpt-5.3-codex"),
+		NewPartParser:       codexPartParser,
+		ParseUsageLine:      codexParseUsageLine,
+		AlwaysStdin:         true,
+		CodexMCPIntegration: true,
 	},
 	{
-		ModelID:        "cli-codex-gpt-5-4",
-		ModelName:      "Codex (gpt-5.4, CLI)",
-		ContextWindow:  272_000,
-		Binary:         "codex",
-		BuildArgs:      codexArgs("gpt-5.4"),
-		NewPartParser:  codexPartParser,
-		ParseUsageLine: codexParseUsageLine,
-		AlwaysStdin:    true,
+		ModelID:             "cli-codex-gpt-5-4",
+		ModelName:           "Codex (gpt-5.4, CLI)",
+		ContextWindow:       272_000,
+		Binary:              "codex",
+		BuildArgs:           codexArgs("gpt-5.4"),
+		NewPartParser:       codexPartParser,
+		ParseUsageLine:      codexParseUsageLine,
+		AlwaysStdin:         true,
+		CodexMCPIntegration: true,
 	},
 	{
-		ModelID:        "cli-codex-gpt-5-2",
-		ModelName:      "Codex (gpt-5.2-codex, CLI)",
-		ContextWindow:  400_000,
-		Binary:         "codex",
-		BuildArgs:      codexArgs("gpt-5.2-codex"),
-		NewPartParser:  codexPartParser,
-		ParseUsageLine: codexParseUsageLine,
-		AlwaysStdin:    true,
+		ModelID:             "cli-codex-gpt-5-2",
+		ModelName:           "Codex (gpt-5.2-codex, CLI)",
+		ContextWindow:       400_000,
+		Binary:              "codex",
+		BuildArgs:           codexArgs("gpt-5.2-codex"),
+		NewPartParser:       codexPartParser,
+		ParseUsageLine:      codexParseUsageLine,
+		AlwaysStdin:         true,
+		CodexMCPIntegration: true,
 	},
 	{
-		ModelID:        "cli-codex-max",
-		ModelName:      "Codex Max (gpt-5.1-codex-max, CLI)",
-		ContextWindow:  400_000,
-		Binary:         "codex",
-		BuildArgs:      codexArgs("gpt-5.1-codex-max"),
-		NewPartParser:  codexPartParser,
-		ParseUsageLine: codexParseUsageLine,
-		AlwaysStdin:    true,
+		ModelID:             "cli-codex-max",
+		ModelName:           "Codex Max (gpt-5.1-codex-max, CLI)",
+		ContextWindow:       400_000,
+		Binary:              "codex",
+		BuildArgs:           codexArgs("gpt-5.1-codex-max"),
+		NewPartParser:       codexPartParser,
+		ParseUsageLine:      codexParseUsageLine,
+		AlwaysStdin:         true,
+		CodexMCPIntegration: true,
 	},
 	{
-		ModelID:        "cli-codex-gpt-5-2-base",
-		ModelName:      "Codex (gpt-5.2, CLI)",
-		ContextWindow:  400_000,
-		Binary:         "codex",
-		BuildArgs:      codexArgs("gpt-5.2"),
-		NewPartParser:  codexPartParser,
-		ParseUsageLine: codexParseUsageLine,
-		AlwaysStdin:    true,
+		ModelID:             "cli-codex-gpt-5-2-base",
+		ModelName:           "Codex (gpt-5.2, CLI)",
+		ContextWindow:       400_000,
+		Binary:              "codex",
+		BuildArgs:           codexArgs("gpt-5.2"),
+		NewPartParser:       codexPartParser,
+		ParseUsageLine:      codexParseUsageLine,
+		AlwaysStdin:         true,
+		CodexMCPIntegration: true,
 	},
 	{
-		ModelID:        "cli-codex-mini",
-		ModelName:      "Codex Mini (gpt-5.1-codex-mini, CLI)",
-		ContextWindow:  400_000,
-		Binary:         "codex",
-		BuildArgs:      codexArgs("gpt-5.1-codex-mini"),
-		NewPartParser:  codexPartParser,
-		ParseUsageLine: codexParseUsageLine,
-		AlwaysStdin:    true,
+		ModelID:             "cli-codex-mini",
+		ModelName:           "Codex Mini (gpt-5.1-codex-mini, CLI)",
+		ContextWindow:       400_000,
+		Binary:              "codex",
+		BuildArgs:           codexArgs("gpt-5.1-codex-mini"),
+		NewPartParser:       codexPartParser,
+		ParseUsageLine:      codexParseUsageLine,
+		AlwaysStdin:         true,
+		CodexMCPIntegration: true,
 	},
 }
 
@@ -623,8 +641,9 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 	// (before the closure runs), deleting the config file before claude CLI
 	// can read it.
 	var mcpSrv *crushMCPServer
-	var mcpTmpCfg string  // path to temp MCP config file (claude-style); "" if not used
-	var qwenMCPName string // registered name in ~/.qwen/settings.json; "" if not used
+	var mcpTmpCfg string    // path to temp MCP config file (claude-style); "" if not used
+	var qwenMCPName string  // registered name in ~/.qwen/settings.json; "" if not used
+	var geminiMCPName string // registered name in ~/.gemini/settings.json; "" if not used
 	if m.spec.UseCrushMCP && !yolo && m.perms != nil {
 		var err error
 		mcpSrv, err = newCrushMCPServer(ctx, m.perms, m.sessions, sessionID, m.workingDir, "")
@@ -707,6 +726,8 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 					// Restrict qwen to only crush MCP tools so its built-in
 					// tools (read_file, glob, etc.) cannot bypass crush's
 					// permission system.
+					// Also block the native todo_write so the model uses
+					// mcp__crush__todos which persists tasks to the crush session.
 					args = append(args,
 						"--allowed-tools",
 						"mcp__"+id+"__Bash",
@@ -715,9 +736,54 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 						"mcp__"+id+"__Glob",
 						"mcp__"+id+"__Grep",
 						"mcp__"+id+"__todos",
+						"--exclude-tools",
+						"todo_write",
 					)
 				}
 			}
+		}
+	}
+
+	// Gemini MCP integration: register crush's MCP server in ~/.gemini/settings.json
+	// using a stable per-project ID. Gemini supports Authorization: Bearer headers and
+	// a trust:true flag to bypass its own confirmation prompts, so tool calls go
+	// directly to our MCP server which shows crush's permission dialog.
+	if m.spec.GeminiMCPIntegration && m.perms != nil {
+		id, idErr := geminiMCPID(m.workingDir)
+		if idErr != nil {
+			slog.Warn("cliprovider: failed to get gemini MCP ID", "err", idErr)
+		} else {
+			var err error
+			mcpSrv, err = newCrushMCPServer(ctx, m.perms, m.sessions, sessionID, m.workingDir, "")
+			if err != nil {
+				slog.Warn("cliprovider: failed to start gemini MCP server", "err", err)
+			} else {
+				deregisterGeminiMCP(id)
+				if regErr := registerGeminiMCP(id, mcpSrv.addr, mcpSrv.token); regErr != nil {
+					slog.Warn("cliprovider: failed to register gemini MCP server", "err", regErr)
+					mcpSrv.stop()
+					mcpSrv = nil
+				} else {
+					geminiMCPName = id
+					args = append(args, "--allowed-mcp-server-names", id)
+					slog.Info("cliprovider: gemini MCP registered", "name", id, "addr", mcpSrv.addr)
+				}
+			}
+		}
+	}
+
+	// Codex MCP integration: pass crush's MCP server URL to codex via -c flag
+	// (inline config override). No persistent changes to ~/.codex/config.toml.
+	// The token is embedded in the URL as a query parameter so the server can
+	// authenticate requests without needing env-var injection.
+	if m.spec.CodexMCPIntegration && m.perms != nil {
+		var err error
+		mcpSrv, err = newCrushMCPServer(ctx, m.perms, m.sessions, sessionID, m.workingDir, "")
+		if err != nil {
+			slog.Warn("cliprovider: failed to start codex MCP server", "err", err)
+		} else {
+			args = append(args, "-c", fmt.Sprintf("mcp_servers.crush.url=%q", mcpSrv.mcpURL()))
+			slog.Info("cliprovider: codex MCP configured", "addr", mcpSrv.addr)
 		}
 	}
 
@@ -847,6 +913,9 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 		}
 		if qwenMCPName != "" {
 			defer deregisterQwenMCP(qwenMCPName)
+		}
+		if geminiMCPName != "" {
+			defer deregisterGeminiMCP(geminiMCPName)
 		}
 
 		// Kill the subprocess immediately when ctx is cancelled, even while

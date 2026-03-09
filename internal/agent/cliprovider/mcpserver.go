@@ -608,6 +608,115 @@ func deregisterQwenMCP(serverName string) {
 	slog.Info("cliprovider: deregistered qwen MCP server", "name", serverName)
 }
 
+// ── gemini MCP registration ───────────────────────────────────────────────────
+
+// geminiMCPID returns a stable MCP server name for the given workingDir.
+// Mirrors the logic of qwenMCPID but uses a separate ID file (gemini-mcp-id).
+func geminiMCPID(workingDir string) (string, error) {
+	var idFile string
+	crushDir := filepath.Join(workingDir, ".crush")
+	if info, err := os.Stat(crushDir); err == nil && info.IsDir() {
+		idFile = filepath.Join(crushDir, "gemini-mcp-id")
+	} else {
+		h := fmt.Sprintf("%x", []byte(workingDir))
+		if len(h) > 16 {
+			h = h[:16]
+		}
+		idFile = filepath.Join(os.TempDir(), "crush-gemini-mcp-"+h)
+	}
+	if data, err := os.ReadFile(idFile); err == nil {
+		if id := strings.TrimSpace(string(data)); id != "" {
+			return id, nil
+		}
+	}
+	id := "crush-" + uuid.New().String()[:8]
+	if err := os.WriteFile(idFile, []byte(id), 0o644); err != nil {
+		return "", fmt.Errorf("cliprovider: write gemini-mcp-id: %w", err)
+	}
+	slog.Info("cliprovider: created gemini MCP ID", "id", id, "file", idFile)
+	return id, nil
+}
+
+// geminiSettingsPath returns the path to ~/.gemini/settings.json.
+func geminiSettingsPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".gemini", "settings.json"), nil
+}
+
+// registerGeminiMCP adds the crush MCP server to ~/.gemini/settings.json.
+// The Authorization: Bearer header is stored in the settings so Gemini sends
+// it with each MCP request. trust:true bypasses Gemini's own confirmation
+// prompts so tool calls flow directly to crush's permission dialog.
+func registerGeminiMCP(serverName, addr, token string) error {
+	path, err := geminiSettingsPath()
+	if err != nil {
+		return err
+	}
+	var settings map[string]any
+	if data, rerr := os.ReadFile(path); rerr == nil {
+		_ = json.Unmarshal(data, &settings)
+	}
+	if settings == nil {
+		settings = map[string]any{}
+	}
+	mcpServers, _ := settings["mcpServers"].(map[string]any)
+	if mcpServers == nil {
+		mcpServers = map[string]any{}
+	}
+	mcpServers[serverName] = map[string]any{
+		"url":  "http://" + addr + "/mcp",
+		"type": "http",
+		"headers": map[string]string{
+			"Authorization": "Bearer " + token,
+		},
+		"trust": true,
+	}
+	settings["mcpServers"] = mcpServers
+	data, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	slog.Info("cliprovider: registered gemini MCP server", "name", serverName, "addr", addr)
+	return os.WriteFile(path, data, 0o644)
+}
+
+// deregisterGeminiMCP removes the crush MCP entry from ~/.gemini/settings.json.
+func deregisterGeminiMCP(serverName string) {
+	path, err := geminiSettingsPath()
+	if err != nil {
+		return
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var settings map[string]any
+	if json.Unmarshal(data, &settings) != nil {
+		return
+	}
+	mcpServers, _ := settings["mcpServers"].(map[string]any)
+	if mcpServers == nil {
+		return
+	}
+	delete(mcpServers, serverName)
+	if len(mcpServers) == 0 {
+		delete(settings, "mcpServers")
+	} else {
+		settings["mcpServers"] = mcpServers
+	}
+	if data, err = json.MarshalIndent(settings, "", "  "); err != nil {
+		return
+	}
+	_ = os.WriteFile(path, data, 0o644)
+	slog.Info("cliprovider: deregistered gemini MCP server", "name", serverName)
+}
+
 func sliceLines(content string, start, end int) string {
 	lines := strings.Split(content, "\n")
 	if start > 0 {
