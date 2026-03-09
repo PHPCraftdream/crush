@@ -244,7 +244,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	defer cancel()
 	defer a.activeRequests.Del(call.SessionID)
 
-	history, files := a.preparePrompt(msgs, call.Attachments...)
+	history, files := a.preparePrompt(msgs, currentSession.Todos, call.Attachments...)
 
 
 	var currentAssistant *message.Message
@@ -648,7 +648,7 @@ func (a *sessionAgent) Summarize(ctx context.Context, sessionID string, opts fan
 		return nil
 	}
 
-	aiMsgs, _ := a.preparePrompt(msgs)
+	aiMsgs, _ := a.preparePrompt(msgs, nil)
 
 	genCtx, cancel := context.WithCancel(ctx)
 	a.activeRequests.Set(sessionID, cancel)
@@ -773,15 +773,25 @@ func (a *sessionAgent) createUserMessage(ctx context.Context, call SessionAgentC
 	return msg, nil
 }
 
-func (a *sessionAgent) preparePrompt(msgs []message.Message, attachments ...message.Attachment) ([]fantasy.Message, []fantasy.FilePart) {
+func (a *sessionAgent) preparePrompt(msgs []message.Message, todos []session.Todo, attachments ...message.Attachment) ([]fantasy.Message, []fantasy.FilePart) {
 	var history []fantasy.Message
 	if !a.isSubAgent {
-		history = append(history, fantasy.NewUserMessage(
-			fmt.Sprintf("<system_reminder>%s</system_reminder>",
-				`This is a reminder that your todo list is currently empty. DO NOT mention this to the user explicitly because they are already aware.
+		var reminderText string
+		if len(todos) == 0 {
+			reminderText = `This is a reminder that your todo list is currently empty. DO NOT mention this to the user explicitly because they are already aware.
 If you are working on tasks that would benefit from a todo list please use the "todos" tool to create one.
-If not, please feel free to ignore. Again do not mention this message to the user.`,
-			),
+If not, please feel free to ignore. Again do not mention this message to the user.`
+		} else {
+			var sb strings.Builder
+			sb.WriteString("This is a reminder of your CURRENT todo list (as last saved — this is the ground truth, even if your conversation history shows something different):\n\n")
+			for _, t := range todos {
+				sb.WriteString(fmt.Sprintf("- [%s] %s\n", t.Status, t.Content))
+			}
+			sb.WriteString("\nDo NOT recreate or reset this list unless the user or task explicitly requires it. DO NOT mention this reminder to the user.")
+			reminderText = sb.String()
+		}
+		history = append(history, fantasy.NewUserMessage(
+			fmt.Sprintf("<system_reminder>%s</system_reminder>", reminderText),
 		))
 	}
 	for _, m := range msgs {
