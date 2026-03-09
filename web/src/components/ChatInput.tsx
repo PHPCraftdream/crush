@@ -1,22 +1,12 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 import { useStore } from "@nanostores/react";
-import { $activeSessionID, $busySessions, $sessionLargeModel, $sessionSmallModel } from "../store";
+import { $activeSessionID, $busySessions } from "../store";
 import { ws } from "../ws";
-
-// Parses "providerID:::modelID" key into {provider, model} object for the wire format.
-function parseModelKey(key: string | undefined): { provider: string; model: string } | undefined {
-  if (!key) return undefined;
-  const idx = key.indexOf(":::");
-  if (idx === -1) return undefined;
-  return { provider: key.slice(0, idx), model: key.slice(idx + 3) };
-}
 
 export function ChatInput() {
   const [text, setText] = useState("");
   const activeSessionID = useStore($activeSessionID);
   const busySessions = useStore($busySessions);
-  const sessionLargeModels = useStore($sessionLargeModel);
-  const sessionSmallModels = useStore($sessionSmallModel);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
@@ -30,17 +20,17 @@ export function ChatInput() {
   const send = useCallback(() => {
     const msg = text.trim();
     if (!msg || !activeSessionID || agentBusy) return;
-    const largeKey = sessionLargeModels[activeSessionID];
-    const smallKey = sessionSmallModels[activeSessionID];
+    
+    // We no longer need to send explicit overrides in every message
+    // because the backend now reads them from the session record in DB.
+    // The UI stays in sync because Header updates the DB immediately on change.
+    
     const payload: Record<string, unknown> = { sessionID: activeSessionID, content: msg };
-    const largeOverride = parseModelKey(largeKey);
-    const smallOverride = parseModelKey(smallKey);
-    if (largeOverride) payload.largeModel = largeOverride;
-    if (smallOverride) payload.smallModel = smallOverride;
+    
     ws.send("send_message", payload);
     setText("");
     if (textareaRef.current) textareaRef.current.style.height = "auto";
-  }, [text, activeSessionID, agentBusy, sessionLargeModels, sessionSmallModels]);
+  }, [text, activeSessionID, agentBusy]);
 
   function onKey(e: React.KeyboardEvent<HTMLTextAreaElement>) {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -64,9 +54,9 @@ export function ChatInput() {
   const placeholder = activeSessionID ? "Message… (Enter to send)" : "Select or create a session";
 
   return (
-    <div className="px-6 py-4 border-t border-surface bg-white shrink-0">
-      <div className={`flex gap-3 items-end bg-base-overlay border rounded-xl px-4 py-3 transition-colors ${
-        activeSessionID ? "border-surface focus-within:border-accent/50 focus-within:shadow-sm" : "border-surface opacity-60"
+    <div className="px-8 py-6 border-t border-surface bg-white shrink-0">
+      <div className={`flex gap-4 items-end bg-base-overlay border rounded-2xl px-5 py-4 transition-all ${
+        activeSessionID ? "border-surface focus-within:border-accent/50 focus-within:shadow-md focus-within:bg-white" : "border-surface opacity-60"
       }`}>
         <textarea
           ref={textareaRef}
@@ -77,12 +67,12 @@ export function ChatInput() {
           disabled={!activeSessionID}
           autoFocus
           rows={1}
-          className="flex-1 bg-transparent border-none outline-none resize-none text-text text-sm leading-6 min-h-[24px] max-h-60 overflow-y-auto disabled:cursor-not-allowed placeholder:text-text-subtle"
+          className="flex-1 bg-transparent border-none outline-none resize-none text-text text-[16px] leading-relaxed min-h-[28px] max-h-80 overflow-y-auto disabled:cursor-not-allowed placeholder:text-text-subtle font-medium"
         />
         {agentBusy ? (
           <button
             onClick={cancel}
-            className="shrink-0 bg-red text-white font-semibold rounded-lg px-4 py-2 text-sm hover:bg-red/90 active:scale-95 transition-all"
+            className="shrink-0 bg-red text-white font-bold rounded-xl px-6 py-2.5 text-base hover:bg-red/90 active:scale-95 transition-all shadow-sm"
           >
             Stop
           </button>
@@ -90,13 +80,13 @@ export function ChatInput() {
           <button
             onClick={send}
             disabled={!canSend}
-            className="shrink-0 bg-accent text-white font-semibold rounded-lg px-4 py-2 text-sm disabled:opacity-30 hover:bg-accent/90 active:scale-95 transition-all"
+            className="shrink-0 bg-accent text-white font-bold rounded-xl px-6 py-2.5 text-base disabled:opacity-30 hover:bg-accent/90 active:scale-95 transition-all shadow-sm"
           >
             Send
           </button>
         )}
       </div>
-      <p className="text-center text-text-subtle text-xs mt-2">
+      <p className="text-center text-text-subtle text-sm mt-3 font-medium">
         Shift+Enter for newline
       </p>
     </div>

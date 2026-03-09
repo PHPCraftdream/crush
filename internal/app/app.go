@@ -20,7 +20,6 @@ import (
 	"github.com/charmbracelet/crush/internal/agent/tools/mcp"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/db"
-	"github.com/charmbracelet/crush/internal/event"
 	"github.com/charmbracelet/crush/internal/filetracker"
 	"github.com/charmbracelet/crush/internal/format"
 	"github.com/charmbracelet/crush/internal/history"
@@ -70,7 +69,7 @@ func New(ctx context.Context, conn *sql.DB, cfg *config.Config) (*App, error) {
 		Sessions:    sessions,
 		Messages:    messages,
 		History:     files,
-		Permissions: permission.NewPermissionService(cfg.WorkingDir(), skipPermissionsRequests, allowedTools),
+		Permissions: permission.NewPermissionService(ctx, cfg.WorkingDir(), skipPermissionsRequests, allowedTools, q),
 		FileTracker: filetracker.NewService(q),
 		LSPManager:  lsp.NewManager(cfg),
 
@@ -412,7 +411,6 @@ func (app *App) Shutdown() {
 
 	// Send exit event
 	wg.Go(func() {
-		event.AppExited()
 	})
 
 	// Kill all background shells.

@@ -6,6 +6,7 @@ import {
   $lspStates,
   $mcpState,
   $agentError,
+  $yolo,
   $sessions,
   $activeSessionID,
   setSessions,
@@ -18,6 +19,9 @@ import {
   removePermission,
   setSessionBusy,
   setActiveSession,
+  trackModelUsage,
+  $recentLargeModels,
+  $recentSmallModels,
 } from "./store";
 import type { WSMessage, Session, Message, PermissionRequest, ConfigPayload, LSPState, MCPState, AgentBusyPayload } from "./types";
 
@@ -108,9 +112,14 @@ export function useWS() {
         }
       }),
 
-      ws.on("message_created", (msg: WSMessage) =>
-        upsertMessage(msg.payload as Message)
-      ),
+      ws.on("message_created", (msg: WSMessage) => {
+        const m = msg.payload as Message;
+        upsertMessage(m);
+        // Track model as recently used when assistant responds successfully
+        if (m.Role === "assistant" && m.Provider && m.Model) {
+          trackModelUsage("large", `${m.Provider}:::${m.Model}`);
+        }
+      }),
       ws.on("message_updated", (msg: WSMessage) =>
         upsertMessage(msg.payload as Message)
       ),
@@ -128,9 +137,23 @@ export function useWS() {
         removePermission((msg.payload as { ToolCallID: string }).ToolCallID)
       ),
 
-      ws.on("config", (msg: WSMessage) =>
-        $config.set(msg.payload as ConfigPayload)
-      ),
+      ws.on("config", (msg: WSMessage) => {
+        const cfg = msg.payload as ConfigPayload;
+        $config.set(cfg);
+        // Sync yolo from server only on initial load (localStorage takes priority on reconnect)
+        if (cfg.yolo !== undefined && localStorage.getItem("crush_yolo") === null) {
+          $yolo.set(cfg.yolo);
+        }
+        // Restore recent models from server (persisted across restarts)
+        if (cfg.recentLargeModels?.length) {
+          const keys = cfg.recentLargeModels.map(m => `${m.Provider}:::${m.Model}`);
+          $recentLargeModels.set(keys);
+        }
+        if (cfg.recentSmallModels?.length) {
+          const keys = cfg.recentSmallModels.map(m => `${m.Provider}:::${m.Model}`);
+          $recentSmallModels.set(keys);
+        }
+      }),
 
       ws.on("lsp_state", (msg: WSMessage) => {
         const incoming = msg.payload as LSPState;
@@ -156,8 +179,6 @@ export function useWS() {
 
       ws.on("error", (msg: WSMessage) => {
         $agentError.set((msg.error as string) || "Unknown error");
-        // Auto-clear after 8 seconds
-        setTimeout(() => $agentError.set(null), 8000);
       }),
     ];
 

@@ -3,12 +3,14 @@ package permission
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
 	"sync"
 
 	"github.com/charmbracelet/crush/internal/csync"
+	"github.com/charmbracelet/crush/internal/db"
 	"github.com/charmbracelet/crush/internal/pubsub"
 	"github.com/google/uuid"
 )
@@ -66,6 +68,7 @@ type permissionService struct {
 	autoApproveSessionsMu sync.RWMutex
 	skip                  bool
 	allowedTools          []string
+	q                     *db.Queries
 
 	// used to make sure we only process one request at a time
 	requestMu       sync.Mutex
@@ -86,6 +89,19 @@ func (s *permissionService) GrantPersistent(permission PermissionRequest) {
 	s.sessionPermissionsMu.Lock()
 	s.sessionPermissions = append(s.sessionPermissions, permission)
 	s.sessionPermissionsMu.Unlock()
+
+	// Persist to DB so it survives restarts.
+	if s.q != nil {
+		if err := s.q.CreateSessionPermission(context.Background(), db.CreateSessionPermissionParams{
+			ID:        uuid.New().String(),
+			SessionID: permission.SessionID,
+			ToolName:  permission.ToolName,
+			Action:    permission.Action,
+			Path:      permission.Path,
+		}); err != nil {
+			slog.Warn("permission: failed to persist grant", "err", err)
+		}
+	}
 
 	s.activeRequestMu.Lock()
 	if s.activeRequest != nil && s.activeRequest.ID == permission.ID {
@@ -233,8 +249,8 @@ func (s *permissionService) SkipRequests() bool {
 	return s.skip
 }
 
-func NewPermissionService(workingDir string, skip bool, allowedTools []string) Service {
-	return &permissionService{
+func NewPermissionService(ctx context.Context, workingDir string, skip bool, allowedTools []string, q *db.Queries) Service {
+	svc := &permissionService{
 		Broker:              pubsub.NewBroker[PermissionRequest](),
 		notificationBroker:  pubsub.NewBroker[PermissionNotification](),
 		workingDir:          workingDir,
@@ -243,5 +259,25 @@ func NewPermissionService(workingDir string, skip bool, allowedTools []string) S
 		skip:                skip,
 		allowedTools:        allowedTools,
 		pendingRequests:     csync.NewMap[string, chan bool](),
+		q:                   q,
 	}
+
+	// Load previously persisted "always allow" permissions from DB.
+	if q != nil {
+		if rows, err := q.ListAllSessionPermissions(ctx); err == nil {
+			for _, r := range rows {
+				svc.sessionPermissions = append(svc.sessionPermissions, PermissionRequest{
+					ID:        r.ID,
+					SessionID: r.SessionID,
+					ToolName:  r.ToolName,
+					Action:    r.Action,
+					Path:      r.Path,
+				})
+			}
+		} else {
+			slog.Warn("permission: failed to load persisted permissions", "err", err)
+		}
+	}
+
+	return svc
 }

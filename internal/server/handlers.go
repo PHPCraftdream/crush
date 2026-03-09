@@ -7,6 +7,7 @@ import (
 
 	appPkg "github.com/charmbracelet/crush/internal/app"
 	"github.com/charmbracelet/crush/internal/agent"
+	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/permission"
 	"github.com/charmbracelet/crush/internal/session"
@@ -48,6 +49,16 @@ func handleIncoming(ctx context.Context, a *appPkg.App, c *Client, raw []byte) {
 		go handleSetTheme(a, c, msg)
 	case CmdRenameSession:
 		go handleRenameSession(ctx, a, c, msg)
+	case CmdSetSessionModels:
+		go handleSetSessionModels(ctx, a, c, msg)
+	case CmdSetYolo:
+		go handleSetYolo(a, c, msg)
+	case CmdRemoveRecentModel:
+		go handleRemoveRecentModel(a, c, msg)
+	case CmdSetProviderKey:
+		go handleSetProviderKey(a, c, msg)
+	case CmdRemoveProviderKey:
+		go handleRemoveProviderKey(a, c, msg)
 	default:
 		slog.Debug("ws: unknown command", "type", msg.Type)
 		c.reply(msg.ID, EventError, nil, "unknown command: "+msg.Type)
@@ -60,6 +71,8 @@ func handleSendMessage(ctx context.Context, a *appPkg.App, c *Client, msg WSMess
 		c.reply(msg.ID, EventError, nil, "invalid payload")
 		return
 	}
+
+	slog.Info("ws: handleSendMessage", "sessionID", p.SessionID, "content", p.Content)
 
 	var attachments []message.Attachment
 	for _, att := range p.Attachments {
@@ -75,12 +88,37 @@ func handleSendMessage(ctx context.Context, a *appPkg.App, c *Client, msg WSMess
 		return
 	}
 
+	// Priority:
+	// 1. Explicit override in message payload (from UI)
+	// 2. Models stored in the session record in DB
+	// 3. Global defaults from config
+
 	var largeOverride, smallOverride *agent.ModelOverride
+
+	// Check payload first
 	if p.LargeModel != nil {
 		largeOverride = &agent.ModelOverride{Provider: p.LargeModel.Provider, Model: p.LargeModel.Model}
 	}
 	if p.SmallModel != nil {
 		smallOverride = &agent.ModelOverride{Provider: p.SmallModel.Provider, Model: p.SmallModel.Model}
+	}
+
+	// If no payload override, check DB
+	if largeOverride == nil || smallOverride == nil {
+		sess, err := a.Sessions.Get(ctx, p.SessionID)
+		if err == nil {
+			if largeOverride == nil && sess.LargeModelID != "" {
+				slog.Info("ws: using models from DB", "sessionID", p.SessionID, "large", sess.LargeModelID)
+				largeOverride = &agent.ModelOverride{Provider: sess.LargeModelProvider, Model: sess.LargeModelID}
+			}
+			if smallOverride == nil && sess.SmallModelID != "" {
+				smallOverride = &agent.ModelOverride{Provider: sess.SmallModelProvider, Model: sess.SmallModelID}
+			}
+		}
+	}
+
+	if largeOverride != nil {
+		slog.Info("ws: final models for run", "sessionID", p.SessionID, "large", largeOverride.Model)
 	}
 
 	c.hub.Broadcast(EventAgentBusy, AgentBusyPayload{SessionID: p.SessionID, Busy: true})
@@ -96,6 +134,75 @@ func handleSendMessage(ctx context.Context, a *appPkg.App, c *Client, msg WSMess
 		slog.Error("ws: agent run error", "err", err)
 		c.reply(msg.ID, EventError, nil, err.Error())
 	}
+}
+
+func handleSetSessionModels(ctx context.Context, a *appPkg.App, c *Client, msg WSMessage) {
+	var p SetSessionModelsPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		c.reply(msg.ID, EventError, nil, "invalid payload")
+		return
+	}
+
+	slog.Info("ws: handleSetSessionModels", "sessionID", p.SessionID, "large", p.LargeModel, "small", p.SmallModel)
+
+	var lp, lm, sp, sm string
+	if p.LargeModel != nil {
+		lp, lm = p.LargeModel.Provider, p.LargeModel.Model
+	}
+	if p.SmallModel != nil {
+		sp, sm = p.SmallModel.Provider, p.SmallModel.Model
+	}
+
+	if err := a.Sessions.UpdateModels(ctx, p.SessionID, lp, lm, sp, sm); err != nil {
+		c.reply(msg.ID, EventError, nil, err.Error())
+		return
+	}
+
+	// Record recently used models in the config (persists across restarts)
+	cfg := a.Config()
+	if cfg != nil && lp != "" && lm != "" {
+		if err := cfg.RecordRecentModel(config.SelectedModelTypeLarge, config.SelectedModel{Provider: lp, Model: lm}); err != nil {
+			slog.Warn("ws: failed to record recent large model", "err", err)
+		}
+	}
+	if cfg != nil && sp != "" && sm != "" {
+		if err := cfg.RecordRecentModel(config.SelectedModelTypeSmall, config.SelectedModel{Provider: sp, Model: sm}); err != nil {
+			slog.Warn("ws: failed to record recent small model", "err", err)
+		}
+	}
+
+	// Broadcast updated session so clients can refresh their model selectors.
+	if sess, err := a.Sessions.Get(ctx, p.SessionID); err == nil {
+		c.hub.Broadcast(EventSessionUpdated, sess)
+	}
+	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
+}
+
+func handleRemoveRecentModel(a *appPkg.App, c *Client, msg WSMessage) {
+	var p RemoveRecentModelPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		c.reply(msg.ID, EventError, nil, "invalid payload")
+		return
+	}
+	cfg := a.Config()
+	if cfg == nil {
+		return
+	}
+	modelType := config.SelectedModelType(p.ModelType)
+	if err := cfg.RemoveRecentModel(modelType, config.SelectedModel{Provider: p.Provider, Model: p.Model}); err != nil {
+		slog.Warn("ws: failed to remove recent model", "err", err)
+	}
+	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
+}
+
+func handleSetYolo(a *appPkg.App, c *Client, msg WSMessage) {
+	var p SetYoloPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		c.reply(msg.ID, EventError, nil, "invalid payload")
+		return
+	}
+	a.Permissions.SetSkipRequests(p.Enabled)
+	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
 }
 
 func handleCancelAgent(_ context.Context, a *appPkg.App, c *Client, msg WSMessage) {
@@ -124,6 +231,26 @@ func handleCreateSession(ctx context.Context, a *appPkg.App, c *Client, msg WSMe
 		c.reply(msg.ID, EventError, nil, err.Error())
 		return
 	}
+
+	// Set default models from config for the new session immediately
+	cfg := a.Config()
+	if cfg != nil {
+		var lp, lm, sp, sm string
+		if large, ok := cfg.Models[config.SelectedModelTypeLarge]; ok {
+			lp, lm = large.Provider, large.Model
+		}
+		if small, ok := cfg.Models[config.SelectedModelTypeSmall]; ok {
+			sp, sm = small.Provider, small.Model
+		}
+		if lp != "" || sp != "" {
+			_ = a.Sessions.UpdateModels(ctx, sess.ID, lp, lm, sp, sm)
+			// Re-fetch to get updated state with models
+			if updated, err := a.Sessions.Get(ctx, sess.ID); err == nil {
+				sess = updated
+			}
+		}
+	}
+
 	// Broadcast to all clients so every tab sees the new session.
 	c.hub.Broadcast(EventSessionCreated, sess)
 }
@@ -193,13 +320,11 @@ func handleDenyPermission(a *appPkg.App, c *Client, msg WSMessage) {
 	a.Permissions.Deny(permission.PermissionRequest{ID: p.PermissionID})
 }
 
-func handleGetConfig(a *appPkg.App, c *Client, msg WSMessage) {
+func buildConfigWire(a *appPkg.App) (ConfigWire, bool) {
 	cfg := a.Config()
 	if cfg == nil {
-		c.reply(msg.ID, EventError, nil, "config not available")
-		return
+		return ConfigWire{}, false
 	}
-	// Build wire format with PascalCase keys matching the frontend's ConfigPayload type.
 	wire := ConfigWire{
 		Models:    make(map[string]ModelEntryWire, len(cfg.Models)),
 		Providers: make(map[string]ProviderWire),
@@ -210,14 +335,103 @@ func handleGetConfig(a *appPkg.App, c *Client, msg WSMessage) {
 			Model:    v.Model,
 		}
 	}
-	for _, p := range cfg.EnabledProviders() {
-		pw := ProviderWire{Models: make([]ModelInfoWire, len(p.Models))}
-		for i, m := range p.Models {
-			pw.Models[i] = ModelInfoWire{ID: m.ID, Name: m.Name}
+
+	enabledIDs := make(map[string]config.ProviderConfig)
+	for _, ep := range cfg.EnabledProviders() {
+		enabledIDs[ep.ID] = ep
+	}
+
+	for _, p := range cfg.KnownProviders() {
+		id := string(p.ID)
+		if ep, ok := enabledIDs[id]; ok {
+			pw := ProviderWire{Name: p.Name, Enabled: true, Type: string(p.Type), Models: make([]ModelInfoWire, len(ep.Models))}
+			for i, m := range ep.Models {
+				pw.Models[i] = ModelInfoWire{ID: m.ID, Name: m.Name, ContextWindow: m.ContextWindow}
+			}
+			wire.Providers[id] = pw
+		} else {
+			pw := ProviderWire{Name: p.Name, Enabled: false, Type: string(p.Type), Models: make([]ModelInfoWire, len(p.Models))}
+			for i, m := range p.Models {
+				pw.Models[i] = ModelInfoWire{ID: m.ID, Name: m.Name, ContextWindow: m.ContextWindow}
+			}
+			wire.Providers[id] = pw
 		}
-		wire.Providers[p.ID] = pw
+	}
+
+	for _, ep := range cfg.EnabledProviders() {
+		if _, exists := wire.Providers[ep.ID]; !exists {
+			pw := ProviderWire{Name: ep.Name, Enabled: true, Type: string(ep.Type), Models: make([]ModelInfoWire, len(ep.Models))}
+			for i, m := range ep.Models {
+				pw.Models[i] = ModelInfoWire{ID: m.ID, Name: m.Name, ContextWindow: m.ContextWindow}
+			}
+			wire.Providers[ep.ID] = pw
+		}
+	}
+
+	wire.Yolo = a.Permissions.SkipRequests()
+
+	for _, m := range cfg.RecentModels[config.SelectedModelTypeLarge] {
+		wire.RecentLargeModels = append(wire.RecentLargeModels, ModelEntryWire{Provider: m.Provider, Model: m.Model})
+	}
+	for _, m := range cfg.RecentModels[config.SelectedModelTypeSmall] {
+		wire.RecentSmallModels = append(wire.RecentSmallModels, ModelEntryWire{Provider: m.Provider, Model: m.Model})
+	}
+
+	return wire, true
+}
+
+func handleGetConfig(a *appPkg.App, c *Client, msg WSMessage) {
+	wire, ok := buildConfigWire(a)
+	if !ok {
+		c.reply(msg.ID, EventError, nil, "config not available")
+		return
 	}
 	c.reply(msg.ID, EventConfig, wire, "")
+}
+
+func handleSetProviderKey(a *appPkg.App, c *Client, msg WSMessage) {
+	var p SetProviderKeyPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		c.reply(msg.ID, EventError, nil, "invalid payload")
+		return
+	}
+	cfg := a.Config()
+	if cfg == nil {
+		c.reply(msg.ID, EventError, nil, "config not available")
+		return
+	}
+	if err := cfg.SetProviderAPIKey(p.ProviderID, p.APIKey); err != nil {
+		slog.Warn("ws: failed to set provider API key", "provider", p.ProviderID, "err", err)
+		c.reply(msg.ID, EventError, nil, err.Error())
+		return
+	}
+	// Broadcast updated config to all clients
+	if wire, ok := buildConfigWire(a); ok {
+		c.hub.Broadcast(EventConfig, wire)
+	}
+	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
+}
+
+func handleRemoveProviderKey(a *appPkg.App, c *Client, msg WSMessage) {
+	var p RemoveProviderKeyPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		c.reply(msg.ID, EventError, nil, "invalid payload")
+		return
+	}
+	cfg := a.Config()
+	if cfg == nil {
+		c.reply(msg.ID, EventError, nil, "config not available")
+		return
+	}
+	if err := cfg.RemoveProviderAPIKey(p.ProviderID); err != nil {
+		slog.Warn("ws: failed to remove provider API key", "provider", p.ProviderID, "err", err)
+		c.reply(msg.ID, EventError, nil, err.Error())
+		return
+	}
+	if wire, ok := buildConfigWire(a); ok {
+		c.hub.Broadcast(EventConfig, wire)
+	}
+	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
 }
 
 func handleRenameSession(ctx context.Context, a *appPkg.App, c *Client, msg WSMessage) {

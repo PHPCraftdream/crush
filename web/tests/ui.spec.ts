@@ -48,8 +48,9 @@ test("header shows token usage for active session", async ({ page }) => {
   });
   await expect(page.getByText("Token Session")).toBeVisible({ timeout: 3000 });
   await page.getByText("Token Session").click();
-  // 1200 + 800 = 2000 → "2.0k tok"
-  await expect(page.getByTitle("Total tokens used")).toBeVisible({ timeout: 2000 });
+  // 1200 + 800 = 2000 → formatTokens → "2.0k" — badge has a title containing "tokens"
+  await expect(page.locator("header span[title*='token']")).toBeVisible({ timeout: 2000 });
+  await expect(page.locator("header").getByText(/2\.0k/)).toBeVisible({ timeout: 2000 });
 });
 
 test("header shows busy dots when agent is working", async ({ page }) => {

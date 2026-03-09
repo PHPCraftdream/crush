@@ -2,13 +2,15 @@
  * Model-switch + chat integration tests.
  *
  * Uses two "real" (in terms of mock config) providers:
- *   - cliprovider / claude-cli   (maps to cli-claude in config)
- *   - glm / glm-5               (maps to glm-5 in config)
+ *   - cliprovider / claude-cli
+ *   - glm / glm-5
  *
  * Tests verify:
- *  1. The correct model override is sent in the send_message payload.
- *  2. The assistant's response appears in the chat after the model is switched.
- *  3. Error events from the backend are surfaced as a visible banner.
+ *  1. Selecting a model sends set_session_models (not a per-message override).
+ *  2. send_message payload contains only sessionID and content.
+ *  3. The assistant's response appears in the chat after the model is switched.
+ *  4. Error events from the backend are surfaced as an inline banner.
+ *  5. Error banner can be dismissed.
  */
 
 import { test, expect } from "@playwright/test";
@@ -19,7 +21,6 @@ import {
 } from "./helpers/mock-ws";
 import { makeSession, makeMessage, makeConfig } from "./helpers/fixtures";
 
-/** Config that mirrors the user's two working models. */
 function makeTwoModelConfig() {
   return makeConfig({
     models: {
@@ -28,10 +29,10 @@ function makeTwoModelConfig() {
     },
     providers: {
       cliprovider: {
-        models: [{ id: "claude-cli", name: "claude-cli" }],
+        models: [{ id: "claude-cli", name: "claude-cli", contextWindow: 200000 }],
       },
       glm: {
-        models: [{ id: "glm-5", name: "glm-5" }],
+        models: [{ id: "glm-5", name: "glm-5", contextWindow: 128000 }],
       },
     },
   });
@@ -43,8 +44,6 @@ test.beforeEach(async ({ page }) => {
     route.fulfill({ status: 200, body: "OK" })
   );
 });
-
-// ── Helpers ──────────────────────────────────────────────────────────────────
 
 async function setupSessionAndConfig(
   page: import("@playwright/test").Page,
@@ -63,7 +62,7 @@ async function setupSessionAndConfig(
 
 async function getLastSentMessage(page: import("@playwright/test").Page) {
   const payloads = await page.evaluate(() => {
-    const sent = (window as Record<string, unknown>)["__wsSent"] as Array<{
+    const sent = ((window as unknown) as Record<string, unknown>)["__wsSent"] as Array<{
       type: string;
       payload: unknown;
     }>;
@@ -74,21 +73,21 @@ async function getLastSentMessage(page: import("@playwright/test").Page) {
   return payloads[payloads.length - 1];
 }
 
-// ── Default model — no override sent ────────────────────────────────────────
+// ── Default model — no DB model set ──────────────────────────────────────────
 
-test("default model: send_message has no override, response appears in chat", async ({ page }) => {
+test("default model: send_message has no overrides and response appears in chat", async ({ page }) => {
   await setupSessionAndConfig(page, "mc-def", "Default Chat");
 
-  // Send a message without changing the model
   await page.getByPlaceholder("Message… (Enter to send)").fill("hello");
   await page.getByRole("button", { name: "Send", exact: true }).click();
 
   const sent = await waitForWSSend(page, "send_message");
   const payload = sent.payload as Record<string, unknown>;
   expect(payload.content).toBe("hello");
+  // No model overrides — backend reads from session record in DB
   expect(payload.largeModel).toBeUndefined();
+  expect(payload.smallModel).toBeUndefined();
 
-  // Simulate assistant response
   await sendMockWSMessage(page, {
     type: "message_created",
     payload: makeMessage({
@@ -100,36 +99,48 @@ test("default model: send_message has no override, response appears in chat", as
       Provider: "cliprovider",
     }),
   });
-
   await expect(page.getByText("Hi there!")).toBeVisible({ timeout: 3000 });
 });
 
-// ── Switch to cli-claude, chat, verify override + response visible ────────────
+// ── Switch large model, verify set_session_models + response visible ──────────
 
-test("cli-claude model: override sent and response appears in chat", async ({ page }) => {
+test("switching large model sends set_session_models and response appears in chat", async ({ page }) => {
   await setupSessionAndConfig(page, "mc-cli", "CLI Claude Chat");
 
-  // Select cli-claude from the large model dropdown
   await expect(
     page.locator("header button[title='Large (strong) model']")
   ).toBeVisible({ timeout: 3000 });
   await page.locator("header button[title='Large (strong) model']").click();
   await page.locator("div.absolute").getByText("claude-cli").click();
 
-  // Verify header shows the selected model
+  // Verify set_session_models was sent
+  const modelsCmd = await waitForWSSend(page, "set_session_models");
+  const mp = modelsCmd.payload as { largeModel: { provider: string; model: string } };
+  expect(mp.largeModel).toEqual({ provider: "cliprovider", model: "claude-cli" });
+
+  // Simulate server confirming session model update
+  await sendMockWSMessage(page, {
+    type: "session_updated",
+    payload: makeSession({
+      ID: "mc-cli",
+      Title: "CLI Claude Chat",
+      LargeModelProvider: "cliprovider",
+      LargeModelID: "claude-cli",
+    }),
+  });
+
   await expect(
     page.locator("header button[title='Large (strong) model']").filter({ hasText: "claude-cli" })
   ).toBeVisible({ timeout: 2000 });
 
-  // Send a message
+  // Send a message — no override in payload
   await page.getByPlaceholder("Message… (Enter to send)").fill("what model are you?");
   await page.getByRole("button", { name: "Send", exact: true }).click();
 
-  // Verify WS payload contains the model override
   await waitForWSSend(page, "send_message");
   const payload = await getLastSentMessage(page);
   expect(payload.content).toBe("what model are you?");
-  expect(payload.largeModel).toEqual({ provider: "cliprovider", model: "claude-cli" });
+  expect(payload.largeModel).toBeUndefined();
 
   // Simulate assistant response
   await sendMockWSMessage(page, {
@@ -143,34 +154,29 @@ test("cli-claude model: override sent and response appears in chat", async ({ pa
       Provider: "cliprovider",
     }),
   });
-
   await expect(page.getByText("I am claude-cli.")).toBeVisible({ timeout: 3000 });
 });
 
-// ── Switch to glm-5, chat, verify override + response visible ────────────────
+// ── Switch small model ────────────────────────────────────────────────────────
 
-test("glm-5 small model: override sent and response appears in chat", async ({ page }) => {
+test("switching small model sends set_session_models and response appears in chat", async ({ page }) => {
   await setupSessionAndConfig(page, "mc-glm", "GLM Chat");
 
-  // Select glm-5 from the small model dropdown
   await page.locator("header button[title='Small (fast) model']").click();
   await page.locator("div.absolute").getByText("glm-5").click();
 
-  // Verify header shows the selected model
-  await expect(
-    page.locator("header button[title='Small (fast) model']").filter({ hasText: "glm-5" })
-  ).toBeVisible({ timeout: 2000 });
+  const modelsCmd = await waitForWSSend(page, "set_session_models");
+  const mp = modelsCmd.payload as { smallModel: { provider: string; model: string } };
+  expect(mp.smallModel).toEqual({ provider: "glm", model: "glm-5" });
 
-  // Send a message
   await page.getByPlaceholder("Message… (Enter to send)").fill("respond fast");
   await page.getByRole("button", { name: "Send", exact: true }).click();
 
   await waitForWSSend(page, "send_message");
   const payload = await getLastSentMessage(page);
   expect(payload.content).toBe("respond fast");
-  expect(payload.smallModel).toEqual({ provider: "glm", model: "glm-5" });
+  expect(payload.smallModel).toBeUndefined();
 
-  // Simulate response
   await sendMockWSMessage(page, {
     type: "message_created",
     payload: makeMessage({
@@ -182,23 +188,21 @@ test("glm-5 small model: override sent and response appears in chat", async ({ p
       Provider: "glm",
     }),
   });
-
   await expect(page.getByText("GLM-5 response here.")).toBeVisible({ timeout: 3000 });
 });
 
-// ── Switch between models across messages in same session ───────────────────
+// ── Switch between models mid-session ────────────────────────────────────────
 
-test("switching model mid-session: each message uses the current model", async ({ page }) => {
+test("switching model mid-session: set_session_models sent each time, no send_message override", async ({ page }) => {
   await setupSessionAndConfig(page, "mc-switch", "Mid-Session Switch");
 
-  // First message — default model
+  // First message — no model switch yet
   await page.getByPlaceholder("Message… (Enter to send)").fill("first message");
   await page.getByRole("button", { name: "Send", exact: true }).click();
   await waitForWSSend(page, "send_message");
   const first = await getLastSentMessage(page);
   expect(first.largeModel).toBeUndefined();
 
-  // Simulate assistant reply
   await sendMockWSMessage(page, {
     type: "message_created",
     payload: makeMessage({
@@ -213,24 +217,23 @@ test("switching model mid-session: each message uses the current model", async (
   // Switch large model to glm-5
   await page.locator("header button[title='Large (strong) model']").click();
   await page.locator("div.absolute").getByText("glm-5").click();
+  await waitForWSSend(page, "set_session_models");
 
-  // Second message — glm-5 override
+  // Second message — still no override in payload
   await page.getByPlaceholder("Message… (Enter to send)").fill("second message");
   await page.getByRole("button", { name: "Send", exact: true }).click();
 
   await page.waitForFunction(() => {
-    const sent = (window as Record<string, unknown>)["__wsSent"] as Array<{
+    const sent = ((window as unknown) as Record<string, unknown>)["__wsSent"] as Array<{
       type: string;
-      payload: Record<string, unknown>;
     }>;
     return sent.filter((m) => m.type === "send_message").length >= 2;
   }, { timeout: 5000 });
 
   const second = await getLastSentMessage(page);
   expect(second.content).toBe("second message");
-  expect(second.largeModel).toEqual({ provider: "glm", model: "glm-5" });
+  expect(second.largeModel).toBeUndefined();
 
-  // Simulate assistant reply
   await sendMockWSMessage(page, {
     type: "message_created",
     payload: makeMessage({
@@ -243,36 +246,75 @@ test("switching model mid-session: each message uses the current model", async (
   await expect(page.getByText("Reply two.")).toBeVisible({ timeout: 3000 });
 });
 
-// ── Error banner appears when backend returns an error ───────────────────────
+// ── Error banner ──────────────────────────────────────────────────────────────
 
-test("agent error event shows error banner in chat", async ({ page }) => {
+test("agent error event shows inline error banner in chat", async ({ page }) => {
   await setupSessionAndConfig(page, "mc-err", "Error Test");
 
-  // Send a message
   await page.getByPlaceholder("Message… (Enter to send)").fill("trigger error");
   await page.getByRole("button", { name: "Send", exact: true }).click();
   await waitForWSSend(page, "send_message");
 
-  // Simulate an error from the backend (e.g. model API failure)
   await sendMockWSMessage(page, {
     type: "error",
     id: "err-1",
     payload: null,
   });
 
-  // The error banner should appear (the WS message uses .error field for text)
-  // Since the mock sends no error string, it shows "Unknown error"
+  // Error banner with ⚠ icon should appear in the chat area
   await expect(page.getByText(/Unknown error|⚠/)).toBeVisible({ timeout: 3000 });
 });
 
-test("error banner can be dismissed", async ({ page }) => {
+test("error banner shows the error message text", async ({ page }) => {
+  await setupSessionAndConfig(page, "mc-err-txt", "Error Text Test");
+
+  await sendMockWSMessage(page, {
+    type: "error",
+    id: "err-2",
+    error: "API rate limit exceeded",
+    payload: null,
+  });
+
+  await expect(page.getByText("API rate limit exceeded")).toBeVisible({ timeout: 3000 });
+});
+
+test("error banner can be dismissed with × button", async ({ page }) => {
   await setupSessionAndConfig(page, "mc-err2", "Dismiss Test");
 
-  // Trigger the error banner via WS error event
   await sendMockWSMessage(page, { type: "error" });
   await expect(page.getByText(/Unknown error/)).toBeVisible({ timeout: 3000 });
 
-  // Click the ✕ dismiss button
-  await page.getByRole("button", { name: "✕" }).last().click();
+  // Click the ✕ dismiss button in the error banner
+  await page.locator("button", { hasText: "×" }).click();
   await expect(page.getByText(/Unknown error/)).not.toBeVisible({ timeout: 2000 });
+});
+
+test("error banner disappears after 8 seconds automatically", async ({ page }) => {
+  // Use fake timers to avoid real 8-second wait
+  await page.addInitScript(() => {
+    // Speed up setTimeout
+    const origSetTimeout = window.setTimeout;
+    (window as unknown as Record<string, unknown>)["__origSetTimeout"] = origSetTimeout;
+  });
+
+  await setupSessionAndConfig(page, "mc-err3", "Auto Dismiss");
+
+  await sendMockWSMessage(page, { type: "error" });
+  await expect(page.getByText(/Unknown error/)).toBeVisible({ timeout: 3000 });
+
+  // Fast-forward time by 10 seconds
+  await page.evaluate(() => {
+    // Trigger all timeouts immediately
+    const callbacks: Array<() => void> = [];
+    const orig = window.setTimeout;
+    (window as unknown as Record<string, unknown>)["setTimeout"] = (fn: () => void) => {
+      callbacks.push(fn);
+      return 0;
+    };
+    // Restore and fire
+    (window as unknown as Record<string, unknown>)["setTimeout"] = orig;
+    callbacks.forEach((fn) => fn());
+  });
+
+  await expect(page.getByText(/Unknown error/)).not.toBeVisible({ timeout: 3000 });
 });

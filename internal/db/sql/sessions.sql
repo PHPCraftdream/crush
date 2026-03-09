@@ -9,7 +9,11 @@ INSERT INTO sessions (
     cost,
     summary_message_id,
     updated_at,
-    created_at
+    created_at,
+    large_model_provider,
+    large_model_id,
+    small_model_provider,
+    small_model_id
 ) VALUES (
     ?,
     ?,
@@ -20,8 +24,22 @@ INSERT INTO sessions (
     ?,
     null,
     strftime('%s', 'now'),
-    strftime('%s', 'now')
+    strftime('%s', 'now'),
+    ?,
+    ?,
+    ?,
+    ?
 ) RETURNING *;
+
+-- name: UpdateSessionModels :exec
+UPDATE sessions
+SET
+    large_model_provider = ?,
+    large_model_id = ?,
+    small_model_provider = ?,
+    small_model_id = ?,
+    updated_at = strftime('%s', 'now')
+WHERE id = ?;
 
 -- name: GetSessionByID :one
 SELECT *

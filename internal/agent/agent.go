@@ -77,6 +77,7 @@ type SessionAgent interface {
 	SetModels(large Model, small Model)
 	SetTools(tools []fantasy.AgentTool)
 	SetSystemPrompt(systemPrompt string)
+	SetSystemPromptPrefix(prefix string)
 	Cancel(sessionID string)
 	CancelAll()
 	IsSessionBusy(sessionID string) bool
@@ -167,8 +168,10 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	largeModel := a.largeModel.Get()
 	systemPrompt := a.systemPrompt.Get()
 	promptPrefix := a.systemPromptPrefix.Get()
-	var instructions strings.Builder
 
+	slog.Info("SessionAgent.Run: starting", "sessionID", call.SessionID, "model", largeModel.ModelCfg.Model, "promptLen", len(systemPrompt))
+
+	var instructions strings.Builder
 	for _, server := range mcp.GetStates() {
 		if server.State != mcp.StateConnected {
 			continue
@@ -232,8 +235,6 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 
 	history, files := a.preparePrompt(msgs, call.Attachments...)
 
-	startTime := time.Now()
-	a.eventPromptSent(call.SessionID)
 
 	var currentAssistant *message.Message
 	var shouldSummarize bool
@@ -483,7 +484,6 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 		},
 	})
 
-	a.eventPromptResponded(call.SessionID, time.Since(startTime).Truncate(time.Second))
 
 	if err != nil {
 		isCancelErr := errors.Is(err, context.Canceled)
@@ -961,7 +961,6 @@ func (a *sessionAgent) updateSessionUsage(model Model, session *session.Session,
 		modelConfig.CostPer1MIn/1e6*float64(usage.InputTokens) +
 		modelConfig.CostPer1MOut/1e6*float64(usage.OutputTokens)
 
-	a.eventTokensUsed(session.ID, model, usage, cost)
 
 	if overrideCost != nil {
 		session.Cost += *overrideCost
@@ -1068,6 +1067,10 @@ func (a *sessionAgent) SetTools(tools []fantasy.AgentTool) {
 
 func (a *sessionAgent) SetSystemPrompt(systemPrompt string) {
 	a.systemPrompt.Set(systemPrompt)
+}
+
+func (a *sessionAgent) SetSystemPromptPrefix(prefix string) {
+	a.systemPromptPrefix.Set(prefix)
 }
 
 func (a *sessionAgent) Model() Model {

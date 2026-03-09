@@ -11,42 +11,42 @@
     @apply bg-white text-text text-base leading-relaxed font-sans antialiased;
   }
 
-  ::-webkit-scrollbar { @apply w-1.5 h-1.5; }
-  ::-webkit-scrollbar-track { @apply bg-transparent; }
-  ::-webkit-scrollbar-thumb { @apply bg-surface rounded-full; }
-  ::-webkit-scrollbar-thumb:hover { @apply bg-text-subtle; }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: #f1f5f9; border-radius: 9999px; }
+  ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 9999px; border: 2px solid #f1f5f9; }
+  ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
 }
 
 @layer components {
   /* Markdown content */
-  .md { @apply text-base leading-7; }
-  .md h1 { @apply mt-6 mb-3 text-2xl text-text font-bold; }
-  .md h2 { @apply mt-5 mb-2 text-xl text-text font-semibold; }
-  .md h3 { @apply mt-4 mb-2 text-lg text-text font-semibold; }
-  .md h4 { @apply mt-3 mb-1 text-base text-text font-semibold; }
-  .md p { @apply my-2 leading-7; }
+  .md { @apply text-[17px] leading-[1.65]; }
+  .md h1 { @apply mt-8 mb-4 text-3xl text-text font-bold; }
+  .md h2 { @apply mt-7 mb-3 text-2xl text-text font-semibold; }
+  .md h3 { @apply mt-6 mb-3 text-xl text-text font-semibold; }
+  .md h4 { @apply mt-5 mb-2 text-lg text-text font-semibold; }
+  .md p { @apply my-3 leading-[1.65]; }
   .md pre {
-    @apply bg-base-overlay border border-surface rounded-lg p-4 overflow-x-auto my-3 font-mono text-sm;
+    @apply bg-base-overlay border border-surface rounded-xl p-5 overflow-x-auto my-4 font-mono text-[15px] leading-relaxed;
   }
   .md code:not(pre code) {
-    @apply bg-base-overlay border border-surface px-1.5 py-0.5 rounded text-[0.875em] font-mono text-text;
+    @apply bg-base-overlay border border-surface px-1.5 py-0.5 rounded text-[0.9em] font-mono text-text;
   }
-  .md ul { @apply pl-6 my-2 list-disc; }
-  .md ol { @apply pl-6 my-2 list-decimal; }
-  .md li { @apply my-1; }
+  .md ul { @apply pl-7 my-3 list-disc; }
+  .md ol { @apply pl-7 my-3 list-decimal; }
+  .md li { @apply my-1.5; }
   .md blockquote {
-    @apply my-3 pl-4 border-l-4 border-accent/30 text-text-muted italic;
+    @apply my-4 pl-5 border-l-4 border-accent/30 text-text-muted italic;
   }
-  .md table { @apply border-collapse w-full my-3 text-sm; }
-  .md th { @apply border border-surface bg-base-overlay px-3 py-2 text-left font-semibold; }
-  .md td { @apply border border-surface px-3 py-2; }
+  .md table { @apply border-collapse w-full my-4 text-[15px]; }
+  .md th { @apply border border-surface bg-base-overlay px-4 py-2.5 text-left font-semibold; }
+  .md td { @apply border border-surface px-4 py-2.5; }
   .md a { @apply text-accent underline underline-offset-2 hover:text-accent/80; }
   .md strong { @apply font-semibold text-text; }
-  .md hr { @apply my-4 border-surface; }
+  .md hr { @apply my-6 border-surface; }
 
   /* Tool call / result blocks */
   .tool-block {
-    @apply my-2 px-4 py-3 bg-base-subtle border border-surface rounded-lg text-sm font-mono;
+    @apply my-3 px-5 py-4 bg-base-subtle border border-surface rounded-xl text-[15px] font-mono leading-relaxed;
   }
 }
 

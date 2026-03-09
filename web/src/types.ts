@@ -20,6 +20,11 @@ export interface Session {
   CreatedAt: number;
   UpdatedAt: number;
   CWD: string;
+
+  LargeModelProvider: string;
+  LargeModelID: string;
+  SmallModelProvider: string;
+  SmallModelID: string;
 }
 
 export type MessageRole = "user" | "assistant" | "tool" | "system";
@@ -101,7 +106,10 @@ export interface ModelInfo {
 
 export interface ConfigPayload {
   models?: Record<string, { Provider: string; Model: string }>;
-  providers?: Record<string, { models?: { id: string; name: string }[] }>;
+  providers?: Record<string, { name?: string; enabled?: boolean; type?: string; models?: { id: string; name: string; contextWindow?: number }[] }>;
+  yolo?: boolean;
+  recentLargeModels?: Array<{ Provider: string; Model: string }>;
+  recentSmallModels?: Array<{ Provider: string; Model: string }>;
 }
 
 export interface LSPState {

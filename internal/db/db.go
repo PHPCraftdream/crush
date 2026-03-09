@@ -27,6 +27,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.createFileStmt, err = db.PrepareContext(ctx, createFile); err != nil {
 		return nil, fmt.Errorf("error preparing query CreateFile: %w", err)
 	}
+	if q.createSessionPermissionStmt, err = db.PrepareContext(ctx, createSessionPermission); err != nil {
+		return nil, fmt.Errorf("error preparing query CreateSessionPermission: %w", err)
+	}
 	if q.createMessageStmt, err = db.PrepareContext(ctx, createMessage); err != nil {
 		return nil, fmt.Errorf("error preparing query CreateMessage: %w", err)
 	}
@@ -90,6 +93,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.getUsageByModelStmt, err = db.PrepareContext(ctx, getUsageByModel); err != nil {
 		return nil, fmt.Errorf("error preparing query GetUsageByModel: %w", err)
 	}
+	if q.listAllSessionPermissionsStmt, err = db.PrepareContext(ctx, listAllSessionPermissions); err != nil {
+		return nil, fmt.Errorf("error preparing query ListAllSessionPermissions: %w", err)
+	}
 	if q.listAllUserMessagesStmt, err = db.PrepareContext(ctx, listAllUserMessages); err != nil {
 		return nil, fmt.Errorf("error preparing query ListAllUserMessages: %w", err)
 	}
@@ -126,6 +132,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.updateSessionStmt, err = db.PrepareContext(ctx, updateSession); err != nil {
 		return nil, fmt.Errorf("error preparing query UpdateSession: %w", err)
 	}
+	if q.updateSessionModelsStmt, err = db.PrepareContext(ctx, updateSessionModels); err != nil {
+		return nil, fmt.Errorf("error preparing query UpdateSessionModels: %w", err)
+	}
 	if q.updateSessionTitleAndUsageStmt, err = db.PrepareContext(ctx, updateSessionTitleAndUsage); err != nil {
 		return nil, fmt.Errorf("error preparing query UpdateSessionTitleAndUsage: %w", err)
 	}
@@ -137,6 +146,11 @@ func (q *Queries) Close() error {
 	if q.createFileStmt != nil {
 		if cerr := q.createFileStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing createFileStmt: %w", cerr)
+		}
+	}
+	if q.createSessionPermissionStmt != nil {
+		if cerr := q.createSessionPermissionStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing createSessionPermissionStmt: %w", cerr)
 		}
 	}
 	if q.createMessageStmt != nil {
@@ -244,6 +258,11 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing getUsageByModelStmt: %w", cerr)
 		}
 	}
+	if q.listAllSessionPermissionsStmt != nil {
+		if cerr := q.listAllSessionPermissionsStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing listAllSessionPermissionsStmt: %w", cerr)
+		}
+	}
 	if q.listAllUserMessagesStmt != nil {
 		if cerr := q.listAllUserMessagesStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing listAllUserMessagesStmt: %w", cerr)
@@ -304,6 +323,11 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing updateSessionStmt: %w", cerr)
 		}
 	}
+	if q.updateSessionModelsStmt != nil {
+		if cerr := q.updateSessionModelsStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing updateSessionModelsStmt: %w", cerr)
+		}
+	}
 	if q.updateSessionTitleAndUsageStmt != nil {
 		if cerr := q.updateSessionTitleAndUsageStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing updateSessionTitleAndUsageStmt: %w", cerr)
@@ -348,9 +372,10 @@ func (q *Queries) queryRow(ctx context.Context, stmt *sql.Stmt, query string, ar
 type Queries struct {
 	db                             DBTX
 	tx                             *sql.Tx
-	createFileStmt                 *sql.Stmt
-	createMessageStmt              *sql.Stmt
-	createSessionStmt              *sql.Stmt
+	createFileStmt                  *sql.Stmt
+	createMessageStmt               *sql.Stmt
+	createSessionStmt               *sql.Stmt
+	createSessionPermissionStmt     *sql.Stmt
 	deleteFileStmt                 *sql.Stmt
 	deleteMessageStmt              *sql.Stmt
 	deleteSessionStmt              *sql.Stmt
@@ -370,7 +395,8 @@ type Queries struct {
 	getUsageByDayOfWeekStmt        *sql.Stmt
 	getUsageByHourStmt             *sql.Stmt
 	getUsageByModelStmt            *sql.Stmt
-	listAllUserMessagesStmt        *sql.Stmt
+	listAllSessionPermissionsStmt   *sql.Stmt
+	listAllUserMessagesStmt         *sql.Stmt
 	listFilesByPathStmt            *sql.Stmt
 	listFilesBySessionStmt         *sql.Stmt
 	listLatestSessionFilesStmt     *sql.Stmt
@@ -382,6 +408,7 @@ type Queries struct {
 	recordFileReadStmt             *sql.Stmt
 	updateMessageStmt              *sql.Stmt
 	updateSessionStmt              *sql.Stmt
+	updateSessionModelsStmt        *sql.Stmt
 	updateSessionTitleAndUsageStmt *sql.Stmt
 }
 
@@ -389,9 +416,10 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 	return &Queries{
 		db:                             tx,
 		tx:                             tx,
-		createFileStmt:                 q.createFileStmt,
-		createMessageStmt:              q.createMessageStmt,
-		createSessionStmt:              q.createSessionStmt,
+		createFileStmt:                  q.createFileStmt,
+		createMessageStmt:               q.createMessageStmt,
+		createSessionStmt:               q.createSessionStmt,
+		createSessionPermissionStmt:     q.createSessionPermissionStmt,
 		deleteFileStmt:                 q.deleteFileStmt,
 		deleteMessageStmt:              q.deleteMessageStmt,
 		deleteSessionStmt:              q.deleteSessionStmt,
@@ -411,7 +439,8 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		getUsageByDayOfWeekStmt:        q.getUsageByDayOfWeekStmt,
 		getUsageByHourStmt:             q.getUsageByHourStmt,
 		getUsageByModelStmt:            q.getUsageByModelStmt,
-		listAllUserMessagesStmt:        q.listAllUserMessagesStmt,
+		listAllSessionPermissionsStmt:   q.listAllSessionPermissionsStmt,
+		listAllUserMessagesStmt:         q.listAllUserMessagesStmt,
 		listFilesByPathStmt:            q.listFilesByPathStmt,
 		listFilesBySessionStmt:         q.listFilesBySessionStmt,
 		listLatestSessionFilesStmt:     q.listLatestSessionFilesStmt,
@@ -423,6 +452,7 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		recordFileReadStmt:             q.recordFileReadStmt,
 		updateMessageStmt:              q.updateMessageStmt,
 		updateSessionStmt:              q.updateSessionStmt,
+		updateSessionModelsStmt:        q.updateSessionModelsStmt,
 		updateSessionTitleAndUsageStmt: q.updateSessionTitleAndUsageStmt,
 	}
 }

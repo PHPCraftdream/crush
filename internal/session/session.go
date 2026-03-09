@@ -9,7 +9,6 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/crush/internal/db"
-	"github.com/charmbracelet/crush/internal/event"
 	"github.com/charmbracelet/crush/internal/pubsub"
 	"github.com/google/uuid"
 )
@@ -50,6 +49,11 @@ type Session struct {
 	Todos            []Todo
 	CreatedAt        int64
 	UpdatedAt        int64
+
+	LargeModelProvider string
+	LargeModelID       string
+	SmallModelProvider string
+	SmallModelID       string
 }
 
 type Service interface {
@@ -61,6 +65,7 @@ type Service interface {
 	List(ctx context.Context) ([]Session, error)
 	Save(ctx context.Context, session Session) (Session, error)
 	UpdateTitleAndUsage(ctx context.Context, sessionID, title string, promptTokens, completionTokens int64, cost float64) error
+	UpdateModels(ctx context.Context, sessionID, largeProvider, largeModel, smallProvider, smallModel string) error
 	Delete(ctx context.Context, id string) error
 
 	// Agent tool session management
@@ -85,7 +90,6 @@ func (s *service) Create(ctx context.Context, title string) (Session, error) {
 	}
 	session := s.fromDBItem(dbSession)
 	s.Publish(pubsub.CreatedEvent, session)
-	event.SessionCreated()
 	return session, nil
 }
 
@@ -145,7 +149,6 @@ func (s *service) Delete(ctx context.Context, id string) error {
 
 	session := s.fromDBItem(dbSession)
 	s.Publish(pubsub.DeletedEvent, session)
-	event.SessionDeleted()
 	return nil
 }
 
@@ -198,6 +201,27 @@ func (s *service) UpdateTitleAndUsage(ctx context.Context, sessionID, title stri
 	})
 }
 
+// UpdateModels updates the models associated with a session.
+func (s *service) UpdateModels(ctx context.Context, sessionID, largeProvider, largeModel, smallProvider, smallModel string) error {
+	err := s.q.UpdateSessionModels(ctx, db.UpdateSessionModelsParams{
+		ID:                 sessionID,
+		LargeModelProvider: sql.NullString{String: largeProvider, Valid: largeProvider != ""},
+		LargeModelID:       sql.NullString{String: largeModel, Valid: largeModel != ""},
+		SmallModelProvider: sql.NullString{String: smallProvider, Valid: smallProvider != ""},
+		SmallModelID:       sql.NullString{String: smallModel, Valid: smallModel != ""},
+	})
+	if err != nil {
+		return err
+	}
+
+	// Publish an update event so the UI gets the new session state
+	sess, err := s.Get(ctx, sessionID)
+	if err == nil {
+		s.Publish(pubsub.UpdatedEvent, sess)
+	}
+	return nil
+}
+
 func (s *service) List(ctx context.Context) ([]Session, error) {
 	dbSessions, err := s.q.ListSessions(ctx)
 	if err != nil {
@@ -227,6 +251,11 @@ func (s service) fromDBItem(item db.Session) Session {
 		Todos:            todos,
 		CreatedAt:        item.CreatedAt,
 		UpdatedAt:        item.UpdatedAt,
+
+		LargeModelProvider: item.LargeModelProvider.String,
+		LargeModelID:       item.LargeModelID.String,
+		SmallModelProvider: item.SmallModelProvider.String,
+		SmallModelID:       item.SmallModelID.String,
 	}
 }
 

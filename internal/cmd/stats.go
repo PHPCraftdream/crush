@@ -16,7 +16,6 @@ import (
 
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/db"
-	"github.com/charmbracelet/crush/internal/event"
 	"github.com/pkg/browser"
 	"github.com/spf13/cobra"
 )
@@ -121,7 +120,6 @@ type HourDayHeatmapPt struct {
 }
 
 func runStats(cmd *cobra.Command, _ []string) error {
-	event.StatsViewed()
 
 	dataDir, _ := cmd.Flags().GetString("data-dir")
 	ctx := cmd.Context()

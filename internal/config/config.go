@@ -411,6 +411,12 @@ func (c *Config) WorkingDir() string {
 	return c.workingDir
 }
 
+// KnownProviders returns all providers from the catwalk catalog, regardless
+// of whether they are configured with an API key.
+func (c *Config) KnownProviders() []catwalk.Provider {
+	return c.knownProviders
+}
+
 func (c *Config) EnabledProviders() []ProviderConfig {
 	var enabled []ProviderConfig
 	for p := range c.Providers.Seq() {
@@ -667,6 +673,40 @@ func (c *Config) SetProviderAPIKey(providerID string, apiKey any) error {
 }
 
 const maxRecentModelsPerType = 5
+
+// RemoveProviderAPIKey removes the API key for the given provider from disk and
+// removes it from the in-memory enabled providers list.
+func (c *Config) RemoveProviderAPIKey(providerID string) error {
+	if err := c.RemoveConfigField(fmt.Sprintf("providers.%s.api_key", providerID)); err != nil {
+		return fmt.Errorf("failed to remove provider API key: %w", err)
+	}
+	c.Providers.Del(providerID)
+	return nil
+}
+
+// RecordRecentModel records the given model as recently used and persists to disk.
+func (c *Config) RecordRecentModel(modelType SelectedModelType, model SelectedModel) error {
+	return c.recordRecentModel(modelType, model)
+}
+
+// RemoveRecentModel removes a model from the recent list and persists to disk.
+func (c *Config) RemoveRecentModel(modelType SelectedModelType, model SelectedModel) error {
+	if c.RecentModels == nil {
+		return nil
+	}
+	current := c.RecentModels[modelType]
+	updated := slices.DeleteFunc(slices.Clone(current), func(m SelectedModel) bool {
+		return m.Provider == model.Provider && m.Model == model.Model
+	})
+	if len(updated) == len(current) {
+		return nil // nothing changed
+	}
+	c.RecentModels[modelType] = updated
+	if err := c.SetConfigField(fmt.Sprintf("recent_models.%s", modelType), updated); err != nil {
+		return fmt.Errorf("failed to persist recent models: %w", err)
+	}
+	return nil
+}
 
 func (c *Config) recordRecentModel(modelType SelectedModelType, model SelectedModel) error {
 	if model.Provider == "" || model.Model == "" {

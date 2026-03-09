@@ -14,7 +14,6 @@ import (
 	"github.com/charmbracelet/crush/internal/app"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/db"
-	"github.com/charmbracelet/crush/internal/event"
 	"github.com/charmbracelet/crush/internal/projects"
 	"github.com/charmbracelet/crush/internal/server"
 	"github.com/charmbracelet/crush/internal/version"
@@ -89,7 +88,6 @@ func runWebMode(cmd *cobra.Command) error {
 	}
 	defer a.Shutdown()
 
-	event.AppInitialized()
 
 	addr := fmt.Sprintf("%s:%d", host, port)
 	srv := server.New(a, addr, crushweb.FS())
@@ -176,7 +174,6 @@ func setupApp(cmd *cobra.Command) (*app.App, error) {
 	}
 
 	if shouldEnableMetrics(cfg) {
-		event.Init()
 	}
 
 	return appInstance, nil

@@ -69,12 +69,12 @@ export async function setupMockWS(page: Page) {
  */
 export async function sendMockWSMessage(page: Page, msg: MockWSMessage) {
   await page.waitForFunction(() => {
-    const ws = (window as Record<string, unknown>)["__mockWS"] as { readyState: number; onmessage: unknown } | null;
+    const ws = ((window as unknown) as Record<string, unknown>)["__mockWS"] as { readyState: number; onmessage: unknown } | null;
     return ws !== null && ws.readyState === 1 && typeof ws.onmessage === "function";
   }, { timeout: 10_000 });
 
   await page.evaluate((data: string) => {
-    const ws = (window as Record<string, unknown>)["__mockWS"] as { onmessage: ((ev: MessageEvent) => void) | null } | null;
+    const ws = ((window as unknown) as Record<string, unknown>)["__mockWS"] as { onmessage: ((ev: MessageEvent) => void) | null } | null;
     if (ws?.onmessage) ws.onmessage(new MessageEvent("message", { data }));
   }, JSON.stringify(msg));
 
@@ -91,7 +91,7 @@ export async function waitForWSSend(
 ): Promise<MockWSMessage> {
   const handle = await page.waitForFunction(
     (t: string) => {
-      const sent = ((window as Record<string, unknown>)["__wsSent"] as Array<{ type: string }>) ?? [];
+      const sent = (((window as unknown) as Record<string, unknown>)["__wsSent"] as Array<{ type: string }>) ?? [];
       return sent.find((m) => m.type === t) ?? null;
     },
     type,

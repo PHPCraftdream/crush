@@ -41,11 +41,12 @@ export function makeConfig(overrides: Record<string, unknown> = {}) {
     providers: {
       anthropic: {
         models: [
-          { id: "claude-opus-4", name: "claude-opus-4" },
-          { id: "claude-haiku-4", name: "claude-haiku-4" },
+          { id: "claude-opus-4", name: "claude-opus-4", contextWindow: 200000 },
+          { id: "claude-haiku-4", name: "claude-haiku-4", contextWindow: 200000 },
         ],
       },
     },
+    yolo: false,
     ...overrides,
   };
 }

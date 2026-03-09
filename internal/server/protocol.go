@@ -47,6 +47,8 @@ const (
 	CmdGetConfig                    = "get_config"
 	CmdSetTheme                     = "set_theme"
 	CmdRenameSession                = "rename_session"
+	CmdSetSessionModels             = "set_session_models"
+	CmdRemoveRecentModel            = "remove_recent_model"
 )
 
 // Payload structs for inbound commands.
@@ -57,6 +59,12 @@ const (
 type ModelOverrideWire struct {
 	Provider string `json:"provider"`
 	Model    string `json:"model"`
+}
+
+type SetSessionModelsPayload struct {
+	SessionID  string             `json:"sessionID"`
+	LargeModel *ModelOverrideWire `json:"largeModel"`
+	SmallModel *ModelOverrideWire `json:"smallModel"`
 }
 
 type SendMessagePayload struct {
@@ -119,11 +127,39 @@ type MCPSnapshot struct {
 	Servers []MCPServerInfo `json:"servers"`
 }
 
+const (
+	CmdSetYolo          = "set_yolo"
+	CmdSetProviderKey   = "set_provider_key"
+	CmdRemoveProviderKey = "remove_provider_key"
+)
+
+type RemoveRecentModelPayload struct {
+	ModelType string `json:"modelType"` // "large" or "small"
+	Provider  string `json:"provider"`
+	Model     string `json:"model"`
+}
+
+type SetYoloPayload struct {
+	Enabled bool `json:"enabled"`
+}
+
+type SetProviderKeyPayload struct {
+	ProviderID string `json:"providerID"`
+	APIKey     string `json:"apiKey"`
+}
+
+type RemoveProviderKeyPayload struct {
+	ProviderID string `json:"providerID"`
+}
+
 // ConfigWire is the frontend-facing config payload with PascalCase field names
 // matching the TypeScript ConfigPayload type.
 type ConfigWire struct {
-	Models    map[string]ModelEntryWire `json:"models"`
-	Providers map[string]ProviderWire   `json:"providers"`
+	Models             map[string]ModelEntryWire   `json:"models"`
+	Providers          map[string]ProviderWire     `json:"providers"`
+	Yolo               bool                        `json:"yolo"`
+	RecentLargeModels  []ModelEntryWire            `json:"recentLargeModels,omitempty"`
+	RecentSmallModels  []ModelEntryWire            `json:"recentSmallModels,omitempty"`
 }
 
 // ModelEntryWire represents a selected model entry (large/small/etc).
@@ -134,11 +170,15 @@ type ModelEntryWire struct {
 
 // ProviderWire is a provider with its available models.
 type ProviderWire struct {
-	Models []ModelInfoWire `json:"models,omitempty"`
+	Name      string          `json:"name,omitempty"`
+	Enabled   bool            `json:"enabled"`
+	Type      string          `json:"type,omitempty"`
+	Models    []ModelInfoWire `json:"models,omitempty"`
 }
 
 // ModelInfoWire is a single available model from a provider.
 type ModelInfoWire struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
+	ID            string `json:"id"`
+	Name          string `json:"name"`
+	ContextWindow int64  `json:"contextWindow,omitempty"`
 }

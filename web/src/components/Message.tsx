@@ -3,6 +3,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
 import type { Message as Msg, ContentPart } from "../types";
+import { BrainCircuit, Check, Copy } from "lucide-react";
 
 function CopyButton({ text, className = "" }: { text: string; className?: string }) {
   const [copied, setCopied] = useState(false);
@@ -18,12 +19,18 @@ function CopyButton({ text, className = "" }: { text: string; className?: string
     <button
       onClick={copy}
       title="Copy"
-      className={`inline-flex items-center gap-1 text-xs text-text-subtle hover:text-text transition-colors ${className}`}
+      className={`inline-flex items-center gap-1.5 text-sm text-text-subtle hover:text-text transition-colors font-medium ${className}`}
     >
       {copied ? (
-        <span className="text-green">✓ Copied</span>
+        <>
+          <Check size={14} className="text-green" />
+          <span className="text-green">Copied</span>
+        </>
       ) : (
-        <span>⎘ Copy</span>
+        <>
+          <Copy size={14} />
+          <span>Copy</span>
+        </>
       )}
     </button>
   );
@@ -41,17 +48,17 @@ export function Message({ message }: { message: Msg }) {
   const copyText = extractText(message.Parts);
 
   return (
-    <div className={`group flex px-6 py-3 ${isUser ? "justify-end" : "justify-start"}`}>
+    <div className={`group flex px-8 py-4 ${isUser ? "justify-end" : "justify-start"}`}>
       {isUser ? (
         /* User message — bubble on the right */
-        <div className="relative max-w-[75%]">
-          <div className="bg-accent text-white rounded-2xl rounded-tr-sm px-4 py-3 text-sm leading-relaxed shadow-sm">
+        <div className="relative max-w-[80%]">
+          <div className="bg-accent text-white rounded-2xl rounded-tr-sm px-5 py-3.5 text-[16px] leading-relaxed shadow-md">
             {message.Parts.map((part, i) => (
               <Part key={i} part={part} isUser />
             ))}
           </div>
           {copyText && (
-            <div className="flex justify-end mt-1 opacity-0 group-hover:opacity-100 transition-opacity">
+            <div className="flex justify-end mt-1.5">
               <CopyButton
                 text={copyText}
                 className="text-text-subtle"
@@ -61,17 +68,20 @@ export function Message({ message }: { message: Msg }) {
         </div>
       ) : (
         /* Assistant message — full width on the left */
-        <div className="relative w-full max-w-[90%]">
-          <div className="text-text text-sm leading-relaxed">
+        <div className="relative w-full max-w-[92%]">
+          <div className="text-text text-[17px] leading-relaxed">
             {message.Parts.map((part, i) => (
               <Part key={i} part={part} isUser={false} />
             ))}
           </div>
-          {copyText && (
-            <div className="flex mt-2 opacity-0 group-hover:opacity-100 transition-opacity">
-              <CopyButton text={copyText} />
-            </div>
-          )}
+          <div className="flex items-center justify-between mt-3">
+            {copyText && <CopyButton text={copyText} />}
+            {message.Model && (
+              <span className="text-xs text-text-subtle font-mono ml-auto">
+                {message.Model}
+              </span>
+            )}
+          </div>
         </div>
       )}
     </div>
@@ -96,12 +106,12 @@ function Part({ part, isUser }: { part: ContentPart; isUser: boolean }) {
 
     case "thinking":
       return (
-        <details className="my-2 border border-surface rounded-lg overflow-hidden">
-          <summary className="px-4 py-2.5 cursor-pointer select-none text-sm text-text-muted bg-base-subtle hover:bg-base-overlay transition-colors flex items-center gap-2">
-            <span className="text-text-subtle">🤔</span>
+        <details className="my-3 border border-surface rounded-xl overflow-hidden shadow-sm">
+          <summary className="px-5 py-3 cursor-pointer select-none text-base text-text-muted bg-base-subtle hover:bg-base-overlay transition-colors flex items-center gap-2.5 font-medium">
+            <span className="text-accent/70"><BrainCircuit size={18} /></span>
             <span>Thinking…</span>
           </summary>
-          <pre className="p-4 bg-base-overlay text-xs font-mono whitespace-pre-wrap overflow-x-auto text-text-muted border-t border-surface">
+          <pre className="p-5 bg-base-overlay text-[14px] font-mono whitespace-pre-wrap overflow-x-auto text-text-muted border-t border-surface leading-relaxed">
             {part.Thinking}
           </pre>
         </details>

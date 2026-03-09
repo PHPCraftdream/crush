@@ -20,6 +20,52 @@ export function setSessions(sessions: Session[]) {
   $sessions.set(sessions);
 }
 
+// ── Model History ────────────────────────────────────────────────────────────
+const STORAGE_KEY_RECENT_LARGE = "crush_recent_models_large";
+const STORAGE_KEY_RECENT_SMALL = "crush_recent_models_small";
+
+function loadRecent(key: string): string[] {
+  try {
+    const val = localStorage.getItem(key);
+    return val ? JSON.parse(val) : [];
+  } catch {
+    return [];
+  }
+}
+
+export const $recentLargeModels = atom<string[]>(loadRecent(STORAGE_KEY_RECENT_LARGE));
+export const $recentSmallModels = atom<string[]>(loadRecent(STORAGE_KEY_RECENT_SMALL));
+
+export function trackModelUsage(role: "large" | "small", modelKey: string) {
+  const store = role === "large" ? $recentLargeModels : $recentSmallModels;
+  const storageKey = role === "large" ? STORAGE_KEY_RECENT_LARGE : STORAGE_KEY_RECENT_SMALL;
+
+  const current = store.get();
+  const next = [modelKey, ...current.filter((k) => k !== modelKey)].slice(0, 5);
+
+  store.set(next);
+  localStorage.setItem(storageKey, JSON.stringify(next));
+}
+
+export function removeRecentModel(role: "large" | "small", modelKey: string) {
+  const store = role === "large" ? $recentLargeModels : $recentSmallModels;
+  const storageKey = role === "large" ? STORAGE_KEY_RECENT_LARGE : STORAGE_KEY_RECENT_SMALL;
+
+  const next = store.get().filter((k) => k !== modelKey);
+  store.set(next);
+  localStorage.setItem(storageKey, JSON.stringify(next));
+
+  // Persist removal to server so it survives restarts
+  const idx = modelKey.indexOf(":::");
+  if (idx !== -1) {
+    ws.send("remove_recent_model", {
+      modelType: role,
+      provider: modelKey.slice(0, idx),
+      model: modelKey.slice(idx + 3),
+    });
+  }
+}
+
 export function upsertSession(s: Session) {
   const list = $sessions.get();
   const idx = list.findIndex((x) => x.ID === s.ID);
@@ -39,6 +85,7 @@ export function removeSession(id: string) {
 export function setActiveSession(id: string | null) {
   $activeSessionID.set(id);
   $messages.set([]);
+  $agentError.set(null);
   if (id) {
     window.location.hash = `#/${id}`;
   } else {
@@ -83,16 +130,58 @@ export function setSessionBusy(sessionID: string, busy: boolean) {
   $busySessions.set(s);
 }
 
-// Per-session model overrides: sessionID → model key ("large" | "small")
-export const $sessionLargeModel = atom<Record<string, string>>({});
-export const $sessionSmallModel = atom<Record<string, string>>({});
+// Per-session model overrides: removed in favor of global selection
+// Now using the session object from DB as source of truth.
+
+export function getDefaultModelKey(role: "large" | "small", config: ConfigPayload | null): string {
+  const entry = config?.models?.[role];
+  if (entry) return `${entry.Provider}:::${entry.Model}`;
+  return "";
+}
+
+import { ws } from "./ws";
+
+export function setSessionModels(sessionID: string, largeKey: string | null, smallKey: string | null) {
+  const parse = (key: string | null) => {
+    if (!key) return null;
+    const idx = key.indexOf(":::");
+    if (idx === -1) return null;
+    return { provider: key.slice(0, idx), model: key.slice(idx + 3) };
+  };
+
+  ws.send("set_session_models", {
+    sessionID,
+    largeModel: parse(largeKey),
+    smallModel: parse(smallKey),
+  });
+}
+
+// ── Yolo mode ────────────────────────────────────────────────────────────────
+const STORAGE_KEY_YOLO = "crush_yolo";
+
+function loadYolo(): boolean {
+  try {
+    return localStorage.getItem(STORAGE_KEY_YOLO) === "true";
+  } catch {
+    return false;
+  }
+}
+
+export const $yolo = atom<boolean>(loadYolo());
+
+export function setYolo(enabled: boolean) {
+  $yolo.set(enabled);
+  localStorage.setItem(STORAGE_KEY_YOLO, String(enabled));
+  ws.send("set_yolo", { enabled });
+}
+
+export function setProviderKey(providerID: string, apiKey: string) {
+  ws.send("set_provider_key", { providerID, apiKey });
+}
+
+export function removeProviderKey(providerID: string) {
+  ws.send("remove_provider_key", { providerID });
+}
 
 // Last agent error to display in chat
 export const $agentError = atom<string | null>(null);
-
-export function setSessionLargeModel(sessionID: string, model: string) {
-  $sessionLargeModel.set({ ...$sessionLargeModel.get(), [sessionID]: model });
-}
-export function setSessionSmallModel(sessionID: string, model: string) {
-  $sessionSmallModel.set({ ...$sessionSmallModel.get(), [sessionID]: model });
-}

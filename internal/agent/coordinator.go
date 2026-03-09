@@ -76,6 +76,7 @@ type coordinator struct {
 	history     history.Service
 	filetracker filetracker.Service
 	lspManager  *lsp.Manager
+	prompt      *prompt.Prompt
 
 	currentAgent SessionAgent
 	agents       map[string]SessionAgent
@@ -93,6 +94,11 @@ func NewCoordinator(
 	filetracker filetracker.Service,
 	lspManager *lsp.Manager,
 ) (Coordinator, error) {
+	p, err := coderPrompt(prompt.WithWorkingDir(cfg.WorkingDir()))
+	if err != nil {
+		return nil, err
+	}
+
 	c := &coordinator{
 		cfg:         cfg,
 		sessions:    sessions,
@@ -101,6 +107,7 @@ func NewCoordinator(
 		history:     history,
 		filetracker: filetracker,
 		lspManager:  lspManager,
+		prompt:      p,
 		agents:      make(map[string]SessionAgent),
 	}
 
@@ -109,13 +116,7 @@ func NewCoordinator(
 		return nil, errors.New("coder agent not configured")
 	}
 
-	// TODO: make this dynamic when we support multiple agents
-	prompt, err := coderPrompt(prompt.WithWorkingDir(c.cfg.WorkingDir()))
-	if err != nil {
-		return nil, err
-	}
-
-	agent, err := c.buildAgent(ctx, prompt, agentCfg, false)
+	agent, err := c.buildAgent(ctx, p, agentCfg, false)
 	if err != nil {
 		return nil, err
 	}
@@ -123,26 +124,86 @@ func NewCoordinator(
 	c.agents[config.AgentCoder] = agent
 	return c, nil
 }
-
 // Run implements Coordinator.
 func (c *coordinator) Run(ctx context.Context, sessionID string, prompt string, attachments ...message.Attachment) (*fantasy.AgentResult, error) {
 	if err := c.readyWg.Wait(); err != nil {
 		return nil, err
 	}
 
-	// refresh models before each run
-	if err := c.UpdateModels(ctx); err != nil {
-		return nil, fmt.Errorf("failed to update models: %w", err)
+	// Check if this session has specific models assigned in the DB.
+	// If so, apply overrides before running (without going through RunWithOverrides
+	// to avoid mutual recursion).
+	sess, err := c.sessions.Get(ctx, sessionID)
+	if err == nil && (sess.LargeModelID != "" || sess.SmallModelID != "") {
+		var large, small *ModelOverride
+		if sess.LargeModelID != "" {
+			large = &ModelOverride{Provider: sess.LargeModelProvider, Model: sess.LargeModelID}
+		}
+		if sess.SmallModelID != "" {
+			small = &ModelOverride{Provider: sess.SmallModelProvider, Model: sess.SmallModelID}
+		}
+		if applyErr := c.applyModelOverrides(ctx, large, small); applyErr != nil {
+			slog.Error("Coordinator.Run: failed to apply DB model overrides, using current models", "err", applyErr)
+		}
 	}
 
+	return c.runInternal(ctx, sessionID, prompt, attachments...)
+}
+
+// applyModelOverrides sets up the agent with the given model overrides (modifies currentAgent in place).
+func (c *coordinator) applyModelOverrides(ctx context.Context, large, small *ModelOverride) error {
+	largeCfg := c.cfg.Models[config.SelectedModelTypeLarge]
+	smallCfg := c.cfg.Models[config.SelectedModelTypeSmall]
+
+	if large != nil {
+		if largeCfg.Provider != large.Provider || largeCfg.Model != large.Model {
+			largeCfg.Think = false
+			largeCfg.ReasoningEffort = ""
+		}
+		largeCfg.Provider = large.Provider
+		largeCfg.Model = large.Model
+	}
+	if small != nil {
+		if smallCfg.Provider != small.Provider || smallCfg.Model != small.Model {
+			smallCfg.Think = false
+			smallCfg.ReasoningEffort = ""
+		}
+		smallCfg.Provider = small.Provider
+		smallCfg.Model = small.Model
+	}
+
+	largeModel, smallModel, err := c.buildModelsFromCfg(ctx, largeCfg, smallCfg, false)
+	if err != nil {
+		return fmt.Errorf("failed to build override models: %w", err)
+	}
+
+	c.currentAgent.SetModels(largeModel, smallModel)
+
+	if largeProviderCfg, ok := c.cfg.Providers.Get(largeModel.ModelCfg.Provider); ok {
+		c.currentAgent.SetSystemPromptPrefix(largeProviderCfg.SystemPromptPrefix)
+	}
+	if c.prompt != nil {
+		newSystemPrompt, err := c.prompt.Build(ctx, largeModel.ModelCfg.Provider, largeModel.ModelCfg.Model, *c.cfg)
+		if err != nil {
+			slog.Error("applyModelOverrides: failed to rebuild system prompt", "err", err)
+		} else {
+			c.currentAgent.SetSystemPrompt(newSystemPrompt)
+		}
+	}
+	return nil
+}
+
+// runInternal executes the agent with whatever models are currently set, handling 401 retries.
+func (c *coordinator) runInternal(ctx context.Context, sessionID string, prompt string, attachments ...message.Attachment) (*fantasy.AgentResult, error) {
 	model := c.currentAgent.Model()
+	slog.Debug("Coordinator: running with model", "sessionID", sessionID, "model", model.ModelCfg.Model)
+
 	maxTokens := model.CatwalkCfg.DefaultMaxTokens
 	if model.ModelCfg.MaxTokens != 0 {
 		maxTokens = model.ModelCfg.MaxTokens
 	}
 
 	if !model.CatwalkCfg.SupportsImages && attachments != nil {
-		// filter out image attachments
 		filteredAttachments := make([]message.Attachment, 0, len(attachments))
 		for _, att := range attachments {
 			if att.IsText() {
@@ -154,7 +215,7 @@ func (c *coordinator) Run(ctx context.Context, sessionID string, prompt string, 
 
 	providerCfg, ok := c.cfg.Providers.Get(model.ModelCfg.Provider)
 	if !ok {
-		return nil, errors.New("model provider not configured")
+		return nil, fmt.Errorf("model provider %q not configured", model.ModelCfg.Provider)
 	}
 
 	mergedOptions, temp, topP, topK, freqPenalty, presPenalty := mergeCallOptions(model, providerCfg)
@@ -211,111 +272,11 @@ func (c *coordinator) RunWithOverrides(ctx context.Context, sessionID, prompt st
 		return nil, err
 	}
 
-	// Get base model configs from global config.
-	largeCfg, ok := c.cfg.Models[config.SelectedModelTypeLarge]
-	if !ok {
-		return nil, errors.New("large model not selected")
-	}
-	smallCfg, ok := c.cfg.Models[config.SelectedModelTypeSmall]
-	if !ok {
-		return nil, errors.New("small model not selected")
+	if err := c.applyModelOverrides(ctx, large, small); err != nil {
+		return nil, err
 	}
 
-	// Apply per-call overrides.
-	if large != nil {
-		slog.Info("RunWithOverrides: applying large model override", "provider", large.Provider, "model", large.Model)
-		largeCfg.Provider = large.Provider
-		largeCfg.Model = large.Model
-	}
-	if small != nil {
-		slog.Info("RunWithOverrides: applying small model override", "provider", small.Provider, "model", small.Model)
-		smallCfg.Provider = small.Provider
-		smallCfg.Model = small.Model
-	}
-
-	largeModel, smallModel, err := c.buildModelsFromCfg(ctx, largeCfg, smallCfg, false)
-	if err != nil {
-		slog.Error("RunWithOverrides: failed to build override models, falling back to global config", "err", err)
-		// Fall back to global config so the user still gets a response.
-		return c.Run(ctx, sessionID, prompt, attachments...)
-	}
-	slog.Info("RunWithOverrides: using overridden models", "large", largeCfg.Model, "small", smallCfg.Model)
-	c.currentAgent.SetModels(largeModel, smallModel)
-
-	model := c.currentAgent.Model()
-	maxTokens := model.CatwalkCfg.DefaultMaxTokens
-	if model.ModelCfg.MaxTokens != 0 {
-		maxTokens = model.ModelCfg.MaxTokens
-	}
-
-	if !model.CatwalkCfg.SupportsImages && attachments != nil {
-		filteredAttachments := make([]message.Attachment, 0, len(attachments))
-		for _, att := range attachments {
-			if att.IsText() {
-				filteredAttachments = append(filteredAttachments, att)
-			}
-		}
-		attachments = filteredAttachments
-	}
-
-	providerCfg, ok := c.cfg.Providers.Get(model.ModelCfg.Provider)
-	if !ok {
-		return nil, errors.New("model provider not configured")
-	}
-
-	mergedOptions, temp, topP, topK, freqPenalty, presPenalty := mergeCallOptions(model, providerCfg)
-
-	if providerCfg.OAuthToken != nil && providerCfg.OAuthToken.IsExpired() {
-		slog.Debug("Token needs to be refreshed", "provider", providerCfg.ID)
-		if err := c.refreshOAuth2Token(ctx, providerCfg); err != nil {
-			return nil, err
-		}
-	}
-
-	run := func() (*fantasy.AgentResult, error) {
-		return c.currentAgent.Run(ctx, SessionAgentCall{
-			SessionID:        sessionID,
-			Prompt:           prompt,
-			Attachments:      attachments,
-			MaxOutputTokens:  maxTokens,
-			ProviderOptions:  mergedOptions,
-			Temperature:      temp,
-			TopP:             topP,
-			TopK:             topK,
-			FrequencyPenalty: freqPenalty,
-			PresencePenalty:  presPenalty,
-		})
-	}
-	result, originalErr := run()
-
-	if c.isUnauthorized(originalErr) {
-		switch {
-		case providerCfg.OAuthToken != nil:
-			slog.Debug("Received 401. Refreshing token and retrying", "provider", providerCfg.ID)
-			if err := c.refreshOAuth2Token(ctx, providerCfg); err != nil {
-				return nil, originalErr
-			}
-			return run()
-		case strings.Contains(providerCfg.APIKeyTemplate, "$"):
-			slog.Debug("Received 401. Refreshing API Key template and retrying", "provider", providerCfg.ID)
-			if err := c.refreshApiKeyTemplate(ctx, providerCfg); err != nil {
-				return nil, originalErr
-			}
-			return run()
-		default:
-			// Override model failed with auth error — fall back to global config.
-			slog.Error("RunWithOverrides: override model unauthorized, falling back to global config",
-				"provider", largeCfg.Provider, "model", largeCfg.Model, "err", originalErr)
-			return c.Run(ctx, sessionID, prompt, attachments...)
-		}
-	}
-
-	if originalErr != nil {
-		// Generic run failure — surface the error so the caller can handle it.
-		return nil, originalErr
-	}
-
-	return result, nil
+	return c.runInternal(ctx, sessionID, prompt, attachments...)
 }
 
 func getProviderOptions(model Model, providerCfg config.ProviderConfig) fantasy.ProviderOptions {
@@ -1008,6 +969,11 @@ func (c *coordinator) UpdateModels(ctx context.Context) error {
 		return err
 	}
 	c.currentAgent.SetModels(large, small)
+
+	// Update prompt prefix for the new large model provider
+	if largeProviderCfg, ok := c.cfg.Providers.Get(large.ModelCfg.Provider); ok {
+		c.currentAgent.SetSystemPromptPrefix(largeProviderCfg.SystemPromptPrefix)
+	}
 
 	agentCfg, ok := c.cfg.Agents[config.AgentCoder]
 	if !ok {

@@ -1,10 +1,12 @@
 /**
  * Model-switch integration tests.
  *
- * These tests verify that when a user selects a different model, the
- * subsequent send_message WebSocket payload contains the correct
- * largeModel / smallModel overrides — proving the frontend actually
- * passes the selection through to the backend.
+ * Model selection now persists in the database via set_session_models,
+ * not via per-message overrides in send_message. These tests verify:
+ *  1. Selecting a model sends set_session_models with correct provider/model.
+ *  2. The send_message payload does NOT contain largeModel/smallModel overrides.
+ *  3. The session_updated event from the server updates the displayed model.
+ *  4. Per-session independence is maintained.
  */
 
 import { test, expect } from "@playwright/test";
@@ -18,12 +20,11 @@ test.beforeEach(async ({ page }) => {
   );
 });
 
-// ── Helper ──────────────────────────────────────────────────────────────────
+// ── Helper ───────────────────────────────────────────────────────────────────
 
-/** Returns all send_message WS payloads sent so far. */
 async function getSentMessages(page: import("@playwright/test").Page) {
   return page.evaluate(() => {
-    const sent = (window as Record<string, unknown>)["__wsSent"] as Array<{
+    const sent = ((window as unknown) as Record<string, unknown>)["__wsSent"] as Array<{
       type: string;
       payload: unknown;
     }>;
@@ -31,35 +32,9 @@ async function getSentMessages(page: import("@playwright/test").Page) {
   });
 }
 
-// ── Default model (no override) ─────────────────────────────────────────────
+// ── set_session_models command ────────────────────────────────────────────────
 
-test("send_message has no model overrides when using default model", async ({ page }) => {
-  await page.goto("/");
-  await sendMockWSMessage(page, {
-    type: "sessions_list",
-    payload: [makeSession({ ID: "sw-def", Title: "Default Model" })],
-  });
-  await sendMockWSMessage(page, { type: "config", payload: makeConfig() });
-  await expect(page.getByText("Default Model")).toBeVisible({ timeout: 3000 });
-  await page.getByText("Default Model").click();
-
-  // Send a message without changing the model
-  await page.getByPlaceholder("Message… (Enter to send)").fill("hello default");
-  await page.getByRole("button", { name: "Send", exact: true }).click();
-
-  const sent = await waitForWSSend(page, "send_message");
-  const payload = sent.payload as Record<string, unknown>;
-
-  // No model overrides — backend uses its global config
-  expect(payload.largeModel).toBeUndefined();
-  expect(payload.smallModel).toBeUndefined();
-  expect(payload.content).toBe("hello default");
-  expect(payload.sessionID).toBe("sw-def");
-});
-
-// ── Large model override ─────────────────────────────────────────────────────
-
-test("send_message includes largeModel override after switching large model", async ({ page }) => {
+test("selecting large model sends set_session_models with provider and model", async ({ page }) => {
   await page.goto("/");
   await sendMockWSMessage(page, {
     type: "sessions_list",
@@ -71,8 +46,8 @@ test("send_message includes largeModel override after switching large model", as
       providers: {
         anthropic: {
           models: [
-            { id: "claude-opus-4", name: "claude-opus-4" },
-            { id: "claude-haiku-4", name: "claude-haiku-4" },
+            { id: "claude-opus-4", name: "claude-opus-4", contextWindow: 200000 },
+            { id: "claude-haiku-4", name: "claude-haiku-4", contextWindow: 200000 },
           ],
         },
       },
@@ -81,30 +56,17 @@ test("send_message includes largeModel override after switching large model", as
   await expect(page.getByText("Large Switch")).toBeVisible({ timeout: 3000 });
   await page.getByText("Large Switch").click();
 
-  // Switch large model to claude-haiku-4
-  await expect(
-    page.locator("header button[title='Large (strong) model']")
-  ).toBeVisible({ timeout: 3000 });
+  await expect(page.locator("header button[title='Large (strong) model']")).toBeVisible({ timeout: 3000 });
   await page.locator("header button[title='Large (strong) model']").click();
   await page.locator("div.absolute").getByText("claude-haiku-4").click();
 
-  // Send a message
-  await page.getByPlaceholder("Message… (Enter to send)").fill("hello haiku");
-  await page.getByRole("button", { name: "Send", exact: true }).click();
-
-  const sent = await waitForWSSend(page, "send_message");
-  const payload = sent.payload as Record<string, unknown>;
-
-  // largeModel override should reflect the selected model
-  expect(payload.content).toBe("hello haiku");
-  expect(payload.largeModel).toEqual({ provider: "anthropic", model: "claude-haiku-4" });
-  // smallModel was not changed so no override
-  expect(payload.smallModel).toBeUndefined();
+  const cmd = await waitForWSSend(page, "set_session_models");
+  const p = cmd.payload as { sessionID: string; largeModel: { provider: string; model: string }; smallModel: unknown };
+  expect(p.sessionID).toBe("sw-lg");
+  expect(p.largeModel).toEqual({ provider: "anthropic", model: "claude-haiku-4" });
 });
 
-// ── Small model override ─────────────────────────────────────────────────────
-
-test("send_message includes smallModel override after switching small model", async ({ page }) => {
+test("selecting small model sends set_session_models with correct small provider/model", async ({ page }) => {
   await page.goto("/");
   await sendMockWSMessage(page, {
     type: "sessions_list",
@@ -116,41 +78,28 @@ test("send_message includes smallModel override after switching small model", as
       providers: {
         anthropic: {
           models: [
-            { id: "claude-opus-4", name: "claude-opus-4" },
-            { id: "claude-haiku-4", name: "claude-haiku-4" },
+            { id: "claude-opus-4", name: "claude-opus-4", contextWindow: 200000 },
+            { id: "claude-haiku-4", name: "claude-haiku-4", contextWindow: 200000 },
           ],
         },
-        openai: { models: [{ id: "gpt-4o-mini", name: "gpt-4o-mini" }] },
+        openai: { models: [{ id: "gpt-4o-mini", name: "gpt-4o-mini", contextWindow: 128000 }] },
       },
     }),
   });
   await expect(page.getByText("Small Switch")).toBeVisible({ timeout: 3000 });
   await page.getByText("Small Switch").click();
 
-  // Switch small model to gpt-4o-mini
-  await expect(
-    page.locator("header button[title='Small (fast) model']")
-  ).toBeVisible({ timeout: 3000 });
+  await expect(page.locator("header button[title='Small (fast) model']")).toBeVisible({ timeout: 3000 });
   await page.locator("header button[title='Small (fast) model']").click();
   await page.locator("div.absolute").getByText("gpt-4o-mini").click();
 
-  // Send a message
-  await page.getByPlaceholder("Message… (Enter to send)").fill("hello mini");
-  await page.getByRole("button", { name: "Send", exact: true }).click();
-
-  const sent = await waitForWSSend(page, "send_message");
-  const payload = sent.payload as Record<string, unknown>;
-
-  expect(payload.content).toBe("hello mini");
-  // smallModel override should reflect the selected openai model
-  expect(payload.smallModel).toEqual({ provider: "openai", model: "gpt-4o-mini" });
-  // largeModel was not changed
-  expect(payload.largeModel).toBeUndefined();
+  const cmd = await waitForWSSend(page, "set_session_models");
+  const p = cmd.payload as { sessionID: string; smallModel: { provider: string; model: string } };
+  expect(p.sessionID).toBe("sw-sm");
+  expect(p.smallModel).toEqual({ provider: "openai", model: "gpt-4o-mini" });
 });
 
-// ── Both overrides ───────────────────────────────────────────────────────────
-
-test("send_message includes both overrides when both models are changed", async ({ page }) => {
+test("set_session_models includes both models", async ({ page }) => {
   await page.goto("/");
   await sendMockWSMessage(page, {
     type: "sessions_list",
@@ -162,40 +111,121 @@ test("send_message includes both overrides when both models are changed", async 
       providers: {
         anthropic: {
           models: [
-            { id: "claude-opus-4", name: "claude-opus-4" },
-            { id: "claude-haiku-4", name: "claude-haiku-4" },
+            { id: "claude-opus-4", name: "claude-opus-4", contextWindow: 200000 },
+            { id: "claude-haiku-4", name: "claude-haiku-4", contextWindow: 200000 },
           ],
         },
-        openai: { models: [{ id: "gpt-4o-mini", name: "gpt-4o-mini" }] },
+        openai: { models: [{ id: "gpt-4o-mini", name: "gpt-4o-mini", contextWindow: 128000 }] },
       },
     }),
   });
   await expect(page.getByText("Both Switch")).toBeVisible({ timeout: 3000 });
   await page.getByText("Both Switch").click();
 
-  // Switch large model to claude-haiku-4
+  // Pick large model
   await page.locator("header button[title='Large (strong) model']").click();
   await page.locator("div.absolute").getByText("claude-haiku-4").click();
+  await waitForWSSend(page, "set_session_models");
 
-  // Switch small model to gpt-4o-mini
+  // Pick small model — second set_session_models command
   await page.locator("header button[title='Small (fast) model']").click();
   await page.locator("div.absolute").getByText("gpt-4o-mini").click();
 
+  const secondCmd = await page.waitForFunction(
+    () => {
+      const sent = ((window as unknown) as Record<string, unknown>)["__wsSent"] as Array<{
+        type: string;
+        payload: Record<string, unknown>;
+      }>;
+      const cmds = sent.filter((m) => m.type === "set_session_models");
+      return cmds.length >= 2 ? cmds[cmds.length - 1] : null;
+    },
+    { timeout: 5_000 }
+  );
+  const last = await secondCmd.jsonValue() as { payload: { smallModel: { provider: string; model: string } } };
+  expect(last.payload.smallModel).toEqual({ provider: "openai", model: "gpt-4o-mini" });
+});
+
+// ── send_message has no overrides ────────────────────────────────────────────
+
+test("send_message does not include largeModel or smallModel overrides", async ({ page }) => {
+  await page.goto("/");
+  await sendMockWSMessage(page, {
+    type: "sessions_list",
+    payload: [makeSession({ ID: "sw-no-ov", Title: "No Override" })],
+  });
+  await sendMockWSMessage(page, { type: "config", payload: makeConfig() });
+  await expect(page.getByText("No Override")).toBeVisible({ timeout: 3000 });
+  await page.getByText("No Override").click();
+
+  // Switch model
+  await page.locator("header button[title='Large (strong) model']").click();
+  await page.locator("div.absolute").getByText("claude-haiku-4").click();
+  await waitForWSSend(page, "set_session_models");
+
   // Send a message
-  await page.getByPlaceholder("Message… (Enter to send)").fill("both models");
+  await page.getByPlaceholder("Message… (Enter to send)").fill("hello");
   await page.getByRole("button", { name: "Send", exact: true }).click();
 
   const sent = await waitForWSSend(page, "send_message");
   const payload = sent.payload as Record<string, unknown>;
-
-  expect(payload.content).toBe("both models");
-  expect(payload.largeModel).toEqual({ provider: "anthropic", model: "claude-haiku-4" });
-  expect(payload.smallModel).toEqual({ provider: "openai", model: "gpt-4o-mini" });
+  expect(payload.largeModel).toBeUndefined();
+  expect(payload.smallModel).toBeUndefined();
+  expect(payload.content).toBe("hello");
 });
 
-// ── Per-session independence ─────────────────────────────────────────────────
+test("send_message never contains model overrides even on default model", async ({ page }) => {
+  await page.goto("/");
+  await sendMockWSMessage(page, {
+    type: "sessions_list",
+    payload: [makeSession({ ID: "sw-def", Title: "Default Model" })],
+  });
+  await sendMockWSMessage(page, { type: "config", payload: makeConfig() });
+  await expect(page.getByText("Default Model")).toBeVisible({ timeout: 3000 });
+  await page.getByText("Default Model").click();
 
-test("model selection is per-session: different sessions send different overrides", async ({ page }) => {
+  await page.getByPlaceholder("Message… (Enter to send)").fill("hello default");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+
+  const sent = await waitForWSSend(page, "send_message");
+  const payload = sent.payload as Record<string, unknown>;
+  expect(payload.largeModel).toBeUndefined();
+  expect(payload.smallModel).toBeUndefined();
+  expect(payload.sessionID).toBe("sw-def");
+});
+
+// ── session_updated reflects model change in header ──────────────────────────
+
+test("session_updated with model fields updates header model button", async ({ page }) => {
+  await page.goto("/");
+  await sendMockWSMessage(page, {
+    type: "sessions_list",
+    payload: [makeSession({ ID: "sw-upd", Title: "Update Model" })],
+  });
+  await sendMockWSMessage(page, { type: "config", payload: makeConfig() });
+  await expect(page.getByText("Update Model")).toBeVisible({ timeout: 3000 });
+  await page.getByText("Update Model").click();
+
+  // Server sends session_updated with model fields filled in
+  await sendMockWSMessage(page, {
+    type: "session_updated",
+    payload: makeSession({
+      ID: "sw-upd",
+      Title: "Update Model",
+      LargeModelProvider: "anthropic",
+      LargeModelID: "claude-haiku-4",
+    }),
+  });
+
+  // Header large model button should now show claude-haiku-4
+  await expect(
+    page.locator("header button[title='Large (strong) model']").filter({ hasText: "claude-haiku-4" })
+  ).toBeVisible({ timeout: 2000 });
+});
+
+// ── Per-session independence ──────────────────────────────────────────────────
+
+test("switching model in session A does not affect session B", async ({ page }) => {
   await page.goto("/");
   await sendMockWSMessage(page, {
     type: "sessions_list",
@@ -210,57 +240,35 @@ test("model selection is per-session: different sessions send different override
       providers: {
         anthropic: {
           models: [
-            { id: "claude-opus-4", name: "claude-opus-4" },
-            { id: "claude-haiku-4", name: "claude-haiku-4" },
+            { id: "claude-opus-4", name: "claude-opus-4", contextWindow: 200000 },
+            { id: "claude-haiku-4", name: "claude-haiku-4", contextWindow: 200000 },
           ],
         },
       },
     }),
   });
 
-  // Session A: change large model to claude-haiku-4
+  // Change Session A model
   await expect(page.getByText("Session A")).toBeVisible({ timeout: 3000 });
   await page.getByText("Session A").click();
   await page.locator("header button[title='Large (strong) model']").click();
   await page.locator("div.absolute").getByText("claude-haiku-4").click();
 
-  // Send from Session A — should have largeModel override
-  await page.getByPlaceholder("Message… (Enter to send)").fill("from A");
-  await page.getByRole("button", { name: "Send", exact: true }).click();
-  await waitForWSSend(page, "send_message");
+  // Session A button shows haiku
+  await expect(
+    page.locator("header button[title='Large (strong) model']").filter({ hasText: "claude-haiku-4" })
+  ).toBeVisible({ timeout: 2000 });
 
-  const sentAfterA = await getSentMessages(page);
-  const msgA = sentAfterA.find(
-    (p: unknown) => (p as Record<string, unknown>).content === "from A"
-  ) as Record<string, unknown> | undefined;
-  expect(msgA?.largeModel).toEqual({ provider: "anthropic", model: "claude-haiku-4" });
-
-  // Switch to Session B (no model change) — send a message
+  // Switch to Session B — should show opus (default)
   await page.getByText("Session B").click();
-  await page.getByPlaceholder("Message… (Enter to send)").fill("from B");
-  await page.getByRole("button", { name: "Send", exact: true }).click();
-
-  // Wait for the Session B message
-  await page.waitForFunction(() => {
-    const sent = (window as Record<string, unknown>)["__wsSent"] as Array<{
-      type: string;
-      payload: Record<string, unknown>;
-    }>;
-    return sent.some((m) => m.type === "send_message" && m.payload?.content === "from B");
-  }, { timeout: 5000 });
-
-  const sentAfterB = await getSentMessages(page);
-  const msgB = sentAfterB.find(
-    (p: unknown) => (p as Record<string, unknown>).content === "from B"
-  ) as Record<string, unknown> | undefined;
-  // Session B never had a model change — no overrides
-  expect(msgB?.largeModel).toBeUndefined();
-  expect(msgB?.smallModel).toBeUndefined();
+  await expect(
+    page.locator("header button[title='Large (strong) model']").filter({ hasText: "claude-opus-4" })
+  ).toBeVisible({ timeout: 2000 });
 });
 
-// ── Override persists across multiple sends ──────────────────────────────────
+// ── Model override persists across sends in same session ─────────────────────
 
-test("model override persists for subsequent messages in same session", async ({ page }) => {
+test("model override persists for subsequent messages via DB", async ({ page }) => {
   await page.goto("/");
   await sendMockWSMessage(page, {
     type: "sessions_list",
@@ -272,8 +280,8 @@ test("model override persists for subsequent messages in same session", async ({
       providers: {
         anthropic: {
           models: [
-            { id: "claude-opus-4", name: "claude-opus-4" },
-            { id: "claude-haiku-4", name: "claude-haiku-4" },
+            { id: "claude-opus-4", name: "claude-opus-4", contextWindow: 200000 },
+            { id: "claude-haiku-4", name: "claude-haiku-4", contextWindow: 200000 },
           ],
         },
       },
@@ -282,31 +290,39 @@ test("model override persists for subsequent messages in same session", async ({
   await expect(page.getByText("Persist Session")).toBeVisible({ timeout: 3000 });
   await page.getByText("Persist Session").click();
 
-  // Switch large model once
+  // Switch model once
   await page.locator("header button[title='Large (strong) model']").click();
   await page.locator("div.absolute").getByText("claude-haiku-4").click();
+  await waitForWSSend(page, "set_session_models");
 
-  // Send first message
+  // Simulate server confirming the session model update
+  await sendMockWSMessage(page, {
+    type: "session_updated",
+    payload: makeSession({
+      ID: "sw-persist",
+      Title: "Persist Session",
+      LargeModelProvider: "anthropic",
+      LargeModelID: "claude-haiku-4",
+    }),
+  });
+
+  // Send two messages — neither should have model overrides in payload
   await page.getByPlaceholder("Message… (Enter to send)").fill("msg one");
   await page.getByRole("button", { name: "Send", exact: true }).click();
   await waitForWSSend(page, "send_message");
 
-  // Send second message without changing model again
   await page.getByPlaceholder("Message… (Enter to send)").fill("msg two");
   await page.getByRole("button", { name: "Send", exact: true }).click();
-
   await page.waitForFunction(() => {
-    const sent = (window as Record<string, unknown>)["__wsSent"] as Array<{
+    const sent = ((window as unknown) as Record<string, unknown>)["__wsSent"] as Array<{
       type: string;
-      payload: Record<string, unknown>;
     }>;
     return sent.filter((m) => m.type === "send_message").length >= 2;
   }, { timeout: 5000 });
 
-  const allSent = await getSentMessages(page);
-  const msgs = allSent as Array<Record<string, unknown>>;
-
+  const msgs = await getSentMessages(page) as Array<Record<string, unknown>>;
   for (const msg of msgs) {
-    expect(msg.largeModel).toEqual({ provider: "anthropic", model: "claude-haiku-4" });
+    expect(msg.largeModel).toBeUndefined();
+    expect(msg.smallModel).toBeUndefined();
   }
 });
