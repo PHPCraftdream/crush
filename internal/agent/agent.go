@@ -784,16 +784,16 @@ func (a *sessionAgent) preparePrompt(msgs []message.Message, todos []session.Tod
 	if !a.isSubAgent {
 		var reminderText string
 		if len(todos) == 0 {
-			reminderText = `This is a reminder that your todo list is currently empty. DO NOT mention this to the user explicitly because they are already aware.
+			reminderText = `This is a reminder that your todo list is currently empty — all previous tasks have been completed or deleted. DO NOT recreate any old tasks from memory. DO NOT mention this to the user explicitly because they are already aware.
 If you are working on tasks that would benefit from a todo list please use the "todos" tool to create one.
 If not, please feel free to ignore. Again do not mention this message to the user.`
 		} else {
 			var sb strings.Builder
-			sb.WriteString("This is a reminder of your CURRENT todo list (as last saved — this is the ground truth, even if your conversation history shows something different):\n\n")
+			sb.WriteString("This is a reminder of your CURRENT todo list. This is the authoritative ground truth — it overrides anything in your conversation history:\n\n")
 			for _, t := range todos {
 				sb.WriteString(fmt.Sprintf("- [%s] %s\n", t.Status, t.Content))
 			}
-			sb.WriteString("\nDo NOT recreate or reset this list unless the user or task explicitly requires it. DO NOT mention this reminder to the user.")
+			sb.WriteString("\nIMPORTANT: Tasks NOT in this list have been DELETED (by the user or by you). Do NOT add them back. Only manage the tasks listed above, plus any new ones the user explicitly requests. DO NOT mention this reminder to the user.")
 			reminderText = sb.String()
 		}
 		history = append(history, fantasy.NewUserMessage(
