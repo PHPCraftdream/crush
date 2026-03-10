@@ -293,6 +293,10 @@ func handleCancelAgent(_ context.Context, a *appPkg.App, c *Client, msg WSMessag
 		return
 	}
 	a.AgentCoordinator.Cancel(p.SessionID)
+	// Force-broadcast busy=false immediately so the UI unblocks and the replay
+	// buffer records a definitive "not busy" state. The goroutine will also
+	// broadcast false when it actually finishes (harmless duplicate).
+	c.hub.Broadcast(EventAgentBusy, AgentBusyPayload{SessionID: p.SessionID, Busy: false})
 }
 
 func handleCreateSession(ctx context.Context, a *appPkg.App, c *Client, msg WSMessage) {
@@ -446,6 +450,16 @@ func handleListSessions(ctx context.Context, a *appPkg.App, c *Client, msg WSMes
 		sessions = []session.Session{}
 	}
 	c.reply(msg.ID, EventSessionsList, sessions, "")
+
+	// Correct any stale agent_busy state in the replay buffer by sending the
+	// server's authoritative busy state for every session to this client only
+	// (not broadcast — other clients already have accurate live state).
+	if a.AgentCoordinator != nil {
+		for _, s := range sessions {
+			busy := a.AgentCoordinator.IsSessionBusy(s.ID)
+			c.reply("", EventAgentBusy, AgentBusyPayload{SessionID: s.ID, Busy: busy}, "")
+		}
+	}
 }
 
 func handleLoadMessages(ctx context.Context, a *appPkg.App, c *Client, msg WSMessage) {

@@ -650,7 +650,7 @@ func (a *sessionAgent) Summarize(ctx context.Context, sessionID string, opts fan
 
 	aiMsgs, _ := a.preparePrompt(msgs, nil)
 
-	genCtx, cancel := context.WithCancel(ctx)
+	genCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	a.activeRequests.Set(sessionID, cancel)
 	defer a.activeRequests.Del(sessionID)
 	defer cancel()
@@ -842,8 +842,18 @@ func (a *sessionAgent) getSessionMessages(ctx context.Context, session session.S
 			}
 		}
 		if summaryMsgIndex != -1 {
+			// Collect pinned messages that appear before the summary
+			var pinned []message.Message
+			for _, msg := range msgs[:summaryMsgIndex] {
+				if msg.Pinned {
+					pinned = append(pinned, msg)
+				}
+			}
 			msgs = msgs[summaryMsgIndex:]
 			msgs[0].Role = message.User
+			if len(pinned) > 0 {
+				msgs = append(pinned, msgs...)
+			}
 		}
 	}
 	return msgs, nil
