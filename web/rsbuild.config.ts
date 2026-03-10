@@ -1,5 +1,6 @@
 import { defineConfig } from "@rsbuild/core";
 import { pluginReact } from "@rsbuild/plugin-react";
+import { pluginBabel } from "@rsbuild/plugin-babel";
 import { execSync } from "child_process";
 
 function git(cmd: string, fallback: string): string {
@@ -15,13 +16,18 @@ const GIT_COUNT   = git("git rev-list --count HEAD", "0");
 const GIT_BRANCH  = git("git rev-parse --abbrev-ref HEAD", "unknown");
 
 export default defineConfig({
-  plugins: [pluginReact()],
-  tools: {
-    babel(config) {
-      config.plugins ??= [];
-      config.plugins.push("babel-plugin-react-compiler");
-    },
-  },
+  plugins: [
+    pluginReact(),
+    pluginBabel({
+      babelLoaderOptions(opts) {
+        opts.plugins ??= [];
+        // React Compiler must run before JSX is lowered to createElement.
+        // pluginBabel inserts babel-loader AFTER SWC in the same rule, so
+        // right-to-left execution means Babel runs first on raw source.
+        opts.plugins.unshift("babel-plugin-react-compiler");
+      },
+    }),
+  ],
   source: {
     entry: { index: "./src/main.tsx" },
     define: {
