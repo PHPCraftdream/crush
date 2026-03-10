@@ -66,7 +66,9 @@ export function useWS() {
         ws.send("list_sessions");
         ws.send("get_config");
         ws.send("get_skills");
-        // Persist any theme set on the login page (before WS was available)
+        // Sync yolo and theme from localStorage to server on every (re)connect
+        // so the server's state always matches what the client has saved locally.
+        ws.send("set_yolo", { enabled: $yolo.get() });
         const localTheme = localStorage.getItem("crush_theme");
         if (localTheme) {
           ws.send("set_theme", { theme: localTheme });
