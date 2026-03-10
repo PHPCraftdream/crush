@@ -16,6 +16,12 @@ const GIT_BRANCH  = git("git rev-parse --abbrev-ref HEAD", "unknown");
 
 export default defineConfig({
   plugins: [pluginReact()],
+  tools: {
+    babel(config) {
+      config.plugins ??= [];
+      config.plugins.push("babel-plugin-react-compiler");
+    },
+  },
   source: {
     entry: { index: "./src/main.tsx" },
     define: {
