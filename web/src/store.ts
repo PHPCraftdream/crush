@@ -305,6 +305,10 @@ export function updateMessagePart(messageID: string, partIndex: number, content:
   ws.send("update_message_part", { messageID, partIndex, content });
 }
 
+export function togglePinMessage(messageID: string, pinned: boolean) {
+  ws.send("toggle_pin_message", { messageID, pinned });
+}
+
 export function rerunFromMessage(messageID: string) {
   const msgs = $messages.get();
   const sessionID = $activeSessionID.get();
@@ -357,6 +361,13 @@ export function toggleMessageSelection(id: string) {
 
 export function clearSelection() {
   $selectedMessageIDs.set(new Set());
+}
+
+// Select (only add, never remove) all IDs in the given array
+export function selectMessageIDs(ids: string[]) {
+  const s = new Set($selectedMessageIDs.get());
+  for (const id of ids) s.add(id);
+  $selectedMessageIDs.set(s);
 }
 
 // Last agent error to display in chat

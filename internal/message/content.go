@@ -135,6 +135,7 @@ type Message struct {
 	CreatedAt        int64
 	UpdatedAt        int64
 	IsSummaryMessage bool
+	Pinned           bool
 }
 
 func (m *Message) Content() TextContent {

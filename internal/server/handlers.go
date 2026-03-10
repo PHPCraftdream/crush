@@ -87,6 +87,8 @@ func handleIncoming(ctx context.Context, a *appPkg.App, c *Client, raw []byte) {
 		go handleDeleteMessagePart(ctx, a, c, msg)
 	case CmdUpdateMessagePart:
 		go handleUpdateMessagePart(ctx, a, c, msg)
+	case CmdTogglePinMessage:
+		go handleTogglePinMessage(ctx, a, c, msg)
 	case CmdLogClientEvent:
 		go handleLogClientEvent(a, c, msg)
 	case CmdLogClientError:
@@ -844,6 +846,19 @@ func handleUpdateMessagePart(ctx context.Context, a *appPkg.App, c *Client, msg 
 		return
 	}
 	if err := a.Messages.Update(ctx, m); err != nil {
+		c.reply(msg.ID, EventError, nil, err.Error())
+		return
+	}
+	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
+}
+
+func handleTogglePinMessage(ctx context.Context, a *appPkg.App, c *Client, msg WSMessage) {
+	var p TogglePinMessagePayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil || p.MessageID == "" {
+		c.reply(msg.ID, EventError, nil, "invalid payload")
+		return
+	}
+	if err := a.Messages.SetPinned(ctx, p.MessageID, p.Pinned); err != nil {
 		c.reply(msg.ID, EventError, nil, err.Error())
 		return
 	}

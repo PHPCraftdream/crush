@@ -61,6 +61,7 @@ const (
 	CmdSummarizeSession             = "summarize_session"
 	CmdDeleteMessagePart            = "delete_message_part"
 	CmdUpdateMessagePart            = "update_message_part"
+	CmdTogglePinMessage             = "toggle_pin_message"
 )
 
 // Payload structs for inbound commands.
@@ -415,6 +416,11 @@ type UpdateMessagePartPayload struct {
 	MessageID string `json:"messageID"`
 	PartIndex int    `json:"partIndex"`
 	Content   string `json:"content"`
+}
+
+type TogglePinMessagePayload struct {
+	MessageID string `json:"messageID"`
+	Pinned    bool   `json:"pinned"`
 }
 
 type SetMCPDisabledPayload struct {

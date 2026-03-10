@@ -34,6 +34,7 @@ type Service interface {
 	ListAllUserMessages(ctx context.Context) ([]Message, error)
 	Delete(ctx context.Context, id string) error
 	DeleteSessionMessages(ctx context.Context, sessionID string) error
+	SetPinned(ctx context.Context, id string, pinned bool) error
 }
 
 type service struct {
@@ -212,7 +213,28 @@ func (s *service) fromDBItem(item db.Message) (Message, error) {
 		CreatedAt:        item.CreatedAt,
 		UpdatedAt:        item.UpdatedAt,
 		IsSummaryMessage: item.IsSummaryMessage != 0,
+		Pinned:           item.Pinned != 0,
 	}, nil
+}
+
+func (s *service) SetPinned(ctx context.Context, id string, pinned bool) error {
+	pinnedVal := int64(0)
+	if pinned {
+		pinnedVal = 1
+	}
+	err := s.q.UpdateMessagePinned(ctx, db.UpdateMessagePinnedParams{
+		ID:     id,
+		Pinned: pinnedVal,
+	})
+	if err != nil {
+		return err
+	}
+	msg, err := s.Get(ctx, id)
+	if err != nil {
+		return err
+	}
+	s.Publish(pubsub.UpdatedEvent, msg.Clone())
+	return nil
 }
 
 type partType string

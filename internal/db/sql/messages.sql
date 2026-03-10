@@ -33,6 +33,13 @@ SET
     updated_at = strftime('%s', 'now')
 WHERE id = ?;
 
+-- name: UpdateMessagePinned :exec
+UPDATE messages
+SET
+    pinned = ?,
+    updated_at = strftime('%s', 'now')
+WHERE id = ?;
+
 
 -- name: DeleteMessage :exec
 DELETE FROM messages

@@ -129,6 +129,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.updateMessageStmt, err = db.PrepareContext(ctx, updateMessage); err != nil {
 		return nil, fmt.Errorf("error preparing query UpdateMessage: %w", err)
 	}
+	if q.updateMessagePinnedStmt, err = db.PrepareContext(ctx, updateMessagePinned); err != nil {
+		return nil, fmt.Errorf("error preparing query UpdateMessagePinned: %w", err)
+	}
 	if q.updateSessionStmt, err = db.PrepareContext(ctx, updateSession); err != nil {
 		return nil, fmt.Errorf("error preparing query UpdateSession: %w", err)
 	}
@@ -318,6 +321,11 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing updateMessageStmt: %w", cerr)
 		}
 	}
+	if q.updateMessagePinnedStmt != nil {
+		if cerr := q.updateMessagePinnedStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing updateMessagePinnedStmt: %w", cerr)
+		}
+	}
 	if q.updateSessionStmt != nil {
 		if cerr := q.updateSessionStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing updateSessionStmt: %w", cerr)
@@ -407,6 +415,7 @@ type Queries struct {
 	listUserMessagesBySessionStmt  *sql.Stmt
 	recordFileReadStmt             *sql.Stmt
 	updateMessageStmt              *sql.Stmt
+	updateMessagePinnedStmt        *sql.Stmt
 	updateSessionStmt              *sql.Stmt
 	updateSessionModelsStmt        *sql.Stmt
 	updateSessionTitleAndUsageStmt *sql.Stmt
@@ -451,6 +460,7 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		listUserMessagesBySessionStmt:  q.listUserMessagesBySessionStmt,
 		recordFileReadStmt:             q.recordFileReadStmt,
 		updateMessageStmt:              q.updateMessageStmt,
+		updateMessagePinnedStmt:        q.updateMessagePinnedStmt,
 		updateSessionStmt:              q.updateSessionStmt,
 		updateSessionModelsStmt:        q.updateSessionModelsStmt,
 		updateSessionTitleAndUsageStmt: q.updateSessionTitleAndUsageStmt,

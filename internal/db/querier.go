@@ -42,6 +42,7 @@ type Querier interface {
 	ListUserMessagesBySession(ctx context.Context, sessionID string) ([]Message, error)
 	RecordFileRead(ctx context.Context, arg RecordFileReadParams) error
 	UpdateMessage(ctx context.Context, arg UpdateMessageParams) error
+	UpdateMessagePinned(ctx context.Context, arg UpdateMessagePinnedParams) error
 	UpdateSession(ctx context.Context, arg UpdateSessionParams) (Session, error)
 	UpdateSessionSystemPrompt(ctx context.Context, arg UpdateSessionSystemPromptParams) error
 	UpdateSessionTitleAndUsage(ctx context.Context, arg UpdateSessionTitleAndUsageParams) error

@@ -82,6 +82,7 @@ export interface Message {
   CreatedAt: number;
   UpdatedAt: number;
   IsSummaryMessage: boolean;
+  Pinned: boolean;
 }
 
 export interface PermissionRequest {
