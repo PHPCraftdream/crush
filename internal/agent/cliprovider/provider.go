@@ -939,62 +939,121 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 			return
 		}
 
-		scanner := bufio.NewScanner(proc.stdout)
-		scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+		// scanResult carries one scanner event: a raw line, or a terminal
+		// signal with any scanner error.
+		type scanResult struct {
+			raw  []byte
+			done bool
+			err  error
+		}
+		scanCh := make(chan scanResult, 64)
+		go func() {
+			scanner := bufio.NewScanner(proc.stdout)
+			scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+			for scanner.Scan() {
+				b := scanner.Bytes()
+				cp := make([]byte, len(b))
+				copy(cp, b)
+				select {
+				case scanCh <- scanResult{raw: cp}:
+				case <-ctx.Done():
+					return
+				}
+			}
+			scanCh <- scanResult{done: true, err: scanner.Err()}
+		}()
+
+		// toolCh is the read side of the MCP tool-event channel.
+		// When nil (no MCP server), selecting on it never fires.
+		var toolCh <-chan mcpToolEvent
+		if mcpSrv != nil {
+			toolCh = mcpSrv.toolCh
+		}
 
 		var finalUsage fantasy.Usage
-		for scanner.Scan() {
+		scanDone := false
+		var scanErr error
+		for !scanDone {
 			select {
 			case <-ctx.Done():
 				proc.kill()
 				yield(fantasy.StreamPart{Type: fantasy.StreamPartTypeError, Error: ctx.Err()}) //nolint:errcheck
 				return
-			default:
-			}
 
-			// Strip ANSI/VT sequences that PTY drivers (especially Windows ConPTY)
-			// inject into the output stream. JSON parsers need clean bytes.
-			raw := scanner.Bytes()
-			slog.Debug("cliprovider: raw line", "raw", string(raw))
-			line := bytes.TrimSpace(ansiEscape.ReplaceAll(raw, nil))
+			case ev := <-toolCh:
+				// Emit ToolInputStart + Delta + End from the MCP tool event.
+				id := ev.id
+				if ev.name != "" {
+					// start event
+					if !yield(fantasy.StreamPart{Type: fantasy.StreamPartTypeToolInputStart, ID: id, ToolCallName: ev.name}) {
+						proc.kill()
+						return
+					}
+					if ev.input != "" {
+						if !yield(fantasy.StreamPart{Type: fantasy.StreamPartTypeToolInputDelta, ID: id, Delta: ev.input}) {
+							proc.kill()
+							return
+						}
+					}
+				} else {
+					// end event
+					if !yield(fantasy.StreamPart{Type: fantasy.StreamPartTypeToolInputEnd, ID: id}) {
+						proc.kill()
+						return
+					}
+				}
 
-			if m.spec.ParseUsageLine != nil {
-				if u, ok := m.spec.ParseUsageLine(line); ok {
-					finalUsage = u
+			case res := <-scanCh:
+				if res.done {
+					scanDone = true
+					scanErr = res.err
+					break
 				}
-			}
 
-			var part fantasy.StreamPart
-			if parsePart != nil {
-				var ok bool
-				part, ok = parsePart(line)
-				if !ok {
-					continue
-				}
-			} else {
-				clean := strings.TrimSpace(string(line))
-				if clean == "" {
-					continue
-				}
-				part = fantasy.StreamPart{
-					Type:  fantasy.StreamPartTypeTextDelta,
-					ID:    textID,
-					Delta: clean + "\n",
-				}
-			}
+				// Strip ANSI/VT sequences that PTY drivers (especially Windows ConPTY)
+				// inject into the output stream. JSON parsers need clean bytes.
+				raw := res.raw
+				slog.Debug("cliprovider: raw line", "raw", string(raw))
+				line := bytes.TrimSpace(ansiEscape.ReplaceAll(raw, nil))
 
-			if !yield(part) {
-				proc.kill()
-				return
+				if m.spec.ParseUsageLine != nil {
+					if u, ok := m.spec.ParseUsageLine(line); ok {
+						finalUsage = u
+					}
+				}
+
+				var part fantasy.StreamPart
+				if parsePart != nil {
+					var ok bool
+					part, ok = parsePart(line)
+					if !ok {
+						continue
+					}
+				} else {
+					clean := strings.TrimSpace(string(line))
+					if clean == "" {
+						continue
+					}
+					part = fantasy.StreamPart{
+						Type:  fantasy.StreamPartTypeTextDelta,
+						ID:    textID,
+						Delta: clean + "\n",
+					}
+				}
+
+				if !yield(part) {
+					proc.kill()
+					return
+				}
 			}
 		}
 
-		if err := scanner.Err(); err != nil && !errors.Is(err, io.EOF) {
+		if scanErr != nil && !errors.Is(scanErr, io.EOF) {
 			// PTY master returns EIO (Unix) or similar when child exits.
 			// Treat any scanner error in PTY mode as normal end-of-stream.
 			if !proc.usingPTY {
 				_, _ = proc.wait()
-				yield(fantasy.StreamPart{Type: fantasy.StreamPartTypeError, Error: err}) //nolint:errcheck
+				yield(fantasy.StreamPart{Type: fantasy.StreamPartTypeError, Error: scanErr}) //nolint:errcheck
 				return
 			}
 		}

@@ -483,6 +483,14 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			currentAssistant.AddToolCall(toolCall)
 			return a.messages.Update(genCtx, *currentAssistant)
 		},
+		OnToolInputDelta: func(id string, delta string) error {
+			currentAssistant.AppendToolCallInput(id, delta)
+			return nil // don't spam DB on every delta; ToolInputEnd will persist
+		},
+		OnToolInputEnd: func(id string) error {
+			currentAssistant.FinishToolCall(id)
+			return a.messages.Update(genCtx, *currentAssistant)
+		},
 		OnRetry: func(err *fantasy.ProviderError, delay time.Duration) {
 			// TODO: implement
 		},

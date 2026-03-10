@@ -35,6 +35,14 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
+// mcpToolEvent is emitted by the MCP server when a tool call starts or ends.
+// id is a UUID; name is non-empty for start events, empty for end events.
+type mcpToolEvent struct {
+	id    string
+	name  string // non-empty = start event; empty = end event
+	input string // JSON-encoded input (start events only)
+}
+
 // crushMCPServer is an in-process MCP HTTP server with token auth.
 // The token is accepted via Authorization: Bearer header (Claude CLI)
 // or as a ?token= query parameter (Qwen CLI, which cannot set headers).
@@ -42,6 +50,9 @@ type crushMCPServer struct {
 	addr    string // "127.0.0.1:PORT"
 	token   string
 	httpSrv *http.Server
+	// toolCh receives tool-call notifications from MCP handlers so the
+	// Stream scan loop can emit ToolInputStart/Delta/End stream parts.
+	toolCh chan mcpToolEvent
 }
 
 // stop shuts down the HTTP server.
@@ -98,7 +109,8 @@ func newCrushMCPServer(ctx context.Context, perms permission.Service, sessions s
 		Version: "1.0",
 	}, nil)
 
-	registerMCPTools(srv, perms, sessions, sessionID, workingDir)
+	toolCh := make(chan mcpToolEvent, 32)
+	registerMCPTools(srv, perms, sessions, sessionID, workingDir, toolCh)
 
 	rawHandler := mcp.NewStreamableHTTPHandler(
 		func(*http.Request) *mcp.Server { return srv },
@@ -140,19 +152,45 @@ func newCrushMCPServer(ctx context.Context, perms permission.Service, sessions s
 		addr:    addr,
 		token:   token,
 		httpSrv: httpSrv,
+		toolCh:  toolCh,
 	}, nil
 }
 
 // registerMCPTools adds crush tool implementations to the MCP server.
 // Each tool requests permission via perms.Request before executing.
-func registerMCPTools(srv *mcp.Server, perms permission.Service, sessions session.Service, sessionID string, workingDir string) {
-	registerBashTool(srv, perms, workingDir)
-	registerViewTool(srv, perms, workingDir)
-	registerWriteTool(srv, perms, workingDir)
-	registerGlobTool(srv, perms, workingDir)
-	registerGrepTool(srv, perms, workingDir)
+// toolCh, if non-nil, receives start/end notifications for each tool call.
+func registerMCPTools(srv *mcp.Server, perms permission.Service, sessions session.Service, sessionID string, workingDir string, toolCh chan mcpToolEvent) {
+	registerBashTool(srv, perms, workingDir, toolCh)
+	registerViewTool(srv, perms, workingDir, toolCh)
+	registerWriteTool(srv, perms, workingDir, toolCh)
+	registerGlobTool(srv, perms, workingDir, toolCh)
+	registerGrepTool(srv, perms, workingDir, toolCh)
 	if sessions != nil && sessionID != "" {
 		registerTodosTool(srv, sessions, sessionID)
+	}
+}
+
+// emitToolStart sends a tool-call start notification to toolCh if non-nil.
+func emitToolStart(toolCh chan mcpToolEvent, id, name, inputJSON string) {
+	if toolCh == nil {
+		return
+	}
+	select {
+	case toolCh <- mcpToolEvent{id: id, name: name, input: inputJSON}:
+	default:
+		slog.Debug("cliprovider: toolCh full, dropping start event", "tool", name)
+	}
+}
+
+// emitToolEnd sends a tool-call end notification to toolCh if non-nil.
+func emitToolEnd(toolCh chan mcpToolEvent, id string) {
+	if toolCh == nil {
+		return
+	}
+	select {
+	case toolCh <- mcpToolEvent{id: id}:
+	default:
+		slog.Debug("cliprovider: toolCh full, dropping end event", "id", id)
 	}
 }
 
@@ -164,7 +202,7 @@ type mcpBashInput struct {
 	WorkingDir  string `json:"working_dir,omitempty" description:"Working directory (defaults to project root)"`
 }
 
-func registerBashTool(srv *mcp.Server, perms permission.Service, workingDir string) {
+func registerBashTool(srv *mcp.Server, perms permission.Service, workingDir string, toolCh chan mcpToolEvent) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "Bash",
 		Description: "Execute a shell command. Requires user approval.",
@@ -175,6 +213,11 @@ func registerBashTool(srv *mcp.Server, perms permission.Service, workingDir stri
 		if input.WorkingDir != "" {
 			wd = input.WorkingDir
 		}
+
+		id := uuid.New().String()
+		inputJSON, _ := json.Marshal(input)
+		emitToolStart(toolCh, id, "Bash", string(inputJSON))
+		defer emitToolEnd(toolCh, id)
 
 		granted, err := perms.Request(ctx, permission.CreatePermissionRequest{
 			SessionID:   mcpSessionID,
@@ -211,12 +254,17 @@ type mcpViewInput struct {
 	EndLine   int    `json:"end_line,omitempty"   description:"Last line to read (0 = end of file)"`
 }
 
-func registerViewTool(srv *mcp.Server, perms permission.Service, workingDir string) {
+func registerViewTool(srv *mcp.Server, perms permission.Service, workingDir string, toolCh chan mcpToolEvent) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "Read",
 		Description: "Read the contents of a file.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, input mcpViewInput) (*mcp.CallToolResult, any, error) {
 		slog.Debug("cliprovider: MCP Read called", "path", input.Path)
+
+		id := uuid.New().String()
+		inputJSON, _ := json.Marshal(input)
+		emitToolStart(toolCh, id, "Read", string(inputJSON))
+		defer emitToolEnd(toolCh, id)
 
 		path := resolvePath(input.Path, workingDir)
 		granted, err := perms.Request(ctx, permission.CreatePermissionRequest{
@@ -254,12 +302,20 @@ type mcpWriteInput struct {
 	Content string `json:"content" description:"Content to write to the file"`
 }
 
-func registerWriteTool(srv *mcp.Server, perms permission.Service, workingDir string) {
+func registerWriteTool(srv *mcp.Server, perms permission.Service, workingDir string, toolCh chan mcpToolEvent) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "Write",
 		Description: "Write content to a file, creating or overwriting it.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, input mcpWriteInput) (*mcp.CallToolResult, any, error) {
 		slog.Debug("cliprovider: MCP Write called", "path", input.Path, "bytes", len(input.Content))
+
+		// Emit start event with path only (omit large content from stream part).
+		id := uuid.New().String()
+		inputJSON, _ := json.Marshal(struct {
+			Path string `json:"path"`
+		}{Path: input.Path})
+		emitToolStart(toolCh, id, "Write", string(inputJSON))
+		defer emitToolEnd(toolCh, id)
 
 		path := resolvePath(input.Path, workingDir)
 		granted, err := perms.Request(ctx, permission.CreatePermissionRequest{
@@ -291,12 +347,17 @@ type mcpGlobInput struct {
 	Path    string `json:"path,omitempty" description:"Directory to search in"`
 }
 
-func registerGlobTool(srv *mcp.Server, perms permission.Service, workingDir string) {
+func registerGlobTool(srv *mcp.Server, perms permission.Service, workingDir string, toolCh chan mcpToolEvent) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "Glob",
 		Description: "Find files matching a glob pattern.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, input mcpGlobInput) (*mcp.CallToolResult, any, error) {
 		slog.Debug("cliprovider: MCP Glob called", "pattern", input.Pattern, "path", input.Path)
+
+		id := uuid.New().String()
+		inputJSON, _ := json.Marshal(input)
+		emitToolStart(toolCh, id, "Glob", string(inputJSON))
+		defer emitToolEnd(toolCh, id)
 
 		dir := workingDir
 		if input.Path != "" {
@@ -339,12 +400,17 @@ type mcpGrepInput struct {
 	Glob    string `json:"glob,omitempty" description:"File glob filter (e.g. *.go)"`
 }
 
-func registerGrepTool(srv *mcp.Server, perms permission.Service, workingDir string) {
+func registerGrepTool(srv *mcp.Server, perms permission.Service, workingDir string, toolCh chan mcpToolEvent) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "Grep",
 		Description: "Search file contents using a regular expression.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, input mcpGrepInput) (*mcp.CallToolResult, any, error) {
 		slog.Debug("cliprovider: MCP Grep called", "pattern", input.Pattern, "path", input.Path)
+
+		id := uuid.New().String()
+		inputJSON, _ := json.Marshal(input)
+		emitToolStart(toolCh, id, "Grep", string(inputJSON))
+		defer emitToolEnd(toolCh, id)
 
 		dir := workingDir
 		if input.Path != "" {
