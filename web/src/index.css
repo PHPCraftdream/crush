@@ -47,6 +47,10 @@
     @apply h-full m-0 p-0;
   }
 
+  html {
+    scroll-behavior: auto;
+  }
+
   body {
     @apply bg-canvas text-text text-base leading-relaxed font-sans antialiased;
   }

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import { useStore } from "@nanostores/react";
 import {
   $messages,
@@ -41,10 +41,7 @@ function QueuedMessageItem({
   const [draft, setDraft] = useState("");
   const taRef = useRef<HTMLTextAreaElement>(null);
 
-  function startEdit() {
-    setDraft(item.content);
-    setEditing(true);
-  }
+  const startEdit = useCallback(() => { setDraft(item.content); setEditing(true); }, [item.content]);
 
   useEffect(() => {
     if (editing && taRef.current) {
@@ -55,22 +52,24 @@ function QueuedMessageItem({
     }
   }, [editing]);
 
-  function save() {
+  const save = useCallback(() => {
     const trimmed = draft.trim();
     if (trimmed) updateQueuedMessage(sessionID, item.id, trimmed);
     setEditing(false);
-  }
+  }, [draft, sessionID, item.id]);
 
-  function onKey(e: React.KeyboardEvent<HTMLTextAreaElement>) {
+  const onKey = useCallback((e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Escape") setEditing(false);
     if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) save();
-  }
+  }, [save]);
 
-  function onInput(e: React.ChangeEvent<HTMLTextAreaElement>) {
+  const onInput = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
     setDraft(e.target.value);
     e.target.style.height = "auto";
     e.target.style.height = e.target.scrollHeight + "px";
-  }
+  }, []);
+
+  const handleRemove = useCallback(() => removeQueuedMessage(sessionID, item.id), [sessionID, item.id]);
 
   return (
     <div className="group/qi flex justify-end px-8 py-2">
@@ -87,24 +86,13 @@ function QueuedMessageItem({
               style={{ overflow: "hidden" }}
             />
             <div className="flex gap-2 justify-end">
-              <button
-                onClick={() => setEditing(false)}
-                className="px-3 py-1 text-xs text-text-subtle hover:text-text transition-colors rounded-lg hover:bg-base-overlay"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={save}
-                className="px-3 py-1 text-xs btn-primary"
-              >
-                Save
-              </button>
+              <button onClick={() => setEditing(false)} className="px-3 py-1 text-xs text-text-subtle hover:text-text transition-colors rounded-lg hover:bg-base-overlay">Cancel</button>
+              <button onClick={save} className="px-3 py-1 text-xs btn-primary">Save</button>
             </div>
           </div>
         ) : (
           <>
             <div className="relative">
-              {/* position badge */}
               <span className="absolute -top-2.5 right-3 text-[10px] font-semibold text-text-subtle bg-canvas border border-surface rounded-full px-1.5 py-0.5 leading-none">
                 #{position}/{total}
               </span>
@@ -113,18 +101,10 @@ function QueuedMessageItem({
               </div>
             </div>
             <div className="flex items-center justify-end gap-1 mt-1.5 opacity-0 group-hover/qi:opacity-100 transition-opacity">
-              <button
-                onClick={startEdit}
-                title="Edit queued message"
-                className="p-1.5 text-text-subtle hover:text-accent transition-colors rounded"
-              >
+              <button onClick={startEdit} title="Edit queued message" className="p-1.5 text-text-subtle hover:text-accent transition-colors rounded">
                 <Pencil size={13} />
               </button>
-              <button
-                onClick={() => removeQueuedMessage(sessionID, item.id)}
-                title="Remove from queue"
-                className="p-1.5 text-text-subtle hover:text-red transition-colors rounded"
-              >
+              <button onClick={handleRemove} title="Remove from queue" className="p-1.5 text-text-subtle hover:text-red transition-colors rounded">
                 <Trash2 size={13} />
               </button>
             </div>
@@ -138,34 +118,44 @@ function QueuedMessageItem({
 // ── Chat ─────────────────────────────────────────────────────────────────────
 
 export function Chat() {
-  const messages = useStore($messages);
+  const messages      = useStore($messages);
   const activeSessionID = useStore($activeSessionID);
-  const busySessions = useStore($busySessions);
-  const agentError = useStore($agentError);
-  const selectedIDs = useStore($selectedMessageIDs);
-  const messageQueue = useStore($messageQueue);
-  const bottomRef = useRef<HTMLDivElement>(null);
-  const scrollRef = useRef<HTMLDivElement>(null);
+  const busySessions  = useStore($busySessions);
+  const agentError    = useStore($agentError);
+  const selectedIDs   = useStore($selectedMessageIDs);
+  const messageQueue  = useStore($messageQueue);
+  const sessions      = useStore($sessions);
+
+  const bottomRef   = useRef<HTMLDivElement>(null);
+  const scrollRef   = useRef<HTMLDivElement>(null);
   const isAtBottomRef = useRef(true);
 
-  const sessions = useStore($sessions);
-  const activeSession = sessions.find((s) => s.ID === activeSessionID) ?? null;
-  const todos = activeSession?.Todos ?? [];
-
-  const isBusy = activeSessionID ? busySessions.has(activeSessionID) : false;
+  const activeSession = useMemo(
+    () => sessions.find((s) => s.ID === activeSessionID) ?? null,
+    [sessions, activeSessionID]
+  );
+  const todos        = useMemo(() => activeSession?.Todos ?? [], [activeSession]);
+  const isBusy       = useMemo(() => activeSessionID ? busySessions.has(activeSessionID) : false, [activeSessionID, busySessions]);
   const selectionActive = selectedIDs.size > 0;
-  const queuedItems = activeSessionID ? (messageQueue.get(activeSessionID) ?? []) : [];
+  const queuedItems  = useMemo(() => activeSessionID ? (messageQueue.get(activeSessionID) ?? []) : [], [activeSessionID, messageQueue]);
 
-  // Last user message — Rerun button shown only here
-  const lastUserMsgID = [...messages].reverse().find((m) => m.Role === "user")?.ID ?? null;
+  const lastUserMsgID = useMemo(
+    () => (isBusy ? null : [...messages].reverse().find((m) => m.Role === "user")?.ID ?? null),
+    [messages, isBusy]
+  );
+
+  const forkDefaultTitle = useMemo(
+    () => (activeSession?.Title || "Session") + " fork",
+    [activeSession]
+  );
 
   const [confirm, setConfirm] = useState<{ text: string; action: () => void } | null>(null);
 
-  function handleScroll() {
+  const handleScroll = useCallback(() => {
     const el = scrollRef.current;
     if (!el) return;
     isAtBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight <= 80;
-  }
+  }, []);
 
   useEffect(() => {
     clearSelection();
@@ -179,20 +169,20 @@ export function Chat() {
     }
   }, [messages, isBusy, agentError]);
 
-  function requestDeleteOne(id: string) {
+  const requestDeleteOne = useCallback((id: string) => {
     setConfirm({
       text: "Delete this message?",
       action: () => { deleteMessage(id); clearSelection(); },
     });
-  }
+  }, []);
 
-  function requestDeleteSelected() {
+  const requestDeleteSelected = useCallback(() => {
     const ids = Array.from(selectedIDs);
     setConfirm({
       text: `Delete ${ids.length} selected message${ids.length === 1 ? "" : "s"}?`,
       action: () => { deleteMessages(ids); clearSelection(); },
     });
-  }
+  }, [selectedIDs]);
 
   return (
     <div className="flex-1 flex flex-col overflow-hidden relative bg-canvas">
@@ -220,7 +210,10 @@ export function Chat() {
               message={m}
               onDeleteRequest={requestDeleteOne}
               selectionActive={selectionActive}
-              isLastUserMsg={m.ID === lastUserMsgID && !isBusy}
+              isLastUserMsg={m.ID === lastUserMsgID}
+              isSelected={selectedIDs.has(m.ID)}
+              forkDefaultTitle={forkDefaultTitle}
+              sessionID={activeSessionID ?? ""}
             />
           ))
         )}
@@ -230,18 +223,13 @@ export function Chat() {
             <div className="flex items-start gap-3 bg-red/5 border border-red/20 rounded-2xl px-5 py-4">
               <span className="text-red text-lg shrink-0 mt-0.5">⚠</span>
               <p className="text-[15px] text-red/80 leading-relaxed flex-1 break-words">{agentError}</p>
-              <button
-                onClick={() => $agentError.set(null)}
-                aria-label="Dismiss"
-                className="text-red/40 hover:text-red/70 transition-colors shrink-0 text-xl leading-none mt-0.5"
-              >
+              <button onClick={() => $agentError.set(null)} aria-label="Dismiss" className="text-red/40 hover:text-red/70 transition-colors shrink-0 text-xl leading-none mt-0.5">
                 <X size={16} />
               </button>
             </div>
           </div>
         )}
 
-        {/* Stop button — compact, shown only when busy */}
         {isBusy && (
           <div className="flex items-center gap-3 px-10 py-2">
             <div className="flex gap-1.5 animate-pulse-dots">
@@ -262,52 +250,34 @@ export function Chat() {
         <div ref={bottomRef} className="h-8 shrink-0" />
       </div>
 
-      {/* Queued messages — outside scroll area so streaming content doesn't cause jitter */}
       {queuedItems.length > 0 && activeSessionID && (
         <div className="shrink-0 border-t border-surface bg-canvas">
           <div className="flex items-center gap-2 px-10 py-1.5">
             <div className="flex-1 h-px bg-surface/50" />
-            <span className="text-[11px] text-text-subtle font-medium uppercase tracking-wider">
-              Queue · {queuedItems.length}
-            </span>
+            <span className="text-[11px] text-text-subtle font-medium uppercase tracking-wider">Queue · {queuedItems.length}</span>
             <div className="flex-1 h-px bg-surface/50" />
           </div>
           {queuedItems.map((item, idx) => (
-            <QueuedMessageItem
-              key={item.id}
-              item={item}
-              sessionID={activeSessionID}
-              position={idx + 1}
-              total={queuedItems.length}
-            />
+            <QueuedMessageItem key={item.id} item={item} sessionID={activeSessionID} position={idx + 1} total={queuedItems.length} />
           ))}
         </div>
       )}
 
-      {/* Batch selection toolbar */}
       {selectionActive && (
         <div className="border-t border-surface bg-base-overlay px-6 py-3 flex items-center gap-4 shrink-0">
           <span className="text-sm text-text-subtle">{selectedIDs.size} selected</span>
-          <button
-            onClick={requestDeleteSelected}
-            className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-red/10 text-red border border-red/20 rounded-lg hover:bg-red/20 transition-colors font-medium"
-          >
+          <button onClick={requestDeleteSelected} className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-red/10 text-red border border-red/20 rounded-lg hover:bg-red/20 transition-colors font-medium">
             <Trash2 size={14} />
             Delete selected
           </button>
-          <button
-            onClick={clearSelection}
-            className="ml-auto flex items-center gap-1.5 text-sm text-text-subtle hover:text-text transition-colors"
-          >
+          <button onClick={clearSelection} className="ml-auto flex items-center gap-1.5 text-sm text-text-subtle hover:text-text transition-colors">
             <X size={14} />
             Cancel
           </button>
         </div>
       )}
 
-      {activeSessionID && (
-        <TodoList sessionID={activeSessionID} todos={todos} />
-      )}
+      {activeSessionID && <TodoList sessionID={activeSessionID} todos={todos} />}
 
       <ChatToolbar />
       <PermissionDialog />
