@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"slices"
@@ -83,6 +84,8 @@ func handleIncoming(ctx context.Context, a *appPkg.App, c *Client, raw []byte) {
 		go handleSetSystemPrompt(ctx, a, c, msg)
 	case CmdSummarizeSession:
 		go handleSummarizeSession(ctx, a, c, msg)
+	case CmdCancelQueuedSummarize:
+		go handleCancelQueuedSummarize(a, c, msg)
 	case CmdDeleteMessagePart:
 		go handleDeleteMessagePart(ctx, a, c, msg)
 	case CmdUpdateMessagePart:
@@ -210,6 +213,16 @@ func handleSendMessage(ctx context.Context, a *appPkg.App, c *Client, msg WSMess
 	if err != nil {
 		slog.Error("ws: agent run error", "err", err)
 		c.reply(msg.ID, EventError, nil, err.Error())
+	}
+
+	// Run any compact (summarise) that was queued while the task was busy.
+	if _, queued := a.AgentCoordinator.TakeSummarizeQueue(p.SessionID); queued {
+		c.hub.Broadcast(EventSummarizeQueued, SummarizeQueuedPayload{SessionID: p.SessionID, Queued: false})
+		c.hub.Broadcast(EventAgentBusy, AgentBusyPayload{SessionID: p.SessionID, Busy: true})
+		if summarizeErr := a.AgentCoordinator.Summarize(agentCtx, p.SessionID); summarizeErr != nil {
+			slog.Error("ws: queued summarize error", "err", summarizeErr)
+		}
+		c.hub.Broadcast(EventAgentBusy, AgentBusyPayload{SessionID: p.SessionID, Busy: false})
 	}
 }
 
@@ -890,14 +903,37 @@ func handleSummarizeSession(ctx context.Context, a *appPkg.App, c *Client, msg W
 		return
 	}
 	agentCtx := context.WithoutCancel(ctx)
+	// Summarize will queue the request and return ErrSummarizeQueued if busy.
 	c.hub.Broadcast(EventAgentBusy, AgentBusyPayload{SessionID: p.SessionID, Busy: true})
 	err := a.AgentCoordinator.Summarize(agentCtx, p.SessionID)
+	if errors.Is(err, agent.ErrSummarizeQueued) {
+		// Undo the busy broadcast — the session isn't busy with summarise yet.
+		c.hub.Broadcast(EventAgentBusy, AgentBusyPayload{SessionID: p.SessionID, Busy: false})
+		c.hub.Broadcast(EventSummarizeQueued, SummarizeQueuedPayload{SessionID: p.SessionID, Queued: true})
+		c.reply(msg.ID, EventResponse, map[string]string{"status": "queued"}, "")
+		return
+	}
 	c.hub.Broadcast(EventAgentBusy, AgentBusyPayload{SessionID: p.SessionID, Busy: false})
 	if err != nil {
 		slog.Error("ws: summarize error", "err", err)
 		c.reply(msg.ID, EventError, nil, err.Error())
 		return
 	}
+	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
+}
+
+func handleCancelQueuedSummarize(a *appPkg.App, c *Client, msg WSMessage) {
+	var p CancelQueuedSummarizePayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil || p.SessionID == "" {
+		c.reply(msg.ID, EventError, nil, "invalid payload")
+		return
+	}
+	if a.AgentCoordinator == nil {
+		c.reply(msg.ID, EventError, nil, "agent not configured")
+		return
+	}
+	a.AgentCoordinator.CancelQueuedSummarize(p.SessionID)
+	c.hub.Broadcast(EventSummarizeQueued, SummarizeQueuedPayload{SessionID: p.SessionID, Queued: false})
 	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
 }
 

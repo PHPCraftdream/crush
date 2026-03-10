@@ -64,6 +64,9 @@ type Coordinator interface {
 	QueuedPromptsList(sessionID string) []string
 	ClearQueue(sessionID string)
 	Summarize(context.Context, string) error
+	SummarizeQueued(sessionID string) bool
+	TakeSummarizeQueue(sessionID string) (fantasy.ProviderOptions, bool)
+	CancelQueuedSummarize(sessionID string)
 	Model() Model
 	UpdateModels(ctx context.Context) error
 	GetSystemPrompt() string
@@ -1037,6 +1040,18 @@ func (c *coordinator) Summarize(ctx context.Context, sessionID string) error {
 		return errors.New("model provider not configured")
 	}
 	return c.currentAgent.Summarize(ctx, sessionID, getProviderOptions(c.currentAgent.Model(), providerCfg))
+}
+
+func (c *coordinator) SummarizeQueued(sessionID string) bool {
+	return c.currentAgent.SummarizeQueued(sessionID)
+}
+
+func (c *coordinator) TakeSummarizeQueue(sessionID string) (fantasy.ProviderOptions, bool) {
+	return c.currentAgent.TakeSummarizeQueue(sessionID)
+}
+
+func (c *coordinator) CancelQueuedSummarize(sessionID string) {
+	c.currentAgent.CancelQueuedSummarize(sessionID)
 }
 
 func (c *coordinator) isUnauthorized(err error) bool {

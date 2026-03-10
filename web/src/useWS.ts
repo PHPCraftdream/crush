@@ -26,8 +26,9 @@ import {
   dequeueNextMessage,
   applyTheme,
   setSkills,
+  setSummarizeQueued,
 } from "./store";
-import type { WSMessage, Session, Message, PermissionRequest, ConfigPayload, LSPSnapshot, MCPState, AgentBusyPayload, SkillsSnapshot } from "./types";
+import type { WSMessage, Session, Message, PermissionRequest, ConfigPayload, LSPSnapshot, MCPState, AgentBusyPayload, SkillsSnapshot, SummarizeQueuedPayload } from "./types";
 
 function getIDFromHash(): string | null {
   const hash = window.location.hash; // #/uuid
@@ -203,6 +204,11 @@ export function useWS() {
             ws.send("send_message", { sessionID: p.SessionID, content: next });
           }
         }
+      }),
+
+      ws.on("summarize_queued", (msg: WSMessage) => {
+        const p = msg.payload as SummarizeQueuedPayload;
+        setSummarizeQueued(p.SessionID, p.Queued);
       }),
 
       ws.on("skills", (msg: WSMessage) => {

@@ -45,7 +45,17 @@ import (
 const (
 	defaultSessionName = "Untitled Session"
 
-	// Constants for auto-summarization thresholds
+	// contextSlideRatio is the fraction of context window retained when the
+	// sliding window kicks in (e.g. 0.70 = keep the newest 70% of tokens).
+	contextSlideRatio = 0.70
+
+	// contextSlideThreshold is the fraction of remaining context that triggers
+	// the sliding window. When less than (1-contextSlideRatio) of the window is
+	// left we trim the oldest messages so the next call fits within the budget.
+	contextSlideThreshold = 1.0 - contextSlideRatio
+
+	// Constants for auto-summarization thresholds (used only for background
+	// summarisation triggered at the same time as the sliding window).
 	largeContextWindowThreshold = 200_000
 	largeContextWindowBuffer    = 20_000
 	smallContextWindowRatio     = 0.2
@@ -90,7 +100,18 @@ type SessionAgent interface {
 	QueuedPrompts(sessionID string) int
 	QueuedPromptsList(sessionID string) []string
 	ClearQueue(sessionID string)
+	// Summarize compresses the session history. If the session is currently
+	// busy the request is queued; call TakeSummarizeQueue after the task
+	// finishes to pick it up.  Returns ErrSummarizeQueued when queued.
 	Summarize(context.Context, string, fantasy.ProviderOptions) error
+	// SummarizeQueued reports whether a manual summarise is pending for the
+	// given session.
+	SummarizeQueued(sessionID string) bool
+	// TakeSummarizeQueue atomically removes and returns the pending summarise
+	// options for the session (if any).
+	TakeSummarizeQueue(sessionID string) (fantasy.ProviderOptions, bool)
+	// CancelQueuedSummarize removes a pending summarise from the queue.
+	CancelQueuedSummarize(sessionID string)
 	Model() Model
 }
 
@@ -115,6 +136,9 @@ type sessionAgent struct {
 
 	messageQueue   *csync.Map[string, []SessionAgentCall]
 	activeRequests *csync.Map[string, context.CancelFunc]
+	// summarizeQueue holds a pending manual-summarise request per session,
+	// queued while the session was busy.
+	summarizeQueue *csync.Map[string, fantasy.ProviderOptions]
 }
 
 type SessionAgentOptions struct {
@@ -146,6 +170,7 @@ func NewSessionAgent(
 		isYolo:               opts.IsYolo,
 		messageQueue:         csync.NewMap[string, []SessionAgentCall](),
 		activeRequests:       csync.NewMap[string, context.CancelFunc](),
+		summarizeQueue:       csync.NewMap[string, fantasy.ProviderOptions](),
 	}
 }
 
@@ -248,7 +273,10 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 
 
 	var currentAssistant *message.Message
-	var shouldSummarize bool
+
+	// bgSummarizeLaunched ensures we launch at most one background
+	// summarisation per Run() call (fired the first time we trim the window).
+	var bgSummarizeLaunched bool
 
 	// latestMsgCh holds at most one pending UI snapshot (latest-value semantics).
 	// A ticker goroutine drains it at ~20fps, decoupling the token arrival rate
@@ -325,6 +353,45 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 					return callContext, prepared, createErr
 				}
 				prepared.Messages = append(prepared.Messages, userMessage.ToAIMessage()...)
+			}
+
+			// Sliding-window context management: when the context is nearly
+			// full, trim old messages so the agent can keep running without
+			// blocking on a synchronous summarisation call.
+			if !a.disableAutoSummarize {
+				cw := int64(largeModel.CatwalkCfg.ContextWindow)
+				if cw > 0 {
+					usedTokens := currentSession.CompletionTokens + currentSession.PromptTokens
+					remaining := cw - usedTokens
+					var slideThreshold int64
+					if cw > largeContextWindowThreshold {
+						slideThreshold = largeContextWindowBuffer
+					} else {
+						slideThreshold = int64(float64(cw) * smallContextWindowRatio)
+					}
+					if remaining <= slideThreshold {
+						targetTokens := int64(float64(cw) * contextSlideRatio)
+						prepared.Messages = trimMessagesToWindow(prepared.Messages, targetTokens)
+
+						// Launch one background summarisation of the full
+						// history so the tail is preserved for later reference.
+						if !bgSummarizeLaunched {
+							bgSummarizeLaunched = true
+							bgCtx, bgCancel := context.WithTimeout(
+								context.WithoutCancel(callContext),
+								10*time.Minute,
+							)
+							bgOpts := call.ProviderOptions
+							bgSessionID := call.SessionID
+							go func() {
+								defer bgCancel()
+								if bgErr := a.runSummarize(bgCtx, bgSessionID, bgOpts); bgErr != nil {
+									slog.Warn("background summarise failed", "session_id", bgSessionID, "err", bgErr)
+								}
+							}()
+						}
+					}
+				}
 			}
 
 			prepared.Messages = a.workaroundProviderMediaLimitations(prepared.Messages, largeModel)
@@ -473,22 +540,6 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			return a.messages.Update(genCtx, *currentAssistant)
 		},
 		StopWhen: []fantasy.StopCondition{
-			func(_ []fantasy.StepResult) bool {
-				cw := int64(largeModel.CatwalkCfg.ContextWindow)
-				tokens := currentSession.CompletionTokens + currentSession.PromptTokens
-				remaining := cw - tokens
-				var threshold int64
-				if cw > largeContextWindowThreshold {
-					threshold = largeContextWindowBuffer
-				} else {
-					threshold = int64(float64(cw) * smallContextWindowRatio)
-				}
-				if (remaining <= threshold) && !a.disableAutoSummarize {
-					shouldSummarize = true
-					return true
-				}
-				return false
-			},
 			func(steps []fantasy.StepResult) bool {
 				return hasRepeatedToolCalls(steps, loopDetectionWindowSize, loopDetectionMaxRepeats)
 			},
@@ -595,23 +646,6 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 		return nil, err
 	}
 
-	if shouldSummarize {
-		a.activeRequests.Del(call.SessionID)
-		if summarizeErr := a.Summarize(genCtx, call.SessionID, call.ProviderOptions); summarizeErr != nil {
-			return nil, summarizeErr
-		}
-		// Always continue after auto-summarization: the context was truncated,
-		// so the agent must resume the original task. The model will decide
-		// whether further work is needed once it sees the summarized history.
-		existing, ok := a.messageQueue.Get(call.SessionID)
-		if !ok {
-			existing = []SessionAgentCall{}
-		}
-		call.Prompt = fmt.Sprintf("The previous session was interrupted because it got too long, the initial user request was: `%s`", call.Prompt)
-		existing = append(existing, call)
-		a.messageQueue.Set(call.SessionID, existing)
-	}
-
 	// Release active request before processing queued messages.
 	a.activeRequests.Del(call.SessionID)
 	cancel()
@@ -626,11 +660,36 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	return a.Run(ctx, firstQueuedMessage)
 }
 
+// ErrSummarizeQueued is returned by Summarize when the session is busy and
+// the request has been queued for execution after the current task finishes.
+var ErrSummarizeQueued = errors.New("summarize queued")
+
 func (a *sessionAgent) Summarize(ctx context.Context, sessionID string, opts fantasy.ProviderOptions) error {
 	if a.IsSessionBusy(sessionID) {
-		return ErrSessionBusy
+		a.summarizeQueue.Set(sessionID, opts)
+		return ErrSummarizeQueued
 	}
+	return a.runSummarize(ctx, sessionID, opts)
+}
 
+func (a *sessionAgent) SummarizeQueued(sessionID string) bool {
+	_, ok := a.summarizeQueue.Get(sessionID)
+	return ok
+}
+
+func (a *sessionAgent) TakeSummarizeQueue(sessionID string) (fantasy.ProviderOptions, bool) {
+	opts, ok := a.summarizeQueue.Take(sessionID)
+	return opts, ok
+}
+
+func (a *sessionAgent) CancelQueuedSummarize(sessionID string) {
+	a.summarizeQueue.Del(sessionID)
+}
+
+// runSummarize performs the actual summarisation without a busy-check.
+// It uses the sessionID+"-summarize" key in activeRequests so it can run
+// concurrently with a regular Run() call on the same session.
+func (a *sessionAgent) runSummarize(ctx context.Context, sessionID string, opts fantasy.ProviderOptions) error {
 	// Copy mutable fields under lock to avoid races with SetModels.
 	largeModel := a.largeModel.Get()
 	systemPromptPrefix := a.systemPromptPrefix.Get()
@@ -650,9 +709,10 @@ func (a *sessionAgent) Summarize(ctx context.Context, sessionID string, opts fan
 
 	aiMsgs, _ := a.preparePrompt(msgs, nil)
 
+	summarizeKey := sessionID + "-summarize"
 	genCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
-	a.activeRequests.Set(sessionID, cancel)
-	defer a.activeRequests.Del(sessionID)
+	a.activeRequests.Set(summarizeKey, cancel)
+	defer a.activeRequests.Del(summarizeKey)
 	defer cancel()
 
 	agent := fantasy.NewAgent(largeModel.Model,
@@ -1238,6 +1298,63 @@ func (a *sessionAgent) workaroundProviderMediaLimitations(messages []fantasy.Mes
 	}
 
 	return convertedMessages
+}
+
+// trimMessagesToWindow returns a suffix of msgs whose estimated token count
+// fits within targetTokens (1 token ≈ 4 characters).  It always starts on a
+// user-role message so the conversation stays well-formed.
+func trimMessagesToWindow(msgs []fantasy.Message, targetTokens int64) []fantasy.Message {
+	if len(msgs) == 0 || targetTokens <= 0 {
+		return msgs
+	}
+	const charsPerToken = 4
+	budget := int(targetTokens) * charsPerToken
+
+	var accumulated int
+	cutIdx := 0 // by default keep everything
+	for i := len(msgs) - 1; i >= 0; i-- {
+		accumulated += estimateMsgChars(msgs[i])
+		if accumulated >= budget {
+			cutIdx = i + 1
+			break
+		}
+	}
+	if cutIdx == 0 {
+		return msgs // all messages fit
+	}
+	// Advance to the next user-role message to keep the history well-formed.
+	for cutIdx < len(msgs) && msgs[cutIdx].Role != fantasy.MessageRoleUser {
+		cutIdx++
+	}
+	if cutIdx >= len(msgs) {
+		return msgs // can't trim without losing all context
+	}
+	return msgs[cutIdx:]
+}
+
+// estimateMsgChars returns a rough character count for a fantasy.Message,
+// used to estimate its token footprint for window trimming.
+func estimateMsgChars(msg fantasy.Message) int {
+	total := 0
+	for _, part := range msg.Content {
+		switch p := part.(type) {
+		case fantasy.TextPart:
+			total += len(p.Text)
+		case fantasy.ToolCallPart:
+			total += len(p.ToolName) + len(p.Input)
+		case fantasy.ToolResultPart:
+			switch o := p.Output.(type) {
+			case fantasy.ToolResultOutputContentText:
+				total += len(o.Text)
+			case fantasy.ToolResultOutputContentError:
+				total += len(fmt.Sprintf("%v", o.Error))
+			}
+		}
+	}
+	if total == 0 {
+		total = 64 // minimum for empty / binary messages
+	}
+	return total
 }
 
 // buildSummaryPrompt constructs the prompt text for session summarization.

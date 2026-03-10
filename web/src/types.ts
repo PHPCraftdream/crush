@@ -186,6 +186,11 @@ export interface AgentBusyPayload {
   Busy: boolean;
 }
 
+export interface SummarizeQueuedPayload {
+  SessionID: string;
+  Queued: boolean;
+}
+
 // ─── WebSocket protocol ────────────────────────────────────────────────────────
 
 export interface WSMessage<T = unknown> {

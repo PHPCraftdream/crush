@@ -15,6 +15,8 @@ export const $config = atom<ConfigPayload | null>(null);
 export const $lspSnapshot = atom<LSPSnapshot | null>(null);
 export const $mcpState = atom<MCPState | null>(null);
 export const $busySessions = atom<Set<string>>(new Set());
+// Sessions where the user has queued a compact/summarise request.
+export const $summarizeQueued = atom<Set<string>>(new Set());
 
 // ── Actions ──────────────────────────────────────────────────────────────────
 export function setSkills(skills: SkillInfo[]) {
@@ -295,6 +297,17 @@ export function updateMessageThinking(messageID: string, thinking: string) {
 
 export function summarizeSession(sessionID: string) {
   ws.send("summarize_session", { sessionID });
+}
+
+export function cancelQueuedSummarize(sessionID: string) {
+  ws.send("cancel_queued_summarize", { sessionID });
+}
+
+export function setSummarizeQueued(sessionID: string, queued: boolean) {
+  const s = new Set($summarizeQueued.get());
+  if (queued) s.add(sessionID);
+  else s.delete(sessionID);
+  $summarizeQueued.set(s);
 }
 
 export function deleteMessagePart(messageID: string, partIndex: number) {

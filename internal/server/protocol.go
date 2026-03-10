@@ -33,6 +33,9 @@ const (
 	EventError                   = "error"
 	EventSystemPrompt            = "system_prompt"
 	EventSkills                  = "skills"
+	// EventSummarizeQueued is sent when a manual summarise is queued (busy=true)
+	// or dequeued/completed (busy=false) for a session.
+	EventSummarizeQueued = "summarize_queued"
 )
 
 // Inbound command types (client → server).
@@ -59,6 +62,7 @@ const (
 	CmdGetSystemPrompt              = "get_system_prompt"
 	CmdSetSystemPrompt              = "set_system_prompt"
 	CmdSummarizeSession             = "summarize_session"
+	CmdCancelQueuedSummarize        = "cancel_queued_summarize"
 	CmdDeleteMessagePart            = "delete_message_part"
 	CmdUpdateMessagePart            = "update_message_part"
 	CmdTogglePinMessage             = "toggle_pin_message"
@@ -393,6 +397,16 @@ type SetSystemPromptPayload struct {
 }
 
 type SummarizeSessionPayload struct {
+	SessionID string `json:"sessionID"`
+}
+
+// SummarizeQueuedPayload is sent when a manual compact is queued or dequeued.
+type SummarizeQueuedPayload struct {
+	SessionID string `json:"SessionID"`
+	Queued    bool   `json:"Queued"`
+}
+
+type CancelQueuedSummarizePayload struct {
 	SessionID string `json:"sessionID"`
 }
 
