@@ -469,7 +469,7 @@ export const Message = memo(function Message({
 
   return (
     <div
-      className={`flex flex-col px-8 py-3 transition-colors ${isSelected ? "bg-accent/5" : ""} ${message.Pinned ? "border-l-2 border-yellow/50 bg-yellow/[3%]" : ""}`}
+      className={`flex flex-col px-8 py-3 transition-colors ${isSelected ? "bg-accent/5" : ""} ${message.Pinned ? "border-l-4 border-yellow/60 bg-yellow/[5%]" : ""}`}
       onMouseEnter={handleMouseEnter}
       onMouseLeave={handleMouseLeave}
     >
@@ -497,7 +497,15 @@ export const Message = memo(function Message({
       {/* Action strip — fixed-height row; interactive controls only mounted on hover */}
       {!editing && (
         <div className={`msg-actions ${isUser ? "justify-end" : "justify-start"}`}>
-          {hovered ? (
+          {/* Star is always visible for pinned messages, regardless of hover state */}
+          {message.Pinned && (
+            <Star
+              size={13}
+              className={`text-yellow shrink-0 ${isUser ? "order-last ml-2" : "order-first mr-2"}`}
+              fill="currentColor"
+            />
+          )}
+          {hovered && (
             isUser ? (
               <UserHoverActions
                 messageID={message.ID}
@@ -518,11 +526,7 @@ export const Message = memo(function Message({
                 onFork={handleForkOpen}
               />
             ) : null
-          ) : message.Pinned ? (
-            <div className={`flex items-center ${isUser ? "" : "ml-auto"}`}>
-              <Star size={13} className="text-yellow shrink-0" fill="currentColor" />
-            </div>
-          ) : null}
+          )}
         </div>
       )}
 
