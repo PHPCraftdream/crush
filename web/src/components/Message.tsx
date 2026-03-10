@@ -469,7 +469,7 @@ export const Message = memo(function Message({
 
   return (
     <div
-      className={`flex flex-col px-8 py-3 transition-colors ${isSelected ? "bg-accent/5" : ""}`}
+      className={`flex flex-col px-8 py-3 transition-colors ${isSelected ? "bg-accent/5" : ""} ${message.Pinned ? "border-l-2 border-yellow/50 bg-yellow/[3%]" : ""}`}
       onMouseEnter={handleMouseEnter}
       onMouseLeave={handleMouseLeave}
     >
@@ -518,9 +518,9 @@ export const Message = memo(function Message({
                 onFork={handleForkOpen}
               />
             ) : null
-          ) : !isUser && hasContent ? (
-            <div className="flex items-center gap-2 ml-auto">
-              <DurationBadge message={message} />
+          ) : message.Pinned ? (
+            <div className={`flex items-center ${isUser ? "" : "ml-auto"}`}>
+              <Star size={13} className="text-yellow shrink-0" fill="currentColor" />
             </div>
           ) : null}
         </div>
