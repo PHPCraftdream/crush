@@ -40,6 +40,7 @@ const (
 	CmdSendMessage                  = "send_message"
 	CmdCancelAgent                  = "cancel_agent"
 	CmdCreateSession                = "create_session"
+	CmdForkSession                  = "fork_session"
 	CmdDeleteSession                = "delete_session"
 	CmdListSessions                 = "list_sessions"
 	CmdLoadMessages                 = "load_messages"
@@ -97,6 +98,11 @@ type CancelAgentPayload struct {
 
 type CreateSessionPayload struct {
 	Title string `json:"title"`
+}
+
+type ForkSessionPayload struct {
+	SessionID string `json:"sessionID"`
+	Title     string `json:"title"`
 }
 
 type DeleteSessionPayload struct {

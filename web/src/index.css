@@ -51,11 +51,10 @@
     @apply bg-canvas text-text text-base leading-relaxed font-sans antialiased;
   }
 
-  /* Light scrollbar */
-  ::-webkit-scrollbar { width: 10px; height: 10px; }
-  ::-webkit-scrollbar-track { background: var(--color-base-overlay); border-radius: 9999px; }
-  ::-webkit-scrollbar-thumb { background: var(--color-surface); border-radius: 9999px; border: 2px solid var(--color-base-overlay); }
-  ::-webkit-scrollbar-thumb:hover { background: var(--color-text-subtle); }
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--color-text-subtle); border-radius: 9999px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--color-text-muted); }
 }
 
 @layer components {

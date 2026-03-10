@@ -5,10 +5,12 @@ import remarkGfm from "remark-gfm";
 import remarkBreaks from "remark-breaks";
 import rehypeHighlight from "rehype-highlight";
 import type { Message as Msg, ContentPart } from "../types";
-import { BrainCircuit, Check, Copy, Pencil, RotateCcw, Trash2, BookMarked } from "lucide-react";
+import { BrainCircuit, Check, Copy, GitFork, Pencil, RotateCcw, Trash2, BookMarked } from "lucide-react";
 import {
   $busySessions,
   $selectedMessageIDs,
+  $sessions,
+  $activeSessionID,
   toggleMessageSelection,
   updateMessageContent,
   updateMessageThinking,
@@ -16,6 +18,7 @@ import {
   rerunFromMessage,
 } from "../store";
 import { ConfirmDialog } from "./ConfirmDialog";
+import { ForkSessionModal } from "./ForkSessionModal";
 
 function formatDuration(seconds: number): string {
   if (seconds < 60) return `${seconds.toFixed(1)}s`;
@@ -158,9 +161,13 @@ export function Message({ message, onDeleteRequest, selectionActive, isLastUserM
   const copyAll = !isUser && copyThinking ? extractAll(message.Parts) : "";
   const selectedIDs = useStore($selectedMessageIDs);
   const isSelected = selectedIDs.has(message.ID);
+  const sessions = useStore($sessions);
+  const activeSessionID = useStore($activeSessionID);
+  const activeSession = sessions.find((s) => s.ID === activeSessionID) ?? null;
 
   const [editing, setEditing] = useState(false);
   const [editValue, setEditValue] = useState("");
+  const [forking, setForking] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   function startEdit() {
@@ -276,6 +283,13 @@ export function Message({ message, onDeleteRequest, selectionActive, isLastUserM
                     </button>
                   )}
                   <button
+                    onClick={() => setForking(true)}
+                    title="Fork session at this message"
+                    className="p-1.5 text-text-subtle hover:text-accent transition-colors rounded"
+                  >
+                    <GitFork size={13} />
+                  </button>
+                  <button
                     onClick={startEdit}
                     title="Edit message"
                     className="p-1.5 text-text-subtle hover:text-accent transition-colors rounded"
@@ -345,6 +359,13 @@ export function Message({ message, onDeleteRequest, selectionActive, isLastUserM
                         <div className="flex items-center gap-1 ml-auto">
                           <div className="flex items-center gap-1">
                             <button
+                              onClick={() => setForking(true)}
+                              title="Fork session at this message"
+                              className="p-1.5 text-text-subtle hover:text-accent transition-colors rounded"
+                            >
+                              <GitFork size={13} />
+                            </button>
+                            <button
                               onClick={startEdit}
                               title="Edit message"
                               className="p-1.5 text-text-subtle hover:text-accent transition-colors rounded"
@@ -374,6 +395,13 @@ export function Message({ message, onDeleteRequest, selectionActive, isLastUserM
             </>
           )}
         </div>
+      )}
+      {forking && activeSessionID && (
+        <ForkSessionModal
+          sessionID={activeSessionID}
+          defaultTitle={(activeSession?.Title || "Session") + " fork"}
+          onClose={() => setForking(false)}
+        />
       )}
     </div>
   );

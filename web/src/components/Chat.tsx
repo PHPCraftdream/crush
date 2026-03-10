@@ -175,7 +175,7 @@ export function Chat() {
 
   useEffect(() => {
     if (isAtBottomRef.current) {
-      bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+      bottomRef.current?.scrollIntoView({ behavior: "instant" });
     }
   }, [messages, isBusy, agentError]);
 
