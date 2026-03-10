@@ -600,16 +600,16 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 		if summarizeErr := a.Summarize(genCtx, call.SessionID, call.ProviderOptions); summarizeErr != nil {
 			return nil, summarizeErr
 		}
-		// If the agent wasn't done...
-		if len(currentAssistant.ToolCalls()) > 0 {
-			existing, ok := a.messageQueue.Get(call.SessionID)
-			if !ok {
-				existing = []SessionAgentCall{}
-			}
-			call.Prompt = fmt.Sprintf("The previous session was interrupted because it got too long, the initial user request was: `%s`", call.Prompt)
-			existing = append(existing, call)
-			a.messageQueue.Set(call.SessionID, existing)
+		// Always continue after auto-summarization: the context was truncated,
+		// so the agent must resume the original task. The model will decide
+		// whether further work is needed once it sees the summarized history.
+		existing, ok := a.messageQueue.Get(call.SessionID)
+		if !ok {
+			existing = []SessionAgentCall{}
 		}
+		call.Prompt = fmt.Sprintf("The previous session was interrupted because it got too long, the initial user request was: `%s`", call.Prompt)
+		existing = append(existing, call)
+		a.messageQueue.Set(call.SessionID, existing)
 	}
 
 	// Release active request before processing queued messages.
