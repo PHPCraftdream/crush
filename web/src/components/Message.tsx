@@ -429,6 +429,7 @@ export interface MessageProps {
 export const Message = memo(function Message({
   message, onDeleteRequest, onRangeSelect, selectionActive, isLastUserMsg, isSelected, forkDefaultTitle, sessionID, index,
 }: MessageProps) {
+  if (message.Hidden) return null;
   if (message.IsSummaryMessage) return <SummaryMessage message={message} />;
 
   const isUser = message.Role === "user";

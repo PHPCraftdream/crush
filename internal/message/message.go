@@ -18,6 +18,10 @@ type CreateMessageParams struct {
 	Model            string
 	Provider         string
 	IsSummaryMessage bool
+	// Hidden marks the message as invisible in the UI. Used for silent
+	// background summaries that provide context to the LLM without cluttering
+	// the conversation view.
+	Hidden bool
 }
 
 type Service interface {
@@ -78,6 +82,10 @@ func (s *service) Create(ctx context.Context, sessionID string, params CreateMes
 	if params.IsSummaryMessage {
 		isSummary = 1
 	}
+	hidden := int64(0)
+	if params.Hidden {
+		hidden = 1
+	}
 	dbMessage, err := s.q.CreateMessage(ctx, db.CreateMessageParams{
 		ID:               uuid.New().String(),
 		SessionID:        sessionID,
@@ -86,6 +94,7 @@ func (s *service) Create(ctx context.Context, sessionID string, params CreateMes
 		Model:            sql.NullString{String: string(params.Model), Valid: true},
 		Provider:         sql.NullString{String: params.Provider, Valid: params.Provider != ""},
 		IsSummaryMessage: isSummary,
+		Hidden:           hidden,
 	})
 	if err != nil {
 		return Message{}, err
@@ -214,6 +223,7 @@ func (s *service) fromDBItem(item db.Message) (Message, error) {
 		UpdatedAt:        item.UpdatedAt,
 		IsSummaryMessage: item.IsSummaryMessage != 0,
 		Pinned:           item.Pinned != 0,
+		Hidden:           item.Hidden != 0,
 	}, nil
 }
 

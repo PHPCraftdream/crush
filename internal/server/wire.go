@@ -41,6 +41,8 @@ type MessageWire struct {
 	CreatedAt        int64      `json:"CreatedAt"`
 	UpdatedAt        int64      `json:"UpdatedAt"`
 	IsSummaryMessage bool       `json:"IsSummaryMessage"`
+	Pinned           bool       `json:"Pinned"`
+	Hidden           bool       `json:"Hidden"`
 }
 
 func toPartWire(part message.ContentPart) PartWire {
@@ -75,6 +77,8 @@ func toMessageWire(m message.Message) MessageWire {
 		CreatedAt:        m.CreatedAt,
 		UpdatedAt:        m.UpdatedAt,
 		IsSummaryMessage: m.IsSummaryMessage,
+		Pinned:           m.Pinned,
+		Hidden:           m.Hidden,
 	}
 }
 

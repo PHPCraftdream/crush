@@ -136,6 +136,9 @@ type Message struct {
 	UpdatedAt        int64
 	IsSummaryMessage bool
 	Pinned           bool
+	// Hidden messages are not rendered in the UI but are still passed to the
+	// LLM as context (used for silent background summaries).
+	Hidden bool
 }
 
 func (m *Message) Content() TextContent {

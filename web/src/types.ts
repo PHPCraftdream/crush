@@ -83,6 +83,7 @@ export interface Message {
   UpdatedAt: number;
   IsSummaryMessage: boolean;
   Pinned: boolean;
+  Hidden: boolean;
 }
 
 export interface PermissionRequest {
@@ -190,6 +191,8 @@ export interface SummarizeQueuedPayload {
   SessionID: string;
   Queued: boolean;
 }
+
+
 
 // ─── WebSocket protocol ────────────────────────────────────────────────────────
 

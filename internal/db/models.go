@@ -30,6 +30,7 @@ type Message struct {
 	Provider         sql.NullString `json:"provider"`
 	IsSummaryMessage int64          `json:"is_summary_message"`
 	Pinned           int64          `json:"pinned"`
+	Hidden           int64          `json:"hidden"`
 }
 
 type ReadFile struct {

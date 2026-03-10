@@ -19,12 +19,13 @@ INSERT INTO messages (
     model,
     provider,
     is_summary_message,
+    hidden,
     created_at,
     updated_at
 ) VALUES (
-    ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'), strftime('%s', 'now')
+    ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'), strftime('%s', 'now')
 )
-RETURNING id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned
+RETURNING id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden
 `
 
 type CreateMessageParams struct {
@@ -35,6 +36,7 @@ type CreateMessageParams struct {
 	Model            sql.NullString `json:"model"`
 	Provider         sql.NullString `json:"provider"`
 	IsSummaryMessage int64          `json:"is_summary_message"`
+	Hidden           int64          `json:"hidden"`
 }
 
 func (q *Queries) CreateMessage(ctx context.Context, arg CreateMessageParams) (Message, error) {
@@ -46,6 +48,7 @@ func (q *Queries) CreateMessage(ctx context.Context, arg CreateMessageParams) (M
 		arg.Model,
 		arg.Provider,
 		arg.IsSummaryMessage,
+		arg.Hidden,
 	)
 	var i Message
 	err := row.Scan(
@@ -60,6 +63,7 @@ func (q *Queries) CreateMessage(ctx context.Context, arg CreateMessageParams) (M
 		&i.Provider,
 		&i.IsSummaryMessage,
 		&i.Pinned,
+		&i.Hidden,
 	)
 	return i, err
 }
@@ -85,7 +89,7 @@ func (q *Queries) DeleteSessionMessages(ctx context.Context, sessionID string) e
 }
 
 const getMessage = `-- name: GetMessage :one
-SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned
+SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden
 FROM messages
 WHERE id = ? LIMIT 1
 `
@@ -105,12 +109,13 @@ func (q *Queries) GetMessage(ctx context.Context, id string) (Message, error) {
 		&i.Provider,
 		&i.IsSummaryMessage,
 		&i.Pinned,
+		&i.Hidden,
 	)
 	return i, err
 }
 
 const listAllUserMessages = `-- name: ListAllUserMessages :many
-SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned
+SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden
 FROM messages
 WHERE role = 'user'
 ORDER BY created_at DESC
@@ -137,6 +142,7 @@ func (q *Queries) ListAllUserMessages(ctx context.Context) ([]Message, error) {
 			&i.Provider,
 			&i.IsSummaryMessage,
 			&i.Pinned,
+			&i.Hidden,
 		); err != nil {
 			return nil, err
 		}
@@ -152,7 +158,7 @@ func (q *Queries) ListAllUserMessages(ctx context.Context) ([]Message, error) {
 }
 
 const listMessagesBySession = `-- name: ListMessagesBySession :many
-SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned
+SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden
 FROM messages
 WHERE session_id = ?
 ORDER BY created_at ASC
@@ -179,6 +185,7 @@ func (q *Queries) ListMessagesBySession(ctx context.Context, sessionID string) (
 			&i.Provider,
 			&i.IsSummaryMessage,
 			&i.Pinned,
+			&i.Hidden,
 		); err != nil {
 			return nil, err
 		}
@@ -194,7 +201,7 @@ func (q *Queries) ListMessagesBySession(ctx context.Context, sessionID string) (
 }
 
 const listUserMessagesBySession = `-- name: ListUserMessagesBySession :many
-SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned
+SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden
 FROM messages
 WHERE session_id = ? AND role = 'user'
 ORDER BY created_at DESC
@@ -221,6 +228,7 @@ func (q *Queries) ListUserMessagesBySession(ctx context.Context, sessionID strin
 			&i.Provider,
 			&i.IsSummaryMessage,
 			&i.Pinned,
+			&i.Hidden,
 		); err != nil {
 			return nil, err
 		}

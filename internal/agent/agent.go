@@ -373,8 +373,8 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 						targetTokens := int64(float64(cw) * contextSlideRatio)
 						prepared.Messages = trimMessagesToWindow(prepared.Messages, targetTokens)
 
-						// Launch one background summarisation of the full
-						// history so the tail is preserved for later reference.
+						// Silently compact the oldest 50% of messages in the
+						// background so the main task keeps running uninterrupted.
 						if !bgSummarizeLaunched {
 							bgSummarizeLaunched = true
 							bgCtx, bgCancel := context.WithTimeout(
@@ -385,8 +385,8 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 							bgSessionID := call.SessionID
 							go func() {
 								defer bgCancel()
-								if bgErr := a.runSummarize(bgCtx, bgSessionID, bgOpts); bgErr != nil {
-									slog.Warn("background summarise failed", "session_id", bgSessionID, "err", bgErr)
+								if bgErr := a.runSummarizeSilent(bgCtx, bgSessionID, bgOpts); bgErr != nil {
+									slog.Warn("background silent summarise failed", "session_id", bgSessionID, "err", bgErr)
 								}
 							}()
 						}
@@ -800,6 +800,145 @@ func (a *sessionAgent) runSummarize(ctx context.Context, sessionID string, opts 
 	usage := resp.Response.Usage
 	freshSession.SummaryMessageID = summaryMessage.ID
 	freshSession.CompletionTokens = usage.OutputTokens
+	freshSession.PromptTokens = 0
+	_, err = a.sessions.Save(genCtx, freshSession)
+	return err
+}
+
+// runSummarizeSilent compacts the oldest half of the session's messages in
+// the background without any visible change in the UI. It:
+//  1. Loads all current messages, splits them at the midpoint.
+//  2. Sends the older half to the LLM for summarisation.
+//  3. Creates a hidden summary message (not rendered in the UI).
+//  4. Deletes all non-pinned messages that were summarised.
+//  5. Updates session.SummaryMessageID so future runs start from the summary.
+//
+// Pinned messages are never deleted.
+func (a *sessionAgent) runSummarizeSilent(ctx context.Context, sessionID string, opts fantasy.ProviderOptions) error {
+	largeModel := a.largeModel.Get()
+	systemPromptPrefix := a.systemPromptPrefix.Get()
+
+	currentSession, err := a.sessions.Get(ctx, sessionID)
+	if err != nil {
+		return fmt.Errorf("failed to get session: %w", err)
+	}
+	msgs, err := a.getSessionMessages(ctx, currentSession)
+	if err != nil {
+		return err
+	}
+	if len(msgs) < 4 {
+		// Too few messages to bother summarising.
+		return nil
+	}
+
+	// Split at midpoint: summarise the older half.
+	mid := len(msgs) / 2
+	oldMsgs := msgs[:mid]
+	// Separate pinned from non-pinned in the old half.
+	var toSummarise, pinnedOld []message.Message
+	for _, m := range oldMsgs {
+		if m.Pinned {
+			pinnedOld = append(pinnedOld, m)
+		} else {
+			toSummarise = append(toSummarise, m)
+		}
+	}
+	if len(toSummarise) == 0 {
+		return nil
+	}
+
+	aiMsgs, _ := a.preparePrompt(toSummarise, nil)
+
+	summarizeKey := sessionID + "-summarize"
+	genCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	a.activeRequests.Set(summarizeKey, cancel)
+	defer a.activeRequests.Del(summarizeKey)
+	defer cancel()
+
+	agent := fantasy.NewAgent(largeModel.Model,
+		fantasy.WithSystemPrompt(string(summaryPrompt)),
+	)
+	// Create the summary message as hidden so it is invisible in the UI.
+	summaryMessage, err := a.messages.Create(ctx, sessionID, message.CreateMessageParams{
+		Role:             message.Assistant,
+		Model:            largeModel.Model.Model(),
+		Provider:         largeModel.Model.Provider(),
+		IsSummaryMessage: true,
+		Hidden:           true,
+	})
+	if err != nil {
+		return err
+	}
+
+	summaryPromptText := buildSummaryPrompt(currentSession.Todos)
+	resp, err := agent.Stream(genCtx, fantasy.AgentStreamCall{
+		Prompt:          summaryPromptText,
+		Messages:        aiMsgs,
+		ProviderOptions: opts,
+		PrepareStep: func(callContext context.Context, options fantasy.PrepareStepFunctionOptions) (_ context.Context, prepared fantasy.PrepareStepResult, err error) {
+			prepared.Messages = options.Messages
+			if systemPromptPrefix != "" {
+				prepared.Messages = append([]fantasy.Message{fantasy.NewSystemMessage(systemPromptPrefix)}, prepared.Messages...)
+			}
+			return callContext, prepared, nil
+		},
+		OnReasoningDelta: func(id string, text string) error {
+			summaryMessage.AppendReasoningContent(text)
+			return a.messages.Update(genCtx, summaryMessage)
+		},
+		OnReasoningEnd: func(id string, reasoning fantasy.ReasoningContent) error {
+			if anthropicData, ok := reasoning.ProviderMetadata["anthropic"]; ok {
+				if signature, ok := anthropicData.(*anthropic.ReasoningOptionMetadata); ok && signature.Signature != "" {
+					summaryMessage.AppendReasoningSignature(signature.Signature)
+				}
+			}
+			summaryMessage.FinishThinking()
+			return a.messages.Update(genCtx, summaryMessage)
+		},
+		OnTextDelta: func(id, text string) error {
+			summaryMessage.AppendContent(text)
+			return a.messages.Update(genCtx, summaryMessage)
+		},
+	})
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			_ = a.messages.Delete(ctx, summaryMessage.ID)
+		}
+		return err
+	}
+
+	summaryMessage.AddFinish(message.FinishReasonEndTurn, "", "")
+	if err = a.messages.Update(genCtx, summaryMessage); err != nil {
+		return err
+	}
+
+	// Delete the non-pinned old messages that were replaced by the summary.
+	for _, m := range toSummarise {
+		if delErr := a.messages.Delete(ctx, m.ID); delErr != nil {
+			slog.Warn("silent summarise: failed to delete old message", "id", m.ID, "err", delErr)
+		}
+	}
+	_ = pinnedOld // pinned messages stay in the DB untouched
+
+	// Update session: point SummaryMessageID to the new hidden summary and
+	// reset token counters so the next call gets an accurate remaining-context
+	// estimate.
+	freshSession, err := a.sessions.Get(ctx, sessionID)
+	if err != nil {
+		return fmt.Errorf("silent summarise: failed to re-fetch session: %w", err)
+	}
+	var openrouterCost *float64
+	for _, step := range resp.Steps {
+		if stepCost := a.openrouterCost(step.ProviderMetadata); stepCost != nil {
+			if openrouterCost == nil {
+				openrouterCost = new(float64)
+			}
+			*openrouterCost += *stepCost
+		}
+	}
+	a.updateSessionUsage(largeModel, &freshSession, resp.TotalUsage, openrouterCost)
+	freshSession.SummaryMessageID = summaryMessage.ID
+	freshSession.CompletionTokens = resp.Response.Usage.OutputTokens
 	freshSession.PromptTokens = 0
 	_, err = a.sessions.Save(genCtx, freshSession)
 	return err
