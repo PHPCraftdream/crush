@@ -389,9 +389,8 @@ func registerGrepTool(srv *mcp.Server, perms permission.Service, workingDir stri
 // ── todos ─────────────────────────────────────────────────────────────────────
 
 // mergeMCPTodos merges the CLI model's desired todo list with the current DB
-// state, applying two protective rules:
-//  1. Status protection: statuses can only advance (pending→in_progress→completed).
-//  2. User task preservation: DB tasks absent from model list are kept.
+// state. The model's list is authoritative; the only protection applied is
+// status protection: statuses can only advance (pending→in_progress→completed).
 func mergeMCPTodos(dbTodos []session.Todo, modelItems []mcpTodoItem) []session.Todo {
 	if len(dbTodos) == 0 {
 		todos := make([]session.Todo, len(modelItems))
@@ -404,10 +403,6 @@ func mergeMCPTodos(dbTodos []session.Todo, modelItems []mcpTodoItem) []session.T
 	for _, t := range dbTodos {
 		dbByContent[t.Content] = t
 	}
-	modelByContent := make(map[string]bool, len(modelItems))
-	for _, item := range modelItems {
-		modelByContent[item.Content] = true
-	}
 	var result []session.Todo
 	for _, item := range modelItems {
 		wantStatus := session.TodoStatus(item.Status)
@@ -419,12 +414,6 @@ func mergeMCPTodos(dbTodos []session.Todo, modelItems []mcpTodoItem) []session.T
 			}
 		}
 		result = append(result, session.Todo{Content: item.Content, Status: wantStatus, ActiveForm: item.ActiveForm})
-	}
-	for _, dbTodo := range dbTodos {
-		if !modelByContent[dbTodo.Content] {
-			slog.Info("cliprovider: MCP todos keeping user task not in model list", "content", dbTodo.Content)
-			result = append(result, dbTodo)
-		}
 	}
 	return result
 }

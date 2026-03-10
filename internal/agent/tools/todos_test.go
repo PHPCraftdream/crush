@@ -78,29 +78,25 @@ func TestMergeTodos_StatusAdvance(t *testing.T) {
 	}
 }
 
-// TestMergeTodos_UserTaskPreservation: DB tasks absent from model are kept.
-func TestMergeTodos_UserTaskPreservation(t *testing.T) {
+// TestMergeTodos_ModelListIsAuthoritative: model list determines which tasks exist.
+// If the model omits a task (even one that was in DB), it is removed.
+// This allows user deletions to be respected: user deletes → DB shrinks →
+// next model call should not re-add deleted tasks.
+func TestMergeTodos_ModelListIsAuthoritative(t *testing.T) {
 	db := []session.Todo{
-		pending("User added task"),
-		pending("Model task"),
+		pending("Task A"),
+		pending("Task B"),
 	}
-	// Model only sends its task, omitting the user-added one
-	model := []TodoItem{item("Model task", "completed")}
+	// Model only sends Task A, omitting Task B
+	model := []TodoItem{item("Task A", "completed")}
 
 	result, _ := mergeTodos(db, model)
-	// Should have both: model task first (from model ordering), then preserved user task
-	if len(result) != 2 {
-		t.Fatalf("expected 2 todos, got %d: %+v", len(result), result)
+	// Model's list is authoritative: only Task A in result
+	if len(result) != 1 {
+		t.Fatalf("expected 1 todo (model is authoritative), got %d: %+v", len(result), result)
 	}
-	// Find user-added task
-	found := false
-	for _, r := range result {
-		if r.Content == "User added task" {
-			found = true
-		}
-	}
-	if !found {
-		t.Error("user-added task was deleted by model")
+	if result[0].Content != "Task A" {
+		t.Errorf("unexpected task: %+v", result[0])
 	}
 }
 
@@ -136,15 +132,16 @@ func TestMergeTodos_OrderingPreserved(t *testing.T) {
 	}
 }
 
-// TestMergeTodos_EmptyModelList: model passes empty list → DB tasks all preserved.
+// TestMergeTodos_EmptyModelList: model passes empty list → result is empty.
+// Model's list is authoritative.
 func TestMergeTodos_EmptyModelList(t *testing.T) {
 	db := []session.Todo{pending("Keep me"), completed("Done task")}
 	result, isNew := mergeTodos(db, []TodoItem{})
 	if isNew {
 		t.Fatal("expected isNew=false")
 	}
-	if len(result) != 2 {
-		t.Fatalf("expected 2 todos preserved, got %d", len(result))
+	if len(result) != 0 {
+		t.Fatalf("expected 0 todos (model is authoritative), got %d: %+v", len(result), result)
 	}
 }
 

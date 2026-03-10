@@ -47,18 +47,17 @@ func todoStatusLevel(s session.TodoStatus) int {
 	}
 }
 
-// mergeTodos combines the model's desired todo list with the current DB state
-// applying two protective rules:
-//  1. Status protection: a task's status can only advance (pending → in_progress →
-//     completed). The model cannot revert a status the user manually set.
-//  2. User task preservation: tasks present in the DB but absent from the model's
-//     list are kept. This prevents the model from silently deleting tasks the
-//     user added manually.
+// mergeTodos merges the model's desired todo list with the current DB state.
+// The only protective rule is status protection: a task's status can only
+// advance (pending → in_progress → completed). The model cannot revert a
+// status the user manually set.
 //
-// The model can still add new tasks (items in model list not in DB are appended).
+// The model's list is otherwise authoritative — if the model omits a task,
+// it is removed. User deletions are respected this way because the
+// system_reminder always shows the model the current DB state as ground truth.
 func mergeTodos(dbTodos []session.Todo, modelItems []TodoItem) ([]session.Todo, bool) {
 	if len(dbTodos) == 0 {
-		// Empty DB → accept model's list as-is (fresh start, no user edits to protect).
+		// Empty DB → accept model's list as-is (fresh start).
 		todos := make([]session.Todo, len(modelItems))
 		for i, item := range modelItems {
 			todos[i] = session.Todo{
@@ -74,14 +73,10 @@ func mergeTodos(dbTodos []session.Todo, modelItems []TodoItem) ([]session.Todo, 
 	for _, t := range dbTodos {
 		dbByContent[t.Content] = t
 	}
-	modelByContent := make(map[string]bool, len(modelItems))
-	for _, item := range modelItems {
-		modelByContent[item.Content] = true
-	}
 
 	var result []session.Todo
 
-	// Process model's items first (preserve model ordering).
+	// Process model's items: apply status protection for known tasks.
 	for _, item := range modelItems {
 		wantStatus := session.TodoStatus(item.Status)
 		if dbTodo, exists := dbByContent[item.Content]; exists {
@@ -100,14 +95,6 @@ func mergeTodos(dbTodos []session.Todo, modelItems []TodoItem) ([]session.Todo, 
 			Status:     wantStatus,
 			ActiveForm: item.ActiveForm,
 		})
-	}
-
-	// Append DB tasks the model didn't mention (user-added tasks).
-	for _, dbTodo := range dbTodos {
-		if !modelByContent[dbTodo.Content] {
-			slog.Info("todos tool: keeping user task not mentioned by model", "content", dbTodo.Content)
-			result = append(result, dbTodo)
-		}
 	}
 
 	return result, false
