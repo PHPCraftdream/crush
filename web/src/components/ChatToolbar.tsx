@@ -33,7 +33,7 @@ export function ChatToolbar() {
         onClick={() => summarizeSession(activeSessionID)}
         disabled={isBusy || !hasMessages}
         title="Compact — compress conversation history to free up context window"
-        className="flex items-center gap-1.5 text-xs font-medium rounded-lg px-2.5 py-1.5 border transition-colors bg-base-overlay border-surface text-text-subtle hover:border-accent/50 hover:text-text disabled:opacity-30 disabled:cursor-not-allowed"
+        className="btn-toolbar"
       >
         <Minimize2 size={13} />
         Compact
@@ -42,11 +42,7 @@ export function ChatToolbar() {
       <button
         onClick={() => setYolo(!yolo)}
         title={yolo ? "Yolo ON — all permissions auto-approved" : "Yolo OFF — tool calls require approval"}
-        className={`flex items-center gap-1.5 text-xs font-medium rounded-lg px-2.5 py-1.5 border transition-colors ${
-          yolo
-            ? "bg-yellow/10 border-yellow/30 text-yellow hover:bg-yellow/20"
-            : "bg-base-overlay border-surface text-text-subtle hover:border-accent/50 hover:text-text"
-        }`}
+        className={`btn-toolbar ${yolo ? "bg-yellow/10 border-yellow/30 text-yellow hover:bg-yellow/20" : ""}`}
       >
         {yolo ? <Zap size={13} /> : <ShieldOff size={13} />}
         Yolo

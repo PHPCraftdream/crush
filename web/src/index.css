@@ -3,43 +3,45 @@
 @tailwind utilities;
 
 /* ── Color tokens ────────────────────────────────────────────────────────────
-   Light theme (default)
-   ───────────────────────────────────────────────────────────────────────── */
+   Values are space-separated RGB channels so Tailwind's opacity modifier
+   syntax (bg-accent/10, border-red/20, etc.) works via @apply.
+   Raw CSS usages wrap with rgb(): rgb(var(--color-X))
+   ─────────────────────────────────────────────────────────────────────────── */
 :root {
   --chat-font-size: 20px;
 
-  --color-canvas:       #ffffff;
-  --color-base-subtle:  #f8fafc;
-  --color-base-overlay: #f1f5f9;
-  --color-surface:      #e2e8f0;
-  --color-text:         #0f172a;
-  --color-text-muted:   #475569;
-  --color-text-subtle:  #94a3b8;
-  --color-accent:       #4f46e5;
-  --color-accent-fill:  #4f46e5;
-  --color-green:        #16a34a;
-  --color-red:          #dc2626;
-  --color-red-fill:     #dc2626;
-  --color-yellow:       #d97706;
-  --color-yellow-fill:  #d97706;
+  --color-canvas:       255 255 255;
+  --color-base-subtle:  248 250 252;
+  --color-base-overlay: 241 245 249;
+  --color-surface:      226 232 240;
+  --color-text:         15 23 42;
+  --color-text-muted:   71 85 105;
+  --color-text-subtle:  148 163 184;
+  --color-accent:       79 70 229;
+  --color-accent-fill:  79 70 229;
+  --color-green:        22 163 74;
+  --color-red:          220 38 38;
+  --color-red-fill:     220 38 38;
+  --color-yellow:       217 119 6;
+  --color-yellow-fill:  217 119 6;
 }
 
 /* ── Dark theme ──────────────────────────────────────────────────────────── */
 .dark {
-  --color-canvas:       #0d1117;
-  --color-base-subtle:  #161b22;
-  --color-base-overlay: #1c2128;
-  --color-surface:      #21262d;
-  --color-text:         #c9d1d9;
-  --color-text-muted:   #8b949e;
-  --color-text-subtle:  #6e7681;
-  --color-accent:       #818cf8;
-  --color-accent-fill:  #4338ca;
-  --color-green:        #3fb950;
-  --color-red:          #f87171;
-  --color-red-fill:     #b91c1c;
-  --color-yellow:       #d29922;
-  --color-yellow-fill:  #854d0e;
+  --color-canvas:       13 17 23;
+  --color-base-subtle:  22 27 34;
+  --color-base-overlay: 28 33 40;
+  --color-surface:      33 38 45;
+  --color-text:         201 209 217;
+  --color-text-muted:   139 148 158;
+  --color-text-subtle:  110 118 129;
+  --color-accent:       129 140 248;
+  --color-accent-fill:  67 56 202;
+  --color-green:        63 185 80;
+  --color-red:          248 113 113;
+  --color-red-fill:     185 28 28;
+  --color-yellow:       210 153 34;
+  --color-yellow-fill:  133 77 14;
 }
 
 @layer base {
@@ -57,8 +59,8 @@
 
   ::-webkit-scrollbar { width: 8px; height: 8px; }
   ::-webkit-scrollbar-track { background: transparent; }
-  ::-webkit-scrollbar-thumb { background: var(--color-text-subtle); border-radius: 9999px; }
-  ::-webkit-scrollbar-thumb:hover { background: var(--color-text-muted); }
+  ::-webkit-scrollbar-thumb { background: rgb(var(--color-text-subtle)); border-radius: 9999px; }
+  ::-webkit-scrollbar-thumb:hover { background: rgb(var(--color-text-muted)); }
 }
 
 @layer components {
@@ -86,15 +88,14 @@
   .md ol { @apply pl-7 my-3 list-decimal; }
   .md li { @apply my-1.5; }
   .md blockquote {
-    @apply my-4 pl-5 border-l-4 text-text-muted italic;
-    border-color: color-mix(in srgb, var(--color-accent) 30%, transparent);
+    @apply my-4 pl-5 border-l-4 text-text-muted italic border-accent/30;
   }
   .md table { @apply border-collapse w-full my-4; font-size: var(--chat-font-size); }
   .md th { @apply border border-surface bg-base-overlay px-4 py-2.5 text-left font-semibold; }
   .md td { @apply border border-surface px-4 py-2.5; }
   .md a {
     @apply text-accent underline underline-offset-2;
-    &:hover { color: color-mix(in srgb, var(--color-accent) 80%, transparent); }
+    &:hover { @apply text-accent/80; }
   }
   .md strong { @apply font-semibold text-text; }
   .md hr { @apply my-6 border-surface; }
@@ -108,12 +109,246 @@
   /* Primary action button — vivid on light, muted on dark */
   .btn-primary {
     @apply font-semibold rounded-lg transition-opacity hover:opacity-90 active:scale-[0.97];
-    background-color: var(--color-accent-fill);
+    background-color: rgb(var(--color-accent-fill));
     color: rgb(255 255 255 / 0.9);
   }
   .dark .btn-primary {
-    background-color: color-mix(in srgb, var(--color-accent) 20%, transparent);
-    color: var(--color-accent);
+    @apply bg-accent/20 text-accent;
+  }
+
+  /* ── Buttons ──────────────────────────────────────────────────────────── */
+
+  /* Icon action button — accent on hover */
+  .btn-icon { @apply p-1.5 text-text-subtle hover:text-accent transition-colors rounded; }
+  /* Icon action button — red/destructive on hover */
+  .btn-icon-danger { @apply p-1.5 text-text-subtle hover:text-red transition-colors rounded; }
+  /* Smaller (p-1) icon button — accent on hover */
+  .btn-icon-sm { @apply p-1 text-text-subtle hover:text-accent transition-colors rounded; }
+  /* Smaller (p-1) icon button — red on hover */
+  .btn-icon-sm-danger { @apply p-1 text-text-subtle hover:text-red transition-colors rounded; }
+
+  /* Small ghost text button */
+  .btn-ghost-sm {
+    @apply px-3 py-1 text-xs text-text-subtle hover:text-text transition-colors rounded-lg hover:bg-base-overlay;
+  }
+
+  /* Bordered toolbar/pill button (default colors) */
+  .btn-toolbar {
+    @apply flex items-center gap-1.5 text-xs font-medium rounded-lg px-2.5 py-1.5 border
+           transition-colors bg-base-overlay border-surface text-text-subtle
+           hover:border-accent/50 hover:text-text
+           disabled:opacity-30 disabled:cursor-not-allowed;
+  }
+
+  /* Secondary cancel/outline button */
+  .btn-cancel {
+    @apply px-4 py-2 rounded-xl bg-base-overlay border border-surface
+           text-text-subtle hover:text-text transition-colors;
+  }
+
+  /* Destructive abort/stop button (red-tinted outline) */
+  .btn-stop {
+    @apply flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold
+           bg-red/10 text-red border border-red/20 rounded-lg
+           hover:bg-red/20 transition-colors;
+  }
+
+  /* Destructive action button (slightly larger, used in selection toolbar) */
+  .btn-delete {
+    @apply flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium
+           bg-red/10 text-red border border-red/20 rounded-lg
+           hover:bg-red/20 transition-colors;
+  }
+
+  /* Inline copy button with text label */
+  .btn-copy {
+    @apply inline-flex items-center gap-1.5 text-sm text-text-subtle hover:text-text transition-colors font-medium;
+  }
+
+  /* Icon-only button in input area (attach / send-small) */
+  .btn-input-action {
+    @apply p-2.5 text-text-subtle hover:text-accent hover:bg-accent/10
+           rounded-xl transition-all active:scale-95 disabled:opacity-30;
+  }
+
+  /* ── Form fields ──────────────────────────────────────────────────────── */
+
+  /* Standard single-line text input */
+  .field-input {
+    @apply w-full bg-base-overlay border border-surface rounded-xl px-4 py-2.5
+           text-text outline-none transition-colors focus:border-accent/60;
+  }
+
+  /* Multi-line resizable textarea for editing content */
+  .field-textarea {
+    @apply w-full bg-base-overlay border border-accent/40 text-text rounded-xl
+           px-4 py-3 leading-relaxed resize-none outline-none focus:border-accent;
+  }
+
+  /* Label above a form field */
+  .field-label { @apply block text-text-muted mb-2 text-sm font-medium; }
+
+  /* Compact inline input (inside list rows, sidebar rename) */
+  .field-inline {
+    @apply w-full bg-canvas border border-accent/40 rounded px-1.5 py-0.5 outline-none text-text;
+  }
+
+  /* ── Modals & dialogs ─────────────────────────────────────────────────── */
+
+  /* Full-screen semi-opaque backdrop */
+  .modal-overlay {
+    @apply fixed inset-0 flex items-center justify-center bg-black/40 backdrop-blur-sm;
+  }
+
+  /* Dialog card container */
+  .modal-panel { @apply bg-canvas border border-surface rounded-2xl shadow-2xl; }
+
+  /* Footer row with action buttons */
+  .modal-footer { @apply flex gap-2 justify-end; }
+
+  /* ── Badges ───────────────────────────────────────────────────────────── */
+
+  /* Inline error/status pill badge */
+  .badge-error {
+    @apply bg-red/10 text-red border border-red/20 text-xs font-medium rounded-full px-2 py-0.5;
+  }
+
+  /* ── Visibility helpers ───────────────────────────────────────────────── */
+
+  /* Hidden until parent `group` is hovered */
+  .hover-reveal { @apply opacity-0 group-hover:opacity-100 transition-opacity; }
+
+  /* ── Empty states ─────────────────────────────────────────────────────── */
+
+  /* Centered empty-state page layout */
+  .empty-state { @apply flex flex-col items-center justify-center flex-1 text-center px-8; }
+  /* Icon circle in empty-state */
+  .empty-state-icon {
+    @apply w-20 h-20 rounded-3xl bg-base-overlay flex items-center justify-center mb-6 text-text-subtle;
+  }
+  /* Primary text in empty-state */
+  .empty-state-title { @apply text-xl font-bold text-text-muted; }
+  /* Secondary text in empty-state */
+  .empty-state-desc { @apply text-text-subtle text-base mt-2; }
+
+  /* ── Chat layout ──────────────────────────────────────────────────────── */
+
+  /* Error/warning banner inside the chat scroll area */
+  .chat-error-banner {
+    @apply flex items-start gap-3 bg-red/5 border border-red/20 rounded-2xl px-5 py-4;
+  }
+
+  /* User message bubble (light: accent tint, dark: surface) */
+  .msg-bubble-user {
+    @apply bg-accent/25 text-text rounded-2xl rounded-tr-sm px-5 py-3.5
+           leading-relaxed shadow-md border border-accent/20;
+  }
+  .dark .msg-bubble-user {
+    @apply bg-base-overlay border-surface;
+  }
+
+  /* User bubble while being edited */
+  .msg-bubble-user-edit {
+    @apply bg-accent/10 border border-accent/40 text-text rounded-2xl rounded-tr-sm
+           px-5 py-3.5 leading-relaxed resize-none outline-none focus:border-accent w-full;
+  }
+
+  /* Fixed-height strip below each message that holds action buttons */
+  .msg-actions { @apply flex items-center h-7 mt-1; }
+
+  /* Wrapper for the always-DOM checkbox (opacity toggled externally) */
+  .msg-checkbox-wrap { @apply flex items-start pt-1 shrink-0 transition-opacity; }
+
+  /* Visual checkbox box */
+  .msg-checkbox {
+    @apply w-4 h-4 mt-1 rounded border-2 flex items-center justify-center cursor-pointer transition-all;
+  }
+
+  /* Pre-formatted output inside tool call / result blocks */
+  .tool-output {
+    @apply text-text-muted text-xs whitespace-pre-wrap overflow-x-auto max-h-48 leading-relaxed;
+  }
+
+  /* Thinking block — streaming / in-progress state */
+  .thinking-card { @apply my-2 rounded-xl border border-surface bg-base-subtle overflow-hidden; }
+
+  /* Header row inside a thinking-card */
+  .thinking-card-header {
+    @apply flex items-center gap-2 px-4 py-2.5 text-sm text-text-muted font-medium;
+  }
+
+  /* Thinking block — finished / collapsible state */
+  .thinking-card-done { @apply my-3 border border-surface rounded-xl overflow-hidden shadow-sm; }
+
+  /* <summary> toggle inside a finished thinking block */
+  .thinking-toggle {
+    @apply px-5 py-3 cursor-pointer select-none text-base text-text-muted
+           bg-base-subtle hover:bg-base-overlay transition-colors
+           flex items-center gap-2.5 font-medium;
+  }
+
+  /* Context-condensed summary card */
+  .summary-card { @apply rounded-2xl border border-yellow/30 bg-yellow/5 overflow-hidden; }
+
+  /* Header strip inside the summary card */
+  .summary-header {
+    @apply flex items-center gap-2.5 px-5 py-3 border-b border-yellow/20 bg-yellow/[8%];
+  }
+
+  /* "Show / Hide summary" toggle row */
+  .summary-toggle {
+    @apply flex items-center gap-2 px-5 py-2.5 cursor-pointer text-xs
+           text-text-muted hover:text-text transition-colors select-none list-none;
+  }
+
+  /* Body of the summary (text + padding) */
+  .summary-body {
+    @apply px-5 pt-3 pb-4 leading-relaxed text-text-subtle border-t border-yellow/10;
+  }
+
+  /* ── Section labels & dividers ────────────────────────────────────────── */
+
+  /* Small uppercase section label */
+  .section-label { @apply text-[11px] text-text-subtle font-medium uppercase tracking-wider; }
+
+  /* Thin horizontal hairline */
+  .divider-line { @apply flex-1 h-px bg-surface/50; }
+
+  /* Bottom toolbar shown when messages are selected */
+  .selection-toolbar {
+    @apply border-t border-surface bg-base-overlay px-6 py-3 flex items-center gap-4 shrink-0;
+  }
+
+  /* ── Sidebar ──────────────────────────────────────────────────────────── */
+
+  /* Square icon button inside a session row (accent variant) */
+  .sidebar-icon-btn {
+    @apply w-7 h-7 flex items-center justify-center rounded-lg text-text-subtle
+           hover:text-accent hover:bg-accent/10 transition-colors;
+  }
+
+  /* Square icon button inside a session row (destructive variant) */
+  .sidebar-icon-btn-danger {
+    @apply w-7 h-7 flex items-center justify-center rounded-lg text-text-subtle
+           hover:text-red hover:bg-red/10 transition-colors;
+  }
+
+  /* Absolutely-positioned action buttons that appear on session row hover */
+  .session-hover-btns {
+    @apply absolute right-3 top-1/2 -translate-y-1/2 flex items-center gap-1
+           opacity-0 group-hover:opacity-100 transition-opacity;
+  }
+
+  /* ── Miscellaneous ────────────────────────────────────────────────────── */
+
+  /* File attachment badge chip in the input area */
+  .attachment-badge {
+    @apply flex items-center gap-1.5 bg-base-overlay border border-surface rounded-lg px-2.5 py-1 text-xs text-text;
+  }
+
+  /* A single to-do item row */
+  .todo-row {
+    @apply flex items-center gap-1.5 px-2 py-1.5 rounded-lg hover:bg-base-overlay transition-colors;
   }
 }
 

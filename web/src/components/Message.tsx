@@ -5,7 +5,7 @@ import remarkGfm from "remark-gfm";
 import remarkBreaks from "remark-breaks";
 import rehypeHighlight from "rehype-highlight";
 import type { Message as Msg, ContentPart } from "../types";
-import { BrainCircuit, Check, Copy, GitFork, Pencil, RotateCcw, Trash2, BookMarked } from "lucide-react";
+import { BrainCircuit, Check, Copy, GitFork, Pencil, RotateCcw, Star, Trash2, BookMarked } from "lucide-react";
 import {
   $busySessions,
   toggleMessageSelection,
@@ -13,6 +13,7 @@ import {
   updateMessageThinking,
   deleteMessagePart,
   rerunFromMessage,
+  togglePinMessage,
 } from "../store";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { ForkSessionModal } from "./ForkSessionModal";
@@ -68,7 +69,7 @@ const CopyButton = memo(function CopyButton({ text, className = "", label = "Cop
     navigator.clipboard.writeText(text).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1500); });
   }, [text]);
   return (
-    <button onClick={copy} title={label} className={`inline-flex items-center gap-1.5 text-sm text-text-subtle hover:text-text transition-colors font-medium ${className}`}>
+    <button onClick={copy} title={label} className={`btn-copy ${className}`}>
       {copied ? <><Check size={14} className="text-green" /><span className="text-green">Copied</span></> : <><Copy size={14} /><span>{label}</span></>}
     </button>
   );
@@ -118,7 +119,7 @@ const EditForm = memo(function EditForm({
     <div className="flex flex-col gap-2">
       <textarea ref={taRef} value={value} onChange={onInput} onKeyDown={onKey} rows={rows} className={className} style={{ overflow: "hidden" }} />
       <div className="flex gap-2">
-        <button onClick={onCancel} className="px-3 py-1 text-xs text-text-subtle hover:text-text transition-colors rounded-lg hover:bg-base-overlay">Cancel</button>
+        <button onClick={onCancel} className="btn-ghost-sm">Cancel</button>
         <button onClick={commit} className="px-3 py-1 text-xs btn-primary">Save</button>
       </div>
     </div>
@@ -128,19 +129,21 @@ const EditForm = memo(function EditForm({
 // ── Hover action strips — only mounted when hovered ───────────────────────────
 
 const UserHoverActions = memo(function UserHoverActions({
-  messageID, copyText, isLastUserMsg, onEdit, onDelete, onFork,
+  messageID, copyText, isLastUserMsg, isPinned, onEdit, onDelete, onFork,
 }: {
-  messageID: string; copyText: string; isLastUserMsg: boolean;
+  messageID: string; copyText: string; isLastUserMsg: boolean; isPinned: boolean;
   onEdit: () => void; onDelete: () => void; onFork: () => void;
 }) {
   const handleRerun = useCallback(() => rerunFromMessage(messageID), [messageID]);
+  const handlePin   = useCallback(() => togglePinMessage(messageID, !isPinned), [messageID, isPinned]);
   return (
-    <div className="flex items-center gap-0.5">
-      {copyText && <CopyButton text={copyText} className="text-text-subtle" />}
-      {isLastUserMsg && <button onClick={handleRerun} title="Rerun" className="p-1.5 text-text-subtle hover:text-accent transition-colors rounded"><RotateCcw size={13} /></button>}
-      <button onClick={onFork}   title="Fork session" className="p-1.5 text-text-subtle hover:text-accent transition-colors rounded"><GitFork size={13} /></button>
-      <button onClick={onEdit}   title="Edit"         className="p-1.5 text-text-subtle hover:text-accent transition-colors rounded"><Pencil  size={13} /></button>
-      <button onClick={onDelete} title="Delete"       className="p-1.5 text-text-subtle hover:text-red   transition-colors rounded"><Trash2  size={13} /></button>
+    <div className="flex items-center gap-1.5">
+      {copyText && <CopyButton text={copyText} />}
+      {isLastUserMsg && <button onClick={handleRerun} title="Rerun" className="btn-icon"><RotateCcw size={13} /></button>}
+      <button onClick={handlePin}   title={isPinned ? "Unpin" : "Pin message"} className={`p-1.5 transition-colors rounded ${isPinned ? "text-yellow" : "text-text-subtle hover:text-yellow"}`}><Star size={13} fill={isPinned ? "currentColor" : "none"} /></button>
+      <button onClick={onFork}      title="Fork session"                       className="btn-icon"><GitFork size={13} /></button>
+      <button onClick={onEdit}      title="Edit"                               className="btn-icon"><Pencil  size={13} /></button>
+      <button onClick={onDelete}    title="Delete"                             className="btn-icon-danger"><Trash2 size={13} /></button>
     </div>
   );
 });
@@ -151,14 +154,16 @@ const AssistantHoverActions = memo(function AssistantHoverActions({
   message: Msg; copyText: string; copyAll: string;
   onEdit: () => void; onDelete: () => void; onFork: () => void;
 }) {
+  const handlePin = useCallback(() => togglePinMessage(message.ID, !message.Pinned), [message.ID, message.Pinned]);
   return (
     <div className="flex items-center gap-1 w-full">
-      <div className="flex items-center gap-1">
+      <div className="flex items-center gap-1.5">
         {copyText && <CopyButton text={copyText} />}
         {copyAll  && <CopyButton text={copyAll}  label="Copy all" />}
-        <button onClick={onFork}   title="Fork session" className="p-1.5 text-text-subtle hover:text-accent transition-colors rounded"><GitFork size={13} /></button>
-        <button onClick={onEdit}   title="Edit"         className="p-1.5 text-text-subtle hover:text-accent transition-colors rounded"><Pencil  size={13} /></button>
-        <button onClick={onDelete} title="Delete"       className="p-1.5 text-text-subtle hover:text-red   transition-colors rounded"><Trash2  size={13} /></button>
+        <button onClick={handlePin} title={message.Pinned ? "Unpin" : "Pin message"} className={`p-1.5 transition-colors rounded ${message.Pinned ? "text-yellow" : "text-text-subtle hover:text-yellow"}`}><Star size={13} fill={message.Pinned ? "currentColor" : "none"} /></button>
+        <button onClick={onFork}    title="Fork session" className="btn-icon"><GitFork size={13} /></button>
+        <button onClick={onEdit}    title="Edit"         className="btn-icon"><Pencil  size={13} /></button>
+        <button onClick={onDelete}  title="Delete"       className="btn-icon-danger"><Trash2 size={13} /></button>
       </div>
       <div className="flex items-center gap-2 ml-auto">
         <DurationBadge message={message} />
@@ -182,7 +187,7 @@ const ToolCallBlock = memo(function ToolCallBlock({ name, input, finished }: { n
         </div>
         <CopyButton text={input} />
       </div>
-      <pre className="text-text-muted text-xs whitespace-pre-wrap overflow-x-auto max-h-48 leading-relaxed">{formatted}</pre>
+      <pre className="tool-output">{formatted}</pre>
     </div>
   );
 });
@@ -194,11 +199,11 @@ const ToolResultBlock = memo(function ToolResultBlock({ name, content, isError }
         <div className="flex items-center gap-2">
           <span className="text-xs text-text-subtle">↩</span>
           <span className="text-text-muted font-semibold text-sm">{name}</span>
-          {isError && <span className="bg-red/10 text-red border border-red/20 text-xs font-medium rounded-full px-2 py-0.5">error</span>}
+          {isError && <span className="badge-error">error</span>}
         </div>
         <CopyButton text={content} />
       </div>
-      <pre className="text-text-muted text-xs whitespace-pre-wrap overflow-x-auto max-h-48 leading-relaxed">{content}</pre>
+      <pre className="tool-output">{content}</pre>
     </div>
   );
 });
@@ -234,8 +239,8 @@ const ThinkingPart = memo(function ThinkingPart({ thinking, messageID, partIndex
 
   if (!done) {
     return (
-      <div className="my-2 rounded-xl border border-surface bg-base-subtle overflow-hidden">
-        <div className="flex items-center gap-2 px-4 py-2.5 text-sm text-text-muted font-medium">
+      <div className="thinking-card">
+        <div className="thinking-card-header">
           <BrainCircuit size={15} className="text-accent/70 shrink-0 animate-pulse" />
           <span>Thinking…</span>
         </div>
@@ -249,14 +254,14 @@ const ThinkingPart = memo(function ThinkingPart({ thinking, messageID, partIndex
   }
 
   return (
-    <details className="group my-3 border border-surface rounded-xl overflow-hidden shadow-sm">
-      <summary className="px-5 py-3 cursor-pointer select-none text-base text-text-muted bg-base-subtle hover:bg-base-overlay transition-colors flex items-center gap-2.5 font-medium">
+    <details className="thinking-card-done group">
+      <summary className="thinking-toggle">
         <span className="text-accent/70"><BrainCircuit size={18} /></span>
         <span>Thoughts</span>
-        <div className="ml-auto flex items-center gap-0.5 opacity-0 group-hover:opacity-100">
+        <div className="ml-auto flex items-center gap-0.5 hover-reveal">
           <CopyButton text={thinking} className="px-1.5 py-1 text-xs" />
-          <button onClick={openEditEv} title="Edit thinking"   className="p-1 text-text-subtle hover:text-accent transition-colors rounded"><Pencil size={13} /></button>
-          <button onClick={openDel}    title="Delete thinking" className="p-1 text-text-subtle hover:text-red   transition-colors rounded"><Trash2 size={13} /></button>
+          <button onClick={openEditEv} title="Edit thinking"   className="btn-icon-sm"><Pencil size={13} /></button>
+          <button onClick={openDel}    title="Delete thinking" className="btn-icon-sm-danger"><Trash2 size={13} /></button>
         </div>
       </summary>
       {confirmDelete && (
@@ -315,14 +320,14 @@ const UserContent = memo(function UserContent({
       <EditForm
         initialValue={extractText(message.Parts)}
         rows={1}
-        className="bg-accent/10 border border-accent/40 text-text rounded-2xl rounded-tr-sm px-5 py-3.5 text-[18px] leading-relaxed resize-none outline-none focus:border-accent w-full min-w-[300px]"
+        className="msg-bubble-user-edit text-[18px] min-w-[300px]"
         onSave={onSaveEdit}
         onCancel={onCancelEdit}
       />
     );
   }
   return (
-    <div className="bg-accent/25 dark:bg-base-overlay text-text rounded-2xl rounded-tr-sm px-5 py-3.5 leading-relaxed shadow-md border border-accent/20 dark:border dark:border-surface" style={{ fontSize: "var(--chat-font-size)" }}>
+    <div className="msg-bubble-user" style={{ fontSize: "var(--chat-font-size)" }}>
       {message.Parts.map((part, i) => <Part key={i} part={part} index={i} isUser messageID={message.ID} thinkingDone={false} />)}
     </div>
   );
@@ -342,7 +347,7 @@ const AssistantContent = memo(function AssistantContent({
       <EditForm
         initialValue={extractText(message.Parts)}
         rows={4}
-        className="bg-base-overlay border border-accent/40 text-text rounded-xl px-4 py-3 text-[16px] leading-relaxed resize-none outline-none focus:border-accent w-full"
+        className="field-textarea text-[16px]"
         onSave={onSaveEdit}
         onCancel={onCancelEdit}
       />
@@ -360,25 +365,47 @@ const AssistantContent = memo(function AssistantContent({
 const SummaryMessage = memo(function SummaryMessage({ message }: { message: Msg }) {
   const text = useMemo(() => extractText(message.Parts), [message.Parts]);
   const isFinished = useMemo(() => message.Parts.some(p => p.type === "finish"), [message.Parts]);
+  const [editing, setEditing] = useState(false);
+
+  const handleSave = useCallback((newText: string) => {
+    if (newText && newText !== text) updateMessageContent(message.ID, newText);
+    setEditing(false);
+  }, [message.ID, text]);
+
   return (
     <div className="px-8 py-3">
-      <div className="rounded-2xl border border-yellow/30 bg-yellow/5 overflow-hidden">
-        <div className="flex items-center gap-2.5 px-5 py-3 border-b border-yellow/20 bg-yellow/8">
+      <div className="summary-card">
+        <div className="summary-header">
           <BookMarked size={15} className="text-yellow shrink-0" />
           <span className="text-sm font-semibold text-yellow">Context condensed</span>
           <span className="ml-auto text-xs text-text-muted font-mono">{message.Model}</span>
           {isFinished && <DurationBadge message={message} />}
+          {isFinished && (
+            <button onClick={() => setEditing(e => !e)} title="Edit summary" className="btn-icon-sm ml-1">
+              <Pencil size={13} />
+            </button>
+          )}
         </div>
         <details className="group">
-          <summary className="flex items-center gap-2 px-5 py-2.5 cursor-pointer text-xs text-text-muted hover:text-text transition-colors select-none list-none">
+          <summary className="summary-toggle">
             <span className="group-open:hidden">Show summary ▸</span>
             <span className="hidden group-open:inline">Hide summary ▾</span>
           </summary>
-          {text && (
-            <div className="px-5 pb-4 text-[15px] leading-relaxed text-text-subtle border-t border-yellow/10 pt-3">
+          {editing ? (
+            <div className="summary-body chat-font">
+              <EditForm
+                initialValue={text}
+                rows={4}
+                className="field-textarea"
+                onSave={handleSave}
+                onCancel={() => setEditing(false)}
+              />
+            </div>
+          ) : text ? (
+            <div className="summary-body md">
               <ReactMarkdown remarkPlugins={MD_REMARK} rehypePlugins={MD_REHYPE}>{text}</ReactMarkdown>
             </div>
-          )}
+          ) : null}
         </details>
       </div>
     </div>
@@ -390,15 +417,17 @@ const SummaryMessage = memo(function SummaryMessage({ message }: { message: Msg 
 export interface MessageProps {
   message: Msg;
   onDeleteRequest: (id: string) => void;
+  onRangeSelect: (index: number) => void;
   selectionActive: boolean;
   isLastUserMsg: boolean;
   isSelected: boolean;
   forkDefaultTitle: string;
   sessionID: string;
+  index: number;
 }
 
 export const Message = memo(function Message({
-  message, onDeleteRequest, selectionActive, isLastUserMsg, isSelected, forkDefaultTitle, sessionID,
+  message, onDeleteRequest, onRangeSelect, selectionActive, isLastUserMsg, isSelected, forkDefaultTitle, sessionID, index,
 }: MessageProps) {
   if (message.IsSummaryMessage) return <SummaryMessage message={message} />;
 
@@ -430,7 +459,10 @@ export const Message = memo(function Message({
     setEditing(false);
   }, [message.ID, message.Parts]);
 
-  const handleCheckboxChange = useCallback(() => toggleMessageSelection(message.ID), [message.ID]);
+  const handleCheckboxClick = useCallback((e: React.MouseEvent) => {
+    if (e.shiftKey) { onRangeSelect(index); }
+    else { toggleMessageSelection(message.ID); }
+  }, [message.ID, index, onRangeSelect]);
 
   // Checkbox is always in DOM (reserves layout space), opacity-0 when not relevant
   const checkboxVisible = selectionActive || isSelected || hovered;
@@ -443,11 +475,11 @@ export const Message = memo(function Message({
     >
       <div className={`flex gap-3 ${isUser ? "justify-end" : "justify-start"}`}>
         <div
-          className={`flex items-start pt-1 shrink-0 transition-opacity ${checkboxVisible ? "opacity-100" : "opacity-0 pointer-events-none"}`}
+          className={`msg-checkbox-wrap ${checkboxVisible ? "opacity-100" : "opacity-0 pointer-events-none"}`}
           style={{ order: isUser ? 1 : -1 }}
-          onClick={handleCheckboxChange}
+          onClick={handleCheckboxClick}
         >
-          <div className={`w-4 h-4 mt-1 rounded border-2 flex items-center justify-center cursor-pointer transition-all ${isSelected ? "bg-accent border-accent" : "border-text-subtle/50 hover:border-accent"}`}>
+          <div className={`msg-checkbox ${isSelected ? "bg-accent border-accent" : "border-text-subtle/50 hover:border-accent"}`}>
             {isSelected && <Check size={10} className="text-white shrink-0" />}
           </div>
         </div>
@@ -464,13 +496,14 @@ export const Message = memo(function Message({
 
       {/* Action strip — fixed-height row; interactive controls only mounted on hover */}
       {!editing && (
-        <div className={`flex items-center h-7 mt-1 ${isUser ? "justify-end" : "justify-start"}`}>
+        <div className={`msg-actions ${isUser ? "justify-end" : "justify-start"}`}>
           {hovered ? (
             isUser ? (
               <UserHoverActions
                 messageID={message.ID}
                 copyText={copyText}
                 isLastUserMsg={isLastUserMsg}
+                isPinned={message.Pinned}
                 onEdit={handleEditOpen}
                 onDelete={handleDelete}
                 onFork={handleForkOpen}

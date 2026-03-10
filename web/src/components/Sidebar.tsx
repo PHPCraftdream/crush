@@ -169,18 +169,18 @@ export function Sidebar() {
                 )}
 
                 {!isEditing && (
-                  <div className="absolute right-3 top-1/2 -translate-y-1/2 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                  <div className="session-hover-btns">
                     <button
                       onClick={(e) => startEditing(e, s.ID, s.Title)}
                       title="Rename session"
-                      className="w-7 h-7 flex items-center justify-center rounded-lg text-text-subtle hover:text-accent hover:bg-accent/10 transition-colors"
+                      className="sidebar-icon-btn"
                     >
                       <Pencil size={14} />
                     </button>
                     <button
                       onClick={(e) => deleteSession(e, s.ID, s.Title)}
                       title="Delete session"
-                      className="w-7 h-7 flex items-center justify-center rounded-lg text-text-subtle hover:text-red hover:bg-red/10 transition-colors"
+                      className="sidebar-icon-btn-danger"
                     >
                       <X size={16} />
                     </button>

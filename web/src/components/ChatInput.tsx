@@ -310,7 +310,7 @@ export function ChatInput() {
           {attachments.map((att, idx) => (
             <div
               key={idx}
-              className="flex items-center gap-1.5 bg-base-overlay border border-surface rounded-lg px-2.5 py-1 text-xs text-text"
+              className="attachment-badge"
             >
               <Paperclip size={11} className="text-text-subtle shrink-0" />
               <span className="truncate max-w-[140px]">{att.fileName}</span>
@@ -371,7 +371,7 @@ export function ChatInput() {
                 onClick={() => fileInputRef.current?.click()}
                 disabled={!activeSessionID}
                 title="Attach files"
-                className="p-2.5 text-text-subtle hover:text-accent hover:bg-accent/10 rounded-xl transition-all active:scale-95 disabled:opacity-30"
+                className="btn-input-action"
               >
                 <Paperclip size={18} />
               </button>
@@ -381,7 +381,7 @@ export function ChatInput() {
                 onClick={sendSmall}
                 disabled={!canSend}
                 title="Send with lightweight model"
-                className="p-2.5 text-text-subtle hover:text-accent hover:bg-accent/10 rounded-xl transition-all active:scale-95 disabled:opacity-30"
+                className="btn-input-action"
               >
                 <SendHorizonal size={18} />
               </button>

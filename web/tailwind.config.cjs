@@ -5,27 +5,27 @@ module.exports = {
   theme: {
     extend: {
       colors: {
-        // Canvas — main page/card background (white in light, very dark in dark)
-        canvas: "var(--color-canvas)",
+        // Canvas — main page/card background
+        canvas:        "rgb(var(--color-canvas) / <alpha-value>)",
         // Backgrounds
         base: {
-          subtle:  "var(--color-base-subtle)",
-          overlay: "var(--color-base-overlay)",
+          subtle:  "rgb(var(--color-base-subtle) / <alpha-value>)",
+          overlay: "rgb(var(--color-base-overlay) / <alpha-value>)",
         },
-        surface: "var(--color-surface)",
+        surface:       "rgb(var(--color-surface) / <alpha-value>)",
         text: {
-          DEFAULT: "var(--color-text)",
-          muted:   "var(--color-text-muted)",
-          subtle:  "var(--color-text-subtle)",
+          DEFAULT: "rgb(var(--color-text) / <alpha-value>)",
+          muted:   "rgb(var(--color-text-muted) / <alpha-value>)",
+          subtle:  "rgb(var(--color-text-subtle) / <alpha-value>)",
         },
-        accent:        "var(--color-accent)",
-        "accent-fill": "var(--color-accent-fill)",
+        accent:        "rgb(var(--color-accent) / <alpha-value>)",
+        "accent-fill": "rgb(var(--color-accent-fill) / <alpha-value>)",
         mauve:         "#7c3aed",
-        green:         "var(--color-green)",
-        red:           "var(--color-red)",
-        "red-fill":    "var(--color-red-fill)",
-        yellow:        "var(--color-yellow)",
-        "yellow-fill": "var(--color-yellow-fill)",
+        green:         "rgb(var(--color-green) / <alpha-value>)",
+        red:           "rgb(var(--color-red) / <alpha-value>)",
+        "red-fill":    "rgb(var(--color-red-fill) / <alpha-value>)",
+        yellow:        "rgb(var(--color-yellow) / <alpha-value>)",
+        "yellow-fill": "rgb(var(--color-yellow-fill) / <alpha-value>)",
         blue:    "#0284c7",
         teal:    "#0d9488",
       },

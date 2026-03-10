@@ -32,11 +32,11 @@ export function ConfirmDialog({
 
   return (
     <div
-      className="fixed inset-0 z-[100] flex items-center justify-center bg-black/40 backdrop-blur-sm p-4"
+      className="modal-overlay p-4 z-[100]"
       onClick={onCancel}
     >
       <div
-        className="bg-canvas border border-surface rounded-2xl shadow-2xl w-full max-w-sm overflow-hidden chat-font"
+        className="modal-panel w-full max-w-sm overflow-hidden chat-font"
         onClick={(e) => e.stopPropagation()}
       >
         {/* icon strip */}

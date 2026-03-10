@@ -31,18 +31,18 @@ export function ForkSessionModal({ sessionID, defaultTitle, onClose }: Props) {
 
   return createPortal(
     <div
-      className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/40 backdrop-blur-sm"
+      className="modal-overlay z-[9999]"
       onClick={onClose}
     >
       <div
-        className="chat-font bg-canvas border border-surface rounded-2xl shadow-2xl p-6 w-full max-w-md mx-4"
+        className="modal-panel chat-font p-6 w-full max-w-md mx-4"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center gap-2.5 mb-5">
           <GitFork size={18} className="text-accent shrink-0" />
           <h2 className="font-bold text-text">Fork session</h2>
         </div>
-        <label className="block text-text-muted mb-2 text-sm font-medium">
+        <label className="field-label">
           Name for the new session
         </label>
         <input
@@ -50,13 +50,13 @@ export function ForkSessionModal({ sessionID, defaultTitle, onClose }: Props) {
           value={title}
           onChange={(e) => setTitle(e.target.value)}
           onKeyDown={onKey}
-          className="w-full bg-base-overlay border border-surface focus:border-accent/60 rounded-xl px-4 py-2.5 text-text outline-none transition-colors"
+          className="field-input"
           style={{ fontSize: "var(--chat-font-size)" }}
         />
-        <div className="flex gap-2 justify-end mt-5">
+        <div className="modal-footer mt-5">
           <button
             onClick={onClose}
-            className="px-4 py-2 rounded-xl bg-base-overlay border border-surface text-text-subtle hover:text-text transition-colors text-sm"
+            className="btn-cancel text-sm"
           >
             Cancel
           </button>

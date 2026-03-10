@@ -68,7 +68,7 @@ function TodoRow({
   return (
     <div
       data-testid="todo-row"
-      className="group flex items-center gap-1.5 px-2 py-1.5 rounded-lg hover:bg-base-overlay transition-colors"
+      className="todo-row group"
     >
       {/* Actions — LEFT side, visible on hover */}
       <div className="flex items-center gap-0.5 shrink-0">
@@ -140,7 +140,7 @@ function TodoRow({
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
             onKeyDown={onKey}
-            className="w-full bg-canvas border border-accent/40 rounded px-1.5 py-0.5 outline-none text-text" style={{ fontSize: "var(--chat-font-size)" }}
+            className="field-inline" style={{ fontSize: "var(--chat-font-size)" }}
           />
         ) : (
           <span
@@ -194,7 +194,7 @@ function AddTaskRow({
         onKeyDown={onKey}
         onBlur={commit}
         placeholder="New task…"
-        className="flex-1 min-w-0 bg-canvas border border-accent/40 rounded px-1.5 py-0.5 outline-none text-text placeholder:text-text-muted"
+        className="field-inline flex-1 min-w-0 placeholder:text-text-muted"
         style={{ fontSize: "var(--chat-font-size)" }}
       />
     </div>

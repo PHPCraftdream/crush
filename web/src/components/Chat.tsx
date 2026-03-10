@@ -9,8 +9,10 @@ import {
   $selectedMessageIDs,
   $messageQueue,
   clearSelection,
+  toggleMessageSelection,
   deleteMessage,
   deleteMessages,
+  selectMessageIDs,
   removeQueuedMessage,
   updateQueuedMessage,
   type QueuedMessage,
@@ -86,7 +88,7 @@ function QueuedMessageItem({
               style={{ overflow: "hidden" }}
             />
             <div className="flex gap-2 justify-end">
-              <button onClick={() => setEditing(false)} className="px-3 py-1 text-xs text-text-subtle hover:text-text transition-colors rounded-lg hover:bg-base-overlay">Cancel</button>
+              <button onClick={() => setEditing(false)} className="btn-ghost-sm">Cancel</button>
               <button onClick={save} className="px-3 py-1 text-xs btn-primary">Save</button>
             </div>
           </div>
@@ -101,12 +103,8 @@ function QueuedMessageItem({
               </div>
             </div>
             <div className="flex items-center justify-end gap-1 mt-1.5 opacity-0 group-hover/qi:opacity-100 transition-opacity">
-              <button onClick={startEdit} title="Edit queued message" className="p-1.5 text-text-subtle hover:text-accent transition-colors rounded">
-                <Pencil size={13} />
-              </button>
-              <button onClick={handleRemove} title="Remove from queue" className="p-1.5 text-text-subtle hover:text-red transition-colors rounded">
-                <Trash2 size={13} />
-              </button>
+              <button onClick={startEdit}    title="Edit queued message"  className="btn-icon"><Pencil size={13} /></button>
+              <button onClick={handleRemove} title="Remove from queue"    className="btn-icon-danger"><Trash2 size={13} /></button>
             </div>
           </>
         )}
@@ -169,6 +167,26 @@ export function Chat() {
     }
   }, [messages, isBusy, agentError]);
 
+  const handleRangeSelect = useCallback((clickedIndex: number) => {
+    const selected = selectedIDs;
+    if (selected.size === 0) {
+      toggleMessageSelection(messages[clickedIndex].ID);
+      return;
+    }
+    let above = -1;
+    let below = -1;
+    for (let i = 0; i < messages.length; i++) {
+      if (selected.has(messages[i].ID)) {
+        if (i < clickedIndex) above = i;
+        if (i > clickedIndex && below === -1) below = i;
+      }
+    }
+    const from = above !== -1 ? above : clickedIndex;
+    const to   = below !== -1 ? below : clickedIndex;
+    const ids  = messages.slice(Math.min(from, clickedIndex), Math.max(to, clickedIndex) + 1).map(m => m.ID);
+    selectMessageIDs(ids);
+  }, [messages, selectedIDs]);
+
   const requestDeleteOne = useCallback((id: string) => {
     setConfirm({
       text: "Delete this message?",
@@ -188,27 +206,29 @@ export function Chat() {
     <div className="flex-1 flex flex-col overflow-hidden relative bg-canvas">
       <div ref={scrollRef} onScroll={handleScroll} className="flex-1 overflow-y-auto py-8 flex flex-col">
         {!activeSessionID ? (
-          <div className="flex flex-col items-center justify-center flex-1 text-center px-8">
-            <div className="w-20 h-20 rounded-3xl bg-base-overlay flex items-center justify-center mb-6 text-text-subtle">
+          <div className="empty-state">
+            <div className="empty-state-icon">
               <MessageSquare size={40} />
             </div>
-            <p className="text-xl font-bold text-text-muted">No session selected</p>
-            <p className="text-text-subtle text-base mt-2">Select a session from the sidebar or create a new one</p>
+            <p className="empty-state-title">No session selected</p>
+            <p className="empty-state-desc">Select a session from the sidebar or create a new one</p>
           </div>
         ) : messages.length === 0 && !agentError ? (
-          <div className="flex flex-col items-center justify-center flex-1 text-center px-8">
-            <div className="w-20 h-20 rounded-3xl bg-base-overlay flex items-center justify-center mb-6 text-text-subtle">
+          <div className="empty-state">
+            <div className="empty-state-icon">
               <Sparkles size={40} />
             </div>
-            <p className="text-xl font-bold text-text-muted">No messages yet</p>
-            <p className="text-text-subtle text-base mt-2">Say something to get started</p>
+            <p className="empty-state-title">No messages yet</p>
+            <p className="empty-state-desc">Say something to get started</p>
           </div>
         ) : (
-          messages.map((m) => (
+          messages.map((m, i) => (
             <Message
               key={m.ID}
+              index={i}
               message={m}
               onDeleteRequest={requestDeleteOne}
+              onRangeSelect={handleRangeSelect}
               selectionActive={selectionActive}
               isLastUserMsg={m.ID === lastUserMsgID}
               isSelected={selectedIDs.has(m.ID)}
@@ -220,7 +240,7 @@ export function Chat() {
 
         {agentError && (
           <div className="px-10 py-2">
-            <div className="flex items-start gap-3 bg-red/5 border border-red/20 rounded-2xl px-5 py-4">
+            <div className="chat-error-banner">
               <span className="text-red text-lg shrink-0 mt-0.5">⚠</span>
               <p className="text-[15px] text-red/80 leading-relaxed flex-1 break-words">{agentError}</p>
               <button onClick={() => $agentError.set(null)} aria-label="Dismiss" className="text-red/40 hover:text-red/70 transition-colors shrink-0 text-xl leading-none mt-0.5">
@@ -239,7 +259,7 @@ export function Chat() {
             </div>
             <button
               onClick={() => activeSessionID && ws.send("cancel_agent", { sessionID: activeSessionID })}
-              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold bg-red/10 text-red border border-red/20 rounded-lg hover:bg-red/20 transition-colors"
+              className="btn-stop"
             >
               <Square size={11} fill="currentColor" />
               Stop
@@ -253,9 +273,9 @@ export function Chat() {
       {queuedItems.length > 0 && activeSessionID && (
         <div className="shrink-0 border-t border-surface bg-canvas">
           <div className="flex items-center gap-2 px-10 py-1.5">
-            <div className="flex-1 h-px bg-surface/50" />
-            <span className="text-[11px] text-text-subtle font-medium uppercase tracking-wider">Queue · {queuedItems.length}</span>
-            <div className="flex-1 h-px bg-surface/50" />
+            <div className="divider-line" />
+            <span className="section-label">Queue · {queuedItems.length}</span>
+            <div className="divider-line" />
           </div>
           {queuedItems.map((item, idx) => (
             <QueuedMessageItem key={item.id} item={item} sessionID={activeSessionID} position={idx + 1} total={queuedItems.length} />
@@ -264,9 +284,9 @@ export function Chat() {
       )}
 
       {selectionActive && (
-        <div className="border-t border-surface bg-base-overlay px-6 py-3 flex items-center gap-4 shrink-0">
+        <div className="selection-toolbar">
           <span className="text-sm text-text-subtle">{selectedIDs.size} selected</span>
-          <button onClick={requestDeleteSelected} className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-red/10 text-red border border-red/20 rounded-lg hover:bg-red/20 transition-colors font-medium">
+          <button onClick={requestDeleteSelected} className="btn-delete">
             <Trash2 size={14} />
             Delete selected
           </button>
