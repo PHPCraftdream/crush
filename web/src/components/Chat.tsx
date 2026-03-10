@@ -241,13 +241,13 @@ export function Chat() {
           </div>
         )}
 
-        {/* Typing indicator + Stop button */}
+        {/* Stop button — compact, shown only when busy */}
         {isBusy && (
-          <div className="flex items-center gap-4 px-10 py-5">
-            <div className="flex gap-2 animate-pulse-dots">
-              <span className="w-2.5 h-2.5 rounded-full bg-accent/60 inline-block" />
-              <span className="w-2.5 h-2.5 rounded-full bg-accent/60 inline-block" />
-              <span className="w-2.5 h-2.5 rounded-full bg-accent/60 inline-block" />
+          <div className="flex items-center gap-3 px-10 py-2">
+            <div className="flex gap-1.5 animate-pulse-dots">
+              <span className="w-2 h-2 rounded-full bg-accent inline-block" />
+              <span className="w-2 h-2 rounded-full bg-accent inline-block" />
+              <span className="w-2 h-2 rounded-full bg-accent inline-block" />
             </div>
             <button
               onClick={() => activeSessionID && ws.send("cancel_agent", { sessionID: activeSessionID })}

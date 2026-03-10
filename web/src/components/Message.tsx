@@ -285,44 +285,52 @@ export function Message({ message, onDeleteRequest, selectionActive, isLastUserM
             </div>
           ) : (
             <>
-              <div className="text-text text-[17px] leading-relaxed">
-                {(() => {
-                  const thinkingDone = message.Parts.some(p => p.type === "text" || p.type === "finish");
-                  return message.Parts.map((part, i) => (
-                    <Part key={i} part={part} index={i} isUser={false} messageID={message.ID} thinkingDone={thinkingDone} />
-                  ));
-                })()}
-              </div>
-              <div className="flex items-center justify-between mt-3">
-                <div className="flex items-center gap-3">
-                  {copyText && <CopyButton text={copyText} />}
-                  {copyAll && <CopyButton text={copyAll} label="Copy all" />}
-                </div>
-                <div className="flex items-center gap-1 ml-auto">
-                  <div className="flex items-center gap-1">
-                    <button
-                      onClick={startEdit}
-                      title="Edit message"
-                      className="p-1.5 text-text-subtle hover:text-accent transition-colors rounded"
-                    >
-                      <Pencil size={13} />
-                    </button>
-                    <button
-                      onClick={() => onDeleteRequest(message.ID)}
-                      title="Delete message"
-                      className="p-1.5 text-text-subtle hover:text-red transition-colors rounded"
-                    >
-                      <Trash2 size={13} />
-                    </button>
-                  </div>
-                  <DurationBadge message={message} />
-                  {message.Model && (
-                    <span className="text-xs text-text-subtle font-mono ml-2">
-                      {message.Model}
-                    </span>
-                  )}
-                </div>
-              </div>
+              {(() => {
+                const thinkingDone = message.Parts.some(p => p.type === "text" || p.type === "finish");
+                const hasContent = message.Parts.some(p => p.type === "text" || p.type === "tool_call" || p.type === "tool_result" || p.type === "finish");
+                return (
+                  <>
+                    <div className="text-text text-[17px] leading-relaxed">
+                      {message.Parts.map((part, i) => (
+                        <Part key={i} part={part} index={i} isUser={false} messageID={message.ID} thinkingDone={thinkingDone} />
+                      ))}
+                    </div>
+                    {/* Only show the action footer once there is real content */}
+                    {hasContent && (
+                      <div className="flex items-center justify-between mt-3">
+                        <div className="flex items-center gap-3">
+                          {copyText && <CopyButton text={copyText} />}
+                          {copyAll && <CopyButton text={copyAll} label="Copy all" />}
+                        </div>
+                        <div className="flex items-center gap-1 ml-auto">
+                          <div className="flex items-center gap-1">
+                            <button
+                              onClick={startEdit}
+                              title="Edit message"
+                              className="p-1.5 text-text-subtle hover:text-accent transition-colors rounded"
+                            >
+                              <Pencil size={13} />
+                            </button>
+                            <button
+                              onClick={() => onDeleteRequest(message.ID)}
+                              title="Delete message"
+                              className="p-1.5 text-text-subtle hover:text-red transition-colors rounded"
+                            >
+                              <Trash2 size={13} />
+                            </button>
+                          </div>
+                          <DurationBadge message={message} />
+                          {message.Model && (
+                            <span className="text-xs text-text-subtle font-mono ml-2">
+                              {message.Model}
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    )}
+                  </>
+                );
+              })()}
             </>
           )}
         </div>
@@ -370,11 +378,28 @@ function ThinkingPart({ thinking, messageID, partIndex, done }: { thinking: stri
     e.target.style.height = e.target.scrollHeight + "px";
   }
 
+  // While still thinking: show a compact live indicator with streaming content
+  if (!done) {
+    return (
+      <div className="my-2 rounded-xl border border-surface bg-base-subtle overflow-hidden">
+        <div className="flex items-center gap-2 px-4 py-2.5 text-sm text-text-muted font-medium">
+          <BrainCircuit size={15} className="text-accent/70 shrink-0 animate-pulse" />
+          <span>Thinking…</span>
+        </div>
+        {thinking && (
+          <pre className="px-4 pb-3 text-[13px] font-mono whitespace-pre-wrap text-text-subtle leading-relaxed max-h-40 overflow-y-auto border-t border-surface/50">
+            {thinking}
+          </pre>
+        )}
+      </div>
+    );
+  }
+
   return (
     <details className="my-3 border border-surface rounded-xl overflow-hidden shadow-sm">
       <summary className="px-5 py-3 cursor-pointer select-none text-base text-text-muted bg-base-subtle hover:bg-base-overlay transition-colors flex items-center gap-2.5 font-medium">
         <span className="text-accent/70"><BrainCircuit size={18} /></span>
-        <span>{done ? "Thoughts" : "Thinking…"}</span>
+        <span>Thoughts</span>
         <div className="ml-auto flex items-center gap-0.5 opacity-0 group-hover/msg:opacity-100">
           <CopyButton text={thinking} className="px-1.5 py-1 text-xs" />
           <button

@@ -40,11 +40,13 @@ test("todo panel visible when session has todos", async ({ page }) => {
   await expect(page.getByTestId("todo-list")).toBeVisible({ timeout: 3000 });
 });
 
-// ── 2. Panel hidden when no todos ────────────────────────────────────────────
+// ── 2. Panel shows empty state when no todos ─────────────────────────────────
 
-test("todo panel hidden when session has no todos", async ({ page }) => {
+test("todo panel shows empty state when session has no todos", async ({ page }) => {
   await setup(page, []);
-  await expect(page.getByTestId("todo-list")).not.toBeAttached({ timeout: 2000 });
+  await expect(page.getByTestId("todo-list")).toBeVisible({ timeout: 2000 });
+  await expect(page.getByTestId("todo-list")).toContainText("No tasks yet.");
+  await expect(page.getByTestId("todo-row")).toHaveCount(0);
 });
 
 // ── 3. Count badge shows completed/total ─────────────────────────────────────
@@ -197,6 +199,37 @@ test("move-up disabled for first item, move-down disabled for last", async ({ pa
   await row.hover();
   await expect(page.getByTestId("todo-move-up").first()).toBeDisabled({ timeout: 2000 });
   await expect(page.getByTestId("todo-move-down").first()).toBeDisabled({ timeout: 2000 });
+});
+
+// ── 7b. Add task ──────────────────────────────────────────────────────────────
+
+test("+ button reveals add-task input that creates a new todo on Enter", async ({ page }) => {
+  await setup(page, [{ content: "Existing", status: "pending" }]);
+
+  await page.getByTestId("todo-add-btn").click();
+  await page.getByPlaceholder("New task…").fill("Brand new task");
+  await page.getByPlaceholder("New task…").press("Enter");
+
+  const cmd = await waitForWSSend(page, "update_todos");
+  const p = cmd.payload as { todos: Array<{ content: string; status: string }> };
+  expect(p.todos).toHaveLength(2);
+  expect(p.todos[1].content).toBe("Brand new task");
+  expect(p.todos[1].status).toBe("pending");
+});
+
+test("Escape in add-task input cancels without sending update_todos", async ({ page }) => {
+  await setup(page, []);
+
+  await page.getByTestId("todo-add-btn").click();
+  await page.getByPlaceholder("New task…").fill("Nope");
+  await page.getByPlaceholder("New task…").press("Escape");
+
+  await expect(page.getByPlaceholder("New task…")).not.toBeVisible({ timeout: 2000 });
+  const sent = await page.evaluate(() =>
+    ((window as unknown) as Record<string, unknown[]>)["__wsSent"]
+      .filter((m: unknown) => (m as { type: string }).type === "update_todos")
+  );
+  expect(sent).toHaveLength(0);
 });
 
 // ── 8. Collapse / expand ──────────────────────────────────────────────────────

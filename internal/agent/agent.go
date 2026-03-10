@@ -728,14 +728,20 @@ func (a *sessionAgent) Summarize(ctx context.Context, sessionID string, opts fan
 		}
 	}
 
-	a.updateSessionUsage(largeModel, &currentSession, resp.TotalUsage, openrouterCost)
+	// Re-fetch the session to pick up any user edits (e.g. todo changes) that
+	// happened while the summary was streaming, then overlay our own fields.
+	freshSession, err := a.sessions.Get(ctx, sessionID)
+	if err != nil {
+		return fmt.Errorf("failed to re-fetch session before save: %w", err)
+	}
+	a.updateSessionUsage(largeModel, &freshSession, resp.TotalUsage, openrouterCost)
 
 	// Just in case, get just the last usage info.
 	usage := resp.Response.Usage
-	currentSession.SummaryMessageID = summaryMessage.ID
-	currentSession.CompletionTokens = usage.OutputTokens
-	currentSession.PromptTokens = 0
-	_, err = a.sessions.Save(genCtx, currentSession)
+	freshSession.SummaryMessageID = summaryMessage.ID
+	freshSession.CompletionTokens = usage.OutputTokens
+	freshSession.PromptTokens = 0
+	_, err = a.sessions.Save(genCtx, freshSession)
 	return err
 }
 
