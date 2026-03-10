@@ -170,9 +170,11 @@ type RemoveSkillsPathPayload struct {
 
 // SkillInfo is the wire format for a single discovered skill.
 type SkillInfo struct {
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	Path        string `json:"path"`
+	Name         string `json:"name"`
+	Description  string `json:"description"`
+	Path         string `json:"path"`
+	Source       string `json:"source,omitempty"`
+	Instructions string `json:"instructions,omitempty"`
 }
 
 // SkillsSnapshot is the full skills state.

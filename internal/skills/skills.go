@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/charmbracelet/crush/internal/home"
 	"github.com/charlievieth/fastwalk"
 	"gopkg.in/yaml.v3"
 )
@@ -35,6 +36,158 @@ type Skill struct {
 	Instructions  string            `yaml:"-" json:"instructions"`
 	Path          string            `yaml:"-" json:"path"`
 	SkillFilePath string            `yaml:"-" json:"skill_file_path"`
+	// Source identifies which AI tool this skill/command comes from (e.g. "claude", "gemini", "crush").
+	Source string `yaml:"-" json:"source,omitempty"`
+}
+
+// CommandDir is a directory to scan for simple markdown command files.
+type CommandDir struct {
+	Path   string
+	Source string
+}
+
+// DefaultCommandDirs returns directories from popular AI coding tools to scan
+// for simple markdown command/prompt files.
+func DefaultCommandDirs() []CommandDir {
+	h := home.Dir()
+	dirs := []CommandDir{
+		{Path: filepath.Join(h, ".claude", "commands"), Source: "claude"},
+		{Path: filepath.Join(h, ".gemini", "commands"), Source: "gemini"},
+		{Path: filepath.Join(h, ".qwen", "commands"), Source: "qwen"},
+		{Path: filepath.Join(h, ".cursor", "rules"), Source: "cursor"},
+		{Path: filepath.Join(h, ".zed", "prompts"), Source: "zed"},
+		{Path: filepath.Join(h, ".windsurf", "commands"), Source: "windsurf"},
+	}
+	// Project-local command directories
+	if cwd, err := os.Getwd(); err == nil {
+		dirs = append(dirs,
+			CommandDir{Path: filepath.Join(cwd, ".claude", "commands"), Source: "claude"},
+			CommandDir{Path: filepath.Join(cwd, ".gemini", "commands"), Source: "gemini"},
+			CommandDir{Path: filepath.Join(cwd, ".qwen", "commands"), Source: "qwen"},
+			CommandDir{Path: filepath.Join(cwd, ".crush", "commands"), Source: "crush"},
+		)
+	}
+	return dirs
+}
+
+// SourceFromPath derives the source label from a skill or command file path.
+func SourceFromPath(path string) string {
+	norm := filepath.ToSlash(strings.ToLower(path))
+	switch {
+	case strings.Contains(norm, "/.claude/") || strings.Contains(norm, "/.claude\\"):
+		return "claude"
+	case strings.Contains(norm, "/.gemini/") || strings.Contains(norm, "/.gemini\\"):
+		return "gemini"
+	case strings.Contains(norm, "/.qwen/") || strings.Contains(norm, "/.qwen\\"):
+		return "qwen"
+	case strings.Contains(norm, "/.cursor/") || strings.Contains(norm, "/.cursor\\"):
+		return "cursor"
+	case strings.Contains(norm, "/.zed/") || strings.Contains(norm, "/.zed\\"):
+		return "zed"
+	case strings.Contains(norm, "/.windsurf/") || strings.Contains(norm, "/.windsurf\\"):
+		return "windsurf"
+	case strings.Contains(norm, "crush"):
+		return "crush"
+	default:
+		return "local"
+	}
+}
+
+// ParseCommand parses a simple markdown file as a slash command.
+// Unlike SKILL.md files, these don't require YAML frontmatter — the filename
+// becomes the command name and the first heading/paragraph is the description.
+func ParseCommand(path, source string) (*Skill, error) {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	filename := strings.TrimSuffix(filepath.Base(path), ".md")
+	name := filename
+	description := ""
+	instructions := strings.TrimSpace(string(content))
+
+	// Try to extract YAML frontmatter if present
+	normalized := strings.ReplaceAll(string(content), "\r\n", "\n")
+	if strings.HasPrefix(normalized, "---\n") {
+		if fm, body, ferr := splitFrontmatter(normalized); ferr == nil {
+			var meta struct {
+				Name        string `yaml:"name"`
+				Description string `yaml:"description"`
+			}
+			if yaml.Unmarshal([]byte(fm), &meta) == nil {
+				if meta.Name != "" {
+					name = meta.Name
+				}
+				if meta.Description != "" {
+					description = meta.Description
+				}
+			}
+			instructions = strings.TrimSpace(body)
+		}
+	}
+
+	// Extract description from the first heading or paragraph
+	if description == "" {
+		for _, line := range strings.Split(instructions, "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			if strings.HasPrefix(line, "#") {
+				description = strings.TrimSpace(strings.TrimLeft(line, "# "))
+			} else {
+				description = line
+				if len(description) > 200 {
+					description = description[:197] + "..."
+				}
+			}
+			break
+		}
+	}
+	if description == "" {
+		description = name
+	}
+
+	return &Skill{
+		Name:          name,
+		Description:   description,
+		Instructions:  instructions,
+		Path:          filepath.Dir(path),
+		SkillFilePath: path,
+		Source:        source,
+	}, nil
+}
+
+// DiscoverCommands scans directories for simple markdown command files.
+func DiscoverCommands(dirs []CommandDir) []*Skill {
+	var result []*Skill
+	seen := make(map[string]bool)
+
+	for _, dir := range dirs {
+		entries, err := os.ReadDir(dir.Path)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(strings.ToLower(e.Name()), ".md") {
+				continue
+			}
+			path := filepath.Join(dir.Path, e.Name())
+			if seen[path] {
+				continue
+			}
+			seen[path] = true
+
+			skill, err := ParseCommand(path, dir.Source)
+			if err != nil {
+				slog.Warn("Failed to parse command file", "path", path, "error", err)
+				continue
+			}
+			result = append(result, skill)
+		}
+	}
+	return result
 }
 
 // Validate checks if the skill meets spec requirements.
@@ -147,6 +300,7 @@ func Discover(paths []string) []*Skill {
 				slog.Warn("Skill validation failed", "path", path, "error", err)
 				return nil
 			}
+			skill.Source = SourceFromPath(path)
 			slog.Debug("Successfully loaded skill", "name", skill.Name, "path", path)
 			mu.Lock()
 			skills = append(skills, skill)

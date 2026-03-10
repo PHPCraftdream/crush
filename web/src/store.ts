@@ -1,11 +1,12 @@
 import { atom } from "nanostores";
-import type { Session, Message, PermissionRequest, ConfigPayload, LSPSnapshot, MCPState, Todo } from "./types";
+import type { Session, Message, PermissionRequest, ConfigPayload, LSPSnapshot, MCPState, Todo, SkillInfo } from "./types";
 
 // ── Connection state ─────────────────────────────────────────────────────────
 export const $connected = atom(false);
 export const $authed = atom(false);
 
 // ── Data ─────────────────────────────────────────────────────────────────────
+export const $skills = atom<SkillInfo[]>([]);
 export const $sessions = atom<Session[]>([]);
 export const $activeSessionID = atom<string | null>(null);
 export const $messages = atom<Message[]>([]);
@@ -16,6 +17,17 @@ export const $mcpState = atom<MCPState | null>(null);
 export const $busySessions = atom<Set<string>>(new Set());
 
 // ── Actions ──────────────────────────────────────────────────────────────────
+export function setSkills(skills: SkillInfo[]) {
+  $skills.set(skills);
+}
+
+const LAST_SKILL_KEY = "crush_last_skill";
+export const $lastUsedSkill = atom<string>(localStorage.getItem(LAST_SKILL_KEY) ?? "");
+export function setLastUsedSkill(name: string) {
+  $lastUsedSkill.set(name);
+  localStorage.setItem(LAST_SKILL_KEY, name);
+}
+
 export function setSessions(sessions: Session[]) {
   $sessions.set(sessions);
 }

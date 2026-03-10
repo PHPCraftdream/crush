@@ -25,8 +25,9 @@ import {
   trackModelUsage,
   dequeueNextMessage,
   applyTheme,
+  setSkills,
 } from "./store";
-import type { WSMessage, Session, Message, PermissionRequest, ConfigPayload, LSPSnapshot, MCPState, AgentBusyPayload } from "./types";
+import type { WSMessage, Session, Message, PermissionRequest, ConfigPayload, LSPSnapshot, MCPState, AgentBusyPayload, SkillsSnapshot } from "./types";
 
 function getIDFromHash(): string | null {
   const hash = window.location.hash; // #/uuid
@@ -64,6 +65,7 @@ export function useWS() {
         $busySessions.set(new Set());
         ws.send("list_sessions");
         ws.send("get_config");
+        ws.send("get_skills");
         // Persist any theme set on the login page (before WS was available)
         const localTheme = localStorage.getItem("crush_theme");
         if (localTheme) {
@@ -191,6 +193,10 @@ export function useWS() {
             ws.send("send_message", { sessionID: p.SessionID, content: next });
           }
         }
+      }),
+
+      ws.on("skills", (msg: WSMessage) => {
+        setSkills((msg.payload as SkillsSnapshot).skills ?? []);
       }),
 
       ws.on("error", (msg: WSMessage) => {

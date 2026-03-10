@@ -135,6 +135,8 @@ export interface SkillInfo {
   name: string;
   description: string;
   path: string;
+  source?: string;
+  instructions?: string;
 }
 
 export interface SkillsSnapshot {

@@ -1109,12 +1109,16 @@ func handleGetSkills(a *appPkg.App, c *Client, msg WSMessage) {
 		paths = cfg.Options.SkillsPaths
 	}
 	discovered := skills.Discover(paths)
-	infos := make([]SkillInfo, 0, len(discovered))
-	for _, s := range discovered {
+	commands := skills.DiscoverCommands(skills.DefaultCommandDirs())
+	all := append(discovered, commands...)
+	infos := make([]SkillInfo, 0, len(all))
+	for _, s := range all {
 		infos = append(infos, SkillInfo{
-			Name:        s.Name,
-			Description: s.Description,
-			Path:        s.Path,
+			Name:         s.Name,
+			Description:  s.Description,
+			Path:         s.Path,
+			Source:       s.Source,
+			Instructions: s.Instructions,
 		})
 	}
 	c.reply(msg.ID, EventSkills, SkillsSnapshot{Skills: infos, Paths: paths}, "")
