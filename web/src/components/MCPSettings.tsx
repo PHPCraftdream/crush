@@ -341,7 +341,7 @@ export function MCPSettings({ onClose }: { onClose: () => void }) {
       onClick={onClose}
     >
       <div
-        className="bg-canvas border border-surface rounded-2xl shadow-xl w-full max-w-lg overflow-hidden flex flex-col max-h-[80vh]"
+        className="bg-canvas border border-surface rounded-2xl shadow-xl w-full max-w-lg overflow-hidden flex flex-col max-h-[80vh] chat-font"
         onClick={e => e.stopPropagation()}
       >
         {/* Header */}

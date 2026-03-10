@@ -59,7 +59,7 @@ export function Login() {
                 <Terminal size={18} className="text-white/90" />
               </div>
               <span className="text-white/60 text-sm font-medium tracking-wide uppercase">
-                crush
+                Crush~
               </span>
             </div>
             <h1 className="text-2xl font-bold text-white/90 leading-tight">

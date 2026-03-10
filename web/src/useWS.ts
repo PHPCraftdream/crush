@@ -143,9 +143,17 @@ export function useWS() {
         setMessages((msg.payload as Message[]) ?? [])
       ),
 
-      ws.on("permission_request", (msg: WSMessage) =>
-        addPermission(msg.payload as PermissionRequest)
-      ),
+      ws.on("permission_request", (msg: WSMessage) => {
+        const p = msg.payload as PermissionRequest;
+        // If yolo is active — auto-grant immediately on the client side without
+        // showing the dialog. This is race-free: the server's skip flag might not
+        // be set yet when the next request arrives, but we handle it here.
+        if ($yolo.get()) {
+          ws.send("grant_permission", { permissionID: p.ID });
+          return;
+        }
+        addPermission(p);
+      }),
       ws.on("permission_notification", (msg: WSMessage) =>
         removePermission((msg.payload as { ToolCallID: string }).ToolCallID)
       ),

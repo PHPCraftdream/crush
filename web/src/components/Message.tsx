@@ -2,9 +2,10 @@ import { useState, useRef, useEffect } from "react";
 import { useStore } from "@nanostores/react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import remarkBreaks from "remark-breaks";
 import rehypeHighlight from "rehype-highlight";
 import type { Message as Msg, ContentPart } from "../types";
-import { BrainCircuit, Check, Copy, Pencil, RotateCcw, Trash2 } from "lucide-react";
+import { BrainCircuit, Check, Copy, Pencil, RotateCcw, Trash2, BookMarked } from "lucide-react";
 import {
   $busySessions,
   $selectedMessageIDs,
@@ -111,7 +112,46 @@ interface MessageProps {
   isLastUserMsg?: boolean;
 }
 
+function SummaryMessage({ message }: { message: Msg }) {
+  const text = extractText(message.Parts);
+  const isFinished = message.Parts.some((p) => p.type === "finish");
+
+  return (
+    <div className="px-8 py-3">
+      <div className="rounded-2xl border border-yellow/30 bg-yellow/5 overflow-hidden">
+        {/* Header */}
+        <div className="flex items-center gap-2.5 px-5 py-3 border-b border-yellow/20 bg-yellow/8">
+          <BookMarked size={15} className="text-yellow shrink-0" />
+          <span className="text-sm font-semibold text-yellow">Context condensed</span>
+          <span className="ml-auto text-xs text-text-muted font-mono">
+            {message.Model}
+          </span>
+          {isFinished && <DurationBadge message={message} />}
+        </div>
+        {/* Summary content — collapsed by default */}
+        <details className="group">
+          <summary className="flex items-center gap-2 px-5 py-2.5 cursor-pointer text-xs text-text-muted hover:text-text transition-colors select-none list-none">
+            <span className="group-open:hidden">Show summary ▸</span>
+            <span className="hidden group-open:inline">Hide summary ▾</span>
+          </summary>
+          {text && (
+            <div className="px-5 pb-4 text-[15px] leading-relaxed text-text-subtle border-t border-yellow/10 pt-3">
+              <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks]} rehypePlugins={[rehypeHighlight]}>
+                {text}
+              </ReactMarkdown>
+            </div>
+          )}
+        </details>
+      </div>
+    </div>
+  );
+}
+
 export function Message({ message, onDeleteRequest, selectionActive, isLastUserMsg }: MessageProps) {
+  if (message.IsSummaryMessage) {
+    return <SummaryMessage message={message} />;
+  }
+
   const isUser = message.Role === "user";
   const copyText = extractText(message.Parts);
   const copyThinking = !isUser ? extractThinking(message.Parts) : "";
@@ -210,7 +250,7 @@ export function Message({ message, onDeleteRequest, selectionActive, isLastUserM
                 </button>
                 <button
                   onClick={commitEdit}
-                  className="px-3 py-1 text-xs bg-accent-fill text-white/90 rounded-lg hover:opacity-90 transition-opacity"
+                  className="px-3 py-1 text-xs btn-primary"
                 >
                   Save
                 </button>
@@ -218,7 +258,7 @@ export function Message({ message, onDeleteRequest, selectionActive, isLastUserM
             </div>
           ) : (
             <>
-              <div className="bg-accent-fill dark:bg-base-overlay text-white/90 dark:text-text rounded-2xl rounded-tr-sm px-5 py-3.5 text-[18px] leading-relaxed shadow-md dark:border dark:border-surface">
+              <div className="bg-accent/25 dark:bg-base-overlay text-text rounded-2xl rounded-tr-sm px-5 py-3.5 leading-relaxed shadow-md border border-accent/20 dark:border dark:border-surface" style={{ fontSize: "var(--chat-font-size)" }}>
                 {message.Parts.map((part, i) => (
                   <Part key={i} part={part} index={i} isUser messageID={message.ID} thinkingDone={false} />
                 ))}
@@ -277,7 +317,7 @@ export function Message({ message, onDeleteRequest, selectionActive, isLastUserM
                 </button>
                 <button
                   onClick={commitEdit}
-                  className="px-3 py-1 text-xs bg-accent-fill text-white/90 rounded-lg hover:opacity-90 transition-opacity"
+                  className="px-3 py-1 text-xs btn-primary"
                 >
                   Save <span className="opacity-70">(Ctrl+Enter)</span>
                 </button>
@@ -290,7 +330,7 @@ export function Message({ message, onDeleteRequest, selectionActive, isLastUserM
                 const hasContent = message.Parts.some(p => p.type === "text" || p.type === "tool_call" || p.type === "tool_result" || p.type === "finish");
                 return (
                   <>
-                    <div className="text-text text-[17px] leading-relaxed">
+                    <div className="text-text leading-relaxed" style={{ fontSize: "var(--chat-font-size)" }}>
                       {message.Parts.map((part, i) => (
                         <Part key={i} part={part} index={i} isUser={false} messageID={message.ID} thinkingDone={thinkingDone} />
                       ))}
@@ -387,7 +427,7 @@ function ThinkingPart({ thinking, messageID, partIndex, done }: { thinking: stri
           <span>Thinking…</span>
         </div>
         {thinking && (
-          <pre className="px-4 pb-3 text-[13px] font-mono whitespace-pre-wrap text-text-subtle leading-relaxed max-h-40 overflow-y-auto border-t border-surface/50">
+          <pre className="px-4 pb-3 font-mono whitespace-pre-wrap text-text-subtle leading-relaxed max-h-40 overflow-y-auto border-t border-surface/50" style={{ fontSize: "var(--chat-font-size)" }}>
             {thinking}
           </pre>
         )}
@@ -446,14 +486,14 @@ function ThinkingPart({ thinking, messageID, partIndex, done }: { thinking: stri
             </button>
             <button
               onClick={save}
-              className="px-3 py-1 text-xs bg-accent-fill text-white/90 rounded-lg hover:opacity-90 transition-opacity"
+              className="px-3 py-1 text-xs btn-primary"
             >
               Save <span className="opacity-70">(Ctrl+Enter)</span>
             </button>
           </div>
         </div>
       ) : (
-        <pre className="p-5 bg-base-overlay text-[14px] font-mono whitespace-pre-wrap overflow-x-auto text-text-muted border-t border-surface leading-relaxed">
+        <pre className="p-5 bg-base-overlay font-mono whitespace-pre-wrap overflow-x-auto text-text-muted border-t border-surface leading-relaxed" style={{ fontSize: "var(--chat-font-size)" }}>
           {thinking}
         </pre>
       )}
@@ -469,7 +509,7 @@ function Part({ part, index, isUser, messageID, thinkingDone }: { part: ContentP
       ) : (
         <div className="md">
           <ReactMarkdown
-            remarkPlugins={[remarkGfm]}
+            remarkPlugins={[remarkGfm, remarkBreaks]}
             rehypePlugins={[rehypeHighlight]}
           >
             {part.Text}

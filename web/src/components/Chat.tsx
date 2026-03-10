@@ -95,7 +95,7 @@ function QueuedMessageItem({
               </button>
               <button
                 onClick={save}
-                className="px-3 py-1 text-xs bg-accent-fill text-white/90 rounded-lg hover:opacity-90 transition-opacity"
+                className="px-3 py-1 text-xs btn-primary"
               >
                 Save
               </button>

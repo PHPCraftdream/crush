@@ -90,13 +90,13 @@ function SlashMenu({ items, selectedIdx, onSelect }: SlashMenuProps) {
             }}
             className={`w-full text-left px-4 py-2.5 flex items-center gap-3 transition-colors border-b border-surface/50 last:border-0 ${
               i === selectedIdx
-                ? "bg-accent/10"
-                : "hover:bg-base-subtle"
+                ? "bg-accent/20 border-l-2 border-l-accent pl-[14px]"
+                : "hover:bg-base-subtle border-l-2 border-l-transparent pl-[14px]"
             }`}
           >
             <div className="flex-1 min-w-0">
               <div className="flex items-center gap-2">
-                <span className="font-semibold text-text text-sm">/{skill.name}</span>
+                <span className={`font-semibold text-sm ${i === selectedIdx ? "text-accent" : "text-text"}`}>/{skill.name}</span>
                 {skill.source && (
                   <span className={`text-[10px] px-1.5 py-0.5 rounded font-mono font-medium ${sourceBadgeClass(skill.source)}`}>
                     {skill.source}
@@ -258,7 +258,7 @@ export function ChatInput() {
       }
     }
 
-    if (e.key === "Enter" && !e.shiftKey) {
+    if (e.key === "Enter" && !e.shiftKey && !e.ctrlKey) {
       e.preventDefault();
       send();
     }
@@ -355,7 +355,7 @@ export function ChatInput() {
             disabled={!activeSessionID}
             autoFocus
             rows={1}
-            className="flex-1 bg-transparent border-none outline-none resize-none text-text text-[16px] leading-relaxed min-h-[28px] max-h-80 overflow-y-auto disabled:cursor-not-allowed placeholder:text-text-subtle font-medium"
+            className="flex-1 bg-transparent border-none outline-none resize-none text-text leading-relaxed min-h-[28px] max-h-80 overflow-y-auto disabled:cursor-not-allowed placeholder:text-text-subtle font-medium" style={{ fontSize: "var(--chat-font-size)" }}
           />
           <div className="flex items-center gap-2 shrink-0">
             <input
@@ -392,7 +392,7 @@ export function ChatInput() {
               className={`font-bold rounded-xl px-5 py-2.5 text-sm disabled:opacity-30 active:scale-95 transition-all shadow-sm flex items-center gap-2 ${
                 agentBusy
                   ? "bg-base-overlay border border-surface text-text-subtle hover:border-accent/50 hover:text-text"
-                  : "bg-accent-fill text-white/90 hover:opacity-90"
+                  : "btn-primary"
               }`}
             >
               {agentBusy ? (
@@ -411,7 +411,7 @@ export function ChatInput() {
         </div>
       </div>
       <p className="text-center text-text-subtle text-sm mt-3 font-medium">
-        Shift+Enter for newline · Drop files to attach
+        Shift+Enter / Ctrl+Enter for newline · Drop files to attach
       </p>
     </div>
   );

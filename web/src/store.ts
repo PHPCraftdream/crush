@@ -100,6 +100,7 @@ export function setActiveSession(id: string | null) {
   $agentError.set(null);
   if (id) {
     window.location.hash = `#/${id}`;
+    restoreYoloForSession(id);
   } else {
     window.location.hash = "";
   }
@@ -226,6 +227,15 @@ export function setTheme(theme: "light" | "dark") {
 
 // ── Yolo mode ────────────────────────────────────────────────────────────────
 const STORAGE_KEY_YOLO = "crush_yolo";
+const STORAGE_KEY_YOLO_SESSIONS = "crush_yolo_sessions";
+
+function loadYoloSessions(): Record<string, boolean> {
+  try {
+    return JSON.parse(localStorage.getItem(STORAGE_KEY_YOLO_SESSIONS) ?? "{}");
+  } catch {
+    return {};
+  }
+}
 
 function loadYolo(): boolean {
   try {
@@ -238,6 +248,22 @@ function loadYolo(): boolean {
 export const $yolo = atom<boolean>(loadYolo());
 
 export function setYolo(enabled: boolean) {
+  $yolo.set(enabled);
+  localStorage.setItem(STORAGE_KEY_YOLO, String(enabled));
+  ws.send("set_yolo", { enabled });
+  // Persist per-session
+  const sessionID = $activeSessionID.get();
+  if (sessionID) {
+    const map = loadYoloSessions();
+    map[sessionID] = enabled;
+    localStorage.setItem(STORAGE_KEY_YOLO_SESSIONS, JSON.stringify(map));
+  }
+}
+
+export function restoreYoloForSession(sessionID: string) {
+  const map = loadYoloSessions();
+  if (!(sessionID in map)) return; // no saved preference — keep current state
+  const enabled = map[sessionID];
   $yolo.set(enabled);
   localStorage.setItem(STORAGE_KEY_YOLO, String(enabled));
   ws.send("set_yolo", { enabled });

@@ -1,22 +1,27 @@
+import { createPortal } from "react-dom";
 import { useStore } from "@nanostores/react";
-import { $permissions, removePermission } from "../store";
+import { $permissions, $activeSessionID, removePermission, setYolo } from "../store";
 import { ws } from "../ws";
 import type { PermissionRequest } from "../types";
+import { Zap } from "lucide-react";
 
 export function PermissionDialog() {
   const permissions = useStore($permissions);
   if (permissions.length === 0) return null;
 
-  return (
-    <div className="fixed bottom-20 left-1/2 -translate-x-1/2 w-[min(600px,90vw)] flex flex-col gap-2 z-50">
+  return createPortal(
+    <div className="fixed bottom-24 left-1/2 -translate-x-1/2 w-[min(600px,90vw)] flex flex-col gap-2 z-[9999]">
       {permissions.map((p) => (
         <PermissionCard key={p.ToolCallID} perm={p} />
       ))}
-    </div>
+    </div>,
+    document.body
   );
 }
 
 function PermissionCard({ perm }: { perm: PermissionRequest }) {
+  const activeSessionID = useStore($activeSessionID);
+
   function grant(persistent: boolean) {
     ws.send(persistent ? "grant_permission_persistent" : "grant_permission", {
       permissionID: perm.ID,
@@ -27,6 +32,14 @@ function PermissionCard({ perm }: { perm: PermissionRequest }) {
   function deny() {
     ws.send("deny_permission", { permissionID: perm.ID });
     removePermission(perm.ToolCallID);
+  }
+
+  function goYolo() {
+    // Enable yolo for this session — grants current request and auto-approves all future ones
+    if (activeSessionID) {
+      setYolo(true);
+    }
+    grant(false);
   }
 
   return (
@@ -61,6 +74,14 @@ function PermissionCard({ perm }: { perm: PermissionRequest }) {
           className="bg-green text-base font-semibold rounded px-3 py-1 text-sm hover:opacity-90 transition-opacity"
         >
           Allow always
+        </button>
+        <button
+          onClick={goYolo}
+          className="flex items-center gap-1.5 bg-yellow/20 border border-yellow/40 text-yellow font-semibold rounded px-3 py-1 text-sm hover:bg-yellow/30 transition-colors"
+          title="Enable Yolo mode — all future permissions auto-approved"
+        >
+          <Zap size={13} />
+          Yolo
         </button>
       </div>
     </div>

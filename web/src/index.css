@@ -6,6 +6,8 @@
    Light theme (default)
    ───────────────────────────────────────────────────────────────────────── */
 :root {
+  --chat-font-size: 20px;
+
   --color-canvas:       #ffffff;
   --color-base-subtle:  #f8fafc;
   --color-base-overlay: #f1f5f9;
@@ -57,18 +59,25 @@
 }
 
 @layer components {
-  /* Markdown content */
-  .md { @apply text-[17px] leading-[1.65]; }
-  .md h1 { @apply mt-8 mb-4 text-3xl text-text font-bold; }
-  .md h2 { @apply mt-7 mb-3 text-2xl text-text font-semibold; }
-  .md h3 { @apply mt-6 mb-3 text-xl text-text font-semibold; }
-  .md h4 { @apply mt-5 mb-2 text-lg text-text font-semibold; }
-  .md p { @apply my-3 leading-[1.65]; }
+  /* Global chat font — applies to all modal/panel content */
+  .chat-font { font-size: var(--chat-font-size); }
+  .chat-font * { font-size: inherit; }
+
+  /* Markdown content — all font sizes inherit --chat-font-size, no overrides */
+  .md { font-size: var(--chat-font-size); line-height: 1.65; }
+  .md * { font-size: inherit; }
+  .md h1 { @apply mt-8 mb-4 text-text font-bold; font-size: 1.75em; }
+  .md h2 { @apply mt-7 mb-3 text-text font-semibold; font-size: 1.5em; }
+  .md h3 { @apply mt-6 mb-3 text-text font-semibold; font-size: 1.25em; }
+  .md h4 { @apply mt-5 mb-2 text-text font-semibold; font-size: 1.1em; }
+  .md p { @apply my-3; line-height: 1.65; }
   .md pre {
-    @apply bg-base-overlay border border-surface rounded-xl p-5 overflow-x-auto my-4 font-mono text-[15px] leading-relaxed;
+    @apply bg-base-overlay border border-surface rounded-xl p-5 overflow-x-auto my-4 font-mono leading-relaxed;
+    font-size: var(--chat-font-size);
   }
   .md code:not(pre code) {
-    @apply bg-base-overlay border border-surface px-1.5 py-0.5 rounded text-[0.9em] font-mono text-text;
+    @apply bg-base-overlay border border-surface px-1.5 py-0.5 rounded font-mono text-text;
+    font-size: inherit;
   }
   .md ul { @apply pl-7 my-3 list-disc; }
   .md ol { @apply pl-7 my-3 list-decimal; }
@@ -77,7 +86,7 @@
     @apply my-4 pl-5 border-l-4 text-text-muted italic;
     border-color: color-mix(in srgb, var(--color-accent) 30%, transparent);
   }
-  .md table { @apply border-collapse w-full my-4 text-[15px]; }
+  .md table { @apply border-collapse w-full my-4; font-size: var(--chat-font-size); }
   .md th { @apply border border-surface bg-base-overlay px-4 py-2.5 text-left font-semibold; }
   .md td { @apply border border-surface px-4 py-2.5; }
   .md a {
@@ -89,7 +98,19 @@
 
   /* Tool call / result blocks */
   .tool-block {
-    @apply my-3 px-5 py-4 bg-base-subtle border border-surface rounded-xl text-[15px] font-mono leading-relaxed;
+    @apply my-3 px-5 py-4 bg-base-subtle border border-surface rounded-xl font-mono leading-relaxed;
+    font-size: var(--chat-font-size);
+  }
+
+  /* Primary action button — vivid on light, muted on dark */
+  .btn-primary {
+    @apply font-semibold rounded-lg transition-opacity hover:opacity-90 active:scale-[0.97];
+    background-color: var(--color-accent-fill);
+    color: rgb(255 255 255 / 0.9);
+  }
+  .dark .btn-primary {
+    background-color: color-mix(in srgb, var(--color-accent) 20%, transparent);
+    color: var(--color-accent);
   }
 }
 

@@ -75,7 +75,11 @@ export function Sidebar() {
     <aside className="w-80 bg-base-subtle border-r border-surface flex flex-col overflow-hidden shrink-0">
       {/* Header */}
       <div className="flex items-center justify-between px-6 py-5 border-b border-surface">
-        <span className="text-xl font-black text-accent tracking-tighter">crush</span>
+        <div className="flex flex-col gap-0.5">
+          <span className="text-xl font-black text-accent tracking-tighter">Crush~</span>
+          <span className="text-[10px] text-text-subtle font-mono opacity-60">#{__GIT_COUNT__} · {__GIT_COMMIT__}</span>
+          <span className="text-[10px] text-text-subtle font-mono opacity-50">{__GIT_BRANCH__}</span>
+        </div>
         <button
           onClick={newSession}
           title="New session"
@@ -114,44 +118,46 @@ export function Sidebar() {
                     : "hover:bg-canvas/50 border border-transparent"
                 }`}
               >
-                <div className="flex items-center gap-3 pr-12">
-                  {isBusy && (
-                    <span className="w-2 h-2 rounded-full bg-accent shrink-0 animate-pulse" />
+                <div className={`flex items-start gap-3 ${!isEditing ? "pr-12" : ""}`}>
+                  {isBusy && !isEditing && (
+                    <span className="w-2 h-2 rounded-full bg-accent shrink-0 animate-pulse mt-2" />
                   )}
                   {isEditing ? (
-                    <div className="flex-1 flex items-center gap-1.5 min-w-0">
+                    <div className="flex-1 flex flex-col gap-1.5 min-w-0" onClick={(e) => e.stopPropagation()}>
                       <input
                         ref={inputRef}
                         value={editTitle}
                         onChange={(e) => setEditTitle(e.target.value)}
                         onBlur={saveRename}
                         onKeyDown={handleKeyDown}
-                        className="text-base font-medium w-full bg-canvas border border-accent rounded-lg px-2 py-1 outline-none shadow-sm"
-                        onClick={(e) => e.stopPropagation()}
+                        className="font-medium w-full bg-canvas border border-accent rounded-lg px-2 py-1 outline-none shadow-sm"
+                        style={{ fontSize: "var(--chat-font-size)" }}
                       />
-                      <button
-                        onClick={(e) => { e.stopPropagation(); saveRename(); }}
-                        title="Save"
-                        className="w-7 h-7 flex items-center justify-center rounded-lg bg-accent-fill text-white/90 hover:bg-accent/90 shrink-0 shadow-sm"
-                      >
-                        <Check size={14} />
-                      </button>
-                      <button
-                        onClick={(e) => { e.stopPropagation(); setEditingID(null); }}
-                        title="Cancel"
-                        className="w-7 h-7 flex items-center justify-center rounded-lg bg-base-overlay text-text-subtle hover:text-text shrink-0 border border-surface"
-                      >
-                        <X size={14} />
-                      </button>
+                      <div className="flex gap-1.5">
+                        <button
+                          onClick={(e) => { e.stopPropagation(); saveRename(); }}
+                          title="Save (Enter)"
+                          className="flex items-center gap-1 px-2 py-1 rounded-lg btn-primary text-xs font-semibold"
+                        >
+                          <Check size={12} /> Save
+                        </button>
+                        <button
+                          onClick={(e) => { e.stopPropagation(); setEditingID(null); }}
+                          title="Cancel (Esc)"
+                          className="flex items-center gap-1 px-2 py-1 rounded-lg bg-base-overlay text-text-subtle hover:text-text border border-surface text-xs"
+                        >
+                          <X size={12} /> Cancel
+                        </button>
+                      </div>
                     </div>
                   ) : (
-                    <div className={`text-base font-semibold truncate ${isActive ? "text-accent" : "text-text"}`}>
+                    <div className={`font-semibold ${isActive ? "text-accent" : "text-text"}`} style={{ fontSize: "var(--chat-font-size)" }}>
                       {s.Title || "Untitled session"}
                     </div>
                   )}
                 </div>
                 {!isEditing && (
-                  <div className="flex items-center gap-2.5 mt-1 text-sm text-text-subtle pl-0 font-medium">
+                  <div className="flex items-center gap-2.5 mt-1 text-text-subtle pl-0 font-medium" style={{ fontSize: "var(--chat-font-size)" }}>
                     <span>{s.MessageCount} msg{s.MessageCount !== 1 ? "s" : ""}</span>
                     {totalTokens > 0 && (
                       <>

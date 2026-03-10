@@ -5,11 +5,12 @@ import { updateTodos } from "../store";
 // ── Status symbol ─────────────────────────────────────────────────────────────
 
 function StatusSymbol({ status }: { status: TodoStatus }) {
+  const s = { fontSize: "var(--chat-font-size)", lineHeight: 1 };
   if (status === "completed")
-    return <span className="text-green text-[15px] leading-none shrink-0">✓</span>;
+    return <span className="text-green shrink-0" style={s}>✓</span>;
   if (status === "in_progress")
-    return <span className="text-accent text-[15px] leading-none shrink-0 animate-pulse">◑</span>;
-  return <span className="text-text-subtle text-[15px] leading-none shrink-0">○</span>;
+    return <span className="text-accent shrink-0 animate-pulse" style={s}>◑</span>;
+  return <span className="text-text-subtle shrink-0" style={s}>○</span>;
 }
 
 function nextStatus(s: TodoStatus): TodoStatus {
@@ -139,14 +140,14 @@ function TodoRow({
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
             onKeyDown={onKey}
-            className="w-full text-sm bg-canvas border border-accent/40 rounded px-1.5 py-0.5 outline-none text-text"
+            className="w-full bg-canvas border border-accent/40 rounded px-1.5 py-0.5 outline-none text-text" style={{ fontSize: "var(--chat-font-size)" }}
           />
         ) : (
           <span
             data-testid="todo-content"
-            className={`text-sm cursor-default select-none block truncate ${
+            className={`cursor-default select-none block truncate ${
               todo.status === "completed" ? "line-through text-text-subtle" : "text-text"
-            }`}
+            }`} style={{ fontSize: "var(--chat-font-size)" }}
           >
             {todo.content}
           </span>
@@ -185,7 +186,7 @@ function AddTaskRow({
 
   return (
     <div className="flex items-center gap-1.5 px-2 py-1.5">
-      <span className="text-text-subtle text-[15px] leading-none shrink-0 w-[58px]">○</span>
+      <span className="text-text-subtle shrink-0" style={{ fontSize: "var(--chat-font-size)", lineHeight: 1 }}>○</span>
       <input
         ref={inputRef}
         value={draft}
@@ -193,7 +194,8 @@ function AddTaskRow({
         onKeyDown={onKey}
         onBlur={commit}
         placeholder="New task…"
-        className="flex-1 min-w-0 text-sm bg-canvas border border-accent/40 rounded px-1.5 py-0.5 outline-none text-text placeholder:text-text-muted"
+        className="flex-1 min-w-0 bg-canvas border border-accent/40 rounded px-1.5 py-0.5 outline-none text-text placeholder:text-text-muted"
+        style={{ fontSize: "var(--chat-font-size)" }}
       />
     </div>
   );
@@ -255,11 +257,11 @@ export function TodoList({ sessionID, todos }: { sessionID: string; todos: Todo[
           <span className={`text-text-subtle text-[11px] transition-transform inline-block ${collapsed ? "" : "rotate-90"}`}>
             ▶
           </span>
-          <span className="text-xs font-semibold text-text-subtle uppercase tracking-wider">
+          <span className="font-semibold text-text-subtle uppercase tracking-wider" style={{ fontSize: "var(--chat-font-size)" }}>
             Tasks
           </span>
           {!isEmpty && (
-            <span className="text-xs text-text-muted ml-1">
+            <span className="text-text-muted ml-1" style={{ fontSize: "var(--chat-font-size)" }}>
               {completed}/{todos.length}
             </span>
           )}
@@ -280,7 +282,7 @@ export function TodoList({ sessionID, todos }: { sessionID: string; todos: Todo[
       {!collapsed && (
         <div className="px-2 pb-2">
           {isEmpty && !addingNew && (
-            <p className="text-xs text-text-muted px-2 py-1">No tasks yet.</p>
+            <p className="text-text-muted px-2 py-1" style={{ fontSize: "var(--chat-font-size)" }}>No tasks yet.</p>
           )}
           {todos.map((t, i) => (
             <TodoRow

@@ -36,7 +36,7 @@ export function ConfirmDialog({
       onClick={onCancel}
     >
       <div
-        className="bg-canvas border border-surface rounded-2xl shadow-2xl w-full max-w-sm overflow-hidden"
+        className="bg-canvas border border-surface rounded-2xl shadow-2xl w-full max-w-sm overflow-hidden chat-font"
         onClick={(e) => e.stopPropagation()}
       >
         {/* icon strip */}

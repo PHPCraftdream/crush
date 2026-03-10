@@ -230,16 +230,16 @@ func (m *Message) IsThinking() bool {
 }
 
 func (m *Message) AppendContent(delta string) {
-	found := false
-	for i, part := range m.Parts {
-		if c, ok := part.(TextContent); ok {
-			m.Parts[i] = TextContent{Text: c.Text + delta}
-			found = true
+	// Only append to the last part if it's a TextContent; otherwise create a new
+	// TextContent. This ensures text that arrives after a tool_call/tool_result
+	// gets its own block rather than being merged into the pre-tool text.
+	if n := len(m.Parts); n > 0 {
+		if c, ok := m.Parts[n-1].(TextContent); ok {
+			m.Parts[n-1] = TextContent{Text: c.Text + delta}
+			return
 		}
 	}
-	if !found {
-		m.Parts = append(m.Parts, TextContent{Text: delta})
-	}
+	m.Parts = append(m.Parts, TextContent{Text: delta})
 }
 
 func (m *Message) AppendReasoningContent(delta string) {
