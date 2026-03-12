@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, useMemo, useCallback } from "react";
 import { useStore } from "@nanostores/react";
-import { CheckCheck, ScrollText, Plug, Sun, Moon, Code2, Settings, ServerCog } from "lucide-react";
+import { CheckCheck, ScrollText, Plug, Sun, Moon, Code2, Settings, ServerCog, FileText, Folder } from "lucide-react";
+import { LogsModal } from "./LogsModal";
 import {
   $sessions,
   $activeSessionID,
@@ -113,7 +114,7 @@ function formatTokens(n: number): string {
   return String(n);
 }
 
-function SessionTitle({ session }: { session: { ID: string; Title: string } | null }) {
+function SessionTitle({ session, cwd }: { session: { ID: string; Title: string } | null; cwd?: string }) {
   const [editing, setEditing] = useState(false);
   const [value, setValue] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
@@ -160,16 +161,24 @@ function SessionTitle({ session }: { session: { ID: string; Title: string } | nu
   }
 
   return (
-    <button
-      onClick={startEdit}
-      title="Click to rename"
-      className="group flex items-center gap-2 text-left min-w-0"
-    >
-      <h1 className="text-lg font-bold text-text truncate">
-        {session.Title || "Untitled session"}
-      </h1>
-      <span className="text-text-subtle opacity-0 group-hover:opacity-100 transition-opacity text-sm shrink-0">✎</span>
-    </button>
+    <div className="flex flex-col gap-1 min-w-0">
+      <button
+        onClick={startEdit}
+        title="Click to rename"
+        className="group flex items-center gap-2 text-left min-w-0"
+      >
+        <h1 className="text-lg font-bold text-text truncate">
+          {session.Title || "Untitled session"}
+        </h1>
+        <span className="text-text-subtle opacity-0 group-hover:opacity-100 transition-opacity text-sm shrink-0">✎</span>
+      </button>
+      {cwd && (
+        <div className="flex items-center gap-1.5 text-xs text-text-subtle truncate" title={cwd}>
+          <Folder size={12} className="shrink-0" />
+          <span className="truncate">{cwd}</span>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -188,6 +197,8 @@ export function Header() {
   const closeSettings = useCallback(() => setShowSettings(false), []);
   const [showProviders, setShowProviders] = useState(false);
   const closeProviders = useCallback(() => setShowProviders(false), []);
+  const [showLogs, setShowLogs] = useState(false);
+  const closeLogs = useCallback(() => setShowLogs(false), []);
 
   const isDark = config?.theme === "dark";
   function toggleTheme() {
@@ -234,7 +245,7 @@ export function Header() {
     <>
     <header className="flex items-center gap-6 px-8 py-6 border-b border-surface bg-canvas shrink-0">
       <div className="flex-1 min-w-0">
-        <SessionTitle session={activeSession} />
+        <SessionTitle session={activeSession} cwd={config?.cwd} />
       </div>
 
       <div className="flex items-center gap-3 shrink-0">
@@ -300,6 +311,15 @@ export function Header() {
         </button>
 
         <button
+          onClick={() => setShowLogs(true)}
+          title="View logs"
+          className="flex items-center gap-1.5 text-xs font-medium rounded-lg px-2.5 py-1.5 border transition-colors bg-base-overlay border-surface text-text-subtle hover:border-accent/50 hover:text-text"
+        >
+          <FileText size={13} />
+          <span>Logs</span>
+        </button>
+
+        <button
           onClick={toggleTheme}
           title={isDark ? "Switch to light theme" : "Switch to dark theme"}
           className="flex items-center justify-center w-8 h-8 rounded-lg border transition-colors bg-base-overlay border-surface text-text-subtle hover:border-accent/50 hover:text-text"
@@ -324,6 +344,7 @@ export function Header() {
     {showLSPSettings && <LSPSettings onClose={closeLSPSettings} />}
     {showSettings && <SettingsModal onClose={closeSettings} />}
     {showProviders && <ProvidersModal onClose={closeProviders} />}
+    {showLogs && <LogsModal onClose={closeLogs} />}}
 </>
   );
 }

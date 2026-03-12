@@ -112,6 +112,8 @@ export function Sidebar() {
                 key={s.ID}
                 onClick={() => selectSession(s.ID)}
                 onDoubleClick={(e) => startEditing(e, s.ID, s.Title)}
+                data-test-id={`session-${s.ID}`}
+                data-session-id={s.ID}
                 className={`group relative px-4 py-4 rounded-xl cursor-pointer transition-all mb-1 ${
                   isActive
                     ? "bg-canvas shadow-sm border border-accent/20"

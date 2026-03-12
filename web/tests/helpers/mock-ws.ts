@@ -87,7 +87,17 @@ export async function sendMockWSMessage(page: Page, msg: MockWSMessage) {
 }
 
 /**
+ * Clears the sent messages array. Useful to wait for NEW messages only.
+ */
+export async function clearWSSent(page: Page) {
+  await page.evaluate(() => {
+    ((window as unknown) as Record<string, unknown>)["__wsSent"] = [];
+  });
+}
+
+/**
  * Polls until the page sends a WS command of the given type.
+ * Returns the LAST matching message (most recent), not the first.
  */
 export async function waitForWSSend(
   page: Page,
@@ -97,7 +107,13 @@ export async function waitForWSSend(
   const handle = await page.waitForFunction(
     (t: string) => {
       const sent = (((window as unknown) as Record<string, unknown>)["__wsSent"] as Array<{ type: string }>) ?? [];
-      return sent.find((m) => m.type === t) ?? null;
+      // Find LAST matching message (most recent)
+      for (let i = sent.length - 1; i >= 0; i--) {
+        if (sent[i].type === t) {
+          return sent[i];
+        }
+      }
+      return null;
     },
     type,
     { timeout }

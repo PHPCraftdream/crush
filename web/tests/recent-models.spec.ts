@@ -19,11 +19,7 @@ test.beforeEach(async ({ page }) => {
   await page.route("/auth/check", (route) =>
     route.fulfill({ status: 200, body: "OK" })
   );
-  // Clear recent models localStorage
-  await page.addInitScript(() => {
-    localStorage.removeItem("crush_recent_models_large");
-    localStorage.removeItem("crush_recent_models_small");
-  });
+  // Note: recent models are now stored on backend only, no localStorage
 });
 
 function multiModelConfig() {

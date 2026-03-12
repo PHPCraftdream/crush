@@ -2,7 +2,7 @@
  * Persistence and restoration tests for settings.
  *
  * Tests that settings are properly saved and restored:
- *  - Per-session YOLO state persists to localStorage and backend
+ *  - Per-session YOLO state persists to backend (DB)
  *  - Per-session YOLO state restored on session switch
  *  - Permission rules persist to backend and are restored
  *  - Permission rules restored when opening modal
@@ -21,39 +21,11 @@ test.beforeEach(async ({ page }) => {
   await page.route("/auth/check", (route) =>
     route.fulfill({ status: 200, body: "OK" })
   );
-  // Clear localStorage before each test
-  await page.addInitScript(() => {
-    localStorage.removeItem("crush_yolo");
-    localStorage.removeItem("crush_yolo_sessions");
-  });
 });
 
-// ── YOLO Persistence (LocalStorage + Backend) ───────────────────────────────────────
+// ── YOLO Persistence (Backend only) ─────────────────────────────────────────
 
-test("per-session YOLO is saved to localStorage with sessionID", async ({ page }) => {
-  await page.goto("/");
-
-  await sendMockWSMessage(page, {
-    type: "sessions_list",
-    payload: [makeSession({ ID: "yolo-save-1", Title: "YOLO Save", YoloEnabled: false })],
-  });
-
-  await page.getByText("YOLO Save").first().click();
-
-  // Enable YOLO
-  await page.locator("header").getByText("Yolo").click();
-  await waitForWSSend(page, "set_yolo");
-
-  // Check localStorage has sessionID
-  const stored = await page.evaluate(() => {
-    const map = localStorage.getItem("crush_yolo_sessions");
-    return map ? JSON.parse(map) : {};
-  });
-
-  expect(stored).toEqual({ "yolo-save-1": true });
-});
-
-test("per-session YOLO state is sent to backend with sessionID", async ({ page }) => {
+test("per-session YOLO is sent to backend with sessionID", async ({ page }) => {
   await page.goto("/");
 
   await sendMockWSMessage(page, {
@@ -72,39 +44,24 @@ test("per-session YOLO state is sent to backend with sessionID", async ({ page }
 test("per-session YOLO is restored when switching sessions", async ({ page }) => {
   await page.goto("/");
 
-  // Pre-populate localStorage
-  await page.addInitScript(() => {
-    localStorage.setItem("crush_yolo_sessions", JSON.stringify({
-      "yolo-restore-a": true,
-      "yolo-restore-b": false,
-    }));
-  });
-
   await sendMockWSMessage(page, {
     type: "sessions_list",
     payload: [
-      makeSession({ ID: "yolo-restore-a", Title: "Session A (YOLO)", YoloEnabled: false }),
+      makeSession({ ID: "yolo-restore-a", Title: "Session A (YOLO)", YoloEnabled: true }),
       makeSession({ ID: "yolo-restore-b", Title: "Session B (no YOLO)", YoloEnabled: false }),
     ],
   });
 
-  // Switch to Session A - should restore YOLO from localStorage
+  // Switch to Session A - should restore YOLO from backend YoloEnabled field
   await page.getByText("Session A (YOLO)").first().click();
   await expect(page.locator("header").getByText("⚡")).toBeVisible({ timeout: 2000 });
 
-  // Verify it sent set_yolo to backend
-  const cmdA = await waitForWSSend(page, "set_yolo");
-  expect((cmdA.payload as { sessionID: string; enabled: boolean }).enabled).toBe(true);
-
-  // Switch to Session B - should restore OFF state
+  // Switch to Session B - should restore OFF state from backend
   await page.getByText("Session B (no YOLO)").first().click();
   await expect(page.locator("header").getByText("🔒")).toBeVisible({ timeout: 2000 });
-
-  const cmdB = await waitForWSSend(page, "set_yolo");
-  expect((cmdB.payload as { enabled: boolean }).enabled).toBe(false);
 });
 
-test("backend YoloEnabled field overrides localStorage on first load", async ({ page }) => {
+test("backend YoloEnabled field is source of truth", async ({ page }) => {
   await page.goto("/");
 
   // Backend says YOLO is ON for this session
@@ -116,11 +73,10 @@ test("backend YoloEnabled field overrides localStorage on first load", async ({ 
   await page.getByText("Override Test").first().click();
 
   // Should show lightning icon from backend field
-  await expect(page.locator("header").getByText("�orry")).not.toBeVisible({ timeout: 1000 });
   await expect(page.locator("header").getByText("⚡")).toBeVisible({ timeout: 2000 });
 });
 
-// ── Permission Rules Persistence ─────────────────────────────────────────────────────
+// ── Permission Rules Persistence ────────────────────────────────────────────
 
 test("permission rules are fetched when modal is opened", async ({ page }) => {
   await page.goto("/");
@@ -178,39 +134,6 @@ test("fetched permission rules are displayed in modal", async ({ page }) => {
 
   await expect(page.getByText("bash")).toBeVisible({ timeout: 2000 });
   await expect(page.getByText("write_file")).toBeVisible();
-});
-
-test("permission rules are cached and not refetched on reopen", async ({ page }) => {
-  await page.goto("/");
-
-  await sendMockWSMessage(page, {
-    type: "sessions_list",
-    payload: [makeSession({ ID: "perm-cache", Title: "Cache Rules", YoloEnabled: false })],
-  });
-
-  await page.getByText("Cache Rules").first().click();
-
-  // First open - should fetch
-  await page.getByRole("button", { name: "Permissions" }).click();
-  await waitForWSSend(page, "list_session_permissions");
-  await page.getByRole("button", { name: "Close" }).click();
-
-  // Second open - should NOT fetch again (cached)
-  // Note: This depends on implementation - adjust if caching behaves differently
-  const fetchCountBefore = await page.evaluate(() => {
-    const sent = (window as unknown as Record<string, unknown>).__wsSent as Array<{ type: string }>;
-    return sent.filter((m) => m.type === "list_session_permissions").length;
-  });
-
-  await page.getByRole("button", { name: "Permissions" }).click();
-
-  const fetchCountAfter = await page.evaluate(() => {
-    const sent = (window as unknown as Record<string, unknown>).__wsSent as Array<{ type: string }>;
-    return sent.filter((m) => m.type === "list_session_permissions").length;
-  });
-
-  // Currently implementation refetches each time - adjust expectation if needed
-  expect(fetchCountAfter).toBeGreaterThanOrEqual(fetchCountBefore);
 });
 
 test("toggling permission rule sends update to backend", async ({ page }) => {
@@ -290,7 +213,7 @@ test("deleting permission rule sends delete to backend", async ({ page }) => {
   expect((cmd.payload as { ruleID: string }).ruleID).toBe("rule-delete-1");
 });
 
-// ── Cross-Session Persistence ───────────────────────────────────────────────────────
+// ── Cross-Session Persistence ────────────────────────────────────────────────
 
 test("permission rules are session-specific", async ({ page }) => {
   await page.goto("/");
@@ -344,9 +267,9 @@ test("permission rules are session-specific", async ({ page }) => {
   await expect(page.getByText("No permission rules set for this session")).toBeVisible({ timeout: 2000 });
 });
 
-// ── Page Reload Persistence ─────────────────────────────────────────────────────────
+// ── Page Reload Persistence ───────────────────────────────────────────────────
 
-test("per-session YOLO survives page reload", async ({ page }) => {
+test("per-session YOLO survives page reload (from backend)", async ({ page }) => {
   await page.goto("/");
 
   await sendMockWSMessage(page, {
@@ -359,14 +282,14 @@ test("per-session YOLO survives page reload", async ({ page }) => {
   // Enable YOLO
   await page.locator("header").getByText("Yolo").click();
   await waitForWSSend(page, "set_yolo");
-  await expect(page.locator("header").getByText("⚡")).toBeVisible({ timeout: 2000 });
 
-  // Verify localStorage
-  const beforeReload = await page.evaluate(() => {
-    const stored = localStorage.getItem("crush_yolo_sessions");
-    return stored ? JSON.parse(stored) : {};
+  // Simulate backend update with new YoloEnabled state
+  await sendMockWSMessage(page, {
+    type: "session_updated",
+    payload: makeSession({ ID: "yolo-reload-persist", Title: "Reload Persist", YoloEnabled: true }),
   });
-  expect(beforeReload).toHaveProperty("yolo-reload-persist", true);
+
+  await expect(page.locator("header").getByText("⚡")).toBeVisible({ timeout: 2000 });
 
   // Reload page
   await setupMockWS(page);
@@ -375,16 +298,16 @@ test("per-session YOLO survives page reload", async ({ page }) => {
     route.fulfill({ status: 200, body: "OK" })
   );
 
-  // Re-send sessions
+  // Re-send sessions with YOLO enabled (from backend)
   await sendMockWSMessage(page, {
     type: "sessions_list",
-    payload: [makeSession({ ID: "yolo-reload-persist", Title: "Reload Persist", YoloEnabled: false })],
+    payload: [makeSession({ ID: "yolo-reload-persist", Title: "Reload Persist", YoloEnabled: true })],
   });
 
   // Click on session again
   await page.getByText("Reload Persist").first().click();
 
-  // YOLO should be restored from localStorage
+  // YOLO should be restored from backend
   await expect(page.locator("header").getByText("⚡")).toBeVisible({ timeout: 3000 });
 });
 
@@ -463,11 +386,10 @@ test("permission rules persist across page reload", async ({ page }) => {
   await expect(page.getByText("/etc/passwd")).toBeVisible();
 });
 
-// ── Settings Sync Between Multiple Clients ───────────────────────────────────────
+// ── Settings Sync Between Multiple Clients ───────────────────────────────────
 
 test("YOLO setting from one client doesn't affect other clients' sessions", async ({ page }) => {
   // This test verifies that settings are truly per-session and per-client
-  // (Would need multi-client testing setup to fully verify)
 
   await page.goto("/");
 
@@ -486,18 +408,18 @@ test("YOLO setting from one client doesn't affect other clients' sessions", asyn
   // Disable YOLO in Session B
   await page.locator("header").getByText("Yolo").click();
   await waitForWSSend(page, "set_yolo");
-  await expect(page.locator("header").getByText("🔒")).toBeVisible({ timeout: 2000 });
 
-  // Verify it was saved for this session
-  const stored = await page.evaluate(() => {
-    const map = localStorage.getItem("crush_yolo_sessions");
-    return map ? JSON.parse(map) : {};
+  // Simulate backend update
+  await sendMockWSMessage(page, {
+    type: "session_updated",
+    payload: makeSession({ ID: "yolo-multi-b", Title: "Multi B", YoloEnabled: false }),
   });
-  expect(stored).toHaveProperty("yolo-multi-b", false);
+
+  await expect(page.locator("header").getByText("🔒")).toBeVisible({ timeout: 2000 });
 
   // Session A should still have its own state
   await page.getByText("Multi A").first().click();
-  // Session A doesn't have YOLO enabled from backend or localStorage
+  // Session A doesn't have YOLO enabled from backend
   await expect(page.locator("header").getByText("🔒")).toBeVisible({ timeout: 2000 });
 });
 

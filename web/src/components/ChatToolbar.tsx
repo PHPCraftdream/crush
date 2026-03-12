@@ -58,6 +58,7 @@ export function ChatToolbar() {
       <button
         onClick={() => activeSessionID && setYolo(activeSessionID, !yolo)}
         title={yolo ? "Yolo ON — all permissions auto-approved" : "Yolo OFF — tool calls require approval"}
+        data-test-id="yolo-button"
         className={`btn-toolbar ${yolo ? "bg-yellow/10 border-yellow/30 text-yellow hover:bg-yellow/20" : ""}`}
       >
         {yolo ? <Zap size={13} /> : <ShieldOff size={13} />}

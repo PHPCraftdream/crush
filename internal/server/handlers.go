@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"slices"
+	"strings"
 	"time"
 
 	appPkg "github.com/charmbracelet/crush/internal/app"
@@ -64,6 +66,8 @@ func handleIncoming(ctx context.Context, a *appPkg.App, c *Client, raw []byte) {
 		go handleDeletePermissionRule(a, c, msg)
 	case CmdGetConfig:
 		go handleGetConfig(a, c, msg)
+	case CmdGetLogs:
+		go handleGetLogs(a, c, msg)
 	case CmdSetTheme:
 		go handleSetTheme(a, c, msg)
 	case CmdRenameSession:
@@ -694,6 +698,7 @@ func buildConfigWire(a *appPkg.App) (ConfigWire, bool) {
 	}
 
 	wire.Version = version.FullVersion()
+	wire.CWD = cfg.WorkingDir()
 
 	return wire, true
 }
@@ -705,6 +710,50 @@ func handleGetConfig(a *appPkg.App, c *Client, msg WSMessage) {
 		return
 	}
 	c.reply(msg.ID, EventConfig, wire, "")
+}
+
+func handleGetLogs(a *appPkg.App, c *Client, msg WSMessage) {
+	var p GetLogsPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		c.reply(msg.ID, EventError, nil, "invalid payload")
+		return
+	}
+
+	// Get log file path
+	logPath := a.Config().LogPath()
+	if logPath == "" {
+		c.reply(msg.ID, EventError, nil, "log path not configured")
+		return
+	}
+
+	// Read last N lines from log file
+	logs, err := readLastNLines(logPath, p.Lines)
+	if err != nil {
+		slog.Error("Failed to read log file", "path", logPath, "error", err)
+		c.reply(msg.ID, EventError, nil, fmt.Sprintf("failed to read logs: %v", err))
+		return
+	}
+
+	c.reply(msg.ID, EventLogs, logs, "")
+}
+
+// readLastNLines reads the last N lines from a file (0 = all lines)
+func readLastNLines(path string, n int) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+
+	if n <= 0 {
+		return string(data), nil
+	}
+
+	lines := strings.Split(string(data), "\n")
+	if len(lines) <= n {
+		return strings.Join(lines, "\n"), nil
+	}
+
+	return strings.Join(lines[len(lines)-n:], "\n"), nil
 }
 
 func handleSetProviderKey(a *appPkg.App, c *Client, msg WSMessage) {

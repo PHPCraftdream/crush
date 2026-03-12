@@ -1,19 +1,18 @@
 /**
- * Per-session YOLO mode tests (append to existing yolo.spec.ts).
+ * Per-session YOLO mode tests.
  *
- * Additional tests for session-specific YOLO feature (commit 6a39c56e):
+ * Tests for session-specific YOLO feature:
  *  - set_yolo sends sessionID with active session
  *  - Different sessions can have different YOLO states
- *  - YOLO state persists per session
- *  - Session YoloEnabled field from backend
- *  - Per-session YOLO in localStorage
+ *  - YOLO state persists per session (backend DB)
+ *  - Session YoloEnabled field from backend is source of truth
+ *  - Permission auto-grant works with per-session YOLO
  *
  * @since 2026-03-12
- * Add this to the existing web/tests/yolo.spec.ts file
  */
 
 import { test, expect } from "@playwright/test";
-import { setupMockWS, sendMockWSMessage, waitForWSSend } from "./helpers/mock-ws";
+import { setupMockWS, sendMockWSMessage, waitForWSSend, clearWSSent } from "./helpers/mock-ws";
 import { makeSession } from "./helpers/fixtures";
 
 test.beforeEach(async ({ page }) => {
@@ -21,26 +20,43 @@ test.beforeEach(async ({ page }) => {
   await page.route("/auth/check", (route) =>
     route.fulfill({ status: 200, body: "OK" })
   );
-  // Clear all localStorage for clean state
-  await page.addInitScript(() => {
-    localStorage.removeItem("crush_yolo");
-    localStorage.removeItem("crush_yolo_sessions");
-  });
 });
 
-// ── Per-Session YOLO State ──────────────────────────────────────────────────────────
+async function activateSession(page: import("@playwright/test").Page, sessionID: string, sessionTitle: string) {
+  // Send sessions list
+  await sendMockWSMessage(page, {
+    type: "sessions_list",
+    payload: [makeSession({ ID: sessionID, Title: sessionTitle, YoloEnabled: false })],
+  });
+
+  // Click session in sidebar using data-test-id
+  await page.locator(`[data-test-id="session-${sessionID}"]`).click();
+
+  // Wait for load_messages to be sent (this confirms session activation)
+  await waitForWSSend(page, "load_messages");
+
+  // Send empty messages list to complete activation
+  await sendMockWSMessage(page, {
+    type: "messages_list",
+    payload: [],
+  });
+
+  // Wait for ChatToolbar to be visible (it has Yolo button)
+  await expect(page.locator('[data-test-id="yolo-button"]')).toBeVisible({ timeout: 3000 });
+}
+
+// ── Per-Session YOLO State ───────────────────────────────────────────────────
 
 test("set_yolo command includes sessionID when session is active", async ({ page }) => {
   await page.goto("/");
-  await sendMockWSMessage(page, {
-    type: "sessions_list",
-    payload: [makeSession({ ID: "yolo-sess-1", Title: "Yolo Session 1", YoloEnabled: false })],
-  });
-  await expect(page.getByText("Yolo Session 1").first()).toBeVisible({ timeout: 3000 });
-  await page.getByText("Yolo Session 1").first().click();
+
+  // Activate session
+  await activateSession(page, "yolo-sess-1", "Yolo Session 1");
 
   // Enable YOLO
-  await page.locator("header").getByText("Yolo").first().click();
+  const yoloBtn = page.locator('[data-test-id="yolo-button"]').first();
+  await clearWSSent(page);  // Clear any previous set_yolo messages
+  await yoloBtn.click();
   const cmd = await waitForWSSend(page, "set_yolo");
 
   expect(cmd.payload).toHaveProperty("sessionID", "yolo-sess-1");
@@ -49,6 +65,8 @@ test("set_yolo command includes sessionID when session is active", async ({ page
 
 test("different sessions can have different YOLO states", async ({ page }) => {
   await page.goto("/");
+
+  // Activate Session A (YOLO off)
   await sendMockWSMessage(page, {
     type: "sessions_list",
     payload: [
@@ -56,19 +74,36 @@ test("different sessions can have different YOLO states", async ({ page }) => {
       makeSession({ ID: "yolo-sess-b", Title: "Session B", YoloEnabled: true }),
     ],
   });
-  await expect(page.getByText("Session A")).toBeVisible({ timeout: 3000 });
+
+  await page.locator('[data-test-id="session-yolo-sess-a"]').click();
+  await waitForWSSend(page, "load_messages");
+  await sendMockWSMessage(page, { type: "messages_list", payload: [] });
+
+  const yoloBtn = page.locator('[data-test-id="yolo-button"]').first();
+  await expect(yoloBtn).toBeVisible({ timeout: 3000 });
 
   // Enable YOLO in Session A
-  await page.getByText("Session A").first().click();
-  await page.locator("header").getByText("Yolo").first().click();
+  await clearWSSent(page);  // Clear any previous set_yolo messages
+  await yoloBtn.click();
   await waitForWSSend(page, "set_yolo");
-  await expect(page.locator("header").getByText("⚡")).toBeVisible({ timeout: 2000 });
+
+  // Simulate backend update
+  await sendMockWSMessage(page, {
+    type: "session_updated",
+    payload: makeSession({ ID: "yolo-sess-a", Title: "Session A", YoloEnabled: true }),
+  });
+
+  // Check YOLO button has active class (yellow background)
+  await expect(yoloBtn).toHaveClass(/bg-yellow/, { timeout: 2000 });
 
   // Switch to Session B (which has YOLO enabled from backend)
-  await page.getByText("Session B").first().click();
+  await page.locator('[data-test-id="session-yolo-sess-b"]').click();
+  await waitForWSSend(page, "load_messages");
+  await sendMockWSMessage(page, { type: "messages_list", payload: [] });
 
+  const yoloBtn2 = page.locator('[data-test-id="yolo-button"]').first();
   // Session B should also show YOLO active (from its YoloEnabled state)
-  await expect(page.locator("header").getByText("⚡")).toBeVisible({ timeout: 2000 });
+  await expect(yoloBtn2).toHaveClass(/bg-yellow/, { timeout: 2000 });
 });
 
 test("switching sessions updates YOLO state based on session", async ({ page }) => {
@@ -84,122 +119,38 @@ test("switching sessions updates YOLO state based on session", async ({ page }) 
   });
 
   // Start with Session A (YOLO off)
-  await page.getByText("Session A (YOLO OFF)").click();
-  await expect(page.locator("header").getByText("🔒")).toBeVisible({ timeout: 2000 });
+  await page.locator('[data-test-id="session-yolo-switch-a"]').click();
+  await waitForWSSend(page, "load_messages");
+  await sendMockWSMessage(page, { type: "messages_list", payload: [] });
+
+  const yoloBtn = page.locator('[data-test-id="yolo-button"]').first();
+  await expect(yoloBtn).toBeVisible({ timeout: 3000 });
+
+  // YOLO button should NOT have active class
+  await expect(yoloBtn).not.toHaveClass(/bg-yellow/, { timeout: 2000 });
 
   // Switch to Session B (YOLO on)
-  await page.getByText("Session B (YOLO ON)").click();
-  await expect(page.locator("header").getByText("⚡")).toBeVisible({ timeout: 2000 });
+  await page.locator('[data-test-id="session-yolo-switch-b"]').click();
+  await waitForWSSend(page, "load_messages");
+  await sendMockWSMessage(page, { type: "messages_list", payload: [] });
+
+  const yoloBtn2 = page.locator('[data-test-id="yolo-button"]').first();
+  // YOLO button should have active class
+  await expect(yoloBtn2).toHaveClass(/bg-yellow/, { timeout: 2000 });
 
   // Switch back to Session A
-  await page.getByText("Session A (YOLO OFF)").click();
-  await expect(page.locator("header").getByText("🔒")).toBeVisible({ timeout: 2000 });
+  await page.locator('[data-test-id="session-yolo-switch-a"]').click();
+  await waitForWSSend(page, "load_messages");
+  await sendMockWSMessage(page, { type: "messages_list", payload: [] });
+
+  const yoloBtn3 = page.locator('[data-test-id="yolo-button"]').first();
+  // YOLO button should NOT have active class
+  await expect(yoloBtn3).not.toHaveClass(/bg-yellow/, { timeout: 2000 });
 });
 
-// ── Per-Session YOLO Persistence ───────────────────────────────────────────────────
+// ── Backend YoloEnabled Field ─────────────────────────────────────────────────
 
-test("YOLO state is stored per session in localStorage", async ({ page }) => {
-  await page.goto("/");
-
-  await sendMockWSMessage(page, {
-    type: "sessions_list",
-    payload: [
-      makeSession({ ID: "yolo-persist-1", Title: "Persist Session 1", YoloEnabled: false }),
-      makeSession({ ID: "yolo-persist-2", Title: "Persist Session 2", YoloEnabled: false }),
-    ],
-  });
-
-  // Enable YOLO in Session 1
-  await page.getByText("Persist Session 1").first().click();
-  await page.locator("header").getByText("Yolo").first().click();
-  await waitForWSSend(page, "set_yolo");
-
-  // Check localStorage
-  const yoloSessions = await page.evaluate(() => {
-    const stored = localStorage.getItem("crush_yolo_sessions");
-    return stored ? JSON.parse(stored) : {};
-  });
-
-  expect(yoloSessions).toHaveProperty("yolo-persist-1", true);
-  expect(yoloSessions).not.toHaveProperty("yolo-persist-2");
-});
-
-test("switching sessions restores YOLO state from localStorage", async ({ page }) => {
-  await page.goto("/");
-
-  // Pre-populate localStorage with different YOLO states
-  await page.addInitScript(() => {
-    localStorage.setItem("crush_yolo_sessions", JSON.stringify({
-      "yolo-restore-a": true,
-      "yolo-restore-b": false,
-    }));
-  });
-
-  await sendMockWSMessage(page, {
-    type: "sessions_list",
-    payload: [
-      makeSession({ ID: "yolo-restore-a", Title: "Session A (should be YOLO)", YoloEnabled: false }),
-      makeSession({ ID: "yolo-restore-b", Title: "Session B (should not)", YoloEnabled: false }),
-    ],
-  });
-
-  // Switch to Session A - should restore YOLO ON
-  await page.getByText("Session A (should be YOLO)").click();
-  await expect(page.locator("header").getByText("⚡")).toBeVisible({ timeout: 2000 });
-
-  // Switch to Session B - should restore YOLO OFF
-  await page.getByText("Session B (should not)").click();
-  await expect(page.locator("header").getByText("🔒")).toBeVisible({ timeout: 2000 });
-});
-
-test("YOLO state persists across page reload per session", async ({ page }) => {
-  await page.goto("/");
-
-  await sendMockWSMessage(page, {
-    type: "sessions_list",
-    payload: [
-      makeSession({ ID: "yolo-reload-1", Title: "Reload Session", YoloEnabled: false }),
-    ],
-  });
-
-  // Enable YOLO
-  await page.getByText("Reload Session").first().click();
-  await page.locator("header").getByText("Yolo").first().click();
-  await waitForWSSend(page, "set_yolo");
-  await expect(page.locator("header").getByText("⚡")).toBeVisible({ timeout: 2000 });
-
-  // Verify localStorage
-  const beforeReload = await page.evaluate(() => {
-    const stored = localStorage.getItem("crush_yolo_sessions");
-    return stored ? JSON.parse(stored) : {};
-  });
-  expect(beforeReload).toHaveProperty("yolo-reload-1", true);
-
-  // Reload page
-  await setupMockWS(page);
-  await page.reload();
-  await page.route("/auth/check", (route) =>
-    route.fulfill({ status: 200, body: "OK" })
-  );
-
-  // Re-send sessions (simulating backend response)
-  await sendMockWSMessage(page, {
-    type: "sessions_list",
-    payload: [
-      makeSession({ ID: "yolo-reload-1", Title: "Reload Session", YoloEnabled: false }),
-    ],
-  });
-
-  // Click on session again
-  await page.getByText("Reload Session").first().click();
-
-  // YOLO should still be ON (restored from localStorage)
-  await expect(page.locator("header").getByText("⚡")).toBeVisible({ timeout: 3000 });
-});
-
-// ── Backend YoloEnabled Field ────────────────────────────────────────────────────────
-
-test("session with YoloEnabled=true from backend shows lightning icon", async ({ page }) => {
+test("session with YoloEnabled=true from backend shows active YOLO button", async ({ page }) => {
   await page.goto("/");
 
   await sendMockWSMessage(page, {
@@ -207,13 +158,17 @@ test("session with YoloEnabled=true from backend shows lightning icon", async ({
     payload: [makeSession({ ID: "yolo-backend-on", Title: "YOLO Session", YoloEnabled: true })],
   });
 
-  await expect(page.getByText("YOLO Session").first()).toBeVisible({ timeout: 3000 });
+  // Click session to activate
+  await page.locator('button:has-text("YOLO Session")').first().click();
+  await waitForWSSend(page, "load_messages");
+  await sendMockWSMessage(page, { type: "messages_list", payload: [] });
 
-  // Should show lightning icon from backend field (session is auto-activated)
-  await expect(page.locator("header").getByText("⚡")).toBeVisible({ timeout: 2000 });
+  const yoloBtn = page.locator('[data-test-id="yolo-button"]').first();
+  // YOLO button should have active class
+  await expect(yoloBtn).toHaveClass(/bg-yellow/, { timeout: 2000 });
 });
 
-test("session with YoloEnabled=false from backend shows lock icon", async ({ page }) => {
+test("session with YoloEnabled=false from backend shows inactive YOLO button", async ({ page }) => {
   await page.goto("/");
 
   await sendMockWSMessage(page, {
@@ -221,10 +176,14 @@ test("session with YoloEnabled=false from backend shows lock icon", async ({ pag
     payload: [makeSession({ ID: "yolo-backend-off", Title: "No YOLO Session", YoloEnabled: false })],
   });
 
-  await expect(page.getByText("No YOLO Session").first()).toBeVisible({ timeout: 3000 });
+  // Click session to activate
+  await page.locator('button:has-text("No YOLO Session")').first().click();
+  await waitForWSSend(page, "load_messages");
+  await sendMockWSMessage(page, { type: "messages_list", payload: [] });
 
-  // Should show lock icon (session is auto-activated)
-  await expect(page.locator("header").getByText("🔒")).toBeVisible({ timeout: 2000 });
+  const yoloBtn = page.locator('[data-test-id="yolo-button"]').first();
+  // YOLO button should NOT have active class
+  await expect(yoloBtn).not.toHaveClass(/bg-yellow/, { timeout: 2000 });
 });
 
 test("session_updated event with YoloEnabled change updates UI", async ({ page }) => {
@@ -235,8 +194,13 @@ test("session_updated event with YoloEnabled change updates UI", async ({ page }
     payload: [makeSession({ ID: "yolo-update", Title: "Update YOLO", YoloEnabled: false })],
   });
 
-  await page.getByText("Update YOLO").first().click();
-  await expect(page.locator("header").getByText("🔒")).toBeVisible({ timeout: 2000 });
+  await page.locator('button:has-text("Update YOLO")').first().click();
+  await waitForWSSend(page, "load_messages");
+  await sendMockWSMessage(page, { type: "messages_list", payload: [] });
+
+  const yoloBtn = page.locator('[data-test-id="yolo-button"]').first();
+  // YOLO button should NOT have active class
+  await expect(yoloBtn).not.toHaveClass(/bg-yellow/, { timeout: 2000 });
 
   // Backend updates YOLO state
   await sendMockWSMessage(page, {
@@ -244,11 +208,11 @@ test("session_updated event with YoloEnabled change updates UI", async ({ page }
     payload: makeSession({ ID: "yolo-update", Title: "Update YOLO", YoloEnabled: true }),
   });
 
-  // UI should update to show lightning icon
-  await expect(page.locator("header").getByText("⚡")).toBeVisible({ timeout: 2000 });
+  // UI should update to show active YOLO button
+  await expect(yoloBtn).toHaveClass(/bg-yellow/, { timeout: 2000 });
 });
 
-// ── Permission Auto-Grant with Per-Session YOLO ───────────────────────────────────
+// ── Permission Auto-Grant with Per-Session YOLO ─────────────────────────────
 
 test("permission_request is auto-granted when session YOLO is enabled", async ({ page }) => {
   await page.goto("/");
@@ -258,7 +222,9 @@ test("permission_request is auto-granted when session YOLO is enabled", async ({
     payload: [makeSession({ ID: "yolo-perm", Title: "YOLO Perm Session", YoloEnabled: true })],
   });
 
-  await page.getByText("YOLO Perm Session").first().click();
+  await page.locator('button:has-text("YOLO Perm Session")').first().click();
+  await waitForWSSend(page, "load_messages");
+  await sendMockWSMessage(page, { type: "messages_list", payload: [] });
 
   // Send permission request
   await sendMockWSMessage(page, {
@@ -298,7 +264,9 @@ test("permission_request shows dialog when session YOLO is disabled", async ({ p
     payload: [makeSession({ ID: "yolo-no-perm", Title: "No YOLO Perm", YoloEnabled: false })],
   });
 
-  await page.getByText("No YOLO Perm").first().click();
+  await page.locator('button:has-text("No YOLO Perm")').first().click();
+  await waitForWSSend(page, "load_messages");
+  await sendMockWSMessage(page, { type: "messages_list", payload: [] });
 
   // Send permission request
   await sendMockWSMessage(page, {
@@ -320,7 +288,7 @@ test("permission_request shows dialog when session YOLO is disabled", async ({ p
   await expect(page.getByText("Manual approval needed")).toBeVisible();
 });
 
-// ── Multiple Sessions with Different YOLO States ───────────────────────────────────
+// ── Multiple Sessions with Different YOLO States ───────────────────────────
 
 test("permission request in non-YOLO session while another has YOLO", async ({ page }) => {
   await page.goto("/");
@@ -333,8 +301,10 @@ test("permission request in non-YOLO session while another has YOLO", async ({ p
     ],
   });
 
-  // Active in non-YOLO session
-  await page.getByText("Non-YOLO Session").first().click();
+  // Activate non-YOLO session
+  await page.locator('[data-test-id="session-yolo-multi-b"]').click();
+  await waitForWSSend(page, "load_messages");
+  await sendMockWSMessage(page, { type: "messages_list", payload: [] });
 
   // Send permission for this session
   await sendMockWSMessage(page, {
@@ -353,4 +323,56 @@ test("permission request in non-YOLO session while another has YOLO", async ({ p
 
   // Should show dialog (this session doesn't have YOLO)
   await expect(page.getByText("bash")).toBeVisible({ timeout: 2000 });
+});
+
+// ── YOLO State Persistence Across Page Reload ───────────────────────────────
+
+test("YOLO state persists across page reload (from backend)", async ({ page }) => {
+  await page.goto("/");
+
+  await sendMockWSMessage(page, {
+    type: "sessions_list",
+    payload: [makeSession({ ID: "yolo-reload", Title: "Reload YOLO", YoloEnabled: false })],
+  });
+
+  await page.locator('button:has-text("Reload YOLO")').first().click();
+  await waitForWSSend(page, "load_messages");
+  await sendMockWSMessage(page, { type: "messages_list", payload: [] });
+
+  const yoloBtn = page.locator('[data-test-id="yolo-button"]').first();
+
+  // Enable YOLO
+  await clearWSSent(page);  // Clear any previous set_yolo messages
+  await yoloBtn.click();
+  await waitForWSSend(page, "set_yolo");
+
+  // Simulate backend update
+  await sendMockWSMessage(page, {
+    type: "session_updated",
+    payload: makeSession({ ID: "yolo-reload", Title: "Reload YOLO", YoloEnabled: true }),
+  });
+
+  // YOLO button should have active class
+  await expect(yoloBtn).toHaveClass(/bg-yellow/, { timeout: 2000 });
+
+  // Reload page
+  await setupMockWS(page);
+  await page.reload();
+  await page.route("/auth/check", (route) =>
+    route.fulfill({ status: 200, body: "OK" })
+  );
+
+  // Re-send sessions with YOLO enabled from backend
+  await sendMockWSMessage(page, {
+    type: "sessions_list",
+    payload: [makeSession({ ID: "yolo-reload", Title: "Reload YOLO", YoloEnabled: true })],
+  });
+
+  // Session should be auto-activated on reload
+  await waitForWSSend(page, "load_messages");
+  await sendMockWSMessage(page, { type: "messages_list", payload: [] });
+
+  const yoloBtn2 = page.locator('[data-test-id="yolo-button"]').first();
+  // YOLO should still be ON (restored from backend)
+  await expect(yoloBtn2).toHaveClass(/bg-yellow/, { timeout: 3000 });
 });

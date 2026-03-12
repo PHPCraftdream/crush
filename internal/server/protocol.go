@@ -29,6 +29,7 @@ const (
 	EventSessionsList            = "sessions_list"
 	EventMessagesList            = "messages_list"
 	EventConfig                  = "config"
+	EventLogs                    = "logs"
 	EventResponse                = "response"
 	EventError                   = "error"
 	EventSystemPrompt            = "system_prompt"
@@ -54,6 +55,7 @@ const (
 	CmdUpdatePermissionRule         = "update_permission_rule"
 	CmdDeletePermissionRule         = "delete_permission_rule"
 	CmdGetConfig                    = "get_config"
+	CmdGetLogs                      = "get_logs"
 	CmdSetTheme                     = "set_theme"
 	CmdRenameSession                = "rename_session"
 	CmdSetSessionModels             = "set_session_models"
@@ -386,6 +388,7 @@ type ConfigWire struct {
 	SkillsPaths       []string                  `json:"skillsPaths,omitempty"`
 	InitializeAs      string                    `json:"initializeAs,omitempty"`
 	Version           string                    `json:"version,omitempty"`
+	CWD               string                    `json:"cwd,omitempty"`
 }
 
 // ModelEntryWire represents a selected model entry (large/small/etc).
@@ -414,6 +417,10 @@ type ModelInfoWire struct {
 
 type GetSystemPromptPayload struct {
 	SessionID string `json:"sessionID"`
+}
+
+type GetLogsPayload struct {
+	Lines int `json:"lines,omitempty"` // number of lines from end, 0 for all
 }
 
 type SetSystemPromptPayload struct {

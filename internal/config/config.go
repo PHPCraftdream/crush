@@ -411,6 +411,14 @@ func (c *Config) WorkingDir() string {
 	return c.workingDir
 }
 
+// LogPath returns the path to the log file.
+func (c *Config) LogPath() string {
+	if c.Options == nil || c.Options.DataDirectory == "" {
+		return ""
+	}
+	return filepath.Join(c.Options.DataDirectory, "logs", "crush.log")
+}
+
 // KnownProviders returns all providers from the catwalk catalog, regardless
 // of whether they are configured with an API key.
 func (c *Config) KnownProviders() []catwalk.Provider {
