@@ -257,7 +257,7 @@
   .msg-actions { @apply flex items-center h-7 mt-1; }
 
   /* Wrapper for the always-DOM checkbox (opacity toggled externally) */
-  .msg-checkbox-wrap { @apply flex items-start pt-1 shrink-0 transition-opacity; }
+  .msg-checkbox-wrap { @apply flex items-start pt-1 shrink-0 transition-opacity select-none; }
 
   /* Visual checkbox box */
   .msg-checkbox {
