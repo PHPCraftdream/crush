@@ -74,6 +74,8 @@ func handleIncoming(ctx context.Context, a *appPkg.App, c *Client, raw []byte) {
 		go handleSetYolo(a, c, msg)
 	case CmdRemoveRecentModel:
 		go handleRemoveRecentModel(a, c, msg)
+	case CmdTrackModelUsage:
+		go handleTrackModelUsage(a, c, msg)
 	case CmdSetProviderKey:
 		go handleSetProviderKey(a, c, msg)
 	case CmdRemoveProviderKey:
@@ -293,6 +295,30 @@ func handleRemoveRecentModel(a *appPkg.App, c *Client, msg WSMessage) {
 	modelType := config.SelectedModelType(p.ModelType)
 	if err := cfg.RemoveRecentModel(modelType, config.SelectedModel{Provider: p.Provider, Model: p.Model}); err != nil {
 		slog.Warn("ws: failed to remove recent model", "err", err)
+	}
+	if wire, ok := buildConfigWire(a); ok {
+		c.hub.Broadcast(EventConfig, wire)
+	}
+	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
+}
+
+func handleTrackModelUsage(a *appPkg.App, c *Client, msg WSMessage) {
+	var p TrackModelUsagePayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		c.reply(msg.ID, EventError, nil, "invalid payload")
+		return
+	}
+	cfg := a.Config()
+	if cfg == nil {
+		return
+	}
+	modelType := config.SelectedModelType(p.ModelType)
+	// Use UpdatePreferredModel which handles both preferred model and recent models tracking
+	if err := cfg.UpdatePreferredModel(modelType, config.SelectedModel{Provider: p.Provider, Model: p.Model}); err != nil {
+		slog.Warn("ws: failed to track model usage", "err", err)
+	}
+	if wire, ok := buildConfigWire(a); ok {
+		c.hub.Broadcast(EventConfig, wire)
 	}
 	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
 }

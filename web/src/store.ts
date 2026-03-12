@@ -36,41 +36,37 @@ export function setSessions(sessions: Session[]) {
 }
 
 // ── Model History ────────────────────────────────────────────────────────────
-const STORAGE_KEY_RECENT_LARGE = "crush_recent_models_large";
-const STORAGE_KEY_RECENT_SMALL = "crush_recent_models_small";
-
-function loadRecent(key: string): string[] {
-  try {
-    const val = localStorage.getItem(key);
-    return val ? JSON.parse(val) : [];
-  } catch {
-    return [];
-  }
-}
-
-export const $recentLargeModels = atom<string[]>(loadRecent(STORAGE_KEY_RECENT_LARGE));
-export const $recentSmallModels = atom<string[]>(loadRecent(STORAGE_KEY_RECENT_SMALL));
+// Recent models are stored on the backend and synced via WebSocket config.
+// Local state is initialized empty and populated when config arrives.
+export const $recentLargeModels = atom<string[]>([]);
+export const $recentSmallModels = atom<string[]>([]);
 
 export function trackModelUsage(role: "large" | "small", modelKey: string) {
   const store = role === "large" ? $recentLargeModels : $recentSmallModels;
-  const storageKey = role === "large" ? STORAGE_KEY_RECENT_LARGE : STORAGE_KEY_RECENT_SMALL;
 
   const current = store.get();
   const next = [modelKey, ...current.filter((k) => k !== modelKey)].slice(0, 5);
 
   store.set(next);
-  localStorage.setItem(storageKey, JSON.stringify(next));
+
+  // Sync to backend - parse modelKey into provider and model
+  const idx = modelKey.indexOf(":::");
+  if (idx !== -1) {
+    ws.send("track_model_usage", {
+      modelType: role,
+      provider: modelKey.slice(0, idx),
+      model: modelKey.slice(idx + 3),
+    });
+  }
 }
 
 export function removeRecentModel(role: "large" | "small", modelKey: string) {
   const store = role === "large" ? $recentLargeModels : $recentSmallModels;
-  const storageKey = role === "large" ? STORAGE_KEY_RECENT_LARGE : STORAGE_KEY_RECENT_SMALL;
 
   const next = store.get().filter((k) => k !== modelKey);
   store.set(next);
-  localStorage.setItem(storageKey, JSON.stringify(next));
 
-  // Persist removal to server so it survives restarts
+  // Persist removal to server
   const idx = modelKey.indexOf(":::");
   if (idx !== -1) {
     ws.send("remove_recent_model", {
@@ -251,6 +247,8 @@ export function setSessionModels(sessionID: string, largeKey: string | null, sma
 }
 
 // ── Theme ─────────────────────────────────────────────────────────────────────
+// Theme is stored on the backend. localStorage is only used as a cache for
+// instant page load (before WS connects) to avoid white flash.
 
 const STORAGE_KEY_THEME = "crush_theme";
 
@@ -260,19 +258,22 @@ export function applyTheme(theme: string) {
   } else {
     document.documentElement.classList.remove("dark");
   }
+  // Cache to localStorage for instant load on next page refresh
   try { localStorage.setItem(STORAGE_KEY_THEME, theme); } catch {}
 }
 
-// Apply saved theme immediately on module load (before WS connects)
+// Apply cached theme immediately on module load (before WS connects)
+// This prevents white flash while waiting for backend connection.
 ;(function () {
   try {
-    const saved = localStorage.getItem(STORAGE_KEY_THEME);
-    if (saved) applyTheme(saved);
+    const cached = localStorage.getItem(STORAGE_KEY_THEME);
+    if (cached) applyTheme(cached);
   } catch {}
 })();
 
 export function setTheme(theme: "light" | "dark") {
   applyTheme(theme);
+  // Send to backend as source of truth
   ws.send("set_theme", { theme });
 }
 

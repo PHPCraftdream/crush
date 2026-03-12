@@ -224,21 +224,22 @@ export function useWS() {
         const cfg = msg.payload as ConfigPayload;
         $config.set(cfg);
         // Note: YOLO is now managed per-session, not globally via config
-        // Apply server theme only if no local preference (first-ever visit).
-        // If the user set a theme on the login page, it's already in localStorage
-        // and was just pushed to the server above — don't let the echoed config
-        // overwrite the local choice.
-        if (cfg.theme && !localStorage.getItem("crush_theme")) {
+        // Apply theme from server (backend is source of truth)
+        if (cfg.theme) {
           applyTheme(cfg.theme);
         }
         // Restore recent models from server (persisted across restarts)
         if (cfg.recentLargeModels?.length) {
           const keys = cfg.recentLargeModels.map(m => `${m.Provider}:::${m.Model}`);
           $recentLargeModels.set(keys);
+        } else {
+          $recentLargeModels.set([]);
         }
         if (cfg.recentSmallModels?.length) {
           const keys = cfg.recentSmallModels.map(m => `${m.Provider}:::${m.Model}`);
           $recentSmallModels.set(keys);
+        } else {
+          $recentSmallModels.set([]);
         }
       }),
 

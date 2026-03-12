@@ -58,6 +58,7 @@ const (
 	CmdRenameSession                = "rename_session"
 	CmdSetSessionModels             = "set_session_models"
 	CmdRemoveRecentModel            = "remove_recent_model"
+	CmdTrackModelUsage              = "track_model_usage"
 	CmdDeleteMessage                = "delete_message"
 	CmdDeleteMessages               = "delete_messages"
 	CmdUpdateMessageContent         = "update_message_content"
@@ -314,6 +315,12 @@ type UpdateLSPServerPayload struct {
 }
 
 type RemoveRecentModelPayload struct {
+	ModelType string `json:"modelType"` // "large" or "small"
+	Provider  string `json:"provider"`
+	Model     string `json:"model"`
+}
+
+type TrackModelUsagePayload struct {
 	ModelType string `json:"modelType"` // "large" or "small"
 	Provider  string `json:"provider"`
 	Model     string `json:"model"`
