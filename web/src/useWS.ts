@@ -131,23 +131,33 @@ export function useWS() {
 
       ws.on("message_created", (msg: WSMessage) => {
         const m = msg.payload as Message;
+        // Only process messages for the active session
+        if (m.SessionID !== $activeSessionID.get()) return;
         upsertMessage(m);
         if (m.Role === "assistant" && m.Provider && m.Model) {
           trackModelUsage("large", `${m.Provider}:::${m.Model}`);
         }
       }),
-      ws.on("message_updated", (msg: WSMessage) =>
-        upsertMessage(msg.payload as Message)
-      ),
-      ws.on("message_deleted", (msg: WSMessage) =>
-        removeMessage((msg.payload as { ID: string }).ID)
-      ),
+      ws.on("message_updated", (msg: WSMessage) => {
+        const m = msg.payload as Message;
+        // Only process messages for the active session
+        if (m.SessionID !== $activeSessionID.get()) return;
+        upsertMessage(m);
+      }),
+      ws.on("message_deleted", (msg: WSMessage) => {
+        const m = msg.payload as Message;
+        // Only process messages for the active session
+        if (m.SessionID !== $activeSessionID.get()) return;
+        removeMessage(m.ID);
+      }),
       ws.on("messages_list", (msg: WSMessage) =>
         setMessages((msg.payload as Message[]) ?? [])
       ),
 
       ws.on("permission_request", (msg: WSMessage) => {
         const p = msg.payload as PermissionRequest;
+        // Only process permissions for the active session
+        if (p.SessionID !== $activeSessionID.get()) return;
         // If yolo is active — auto-grant immediately on the client side without
         // showing the dialog. This is race-free: the server's skip flag might not
         // be set yet when the next request arrives, but we handle it here.
