@@ -28,6 +28,7 @@ export interface Session {
   SmallModelID: string;
 
   SystemPrompt: string;
+  YoloEnabled: boolean;
 }
 
 export type MessageRole = "user" | "assistant" | "tool" | "system";

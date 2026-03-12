@@ -56,4 +56,5 @@ type Session struct {
 	SmallModelProvider  sql.NullString `json:"small_model_provider"`
 	SmallModelID        sql.NullString `json:"small_model_id"`
 	SystemPrompt        string         `json:"system_prompt"`
+	YoloEnabled         int64          `json:"yolo_enabled"`
 }

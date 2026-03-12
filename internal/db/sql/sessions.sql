@@ -13,7 +13,8 @@ INSERT INTO sessions (
     large_model_provider,
     large_model_id,
     small_model_provider,
-    small_model_id
+    small_model_id,
+    yolo_enabled
 ) VALUES (
     ?,
     ?,
@@ -28,7 +29,8 @@ INSERT INTO sessions (
     ?,
     ?,
     ?,
-    ?
+    ?,
+    0
 ) RETURNING *;
 
 -- name: UpdateSessionModels :exec
@@ -76,4 +78,10 @@ WHERE id = ?;
 
 -- name: DeleteSession :exec
 DELETE FROM sessions
+WHERE id = ?;
+
+-- name: SetSessionYolo :exec
+UPDATE sessions
+SET yolo_enabled = ?,
+    updated_at = strftime('%s', 'now')
 WHERE id = ?;

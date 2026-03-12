@@ -93,11 +93,9 @@ func (s *permissionService) GrantPersistent(permission PermissionRequest) {
 		respCh <- true
 	}
 
-	// Persistent permissions match any session (SessionID="").
-	persistent := permission
-	persistent.SessionID = ""
+	// Persistent permissions are now session-specific.
 	s.sessionPermissionsMu.Lock()
-	s.sessionPermissions = append(s.sessionPermissions, persistent)
+	s.sessionPermissions = append(s.sessionPermissions, permission)
 	s.sessionPermissionsMu.Unlock()
 
 	// Persist to DB so it survives restarts.
@@ -105,7 +103,7 @@ func (s *permissionService) GrantPersistent(permission PermissionRequest) {
 	if s.q != nil && permission.ToolName != "" && permission.Action != "" {
 		if err := s.q.CreateSessionPermission(context.Background(), db.CreateSessionPermissionParams{
 			ID:        uuid.New().String(),
-			SessionID: "",
+			SessionID: permission.SessionID,
 			ToolName:  permission.ToolName,
 			Action:    permission.Action,
 			Path:      permission.Path,
@@ -180,6 +178,18 @@ func (s *permissionService) Request(ctx context.Context, opts CreatePermissionRe
 			Granted:    true,
 		})
 		return true, nil
+	}
+
+	// Check session-specific YOLO mode in database.
+	if s.q != nil {
+		session, err := s.q.GetSessionByID(ctx, opts.SessionID)
+		if err == nil && session.YoloEnabled != 0 {
+			s.notificationBroker.Publish(pubsub.CreatedEvent, PermissionNotification{
+				ToolCallID: opts.ToolCallID,
+				Granted:    true,
+			})
+			return true, nil
+		}
 	}
 
 	fileInfo, err := os.Stat(opts.Path)

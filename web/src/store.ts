@@ -252,9 +252,9 @@ export const $yolo = atom<boolean>(loadYolo());
 export function setYolo(enabled: boolean) {
   $yolo.set(enabled);
   localStorage.setItem(STORAGE_KEY_YOLO, String(enabled));
-  ws.send("set_yolo", { enabled });
-  // Persist per-session
+  // Persist per-session and send to backend with session ID
   const sessionID = $activeSessionID.get();
+  ws.send("set_yolo", { sessionID, enabled });
   if (sessionID) {
     const map = loadYoloSessions();
     map[sessionID] = enabled;
@@ -268,7 +268,7 @@ export function restoreYoloForSession(sessionID: string) {
   const enabled = map[sessionID];
   $yolo.set(enabled);
   localStorage.setItem(STORAGE_KEY_YOLO, String(enabled));
-  ws.send("set_yolo", { enabled });
+  ws.send("set_yolo", { sessionID, enabled });
 }
 
 export function setProviderKey(providerID: string, apiKey: string) {

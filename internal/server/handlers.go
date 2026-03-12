@@ -295,6 +295,15 @@ func handleSetYolo(a *appPkg.App, c *Client, msg WSMessage) {
 		c.reply(msg.ID, EventError, nil, "invalid payload")
 		return
 	}
+
+	// Set session-specific YOLO mode in database.
+	if p.SessionID != "" {
+		if err := a.Sessions.SetYolo(context.Background(), p.SessionID, p.Enabled); err != nil {
+			slog.Warn("ws: failed to set session YOLO", "err", err)
+		}
+	}
+
+	// Also set global skip flag for backwards compatibility.
 	a.Permissions.SetSkipRequests(p.Enabled)
 	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
 }

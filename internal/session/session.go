@@ -56,6 +56,7 @@ type Session struct {
 	SmallModelID       string
 
 	SystemPrompt string
+	YoloEnabled  bool
 }
 
 type Service interface {
@@ -69,6 +70,7 @@ type Service interface {
 	UpdateTitleAndUsage(ctx context.Context, sessionID, title string, promptTokens, completionTokens int64, cost float64) error
 	UpdateModels(ctx context.Context, sessionID, largeProvider, largeModel, smallProvider, smallModel string) error
 	UpdateSystemPrompt(ctx context.Context, sessionID, prompt string) error
+	SetYolo(ctx context.Context, sessionID string, enabled bool) error
 	Delete(ctx context.Context, id string) error
 
 	// Agent tool session management
@@ -239,6 +241,25 @@ func (s *service) UpdateModels(ctx context.Context, sessionID, largeProvider, la
 	return nil
 }
 
+// SetYolo sets the YOLO (auto-grant permissions) mode for a session.
+func (s *service) SetYolo(ctx context.Context, sessionID string, enabled bool) error {
+	var yolo int64
+	if enabled {
+		yolo = 1
+	}
+	_, err := s.db.ExecContext(ctx, "UPDATE sessions SET yolo_enabled = ?, updated_at = strftime('%s', 'now') WHERE id = ?", yolo, sessionID)
+	if err != nil {
+		return err
+	}
+
+	// Publish an update event so the UI gets the new session state
+	sess, err := s.Get(ctx, sessionID)
+	if err == nil {
+		s.Publish(pubsub.UpdatedEvent, sess)
+	}
+	return nil
+}
+
 func (s *service) List(ctx context.Context) ([]Session, error) {
 	dbSessions, err := s.q.ListSessions(ctx)
 	if err != nil {
@@ -275,6 +296,7 @@ func (s service) fromDBItem(item db.Session) Session {
 		SmallModelID:       item.SmallModelID.String,
 
 		SystemPrompt: item.SystemPrompt,
+		YoloEnabled:  item.YoloEnabled != 0,
 	}
 }
 

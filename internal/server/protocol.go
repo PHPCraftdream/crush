@@ -317,7 +317,8 @@ type RemoveRecentModelPayload struct {
 }
 
 type SetYoloPayload struct {
-	Enabled bool `json:"enabled"`
+	SessionID string `json:"sessionID"`
+	Enabled   bool   `json:"enabled"`
 }
 
 type SetProviderKeyPayload struct {
