@@ -155,6 +155,16 @@ export function Chat() {
     isAtBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight <= 80;
   }, []);
 
+  const handleWheel = useCallback((e: React.WheelEvent<HTMLDivElement>) => {
+    if (e.shiftKey) {
+      const el = scrollRef.current;
+      if (!el) return;
+      e.preventDefault();
+      // Scroll 5x faster when Shift is held
+      el.scrollTop += e.deltaY * 5;
+    }
+  }, []);
+
   useEffect(() => {
     clearSelection();
     isAtBottomRef.current = true;
@@ -204,7 +214,7 @@ export function Chat() {
 
   return (
     <div className="flex-1 flex flex-col overflow-hidden relative bg-canvas">
-      <div ref={scrollRef} onScroll={handleScroll} className="flex-1 overflow-y-auto py-8 flex flex-col">
+      <div ref={scrollRef} onScroll={handleScroll} onWheel={handleWheel} className="flex-1 overflow-y-auto py-8 flex flex-col">
         {!activeSessionID ? (
           <div className="empty-state">
             <div className="empty-state-icon">
