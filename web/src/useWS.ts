@@ -20,6 +20,7 @@ import {
   removePermission,
   setSessionBusy,
   setActiveSession,
+  setPermissionRules,
   $recentLargeModels,
   $recentSmallModels,
   trackModelUsage,
@@ -170,6 +171,36 @@ export function useWS() {
       ws.on("permission_notification", (msg: WSMessage) =>
         removePermission((msg.payload as { ToolCallID: string }).ToolCallID)
       ),
+
+      ws.on("session_permissions", (msg: WSMessage) => {
+        const rules = msg.payload as Array<{
+          id: string;
+          session_id: string;
+          tool_name: string;
+          action: string;
+          path: string;
+          created_at: number;
+          enabled: number;
+        }>;
+
+        if (!rules || rules.length === 0) {
+          setPermissionRules($activeSessionID.get() || "", []);
+          return;
+        }
+
+        // Convert to frontend format
+        const permissionRules = rules.map(r => ({
+          ID: r.id,
+          SessionID: r.session_id,
+          ToolName: r.tool_name,
+          Action: r.action,
+          Path: r.path,
+          CreatedAt: r.created_at,
+          Enabled: r.enabled !== 0,
+        }));
+
+        setPermissionRules($activeSessionID.get() || "", permissionRules);
+      }),
 
       ws.on("config", (msg: WSMessage) => {
         const cfg = msg.payload as ConfigPayload;

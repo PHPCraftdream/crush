@@ -54,6 +54,12 @@ func handleIncoming(ctx context.Context, a *appPkg.App, c *Client, raw []byte) {
 		go handleGrantPermission(a, c, msg, true)
 	case CmdDenyPermission:
 		go handleDenyPermission(a, c, msg)
+	case CmdListSessionPermissions:
+		go handleListSessionPermissions(ctx, a, c, msg)
+	case CmdUpdatePermissionRule:
+		go handleUpdatePermissionRule(a, c, msg)
+	case CmdDeletePermissionRule:
+		go handleDeletePermissionRule(a, c, msg)
 	case CmdGetConfig:
 		go handleGetConfig(a, c, msg)
 	case CmdSetTheme:
@@ -522,6 +528,97 @@ func handleDenyPermission(a *appPkg.App, c *Client, msg WSMessage) {
 		return
 	}
 	a.Permissions.Deny(permission.PermissionRequest{ID: p.PermissionID})
+}
+
+func handleListSessionPermissions(ctx context.Context, a *appPkg.App, c *Client, msg WSMessage) {
+	var p ListSessionPermissionsPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		c.reply(msg.ID, EventError, nil, "invalid payload")
+		return
+	}
+
+	// Query session permissions from DB
+	rows, err := a.DB().QueryContext(ctx,
+		`SELECT id, session_id, tool_name, action, path, created_at, enabled
+		 FROM session_permissions
+		 WHERE session_id = ?
+		 ORDER BY created_at DESC`, p.SessionID)
+	if err != nil {
+		slog.Warn("ws: failed to query session permissions", "err", err)
+		c.reply(msg.ID, EventError, nil, "failed to query permissions")
+		return
+	}
+	defer rows.Close()
+
+	var permissions []struct {
+		ID        string `json:"id"`
+		SessionID string `json:"session_id"`
+		ToolName  string `json:"tool_name"`
+		Action    string `json:"action"`
+		Path      string `json:"path"`
+		CreatedAt int64  `json:"created_at"`
+		Enabled   int64  `json:"enabled"`
+	}
+
+	for rows.Next() {
+		var perm struct {
+			ID        string `json:"id"`
+			SessionID string `json:"session_id"`
+			ToolName  string `json:"tool_name"`
+			Action    string `json:"action"`
+			Path      string `json:"path"`
+			CreatedAt int64  `json:"created_at"`
+			Enabled   int64  `json:"enabled"`
+		}
+		if err := rows.Scan(&perm.ID, &perm.SessionID, &perm.ToolName, &perm.Action, &perm.Path, &perm.CreatedAt, &perm.Enabled); err != nil {
+			slog.Warn("ws: failed to scan permission row", "err", err)
+			continue
+		}
+		permissions = append(permissions, perm)
+	}
+
+	c.reply(msg.ID, "session_permissions", permissions, "")
+}
+
+func handleUpdatePermissionRule(a *appPkg.App, c *Client, msg WSMessage) {
+	var p UpdatePermissionRulePayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		c.reply(msg.ID, EventError, nil, "invalid payload")
+		return
+	}
+
+	var enabled int64
+	if p.Enabled {
+		enabled = 1
+	}
+
+	_, err := a.DB().ExecContext(context.Background(),
+		`UPDATE session_permissions SET enabled = ? WHERE id = ?`, enabled, p.RuleID)
+	if err != nil {
+		slog.Warn("ws: failed to update permission rule", "err", err)
+		c.reply(msg.ID, EventError, nil, "failed to update rule")
+		return
+	}
+
+	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
+}
+
+func handleDeletePermissionRule(a *appPkg.App, c *Client, msg WSMessage) {
+	var p DeletePermissionRulePayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		c.reply(msg.ID, EventError, nil, "invalid payload")
+		return
+	}
+
+	_, err := a.DB().ExecContext(context.Background(),
+		`DELETE FROM session_permissions WHERE id = ?`, p.RuleID)
+	if err != nil {
+		slog.Warn("ws: failed to delete permission rule", "err", err)
+		c.reply(msg.ID, EventError, nil, "failed to delete rule")
+		return
+	}
+
+	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
 }
 
 func buildConfigWire(a *appPkg.App) (ConfigWire, bool) {

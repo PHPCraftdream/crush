@@ -50,6 +50,9 @@ const (
 	CmdGrantPermission              = "grant_permission"
 	CmdGrantPermissionPersistent    = "grant_permission_persistent"
 	CmdDenyPermission               = "deny_permission"
+	CmdListSessionPermissions       = "list_session_permissions"
+	CmdUpdatePermissionRule         = "update_permission_rule"
+	CmdDeletePermissionRule         = "delete_permission_rule"
 	CmdGetConfig                    = "get_config"
 	CmdSetTheme                     = "set_theme"
 	CmdRenameSession                = "rename_session"
@@ -336,6 +339,19 @@ type DeleteMessagePayload struct {
 
 type DeleteMessagesPayload struct {
 	MessageIDs []string `json:"messageIDs"`
+}
+
+type ListSessionPermissionsPayload struct {
+	SessionID string `json:"sessionID"`
+}
+
+type UpdatePermissionRulePayload struct {
+	RuleID  string `json:"ruleID"`
+	Enabled bool   `json:"enabled"`
+}
+
+type DeletePermissionRulePayload struct {
+	RuleID string `json:"ruleID"`
 }
 
 type UpdateMessageContentPayload struct {

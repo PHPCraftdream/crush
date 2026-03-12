@@ -11,6 +11,7 @@ export const $sessions = atom<Session[]>([]);
 export const $activeSessionID = atom<string | null>(null);
 export const $messages = atom<Message[]>([]);
 export const $permissions = atom<PermissionRequest[]>([]);
+export const $permissionRules = atom<Map<string, PermissionRule[]>>(new Map()); // sessionID -> rules
 export const $config = atom<ConfigPayload | null>(null);
 export const $lspSnapshot = atom<LSPSnapshot | null>(null);
 export const $mcpState = atom<MCPState | null>(null);
@@ -136,6 +137,47 @@ export function removePermission(toolCallID: string) {
   $permissions.set(
     $permissions.get().filter((p) => p.ToolCallID !== toolCallID)
   );
+}
+
+// ── Permission Rules (persistent permissions) ─────────────────────────────
+
+export function setPermissionRules(sessionID: string, rules: PermissionRule[]) {
+  const map = new Map($permissionRules.get());
+  map.set(sessionID, rules);
+  $permissionRules.set(map);
+}
+
+export function getPermissionRules(sessionID: string): PermissionRule[] {
+  return $permissionRules.get().get(sessionID) || [];
+}
+
+export function togglePermissionRule(sessionID: string, ruleID: string) {
+  const map = new Map($permissionRules.get());
+  const rules = (map.get(sessionID) || []).map((r) =>
+    r.ID === ruleID ? { ...r, Enabled: !r.Enabled } : r
+  );
+  map.set(sessionID, rules);
+  $permissionRules.set(map);
+
+  // Sync to backend
+  const rule = rules.find((r) => r.ID === ruleID);
+  if (rule) {
+    ws.send("update_permission_rule", { ruleID, enabled: rule.Enabled });
+  }
+}
+
+export function deletePermissionRule(sessionID: string, ruleID: string) {
+  const map = new Map($permissionRules.get());
+  const rules = (map.get(sessionID) || []).filter((r) => r.ID !== ruleID);
+  map.set(sessionID, rules);
+  $permissionRules.set(map);
+
+  // Sync to backend
+  ws.send("delete_permission_rule", { ruleID });
+}
+
+export function fetchPermissionRules(sessionID: string) {
+  ws.send("list_session_permissions", { sessionID });
 }
 
 export function setSessionBusy(sessionID: string, busy: boolean) {

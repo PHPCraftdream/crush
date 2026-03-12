@@ -98,6 +98,16 @@ export interface PermissionRequest {
   Params: unknown;
 }
 
+export interface PermissionRule {
+  ID: string;
+  SessionID: string;
+  ToolName: string;
+  Action: string;
+  Path: string;
+  CreatedAt: number;
+  Enabled: boolean;
+}
+
 export interface PermissionNotification {
   ToolCallID: string;
   Granted: boolean;
