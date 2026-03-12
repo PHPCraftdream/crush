@@ -57,7 +57,7 @@
     @apply bg-canvas text-text text-base leading-relaxed font-sans antialiased;
   }
 
-  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar { width: 16px; height: 16px; }
   ::-webkit-scrollbar-track { background: transparent; }
   ::-webkit-scrollbar-thumb { background: rgb(var(--color-text-subtle)); border-radius: 9999px; }
   ::-webkit-scrollbar-thumb:hover { background: rgb(var(--color-text-muted)); }
