@@ -12,6 +12,7 @@ export function makeSession(overrides: Record<string, unknown> = {}) {
     CreatedAt: 1700000000000,
     UpdatedAt: 1700000000000,
     ParentSessionID: "",
+    YoloEnabled: false,
     ...overrides,
   };
 }
