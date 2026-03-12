@@ -461,7 +461,10 @@ export const Message = memo(function Message({
   }, [message.ID, message.Parts]);
 
   const handleCheckboxClick = useCallback((e: React.MouseEvent) => {
-    if (e.shiftKey) { onRangeSelect(index); }
+    if (e.shiftKey) {
+      e.preventDefault(); // Prevent text selection between clicks
+      onRangeSelect(index);
+    }
     else { toggleMessageSelection(message.ID); }
   }, [message.ID, index, onRangeSelect]);
 
