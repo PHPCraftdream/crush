@@ -54,6 +54,9 @@ type Service interface {
 	SetSkipRequests(skip bool)
 	SkipRequests() bool
 	SubscribeNotifications(ctx context.Context) <-chan pubsub.Event[PermissionNotification]
+	ListSessionPermissions(sessionID string) ([]db.SessionPermission, error)
+	UpdatePermissionEnabled(ruleID string, enabled bool) error
+	DeletePermission(ruleID string) error
 }
 
 type permissionService struct {
@@ -328,4 +331,23 @@ func NewPermissionService(ctx context.Context, workingDir string, skip bool, all
 	}
 
 	return svc
+}
+
+func (s *permissionService) ListSessionPermissions(sessionID string) ([]db.SessionPermission, error) {
+	return s.q.ListSessionPermissions(context.Background(), sessionID)
+}
+
+func (s *permissionService) UpdatePermissionEnabled(ruleID string, enabled bool) error {
+	var enabledInt int64
+	if enabled {
+		enabledInt = 1
+	}
+	return s.q.UpdatePermissionEnabled(context.Background(), db.UpdatePermissionEnabledParams{
+		Enabled: enabledInt,
+		ID:      ruleID,
+	})
+}
+
+func (s *permissionService) DeletePermission(ruleID string) error {
+	return s.q.DeletePermission(context.Background(), ruleID)
 }

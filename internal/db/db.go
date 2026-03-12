@@ -51,6 +51,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.deleteSessionMessagesStmt, err = db.PrepareContext(ctx, deleteSessionMessages); err != nil {
 		return nil, fmt.Errorf("error preparing query DeleteSessionMessages: %w", err)
 	}
+	if q.deletePermissionStmt, err = db.PrepareContext(ctx, deletePermission); err != nil {
+		return nil, fmt.Errorf("error preparing query DeletePermission: %w", err)
+	}
 	if q.getAverageResponseTimeStmt, err = db.PrepareContext(ctx, getAverageResponseTime); err != nil {
 		return nil, fmt.Errorf("error preparing query GetAverageResponseTime: %w", err)
 	}
@@ -96,6 +99,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.listAllSessionPermissionsStmt, err = db.PrepareContext(ctx, listAllSessionPermissions); err != nil {
 		return nil, fmt.Errorf("error preparing query ListAllSessionPermissions: %w", err)
 	}
+	if q.listSessionPermissionsStmt, err = db.PrepareContext(ctx, listSessionPermissions); err != nil {
+		return nil, fmt.Errorf("error preparing query ListSessionPermissions: %w", err)
+	}
 	if q.listAllUserMessagesStmt, err = db.PrepareContext(ctx, listAllUserMessages); err != nil {
 		return nil, fmt.Errorf("error preparing query ListAllUserMessages: %w", err)
 	}
@@ -131,6 +137,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	}
 	if q.updateMessagePinnedStmt, err = db.PrepareContext(ctx, updateMessagePinned); err != nil {
 		return nil, fmt.Errorf("error preparing query UpdateMessagePinned: %w", err)
+	}
+	if q.updatePermissionEnabledStmt, err = db.PrepareContext(ctx, updatePermissionEnabled); err != nil {
+		return nil, fmt.Errorf("error preparing query UpdatePermissionEnabled: %w", err)
 	}
 	if q.updateSessionStmt, err = db.PrepareContext(ctx, updateSession); err != nil {
 		return nil, fmt.Errorf("error preparing query UpdateSession: %w", err)
@@ -389,6 +398,7 @@ type Queries struct {
 	deleteSessionStmt              *sql.Stmt
 	deleteSessionFilesStmt         *sql.Stmt
 	deleteSessionMessagesStmt      *sql.Stmt
+	deletePermissionStmt           *sql.Stmt
 	getAverageResponseTimeStmt     *sql.Stmt
 	getFileStmt                    *sql.Stmt
 	getFileByPathAndSessionStmt    *sql.Stmt
@@ -404,6 +414,7 @@ type Queries struct {
 	getUsageByHourStmt             *sql.Stmt
 	getUsageByModelStmt            *sql.Stmt
 	listAllSessionPermissionsStmt   *sql.Stmt
+	listSessionPermissionsStmt      *sql.Stmt
 	listAllUserMessagesStmt         *sql.Stmt
 	listFilesByPathStmt            *sql.Stmt
 	listFilesBySessionStmt         *sql.Stmt
@@ -416,6 +427,7 @@ type Queries struct {
 	recordFileReadStmt             *sql.Stmt
 	updateMessageStmt              *sql.Stmt
 	updateMessagePinnedStmt        *sql.Stmt
+	updatePermissionEnabledStmt    *sql.Stmt
 	updateSessionStmt              *sql.Stmt
 	updateSessionModelsStmt        *sql.Stmt
 	updateSessionTitleAndUsageStmt *sql.Stmt
@@ -434,6 +446,7 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		deleteSessionStmt:              q.deleteSessionStmt,
 		deleteSessionFilesStmt:         q.deleteSessionFilesStmt,
 		deleteSessionMessagesStmt:      q.deleteSessionMessagesStmt,
+		deletePermissionStmt:           q.deletePermissionStmt,
 		getAverageResponseTimeStmt:     q.getAverageResponseTimeStmt,
 		getFileStmt:                    q.getFileStmt,
 		getFileByPathAndSessionStmt:    q.getFileByPathAndSessionStmt,
@@ -449,6 +462,7 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		getUsageByHourStmt:             q.getUsageByHourStmt,
 		getUsageByModelStmt:            q.getUsageByModelStmt,
 		listAllSessionPermissionsStmt:   q.listAllSessionPermissionsStmt,
+		listSessionPermissionsStmt:      q.listSessionPermissionsStmt,
 		listAllUserMessagesStmt:         q.listAllUserMessagesStmt,
 		listFilesByPathStmt:            q.listFilesByPathStmt,
 		listFilesBySessionStmt:         q.listFilesBySessionStmt,
@@ -461,6 +475,7 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		recordFileReadStmt:             q.recordFileReadStmt,
 		updateMessageStmt:              q.updateMessageStmt,
 		updateMessagePinnedStmt:        q.updateMessagePinnedStmt,
+		updatePermissionEnabledStmt:    q.updatePermissionEnabledStmt,
 		updateSessionStmt:              q.updateSessionStmt,
 		updateSessionModelsStmt:        q.updateSessionModelsStmt,
 		updateSessionTitleAndUsageStmt: q.updateSessionTitleAndUsageStmt,
