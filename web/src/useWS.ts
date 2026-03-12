@@ -88,9 +88,15 @@ export function useWS() {
         setActiveSession(s.ID);
         ws.send("load_messages", { sessionID: s.ID });
       }),
-      ws.on("session_updated", (msg: WSMessage) =>
-        upsertSession(msg.payload as Session)
-      ),
+      ws.on("session_updated", (msg: WSMessage) => {
+        const session = msg.payload as Session;
+        upsertSession(session);
+        // If this is the active session, sync YOLO state
+        if ($activeSessionID.get() === session.ID && session.YoloEnabled !== $yolo.get()) {
+          $yolo.set(session.YoloEnabled);
+          localStorage.setItem("crush_yolo", String(session.YoloEnabled));
+        }
+      }),
       ws.on("session_deleted", (msg: WSMessage) => {
         const id = (msg.payload as { ID: string }).ID;
         removeSession(id);
@@ -116,6 +122,11 @@ export function useWS() {
           if (session) {
             if (activeID !== hashID) {
               setActiveSession(hashID);
+              // Sync YOLO state from backend if session has YoloEnabled set
+              if (session.YoloEnabled !== $yolo.get()) {
+                $yolo.set(session.YoloEnabled);
+                localStorage.setItem("crush_yolo", String(session.YoloEnabled));
+              }
               ws.send("load_messages", { sessionID: hashID });
             }
             return;
@@ -126,6 +137,11 @@ export function useWS() {
         const latest = sessions[0];
         if (latest && activeID !== latest.ID) {
           setActiveSession(latest.ID);
+          // Sync YOLO state from backend if session has YoloEnabled set
+          if (latest.YoloEnabled !== $yolo.get()) {
+            $yolo.set(latest.YoloEnabled);
+            localStorage.setItem("crush_yolo", String(latest.YoloEnabled));
+          }
           ws.send("load_messages", { sessionID: latest.ID });
         }
       }),
@@ -133,7 +149,8 @@ export function useWS() {
       ws.on("message_created", (msg: WSMessage) => {
         const m = msg.payload as Message;
         // Only process messages for the active session
-        if (m.SessionID !== $activeSessionID.get()) return;
+        const activeID = $activeSessionID.get();
+        if (!activeID || m.SessionID !== activeID) return;
         upsertMessage(m);
         if (m.Role === "assistant" && m.Provider && m.Model) {
           trackModelUsage("large", `${m.Provider}:::${m.Model}`);
@@ -142,13 +159,15 @@ export function useWS() {
       ws.on("message_updated", (msg: WSMessage) => {
         const m = msg.payload as Message;
         // Only process messages for the active session
-        if (m.SessionID !== $activeSessionID.get()) return;
+        const activeID = $activeSessionID.get();
+        if (!activeID || m.SessionID !== activeID) return;
         upsertMessage(m);
       }),
       ws.on("message_deleted", (msg: WSMessage) => {
         const m = msg.payload as Message;
         // Only process messages for the active session
-        if (m.SessionID !== $activeSessionID.get()) return;
+        const activeID = $activeSessionID.get();
+        if (!activeID || m.SessionID !== activeID) return;
         removeMessage(m.ID);
       }),
       ws.on("messages_list", (msg: WSMessage) =>

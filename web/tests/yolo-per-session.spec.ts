@@ -36,11 +36,11 @@ test("set_yolo command includes sessionID when session is active", async ({ page
     type: "sessions_list",
     payload: [makeSession({ ID: "yolo-sess-1", Title: "Yolo Session 1", YoloEnabled: false })],
   });
-  await expect(page.getByText("Yolo Session 1")).toBeVisible({ timeout: 3000 });
-  await page.getByText("Yolo Session 1").click();
+  await expect(page.getByText("Yolo Session 1").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("Yolo Session 1").first().click();
 
   // Enable YOLO
-  await page.locator("header").getByText("Yolo").click();
+  await page.locator("header").getByText("Yolo").first().click();
   const cmd = await waitForWSSend(page, "set_yolo");
 
   expect(cmd.payload).toHaveProperty("sessionID", "yolo-sess-1");
@@ -59,13 +59,13 @@ test("different sessions can have different YOLO states", async ({ page }) => {
   await expect(page.getByText("Session A")).toBeVisible({ timeout: 3000 });
 
   // Enable YOLO in Session A
-  await page.getByText("Session A").click();
-  await page.locator("header").getByText("Yolo").click();
+  await page.getByText("Session A").first().click();
+  await page.locator("header").getByText("Yolo").first().click();
   await waitForWSSend(page, "set_yolo");
   await expect(page.locator("header").getByText("⚡")).toBeVisible({ timeout: 2000 });
 
   // Switch to Session B (which has YOLO enabled from backend)
-  await page.getByText("Session B").click();
+  await page.getByText("Session B").first().click();
 
   // Session B should also show YOLO active (from its YoloEnabled state)
   await expect(page.locator("header").getByText("⚡")).toBeVisible({ timeout: 2000 });
@@ -110,8 +110,8 @@ test("YOLO state is stored per session in localStorage", async ({ page }) => {
   });
 
   // Enable YOLO in Session 1
-  await page.getByText("Persist Session 1").click();
-  await page.locator("header").getByText("Yolo").click();
+  await page.getByText("Persist Session 1").first().click();
+  await page.locator("header").getByText("Yolo").first().click();
   await waitForWSSend(page, "set_yolo");
 
   // Check localStorage
@@ -163,8 +163,8 @@ test("YOLO state persists across page reload per session", async ({ page }) => {
   });
 
   // Enable YOLO
-  await page.getByText("Reload Session").click();
-  await page.locator("header").getByText("Yolo").click();
+  await page.getByText("Reload Session").first().click();
+  await page.locator("header").getByText("Yolo").first().click();
   await waitForWSSend(page, "set_yolo");
   await expect(page.locator("header").getByText("⚡")).toBeVisible({ timeout: 2000 });
 
@@ -191,7 +191,7 @@ test("YOLO state persists across page reload per session", async ({ page }) => {
   });
 
   // Click on session again
-  await page.getByText("Reload Session").click();
+  await page.getByText("Reload Session").first().click();
 
   // YOLO should still be ON (restored from localStorage)
   await expect(page.locator("header").getByText("⚡")).toBeVisible({ timeout: 3000 });
@@ -207,10 +207,9 @@ test("session with YoloEnabled=true from backend shows lightning icon", async ({
     payload: [makeSession({ ID: "yolo-backend-on", Title: "YOLO Session", YoloEnabled: true })],
   });
 
-  await expect(page.getByText("YOLO Session")).toBeVisible({ timeout: 3000 });
-  await page.getByText("YOLO Session").click();
+  await expect(page.getByText("YOLO Session").first()).toBeVisible({ timeout: 3000 });
 
-  // Should show lightning icon immediately
+  // Should show lightning icon from backend field (session is auto-activated)
   await expect(page.locator("header").getByText("⚡")).toBeVisible({ timeout: 2000 });
 });
 
@@ -222,10 +221,9 @@ test("session with YoloEnabled=false from backend shows lock icon", async ({ pag
     payload: [makeSession({ ID: "yolo-backend-off", Title: "No YOLO Session", YoloEnabled: false })],
   });
 
-  await expect(page.getByText("No YOLO Session")).toBeVisible({ timeout: 3000 });
-  await page.getByText("No YOLO Session").click();
+  await expect(page.getByText("No YOLO Session").first()).toBeVisible({ timeout: 3000 });
 
-  // Should show lock icon
+  // Should show lock icon (session is auto-activated)
   await expect(page.locator("header").getByText("🔒")).toBeVisible({ timeout: 2000 });
 });
 
@@ -237,7 +235,7 @@ test("session_updated event with YoloEnabled change updates UI", async ({ page }
     payload: [makeSession({ ID: "yolo-update", Title: "Update YOLO", YoloEnabled: false })],
   });
 
-  await page.getByText("Update YOLO").click();
+  await page.getByText("Update YOLO").first().click();
   await expect(page.locator("header").getByText("🔒")).toBeVisible({ timeout: 2000 });
 
   // Backend updates YOLO state
@@ -260,7 +258,7 @@ test("permission_request is auto-granted when session YOLO is enabled", async ({
     payload: [makeSession({ ID: "yolo-perm", Title: "YOLO Perm Session", YoloEnabled: true })],
   });
 
-  await page.getByText("YOLO Perm Session").click();
+  await page.getByText("YOLO Perm Session").first().click();
 
   // Send permission request
   await sendMockWSMessage(page, {
@@ -300,7 +298,7 @@ test("permission_request shows dialog when session YOLO is disabled", async ({ p
     payload: [makeSession({ ID: "yolo-no-perm", Title: "No YOLO Perm", YoloEnabled: false })],
   });
 
-  await page.getByText("No YOLO Perm").click();
+  await page.getByText("No YOLO Perm").first().click();
 
   // Send permission request
   await sendMockWSMessage(page, {
@@ -336,7 +334,7 @@ test("permission request in non-YOLO session while another has YOLO", async ({ p
   });
 
   // Active in non-YOLO session
-  await page.getByText("Non-YOLO Session").click();
+  await page.getByText("Non-YOLO Session").first().click();
 
   // Send permission for this session
   await sendMockWSMessage(page, {

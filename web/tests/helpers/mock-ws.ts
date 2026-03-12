@@ -16,6 +16,7 @@ export interface MockWSMessage {
 export async function setupMockWS(page: Page) {
   await page.addInitScript(`
     window.__wsSent = [];
+    window.__wsReceived = [];
     window.__mockWS = null;
 
     var _OriginalWebSocket = window.WebSocket;
@@ -75,6 +76,10 @@ export async function sendMockWSMessage(page: Page, msg: MockWSMessage) {
 
   await page.evaluate((data: string) => {
     const ws = ((window as unknown) as Record<string, unknown>)["__mockWS"] as { onmessage: ((ev: MessageEvent) => void) | null } | null;
+    // Track received messages
+    const msgObj = JSON.parse(data);
+    ((window as unknown) as Record<string, unknown>)["__wsReceived"] = ((window as unknown) as Record<string, unknown>)["__wsReceived"] as unknown[] ?? [];
+    ((window as unknown) as Record<string, unknown>)["__wsReceived"] = (((window as unknown) as Record<string, unknown>)["__wsReceived"] as unknown[]).concat(msgObj);
     if (ws?.onmessage) ws.onmessage(new MessageEvent("message", { data }));
   }, JSON.stringify(msg));
 

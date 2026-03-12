@@ -100,6 +100,7 @@ export function removeSession(id: string) {
 export function setActiveSession(id: string | null) {
   $activeSessionID.set(id);
   $messages.set([]);
+  $permissions.set([]);  // Clear permission dialogs when switching sessions
   $agentError.set(null);
   if (id) {
     window.location.hash = `#/${id}`;
@@ -306,7 +307,11 @@ export function setYolo(enabled: boolean) {
 
 export function restoreYoloForSession(sessionID: string) {
   const map = loadYoloSessions();
-  if (!(sessionID in map)) return; // no saved preference — keep current state
+  if (!(sessionID in map)) {
+    // No saved preference - send set_yolo to sync with backend state
+    ws.send("set_yolo", { sessionID, enabled: $yolo.get() });
+    return;
+  }
   const enabled = map[sessionID];
   $yolo.set(enabled);
   localStorage.setItem(STORAGE_KEY_YOLO, String(enabled));

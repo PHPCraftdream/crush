@@ -1,0 +1,110 @@
+
+> crush-web@0.1.0 test
+> playwright test tests/session-filtering.spec.ts --reporter=line
+
+
+Running 18 tests using 1 worker
+
+[1A[2K[1/18] tests\session-filtering.spec.ts:57:1 › message_created for active session appears in chat
+[1A[2K[2/18] tests\session-filtering.spec.ts:70:1 › message_created for different session does NOT appear
+[1A[2K[3/18] tests\session-filtering.spec.ts:84:1 › after switching sessions, old messages are cleared
+[1A[2K[4/18] tests\session-filtering.spec.ts:102:1 › switching back to session shows its messages again
+[1A[2K  1) tests\session-filtering.spec.ts:102:1 › switching back to session shows its messages again ────
+
+    Error: [2mexpect([22m[31mlocator[39m[2m).[22mtoBeVisible[2m([22m[2m)[22m failed
+
+    Locator: getByText('Alpha first')
+    Expected: visible
+    Timeout: 2000ms
+    Error: element(s) not found
+
+    Call log:
+    [2m  - Expect "toBeVisible" with timeout 2000ms[22m
+    [2m  - waiting for getByText('Alpha first')[22m
+
+
+      128 |
+      129 |   // Should load Alpha's messages (via load_messages)
+    > 130 |   await expect(page.getByText("Alpha first")).toBeVisible({ timeout: 2000 });
+          |                                               ^
+      131 |   await expect(page.getByText("Alpha second")).toBeVisible();
+      132 |   // Beta message should NOT be visible
+      133 |   await expect(page.getByText("Beta message")).not.toBeVisible();
+        at D:\dev\go\crush\c\web\tests\session-filtering.spec.ts:130:47
+
+    Error Context: test-results\session-filtering-switchin-23709-on-shows-its-messages-again\error-context.md
+
+
+[1A[2K[5/18] tests\session-filtering.spec.ts:138:1 › message_updated for active session updates the message
+[1A[2K[6/18] tests\session-filtering.spec.ts:161:1 › message_updated for different session is ignored
+[1A[2K[7/18] tests\session-filtering.spec.ts:185:1 › message_deleted for active session removes the message
+[1A[2K[8/18] tests\session-filtering.spec.ts:205:1 › message_deleted for different session is ignored
+[1A[2K[9/18] tests\session-filtering.spec.ts:228:1 › permission_request for active session shows dialog
+[1A[2K[10/18] tests\session-filtering.spec.ts:251:1 › permission_request for different session is ignored
+[1A[2K[11/18] tests\session-filtering.spec.ts:275:1 › permission_request appears only in its session when multiple sessions active
+[1A[2K[12/18] tests\session-filtering.spec.ts:321:1 › session_created event creates new session in sidebar
+[1A[2K[13/18] tests\session-filtering.spec.ts:334:1 › session_updated event updates session in sidebar
+[1A[2K[14/18] tests\session-filtering.spec.ts:348:1 › agent_busy event updates session busy state correctly
+[1A[2K[15/18] tests\session-filtering.spec.ts:366:1 › summarize_queued event applies to correct session
+[1A[2K[16/18] tests\session-filtering.spec.ts:386:1 › messages_list clears previous session messages
+[1A[2K[17/18] tests\session-filtering.spec.ts:418:1 › no active session means no messages shown
+[1A[2K  2) tests\session-filtering.spec.ts:418:1 › no active session means no messages shown ─────────────
+
+    Error: [2mexpect([22m[31mlocator[39m[2m).not.[22mtoBeVisible[2m([22m[2m)[22m failed
+
+    Locator:  getByText('Should not appear')
+    Expected: not visible
+    Received: visible
+    Timeout:  2000ms
+
+    Call log:
+    [2m  - Expect "not toBeVisible" with timeout 2000ms[22m
+    [2m  - waiting for getByText('Should not appear')[22m
+    [2m    5 × locator resolved to <p>Should not appear</p>[22m
+    [2m      - unexpected value "visible"[22m
+
+
+      433 |
+      434 |   // Message should NOT appear (no active session)
+    > 435 |   await expect(page.getByText("Should not appear")).not.toBeVisible({ timeout: 2000 });
+          |                                                         ^
+      436 | });
+      437 |
+      438 | test("rapid session switches handle filtering correctly", async ({ page }) => {
+        at D:\dev\go\crush\c\web\tests\session-filtering.spec.ts:435:57
+
+    Error Context: test-results\session-filtering-no-active-session-means-no-messages-shown\error-context.md
+
+
+[1A[2K[18/18] tests\session-filtering.spec.ts:438:1 › rapid session switches handle filtering correctly
+[1A[2K  3) tests\session-filtering.spec.ts:438:1 › rapid session switches handle filtering correctly ─────
+
+    Error: [2mexpect([22m[31mlocator[39m[2m).[22mtoBeVisible[2m([22m[2m)[22m failed
+
+    Locator: getByText('In Alpha')
+    Expected: visible
+    Timeout: 2000ms
+    Error: element(s) not found
+
+    Call log:
+    [2m  - Expect "toBeVisible" with timeout 2000ms[22m
+    [2m  - waiting for getByText('In Alpha')[22m
+
+
+      465 |   // Back to Alpha
+      466 |   await switchToSession(page, "Alpha Session");
+    > 467 |   await expect(page.getByText("In Alpha")).toBeVisible({ timeout: 2000 });
+          |                                            ^
+      468 |   await expect(page.getByText("In Gamma")).not.toBeVisible();
+      469 | });
+      470 |
+        at D:\dev\go\crush\c\web\tests\session-filtering.spec.ts:467:44
+
+    Error Context: test-results\session-filtering-rapid-se-a423e--handle-filtering-correctly\error-context.md
+
+
+[1A[2K  3 failed
+    tests\session-filtering.spec.ts:102:1 › switching back to session shows its messages again ─────
+    tests\session-filtering.spec.ts:418:1 › no active session means no messages shown ──────────────
+    tests\session-filtering.spec.ts:438:1 › rapid session switches handle filtering correctly ──────
+  15 passed (1.3m)
