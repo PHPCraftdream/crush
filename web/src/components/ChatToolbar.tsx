@@ -1,5 +1,5 @@
 import { useStore } from "@nanostores/react";
-import { Minimize2, Zap, ShieldOff, X } from "lucide-react";
+import { Minimize2, Zap, ShieldOff, X, Settings } from "lucide-react";
 import {
   $sessions,
   $activeSessionID,
@@ -56,12 +56,20 @@ export function ChatToolbar() {
       )}
 
       <button
-        onClick={() => setYolo(!yolo)}
+        onClick={() => activeSessionID && setYolo(activeSessionID, !yolo)}
         title={yolo ? "Yolo ON — all permissions auto-approved" : "Yolo OFF — tool calls require approval"}
         className={`btn-toolbar ${yolo ? "bg-yellow/10 border-yellow/30 text-yellow hover:bg-yellow/20" : ""}`}
       >
         {yolo ? <Zap size={13} /> : <ShieldOff size={13} />}
         Yolo
+      </button>
+
+      <button
+        onClick={() => (window as unknown as Record<string, () => void>).openSettingsModal?.()}
+        title="Settings"
+        className="btn-toolbar"
+      >
+        <Settings size={13} />
       </button>
     </div>
   );

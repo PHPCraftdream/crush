@@ -1,49 +1,31 @@
 import { createPortal } from "react-dom";
 import { useStore } from "@nanostores/react";
-import { useState } from "react";
 import { $permissions, $activeSessionID, removePermission, setYolo } from "../store";
 import { ws } from "../ws";
 import type { PermissionRequest } from "../types";
-import { Zap, Settings } from "lucide-react";
-import { PermissionsModal } from "./PermissionsModal";
+import { Zap } from "lucide-react";
 
 export function PermissionDialog() {
   const permissions = useStore($permissions);
-  const [showModal, setShowModal] = useState(false);
 
-  if (permissions.length === 0 && !showModal) return null;
+  if (permissions.length === 0) return null;
 
   return createPortal(
     <>
-      {/* Manage Permissions Button - always visible when there's an active session */}
-      {permissions.length === 0 && (
-        <button
-          onClick={() => setShowModal(true)}
-          className="fixed bottom-6 right-6 z-[9998] flex items-center gap-2 bg-base-subtle border border-surface text-text-subtle hover:text-text rounded-xl px-4 py-2 shadow-lg transition-colors"
-          title="Manage permissions"
-        >
-          <Settings size={16} />
-          <span className="text-sm font-medium">Permissions</span>
-        </button>
-      )}
-
       {/* Permission Requests */}
       {permissions.length > 0 && (
         <div className="fixed bottom-24 left-1/2 -translate-x-1/2 w-[min(600px,90vw)] flex flex-col gap-2 z-[9999]">
           {permissions.map((p) => (
-            <PermissionCard key={p.ToolCallID} perm={p} onOpenSettings={() => setShowModal(true)} />
+            <PermissionCard key={p.ToolCallID} perm={p} />
           ))}
         </div>
       )}
-
-      {/* Permissions Modal */}
-      {showModal && <PermissionsModal onClose={() => setShowModal(false)} />}
     </>,
     document.body
   );
 }
 
-function PermissionCard({ perm, onOpenSettings }: { perm: PermissionRequest; onOpenSettings?: () => void }) {
+function PermissionCard({ perm }: { perm: PermissionRequest }) {
   const activeSessionID = useStore($activeSessionID);
 
   function grant(persistent: boolean) {
@@ -61,7 +43,7 @@ function PermissionCard({ perm, onOpenSettings }: { perm: PermissionRequest; onO
   function goYolo() {
     // Enable yolo for this session — grants current request and auto-approves all future ones
     if (activeSessionID) {
-      setYolo(true);
+      setYolo(activeSessionID, true);
     }
     grant(false);
   }
@@ -81,15 +63,6 @@ function PermissionCard({ perm, onOpenSettings }: { perm: PermissionRequest; onO
         </p>
       )}
       <div className="flex gap-2 justify-end">
-        {onOpenSettings && (
-          <button
-            onClick={onOpenSettings}
-            className="bg-base-overlay border border-surface text-text-subtle rounded px-3 py-1 text-sm hover:bg-canvas transition-colors"
-            title="Manage all permissions"
-          >
-            <Settings size={14} />
-          </button>
-        )}
         <button
           onClick={deny}
           className="bg-base-overlay border border-surface text-red rounded px-3 py-1 text-sm hover:bg-canvas transition-colors"

@@ -1,10 +1,23 @@
 package version
 
-import "runtime/debug"
+import (
+	"fmt"
+	"runtime/debug"
+)
 
 // Build-time parameters set via -ldflags
+var (
+	Version  = "devel"
+	BuildTime = "unknown"
+)
 
-var Version = "devel"
+// FullVersion returns version with build time
+func FullVersion() string {
+	if BuildTime != "unknown" {
+		return fmt.Sprintf("%s (%s)", Version, BuildTime)
+	}
+	return Version
+}
 
 // A user may install crush using `go install github.com/charmbracelet/crush@latest`.
 // without -ldflags, in which case the version above is unset. As a workaround

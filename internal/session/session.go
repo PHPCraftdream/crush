@@ -247,16 +247,43 @@ func (s *service) SetYolo(ctx context.Context, sessionID string, enabled bool) e
 	if enabled {
 		yolo = 1
 	}
-	_, err := s.db.ExecContext(ctx, "UPDATE sessions SET yolo_enabled = ?, updated_at = strftime('%s', 'now') WHERE id = ?", yolo, sessionID)
+
+	slog.Info("SetYolo: Starting", "sessionID", sessionID, "enabled", enabled, "yoloValue", yolo)
+
+	// Update YOLO flag in database
+	result, err := s.db.ExecContext(ctx, "UPDATE sessions SET yolo_enabled = ?, updated_at = strftime('%s', 'now') WHERE id = ?", yolo, sessionID)
 	if err != nil {
+		slog.Error("SetYolo: UPDATE failed", "sessionID", sessionID, "enabled", enabled, "err", err)
 		return err
 	}
 
-	// Publish an update event so the UI gets the new session state
-	sess, err := s.Get(ctx, sessionID)
-	if err == nil {
-		s.Publish(pubsub.UpdatedEvent, sess)
+	rows, _ := result.RowsAffected()
+	slog.Info("SetYolo: UPDATE executed", "sessionID", sessionID, "rowsAffected", rows, "yoloValue", yolo)
+
+	if rows == 0 {
+		slog.Error("SetYolo: No rows updated! Session not found or yolo_enabled column missing?", "sessionID", sessionID)
 	}
+
+	// Direct verification: read yolo_enabled from DB
+	var yoloVal int64
+	err = s.db.QueryRowContext(ctx, "SELECT yolo_enabled FROM sessions WHERE id = ?", sessionID).Scan(&yoloVal)
+	if err != nil {
+		slog.Error("SetYolo: Failed to verify", "err", err)
+	} else {
+		slog.Info("SetYolo: Direct verification", "sessionID", sessionID, "yoloVal", yoloVal)
+	}
+
+	// Fetch and broadcast the updated session
+	sess, err := s.Get(ctx, sessionID)
+	if err != nil {
+		slog.Error("SetYolo: Failed to fetch session", "sessionID", sessionID, "err", err)
+		return err
+	}
+
+	slog.Info("SetYolo: Final state", "sessionID", sessionID, "enabled", enabled, "yoloEnabled", sess.YoloEnabled)
+
+	// Broadcast update so UI gets the new state
+	s.Publish(pubsub.UpdatedEvent, sess)
 	return nil
 }
 

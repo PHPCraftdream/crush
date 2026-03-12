@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { useStore } from "@nanostores/react";
-import { $config, setDebug, addContextPath, removeContextPath, addSkillsPath, removeSkillsPath, initializeProject, setActiveSession } from "../store";
+import { $config, addContextPath, removeContextPath, addSkillsPath, removeSkillsPath, initializeProject, setActiveSession } from "../store";
 import { ws } from "../ws";
 import { X, Plus, Trash2, RefreshCw, FolderOpen, Loader2 } from "lucide-react";
 import type { SkillsSnapshot } from "../types";
@@ -159,12 +159,6 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
     return () => document.removeEventListener("keydown", onKey);
   }, [onClose]);
 
-  function handleDebugChange(field: "debug" | "debugLsp", value: boolean) {
-    const debug = field === "debug" ? value : (config?.debug ?? false);
-    const debugLsp = field === "debugLsp" ? value : (config?.debugLsp ?? false);
-    setDebug(debug, debugLsp);
-  }
-
   function handleInitialize() {
     setInitBusy(true);
     const msgID = crypto.randomUUID();
@@ -201,7 +195,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
         <div className="flex items-center justify-between px-5 py-4 border-b border-surface shrink-0">
           <div>
             <h2 className="text-base font-semibold text-text">Settings</h2>
-            <p className="text-xs text-text-subtle mt-0.5">Debug, context and skills configuration</p>
+            <p className="text-xs text-text-subtle mt-0.5">Context and skills configuration</p>
           </div>
           <button onClick={onClose} className="text-text-subtle hover:text-text transition-colors p-1 rounded-lg hover:bg-base-overlay">
             <X size={16} />
@@ -210,21 +204,6 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
 
         {/* Body */}
         <div className="flex-1 overflow-y-auto divide-y divide-surface">
-
-          {/* Debug section */}
-          <section className="px-5 py-4 space-y-3">
-            <h3 className="text-xs font-semibold text-text-subtle uppercase tracking-wider">Debug</h3>
-            <Toggle
-              checked={config?.debug ?? false}
-              onChange={(v) => handleDebugChange("debug", v)}
-              label="Enable debug logging"
-            />
-            <Toggle
-              checked={config?.debugLsp ?? false}
-              onChange={(v) => handleDebugChange("debugLsp", v)}
-              label="Enable LSP debug logging"
-            />
-          </section>
 
           {/* Initialize project */}
           <section className="px-5 py-4 space-y-3">
@@ -277,6 +256,13 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
             />
             <SkillsSection skillsPaths={skillsPaths} />
           </section>
+        </div>
+
+        {/* Footer */}
+        <div className="px-5 py-3 border-t border-surface bg-base-overlay/50">
+          <p className="text-xs text-text-subtle text-center">
+            {config?.version || "Development build"}
+          </p>
         </div>
       </div>
     </div>

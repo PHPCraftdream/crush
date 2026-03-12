@@ -102,10 +102,16 @@ export function setActiveSession(id: string | null) {
   $messages.set([]);
   $permissions.set([]);  // Clear permission dialogs when switching sessions
   $agentError.set(null);
+  // Restore YOLO state for the new active session
   if (id) {
+    const sessions = $sessions.get();
+    const session = sessions.find((s) => s.ID === id);
+    const yoloEnabled = session?.YoloEnabled ?? false;
+    $yolo.set(yoloEnabled);
+    console.log("[setActiveSession] id:", id, "YoloEnabled:", yoloEnabled, "session:", session);
     window.location.hash = `#/${id}`;
-    restoreYoloForSession(id);
   } else {
+    $yolo.set(false);
     window.location.hash = "";
   }
 }
@@ -271,51 +277,16 @@ export function setTheme(theme: "light" | "dark") {
 }
 
 // ── Yolo mode ────────────────────────────────────────────────────────────────
-const STORAGE_KEY_YOLO = "crush_yolo";
-const STORAGE_KEY_YOLO_SESSIONS = "crush_yolo_sessions";
+export const $yolo = atom<boolean>(false);
 
-function loadYoloSessions(): Record<string, boolean> {
-  try {
-    return JSON.parse(localStorage.getItem(STORAGE_KEY_YOLO_SESSIONS) ?? "{}");
-  } catch {
-    return {};
-  }
-}
-
-function loadYolo(): boolean {
-  try {
-    return localStorage.getItem(STORAGE_KEY_YOLO) === "true";
-  } catch {
-    return false;
-  }
-}
-
-export const $yolo = atom<boolean>(loadYolo());
-
-export function setYolo(enabled: boolean) {
-  $yolo.set(enabled);
-  localStorage.setItem(STORAGE_KEY_YOLO, String(enabled));
-  // Persist per-session and send to backend with session ID
-  const sessionID = $activeSessionID.get();
-  ws.send("set_yolo", { sessionID, enabled });
-  if (sessionID) {
-    const map = loadYoloSessions();
-    map[sessionID] = enabled;
-    localStorage.setItem(STORAGE_KEY_YOLO_SESSIONS, JSON.stringify(map));
-  }
-}
-
-export function restoreYoloForSession(sessionID: string) {
-  const map = loadYoloSessions();
-  if (!(sessionID in map)) {
-    // No saved preference - send set_yolo to sync with backend state
-    ws.send("set_yolo", { sessionID, enabled: $yolo.get() });
+export function setYolo(sessionID: string, enabled: boolean) {
+  if (!sessionID) {
+    console.warn("[setYolo] No session ID provided");
     return;
   }
-  const enabled = map[sessionID];
-  $yolo.set(enabled);
-  localStorage.setItem(STORAGE_KEY_YOLO, String(enabled));
+  console.log("[setYolo] Called with:", { sessionID, enabled, currentYolo: $yolo.get() });
   ws.send("set_yolo", { sessionID, enabled });
+  console.log("[setYolo] Sent set_yolo to backend");
 }
 
 export function setProviderKey(providerID: string, apiKey: string) {
@@ -475,10 +446,6 @@ export function updateQueuedMessage(sessionID: string, id: string, content: stri
 }
 
 // ── Settings actions ───────────────────────────────────────────────────────────
-
-export function setDebug(debug: boolean, debugLsp: boolean) {
-  ws.send("set_debug", { debug, debugLsp });
-}
 
 export function addContextPath(path: string) {
   ws.send("add_context_path", { path });

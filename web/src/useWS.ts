@@ -83,6 +83,7 @@ export function useWS() {
 
       ws.on("session_created", (msg: WSMessage) => {
         const s = msg.payload as Session;
+        console.log("[useWS] session_created:", s.ID, "YoloEnabled:", s.YoloEnabled);
         upsertSession(s);
         // Always select newly created session (whether auto-created or manual)
         setActiveSession(s.ID);
@@ -91,10 +92,10 @@ export function useWS() {
       ws.on("session_updated", (msg: WSMessage) => {
         const session = msg.payload as Session;
         upsertSession(session);
-        // If this is the active session, sync YOLO state
-        if ($activeSessionID.get() === session.ID && session.YoloEnabled !== $yolo.get()) {
+        // Sync YOLO state from backend when active session is updated
+        if ($activeSessionID.get() === session.ID && session.YoloEnabled !== undefined) {
+          console.log("[useWS] session_updated for active session, YoloEnabled:", session.YoloEnabled, "current yolo:", $yolo.get());
           $yolo.set(session.YoloEnabled);
-          localStorage.setItem("crush_yolo", String(session.YoloEnabled));
         }
       }),
       ws.on("session_deleted", (msg: WSMessage) => {
@@ -122,10 +123,9 @@ export function useWS() {
           if (session) {
             if (activeID !== hashID) {
               setActiveSession(hashID);
-              // Sync YOLO state from backend if session has YoloEnabled set
-              if (session.YoloEnabled !== $yolo.get()) {
+              // Sync YOLO state from backend
+              if (session.YoloEnabled !== undefined) {
                 $yolo.set(session.YoloEnabled);
-                localStorage.setItem("crush_yolo", String(session.YoloEnabled));
               }
               ws.send("load_messages", { sessionID: hashID });
             }
@@ -137,10 +137,9 @@ export function useWS() {
         const latest = sessions[0];
         if (latest && activeID !== latest.ID) {
           setActiveSession(latest.ID);
-          // Sync YOLO state from backend if session has YoloEnabled set
-          if (latest.YoloEnabled !== $yolo.get()) {
+          // Sync YOLO state from backend
+          if (latest.YoloEnabled !== undefined) {
             $yolo.set(latest.YoloEnabled);
-            localStorage.setItem("crush_yolo", String(latest.YoloEnabled));
           }
           ws.send("load_messages", { sessionID: latest.ID });
         }
@@ -224,10 +223,7 @@ export function useWS() {
       ws.on("config", (msg: WSMessage) => {
         const cfg = msg.payload as ConfigPayload;
         $config.set(cfg);
-        // Sync yolo from server only on initial load (localStorage takes priority on reconnect)
-        if (cfg.yolo !== undefined && localStorage.getItem("crush_yolo") === null) {
-          $yolo.set(cfg.yolo);
-        }
+        // Note: YOLO is now managed per-session, not globally via config
         // Apply server theme only if no local preference (first-ever visit).
         // If the user set a theme on the login page, it's already in localStorage
         // and was just pushed to the server above — don't let the echoed config

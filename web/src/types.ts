@@ -142,6 +142,7 @@ export interface ConfigPayload {
   contextPaths?: string[];
   skillsPaths?: string[];
   initializeAs?: string;
+  version?: string;
 }
 
 export interface SkillInfo {

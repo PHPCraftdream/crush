@@ -378,6 +378,7 @@ type ConfigWire struct {
 	ContextPaths      []string                  `json:"contextPaths,omitempty"`
 	SkillsPaths       []string                  `json:"skillsPaths,omitempty"`
 	InitializeAs      string                    `json:"initializeAs,omitempty"`
+	Version           string                    `json:"version,omitempty"`
 }
 
 // ModelEntryWire represents a selected model entry (large/small/etc).

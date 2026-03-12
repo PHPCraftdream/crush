@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"time"
 )
 
 func run(dir, name string, args ...string) {
@@ -35,7 +36,10 @@ func main() {
 	}
 
 	fmt.Println("→ Building crush binary...")
-	run(root, "go", "build", "-o", out, ".")
+	// Get current time for build timestamp
+	buildTime := time.Now().Format("2006-01-02_15-04-05")
+	ldflags := fmt.Sprintf("-X=github.com/charmbracelet/crush/internal/version.BuildTime=%s", buildTime)
+	run(root, "go", "build", "-ldflags", ldflags, "-o", out, ".")
 
 	fmt.Printf("✓ Done → %s\n", out)
 }

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"time"
 
 	appPkg "github.com/charmbracelet/crush/internal/app"
 	"github.com/charmbracelet/crush/internal/agent"
@@ -18,6 +19,7 @@ import (
 	"github.com/charmbracelet/crush/internal/permission"
 	"github.com/charmbracelet/crush/internal/session"
 	"github.com/charmbracelet/crush/internal/skills"
+	"github.com/charmbracelet/crush/internal/version"
 
 	"charm.land/catwalk/pkg/catwalk"
 )
@@ -298,15 +300,22 @@ func handleRemoveRecentModel(a *appPkg.App, c *Client, msg WSMessage) {
 func handleSetYolo(a *appPkg.App, c *Client, msg WSMessage) {
 	var p SetYoloPayload
 	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		slog.Error("handleSetYolo: invalid payload", "err", err, "payload", string(msg.Payload))
 		c.reply(msg.ID, EventError, nil, "invalid payload")
 		return
 	}
 
+	slog.Info("handleSetYolo: received", "sessionID", p.SessionID, "enabled", p.Enabled)
+
 	// Set session-specific YOLO mode in database.
 	if p.SessionID != "" {
-		if err := a.Sessions.SetYolo(context.Background(), p.SessionID, p.Enabled); err != nil {
-			slog.Warn("ws: failed to set session YOLO", "err", err)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := a.Sessions.SetYolo(ctx, p.SessionID, p.Enabled); err != nil {
+			slog.Error("handleSetYolo: failed to set session YOLO", "err", err)
 		}
+	} else {
+		slog.Warn("handleSetYolo: empty sessionID")
 	}
 
 	// Also set global skip flag for backwards compatibility.
@@ -657,6 +666,8 @@ func buildConfigWire(a *appPkg.App) (ConfigWire, bool) {
 	for _, m := range cfg.RecentModels[config.SelectedModelTypeSmall] {
 		wire.RecentSmallModels = append(wire.RecentSmallModels, ModelEntryWire{Provider: m.Provider, Model: m.Model})
 	}
+
+	wire.Version = version.FullVersion()
 
 	return wire, true
 }
