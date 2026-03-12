@@ -30,11 +30,13 @@ function PathList({
   onAdd,
   onRemove,
   placeholder,
+  testId,
 }: {
   paths: string[];
   onAdd: (p: string) => void;
   onRemove: (p: string) => void;
   placeholder: string;
+  testId: string;
 }) {
   const [draft, setDraft] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
@@ -51,16 +53,17 @@ function PathList({
   }
 
   return (
-    <div className="space-y-2">
+    <div className="space-y-2" data-test-id={testId}>
       {paths.length > 0 ? (
         <ul className="space-y-1">
-          {paths.map((p) => (
-            <li key={p} className="flex items-center gap-2 bg-base-overlay border border-surface rounded-lg px-3 py-1.5">
+          {paths.map((p, idx) => (
+            <li key={p} className="flex items-center gap-2 bg-base-overlay border border-surface rounded-lg px-3 py-1.5" data-test-id={`${testId}-item-${idx}`}>
               <span className="flex-1 text-xs font-mono text-text truncate">{p}</span>
               <button
                 onClick={() => onRemove(p)}
                 className="shrink-0 text-text-subtle hover:text-red transition-colors"
                 title="Remove"
+                data-test-id={`${testId}-remove-${idx}`}
               >
                 <Trash2 size={13} />
               </button>
@@ -78,11 +81,13 @@ function PathList({
           onKeyDown={onKey}
           placeholder={placeholder}
           className="flex-1 text-xs font-mono text-text bg-canvas border border-surface rounded-lg px-3 py-1.5 outline-none focus:border-accent/50 transition-colors placeholder:text-text-muted/50"
+          data-test-id={`${testId}-input`}
         />
         <button
           onClick={add}
           disabled={!draft.trim()}
           className="px-3 py-1.5 text-xs font-medium bg-accent-fill text-white/90 rounded-lg hover:opacity-90 disabled:opacity-40 flex items-center gap-1"
+          data-test-id={`${testId}-add`}
         >
           <Plus size={12} />
           Add
@@ -113,7 +118,7 @@ function SkillsSection({ skillsPaths: _skillsPaths }: { skillsPaths: string[] })
   useEffect(() => { refresh(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
-    <div className="space-y-3">
+    <div className="space-y-3" data-test-id="settings-skills-section">
       <div className="flex items-center justify-between">
         <span className="text-xs font-semibold text-text-subtle uppercase tracking-wider">Discovered Skills</span>
         <button
@@ -121,6 +126,7 @@ function SkillsSection({ skillsPaths: _skillsPaths }: { skillsPaths: string[] })
           disabled={loading}
           title="Refresh skills"
           className="text-text-subtle hover:text-accent transition-colors disabled:opacity-40"
+          data-test-id="settings-skills-refresh"
         >
           <RefreshCw size={13} className={loading ? "animate-spin" : ""} />
         </button>
@@ -129,8 +135,8 @@ function SkillsSection({ skillsPaths: _skillsPaths }: { skillsPaths: string[] })
         <p className="text-xs text-text-subtle">Scanning…</p>
       ) : snapshot && snapshot.skills.length > 0 ? (
         <ul className="space-y-1.5">
-          {snapshot.skills.map((s) => (
-            <li key={s.path} className="bg-base-overlay border border-surface rounded-lg px-3 py-2">
+          {snapshot.skills.map((s, idx) => (
+            <li key={s.path} className="bg-base-overlay border border-surface rounded-lg px-3 py-2" data-test-id={`settings-skill-item-${idx}`}>
               <div className="text-xs font-semibold text-text">{s.name}</div>
               {s.description && <div className="text-[11px] text-text-subtle mt-0.5 line-clamp-2">{s.description}</div>}
               <div className="text-[10px] font-mono text-text-muted mt-1 truncate">{s.path}</div>
@@ -186,27 +192,29 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm p-4"
       onClick={onClose}
+      data-test-id="settings-modal-overlay"
     >
       <div
         className="bg-canvas border border-surface rounded-2xl shadow-xl w-full max-w-lg overflow-hidden flex flex-col max-h-[85vh] chat-font"
         onClick={(e) => e.stopPropagation()}
+        data-test-id="settings-modal"
       >
         {/* Header */}
-        <div className="flex items-center justify-between px-5 py-4 border-b border-surface shrink-0">
+        <div className="flex items-center justify-between px-5 py-4 border-b border-surface shrink-0" data-test-id="settings-modal-header">
           <div>
             <h2 className="text-base font-semibold text-text">Settings</h2>
             <p className="text-xs text-text-subtle mt-0.5">Context and skills configuration</p>
           </div>
-          <button onClick={onClose} className="text-text-subtle hover:text-text transition-colors p-1 rounded-lg hover:bg-base-overlay">
+          <button onClick={onClose} className="text-text-subtle hover:text-text transition-colors p-1 rounded-lg hover:bg-base-overlay" data-test-id="settings-modal-close">
             <X size={16} />
           </button>
         </div>
 
         {/* Body */}
-        <div className="flex-1 overflow-y-auto divide-y divide-surface">
+        <div className="flex-1 overflow-y-auto divide-y divide-surface" data-test-id="settings-modal-body">
 
           {/* Initialize project */}
-          <section className="px-5 py-4 space-y-3">
+          <section className="px-5 py-4 space-y-3" data-test-id="settings-section-init">
             <h3 className="text-xs font-semibold text-text-subtle uppercase tracking-wider">Project Initialization</h3>
             <p className="text-xs text-text-subtle leading-relaxed">
               Analyze the codebase and create or update{" "}
@@ -217,6 +225,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
               onClick={handleInitialize}
               disabled={initBusy || initDone}
               className="flex items-center gap-2 px-4 py-2 text-sm font-medium bg-accent-fill text-white/90 rounded-xl hover:opacity-90 disabled:opacity-40 transition-all"
+              data-test-id="settings-init-button"
             >
               {initBusy ? (
                 <><Loader2 size={14} className="animate-spin" /> Initializing…</>
@@ -229,7 +238,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
           </section>
 
           {/* Context paths */}
-          <section className="px-5 py-4 space-y-3">
+          <section className="px-5 py-4 space-y-3" data-test-id="settings-section-context">
             <h3 className="text-xs font-semibold text-text-subtle uppercase tracking-wider">Context Paths</h3>
             <p className="text-xs text-text-subtle leading-relaxed">
               Additional files the agent reads for project context (beyond defaults like AGENTS.md, CLAUDE.md).
@@ -239,11 +248,12 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
               onAdd={addContextPath}
               onRemove={removeContextPath}
               placeholder="e.g. docs/architecture.md"
+              testId="settings-context-paths"
             />
           </section>
 
           {/* Skills paths */}
-          <section className="px-5 py-4 space-y-3">
+          <section className="px-5 py-4 space-y-3" data-test-id="settings-section-skills">
             <h3 className="text-xs font-semibold text-text-subtle uppercase tracking-wider">Agent Skills Paths</h3>
             <p className="text-xs text-text-subtle leading-relaxed">
               Directories containing Agent Skills (folders with SKILL.md files).
@@ -253,13 +263,14 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
               onAdd={addSkillsPath}
               onRemove={removeSkillsPath}
               placeholder="e.g. ./project-skills"
+              testId="settings-skills-paths"
             />
             <SkillsSection skillsPaths={skillsPaths} />
           </section>
         </div>
 
         {/* Footer */}
-        <div className="px-5 py-3 border-t border-surface bg-base-overlay/50">
+        <div className="px-5 py-3 border-t border-surface bg-base-overlay/50" data-test-id="settings-modal-footer">
           <p className="text-xs text-text-subtle text-center">
             {config?.version || "Development build"}
           </p>
