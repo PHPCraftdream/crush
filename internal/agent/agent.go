@@ -418,10 +418,11 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 
 			var assistantMsg message.Message
 			assistantMsg, err = a.messages.Create(callContext, call.SessionID, message.CreateMessageParams{
-				Role:     message.Assistant,
-				Parts:    []message.ContentPart{},
-				Model:    largeModel.ModelCfg.Model,
-				Provider: largeModel.ModelCfg.Provider,
+				Role:            message.Assistant,
+				Parts:           []message.ContentPart{},
+				Model:           largeModel.ModelCfg.Model,
+				Provider:        largeModel.ModelCfg.Provider,
+				ReasoningEffort: currentSession.LargeModelReasoningEffort,
 			})
 			if err != nil {
 				return callContext, prepared, err
@@ -730,6 +731,7 @@ func (a *sessionAgent) runSummarize(ctx context.Context, sessionID string, opts 
 		Role:             message.Assistant,
 		Model:            largeModel.Model.Model(),
 		Provider:         largeModel.Model.Provider(),
+		ReasoningEffort:  currentSession.LargeModelReasoningEffort,
 		IsSummaryMessage: true,
 	})
 	if err != nil {
@@ -871,6 +873,7 @@ func (a *sessionAgent) runSummarizeSilent(ctx context.Context, sessionID string,
 		Role:             message.Assistant,
 		Model:            largeModel.Model.Model(),
 		Provider:         largeModel.Model.Provider(),
+		ReasoningEffort:  currentSession.LargeModelReasoningEffort,
 		IsSummaryMessage: true,
 		Hidden:           true,
 	})

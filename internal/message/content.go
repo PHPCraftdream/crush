@@ -132,6 +132,7 @@ type Message struct {
 	Parts            []ContentPart
 	Model            string
 	Provider         string
+	ReasoningEffort  string // "low", "medium", "high", or "max" - reasoning effort for Claude models
 	CreatedAt        int64
 	UpdatedAt        int64
 	IsSummaryMessage bool

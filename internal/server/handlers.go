@@ -249,17 +249,32 @@ func handleSetSessionModels(ctx context.Context, a *appPkg.App, c *Client, msg W
 
 	slog.Info("ws: handleSetSessionModels", "sessionID", p.SessionID, "large", p.LargeModel, "small", p.SmallModel)
 
-	var lp, lm, sp, sm string
+	var lp, lm, lre, sp, sm, sre string
 	if p.LargeModel != nil {
 		lp, lm = p.LargeModel.Provider, p.LargeModel.Model
+		lre = p.LargeModel.ReasoningEffort
+		if lre == "" {
+			lre = "medium" // default
+		}
 	}
 	if p.SmallModel != nil {
 		sp, sm = p.SmallModel.Provider, p.SmallModel.Model
+		sre = p.SmallModel.ReasoningEffort
+		if sre == "" {
+			sre = "medium" // default
+		}
 	}
 
 	if err := a.Sessions.UpdateModels(ctx, p.SessionID, lp, lm, sp, sm); err != nil {
 		c.reply(msg.ID, EventError, nil, err.Error())
 		return
+	}
+
+	// Update reasoning effort for models that support it
+	if lre != "" || sre != "" {
+		if err := a.Sessions.UpdateReasoningEffort(ctx, p.SessionID, lre, sre); err != nil {
+			slog.Warn("ws: failed to update reasoning effort", "err", err)
+		}
 	}
 
 	// Record recently used models in the config (persists across restarts)
@@ -486,6 +501,7 @@ func handleForkSession(ctx context.Context, a *appPkg.App, c *Client, msg WSMess
 			Parts:            m.Parts,
 			Model:            string(m.Model),
 			Provider:         m.Provider,
+			ReasoningEffort:  m.ReasoningEffort,
 			IsSummaryMessage: m.IsSummaryMessage,
 		})
 	}

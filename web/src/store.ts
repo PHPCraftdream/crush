@@ -246,6 +246,42 @@ export function setSessionModels(sessionID: string, largeKey: string | null, sma
   });
 }
 
+export function setSessionReasoningEffort(
+  sessionID: string,
+  largeEffort: string | null,
+  smallEffort: string | null,
+) {
+  const sessions = $sessions.get();
+  const idx = sessions.findIndex((s) => s.ID === sessionID);
+  if (idx !== -1) {
+    const next = [...sessions];
+    next[idx] = {
+      ...next[idx],
+      ...(largeEffort ? { LargeModelReasoningEffort: largeEffort } : {}),
+      ...(smallEffort ? { SmallModelReasoningEffort: smallEffort } : {}),
+    };
+    $sessions.set(next);
+  }
+
+  // Get current models to send with reasoning effort update
+  const session = sessions[idx];
+  if (session) {
+    ws.send("set_session_models", {
+      sessionID,
+      largeModel: {
+        provider: session.LargeModelProvider,
+        model: session.LargeModelID,
+        reasoning_effort: largeEffort || undefined,
+      },
+      smallModel: {
+        provider: session.SmallModelProvider,
+        model: session.SmallModelID,
+        reasoning_effort: smallEffort || undefined,
+      },
+    });
+  }
+}
+
 // ── Theme ─────────────────────────────────────────────────────────────────────
 // Theme is stored on the backend. localStorage is only used as a cache for
 // instant page load (before WS connects) to avoid white flash.

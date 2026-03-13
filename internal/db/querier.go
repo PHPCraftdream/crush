@@ -12,8 +12,10 @@ type Querier interface {
 	CreateFile(ctx context.Context, arg CreateFileParams) (File, error)
 	CreateMessage(ctx context.Context, arg CreateMessageParams) (Message, error)
 	CreateSession(ctx context.Context, arg CreateSessionParams) (Session, error)
+	CreateSessionPermission(ctx context.Context, arg CreateSessionPermissionParams) error
 	DeleteFile(ctx context.Context, id string) error
 	DeleteMessage(ctx context.Context, id string) error
+	DeletePermission(ctx context.Context, id string) error
 	DeleteSession(ctx context.Context, id string) error
 	DeleteSessionFiles(ctx context.Context, sessionID string) error
 	DeleteSessionMessages(ctx context.Context, sessionID string) error
@@ -31,19 +33,25 @@ type Querier interface {
 	GetUsageByDayOfWeek(ctx context.Context) ([]GetUsageByDayOfWeekRow, error)
 	GetUsageByHour(ctx context.Context) ([]GetUsageByHourRow, error)
 	GetUsageByModel(ctx context.Context) ([]GetUsageByModelRow, error)
+	ListAllSessionPermissions(ctx context.Context) ([]SessionPermission, error)
 	ListAllUserMessages(ctx context.Context) ([]Message, error)
 	ListFilesByPath(ctx context.Context, path string) ([]File, error)
 	ListFilesBySession(ctx context.Context, sessionID string) ([]File, error)
 	ListLatestSessionFiles(ctx context.Context, sessionID string) ([]File, error)
 	ListMessagesBySession(ctx context.Context, sessionID string) ([]Message, error)
 	ListNewFiles(ctx context.Context) ([]File, error)
+	ListSessionPermissions(ctx context.Context, sessionID string) ([]SessionPermission, error)
 	ListSessionReadFiles(ctx context.Context, sessionID string) ([]ReadFile, error)
 	ListSessions(ctx context.Context) ([]Session, error)
 	ListUserMessagesBySession(ctx context.Context, sessionID string) ([]Message, error)
 	RecordFileRead(ctx context.Context, arg RecordFileReadParams) error
+	SetSessionYolo(ctx context.Context, arg SetSessionYoloParams) error
 	UpdateMessage(ctx context.Context, arg UpdateMessageParams) error
 	UpdateMessagePinned(ctx context.Context, arg UpdateMessagePinnedParams) error
+	UpdatePermissionEnabled(ctx context.Context, arg UpdatePermissionEnabledParams) error
 	UpdateSession(ctx context.Context, arg UpdateSessionParams) (Session, error)
+	UpdateSessionModels(ctx context.Context, arg UpdateSessionModelsParams) error
+	UpdateSessionReasoningEffort(ctx context.Context, arg UpdateSessionReasoningEffortParams) error
 	UpdateSessionSystemPrompt(ctx context.Context, arg UpdateSessionSystemPromptParams) error
 	UpdateSessionTitleAndUsage(ctx context.Context, arg UpdateSessionTitleAndUsageParams) error
 }

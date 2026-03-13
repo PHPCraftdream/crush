@@ -50,10 +50,12 @@ type Session struct {
 	CreatedAt        int64
 	UpdatedAt        int64
 
-	LargeModelProvider string
-	LargeModelID       string
-	SmallModelProvider string
-	SmallModelID       string
+	LargeModelProvider         string
+	LargeModelID               string
+	LargeModelReasoningEffort  string // "low", "medium", "high", or "max"
+	SmallModelProvider         string
+	SmallModelID               string
+	SmallModelReasoningEffort  string // "low", "medium", "high", or "max"
 
 	SystemPrompt string
 	YoloEnabled  bool
@@ -69,6 +71,7 @@ type Service interface {
 	Save(ctx context.Context, session Session) (Session, error)
 	UpdateTitleAndUsage(ctx context.Context, sessionID, title string, promptTokens, completionTokens int64, cost float64) error
 	UpdateModels(ctx context.Context, sessionID, largeProvider, largeModel, smallProvider, smallModel string) error
+	UpdateReasoningEffort(ctx context.Context, sessionID, largeEffort, smallEffort string) error
 	UpdateSystemPrompt(ctx context.Context, sessionID, prompt string) error
 	SetYolo(ctx context.Context, sessionID string, enabled bool) error
 	Delete(ctx context.Context, id string) error
@@ -287,6 +290,25 @@ func (s *service) SetYolo(ctx context.Context, sessionID string, enabled bool) e
 	return nil
 }
 
+// UpdateReasoningEffort updates the reasoning effort for large and small models.
+func (s *service) UpdateReasoningEffort(ctx context.Context, sessionID, largeEffort, smallEffort string) error {
+	err := s.q.UpdateSessionReasoningEffort(ctx, db.UpdateSessionReasoningEffortParams{
+		ID:                          sessionID,
+		LargeModelReasoningEffort:   sql.NullString{String: largeEffort, Valid: largeEffort != ""},
+		SmallModelReasoningEffort:   sql.NullString{String: smallEffort, Valid: smallEffort != ""},
+	})
+	if err != nil {
+		return err
+	}
+
+	// Publish an update event so the UI gets the new session state
+	sess, err := s.Get(ctx, sessionID)
+	if err == nil {
+		s.Publish(pubsub.UpdatedEvent, sess)
+	}
+	return nil
+}
+
 func (s *service) List(ctx context.Context) ([]Session, error) {
 	dbSessions, err := s.q.ListSessions(ctx)
 	if err != nil {
@@ -317,10 +339,12 @@ func (s service) fromDBItem(item db.Session) Session {
 		CreatedAt:        item.CreatedAt,
 		UpdatedAt:        item.UpdatedAt,
 
-		LargeModelProvider: item.LargeModelProvider.String,
-		LargeModelID:       item.LargeModelID.String,
-		SmallModelProvider: item.SmallModelProvider.String,
-		SmallModelID:       item.SmallModelID.String,
+		LargeModelProvider:        item.LargeModelProvider.String,
+		LargeModelID:              item.LargeModelID.String,
+		LargeModelReasoningEffort: item.LargeModelReasoningEffort.String,
+		SmallModelProvider:        item.SmallModelProvider.String,
+		SmallModelID:              item.SmallModelID.String,
+		SmallModelReasoningEffort: item.SmallModelReasoningEffort.String,
 
 		SystemPrompt: item.SystemPrompt,
 		YoloEnabled:  item.YoloEnabled != 0,

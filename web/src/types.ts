@@ -24,8 +24,10 @@ export interface Session {
 
   LargeModelProvider: string;
   LargeModelID: string;
+  LargeModelReasoningEffort: string; // "low", "medium", "high", or "max"
   SmallModelProvider: string;
   SmallModelID: string;
+  SmallModelReasoningEffort: string; // "low", "medium", "high", or "max"
 
   SystemPrompt: string;
   YoloEnabled: boolean;
@@ -80,6 +82,7 @@ export interface Message {
   Parts: ContentPart[];
   Model: string;
   Provider: string;
+  ReasoningEffort: string; // "low", "medium", "high", or "max" - for Claude models
   CreatedAt: number;
   UpdatedAt: number;
   IsSummaryMessage: boolean;

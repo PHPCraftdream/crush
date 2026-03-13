@@ -80,8 +80,9 @@ const (
 
 // ModelOverrideWire carries per-call model overrides from the client.
 type ModelOverrideWire struct {
-	Provider string `json:"provider"`
-	Model    string `json:"model"`
+	Provider        string `json:"provider"`
+	Model           string `json:"model"`
+	ReasoningEffort string `json:"reasoning_effort,omitempty"` // "low", "medium", "high", or "max"
 }
 
 type SetSessionModelsPayload struct {

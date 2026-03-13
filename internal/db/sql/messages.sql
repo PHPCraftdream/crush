@@ -17,12 +17,13 @@ INSERT INTO messages (
     parts,
     model,
     provider,
+    reasoning_effort,
     is_summary_message,
     hidden,
     created_at,
     updated_at
 ) VALUES (
-    ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'), strftime('%s', 'now')
+    ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'), strftime('%s', 'now')
 )
 RETURNING *;
 

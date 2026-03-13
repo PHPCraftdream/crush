@@ -18,14 +18,15 @@ INSERT INTO messages (
     parts,
     model,
     provider,
+    reasoning_effort,
     is_summary_message,
     hidden,
     created_at,
     updated_at
 ) VALUES (
-    ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'), strftime('%s', 'now')
+    ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'), strftime('%s', 'now')
 )
-RETURNING id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden
+RETURNING id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden, reasoning_effort
 `
 
 type CreateMessageParams struct {
@@ -35,6 +36,7 @@ type CreateMessageParams struct {
 	Parts            string         `json:"parts"`
 	Model            sql.NullString `json:"model"`
 	Provider         sql.NullString `json:"provider"`
+	ReasoningEffort  sql.NullString `json:"reasoning_effort"`
 	IsSummaryMessage int64          `json:"is_summary_message"`
 	Hidden           int64          `json:"hidden"`
 }
@@ -47,6 +49,7 @@ func (q *Queries) CreateMessage(ctx context.Context, arg CreateMessageParams) (M
 		arg.Parts,
 		arg.Model,
 		arg.Provider,
+		arg.ReasoningEffort,
 		arg.IsSummaryMessage,
 		arg.Hidden,
 	)
@@ -64,6 +67,7 @@ func (q *Queries) CreateMessage(ctx context.Context, arg CreateMessageParams) (M
 		&i.IsSummaryMessage,
 		&i.Pinned,
 		&i.Hidden,
+		&i.ReasoningEffort,
 	)
 	return i, err
 }
@@ -89,7 +93,7 @@ func (q *Queries) DeleteSessionMessages(ctx context.Context, sessionID string) e
 }
 
 const getMessage = `-- name: GetMessage :one
-SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden
+SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden, reasoning_effort
 FROM messages
 WHERE id = ? LIMIT 1
 `
@@ -110,12 +114,13 @@ func (q *Queries) GetMessage(ctx context.Context, id string) (Message, error) {
 		&i.IsSummaryMessage,
 		&i.Pinned,
 		&i.Hidden,
+		&i.ReasoningEffort,
 	)
 	return i, err
 }
 
 const listAllUserMessages = `-- name: ListAllUserMessages :many
-SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden
+SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden, reasoning_effort
 FROM messages
 WHERE role = 'user'
 ORDER BY created_at DESC
@@ -143,6 +148,7 @@ func (q *Queries) ListAllUserMessages(ctx context.Context) ([]Message, error) {
 			&i.IsSummaryMessage,
 			&i.Pinned,
 			&i.Hidden,
+			&i.ReasoningEffort,
 		); err != nil {
 			return nil, err
 		}
@@ -158,7 +164,7 @@ func (q *Queries) ListAllUserMessages(ctx context.Context) ([]Message, error) {
 }
 
 const listMessagesBySession = `-- name: ListMessagesBySession :many
-SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden
+SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden, reasoning_effort
 FROM messages
 WHERE session_id = ?
 ORDER BY created_at ASC
@@ -186,6 +192,7 @@ func (q *Queries) ListMessagesBySession(ctx context.Context, sessionID string) (
 			&i.IsSummaryMessage,
 			&i.Pinned,
 			&i.Hidden,
+			&i.ReasoningEffort,
 		); err != nil {
 			return nil, err
 		}
@@ -201,7 +208,7 @@ func (q *Queries) ListMessagesBySession(ctx context.Context, sessionID string) (
 }
 
 const listUserMessagesBySession = `-- name: ListUserMessagesBySession :many
-SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden
+SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden, reasoning_effort
 FROM messages
 WHERE session_id = ? AND role = 'user'
 ORDER BY created_at DESC
@@ -229,6 +236,7 @@ func (q *Queries) ListUserMessagesBySession(ctx context.Context, sessionID strin
 			&i.IsSummaryMessage,
 			&i.Pinned,
 			&i.Hidden,
+			&i.ReasoningEffort,
 		); err != nil {
 			return nil, err
 		}

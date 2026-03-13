@@ -85,3 +85,18 @@ UPDATE sessions
 SET yolo_enabled = ?,
     updated_at = strftime('%s', 'now')
 WHERE id = ?;
+
+-- name: UpdateSessionSystemPrompt :exec
+UPDATE sessions
+SET
+    system_prompt = ?,
+    updated_at = strftime('%s', 'now')
+WHERE id = ?;
+
+-- name: UpdateSessionReasoningEffort :exec
+UPDATE sessions
+SET
+    large_model_reasoning_effort = ?,
+    small_model_reasoning_effort = ?,
+    updated_at = strftime('%s', 'now')
+WHERE id = ?;

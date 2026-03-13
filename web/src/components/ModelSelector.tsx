@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useMemo } from "react";
 import { useStore } from "@nanostores/react";
-import { BrainCircuit, Zap } from "lucide-react";
+import { BrainCircuit, Zap, ChevronLeft, ChevronRight } from "lucide-react";
 import {
   $config,
   $recentLargeModels,
@@ -9,10 +9,20 @@ import {
   removeRecentModel,
   getDefaultModelKey,
   setSessionModels,
+  setSessionReasoningEffort,
   setProviderKey,
   removeProviderKey,
 } from "../store";
 import type { ConfigPayload, Session } from "../types";
+
+// Effort levels in cycle order: left arrow decrements, right arrow increments
+const EFFORT_LEVELS = ["low", "medium", "high", "max"] as const;
+const EFFORT_LABELS: Record<string, string> = { low: "L", medium: "M", high: "H", max: "X" };
+
+// Returns true if the model is a CLI Claude model (supports reasoning_effort)
+function isCLIClaudeModel(provider: string, model: string): boolean {
+  return provider === "local-cli" && model.startsWith("cli-claude-");
+}
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -194,6 +204,29 @@ export function ModelSelector({ session, modelType }: { session: Session | null;
   const currentEntry = allModels.find(m => m.key === currentKey);
   const displayName = currentEntry?.name ?? currentKey.split(":::")[1] ?? "No model";
 
+  // Get current reasoning effort (default to "medium" if not set)
+  const currentProvider = currentEntry?.providerID ?? "";
+  const currentModelID = currentEntry?.modelID ?? "";
+  const isCLIClaudeModelFlag = isCLIClaudeModel(currentProvider, currentModelID);
+  let currentEffort = "medium";
+  if (session) {
+    const effort = modelType === "large" ? session.LargeModelReasoningEffort : session.SmallModelReasoningEffort;
+    if (effort) currentEffort = effort;
+  }
+
+  function cycleEffort(direction: 1 | -1) {
+    if (!session || !isCLIClaudeModelFlag) return;
+    const idx = EFFORT_LEVELS.indexOf(currentEffort as typeof EFFORT_LEVELS[number]);
+    if (idx === -1) return;
+    const newIdx = (idx + direction + EFFORT_LEVELS.length) % EFFORT_LEVELS.length;
+    const newEffort = EFFORT_LEVELS[newIdx];
+    setSessionReasoningEffort(
+      session.ID,
+      modelType === "large" ? newEffort : null,
+      modelType === "small" ? newEffort : null,
+    );
+  }
+
   const recentModels = useMemo(() => {
     return recentKeys
       .map(k => allModels.find(m => m.key === k))
@@ -276,8 +309,39 @@ export function ModelSelector({ session, modelType }: { session: Session | null;
         data-test-id={modelType === "large" ? "model-selector-large" : "model-selector-small"}
       >
         <Icon size={12} className="shrink-0" />
-        <span className="font-medium truncate max-w-[220px]">{displayName}</span>
-        <span className="text-text-subtle">{open ? "▴" : "▾"}</span>
+        <span className="font-medium truncate max-w-[180px]">{displayName}</span>
+        {isCLIClaudeModelFlag && (
+          <div
+            className="flex items-center gap-0.5 shrink-0 ml-1"
+            onClick={e => e.stopPropagation()}
+            data-test-id={`reasoning-effort-${modelType}`}
+          >
+            <button
+              onClick={() => cycleEffort(-1)}
+              className="p-0.5 rounded hover:bg-base-subtle text-text-subtle hover:text-text transition-colors"
+              title={`Reasoning effort: ${currentEffort} (click to decrease)`}
+              data-test-id={`reasoning-effort-${modelType}-decrease`}
+            >
+              <ChevronLeft size={12} strokeWidth={2.5} />
+            </button>
+            <span
+              className="px-1 py-0.5 rounded bg-base-subtle text-text font-mono text-[10px] min-w-[16px] text-center"
+              title={`Reasoning effort: ${currentEffort}`}
+              data-test-id={`reasoning-effort-${modelType}-label`}
+            >
+              {EFFORT_LABELS[currentEffort] ?? "?"}
+            </span>
+            <button
+              onClick={() => cycleEffort(1)}
+              className="p-0.5 rounded hover:bg-base-subtle text-text-subtle hover:text-text transition-colors"
+              title={`Reasoning effort: ${currentEffort} (click to increase)`}
+              data-test-id={`reasoning-effort-${modelType}-increase`}
+            >
+              <ChevronRight size={12} strokeWidth={2.5} />
+            </button>
+          </div>
+        )}
+        <span className="text-text-subtle ml-auto">{open ? "▴" : "▾"}</span>
       </button>
       {open && (
         <div

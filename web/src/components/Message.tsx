@@ -167,7 +167,16 @@ const AssistantHoverActions = memo(function AssistantHoverActions({
       </div>
       <div className="flex items-center gap-2 ml-auto">
         <DurationBadge message={message} />
-        {message.Model && <span className="text-xs text-text-subtle font-mono">{message.Model}</span>}
+        {message.Model && (
+          <span className="text-xs text-text-subtle font-mono flex items-center gap-1">
+            {message.Model}
+            {message.ReasoningEffort && (message.Provider === "anthropic" || message.Provider === "local-cli") && (
+              <span className="px-1 py-0.5 rounded bg-base-subtle text-text-muted font-mono text-[10px]" title={`Reasoning effort: ${message.ReasoningEffort}`}>
+                {message.ReasoningEffort === "low" ? "L" : message.ReasoningEffort === "medium" ? "M" : message.ReasoningEffort === "high" ? "H" : "X"}
+              </span>
+            )}
+          </span>
+        )}
       </div>
     </div>
   );
@@ -378,7 +387,14 @@ const SummaryMessage = memo(function SummaryMessage({ message }: { message: Msg 
         <div className="summary-header">
           <BookMarked size={15} className="text-yellow shrink-0" />
           <span className="text-sm font-semibold text-yellow">Context condensed</span>
-          <span className="ml-auto text-xs text-text-muted font-mono">{message.Model}</span>
+          <span className="ml-auto text-xs text-text-muted font-mono flex items-center gap-1">
+            {message.Model}
+            {message.ReasoningEffort && (message.Provider === "anthropic" || message.Provider === "local-cli") && (
+              <span className="px-1 py-0.5 rounded bg-base-subtle text-text-muted font-mono text-[10px]" title={`Reasoning effort: ${message.ReasoningEffort}`}>
+                {message.ReasoningEffort === "low" ? "L" : message.ReasoningEffort === "medium" ? "M" : message.ReasoningEffort === "high" ? "H" : "X"}
+              </span>
+            )}
+          </span>
           {isFinished && <DurationBadge message={message} />}
           {isFinished && (
             <button onClick={() => setEditing(e => !e)} title="Edit summary" className="btn-icon-sm ml-1">

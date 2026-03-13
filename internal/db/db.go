@@ -27,20 +27,23 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.createFileStmt, err = db.PrepareContext(ctx, createFile); err != nil {
 		return nil, fmt.Errorf("error preparing query CreateFile: %w", err)
 	}
-	if q.createSessionPermissionStmt, err = db.PrepareContext(ctx, createSessionPermission); err != nil {
-		return nil, fmt.Errorf("error preparing query CreateSessionPermission: %w", err)
-	}
 	if q.createMessageStmt, err = db.PrepareContext(ctx, createMessage); err != nil {
 		return nil, fmt.Errorf("error preparing query CreateMessage: %w", err)
 	}
 	if q.createSessionStmt, err = db.PrepareContext(ctx, createSession); err != nil {
 		return nil, fmt.Errorf("error preparing query CreateSession: %w", err)
 	}
+	if q.createSessionPermissionStmt, err = db.PrepareContext(ctx, createSessionPermission); err != nil {
+		return nil, fmt.Errorf("error preparing query CreateSessionPermission: %w", err)
+	}
 	if q.deleteFileStmt, err = db.PrepareContext(ctx, deleteFile); err != nil {
 		return nil, fmt.Errorf("error preparing query DeleteFile: %w", err)
 	}
 	if q.deleteMessageStmt, err = db.PrepareContext(ctx, deleteMessage); err != nil {
 		return nil, fmt.Errorf("error preparing query DeleteMessage: %w", err)
+	}
+	if q.deletePermissionStmt, err = db.PrepareContext(ctx, deletePermission); err != nil {
+		return nil, fmt.Errorf("error preparing query DeletePermission: %w", err)
 	}
 	if q.deleteSessionStmt, err = db.PrepareContext(ctx, deleteSession); err != nil {
 		return nil, fmt.Errorf("error preparing query DeleteSession: %w", err)
@@ -50,9 +53,6 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	}
 	if q.deleteSessionMessagesStmt, err = db.PrepareContext(ctx, deleteSessionMessages); err != nil {
 		return nil, fmt.Errorf("error preparing query DeleteSessionMessages: %w", err)
-	}
-	if q.deletePermissionStmt, err = db.PrepareContext(ctx, deletePermission); err != nil {
-		return nil, fmt.Errorf("error preparing query DeletePermission: %w", err)
 	}
 	if q.getAverageResponseTimeStmt, err = db.PrepareContext(ctx, getAverageResponseTime); err != nil {
 		return nil, fmt.Errorf("error preparing query GetAverageResponseTime: %w", err)
@@ -99,9 +99,6 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.listAllSessionPermissionsStmt, err = db.PrepareContext(ctx, listAllSessionPermissions); err != nil {
 		return nil, fmt.Errorf("error preparing query ListAllSessionPermissions: %w", err)
 	}
-	if q.listSessionPermissionsStmt, err = db.PrepareContext(ctx, listSessionPermissions); err != nil {
-		return nil, fmt.Errorf("error preparing query ListSessionPermissions: %w", err)
-	}
 	if q.listAllUserMessagesStmt, err = db.PrepareContext(ctx, listAllUserMessages); err != nil {
 		return nil, fmt.Errorf("error preparing query ListAllUserMessages: %w", err)
 	}
@@ -120,6 +117,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.listNewFilesStmt, err = db.PrepareContext(ctx, listNewFiles); err != nil {
 		return nil, fmt.Errorf("error preparing query ListNewFiles: %w", err)
 	}
+	if q.listSessionPermissionsStmt, err = db.PrepareContext(ctx, listSessionPermissions); err != nil {
+		return nil, fmt.Errorf("error preparing query ListSessionPermissions: %w", err)
+	}
 	if q.listSessionReadFilesStmt, err = db.PrepareContext(ctx, listSessionReadFiles); err != nil {
 		return nil, fmt.Errorf("error preparing query ListSessionReadFiles: %w", err)
 	}
@@ -131,6 +131,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	}
 	if q.recordFileReadStmt, err = db.PrepareContext(ctx, recordFileRead); err != nil {
 		return nil, fmt.Errorf("error preparing query RecordFileRead: %w", err)
+	}
+	if q.setSessionYoloStmt, err = db.PrepareContext(ctx, setSessionYolo); err != nil {
+		return nil, fmt.Errorf("error preparing query SetSessionYolo: %w", err)
 	}
 	if q.updateMessageStmt, err = db.PrepareContext(ctx, updateMessage); err != nil {
 		return nil, fmt.Errorf("error preparing query UpdateMessage: %w", err)
@@ -147,6 +150,12 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.updateSessionModelsStmt, err = db.PrepareContext(ctx, updateSessionModels); err != nil {
 		return nil, fmt.Errorf("error preparing query UpdateSessionModels: %w", err)
 	}
+	if q.updateSessionReasoningEffortStmt, err = db.PrepareContext(ctx, updateSessionReasoningEffort); err != nil {
+		return nil, fmt.Errorf("error preparing query UpdateSessionReasoningEffort: %w", err)
+	}
+	if q.updateSessionSystemPromptStmt, err = db.PrepareContext(ctx, updateSessionSystemPrompt); err != nil {
+		return nil, fmt.Errorf("error preparing query UpdateSessionSystemPrompt: %w", err)
+	}
 	if q.updateSessionTitleAndUsageStmt, err = db.PrepareContext(ctx, updateSessionTitleAndUsage); err != nil {
 		return nil, fmt.Errorf("error preparing query UpdateSessionTitleAndUsage: %w", err)
 	}
@@ -160,11 +169,6 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing createFileStmt: %w", cerr)
 		}
 	}
-	if q.createSessionPermissionStmt != nil {
-		if cerr := q.createSessionPermissionStmt.Close(); cerr != nil {
-			err = fmt.Errorf("error closing createSessionPermissionStmt: %w", cerr)
-		}
-	}
 	if q.createMessageStmt != nil {
 		if cerr := q.createMessageStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing createMessageStmt: %w", cerr)
@@ -175,6 +179,11 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing createSessionStmt: %w", cerr)
 		}
 	}
+	if q.createSessionPermissionStmt != nil {
+		if cerr := q.createSessionPermissionStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing createSessionPermissionStmt: %w", cerr)
+		}
+	}
 	if q.deleteFileStmt != nil {
 		if cerr := q.deleteFileStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing deleteFileStmt: %w", cerr)
@@ -183,6 +192,11 @@ func (q *Queries) Close() error {
 	if q.deleteMessageStmt != nil {
 		if cerr := q.deleteMessageStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing deleteMessageStmt: %w", cerr)
+		}
+	}
+	if q.deletePermissionStmt != nil {
+		if cerr := q.deletePermissionStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing deletePermissionStmt: %w", cerr)
 		}
 	}
 	if q.deleteSessionStmt != nil {
@@ -305,6 +319,11 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing listNewFilesStmt: %w", cerr)
 		}
 	}
+	if q.listSessionPermissionsStmt != nil {
+		if cerr := q.listSessionPermissionsStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing listSessionPermissionsStmt: %w", cerr)
+		}
+	}
 	if q.listSessionReadFilesStmt != nil {
 		if cerr := q.listSessionReadFilesStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing listSessionReadFilesStmt: %w", cerr)
@@ -325,6 +344,11 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing recordFileReadStmt: %w", cerr)
 		}
 	}
+	if q.setSessionYoloStmt != nil {
+		if cerr := q.setSessionYoloStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing setSessionYoloStmt: %w", cerr)
+		}
+	}
 	if q.updateMessageStmt != nil {
 		if cerr := q.updateMessageStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing updateMessageStmt: %w", cerr)
@@ -335,6 +359,11 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing updateMessagePinnedStmt: %w", cerr)
 		}
 	}
+	if q.updatePermissionEnabledStmt != nil {
+		if cerr := q.updatePermissionEnabledStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing updatePermissionEnabledStmt: %w", cerr)
+		}
+	}
 	if q.updateSessionStmt != nil {
 		if cerr := q.updateSessionStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing updateSessionStmt: %w", cerr)
@@ -343,6 +372,16 @@ func (q *Queries) Close() error {
 	if q.updateSessionModelsStmt != nil {
 		if cerr := q.updateSessionModelsStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing updateSessionModelsStmt: %w", cerr)
+		}
+	}
+	if q.updateSessionReasoningEffortStmt != nil {
+		if cerr := q.updateSessionReasoningEffortStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing updateSessionReasoningEffortStmt: %w", cerr)
+		}
+	}
+	if q.updateSessionSystemPromptStmt != nil {
+		if cerr := q.updateSessionSystemPromptStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing updateSessionSystemPromptStmt: %w", cerr)
 		}
 	}
 	if q.updateSessionTitleAndUsageStmt != nil {
@@ -387,97 +426,103 @@ func (q *Queries) queryRow(ctx context.Context, stmt *sql.Stmt, query string, ar
 }
 
 type Queries struct {
-	db                             DBTX
-	tx                             *sql.Tx
-	createFileStmt                  *sql.Stmt
-	createMessageStmt               *sql.Stmt
-	createSessionStmt               *sql.Stmt
-	createSessionPermissionStmt     *sql.Stmt
-	deleteFileStmt                 *sql.Stmt
-	deleteMessageStmt              *sql.Stmt
-	deleteSessionStmt              *sql.Stmt
-	deleteSessionFilesStmt         *sql.Stmt
-	deleteSessionMessagesStmt      *sql.Stmt
-	deletePermissionStmt           *sql.Stmt
-	getAverageResponseTimeStmt     *sql.Stmt
-	getFileStmt                    *sql.Stmt
-	getFileByPathAndSessionStmt    *sql.Stmt
-	getFileReadStmt                *sql.Stmt
-	getHourDayHeatmapStmt          *sql.Stmt
-	getMessageStmt                 *sql.Stmt
-	getRecentActivityStmt          *sql.Stmt
-	getSessionByIDStmt             *sql.Stmt
-	getToolUsageStmt               *sql.Stmt
-	getTotalStatsStmt              *sql.Stmt
-	getUsageByDayStmt              *sql.Stmt
-	getUsageByDayOfWeekStmt        *sql.Stmt
-	getUsageByHourStmt             *sql.Stmt
-	getUsageByModelStmt            *sql.Stmt
-	listAllSessionPermissionsStmt   *sql.Stmt
-	listSessionPermissionsStmt      *sql.Stmt
-	listAllUserMessagesStmt         *sql.Stmt
-	listFilesByPathStmt            *sql.Stmt
-	listFilesBySessionStmt         *sql.Stmt
-	listLatestSessionFilesStmt     *sql.Stmt
-	listMessagesBySessionStmt      *sql.Stmt
-	listNewFilesStmt               *sql.Stmt
-	listSessionReadFilesStmt       *sql.Stmt
-	listSessionsStmt               *sql.Stmt
-	listUserMessagesBySessionStmt  *sql.Stmt
-	recordFileReadStmt             *sql.Stmt
-	updateMessageStmt              *sql.Stmt
-	updateMessagePinnedStmt        *sql.Stmt
-	updatePermissionEnabledStmt    *sql.Stmt
-	updateSessionStmt              *sql.Stmt
-	updateSessionModelsStmt        *sql.Stmt
-	updateSessionTitleAndUsageStmt *sql.Stmt
+	db                               DBTX
+	tx                               *sql.Tx
+	createFileStmt                   *sql.Stmt
+	createMessageStmt                *sql.Stmt
+	createSessionStmt                *sql.Stmt
+	createSessionPermissionStmt      *sql.Stmt
+	deleteFileStmt                   *sql.Stmt
+	deleteMessageStmt                *sql.Stmt
+	deletePermissionStmt             *sql.Stmt
+	deleteSessionStmt                *sql.Stmt
+	deleteSessionFilesStmt           *sql.Stmt
+	deleteSessionMessagesStmt        *sql.Stmt
+	getAverageResponseTimeStmt       *sql.Stmt
+	getFileStmt                      *sql.Stmt
+	getFileByPathAndSessionStmt      *sql.Stmt
+	getFileReadStmt                  *sql.Stmt
+	getHourDayHeatmapStmt            *sql.Stmt
+	getMessageStmt                   *sql.Stmt
+	getRecentActivityStmt            *sql.Stmt
+	getSessionByIDStmt               *sql.Stmt
+	getToolUsageStmt                 *sql.Stmt
+	getTotalStatsStmt                *sql.Stmt
+	getUsageByDayStmt                *sql.Stmt
+	getUsageByDayOfWeekStmt          *sql.Stmt
+	getUsageByHourStmt               *sql.Stmt
+	getUsageByModelStmt              *sql.Stmt
+	listAllSessionPermissionsStmt    *sql.Stmt
+	listAllUserMessagesStmt          *sql.Stmt
+	listFilesByPathStmt              *sql.Stmt
+	listFilesBySessionStmt           *sql.Stmt
+	listLatestSessionFilesStmt       *sql.Stmt
+	listMessagesBySessionStmt        *sql.Stmt
+	listNewFilesStmt                 *sql.Stmt
+	listSessionPermissionsStmt       *sql.Stmt
+	listSessionReadFilesStmt         *sql.Stmt
+	listSessionsStmt                 *sql.Stmt
+	listUserMessagesBySessionStmt    *sql.Stmt
+	recordFileReadStmt               *sql.Stmt
+	setSessionYoloStmt               *sql.Stmt
+	updateMessageStmt                *sql.Stmt
+	updateMessagePinnedStmt          *sql.Stmt
+	updatePermissionEnabledStmt      *sql.Stmt
+	updateSessionStmt                *sql.Stmt
+	updateSessionModelsStmt          *sql.Stmt
+	updateSessionReasoningEffortStmt *sql.Stmt
+	updateSessionSystemPromptStmt    *sql.Stmt
+	updateSessionTitleAndUsageStmt   *sql.Stmt
 }
 
 func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 	return &Queries{
-		db:                             tx,
-		tx:                             tx,
-		createFileStmt:                  q.createFileStmt,
-		createMessageStmt:               q.createMessageStmt,
-		createSessionStmt:               q.createSessionStmt,
-		createSessionPermissionStmt:     q.createSessionPermissionStmt,
-		deleteFileStmt:                 q.deleteFileStmt,
-		deleteMessageStmt:              q.deleteMessageStmt,
-		deleteSessionStmt:              q.deleteSessionStmt,
-		deleteSessionFilesStmt:         q.deleteSessionFilesStmt,
-		deleteSessionMessagesStmt:      q.deleteSessionMessagesStmt,
-		deletePermissionStmt:           q.deletePermissionStmt,
-		getAverageResponseTimeStmt:     q.getAverageResponseTimeStmt,
-		getFileStmt:                    q.getFileStmt,
-		getFileByPathAndSessionStmt:    q.getFileByPathAndSessionStmt,
-		getFileReadStmt:                q.getFileReadStmt,
-		getHourDayHeatmapStmt:          q.getHourDayHeatmapStmt,
-		getMessageStmt:                 q.getMessageStmt,
-		getRecentActivityStmt:          q.getRecentActivityStmt,
-		getSessionByIDStmt:             q.getSessionByIDStmt,
-		getToolUsageStmt:               q.getToolUsageStmt,
-		getTotalStatsStmt:              q.getTotalStatsStmt,
-		getUsageByDayStmt:              q.getUsageByDayStmt,
-		getUsageByDayOfWeekStmt:        q.getUsageByDayOfWeekStmt,
-		getUsageByHourStmt:             q.getUsageByHourStmt,
-		getUsageByModelStmt:            q.getUsageByModelStmt,
-		listAllSessionPermissionsStmt:   q.listAllSessionPermissionsStmt,
-		listSessionPermissionsStmt:      q.listSessionPermissionsStmt,
-		listAllUserMessagesStmt:         q.listAllUserMessagesStmt,
-		listFilesByPathStmt:            q.listFilesByPathStmt,
-		listFilesBySessionStmt:         q.listFilesBySessionStmt,
-		listLatestSessionFilesStmt:     q.listLatestSessionFilesStmt,
-		listMessagesBySessionStmt:      q.listMessagesBySessionStmt,
-		listNewFilesStmt:               q.listNewFilesStmt,
-		listSessionReadFilesStmt:       q.listSessionReadFilesStmt,
-		listSessionsStmt:               q.listSessionsStmt,
-		listUserMessagesBySessionStmt:  q.listUserMessagesBySessionStmt,
-		recordFileReadStmt:             q.recordFileReadStmt,
-		updateMessageStmt:              q.updateMessageStmt,
-		updateMessagePinnedStmt:        q.updateMessagePinnedStmt,
-		updatePermissionEnabledStmt:    q.updatePermissionEnabledStmt,
-		updateSessionStmt:              q.updateSessionStmt,
-		updateSessionModelsStmt:        q.updateSessionModelsStmt,
-		updateSessionTitleAndUsageStmt: q.updateSessionTitleAndUsageStmt,
+		db:                               tx,
+		tx:                               tx,
+		createFileStmt:                   q.createFileStmt,
+		createMessageStmt:                q.createMessageStmt,
+		createSessionStmt:                q.createSessionStmt,
+		createSessionPermissionStmt:      q.createSessionPermissionStmt,
+		deleteFileStmt:                   q.deleteFileStmt,
+		deleteMessageStmt:                q.deleteMessageStmt,
+		deletePermissionStmt:             q.deletePermissionStmt,
+		deleteSessionStmt:                q.deleteSessionStmt,
+		deleteSessionFilesStmt:           q.deleteSessionFilesStmt,
+		deleteSessionMessagesStmt:        q.deleteSessionMessagesStmt,
+		getAverageResponseTimeStmt:       q.getAverageResponseTimeStmt,
+		getFileStmt:                      q.getFileStmt,
+		getFileByPathAndSessionStmt:      q.getFileByPathAndSessionStmt,
+		getFileReadStmt:                  q.getFileReadStmt,
+		getHourDayHeatmapStmt:            q.getHourDayHeatmapStmt,
+		getMessageStmt:                   q.getMessageStmt,
+		getRecentActivityStmt:            q.getRecentActivityStmt,
+		getSessionByIDStmt:               q.getSessionByIDStmt,
+		getToolUsageStmt:                 q.getToolUsageStmt,
+		getTotalStatsStmt:                q.getTotalStatsStmt,
+		getUsageByDayStmt:                q.getUsageByDayStmt,
+		getUsageByDayOfWeekStmt:          q.getUsageByDayOfWeekStmt,
+		getUsageByHourStmt:               q.getUsageByHourStmt,
+		getUsageByModelStmt:              q.getUsageByModelStmt,
+		listAllSessionPermissionsStmt:    q.listAllSessionPermissionsStmt,
+		listAllUserMessagesStmt:          q.listAllUserMessagesStmt,
+		listFilesByPathStmt:              q.listFilesByPathStmt,
+		listFilesBySessionStmt:           q.listFilesBySessionStmt,
+		listLatestSessionFilesStmt:       q.listLatestSessionFilesStmt,
+		listMessagesBySessionStmt:        q.listMessagesBySessionStmt,
+		listNewFilesStmt:                 q.listNewFilesStmt,
+		listSessionPermissionsStmt:       q.listSessionPermissionsStmt,
+		listSessionReadFilesStmt:         q.listSessionReadFilesStmt,
+		listSessionsStmt:                 q.listSessionsStmt,
+		listUserMessagesBySessionStmt:    q.listUserMessagesBySessionStmt,
+		recordFileReadStmt:               q.recordFileReadStmt,
+		setSessionYoloStmt:               q.setSessionYoloStmt,
+		updateMessageStmt:                q.updateMessageStmt,
+		updateMessagePinnedStmt:          q.updateMessagePinnedStmt,
+		updatePermissionEnabledStmt:      q.updatePermissionEnabledStmt,
+		updateSessionStmt:                q.updateSessionStmt,
+		updateSessionModelsStmt:          q.updateSessionModelsStmt,
+		updateSessionReasoningEffortStmt: q.updateSessionReasoningEffortStmt,
+		updateSessionSystemPromptStmt:    q.updateSessionSystemPromptStmt,
+		updateSessionTitleAndUsageStmt:   q.updateSessionTitleAndUsageStmt,
 	}
 }

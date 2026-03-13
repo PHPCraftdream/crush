@@ -31,30 +31,43 @@ type Message struct {
 	IsSummaryMessage int64          `json:"is_summary_message"`
 	Pinned           int64          `json:"pinned"`
 	Hidden           int64          `json:"hidden"`
+	ReasoningEffort  sql.NullString `json:"reasoning_effort"`
 }
 
 type ReadFile struct {
 	SessionID string `json:"session_id"`
 	Path      string `json:"path"`
-	ReadAt    int64  `json:"read_at"` // Unix timestamp when file was last read
+	ReadAt    int64  `json:"read_at"`
 }
 
 type Session struct {
-	ID                  string         `json:"id"`
-	ParentSessionID     sql.NullString `json:"parent_session_id"`
-	Title               string         `json:"title"`
-	MessageCount        int64          `json:"message_count"`
-	PromptTokens        int64          `json:"prompt_tokens"`
-	CompletionTokens    int64          `json:"completion_tokens"`
-	Cost                float64        `json:"cost"`
-	UpdatedAt           int64          `json:"updated_at"`
-	CreatedAt           int64          `json:"created_at"`
-	SummaryMessageID    sql.NullString `json:"summary_message_id"`
-	Todos               sql.NullString `json:"todos"`
-	LargeModelProvider  sql.NullString `json:"large_model_provider"`
-	LargeModelID        sql.NullString `json:"large_model_id"`
-	SmallModelProvider  sql.NullString `json:"small_model_provider"`
-	SmallModelID        sql.NullString `json:"small_model_id"`
-	SystemPrompt        string         `json:"system_prompt"`
-	YoloEnabled         int64          `json:"yolo_enabled"`
+	ID                        string         `json:"id"`
+	ParentSessionID           sql.NullString `json:"parent_session_id"`
+	Title                     string         `json:"title"`
+	MessageCount              int64          `json:"message_count"`
+	PromptTokens              int64          `json:"prompt_tokens"`
+	CompletionTokens          int64          `json:"completion_tokens"`
+	Cost                      float64        `json:"cost"`
+	UpdatedAt                 int64          `json:"updated_at"`
+	CreatedAt                 int64          `json:"created_at"`
+	SummaryMessageID          sql.NullString `json:"summary_message_id"`
+	Todos                     sql.NullString `json:"todos"`
+	LargeModelProvider        sql.NullString `json:"large_model_provider"`
+	LargeModelID              sql.NullString `json:"large_model_id"`
+	SmallModelProvider        sql.NullString `json:"small_model_provider"`
+	SmallModelID              sql.NullString `json:"small_model_id"`
+	SystemPrompt              string         `json:"system_prompt"`
+	YoloEnabled               int64          `json:"yolo_enabled"`
+	LargeModelReasoningEffort sql.NullString `json:"large_model_reasoning_effort"`
+	SmallModelReasoningEffort sql.NullString `json:"small_model_reasoning_effort"`
+}
+
+type SessionPermission struct {
+	ID        string `json:"id"`
+	SessionID string `json:"session_id"`
+	ToolName  string `json:"tool_name"`
+	Action    string `json:"action"`
+	Path      string `json:"path"`
+	CreatedAt int64  `json:"created_at"`
+	Enabled   int64  `json:"enabled"`
 }

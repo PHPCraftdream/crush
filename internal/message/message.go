@@ -17,6 +17,7 @@ type CreateMessageParams struct {
 	Parts            []ContentPart
 	Model            string
 	Provider         string
+	ReasoningEffort  string // "low", "medium", "high", or "max" - reasoning effort for Claude models
 	IsSummaryMessage bool
 	// Hidden marks the message as invisible in the UI. Used for silent
 	// background summaries that provide context to the LLM without cluttering
@@ -93,6 +94,7 @@ func (s *service) Create(ctx context.Context, sessionID string, params CreateMes
 		Parts:            string(partsJSON),
 		Model:            sql.NullString{String: string(params.Model), Valid: true},
 		Provider:         sql.NullString{String: params.Provider, Valid: params.Provider != ""},
+		ReasoningEffort:  sql.NullString{String: params.ReasoningEffort, Valid: params.ReasoningEffort != ""},
 		IsSummaryMessage: isSummary,
 		Hidden:           hidden,
 	})
@@ -219,6 +221,7 @@ func (s *service) fromDBItem(item db.Message) (Message, error) {
 		Parts:            parts,
 		Model:            item.Model.String,
 		Provider:         item.Provider.String,
+		ReasoningEffort:  item.ReasoningEffort.String,
 		CreatedAt:        item.CreatedAt,
 		UpdatedAt:        item.UpdatedAt,
 		IsSummaryMessage: item.IsSummaryMessage != 0,

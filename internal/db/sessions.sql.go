@@ -25,7 +25,8 @@ INSERT INTO sessions (
     large_model_provider,
     large_model_id,
     small_model_provider,
-    small_model_id
+    small_model_id,
+    yolo_enabled
 ) VALUES (
     ?,
     ?,
@@ -40,8 +41,9 @@ INSERT INTO sessions (
     ?,
     ?,
     ?,
-    ?
-) RETURNING id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id, system_prompt, yolo_enabled
+    ?,
+    0
+) RETURNING id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id, system_prompt, yolo_enabled, large_model_reasoning_effort, small_model_reasoning_effort
 `
 
 type CreateSessionParams struct {
@@ -91,6 +93,8 @@ func (q *Queries) CreateSession(ctx context.Context, arg CreateSessionParams) (S
 		&i.SmallModelID,
 		&i.SystemPrompt,
 		&i.YoloEnabled,
+		&i.LargeModelReasoningEffort,
+		&i.SmallModelReasoningEffort,
 	)
 	return i, err
 }
@@ -106,7 +110,7 @@ func (q *Queries) DeleteSession(ctx context.Context, id string) error {
 }
 
 const getSessionByID = `-- name: GetSessionByID :one
-SELECT id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id, system_prompt, yolo_enabled
+SELECT id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id, system_prompt, yolo_enabled, large_model_reasoning_effort, small_model_reasoning_effort
 FROM sessions
 WHERE id = ? LIMIT 1
 `
@@ -132,12 +136,14 @@ func (q *Queries) GetSessionByID(ctx context.Context, id string) (Session, error
 		&i.SmallModelID,
 		&i.SystemPrompt,
 		&i.YoloEnabled,
+		&i.LargeModelReasoningEffort,
+		&i.SmallModelReasoningEffort,
 	)
 	return i, err
 }
 
 const listSessions = `-- name: ListSessions :many
-SELECT id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id, system_prompt, yolo_enabled
+SELECT id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id, system_prompt, yolo_enabled, large_model_reasoning_effort, small_model_reasoning_effort
 FROM sessions
 WHERE parent_session_id is NULL
 ORDER BY updated_at DESC
@@ -170,6 +176,8 @@ func (q *Queries) ListSessions(ctx context.Context) ([]Session, error) {
 			&i.SmallModelID,
 			&i.SystemPrompt,
 			&i.YoloEnabled,
+			&i.LargeModelReasoningEffort,
+			&i.SmallModelReasoningEffort,
 		); err != nil {
 			return nil, err
 		}
@@ -184,6 +192,23 @@ func (q *Queries) ListSessions(ctx context.Context) ([]Session, error) {
 	return items, nil
 }
 
+const setSessionYolo = `-- name: SetSessionYolo :exec
+UPDATE sessions
+SET yolo_enabled = ?,
+    updated_at = strftime('%s', 'now')
+WHERE id = ?
+`
+
+type SetSessionYoloParams struct {
+	YoloEnabled int64  `json:"yolo_enabled"`
+	ID          string `json:"id"`
+}
+
+func (q *Queries) SetSessionYolo(ctx context.Context, arg SetSessionYoloParams) error {
+	_, err := q.exec(ctx, q.setSessionYoloStmt, setSessionYolo, arg.YoloEnabled, arg.ID)
+	return err
+}
+
 const updateSession = `-- name: UpdateSession :one
 UPDATE sessions
 SET
@@ -194,7 +219,7 @@ SET
     cost = ?,
     todos = ?
 WHERE id = ?
-RETURNING id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id, system_prompt, yolo_enabled
+RETURNING id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id, system_prompt, yolo_enabled, large_model_reasoning_effort, small_model_reasoning_effort
 `
 
 type UpdateSessionParams struct {
@@ -236,6 +261,8 @@ func (q *Queries) UpdateSession(ctx context.Context, arg UpdateSessionParams) (S
 		&i.SmallModelID,
 		&i.SystemPrompt,
 		&i.YoloEnabled,
+		&i.LargeModelReasoningEffort,
+		&i.SmallModelReasoningEffort,
 	)
 	return i, err
 }
@@ -270,6 +297,44 @@ func (q *Queries) UpdateSessionModels(ctx context.Context, arg UpdateSessionMode
 	return err
 }
 
+const updateSessionReasoningEffort = `-- name: UpdateSessionReasoningEffort :exec
+UPDATE sessions
+SET
+    large_model_reasoning_effort = ?,
+    small_model_reasoning_effort = ?,
+    updated_at = strftime('%s', 'now')
+WHERE id = ?
+`
+
+type UpdateSessionReasoningEffortParams struct {
+	LargeModelReasoningEffort sql.NullString `json:"large_model_reasoning_effort"`
+	SmallModelReasoningEffort sql.NullString `json:"small_model_reasoning_effort"`
+	ID                        string         `json:"id"`
+}
+
+func (q *Queries) UpdateSessionReasoningEffort(ctx context.Context, arg UpdateSessionReasoningEffortParams) error {
+	_, err := q.exec(ctx, q.updateSessionReasoningEffortStmt, updateSessionReasoningEffort, arg.LargeModelReasoningEffort, arg.SmallModelReasoningEffort, arg.ID)
+	return err
+}
+
+const updateSessionSystemPrompt = `-- name: UpdateSessionSystemPrompt :exec
+UPDATE sessions
+SET
+    system_prompt = ?,
+    updated_at = strftime('%s', 'now')
+WHERE id = ?
+`
+
+type UpdateSessionSystemPromptParams struct {
+	SystemPrompt string `json:"system_prompt"`
+	ID           string `json:"id"`
+}
+
+func (q *Queries) UpdateSessionSystemPrompt(ctx context.Context, arg UpdateSessionSystemPromptParams) error {
+	_, err := q.exec(ctx, q.updateSessionSystemPromptStmt, updateSessionSystemPrompt, arg.SystemPrompt, arg.ID)
+	return err
+}
+
 const updateSessionTitleAndUsage = `-- name: UpdateSessionTitleAndUsage :exec
 UPDATE sessions
 SET
@@ -296,23 +361,5 @@ func (q *Queries) UpdateSessionTitleAndUsage(ctx context.Context, arg UpdateSess
 		arg.Cost,
 		arg.ID,
 	)
-	return err
-}
-
-const updateSessionSystemPrompt = `-- name: UpdateSessionSystemPrompt :exec
-UPDATE sessions
-SET
-    system_prompt = ?,
-    updated_at = strftime('%s', 'now')
-WHERE id = ?
-`
-
-type UpdateSessionSystemPromptParams struct {
-	SystemPrompt string `json:"system_prompt"`
-	ID           string `json:"id"`
-}
-
-func (q *Queries) UpdateSessionSystemPrompt(ctx context.Context, arg UpdateSessionSystemPromptParams) error {
-	_, err := q.db.ExecContext(ctx, updateSessionSystemPrompt, arg.SystemPrompt, arg.ID)
 	return err
 }
