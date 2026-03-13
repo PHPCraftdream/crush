@@ -25,8 +25,8 @@ test.beforeEach(async ({ page }) => {
 
 test("shows Connected with green dot after WS connects", async ({ page }) => {
   await page.goto("/");
-  await expect(page.getByText("Connected")).toBeVisible({ timeout: 3000 });
-  const dot = page.locator("text=Connected").locator("..").locator("span.rounded-full");
+  await expect(page.getByTestId("status-connection")).toContainText("Connected", { timeout: 3000 });
+  const dot = page.getByTestId("status-connection").locator("span.rounded-full");
   await expect(dot).toHaveClass(/bg-green/);
 });
 
@@ -36,45 +36,52 @@ test("multiple LSP servers displayed", async ({ page }) => {
   await page.goto("/");
   await sendMockWSMessage(page, {
     type: "lsp_state",
-    payload: { name: "gopls", state: "running", diagnosticCount: 0 },
-  });
-  await sendMockWSMessage(page, {
-    type: "lsp_state",
-    payload: { name: "tsserver", state: "starting", diagnosticCount: 2 },
+    payload: {
+      servers: [
+        { name: "gopls", state: "ready", disabled: false, diagnosticCount: 0 },
+        { name: "tsserver", state: "starting", disabled: false, diagnosticCount: 2 },
+      ],
+    },
   });
 
-  await expect(page.getByText("gopls")).toBeVisible({ timeout: 2000 });
-  await expect(page.getByText("tsserver")).toBeVisible();
-  await expect(page.getByText("(2)")).toBeVisible();
+  await expect(page.getByTestId("status-lsp-gopls")).toBeVisible({ timeout: 2000 });
+  await expect(page.getByTestId("status-lsp-tsserver")).toBeVisible();
+  await expect(page.getByTestId("status-lsp-tsserver")).toContainText("(2)");
 });
 
 test("LSP state update replaces existing entry", async ({ page }) => {
   await page.goto("/");
   await sendMockWSMessage(page, {
     type: "lsp_state",
-    payload: { name: "gopls", state: "starting", diagnosticCount: 0 },
+    payload: {
+      servers: [{ name: "gopls", state: "starting", disabled: false, diagnosticCount: 0 }],
+    },
   });
-  await expect(page.getByText("gopls")).toBeVisible({ timeout: 2000 });
+  await expect(page.getByTestId("status-lsp-gopls")).toBeVisible({ timeout: 2000 });
 
   // Update same server with new state
   await sendMockWSMessage(page, {
     type: "lsp_state",
-    payload: { name: "gopls", state: "running", diagnosticCount: 5 },
+    payload: {
+      servers: [{ name: "gopls", state: "ready", disabled: false, diagnosticCount: 5 }],
+    },
   });
 
   // Still only one "gopls" entry, now with diagnostics
-  await expect(page.getByText("gopls")).toBeVisible();
-  await expect(page.getByText("(5)")).toBeVisible({ timeout: 2000 });
+  await expect(page.getByTestId("status-lsp-gopls")).toBeVisible();
+  await expect(page.getByTestId("status-lsp-gopls")).toContainText("(5)", { timeout: 2000 });
 });
 
-test("LSP running state shows green dot", async ({ page }) => {
+test("LSP running/ready state shows green dot", async ({ page }) => {
   await page.goto("/");
   await sendMockWSMessage(page, {
     type: "lsp_state",
-    payload: { name: "gopls", state: "running", diagnosticCount: 0 },
+    payload: {
+      servers: [{ name: "gopls", state: "ready", disabled: false, diagnosticCount: 0 }],
+    },
   });
 
-  const lspItem = page.getByTitle("gopls: running");
+  const lspItem = page.getByTestId("status-lsp-gopls");
   await expect(lspItem).toBeVisible({ timeout: 2000 });
   await expect(lspItem.locator("span.rounded-full")).toHaveClass(/bg-green/);
 });
@@ -83,10 +90,12 @@ test("LSP starting state shows yellow dot", async ({ page }) => {
   await page.goto("/");
   await sendMockWSMessage(page, {
     type: "lsp_state",
-    payload: { name: "tsserver", state: "starting", diagnosticCount: 0 },
+    payload: {
+      servers: [{ name: "tsserver", state: "starting", disabled: false, diagnosticCount: 0 }],
+    },
   });
 
-  const lspItem = page.getByTitle("tsserver: starting");
+  const lspItem = page.getByTestId("status-lsp-tsserver");
   await expect(lspItem).toBeVisible({ timeout: 2000 });
   await expect(lspItem.locator("span.rounded-full")).toHaveClass(/bg-yellow/);
 });
@@ -95,10 +104,12 @@ test("LSP error state shows red dot", async ({ page }) => {
   await page.goto("/");
   await sendMockWSMessage(page, {
     type: "lsp_state",
-    payload: { name: "pyright", state: "error", diagnosticCount: 0 },
+    payload: {
+      servers: [{ name: "pyright", state: "error", disabled: false, diagnosticCount: 0 }],
+    },
   });
 
-  const lspItem = page.getByTitle("pyright: error");
+  const lspItem = page.getByTestId("status-lsp-pyright");
   await expect(lspItem).toBeVisible({ timeout: 2000 });
   await expect(lspItem.locator("span.rounded-full")).toHaveClass(/bg-red/);
 });
@@ -106,9 +117,9 @@ test("LSP error state shows red dot", async ({ page }) => {
 test("LSP section not shown when no servers", async ({ page }) => {
   await page.goto("/");
   // Wait for connection
-  await expect(page.getByText("Connected")).toBeVisible({ timeout: 3000 });
+  await expect(page.getByTestId("status-connection")).toContainText("Connected", { timeout: 3000 });
   // LSP label should not be present
-  await expect(page.getByText("LSP")).not.toBeVisible({ timeout: 1000 });
+  await expect(page.getByTestId("status-lsp")).not.toBeVisible({ timeout: 1000 });
 });
 
 // ── MCP states ─────────────────────────────────────────────────────────
@@ -120,7 +131,7 @@ test("MCP connected server shows green dot", async ({ page }) => {
     payload: { servers: [{ name: "filesystem", status: "connected" }] },
   });
 
-  const mcpItem = page.getByTitle("filesystem: connected");
+  const mcpItem = page.getByTestId("status-mcp-filesystem");
   await expect(mcpItem).toBeVisible({ timeout: 2000 });
   await expect(mcpItem.locator("span.rounded-full")).toHaveClass(/bg-green/);
 });
@@ -132,7 +143,7 @@ test("MCP connecting server shows yellow dot", async ({ page }) => {
     payload: { servers: [{ name: "db-server", status: "connecting" }] },
   });
 
-  const mcpItem = page.getByTitle("db-server: connecting");
+  const mcpItem = page.getByTestId("status-mcp-db-server");
   await expect(mcpItem).toBeVisible({ timeout: 2000 });
   await expect(mcpItem.locator("span.rounded-full")).toHaveClass(/bg-yellow/);
 });
@@ -144,15 +155,15 @@ test("MCP error server shows red dot", async ({ page }) => {
     payload: { servers: [{ name: "broken", status: "error" }] },
   });
 
-  const mcpItem = page.getByTitle("broken: error");
+  const mcpItem = page.getByTestId("status-mcp-broken");
   await expect(mcpItem).toBeVisible({ timeout: 2000 });
   await expect(mcpItem.locator("span.rounded-full")).toHaveClass(/bg-red/);
 });
 
 test("MCP section not shown when no servers", async ({ page }) => {
   await page.goto("/");
-  await expect(page.getByText("Connected")).toBeVisible({ timeout: 3000 });
-  await expect(page.getByText("MCP")).not.toBeVisible({ timeout: 1000 });
+  await expect(page.getByTestId("status-connection")).toContainText("Connected", { timeout: 3000 });
+  await expect(page.getByTestId("status-mcp")).not.toBeVisible({ timeout: 1000 });
 });
 
 test("MCP section not shown when servers array is empty", async ({ page }) => {
@@ -161,7 +172,7 @@ test("MCP section not shown when servers array is empty", async ({ page }) => {
     type: "mcp_state",
     payload: { servers: [] },
   });
-  await expect(page.getByText("MCP")).not.toBeVisible({ timeout: 1000 });
+  await expect(page.getByTestId("status-mcp")).not.toBeVisible({ timeout: 1000 });
 });
 
 test("multiple MCP servers displayed", async ({ page }) => {
@@ -176,6 +187,6 @@ test("multiple MCP servers displayed", async ({ page }) => {
     },
   });
 
-  await expect(page.getByText("filesystem")).toBeVisible({ timeout: 2000 });
-  await expect(page.getByText("database")).toBeVisible();
+  await expect(page.getByTestId("status-mcp-filesystem")).toBeVisible({ timeout: 2000 });
+  await expect(page.getByTestId("status-mcp-database")).toBeVisible();
 });

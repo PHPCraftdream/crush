@@ -355,6 +355,7 @@ export function ChatInput() {
             disabled={!activeSessionID}
             autoFocus
             rows={1}
+            data-test-id="chat-input-textarea"
             className="flex-1 bg-transparent border-none outline-none resize-none text-text leading-relaxed min-h-[28px] max-h-80 overflow-y-auto disabled:cursor-not-allowed placeholder:text-text-subtle font-medium" style={{ fontSize: "var(--chat-font-size)" }}
           />
           <div className="flex items-center gap-2 shrink-0">
@@ -389,6 +390,7 @@ export function ChatInput() {
             <button
               onClick={send}
               disabled={!canSend}
+              data-test-id="chat-input-send-button"
               className={`font-bold rounded-xl px-5 py-2.5 text-sm disabled:opacity-30 active:scale-95 transition-all shadow-sm flex items-center gap-2 ${
                 agentBusy
                   ? "bg-base-overlay border border-surface text-text-subtle hover:border-accent/50 hover:text-text"

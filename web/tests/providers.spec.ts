@@ -36,10 +36,8 @@ function makeConfigWithProvider(overrides: Record<string, unknown> = {}) {
 async function openProvidersModal(page: Parameters<typeof sendMockWSMessage>[0]) {
   await page.goto("/");
   await sendMockWSMessage(page, { type: "config", payload: makeConfig() });
-  await page.getByRole("button", { name: "Providers" }).click();
-  await expect(
-    page.getByRole("heading", { name: "Custom Providers" })
-  ).toBeVisible({ timeout: 3000 });
+  await page.getByTestId("header-providers-button").click();
+  await expect(page.getByTestId("providers-modal")).toBeVisible({ timeout: 3000 });
 }
 
 // ── Open / close ─────────────────────────────────────────────────────────────
@@ -47,17 +45,13 @@ async function openProvidersModal(page: Parameters<typeof sendMockWSMessage>[0])
 test("Providers modal closes on Escape", async ({ page }) => {
   await openProvidersModal(page);
   await page.keyboard.press("Escape");
-  await expect(
-    page.getByRole("heading", { name: "Custom Providers" })
-  ).not.toBeVisible({ timeout: 3000 });
+  await expect(page.getByTestId("providers-modal")).not.toBeVisible({ timeout: 3000 });
 });
 
 test("Providers modal closes on backdrop click", async ({ page }) => {
   await openProvidersModal(page);
   await page.mouse.click(10, 10);
-  await expect(
-    page.getByRole("heading", { name: "Custom Providers" })
-  ).not.toBeVisible({ timeout: 3000 });
+  await expect(page.getByTestId("providers-modal")).not.toBeVisible({ timeout: 3000 });
 });
 
 // ── Provider display ─────────────────────────────────────────────────────────
@@ -68,10 +62,8 @@ test("Providers modal shows provider base URL", async ({ page }) => {
     type: "config",
     payload: makeConfigWithProvider(),
   });
-  await page.getByRole("button", { name: "Providers" }).click();
-  await expect(
-    page.getByRole("heading", { name: "Custom Providers" })
-  ).toBeVisible({ timeout: 3000 });
+  await page.getByTestId("header-providers-button").click();
+  await expect(page.getByTestId("providers-modal")).toBeVisible({ timeout: 3000 });
   await expect(
     page.getByText("http://localhost:11434/v1/", { exact: false })
   ).toBeVisible({ timeout: 3000 });
@@ -98,10 +90,8 @@ test("Providers modal shows model count", async ({ page }) => {
       },
     }),
   });
-  await page.getByRole("button", { name: "Providers" }).click();
-  await expect(
-    page.getByRole("heading", { name: "Custom Providers" })
-  ).toBeVisible({ timeout: 3000 });
+  await page.getByTestId("header-providers-button").click();
+  await expect(page.getByTestId("providers-modal")).toBeVisible({ timeout: 3000 });
   // The row subtitle shows "2 models"
   await expect(page.getByText(/2 model/, { exact: false })).toBeVisible({
     timeout: 3000,
@@ -116,10 +106,8 @@ test("Edit provider button opens edit form", async ({ page }) => {
     type: "config",
     payload: makeConfigWithProvider(),
   });
-  await page.getByRole("button", { name: "Providers" }).click();
-  await expect(page.getByText("Ollama", { exact: true })).toBeVisible({
-    timeout: 3000,
-  });
+  await page.getByTestId("header-providers-button").click();
+  await expect(page.getByTestId("providers-modal")).toContainText("Ollama", { timeout: 3000 });
   await page.getByTitle("Edit provider").click();
   await expect(page.getByText("Edit: ollama", { exact: false })).toBeVisible({
     timeout: 3000,
@@ -132,10 +120,8 @@ test("Edit provider form has ID field disabled", async ({ page }) => {
     type: "config",
     payload: makeConfigWithProvider(),
   });
-  await page.getByRole("button", { name: "Providers" }).click();
-  await expect(page.getByText("Ollama", { exact: true })).toBeVisible({
-    timeout: 3000,
-  });
+  await page.getByTestId("header-providers-button").click();
+  await expect(page.getByTestId("providers-modal")).toContainText("Ollama", { timeout: 3000 });
   await page.getByTitle("Edit provider").click();
   await expect(page.getByText("Edit: ollama", { exact: false })).toBeVisible({
     timeout: 3000,
@@ -151,10 +137,8 @@ test("Edit provider sends update_custom_provider", async ({ page }) => {
     type: "config",
     payload: makeConfigWithProvider(),
   });
-  await page.getByRole("button", { name: "Providers" }).click();
-  await expect(page.getByText("Ollama", { exact: true })).toBeVisible({
-    timeout: 3000,
-  });
+  await page.getByTestId("header-providers-button").click();
+  await expect(page.getByTestId("providers-modal")).toContainText("Ollama", { timeout: 3000 });
   await page.getByTitle("Edit provider").click();
   await expect(page.getByText("Edit: ollama", { exact: false })).toBeVisible({
     timeout: 3000,
@@ -173,7 +157,7 @@ test("Edit provider sends update_custom_provider", async ({ page }) => {
 
 test("Add provider form validates empty ID", async ({ page }) => {
   await openProvidersModal(page);
-  await page.getByRole("button", { name: /Add custom provider/i }).click();
+  await page.getByTestId("providers-modal-add").click();
   // Fill base URL but leave ID empty
   await page
     .getByPlaceholder("e.g. http://localhost:11434/v1/")
@@ -184,7 +168,7 @@ test("Add provider form validates empty ID", async ({ page }) => {
 
 test("Add provider form validates invalid base URL", async ({ page }) => {
   await openProvidersModal(page);
-  await page.getByRole("button", { name: /Add custom provider/i }).click();
+  await page.getByTestId("providers-modal-add").click();
   // Fill a valid provider ID and name
   await page
     .getByPlaceholder("e.g. ollama", { exact: true })
@@ -206,7 +190,7 @@ test("Add provider form validates invalid base URL", async ({ page }) => {
 
 test("Add provider form with model saves correctly", async ({ page }) => {
   await openProvidersModal(page);
-  await page.getByRole("button", { name: /Add custom provider/i }).click();
+  await page.getByTestId("providers-modal-add").click();
   await page
     .getByPlaceholder("e.g. ollama", { exact: true })
     .fill("localprovider");
@@ -238,10 +222,8 @@ test("Remove provider - cancel hides confirm", async ({ page }) => {
     type: "config",
     payload: makeConfigWithProvider(),
   });
-  await page.getByRole("button", { name: "Providers" }).click();
-  await expect(page.getByText("Ollama", { exact: true })).toBeVisible({
-    timeout: 3000,
-  });
+  await page.getByTestId("header-providers-button").click();
+  await expect(page.getByTestId("providers-modal")).toContainText("Ollama", { timeout: 3000 });
   await page.getByTitle("Remove provider").click();
   await expect(page.getByRole("button", { name: "Yes" })).toBeVisible({
     timeout: 3000,
@@ -273,10 +255,8 @@ test("Provider with API key shows Key set badge", async ({ page }) => {
       },
     }),
   });
-  await page.getByRole("button", { name: "Providers" }).click();
-  await expect(
-    page.getByRole("heading", { name: "Custom Providers" })
-  ).toBeVisible({ timeout: 3000 });
+  await page.getByTestId("header-providers-button").click();
+  await expect(page.getByTestId("providers-modal")).toBeVisible({ timeout: 3000 });
   await expect(page.getByText("Key set", { exact: false })).toBeVisible({
     timeout: 3000,
   });

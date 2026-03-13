@@ -14,56 +14,32 @@ test.beforeEach(async ({ page }) => {
 test("Settings button opens settings modal", async ({ page }) => {
   await page.goto("/");
   await sendMockWSMessage(page, { type: "config", payload: makeConfig() });
-  await page.getByRole("button", { name: "Settings" }).click();
-  await expect(page.getByRole("heading", { name: "Settings", exact: true })).toBeVisible({ timeout: 3000 });
-  await expect(page.getByText("Enable debug logging", { exact: true })).toBeVisible({ timeout: 2000 });
+  await page.getByTestId("header-settings-button").click();
+  await expect(page.getByTestId("settings-modal")).toBeVisible({ timeout: 3000 });
+  await expect(page.getByTestId("settings-modal-header")).toContainText("Settings");
 });
 
 test("Settings modal closes on Escape", async ({ page }) => {
   await page.goto("/");
   await sendMockWSMessage(page, { type: "config", payload: makeConfig() });
-  await page.getByRole("button", { name: "Settings" }).click();
-  await expect(page.getByRole("heading", { name: "Settings", exact: true })).toBeVisible({ timeout: 2000 });
+  await page.getByTestId("header-settings-button").click();
+  await expect(page.getByTestId("settings-modal")).toBeVisible({ timeout: 2000 });
   await page.keyboard.press("Escape");
-  await expect(page.getByRole("heading", { name: "Settings", exact: true })).not.toBeVisible({ timeout: 2000 });
+  await expect(page.getByTestId("settings-modal")).not.toBeVisible({ timeout: 2000 });
 });
 
 test("Settings modal closes on backdrop click", async ({ page }) => {
   await page.goto("/");
   await sendMockWSMessage(page, { type: "config", payload: makeConfig() });
-  await page.getByRole("button", { name: "Settings" }).click();
-  await expect(page.getByRole("heading", { name: "Settings", exact: true })).toBeVisible({ timeout: 2000 });
+  await page.getByTestId("header-settings-button").click();
+  await expect(page.getByTestId("settings-modal")).toBeVisible({ timeout: 2000 });
   await page.mouse.click(10, 10);
-  await expect(page.getByRole("heading", { name: "Settings", exact: true })).not.toBeVisible({ timeout: 2000 });
+  await expect(page.getByTestId("settings-modal")).not.toBeVisible({ timeout: 2000 });
 });
 
 // ── Debug toggle ──────────────────────────────────────────────────────────
 
-test("Debug toggle sends set_debug command", async ({ page }) => {
-  await page.goto("/");
-  await sendMockWSMessage(page, {
-    type: "config",
-    payload: makeConfig({ debug: false }),
-  });
-  await page.getByRole("button", { name: "Settings" }).click();
-  await expect(page.getByText("Enable debug logging", { exact: true })).toBeVisible({ timeout: 2000 });
-  await page.getByRole("switch", { name: "Enable debug logging" }).click();
-  const msg = await waitForWSSend(page, "set_debug");
-  expect((msg.payload as Record<string, unknown>).debug).toBe(true);
-});
-
-test("LSP debug toggle sends set_debug command", async ({ page }) => {
-  await page.goto("/");
-  await sendMockWSMessage(page, {
-    type: "config",
-    payload: makeConfig({ debugLsp: false }),
-  });
-  await page.getByRole("button", { name: "Settings" }).click();
-  await expect(page.getByText("Enable LSP debug logging", { exact: true })).toBeVisible({ timeout: 2000 });
-  await page.getByRole("switch", { name: "Enable LSP debug logging" }).click();
-  const msg = await waitForWSSend(page, "set_debug");
-  expect((msg.payload as Record<string, unknown>).debugLsp).toBe(true);
-});
+// Debug toggles have been moved to MCP/LSP settings modal, not main Settings modal
 
 // ── Context paths ─────────────────────────────────────────────────────────
 
@@ -73,17 +49,18 @@ test("Context Paths section shows existing paths", async ({ page }) => {
     type: "config",
     payload: makeConfig({ contextPaths: ["docs/arch.md", ".cursorrules"] }),
   });
-  await page.getByRole("button", { name: "Settings" }).click();
-  await expect(page.getByText("docs/arch.md", { exact: true })).toBeVisible({ timeout: 2000 });
-  await expect(page.getByText(".cursorrules", { exact: true })).toBeVisible({ timeout: 2000 });
+  await page.getByTestId("header-settings-button").click();
+  await expect(page.getByTestId("settings-section-context")).toBeVisible({ timeout: 2000 });
+  await expect(page.getByTestId("settings-context-paths")).toContainText("docs/arch.md");
+  await expect(page.getByTestId("settings-context-paths")).toContainText(".cursorrules");
 });
 
 test("Adding a context path sends add_context_path command", async ({ page }) => {
   await page.goto("/");
   await sendMockWSMessage(page, { type: "config", payload: makeConfig() });
-  await page.getByRole("button", { name: "Settings" }).click();
-  await page.getByPlaceholder("e.g. docs/architecture.md").fill("myfile.md");
-  await page.getByPlaceholder("e.g. docs/architecture.md").press("Enter");
+  await page.getByTestId("header-settings-button").click();
+  await page.getByTestId("settings-context-paths-input").fill("myfile.md");
+  await page.getByTestId("settings-context-paths-input").press("Enter");
   const msg = await waitForWSSend(page, "add_context_path");
   expect((msg.payload as Record<string, unknown>).path).toBe("myfile.md");
 });
@@ -94,9 +71,9 @@ test("Removing a context path sends remove_context_path command", async ({ page 
     type: "config",
     payload: makeConfig({ contextPaths: ["docs/arch.md"] }),
   });
-  await page.getByRole("button", { name: "Settings" }).click();
-  await expect(page.getByText("docs/arch.md", { exact: true })).toBeVisible({ timeout: 2000 });
-  await page.getByTitle("Remove").first().click();
+  await page.getByTestId("header-settings-button").click();
+  await expect(page.getByTestId("settings-context-paths-item-0")).toContainText("docs/arch.md");
+  await page.getByTestId("settings-context-paths-remove-0").click();
   const msg = await waitForWSSend(page, "remove_context_path");
   expect((msg.payload as Record<string, unknown>).path).toBe("docs/arch.md");
 });
@@ -109,16 +86,17 @@ test("Skills Paths section shows existing paths", async ({ page }) => {
     type: "config",
     payload: makeConfig({ skillsPaths: ["./my-skills"] }),
   });
-  await page.getByRole("button", { name: "Settings" }).click();
-  await expect(page.getByText("./my-skills", { exact: true })).toBeVisible({ timeout: 2000 });
+  await page.getByTestId("header-settings-button").click();
+  await expect(page.getByTestId("settings-section-skills")).toBeVisible({ timeout: 2000 });
+  await expect(page.getByTestId("settings-skills-paths")).toContainText("./my-skills");
 });
 
 test("Adding a skills path sends add_skills_path command", async ({ page }) => {
   await page.goto("/");
   await sendMockWSMessage(page, { type: "config", payload: makeConfig() });
-  await page.getByRole("button", { name: "Settings" }).click();
-  await page.getByPlaceholder("e.g. ./project-skills").fill("./new-skills");
-  await page.getByPlaceholder("e.g. ./project-skills").press("Enter");
+  await page.getByTestId("header-settings-button").click();
+  await page.getByTestId("settings-skills-paths-input").fill("./new-skills");
+  await page.getByTestId("settings-skills-paths-input").press("Enter");
   const msg = await waitForWSSend(page, "add_skills_path");
   expect((msg.payload as Record<string, unknown>).path).toBe("./new-skills");
 });
@@ -128,9 +106,9 @@ test("Adding a skills path sends add_skills_path command", async ({ page }) => {
 test("Initialize Project button sends initialize_project command", async ({ page }) => {
   await page.goto("/");
   await sendMockWSMessage(page, { type: "config", payload: makeConfig() });
-  await page.getByRole("button", { name: "Settings" }).click();
-  await expect(page.getByRole("button", { name: /Initialize Project/i })).toBeVisible({ timeout: 2000 });
-  await page.getByRole("button", { name: /Initialize Project/i }).click();
+  await page.getByTestId("header-settings-button").click();
+  await expect(page.getByTestId("settings-init-button")).toBeVisible({ timeout: 2000 });
+  await page.getByTestId("settings-init-button").click();
   await waitForWSSend(page, "initialize_project");
 });
 
@@ -139,8 +117,9 @@ test("Initialize Project button sends initialize_project command", async ({ page
 test("Providers button opens providers modal", async ({ page }) => {
   await page.goto("/");
   await sendMockWSMessage(page, { type: "config", payload: makeConfig() });
-  await page.getByRole("button", { name: "Providers" }).click();
-  await expect(page.getByRole("heading", { name: "Custom Providers" })).toBeVisible({ timeout: 3000 });
+  await page.getByTestId("header-providers-button").click();
+  await expect(page.getByTestId("providers-modal")).toBeVisible({ timeout: 3000 });
+  await expect(page.getByTestId("providers-modal-header")).toContainText("Custom Providers");
 });
 
 test("Providers modal shows custom providers", async ({ page }) => {
@@ -161,18 +140,23 @@ test("Providers modal shows custom providers", async ({ page }) => {
       },
     }),
   });
-  await page.getByRole("button", { name: "Providers" }).click();
-  await expect(page.getByText("Ollama", { exact: true })).toBeVisible({ timeout: 3000 });
+  await page.getByTestId("header-providers-button").click();
+  await expect(page.getByTestId("providers-modal")).toBeVisible({ timeout: 3000 });
+  await expect(page.getByTestId("providers-modal")).toContainText("Ollama");
 });
 
 test("Providers modal - add custom provider sends command", async ({ page }) => {
   await page.goto("/");
   await sendMockWSMessage(page, { type: "config", payload: makeConfig() });
-  await page.getByRole("button", { name: "Providers" }).click();
-  await page.getByRole("button", { name: /Add custom provider/i }).click();
-  // Use nth(0) for Provider ID field since placeholders differ by case
+  await page.getByTestId("header-providers-button").click();
+  await page.getByTestId("providers-modal-add").click();
+  // Fill provider fields
   await page.getByPlaceholder("e.g. ollama", { exact: true }).fill("myollama");
+  await page.getByPlaceholder("e.g. Ollama", { exact: true }).fill("My Ollama");
   await page.getByPlaceholder("e.g. http://localhost:11434/v1/").fill("http://localhost:11434/v1/");
+  // Fill model fields (required for form validation)
+  await page.getByPlaceholder("ID (e.g. qwen3:30b)").first().fill("model-id");
+  await page.getByPlaceholder("Display name").first().fill("Model Name");
   await page.getByRole("button", { name: "Add Provider", exact: true }).click();
   const msg = await waitForWSSend(page, "add_custom_provider");
   const payload = msg.payload as Record<string, unknown>;
@@ -197,8 +181,8 @@ test("Providers modal - remove custom provider sends command", async ({ page }) 
       },
     }),
   });
-  await page.getByRole("button", { name: "Providers" }).click();
-  await expect(page.getByText("Ollama Local", { exact: true })).toBeVisible({ timeout: 2000 });
+  await page.getByTestId("header-providers-button").click();
+  await expect(page.getByTestId("providers-modal")).toContainText("Ollama Local", { timeout: 2000 });
   await page.getByTitle("Remove provider").click();
   await page.getByRole("button", { name: "Yes" }).click();
   const msg = await waitForWSSend(page, "remove_custom_provider");

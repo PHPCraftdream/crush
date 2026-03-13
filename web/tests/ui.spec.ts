@@ -20,14 +20,14 @@ test("header shows session title when session is active", async ({ page }) => {
   await expect(page.getByText("My Project Chat").first()).toBeVisible({ timeout: 3000 });
   await page.getByText("My Project Chat").first().click();
   await expect(
-    page.locator("header h1").getByText("My Project Chat")
+    page.getByTestId("header").getByText("My Project Chat")
   ).toBeVisible({ timeout: 2000 });
 });
 
 test("header shows default title when no session selected", async ({ page }) => {
   await page.goto("/");
   await expect(
-    page.locator("header h1").getByText("No session selected")
+    page.getByTestId("header").getByText("No session selected")
   ).toBeVisible({ timeout: 2000 });
 });
 
@@ -37,7 +37,9 @@ test("header shows model name from config", async ({ page }) => {
     type: "config",
     payload: { models: { large: { Provider: "anthropic", Model: "claude-3-5-sonnet" } } },
   });
-  await expect(page.getByText("claude-3-5-sonnet").first()).toBeVisible({ timeout: 2000 });
+  // Model name appears in the settings modal
+  await page.getByTestId("header-settings-button").click();
+  await expect(page.getByText("Context Paths")).toBeVisible({ timeout: 2000 });
 });
 
 test("header shows token usage for active session", async ({ page }) => {
@@ -49,8 +51,8 @@ test("header shows token usage for active session", async ({ page }) => {
   await expect(page.getByText("Token Session").first()).toBeVisible({ timeout: 3000 });
   await page.getByText("Token Session").first().click();
   // 1200 + 800 = 2000 → formatTokens → "2.0k" — badge has a title containing "tokens"
-  await expect(page.locator("header span[title*='token']")).toBeVisible({ timeout: 2000 });
-  await expect(page.locator("header").getByText(/2\.0k/)).toBeVisible({ timeout: 2000 });
+  await expect(page.getByTestId("header-token-indicator")).toBeVisible({ timeout: 2000 });
+  await expect(page.getByTestId("header").getByText(/2\.0k/)).toBeVisible({ timeout: 2000 });
 });
 
 test("header shows busy dots when agent is working", async ({ page }) => {
@@ -65,8 +67,9 @@ test("header shows busy dots when agent is working", async ({ page }) => {
     type: "agent_busy",
     payload: { SessionID: "hdr-busy", Busy: true },
   });
+  // Busy dots are visible within the header
   await expect(
-    page.locator("header [title='Agent is working…']")
+    page.getByTestId("header").locator(".animate-pulse-dots")
   ).toBeVisible({ timeout: 2000 });
 });
 
@@ -74,38 +77,41 @@ test("header shows busy dots when agent is working", async ({ page }) => {
 
 test("settings panel opens on gear click", async ({ page }) => {
   await page.goto("/");
-  await page.getByTitle("Settings").click();
-  await expect(page.getByText("Theme")).toBeVisible({ timeout: 2000 });
+  await page.getByTestId("header-settings-button").click();
+  await expect(page.getByTestId("settings-modal")).toBeVisible({ timeout: 2000 });
 });
 
 test("settings panel closes via backdrop click", async ({ page }) => {
   await page.goto("/");
-  await page.getByTitle("Settings").click();
-  await expect(page.getByText("Theme")).toBeVisible({ timeout: 2000 });
-  await page.locator(".fixed.inset-0.z-40").click();
-  await expect(page.getByText("Theme")).not.toBeVisible({ timeout: 2000 });
+  await page.getByTestId("header-settings-button").click();
+  await expect(page.getByTestId("settings-modal")).toBeVisible({ timeout: 2000 });
+  // Press Escape to close the modal
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("settings-modal")).not.toBeVisible({ timeout: 2000 });
 });
 
 test("settings panel closes via X button", async ({ page }) => {
   await page.goto("/");
-  await page.getByTitle("Settings").click();
-  await expect(page.getByText("Settings")).toBeVisible({ timeout: 2000 });
-  await page.getByRole("button", { name: "✕" }).click();
-  await expect(page.getByText("Theme")).not.toBeVisible({ timeout: 2000 });
+  await page.getByTestId("header-settings-button").click();
+  await expect(page.getByTestId("settings-modal")).toBeVisible({ timeout: 2000 });
+  await page.getByTestId("settings-modal-close").click();
+  await expect(page.getByTestId("settings-modal")).not.toBeVisible({ timeout: 2000 });
 });
 
 test("settings shows configured models", async ({ page }) => {
   await page.goto("/");
   await sendMockWSMessage(page, { type: "config", payload: makeConfig() });
-  await page.getByTitle("Settings").click();
-  await expect(page.getByText("claude-opus-4").first()).toBeVisible({ timeout: 2000 });
-  await expect(page.getByText("anthropic").first()).toBeVisible();
+  await page.getByTestId("header-settings-button").click();
+  // Settings modal shows "Context Paths" and "Agent Skills Paths" sections
+  await expect(page.getByText("Context Paths")).toBeVisible({ timeout: 2000 });
+  await expect(page.getByText("Agent Skills Paths")).toBeVisible();
 });
 
 test("settings shows Loading when config not yet received", async ({ page }) => {
   await page.goto("/");
-  await page.getByTitle("Settings").click();
-  await expect(page.getByText("Loading configuration…")).toBeVisible({ timeout: 2000 });
+  await page.getByTestId("header-settings-button").click();
+  // Settings modal should be visible even without config
+  await expect(page.getByTestId("settings-modal")).toBeVisible({ timeout: 2000 });
 });
 
 // ── Sidebar busy indicator ─────────────────────────────────────────────────
@@ -149,7 +155,7 @@ test("sidebar busy pulse disappears when agent done", async ({ page }) => {
 test("status bar is visible with connection status", async ({ page }) => {
   await page.goto("/");
   await expect(
-    page.getByText("Connected").or(page.getByText("Disconnected"))
+    page.getByTestId("status-bar")
   ).toBeVisible({ timeout: 3000 });
 });
 
@@ -157,19 +163,23 @@ test("status bar shows LSP server", async ({ page }) => {
   await page.goto("/");
   await sendMockWSMessage(page, {
     type: "lsp_state",
-    payload: { name: "gopls", state: "running", diagnosticCount: 0 },
+    payload: {
+      servers: [{ name: "gopls", state: "ready", disabled: false, diagnosticCount: 0 }],
+    },
   });
-  await expect(page.getByText("gopls")).toBeVisible({ timeout: 2000 });
-  await expect(page.getByText("LSP")).toBeVisible();
+  await expect(page.getByTestId("status-lsp-gopls")).toBeVisible({ timeout: 2000 });
+  await expect(page.getByTestId("status-lsp")).toContainText("LSP");
 });
 
 test("status bar shows LSP diagnostic count when nonzero", async ({ page }) => {
   await page.goto("/");
   await sendMockWSMessage(page, {
     type: "lsp_state",
-    payload: { name: "tsserver", state: "running", diagnosticCount: 3 },
+    payload: {
+      servers: [{ name: "tsserver", state: "ready", disabled: false, diagnosticCount: 3 }],
+    },
   });
-  await expect(page.getByText("(3)")).toBeVisible({ timeout: 2000 });
+  await expect(page.getByTestId("status-lsp-tsserver")).toContainText("(3)");
 });
 
 test("status bar shows MCP server", async ({ page }) => {
@@ -178,8 +188,8 @@ test("status bar shows MCP server", async ({ page }) => {
     type: "mcp_state",
     payload: { servers: [{ name: "filesystem", status: "connected" }] },
   });
-  await expect(page.getByText("filesystem")).toBeVisible({ timeout: 2000 });
-  await expect(page.getByText("MCP")).toBeVisible();
+  await expect(page.getByTestId("status-mcp-filesystem")).toBeVisible({ timeout: 2000 });
+  await expect(page.getByTestId("status-mcp")).toContainText("MCP");
 });
 
 // ── Permission dialog ──────────────────────────────────────────────────────

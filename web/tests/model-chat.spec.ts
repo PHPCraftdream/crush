@@ -81,8 +81,8 @@ async function getLastSentMessage(page: import("@playwright/test").Page) {
 test("default model: send_message has no overrides and response appears in chat", async ({ page }) => {
   await setupSessionAndConfig(page, "mc-def", "Default Chat");
 
-  await page.getByPlaceholder("Message… (Enter to send)").fill("hello");
-  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await page.locator('[data-test-id="chat-input-textarea"]').fill("hello");
+  await page.locator('[data-test-id="chat-input-send-button"]').click();
 
   const sent = await waitForWSSend(page, "send_message");
   const payload = sent.payload as Record<string, unknown>;
@@ -111,10 +111,10 @@ test("switching large model sends set_session_models and response appears in cha
   await setupSessionAndConfig(page, "mc-cli", "CLI Claude Chat");
 
   await expect(
-    page.locator("button[title='Large (strong) model']")
+    page.locator('[data-test-id="model-selector-large"]')
   ).toBeVisible({ timeout: 3000 });
-  await page.locator("button[title='Large (strong) model']").click();
-  await page.locator('[data-testid="model-dropdown"]').getByText("claude-cli").click();
+  await page.locator('[data-test-id="model-selector-large"]').click();
+  await page.locator('[data-test-id="model-dropdown"]').getByText("claude-cli").click();
 
   // Verify set_session_models was sent
   const modelsCmd = await waitForWSSend(page, "set_session_models");
@@ -133,12 +133,12 @@ test("switching large model sends set_session_models and response appears in cha
   });
 
   await expect(
-    page.locator("button[title='Large (strong) model']").filter({ hasText: "claude-cli" })
+    page.locator('[data-test-id="model-selector-large"]').filter({ hasText: "claude-cli" })
   ).toBeVisible({ timeout: 2000 });
 
   // Send a message — no override in payload
-  await page.getByPlaceholder("Message… (Enter to send)").fill("what model are you?");
-  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await page.locator('[data-test-id="chat-input-textarea"]').fill("what model are you?");
+  await page.locator('[data-test-id="chat-input-send-button"]').click();
 
   await waitForWSSend(page, "send_message");
   const payload = await getLastSentMessage(page);
@@ -165,15 +165,15 @@ test("switching large model sends set_session_models and response appears in cha
 test("switching small model sends set_session_models and response appears in chat", async ({ page }) => {
   await setupSessionAndConfig(page, "mc-glm", "GLM Chat");
 
-  await page.locator("button[title='Small (fast) model']").click();
-  await page.locator('[data-testid="model-dropdown"]').getByText("glm-5").click();
+  await page.locator('[data-test-id="model-selector-small"]').click();
+  await page.locator('[data-test-id="model-dropdown"]').getByText("glm-5").click();
 
   const modelsCmd = await waitForWSSend(page, "set_session_models");
   const mp = modelsCmd.payload as { smallModel: { provider: string; model: string } };
   expect(mp.smallModel).toEqual({ provider: "glm", model: "glm-5" });
 
-  await page.getByPlaceholder("Message… (Enter to send)").fill("respond fast");
-  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await page.locator('[data-test-id="chat-input-textarea"]').fill("respond fast");
+  await page.locator('[data-test-id="chat-input-send-button"]').click();
 
   await waitForWSSend(page, "send_message");
   const payload = await getLastSentMessage(page);
@@ -200,8 +200,8 @@ test("switching model mid-session: set_session_models sent each time, no send_me
   await setupSessionAndConfig(page, "mc-switch", "Mid-Session Switch");
 
   // First message — no model switch yet
-  await page.getByPlaceholder("Message… (Enter to send)").fill("first message");
-  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await page.locator('[data-test-id="chat-input-textarea"]').fill("first message");
+  await page.locator('[data-test-id="chat-input-send-button"]').click();
   await waitForWSSend(page, "send_message");
   const first = await getLastSentMessage(page);
   expect(first.largeModel).toBeUndefined();
@@ -218,13 +218,13 @@ test("switching model mid-session: set_session_models sent each time, no send_me
   await expect(page.getByText("Reply one.")).toBeVisible({ timeout: 3000 });
 
   // Switch large model to glm-5
-  await page.locator("button[title='Large (strong) model']").click();
-  await page.locator('[data-testid="model-dropdown"]').getByText("glm-5").click();
+  await page.locator('[data-test-id="model-selector-large"]').click();
+  await page.locator('[data-test-id="model-dropdown"]').getByText("glm-5").click();
   await waitForWSSend(page, "set_session_models");
 
   // Second message — still no override in payload
-  await page.getByPlaceholder("Message… (Enter to send)").fill("second message");
-  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await page.locator('[data-test-id="chat-input-textarea"]').fill("second message");
+  await page.locator('[data-test-id="chat-input-send-button"]').click();
 
   await page.waitForFunction(() => {
     const sent = ((window as unknown) as Record<string, unknown>)["__wsSent"] as Array<{
@@ -254,8 +254,8 @@ test("switching model mid-session: set_session_models sent each time, no send_me
 test("agent error event shows inline error banner in chat", async ({ page }) => {
   await setupSessionAndConfig(page, "mc-err", "Error Test");
 
-  await page.getByPlaceholder("Message… (Enter to send)").fill("trigger error");
-  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await page.locator('[data-test-id="chat-input-textarea"]').fill("trigger error");
+  await page.locator('[data-test-id="chat-input-send-button"]').click();
   await waitForWSSend(page, "send_message");
 
   await sendMockWSMessage(page, {

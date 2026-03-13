@@ -83,23 +83,23 @@ async function setup(page: Page, sessionID: string, title: string) {
   });
   await sendMockWSMessage(page, { type: "config", payload: makeCliConfig() });
   // Wait until the chat input is enabled (session active + config received)
-  await expect(page.getByPlaceholder("Message… (Enter to send)")).toBeEnabled({ timeout: 5000 });
+  await expect(page.locator('[data-test-id="chat-input-textarea"]')).toBeEnabled({ timeout: 5000 });
 }
 
 /** Select a model from the "Large" model dropdown in the header. */
 async function selectLargeModel(page: Page, modelName: string) {
-  await expect(page.locator("button[title='Large (strong) model']")).toBeVisible({ timeout: 3000 });
-  await page.locator("button[title='Large (strong) model']").click();
-  await page.getByPlaceholder("Search models…").fill(modelName);
-  await page.locator('[data-testid="model-dropdown"]').getByRole("button", { name: modelName, exact: true }).click();
+  await expect(page.locator('[data-test-id="model-selector-large"]')).toBeVisible({ timeout: 3000 });
+  await page.locator('[data-test-id="model-selector-large"]').click();
+  await page.locator('[data-test-id="model-dropdown"]').getByPlaceholder("Search models…").fill(modelName);
+  await page.locator('[data-test-id="model-dropdown"]').getByRole("button", { name: modelName, exact: true }).click();
 }
 
 /** Select a model from the "Small" model dropdown in the header. */
 async function selectSmallModel(page: Page, modelName: string) {
-  await expect(page.locator("button[title='Small (fast) model']")).toBeVisible({ timeout: 3000 });
-  await page.locator("button[title='Small (fast) model']").click();
-  await page.getByPlaceholder("Search models…").fill(modelName);
-  await page.locator('[data-testid="model-dropdown"]').getByRole("button", { name: modelName, exact: true }).click();
+  await expect(page.locator('[data-test-id="model-selector-small"]')).toBeVisible({ timeout: 3000 });
+  await page.locator('[data-test-id="model-selector-small"]').click();
+  await page.locator('[data-test-id="model-dropdown"]').getByPlaceholder("Search models…").fill(modelName);
+  await page.locator('[data-test-id="model-dropdown"]').getByRole("button", { name: modelName, exact: true }).click();
 }
 
 function makePermission(overrides: Record<string, unknown> = {}) {
@@ -178,8 +178,8 @@ for (const model of CLI_MODELS) {
       });
 
       // Send a message
-      await page.getByPlaceholder("Message… (Enter to send)").fill("Hello from test");
-      await page.getByRole("button", { name: "Send", exact: true }).click();
+      await page.locator('[data-test-id="chat-input-textarea"]').fill("Hello from test");
+      await page.locator('[data-test-id="chat-input-send-button"]').click();
 
       const sent = await waitForWSSend(page, "send_message");
       expect((sent.payload as Record<string, unknown>).content).toBe("Hello from test");

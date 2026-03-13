@@ -388,13 +388,15 @@ export function ProvidersModal({ onClose }: { onClose: () => void }) {
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm p-4"
       onClick={onClose}
+      data-test-id="providers-modal-overlay"
     >
       <div
         className="bg-canvas border border-surface rounded-2xl shadow-xl w-full max-w-lg overflow-hidden flex flex-col max-h-[80vh] chat-font"
         onClick={(e) => e.stopPropagation()}
+        data-test-id="providers-modal"
       >
         {/* Header */}
-        <div className="flex items-center justify-between px-5 py-4 border-b border-surface shrink-0">
+        <div className="flex items-center justify-between px-5 py-4 border-b border-surface shrink-0" data-test-id="providers-modal-header">
           <div>
             <h2 className="text-base font-semibold text-text">Custom Providers</h2>
             <p className="text-xs text-text-subtle mt-0.5">
@@ -456,6 +458,7 @@ export function ProvidersModal({ onClose }: { onClose: () => void }) {
             <button
               onClick={() => setShowAdd(true)}
               className="flex items-center gap-2 w-full px-4 py-2.5 text-sm font-medium text-accent border border-accent/30 rounded-xl hover:bg-accent/5 transition-colors"
+              data-test-id="providers-modal-add"
             >
               <Plus size={15} />
               Add custom provider

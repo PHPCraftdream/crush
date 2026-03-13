@@ -38,9 +38,9 @@ export function StatusBar() {
   const connected = useStore($connected);
 
   return (
-    <div className="flex items-center gap-4 px-5 py-2 border-t border-surface bg-base-subtle text-xs text-text-subtle shrink-0 overflow-x-auto">
+    <div data-test-id="status-bar" className="flex items-center gap-4 px-5 py-2 border-t border-surface bg-base-subtle text-xs text-text-subtle shrink-0 overflow-x-auto">
       {/* Connection */}
-      <div className="flex items-center gap-1.5 shrink-0">
+      <div data-test-id="status-connection" className="flex items-center gap-1.5 shrink-0">
         <span
           className={`w-1.5 h-1.5 rounded-full inline-block ${connected ? "bg-green" : "bg-red"}`}
         />
@@ -51,10 +51,10 @@ export function StatusBar() {
       {lspStates.length > 0 && (
         <>
           <span className="text-surface">|</span>
-          <div className="flex items-center gap-3 shrink-0">
+          <div data-test-id="status-lsp" className="flex items-center gap-3 shrink-0">
             <span className="text-text-subtle font-semibold">LSP</span>
             {lspStates.map((l) => (
-              <div key={l.name} className="flex items-center gap-1" title={`${l.name}: ${l.state}`}>
+              <div key={l.name} data-test-id={`status-lsp-${l.name}`} className="flex items-center gap-1" title={`${l.name}: ${l.state}`}>
                 <span className={`w-1.5 h-1.5 rounded-full inline-block ${lspDot(l.state)}`} />
                 <span>{l.name}</span>
                 {l.diagnosticCount > 0 && (
@@ -70,11 +70,12 @@ export function StatusBar() {
       {mcpState && (mcpState.servers?.length ?? 0) > 0 && (
         <>
           <span className="text-surface">|</span>
-          <div className="flex items-center gap-3 shrink-0">
+          <div data-test-id="status-mcp" className="flex items-center gap-3 shrink-0">
             <span className="text-text-subtle font-semibold">MCP</span>
             {(mcpState.servers ?? []).map((srv) => (
               <div
                 key={srv.name}
+                data-test-id={`status-mcp-${srv.name}`}
                 className="flex items-center gap-1"
                 title={`${srv.name}: ${srv.status}`}
               >

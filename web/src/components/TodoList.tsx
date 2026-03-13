@@ -67,14 +67,14 @@ function TodoRow({
 
   return (
     <div
-      data-testid="todo-row"
+      data-test-id="todo-row"
       className="todo-row group"
     >
       {/* Actions — LEFT side, visible on hover */}
       <div className="flex items-center gap-0.5 shrink-0">
         {editing ? (
           <button
-            data-testid="todo-save"
+            data-test-id="todo-save"
             onClick={commitEdit}
             title="Save"
             className="w-5 h-5 flex items-center justify-center text-green hover:opacity-70 transition-opacity text-[13px] leading-none"
@@ -84,7 +84,7 @@ function TodoRow({
         ) : (
           <div className="flex items-center gap-0 opacity-0 group-hover:opacity-100 transition-opacity">
             <button
-              data-testid="todo-edit"
+              data-test-id="todo-edit"
               onClick={startEdit}
               title="Edit"
               className="w-5 h-5 flex items-center justify-center text-text-subtle hover:text-accent transition-colors text-[12px] leading-none"
@@ -92,7 +92,7 @@ function TodoRow({
               ✏
             </button>
             <button
-              data-testid="todo-move-up"
+              data-test-id="todo-move-up"
               onClick={() => onMove(-1)}
               disabled={index === 0}
               title="Move up"
@@ -101,7 +101,7 @@ function TodoRow({
               ↑
             </button>
             <button
-              data-testid="todo-move-down"
+              data-test-id="todo-move-down"
               onClick={() => onMove(1)}
               disabled={index === total - 1}
               title="Move down"
@@ -110,7 +110,7 @@ function TodoRow({
               ↓
             </button>
             <button
-              data-testid="todo-delete"
+              data-test-id="todo-delete"
               onClick={onDelete}
               title="Delete"
               className="w-5 h-5 flex items-center justify-center text-text-subtle hover:text-red transition-colors text-[14px] leading-none"
@@ -123,7 +123,7 @@ function TodoRow({
 
       {/* Status toggle */}
       <button
-        data-testid="todo-status-btn"
+        data-test-id="todo-status-btn"
         onClick={() => onChange({ ...todo, status: nextStatus(todo.status) })}
         title={`Status: ${todo.status}`}
         className="shrink-0 hover:opacity-70 transition-opacity"
@@ -136,7 +136,7 @@ function TodoRow({
         {editing ? (
           <input
             ref={inputRef}
-            data-testid="todo-edit-input"
+            data-test-id="todo-edit-input"
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
             onKeyDown={onKey}
@@ -144,7 +144,7 @@ function TodoRow({
           />
         ) : (
           <span
-            data-testid="todo-content"
+            data-test-id="todo-content"
             className={`cursor-default select-none block truncate ${
               todo.status === "completed" ? "line-through text-text-subtle" : "text-text"
             }`} style={{ fontSize: "var(--chat-font-size)" }}
@@ -244,13 +244,13 @@ export function TodoList({ sessionID, todos }: { sessionID: string; todos: Todo[
 
   return (
     <div
-      data-testid="todo-list"
+      data-test-id="todo-list"
       className="shrink-0 border-t border-surface bg-base-subtle/40"
     >
       {/* Header */}
       <div className="flex items-center">
         <button
-          data-testid="todo-list-toggle"
+          data-test-id="todo-list-toggle"
           onClick={() => setCollapsed((c) => !c)}
           className="flex-1 flex items-center gap-2 px-4 py-2 text-left hover:bg-base-overlay/50 transition-colors"
         >
@@ -269,7 +269,7 @@ export function TodoList({ sessionID, todos }: { sessionID: string; todos: Todo[
 
         {/* Add task button */}
         <button
-          data-testid="todo-add-btn"
+          data-test-id="todo-add-btn"
           onClick={startAdding}
           title="Add task"
           className="px-3 py-2 text-text-subtle hover:text-text transition-colors text-[18px] leading-none"

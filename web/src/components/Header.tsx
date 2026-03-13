@@ -155,6 +155,7 @@ function SessionTitle({ session, cwd }: { session: { ID: string; Title: string }
         onChange={e => setValue(e.target.value)}
         onBlur={commit}
         onKeyDown={onKey}
+        data-test-id="session-edit-input"
         className="text-lg font-bold text-text bg-base-overlay border border-accent/50 rounded-xl px-3 py-1 outline-none w-full max-w-md"
       />
     );
@@ -243,7 +244,7 @@ export function Header() {
 
   return (
     <>
-    <header className="flex items-center gap-6 px-8 py-6 border-b border-surface bg-canvas shrink-0">
+    <header data-test-id="header" className="flex items-center gap-6 px-8 py-6 border-b border-surface bg-canvas shrink-0">
       <div className="flex-1 min-w-0">
         <SessionTitle session={activeSession} cwd={config?.cwd} />
       </div>
@@ -251,6 +252,7 @@ export function Header() {
       <div className="flex items-center gap-3 shrink-0">
         {activeSession && totalTokens > 0 && (
           <span
+            data-test-id="header-token-indicator"
             className="text-sm font-medium text-text-subtle bg-base-overlay border border-surface rounded-xl px-3.5 py-2 flex items-center gap-1.5"
             title={`${totalTokens.toLocaleString()} tokens total across all requests in this session (includes system prompt + tool definitions sent each turn)${contextWindow > 0 ? ` · context window: ${contextWindow.toLocaleString()}` : ""}`}
           >
@@ -259,12 +261,13 @@ export function Header() {
               <span className={`font-semibold ${pctColor(contextPct)}`}>{contextPct}%</span>
             )}
             {isSummarized && (
-              <span title="Session has been summarized"><CheckCheck size={13} className="text-accent" /></span>
+              <span data-test-id="header-summarized-badge" title="Session has been summarized"><CheckCheck size={13} className="text-accent" /></span>
             )}
           </span>
         )}
 
         <button
+          data-test-id="header-prompt-button"
           onClick={() => setShowSystemPrompt(true)}
           disabled={!activeSessionID}
           title="View / edit system prompt"
@@ -275,6 +278,7 @@ export function Header() {
         </button>
 
         <button
+          data-test-id="header-mcp-button"
           onClick={() => setShowMCPSettings(true)}
           title="MCP server settings"
           className="flex items-center gap-1.5 text-xs font-medium rounded-lg px-2.5 py-1.5 border transition-colors bg-base-overlay border-surface text-text-subtle hover:border-accent/50 hover:text-text"
@@ -284,6 +288,7 @@ export function Header() {
         </button>
 
         <button
+          data-test-id="header-lsp-button"
           onClick={() => setShowLSPSettings(true)}
           title="LSP server settings"
           className="flex items-center gap-1.5 text-xs font-medium rounded-lg px-2.5 py-1.5 border transition-colors bg-base-overlay border-surface text-text-subtle hover:border-accent/50 hover:text-text"
@@ -293,6 +298,7 @@ export function Header() {
         </button>
 
         <button
+          data-test-id="header-providers-button"
           onClick={() => setShowProviders(true)}
           title="Custom providers"
           className="flex items-center gap-1.5 text-xs font-medium rounded-lg px-2.5 py-1.5 border transition-colors bg-base-overlay border-surface text-text-subtle hover:border-accent/50 hover:text-text"
@@ -302,6 +308,7 @@ export function Header() {
         </button>
 
         <button
+          data-test-id="header-settings-button"
           onClick={() => setShowSettings(true)}
           title="Settings"
           className="flex items-center gap-1.5 text-xs font-medium rounded-lg px-2.5 py-1.5 border transition-colors bg-base-overlay border-surface text-text-subtle hover:border-accent/50 hover:text-text"
@@ -320,6 +327,7 @@ export function Header() {
         </button>
 
         <button
+          data-test-id="header-theme-toggle"
           onClick={toggleTheme}
           title={isDark ? "Switch to light theme" : "Switch to dark theme"}
           className="flex items-center justify-center w-8 h-8 rounded-lg border transition-colors bg-base-overlay border-surface text-text-subtle hover:border-accent/50 hover:text-text"

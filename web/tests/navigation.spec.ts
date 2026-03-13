@@ -41,8 +41,8 @@ test("selecting a session updates URL hash", async ({ page }) => {
       makeSession({ ID: "nav-2", Title: "Other Nav" }),
     ],
   });
-  await expect(page.getByText("Nav Session").first()).toBeVisible({ timeout: 3000 });
-  await page.getByText("Nav Session").first().click();
+  await expect(page.getByTestId("session-title-nav-1")).toBeVisible({ timeout: 3000 });
+  await page.getByTestId("session-nav-1").click();
 
   // Hash should contain the session ID
   const url = page.url();
@@ -132,8 +132,8 @@ test("deleting active session clears hash and shows no session", async ({ page }
     type: "sessions_list",
     payload: [makeSession({ ID: "del-active", Title: "Active To Delete" })],
   });
-  await expect(page.getByText("Active To Delete").first()).toBeVisible({ timeout: 3000 });
-  await page.getByText("Active To Delete").first().click();
+  await expect(page.getByTestId("session-title-del-active")).toBeVisible({ timeout: 3000 });
+  await page.getByTestId("session-del-active").click();
 
   // Server deletes the active session
   await sendMockWSMessage(page, {

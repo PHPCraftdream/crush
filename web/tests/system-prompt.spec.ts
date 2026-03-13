@@ -41,13 +41,13 @@ async function setupWithSession(page: import("@playwright/test").Page) {
 
 test("Prompt button disabled without active session", async ({ page }) => {
   await page.goto("/");
-  const btn = page.locator("header button[title='View / edit system prompt']");
+  const btn = page.getByTestId("header-prompt-button");
   await expect(btn).toBeDisabled({ timeout: 2000 });
 });
 
 test("System prompt button visible when session active", async ({ page }) => {
   await setupWithSession(page);
-  const btn = page.locator("header button[title='View / edit system prompt']");
+  const btn = page.getByTestId("header-prompt-button");
   await expect(btn).toBeEnabled({ timeout: 3000 });
 });
 
@@ -55,13 +55,13 @@ test("System prompt button visible when session active", async ({ page }) => {
 
 test("System prompt modal opens on button click", async ({ page }) => {
   await setupWithSession(page);
-  await page.locator("header button[title='View / edit system prompt']").click();
+  await page.getByTestId("header-prompt-button").click();
   await expect(page.getByText("System Prompt")).toBeVisible({ timeout: 3000 });
 });
 
 test("modal sends get_system_prompt on open", async ({ page }) => {
   await setupWithSession(page);
-  await page.locator("header button[title='View / edit system prompt']").click();
+  await page.getByTestId("header-prompt-button").click();
   const cmd = await waitForWSSend(page, "get_system_prompt");
   expect((cmd.payload as { sessionID: string }).sessionID).toBe("sp-sess");
 });
@@ -70,7 +70,7 @@ test("modal sends get_system_prompt on open", async ({ page }) => {
 
 test("System prompt modal shows loading then textarea after response", async ({ page }) => {
   await setupWithSession(page);
-  await page.locator("header button[title='View / edit system prompt']").click();
+  await page.getByTestId("header-prompt-button").click();
 
   // Should show loading state initially
   await expect(page.getByText("Loading")).toBeVisible({ timeout: 2000 });
@@ -90,7 +90,7 @@ test("System prompt modal shows loading then textarea after response", async ({ 
 
 test("System prompt modal shows loaded content", async ({ page }) => {
   await setupWithSession(page);
-  await page.locator("header button[title='View / edit system prompt']").click();
+  await page.getByTestId("header-prompt-button").click();
   await sendMockWSMessage(page, {
     type: "system_prompt",
     payload: { content: "You are helpful" },
@@ -104,7 +104,7 @@ test("System prompt modal shows loaded content", async ({ page }) => {
 
 test("Save button disabled when content unchanged", async ({ page }) => {
   await setupWithSession(page);
-  await page.locator("header button[title='View / edit system prompt']").click();
+  await page.getByTestId("header-prompt-button").click();
   await sendMockWSMessage(page, {
     type: "system_prompt",
     payload: { content: "Original" },
@@ -115,7 +115,7 @@ test("Save button disabled when content unchanged", async ({ page }) => {
 
 test("Save button enabled after editing", async ({ page }) => {
   await setupWithSession(page);
-  await page.locator("header button[title='View / edit system prompt']").click();
+  await page.getByTestId("header-prompt-button").click();
   await sendMockWSMessage(page, {
     type: "system_prompt",
     payload: { content: "Original" },
@@ -128,7 +128,7 @@ test("Save button enabled after editing", async ({ page }) => {
 
 test("Save button sends set_system_prompt", async ({ page }) => {
   await setupWithSession(page);
-  await page.locator("header button[title='View / edit system prompt']").click();
+  await page.getByTestId("header-prompt-button").click();
   await sendMockWSMessage(page, {
     type: "system_prompt",
     payload: { content: "Old prompt" },
@@ -146,7 +146,7 @@ test("Save button sends set_system_prompt", async ({ page }) => {
 
 test("Reset button reverts draft to original content", async ({ page }) => {
   await setupWithSession(page);
-  await page.locator("header button[title='View / edit system prompt']").click();
+  await page.getByTestId("header-prompt-button").click();
   await sendMockWSMessage(page, {
     type: "system_prompt",
     payload: { content: "Original text" },
@@ -162,7 +162,7 @@ test("Reset button reverts draft to original content", async ({ page }) => {
 
 test("System prompt modal closes on Escape", async ({ page }) => {
   await setupWithSession(page);
-  await page.locator("header button[title='View / edit system prompt']").click();
+  await page.getByTestId("header-prompt-button").click();
   await expect(page.getByText("System Prompt")).toBeVisible({ timeout: 2000 });
   await page.keyboard.press("Escape");
   await expect(page.getByText("System Prompt")).not.toBeVisible({ timeout: 3000 });
@@ -170,7 +170,7 @@ test("System prompt modal closes on Escape", async ({ page }) => {
 
 test("clicking × closes system prompt modal", async ({ page }) => {
   await setupWithSession(page);
-  await page.locator("header button[title='View / edit system prompt']").click();
+  await page.getByTestId("header-prompt-button").click();
   await expect(page.getByText("System Prompt")).toBeVisible({ timeout: 2000 });
   await page.locator(".fixed button", { hasText: "×" }).click();
   await expect(page.getByText("System Prompt")).not.toBeVisible({ timeout: 2000 });

@@ -33,14 +33,13 @@ test("double-clicking session in sidebar opens rename input", async ({ page }) =
     type: "sessions_list",
     payload: [makeSession({ ID: "sb-dbl", Title: "Double Click Me" })],
   });
-  await expect(page.locator("aside").getByText("Double Click Me")).toBeVisible({ timeout: 3000 });
+  await expect(page.getByTestId("session-title-sb-dbl")).toBeVisible({ timeout: 3000 });
 
-  // Double-click on the session row
-  const sessionText = page.locator("aside").getByText("Double Click Me");
-  await sessionText.dblclick();
+  // Double-click on the session title to open rename
+  await page.getByTestId("session-title-sb-dbl").dblclick();
 
   // Input should appear in sidebar
-  await expect(page.locator("aside input")).toBeVisible({ timeout: 2000 });
+  await expect(page.getByTestId("session-edit-input")).toBeVisible({ timeout: 2000 });
 });
 
 test("sidebar rename via Enter sends rename_session", async ({ page }) => {
@@ -49,10 +48,10 @@ test("sidebar rename via Enter sends rename_session", async ({ page }) => {
     type: "sessions_list",
     payload: [makeSession({ ID: "sb-ren1", Title: "Rename Me" })],
   });
-  const sessionText = page.locator("aside").getByText("Rename Me");
+  const sessionText = page.getByTestId("session-title-sb-ren1");
   await sessionText.dblclick();
 
-  const input = page.locator("aside input");
+  const input = page.getByTestId("session-edit-input");
   await input.fill("New Sidebar Name");
   await input.press("Enter");
 
@@ -66,15 +65,15 @@ test("sidebar rename via Escape cancels without sending", async ({ page }) => {
     type: "sessions_list",
     payload: [makeSession({ ID: "sb-esc", Title: "Escape Rename" })],
   });
-  const sessionText = page.locator("aside").getByText("Escape Rename");
+  const sessionText = page.getByTestId("session-title-sb-esc");
   await sessionText.dblclick();
 
-  const input = page.locator("aside input");
+  const input = page.getByTestId("session-edit-input");
   await input.fill("Changed Name");
   await input.press("Escape");
 
   await expect(input).not.toBeVisible({ timeout: 2000 });
-  await expect(page.locator("aside").getByText("Escape Rename")).toBeVisible();
+  await expect(page.getByTestId("session-title-sb-esc")).toBeVisible();
 });
 
 // ── Pencil button rename ────────────────────────────────────────────────
@@ -85,13 +84,13 @@ test("pencil button in sidebar opens rename mode", async ({ page }) => {
     type: "sessions_list",
     payload: [makeSession({ ID: "sb-pen", Title: "Pencil Rename" })],
   });
-  await expect(page.locator("aside").getByText("Pencil Rename")).toBeVisible({ timeout: 3000 });
+  await expect(page.getByTestId("session-title-sb-pen")).toBeVisible({ timeout: 3000 });
 
-  const row = page.locator("aside").getByText("Pencil Rename").locator("../..");
-  await row.hover();
-  await row.getByTitle("Rename session").click();
+  const sessionRow = page.getByTestId("session-sb-pen");
+  await sessionRow.hover();
+  await page.getByTestId("session-rename-sb-pen").click();
 
-  await expect(page.locator("aside input")).toBeVisible({ timeout: 2000 });
+  await expect(page.getByTestId("session-edit-input")).toBeVisible({ timeout: 2000 });
 });
 
 // ── Untitled session fallback ──────────────────────────────────────────
@@ -103,7 +102,7 @@ test("session with empty title shows Untitled session", async ({ page }) => {
     payload: [makeSession({ ID: "sb-untitled", Title: "" })],
   });
 
-  await expect(page.locator("aside").getByText("Untitled session")).toBeVisible({ timeout: 2000 });
+  await expect(page.getByTestId("session-title-sb-untitled")).toHaveText("Untitled session", { timeout: 2000 });
 });
 
 // ── Active session highlight ────────────────────────────────────────────
@@ -117,11 +116,11 @@ test("active session has different styling in sidebar", async ({ page }) => {
       makeSession({ ID: "sb-act2", Title: "Inactive Two" }),
     ],
   });
-  await expect(page.locator("aside").getByText("Active One")).toBeVisible({ timeout: 3000 });
-  await page.locator("aside").getByText("Active One").click();
+  await expect(page.getByTestId("session-title-sb-act1")).toBeVisible({ timeout: 3000 });
+  await page.getByTestId("session-sb-act1").click();
 
   // Active session row should have distinct class
-  const activeRow = page.locator("aside").getByText("Active One").locator("../..");
+  const activeRow = page.getByTestId("session-sb-act1");
   await expect(activeRow).toHaveClass(/border-accent/, { timeout: 2000 });
 });
 
@@ -129,7 +128,7 @@ test("active session has different styling in sidebar", async ({ page }) => {
 
 test("sidebar shows New button", async ({ page }) => {
   await page.goto("/");
-  await expect(page.locator("aside button[title='New session']")).toBeVisible({ timeout: 2000 });
+  await expect(page.getByTestId("sidebar-new-session")).toBeVisible({ timeout: 2000 });
 });
 
 // ── Sidebar rename Save/Cancel buttons ────────────────────────────────
@@ -140,14 +139,14 @@ test("Save button in sidebar edit mode commits rename", async ({ page }) => {
     type: "sessions_list",
     payload: [makeSession({ ID: "sb-save", Title: "Save Rename" })],
   });
-  const sessionText = page.locator("aside").getByText("Save Rename");
+  const sessionText = page.getByTestId("session-title-sb-save");
   await sessionText.dblclick();
 
-  const input = page.locator("aside input");
+  const input = page.getByTestId("session-edit-input");
   await input.fill("Saved Name");
 
   // Click the Save (check) button
-  await page.locator("aside button[title='Save']").click();
+  await page.getByTestId("session-edit-save").click();
 
   const cmd = await waitForWSSend(page, "rename_session");
   expect((cmd.payload as { title: string }).title).toBe("Saved Name");
@@ -159,14 +158,14 @@ test("Cancel button in sidebar edit mode closes without sending", async ({ page 
     type: "sessions_list",
     payload: [makeSession({ ID: "sb-cancel", Title: "Cancel Rename" })],
   });
-  const sessionText = page.locator("aside").getByText("Cancel Rename");
+  const sessionText = page.getByTestId("session-title-sb-cancel");
   await sessionText.dblclick();
 
-  await expect(page.locator("aside input")).toBeVisible({ timeout: 2000 });
-  await page.locator("aside button[title='Cancel']").click();
+  await expect(page.getByTestId("session-edit-input")).toBeVisible({ timeout: 2000 });
+  await page.getByTestId("session-edit-cancel").click();
 
-  await expect(page.locator("aside input")).not.toBeVisible({ timeout: 2000 });
-  await expect(page.locator("aside").getByText("Cancel Rename")).toBeVisible();
+  await expect(page.getByTestId("session-edit-input")).not.toBeVisible({ timeout: 2000 });
+  await expect(page.getByTestId("session-title-sb-cancel")).toBeVisible();
 });
 
 // ── Token display in sidebar ────────────────────────────────────────────
@@ -178,7 +177,7 @@ test("sidebar shows formatted token count", async ({ page }) => {
     payload: [makeSession({ ID: "sb-tok", Title: "Token Sidebar", PromptTokens: 500, CompletionTokens: 500 })],
   });
 
-  await expect(page.locator("aside").getByText("1.0k tok")).toBeVisible({ timeout: 2000 });
+  await expect(page.getByTestId("session-tokens-sb-tok")).toHaveText("1.0k tok", { timeout: 2000 });
 });
 
 test("sidebar hides token count when zero", async ({ page }) => {
@@ -188,6 +187,6 @@ test("sidebar hides token count when zero", async ({ page }) => {
     payload: [makeSession({ ID: "sb-notok", Title: "Zero Usage", PromptTokens: 0, CompletionTokens: 0 })],
   });
 
-  // Token count line (e.g. "1.0k tok") should not appear when total is 0
-  await expect(page.locator("aside").getByText("tok")).not.toBeVisible({ timeout: 1000 });
+  // Token count should not be visible when total is 0
+  await expect(page.getByTestId("session-tokens-sb-notok")).not.toBeVisible({ timeout: 1000 });
 });

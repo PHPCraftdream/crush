@@ -178,12 +178,12 @@ const AssistantHoverActions = memo(function AssistantHoverActions({
 const ToolCallBlock = memo(function ToolCallBlock({ name, input, finished }: { name: string; input: string; finished: boolean }) {
   const formatted = useMemo(() => formatJSON(input), [input]);
   return (
-    <div className="tool-block my-2">
+    <div data-test-id="tool-call" className="tool-block my-2">
       <div className="flex items-center justify-between gap-2 mb-2">
         <div className="flex items-center gap-2">
           <span className="text-xs text-text-subtle">⚡</span>
           <span className="text-mauve font-semibold text-sm">{name}</span>
-          {!finished && <span className="text-text-subtle text-xs animate-pulse">running…</span>}
+          {!finished && <span data-test-id="tool-call-running" className="text-text-subtle text-xs animate-pulse">running…</span>}
         </div>
         <CopyButton text={input} />
       </div>
@@ -194,12 +194,12 @@ const ToolCallBlock = memo(function ToolCallBlock({ name, input, finished }: { n
 
 const ToolResultBlock = memo(function ToolResultBlock({ name, content, isError }: { name: string; content: string; isError: boolean }) {
   return (
-    <div className="tool-block my-2 opacity-80">
+    <div data-test-id="tool-result" className="tool-block my-2 opacity-80">
       <div className="flex items-center justify-between gap-2 mb-2">
         <div className="flex items-center gap-2">
           <span className="text-xs text-text-subtle">↩</span>
           <span className="text-text-muted font-semibold text-sm">{name}</span>
-          {isError && <span className="badge-error">error</span>}
+          {isError && <span data-test-id="tool-result-error" className="badge-error">error</span>}
         </div>
         <CopyButton text={content} />
       </div>
@@ -239,13 +239,13 @@ const ThinkingPart = memo(function ThinkingPart({ thinking, messageID, partIndex
 
   if (!done) {
     return (
-      <div className="thinking-card">
+      <div data-test-id="thinking-card" className="thinking-card">
         <div className="thinking-card-header">
           <BrainCircuit size={15} className="text-accent/70 shrink-0 animate-pulse" />
-          <span>Thinking…</span>
+          <span data-test-id="thinking-label">Thinking…</span>
         </div>
         {thinking && (
-          <pre className="px-4 pb-3 font-mono whitespace-pre-wrap text-text-subtle leading-relaxed max-h-40 overflow-y-auto border-t border-surface/50" style={{ fontSize: "var(--chat-font-size)" }}>
+          <pre data-test-id="thinking-content" className="px-4 pb-3 font-mono whitespace-pre-wrap text-text-subtle leading-relaxed max-h-40 overflow-y-auto border-t border-surface/50" style={{ fontSize: "var(--chat-font-size)" }}>
             {thinking}
           </pre>
         )}
@@ -254,10 +254,10 @@ const ThinkingPart = memo(function ThinkingPart({ thinking, messageID, partIndex
   }
 
   return (
-    <details className="thinking-card-done group">
-      <summary className="thinking-toggle">
+    <details data-test-id="thinking-card" className="thinking-card-done group">
+      <summary data-test-id="thinking-toggle" className="thinking-toggle">
         <span className="text-accent/70"><BrainCircuit size={18} /></span>
-        <span>Thoughts</span>
+        <span data-test-id="thinking-label">Thoughts</span>
         <div className="ml-auto flex items-center gap-0.5 hover-reveal">
           <CopyButton text={thinking} className="px-1.5 py-1 text-xs" />
           <button onClick={openEditEv} title="Edit thinking"   className="btn-icon-sm"><Pencil size={13} /></button>
@@ -284,7 +284,7 @@ const ThinkingPart = memo(function ThinkingPart({ thinking, messageID, partIndex
           />
         </div>
       ) : (
-        <pre className="p-5 bg-base-overlay font-mono whitespace-pre-wrap overflow-x-auto text-text-muted border-t border-surface leading-relaxed" style={{ fontSize: "var(--chat-font-size)" }}>
+        <pre data-test-id="thinking-content" className="p-5 bg-base-overlay font-mono whitespace-pre-wrap overflow-x-auto text-text-muted border-t border-surface leading-relaxed" style={{ fontSize: "var(--chat-font-size)" }}>
           {thinking}
         </pre>
       )}

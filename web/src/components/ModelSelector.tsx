@@ -99,7 +99,7 @@ function APIKeyForm({ providerID, providerName, onDone, onCancel }: {
   }
 
   return (
-    <div className="p-3 border-b border-surface/40 bg-base-overlay/50" onClick={e => e.stopPropagation()}>
+    <div className="p-3 border-b border-surface/40 bg-base-overlay/50" data-test-id="model-api-key-form" onClick={e => e.stopPropagation()}>
       <div className="text-xs font-semibold text-text mb-1.5">{providerName} — Enter API key</div>
       <div className="flex gap-2">
         <input
@@ -138,6 +138,7 @@ function ModelRow({ model, isSelected, onSelect }: { model: ModelItem, isSelecte
   return (
     <button
       onClick={() => onSelect(model)}
+      data-test-id={`model-item-${model.key}`}
       className={`w-full text-left px-3 py-2 transition-colors border-b border-surface/30 last:border-0 ${
         disabled ? "opacity-50 hover:bg-base-overlay" : isSelected ? "bg-accent/5 hover:bg-accent/8" : "hover:bg-base-overlay"
       }`}
@@ -272,6 +273,7 @@ export function ModelSelector({ session, modelType }: { session: Session | null;
         onClick={() => { setOpen(o => !o); setSearch(""); setKeyFormProvider(null); }}
         className="flex items-center gap-1.5 text-xs text-text bg-base-overlay border border-surface rounded-lg px-2.5 py-1.5 hover:border-accent/50 hover:bg-base-subtle transition-colors"
         title={title}
+        data-test-id={modelType === "large" ? "model-selector-large" : "model-selector-small"}
       >
         <Icon size={12} className="shrink-0" />
         <span className="font-medium truncate max-w-[220px]">{displayName}</span>
@@ -279,7 +281,7 @@ export function ModelSelector({ session, modelType }: { session: Session | null;
       </button>
       {open && (
         <div
-          data-testid="model-dropdown"
+          data-test-id="model-dropdown"
           style={{ position: "fixed", left: dropdownPos.left, bottom: dropdownPos.bottom, width: 520, zIndex: 9999 }}
           className="bg-canvas border border-surface rounded-xl shadow-xl overflow-hidden"
         >

@@ -39,7 +39,7 @@ async function setupWithMessage(
 
 // ── Thinking part ───────────────────────────────────────────────────────
 
-test("thinking part renders as collapsible with 'Thinking' label", async ({ page }) => {
+test("thinking part renders as collapsible with 'Thoughts' label when done", async ({ page }) => {
   await setupWithMessage(page, makeMessage({
     ID: "tp-1",
     Role: "assistant",
@@ -49,7 +49,8 @@ test("thinking part renders as collapsible with 'Thinking' label", async ({ page
     ],
   }));
 
-  await expect(page.getByText("Thinking…")).toBeVisible({ timeout: 2000 });
+  // When thinking is done (has text part after), shows "Thoughts" label
+  await expect(page.getByTestId("thinking-card")).toBeVisible({ timeout: 2000 });
   await expect(page.getByText("Here is my answer.")).toBeVisible();
 });
 
@@ -63,12 +64,12 @@ test("thinking content is hidden by default inside details", async ({ page }) =>
     ],
   }));
 
-  // Thinking label visible but content hidden (inside closed details)
-  await expect(page.getByText("Thinking…")).toBeVisible({ timeout: 2000 });
-  await expect(page.getByText("Secret reasoning content")).not.toBeVisible();
+  // Thinking card visible but content hidden (inside closed details)
+  await expect(page.getByTestId("thinking-card")).toBeVisible({ timeout: 2000 });
+  await expect(page.getByTestId("thinking-content")).not.toBeVisible();
 });
 
-test("clicking thinking summary reveals content", async ({ page }) => {
+test("clicking thinking toggle reveals content", async ({ page }) => {
   await setupWithMessage(page, makeMessage({
     ID: "tp-3",
     Role: "assistant",
@@ -78,8 +79,9 @@ test("clicking thinking summary reveals content", async ({ page }) => {
     ],
   }));
 
-  await page.getByText("Thinking…").click();
-  await expect(page.getByText("Revealed reasoning")).toBeVisible({ timeout: 2000 });
+  await page.getByTestId("thinking-toggle").click();
+  await expect(page.getByTestId("thinking-content")).toBeVisible({ timeout: 2000 });
+  await expect(page.getByTestId("thinking-content")).toContainText("Revealed reasoning");
 });
 
 // ── Tool call ──────────────────────────────────────────────────────────
@@ -93,8 +95,8 @@ test("tool call shows running indicator when not finished", async ({ page }) => 
     ],
   }));
 
-  await expect(page.getByText("read_file")).toBeVisible({ timeout: 2000 });
-  await expect(page.getByText("running…")).toBeVisible();
+  await expect(page.getByTestId("tool-call")).toContainText("read_file", { timeout: 2000 });
+  await expect(page.getByTestId("tool-call-running")).toBeVisible();
 });
 
 test("tool call hides running indicator when finished", async ({ page }) => {
@@ -106,8 +108,8 @@ test("tool call hides running indicator when finished", async ({ page }) => {
     ],
   }));
 
-  await expect(page.getByText("bash")).toBeVisible({ timeout: 2000 });
-  await expect(page.getByText("running…")).not.toBeVisible();
+  await expect(page.getByTestId("tool-call")).toContainText("bash", { timeout: 2000 });
+  await expect(page.getByTestId("tool-call-running")).not.toBeVisible();
 });
 
 test("tool call input is formatted as JSON", async ({ page }) => {
@@ -120,8 +122,8 @@ test("tool call input is formatted as JSON", async ({ page }) => {
   }));
 
   // formatJSON should pretty-print the input
-  await expect(page.getByText('"path"')).toBeVisible({ timeout: 2000 });
-  await expect(page.getByText('"content"')).toBeVisible();
+  await expect(page.getByTestId("tool-call")).toContainText('"path"', { timeout: 2000 });
+  await expect(page.getByTestId("tool-call")).toContainText('"content"');
 });
 
 // ── Tool result ────────────────────────────────────────────────────────
@@ -135,8 +137,8 @@ test("tool result with IsError shows error badge", async ({ page }) => {
     ],
   }));
 
-  await expect(page.getByText("command not found")).toBeVisible({ timeout: 2000 });
-  await expect(page.getByText("error")).toBeVisible();
+  await expect(page.getByTestId("tool-result")).toContainText("command not found", { timeout: 2000 });
+  await expect(page.getByTestId("tool-result-error")).toBeVisible();
 });
 
 test("tool result without error has no error badge", async ({ page }) => {
@@ -148,10 +150,9 @@ test("tool result without error has no error badge", async ({ page }) => {
     ],
   }));
 
-  await expect(page.getByText("success output")).toBeVisible({ timeout: 2000 });
+  await expect(page.getByTestId("tool-result")).toContainText("success output", { timeout: 2000 });
   // No error badge
-  const errorBadge = page.locator("span").filter({ hasText: /^error$/ });
-  await expect(errorBadge).not.toBeVisible({ timeout: 1000 });
+  await expect(page.getByTestId("tool-result-error")).not.toBeVisible({ timeout: 1000 });
 });
 
 // ── Finish part ────────────────────────────────────────────────────────
