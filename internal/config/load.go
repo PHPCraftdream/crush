@@ -294,6 +294,17 @@ func (c *Config) configureProviders(env env.Env, resolver VariableResolver, know
 			Models: models,
 		})
 		knownProviderNames[cliprovider.ProviderID] = true // skip custom-provider validation
+
+		// Inject a synthetic catwalk Provider for local-cli with default models.
+		// This allows defaultModelSelection to find the proper defaults for CLI models.
+		knownProviders = append(knownProviders, catwalk.Provider{
+			ID:                  cliprovider.ProviderID,
+			Name:                "Local CLI",
+			Type:                cliprovider.ProviderType,
+			DefaultLargeModelID: "cli-claude-opus-1m",
+			DefaultSmallModelID: "cli-claude-sonnet-1m",
+			Models:              models,
+		})
 	}
 
 	// validate the custom providers
