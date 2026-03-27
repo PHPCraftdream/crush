@@ -242,3 +242,26 @@ func TestCreateMessage_ParamsValidation(t *testing.T) {
 		assert.True(t, msg.Hidden)
 	})
 }
+
+func TestFinishToolCall_PreservesProviderExecuted(t *testing.T) {
+	msg := &Message{
+		Parts: []ContentPart{
+			ToolCall{
+				ID:               "call-1",
+				Name:             "bash",
+				Input:            `{"cmd":"ls"}`,
+				ProviderExecuted: true,
+			},
+		},
+	}
+
+	msg.FinishToolCall("call-1")
+
+	tc, ok := msg.Parts[0].(ToolCall)
+	require.True(t, ok)
+	assert.True(t, tc.Finished, "FinishToolCall should set Finished=true")
+	assert.True(t, tc.ProviderExecuted, "FinishToolCall should preserve ProviderExecuted")
+	assert.Equal(t, "call-1", tc.ID)
+	assert.Equal(t, "bash", tc.Name)
+	assert.Equal(t, `{"cmd":"ls"}`, tc.Input)
+}

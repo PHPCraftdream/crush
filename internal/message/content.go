@@ -349,10 +349,11 @@ func (m *Message) FinishToolCall(toolCallID string) {
 		if c, ok := part.(ToolCall); ok {
 			if c.ID == toolCallID {
 				m.Parts[i] = ToolCall{
-					ID:       c.ID,
-					Name:     c.Name,
-					Input:    c.Input,
-					Finished: true,
+					ID:               c.ID,
+					Name:             c.Name,
+					Input:            c.Input,
+					ProviderExecuted: c.ProviderExecuted,
+					Finished:         true,
 				}
 				return
 			}
