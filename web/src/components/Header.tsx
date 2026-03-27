@@ -352,7 +352,7 @@ export function Header() {
     {showLSPSettings && <LSPSettings onClose={closeLSPSettings} />}
     {showSettings && <SettingsModal onClose={closeSettings} />}
     {showProviders && <ProvidersModal onClose={closeProviders} />}
-    {showLogs && <LogsModal onClose={closeLogs} />}}
+    {showLogs && <LogsModal onClose={closeLogs} />}
 </>
   );
 }

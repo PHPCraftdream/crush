@@ -1,5 +1,5 @@
 import { atom } from "nanostores";
-import type { Session, Message, PermissionRequest, ConfigPayload, LSPSnapshot, MCPState, Todo, SkillInfo } from "./types";
+import type { Session, Message, PermissionRequest, PermissionRule, ConfigPayload, LSPSnapshot, MCPState, Todo, SkillInfo } from "./types";
 
 // ── Connection state ─────────────────────────────────────────────────────────
 export const $connected = atom(false);
@@ -264,21 +264,23 @@ export function setSessionReasoningEffort(
   }
 
   // Get current models to send with reasoning effort update
-  const session = sessions[idx];
-  if (session) {
-    ws.send("set_session_models", {
-      sessionID,
-      largeModel: {
-        provider: session.LargeModelProvider,
-        model: session.LargeModelID,
-        reasoning_effort: largeEffort || undefined,
-      },
-      smallModel: {
-        provider: session.SmallModelProvider,
-        model: session.SmallModelID,
-        reasoning_effort: smallEffort || undefined,
-      },
-    });
+  if (idx !== -1) {
+    const session = sessions[idx];
+    if (session) {
+      ws.send("set_session_models", {
+        sessionID,
+        largeModel: {
+          provider: session.LargeModelProvider,
+          model: session.LargeModelID,
+          reasoning_effort: largeEffort || undefined,
+        },
+        smallModel: {
+          provider: session.SmallModelProvider,
+          model: session.SmallModelID,
+          reasoning_effort: smallEffort || undefined,
+        },
+      });
+    }
   }
 }
 

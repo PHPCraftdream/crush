@@ -1,5 +1,5 @@
 import { useStore } from "@nanostores/react";
-import { Minimize2, Zap, ShieldOff, X, Settings } from "lucide-react";
+import { Minimize2, Zap, ShieldOff, X } from "lucide-react";
 import {
   $sessions,
   $activeSessionID,
@@ -65,13 +65,6 @@ export function ChatToolbar() {
         Yolo
       </button>
 
-      <button
-        onClick={() => (window as unknown as Record<string, () => void>).openSettingsModal?.()}
-        title="Settings"
-        className="btn-toolbar"
-      >
-        <Settings size={13} />
-      </button>
     </div>
   );
 }
