@@ -4,6 +4,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/charmbracelet/crush/internal/db"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -206,4 +207,39 @@ func TestAlwaysAllow_DifferentPath(t *testing.T) {
 	svc.Deny(ev.Payload)
 	wg.Wait()
 	assert.False(t, result2, "different path must not be auto-approved")
+}
+
+// TestDisabledPermissions_NotLoaded verifies that permissions with enabled=0
+// in the database are NOT loaded into the auto-approve list on startup.
+func TestDisabledPermissions_NotLoaded(t *testing.T) {
+	conn, err := db.Connect(t.Context(), t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() { conn.Close() })
+
+	q := db.New(conn)
+
+	// Create two permissions: one enabled, one that we'll disable.
+	err = q.CreateSessionPermission(t.Context(), db.CreateSessionPermissionParams{
+		ID: "perm-enabled", SessionID: "s1", ToolName: "bash", Action: "run", Path: "/tmp",
+	})
+	require.NoError(t, err)
+
+	err = q.CreateSessionPermission(t.Context(), db.CreateSessionPermissionParams{
+		ID: "perm-disabled", SessionID: "s1", ToolName: "write", Action: "run", Path: "/tmp",
+	})
+	require.NoError(t, err)
+
+	// Disable the second permission.
+	err = q.UpdatePermissionEnabled(t.Context(), db.UpdatePermissionEnabledParams{
+		ID: "perm-disabled", Enabled: 0,
+	})
+	require.NoError(t, err)
+
+	// Create a new permission service — it should only load the enabled permission.
+	svc := NewPermissionService(t.Context(), "/tmp", false, nil, q)
+	ps := svc.(*permissionService)
+
+	// Only the enabled permission should have been loaded.
+	assert.Len(t, ps.sessionPermissions, 1)
+	assert.Equal(t, "perm-enabled", ps.sessionPermissions[0].ID)
 }

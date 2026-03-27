@@ -316,6 +316,9 @@ func NewPermissionService(ctx context.Context, workingDir string, skip bool, all
 	if q != nil {
 		if rows, err := q.ListAllSessionPermissions(ctx); err == nil {
 			for _, r := range rows {
+				if r.Enabled == 0 {
+					continue
+				}
 				svc.sessionPermissions = append(svc.sessionPermissions, PermissionRequest{
 					ID:       r.ID,
 					// SessionID is intentionally empty: persistent permissions
