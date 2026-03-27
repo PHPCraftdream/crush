@@ -46,8 +46,9 @@ import (
 
 // ModelOverride allows callers to specify per-run model overrides (provider + model ID).
 type ModelOverride struct {
-	Provider string
-	Model    string
+	Provider        string
+	Model           string
+	ReasoningEffort string
 }
 
 type Coordinator interface {
@@ -143,10 +144,10 @@ func (c *coordinator) Run(ctx context.Context, sessionID string, prompt string, 
 	if err == nil && (sess.LargeModelID != "" || sess.SmallModelID != "") {
 		var large, small *ModelOverride
 		if sess.LargeModelID != "" {
-			large = &ModelOverride{Provider: sess.LargeModelProvider, Model: sess.LargeModelID}
+			large = &ModelOverride{Provider: sess.LargeModelProvider, Model: sess.LargeModelID, ReasoningEffort: sess.LargeModelReasoningEffort}
 		}
 		if sess.SmallModelID != "" {
-			small = &ModelOverride{Provider: sess.SmallModelProvider, Model: sess.SmallModelID}
+			small = &ModelOverride{Provider: sess.SmallModelProvider, Model: sess.SmallModelID, ReasoningEffort: sess.SmallModelReasoningEffort}
 		}
 		if applyErr := c.applyModelOverrides(ctx, large, small); applyErr != nil {
 			slog.Error("Coordinator.Run: failed to apply DB model overrides, using current models", "err", applyErr)
@@ -168,6 +169,9 @@ func (c *coordinator) applyModelOverrides(ctx context.Context, large, small *Mod
 		}
 		largeCfg.Provider = large.Provider
 		largeCfg.Model = large.Model
+		if large.ReasoningEffort != "" {
+			largeCfg.ReasoningEffort = large.ReasoningEffort
+		}
 	}
 	if small != nil {
 		if smallCfg.Provider != small.Provider || smallCfg.Model != small.Model {
@@ -176,6 +180,9 @@ func (c *coordinator) applyModelOverrides(ctx context.Context, large, small *Mod
 		}
 		smallCfg.Provider = small.Provider
 		smallCfg.Model = small.Model
+		if small.ReasoningEffort != "" {
+			smallCfg.ReasoningEffort = small.ReasoningEffort
+		}
 	}
 
 	largeModel, smallModel, err := c.buildModelsFromCfg(ctx, largeCfg, smallCfg, false)
@@ -292,6 +299,17 @@ func (c *coordinator) runInternal(ctx context.Context, sessionID string, prompt 
 func (c *coordinator) RunWithOverrides(ctx context.Context, sessionID, prompt string, large, small *ModelOverride, attachments ...message.Attachment) (*fantasy.AgentResult, error) {
 	if err := c.readyWg.Wait(); err != nil {
 		return nil, err
+	}
+
+	// Carry session-level reasoning effort into the overrides so that
+	// applyModelOverrides restores it after resetting the model config.
+	if sess, err := c.sessions.Get(ctx, sessionID); err == nil {
+		if large != nil && large.ReasoningEffort == "" && sess.LargeModelReasoningEffort != "" {
+			large.ReasoningEffort = sess.LargeModelReasoningEffort
+		}
+		if small != nil && small.ReasoningEffort == "" && sess.SmallModelReasoningEffort != "" {
+			small.ReasoningEffort = sess.SmallModelReasoningEffort
+		}
 	}
 
 	if err := c.applyModelOverrides(ctx, large, small); err != nil {

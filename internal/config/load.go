@@ -301,8 +301,8 @@ func (c *Config) configureProviders(env env.Env, resolver VariableResolver, know
 			ID:                  cliprovider.ProviderID,
 			Name:                "Local CLI",
 			Type:                cliprovider.ProviderType,
-			DefaultLargeModelID: "cli-claude-opus-1m",
-			DefaultSmallModelID: "cli-claude-sonnet-1m",
+			DefaultLargeModelID: "cli-claude-opus",
+			DefaultSmallModelID: "cli-claude-sonnet",
 			Models:              models,
 		})
 	}

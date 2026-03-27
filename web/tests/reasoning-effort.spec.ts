@@ -29,8 +29,8 @@ test.beforeEach(async ({ page }) => {
 function makeClaudeConfig() {
   return makeConfig({
     models: {
-      large: { Provider: "local-cli", Model: "cli-claude-opus-1m" },
-      small: { Provider: "local-cli", Model: "cli-claude-sonnet-1m" },
+      large: { Provider: "local-cli", Model: "cli-claude-opus" },
+      small: { Provider: "local-cli", Model: "cli-claude-sonnet" },
     },
     providers: {
       "local-cli": {
@@ -38,9 +38,9 @@ function makeClaudeConfig() {
         enabled: true,
         type: "cli",
         models: [
-          { id: "cli-claude-opus-1m", name: "Claude Opus 1M (CLI)", contextWindow: 1_000_000 },
-          { id: "cli-claude-sonnet-1m", name: "Claude Sonnet 1M (CLI)", contextWindow: 1_000_000 },
-          { id: "gemini-flash", name: "Gemini Flash", contextWindow: 1_000_000 },
+          { id: "cli-claude-opus", name: "Claude Opus (CLI)", contextWindow: 200_000 },
+          { id: "cli-claude-sonnet", name: "Claude Sonnet (CLI)", contextWindow: 200_000 },
+          { id: "gemini-flash", name: "Gemini Flash", contextWindow: 200_000 },
         ],
       },
     },
@@ -60,7 +60,7 @@ async function setup(page: any) {
         ID: sessionID,
         Title: "Reasoning Effort Test",
         LargeModelProvider: "local-cli",
-        LargeModelID: "cli-claude-opus-1m",
+        LargeModelID: "cli-claude-opus",
         LargeModelReasoningEffort: "medium",
       }),
     ],
@@ -176,7 +176,7 @@ test.describe("Reasoning Effort Controls", () => {
         ID: sessionID,
         Title: "Reasoning Effort Test",
         LargeModelProvider: "local-cli",
-        LargeModelID: "cli-claude-opus-1m",
+        LargeModelID: "cli-claude-opus",
         LargeModelReasoningEffort: "high",
       }),
     });
@@ -212,7 +212,7 @@ test.describe("Reasoning Effort Controls", () => {
         SessionID: sessionID,
         Role: "assistant",
         Parts: [{ type: "text", Text: "Response with max effort" }],
-        Model: "cli-claude-opus-1m",
+        Model: "cli-claude-opus",
         Provider: "local-cli",
         ReasoningEffort: "max",
       }),
