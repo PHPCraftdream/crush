@@ -16,8 +16,8 @@ import (
 )
 
 var upgrader = websocket.Upgrader{
-	ReadBufferSize:  4096,
-	WriteBufferSize: 4096,
+	ReadBufferSize:  64 * 1024,
+	WriteBufferSize: 64 * 1024,
 	// Allow all origins for local use; tighten for production deployments.
 	CheckOrigin: func(r *http.Request) bool { return true },
 }

@@ -13,7 +13,7 @@ const (
 	writeWait      = 10 * time.Second
 	pongWait       = 60 * time.Second
 	pingPeriod     = (pongWait * 9) / 10
-	maxMessageSize = 512 * 1024 // 512 KB
+	maxMessageSize = 20 * 1024 * 1024 // 20 MB — supports image attachments
 	sendBufSize    = 512
 	maxBufferSize  = 2000 // max events to replay to new clients
 )

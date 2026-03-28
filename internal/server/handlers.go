@@ -161,10 +161,11 @@ func handleSendMessage(ctx context.Context, a *appPkg.App, c *Client, msg WSMess
 		return
 	}
 
-	slog.Info("ws: handleSendMessage", "sessionID", p.SessionID, "content", p.Content)
+	slog.Info("ws: handleSendMessage", "sessionID", p.SessionID, "content", p.Content, "attachments", len(p.Attachments))
 
 	var attachments []message.Attachment
 	for _, att := range p.Attachments {
+		slog.Info("ws: attachment received", "fileName", att.FileName, "mimeType", att.MimeType, "dataLen", len(att.Data))
 		attachments = append(attachments, message.Attachment{
 			FileName: att.FileName,
 			MimeType: att.MimeType,

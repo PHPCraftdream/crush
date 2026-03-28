@@ -297,16 +297,16 @@ export function ChatInput() {
 
   async function onPaste(e: React.ClipboardEvent) {
     const items = Array.from(e.clipboardData.items);
-    const imageFiles: File[] = [];
+    const pastedFiles: File[] = [];
     for (const item of items) {
-      if (item.type.startsWith("image/")) {
+      if (item.kind === "file") {
         const file = item.getAsFile();
-        if (file) imageFiles.push(file);
+        if (file) pastedFiles.push(file);
       }
     }
-    if (imageFiles.length === 0) return;
+    if (pastedFiles.length === 0) return;
     e.preventDefault();
-    const reads = await Promise.all(imageFiles.map(readFileAsBase64));
+    const reads = await Promise.all(pastedFiles.map(readFileAsBase64));
     setAttachments((prev) => [...prev, ...reads]);
   }
 
