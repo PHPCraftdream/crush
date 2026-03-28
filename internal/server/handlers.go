@@ -278,14 +278,14 @@ func handleSetSessionModels(ctx context.Context, a *appPkg.App, c *Client, msg W
 	}
 
 	// Record recently used models in the config (persists across restarts)
-	cfg := a.Config()
-	if cfg != nil && lp != "" && lm != "" {
-		if err := cfg.RecordRecentModel(config.SelectedModelTypeLarge, config.SelectedModel{Provider: lp, Model: lm}); err != nil {
+	store := a.Store()
+	if store != nil && lp != "" && lm != "" {
+		if err := store.RecordRecentModel(config.ScopeGlobal, config.SelectedModelTypeLarge, config.SelectedModel{Provider: lp, Model: lm}); err != nil {
 			slog.Warn("ws: failed to record recent large model", "err", err)
 		}
 	}
-	if cfg != nil && sp != "" && sm != "" {
-		if err := cfg.RecordRecentModel(config.SelectedModelTypeSmall, config.SelectedModel{Provider: sp, Model: sm}); err != nil {
+	if store != nil && sp != "" && sm != "" {
+		if err := store.RecordRecentModel(config.ScopeGlobal, config.SelectedModelTypeSmall, config.SelectedModel{Provider: sp, Model: sm}); err != nil {
 			slog.Warn("ws: failed to record recent small model", "err", err)
 		}
 	}
@@ -307,12 +307,12 @@ func handleRemoveRecentModel(a *appPkg.App, c *Client, msg WSMessage) {
 		c.reply(msg.ID, EventError, nil, "invalid payload")
 		return
 	}
-	cfg := a.Config()
-	if cfg == nil {
+	store := a.Store()
+	if store == nil {
 		return
 	}
 	modelType := config.SelectedModelType(p.ModelType)
-	if err := cfg.RemoveRecentModel(modelType, config.SelectedModel{Provider: p.Provider, Model: p.Model}); err != nil {
+	if err := store.RemoveRecentModel(config.ScopeGlobal, modelType, config.SelectedModel{Provider: p.Provider, Model: p.Model}); err != nil {
 		slog.Warn("ws: failed to remove recent model", "err", err)
 	}
 	if wire, ok := buildConfigWire(a); ok {
@@ -327,13 +327,13 @@ func handleTrackModelUsage(a *appPkg.App, c *Client, msg WSMessage) {
 		c.reply(msg.ID, EventError, nil, "invalid payload")
 		return
 	}
-	cfg := a.Config()
-	if cfg == nil {
+	store := a.Store()
+	if store == nil {
 		return
 	}
 	modelType := config.SelectedModelType(p.ModelType)
 	// Use UpdatePreferredModel which handles both preferred model and recent models tracking
-	if err := cfg.UpdatePreferredModel(modelType, config.SelectedModel{Provider: p.Provider, Model: p.Model}); err != nil {
+	if err := store.UpdatePreferredModel(config.ScopeGlobal, modelType, config.SelectedModel{Provider: p.Provider, Model: p.Model}); err != nil {
 		slog.Warn("ws: failed to track model usage", "err", err)
 	}
 	if wire, ok := buildConfigWire(a); ok {
@@ -635,7 +635,8 @@ func handleDeletePermissionRule(a *appPkg.App, c *Client, msg WSMessage) {
 }
 
 func buildConfigWire(a *appPkg.App) (ConfigWire, bool) {
-	cfg := a.Config()
+	store := a.Store()
+	cfg := store.Config()
 	if cfg == nil {
 		return ConfigWire{}, false
 	}
@@ -655,7 +656,7 @@ func buildConfigWire(a *appPkg.App) (ConfigWire, bool) {
 		enabledIDs[ep.ID] = ep
 	}
 
-	for _, p := range cfg.KnownProviders() {
+	for _, p := range store.KnownProviders() {
 		id := string(p.ID)
 		if ep, ok := enabledIDs[id]; ok {
 			pw := ProviderWire{Name: p.Name, Enabled: true, Type: string(p.Type), APIKeySet: ep.APIKey != "", Models: make([]ModelInfoWire, len(ep.Models))}
@@ -714,7 +715,7 @@ func buildConfigWire(a *appPkg.App) (ConfigWire, bool) {
 	}
 
 	wire.Version = version.FullVersion()
-	wire.CWD = cfg.WorkingDir()
+	wire.CWD = store.WorkingDir()
 
 	return wire, true
 }
@@ -736,7 +737,7 @@ func handleGetLogs(a *appPkg.App, c *Client, msg WSMessage) {
 	}
 
 	// Get log file path
-	logPath := a.Config().LogPath()
+	logPath := a.Store().LogPath()
 	if logPath == "" {
 		c.reply(msg.ID, EventError, nil, "log path not configured")
 		return
@@ -778,12 +779,12 @@ func handleSetProviderKey(a *appPkg.App, c *Client, msg WSMessage) {
 		c.reply(msg.ID, EventError, nil, "invalid payload")
 		return
 	}
-	cfg := a.Config()
-	if cfg == nil {
+	store := a.Store()
+	if store == nil {
 		c.reply(msg.ID, EventError, nil, "config not available")
 		return
 	}
-	if err := cfg.SetProviderAPIKey(p.ProviderID, p.APIKey); err != nil {
+	if err := store.SetProviderAPIKey(config.ScopeGlobal, p.ProviderID, p.APIKey); err != nil {
 		slog.Warn("ws: failed to set provider API key", "provider", p.ProviderID, "err", err)
 		c.reply(msg.ID, EventError, nil, err.Error())
 		return
@@ -801,12 +802,12 @@ func handleRemoveProviderKey(a *appPkg.App, c *Client, msg WSMessage) {
 		c.reply(msg.ID, EventError, nil, "invalid payload")
 		return
 	}
-	cfg := a.Config()
-	if cfg == nil {
+	store := a.Store()
+	if store == nil {
 		c.reply(msg.ID, EventError, nil, "config not available")
 		return
 	}
-	if err := cfg.RemoveProviderAPIKey(p.ProviderID); err != nil {
+	if err := store.RemoveProviderAPIKey(config.ScopeGlobal, p.ProviderID); err != nil {
 		slog.Warn("ws: failed to remove provider API key", "provider", p.ProviderID, "err", err)
 		c.reply(msg.ID, EventError, nil, err.Error())
 		return
@@ -1129,7 +1130,7 @@ func handleSetTheme(a *appPkg.App, c *Client, msg WSMessage) {
 		c.reply(msg.ID, EventError, nil, "invalid payload")
 		return
 	}
-	if err := a.Config().SetTheme(p.Theme); err != nil {
+	if err := a.Store().SetTheme(config.ScopeGlobal, p.Theme); err != nil {
 		c.reply(msg.ID, EventError, nil, err.Error())
 		return
 	}
@@ -1144,16 +1145,16 @@ func handleSetMCPDisabled(ctx context.Context, a *appPkg.App, c *Client, msg WSM
 		c.reply(msg.ID, EventError, nil, "invalid payload")
 		return
 	}
-	cfg := a.Config()
-	if cfg == nil {
+	store := a.Store()
+	if store == nil {
 		c.reply(msg.ID, EventError, nil, "config not available")
 		return
 	}
 	var err error
 	if p.Disabled {
-		err = mcp.DisableServer(ctx, cfg, p.Name)
+		err = mcp.DisableServer(ctx, store, p.Name)
 	} else {
-		err = mcp.EnableServer(ctx, cfg, p.Name)
+		err = mcp.EnableServer(ctx, store, p.Name)
 	}
 	if err != nil {
 		c.reply(msg.ID, EventError, nil, err.Error())
@@ -1172,8 +1173,8 @@ func handleAddMCPServer(ctx context.Context, a *appPkg.App, c *Client, msg WSMes
 		c.reply(msg.ID, EventError, nil, "name is required")
 		return
 	}
-	cfg := a.Config()
-	if cfg == nil {
+	store := a.Store()
+	if store == nil {
 		c.reply(msg.ID, EventError, nil, "config not available")
 		return
 	}
@@ -1186,7 +1187,7 @@ func handleAddMCPServer(ctx context.Context, a *appPkg.App, c *Client, msg WSMes
 		Headers: p.Headers,
 		Timeout: p.Timeout,
 	}
-	if err := mcp.AddServer(ctx, cfg, p.Name, mcpCfg); err != nil {
+	if err := mcp.AddServer(ctx, store, p.Name, mcpCfg); err != nil {
 		c.reply(msg.ID, EventError, nil, err.Error())
 		return
 	}
@@ -1199,12 +1200,12 @@ func handleRemoveMCPServer(a *appPkg.App, c *Client, msg WSMessage) {
 		c.reply(msg.ID, EventError, nil, "invalid payload")
 		return
 	}
-	cfg := a.Config()
-	if cfg == nil {
+	store := a.Store()
+	if store == nil {
 		c.reply(msg.ID, EventError, nil, "config not available")
 		return
 	}
-	if err := mcp.RemoveServer(cfg, p.Name); err != nil {
+	if err := mcp.RemoveServer(store, p.Name); err != nil {
 		c.reply(msg.ID, EventError, nil, err.Error())
 		return
 	}
@@ -1221,13 +1222,13 @@ func handleUpdateMCPServer(ctx context.Context, a *appPkg.App, c *Client, msg WS
 		c.reply(msg.ID, EventError, nil, "oldName and name are required")
 		return
 	}
-	cfg := a.Config()
-	if cfg == nil {
+	store := a.Store()
+	if store == nil {
 		c.reply(msg.ID, EventError, nil, "config not available")
 		return
 	}
 	// Remove old entry
-	if err := mcp.RemoveServer(cfg, p.OldName); err != nil {
+	if err := mcp.RemoveServer(store, p.OldName); err != nil {
 		c.reply(msg.ID, EventError, nil, err.Error())
 		return
 	}
@@ -1241,7 +1242,7 @@ func handleUpdateMCPServer(ctx context.Context, a *appPkg.App, c *Client, msg WS
 		Headers: p.Headers,
 		Timeout: p.Timeout,
 	}
-	if err := mcp.AddServer(ctx, cfg, p.Name, mcpCfg); err != nil {
+	if err := mcp.AddServer(ctx, store, p.Name, mcpCfg); err != nil {
 		c.reply(msg.ID, EventError, nil, err.Error())
 		return
 	}
@@ -1254,7 +1255,8 @@ func handleSetLSPDisabled(ctx context.Context, a *appPkg.App, c *Client, msg WSM
 		c.reply(msg.ID, EventError, nil, "invalid payload")
 		return
 	}
-	cfg := a.Config()
+	store := a.Store()
+	cfg := store.Config()
 	if cfg == nil {
 		c.reply(msg.ID, EventError, nil, "config not available")
 		return
@@ -1266,7 +1268,7 @@ func handleSetLSPDisabled(ctx context.Context, a *appPkg.App, c *Client, msg WSM
 	}
 	lspCfg.Disabled = p.Disabled
 	cfg.LSP[p.Name] = lspCfg
-	if err := cfg.SetConfigField(fmt.Sprintf("lsp.%s.disabled", p.Name), p.Disabled); err != nil {
+	if err := store.SetConfigField(config.ScopeGlobal, fmt.Sprintf("lsp.%s.disabled", p.Name), p.Disabled); err != nil {
 		slog.Warn("ws: failed to persist LSP disabled state", "name", p.Name, "err", err)
 	}
 	if p.Disabled {
@@ -1288,7 +1290,8 @@ func handleAddLSPServer(a *appPkg.App, c *Client, msg WSMessage) {
 		c.reply(msg.ID, EventError, nil, "name and command are required")
 		return
 	}
-	cfg := a.Config()
+	store := a.Store()
+	cfg := store.Config()
 	if cfg == nil {
 		c.reply(msg.ID, EventError, nil, "config not available")
 		return
@@ -1308,7 +1311,7 @@ func handleAddLSPServer(a *appPkg.App, c *Client, msg WSMessage) {
 		Timeout:   p.Timeout,
 	}
 	cfg.LSP[p.Name] = lspCfg
-	if err := cfg.SetConfigField(fmt.Sprintf("lsp.%s", p.Name), lspCfg); err != nil {
+	if err := store.SetConfigField(config.ScopeGlobal, fmt.Sprintf("lsp.%s", p.Name), lspCfg); err != nil {
 		slog.Warn("ws: failed to persist new LSP server", "name", p.Name, "err", err)
 	}
 	a.LSPManager.RegisterServer(p.Name, lspCfg)
@@ -1324,7 +1327,8 @@ func handleSetDebug(a *appPkg.App, c *Client, msg WSMessage) {
 		c.reply(msg.ID, EventError, nil, "invalid payload")
 		return
 	}
-	cfg := a.Config()
+	store := a.Store()
+	cfg := store.Config()
 	if cfg == nil {
 		c.reply(msg.ID, EventError, nil, "config not available")
 		return
@@ -1334,10 +1338,10 @@ func handleSetDebug(a *appPkg.App, c *Client, msg WSMessage) {
 	}
 	cfg.Options.Debug = p.Debug
 	cfg.Options.DebugLSP = p.DebugLSP
-	if err := cfg.SetConfigField("options.debug", p.Debug); err != nil {
+	if err := store.SetConfigField(config.ScopeGlobal, "options.debug", p.Debug); err != nil {
 		slog.Warn("ws: failed to persist debug setting", "err", err)
 	}
-	if err := cfg.SetConfigField("options.debug_lsp", p.DebugLSP); err != nil {
+	if err := store.SetConfigField(config.ScopeGlobal, "options.debug_lsp", p.DebugLSP); err != nil {
 		slog.Warn("ws: failed to persist debug_lsp setting", "err", err)
 	}
 	if wire, ok := buildConfigWire(a); ok {
@@ -1358,7 +1362,8 @@ func handleAddContextPath(a *appPkg.App, c *Client, msg WSMessage) {
 		c.reply(msg.ID, EventError, nil, "path is required")
 		return
 	}
-	cfg := a.Config()
+	store := a.Store()
+	cfg := store.Config()
 	if cfg == nil {
 		c.reply(msg.ID, EventError, nil, "config not available")
 		return
@@ -1371,7 +1376,7 @@ func handleAddContextPath(a *appPkg.App, c *Client, msg WSMessage) {
 		return
 	}
 	cfg.Options.ContextPaths = append(cfg.Options.ContextPaths, p.Path)
-	if err := cfg.SetConfigField("options.context_paths", cfg.Options.ContextPaths); err != nil {
+	if err := store.SetConfigField(config.ScopeGlobal, "options.context_paths", cfg.Options.ContextPaths); err != nil {
 		slog.Warn("ws: failed to persist context paths", "err", err)
 	}
 	if wire, ok := buildConfigWire(a); ok {
@@ -1386,7 +1391,8 @@ func handleRemoveContextPath(a *appPkg.App, c *Client, msg WSMessage) {
 		c.reply(msg.ID, EventError, nil, "invalid payload")
 		return
 	}
-	cfg := a.Config()
+	store := a.Store()
+	cfg := store.Config()
 	if cfg == nil {
 		c.reply(msg.ID, EventError, nil, "config not available")
 		return
@@ -1396,7 +1402,7 @@ func handleRemoveContextPath(a *appPkg.App, c *Client, msg WSMessage) {
 		return
 	}
 	cfg.Options.ContextPaths = slices.DeleteFunc(cfg.Options.ContextPaths, func(s string) bool { return s == p.Path })
-	if err := cfg.SetConfigField("options.context_paths", cfg.Options.ContextPaths); err != nil {
+	if err := store.SetConfigField(config.ScopeGlobal, "options.context_paths", cfg.Options.ContextPaths); err != nil {
 		slog.Warn("ws: failed to persist context paths", "err", err)
 	}
 	if wire, ok := buildConfigWire(a); ok {
@@ -1443,7 +1449,8 @@ func handleAddSkillsPath(a *appPkg.App, c *Client, msg WSMessage) {
 		c.reply(msg.ID, EventError, nil, "path is required")
 		return
 	}
-	cfg := a.Config()
+	store := a.Store()
+	cfg := store.Config()
 	if cfg == nil {
 		c.reply(msg.ID, EventError, nil, "config not available")
 		return
@@ -1456,7 +1463,7 @@ func handleAddSkillsPath(a *appPkg.App, c *Client, msg WSMessage) {
 		return
 	}
 	cfg.Options.SkillsPaths = append(cfg.Options.SkillsPaths, p.Path)
-	if err := cfg.SetConfigField("options.skills_paths", cfg.Options.SkillsPaths); err != nil {
+	if err := store.SetConfigField(config.ScopeGlobal, "options.skills_paths", cfg.Options.SkillsPaths); err != nil {
 		slog.Warn("ws: failed to persist skills paths", "err", err)
 	}
 	if wire, ok := buildConfigWire(a); ok {
@@ -1471,7 +1478,8 @@ func handleRemoveSkillsPath(a *appPkg.App, c *Client, msg WSMessage) {
 		c.reply(msg.ID, EventError, nil, "invalid payload")
 		return
 	}
-	cfg := a.Config()
+	store := a.Store()
+	cfg := store.Config()
 	if cfg == nil {
 		c.reply(msg.ID, EventError, nil, "config not available")
 		return
@@ -1481,7 +1489,7 @@ func handleRemoveSkillsPath(a *appPkg.App, c *Client, msg WSMessage) {
 		return
 	}
 	cfg.Options.SkillsPaths = slices.DeleteFunc(cfg.Options.SkillsPaths, func(s string) bool { return s == p.Path })
-	if err := cfg.SetConfigField("options.skills_paths", cfg.Options.SkillsPaths); err != nil {
+	if err := store.SetConfigField(config.ScopeGlobal, "options.skills_paths", cfg.Options.SkillsPaths); err != nil {
 		slog.Warn("ws: failed to persist skills paths", "err", err)
 	}
 	if wire, ok := buildConfigWire(a); ok {
@@ -1493,8 +1501,8 @@ func handleRemoveSkillsPath(a *appPkg.App, c *Client, msg WSMessage) {
 // ── Project initialization ────────────────────────────────────────────────────
 
 func handleInitializeProject(ctx context.Context, a *appPkg.App, c *Client, msg WSMessage) {
-	cfg := a.Config()
-	if cfg == nil {
+	store := a.Store()
+	if store == nil {
 		c.reply(msg.ID, EventError, nil, "config not available")
 		return
 	}
@@ -1503,7 +1511,7 @@ func handleInitializeProject(ctx context.Context, a *appPkg.App, c *Client, msg 
 		return
 	}
 
-	initPrompt, err := agent.InitializePrompt(*cfg)
+	initPrompt, err := agent.InitializePrompt(store)
 	if err != nil {
 		c.reply(msg.ID, EventError, nil, "failed to build initialization prompt: "+err.Error())
 		return
@@ -1517,6 +1525,7 @@ func handleInitializeProject(ctx context.Context, a *appPkg.App, c *Client, msg 
 	}
 
 	// Set default models from config.
+	cfg := store.Config()
 	if large, ok := cfg.Models[config.SelectedModelTypeLarge]; ok {
 		_ = a.Sessions.UpdateModels(ctx, sess.ID, large.Provider, large.Model, "", "")
 	}
@@ -1540,7 +1549,7 @@ func handleInitializeProject(ctx context.Context, a *appPkg.App, c *Client, msg 
 	if runErr != nil {
 		slog.Error("ws: initialization run error", "err", runErr)
 	}
-	_ = config.MarkProjectInitialized(cfg)
+	_ = config.MarkProjectInitialized(a.Store())
 }
 
 // ── Custom providers ──────────────────────────────────────────────────────────
@@ -1555,7 +1564,8 @@ func handleAddCustomProvider(a *appPkg.App, c *Client, msg WSMessage) {
 		c.reply(msg.ID, EventError, nil, "id and baseUrl are required")
 		return
 	}
-	cfg := a.Config()
+	store := a.Store()
+	cfg := store.Config()
 	if cfg == nil {
 		c.reply(msg.ID, EventError, nil, "config not available")
 		return
@@ -1583,7 +1593,7 @@ func handleAddCustomProvider(a *appPkg.App, c *Client, msg WSMessage) {
 		Models:  models,
 	}
 	cfg.Providers.Set(p.ID, providerCfg)
-	if err := cfg.SetConfigField(fmt.Sprintf("providers.%s", p.ID), providerCfg); err != nil {
+	if err := store.SetConfigField(config.ScopeGlobal, fmt.Sprintf("providers.%s", p.ID), providerCfg); err != nil {
 		slog.Warn("ws: failed to persist custom provider", "id", p.ID, "err", err)
 	}
 	if wire, ok := buildConfigWire(a); ok {
@@ -1602,13 +1612,14 @@ func handleRemoveCustomProvider(a *appPkg.App, c *Client, msg WSMessage) {
 		c.reply(msg.ID, EventError, nil, "id is required")
 		return
 	}
-	cfg := a.Config()
+	store := a.Store()
+	cfg := store.Config()
 	if cfg == nil {
 		c.reply(msg.ID, EventError, nil, "config not available")
 		return
 	}
 	cfg.Providers.Del(p.ID)
-	if err := cfg.RemoveConfigField(fmt.Sprintf("providers.%s", p.ID)); err != nil {
+	if err := store.RemoveConfigField(config.ScopeGlobal, fmt.Sprintf("providers.%s", p.ID)); err != nil {
 		slog.Warn("ws: failed to remove custom provider", "id", p.ID, "err", err)
 	}
 	if wire, ok := buildConfigWire(a); ok {
@@ -1627,7 +1638,8 @@ func handleUpdateCustomProvider(a *appPkg.App, c *Client, msg WSMessage) {
 		c.reply(msg.ID, EventError, nil, "oldId, id and baseUrl are required")
 		return
 	}
-	cfg := a.Config()
+	store := a.Store()
+	cfg := store.Config()
 	if cfg == nil {
 		c.reply(msg.ID, EventError, nil, "config not available")
 		return
@@ -1635,7 +1647,7 @@ func handleUpdateCustomProvider(a *appPkg.App, c *Client, msg WSMessage) {
 	// Remove the old entry.
 	cfg.Providers.Del(p.OldID)
 	if p.OldID != p.ID {
-		if err := cfg.RemoveConfigField(fmt.Sprintf("providers.%s", p.OldID)); err != nil {
+		if err := store.RemoveConfigField(config.ScopeGlobal, fmt.Sprintf("providers.%s", p.OldID)); err != nil {
 			slog.Warn("ws: failed to remove old custom provider", "id", p.OldID, "err", err)
 		}
 	}
@@ -1659,7 +1671,7 @@ func handleUpdateCustomProvider(a *appPkg.App, c *Client, msg WSMessage) {
 		Models:  models,
 	}
 	cfg.Providers.Set(p.ID, providerCfg)
-	if err := cfg.SetConfigField(fmt.Sprintf("providers.%s", p.ID), providerCfg); err != nil {
+	if err := store.SetConfigField(config.ScopeGlobal, fmt.Sprintf("providers.%s", p.ID), providerCfg); err != nil {
 		slog.Warn("ws: failed to persist updated custom provider", "id", p.ID, "err", err)
 	}
 	if wire, ok := buildConfigWire(a); ok {
@@ -1673,7 +1685,8 @@ func handleRemoveLSPServer(ctx context.Context, a *appPkg.App, c *Client, msg WS
 		c.reply(msg.ID, EventError, nil, "invalid payload")
 		return
 	}
-	cfg := a.Config()
+	store := a.Store()
+	cfg := store.Config()
 	if cfg == nil {
 		c.reply(msg.ID, EventError, nil, "config not available")
 		return
@@ -1684,7 +1697,7 @@ func handleRemoveLSPServer(ctx context.Context, a *appPkg.App, c *Client, msg WS
 	}
 	a.LSPManager.UnregisterServer(ctx, p.Name)
 	delete(cfg.LSP, p.Name)
-	if err := cfg.RemoveConfigField(fmt.Sprintf("lsp.%s", p.Name)); err != nil {
+	if err := store.RemoveConfigField(config.ScopeGlobal, fmt.Sprintf("lsp.%s", p.Name)); err != nil {
 		slog.Warn("ws: failed to remove LSP from config", "name", p.Name, "err", err)
 	}
 	c.hub.Broadcast(EventLSPState, buildLSPSnapshot(cfg))
@@ -1701,7 +1714,8 @@ func handleUpdateLSPServer(ctx context.Context, a *appPkg.App, c *Client, msg WS
 		c.reply(msg.ID, EventError, nil, "oldName, name and command are required")
 		return
 	}
-	cfg := a.Config()
+	store := a.Store()
+	cfg := store.Config()
 	if cfg == nil {
 		c.reply(msg.ID, EventError, nil, "config not available")
 		return
@@ -1709,7 +1723,7 @@ func handleUpdateLSPServer(ctx context.Context, a *appPkg.App, c *Client, msg WS
 	// Remove old entry
 	a.LSPManager.UnregisterServer(ctx, p.OldName)
 	delete(cfg.LSP, p.OldName)
-	if err := cfg.RemoveConfigField(fmt.Sprintf("lsp.%s", p.OldName)); err != nil {
+	if err := store.RemoveConfigField(config.ScopeGlobal, fmt.Sprintf("lsp.%s", p.OldName)); err != nil {
 		slog.Warn("ws: failed to remove old LSP from config", "name", p.OldName, "err", err)
 	}
 	// Add new entry
@@ -1724,7 +1738,7 @@ func handleUpdateLSPServer(ctx context.Context, a *appPkg.App, c *Client, msg WS
 		cfg.LSP = make(config.LSPs)
 	}
 	cfg.LSP[p.Name] = lspCfg
-	if err := cfg.SetConfigField(fmt.Sprintf("lsp.%s", p.Name), lspCfg); err != nil {
+	if err := store.SetConfigField(config.ScopeGlobal, fmt.Sprintf("lsp.%s", p.Name), lspCfg); err != nil {
 		slog.Warn("ws: failed to persist updated LSP server", "name", p.Name, "err", err)
 	}
 	a.LSPManager.RegisterServer(p.Name, lspCfg)

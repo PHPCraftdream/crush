@@ -54,7 +54,7 @@ type ViewResponseMetadata struct {
 
 const (
 	ViewToolName     = "view"
-	MaxReadSize      = 5 * 1024 * 1024 // 5MB
+	MaxViewSize      = 1 * 1024 * 1024 // 1MB
 	DefaultReadLimit = 2000
 	MaxLineLength    = 2000
 )
@@ -156,9 +156,9 @@ func NewViewTool(
 			}
 
 			// Based on the specifications we should not limit the skills read.
-			if !isSkillFile && fileInfo.Size() > MaxReadSize {
+			if !isSkillFile && fileInfo.Size() > MaxViewSize {
 				return fantasy.NewTextErrorResponse(fmt.Sprintf("File is too large (%d bytes). Maximum size is %d bytes",
-					fileInfo.Size(), MaxReadSize)), nil
+					fileInfo.Size(), MaxViewSize)), nil
 			}
 
 			// Set default limit if not provided (no limit for SKILL.md files)

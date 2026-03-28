@@ -11,6 +11,7 @@ import (
 	"github.com/charmbracelet/crush/internal/db"
 	"github.com/charmbracelet/crush/internal/pubsub"
 	"github.com/google/uuid"
+	"github.com/zeebo/xxh3"
 )
 
 type TodoStatus string
@@ -20,6 +21,13 @@ const (
 	TodoStatusInProgress TodoStatus = "in_progress"
 	TodoStatusCompleted  TodoStatus = "completed"
 )
+
+// HashID returns the XXH3 hash of a session ID (UUID) as a hex string.
+func HashID(id string) string {
+	h := xxh3.New()
+	h.WriteString(id)
+	return fmt.Sprintf("%x", h.Sum(nil))
+}
 
 type Todo struct {
 	Content    string     `json:"content"`
@@ -67,6 +75,7 @@ type Service interface {
 	CreateTitleSession(ctx context.Context, parentSessionID string) (Session, error)
 	CreateTaskSession(ctx context.Context, toolCallID, parentSessionID, title string) (Session, error)
 	Get(ctx context.Context, id string) (Session, error)
+	GetLast(ctx context.Context) (Session, error)
 	List(ctx context.Context) ([]Session, error)
 	Save(ctx context.Context, session Session) (Session, error)
 	UpdateTitleAndUsage(ctx context.Context, sessionID, title string, promptTokens, completionTokens int64, cost float64) error
@@ -74,6 +83,7 @@ type Service interface {
 	UpdateReasoningEffort(ctx context.Context, sessionID, largeEffort, smallEffort string) error
 	UpdateSystemPrompt(ctx context.Context, sessionID, prompt string) error
 	SetYolo(ctx context.Context, sessionID string, enabled bool) error
+	Rename(ctx context.Context, id string, title string) error
 	Delete(ctx context.Context, id string) error
 
 	// Agent tool session management
@@ -162,6 +172,14 @@ func (s *service) Delete(ctx context.Context, id string) error {
 
 func (s *service) Get(ctx context.Context, id string) (Session, error) {
 	dbSession, err := s.q.GetSessionByID(ctx, id)
+	if err != nil {
+		return Session{}, err
+	}
+	return s.fromDBItem(dbSession), nil
+}
+
+func (s *service) GetLast(ctx context.Context) (Session, error) {
+	dbSession, err := s.q.GetLastSession(ctx)
 	if err != nil {
 		return Session{}, err
 	}
@@ -293,9 +311,9 @@ func (s *service) SetYolo(ctx context.Context, sessionID string, enabled bool) e
 // UpdateReasoningEffort updates the reasoning effort for large and small models.
 func (s *service) UpdateReasoningEffort(ctx context.Context, sessionID, largeEffort, smallEffort string) error {
 	err := s.q.UpdateSessionReasoningEffort(ctx, db.UpdateSessionReasoningEffortParams{
-		ID:                          sessionID,
-		LargeModelReasoningEffort:   sql.NullString{String: largeEffort, Valid: largeEffort != ""},
-		SmallModelReasoningEffort:   sql.NullString{String: smallEffort, Valid: smallEffort != ""},
+		ID:                        sessionID,
+		LargeModelReasoningEffort: sql.NullString{String: largeEffort, Valid: largeEffort != ""},
+		SmallModelReasoningEffort: sql.NullString{String: smallEffort, Valid: smallEffort != ""},
 	})
 	if err != nil {
 		return err
@@ -307,6 +325,15 @@ func (s *service) UpdateReasoningEffort(ctx context.Context, sessionID, largeEff
 		s.Publish(pubsub.UpdatedEvent, sess)
 	}
 	return nil
+}
+
+// Rename updates only the title of a session without touching updated_at or
+// usage fields.
+func (s *service) Rename(ctx context.Context, id string, title string) error {
+	return s.q.RenameSession(ctx, db.RenameSessionParams{
+		ID:    id,
+		Title: title,
+	})
 }
 
 func (s *service) List(ctx context.Context) ([]Session, error) {

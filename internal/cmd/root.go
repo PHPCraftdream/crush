@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	_ "embed"
 	"fmt"
 	"io"
 	"log/slog"
@@ -17,7 +18,7 @@ import (
 	"github.com/charmbracelet/crush/internal/projects"
 	"github.com/charmbracelet/crush/internal/server"
 	"github.com/charmbracelet/crush/internal/version"
-	"github.com/charmbracelet/fang"
+	"charm.land/fang/v2"
 	"github.com/charmbracelet/x/term"
 	crushweb "github.com/charmbracelet/crush/web"
 	"github.com/pkg/browser"
@@ -33,6 +34,9 @@ func init() {
 	rootCmd.Flags().StringP("host", "H", "localhost", "Web mode: host to listen on")
 	rootCmd.Flags().IntP("port", "p", 0, "Web mode: port to listen on (0 = random free port)")
 	rootCmd.Flags().Bool("no-open", false, "Web mode: do not open browser automatically")
+	rootCmd.Flags().StringP("session", "s", "", "Continue a previous session by ID")
+	rootCmd.Flags().BoolP("continue", "C", false, "Continue the most recent session")
+	rootCmd.MarkFlagsMutuallyExclusive("session", "continue")
 
 	rootCmd.AddCommand(
 		runCmd,
@@ -48,29 +52,32 @@ func init() {
 
 var rootCmd = &cobra.Command{
 	Use:   "crush",
-	Short: "An AI assistant for software development",
-	Long:  "An AI assistant for software development and similar tasks with direct access to the terminal",
+	Short: "A terminal-first AI assistant for software development",
+	Long:  "A glamorous, terminal-first AI assistant for software development and adjacent tasks",
 	Example: `
 # Run in interactive mode
 crush
 
-# Run with debug logging
-crush -d
+# Run non-interactively
+crush run "Guess my 5 favorite Pokémon"
+
+# Run a non-interactively with pipes and redirection
+cat README.md | crush run "make this more glamorous" > GLAMOROUS_README.md
 
 # Run with debug logging in a specific directory
-crush -d -c /path/to/project
+crush --debug --cwd /path/to/project
+
+# Run in yolo mode (auto-accept all permissions; use with care)
+crush --yolo
 
 # Run with custom data directory
-crush -D /path/to/custom/.crush
+crush --data-dir /path/to/custom/.crush
 
-# Print version
-crush -v
+# Continue a previous session
+crush --session {session-id}
 
-# Run a single non-interactive prompt
-crush run "Explain the use of context in Go"
-
-# Run in dangerous mode (auto-accept all permissions)
-crush -y
+# Continue the most recent session
+crush --continue
   `,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return runWebMode(cmd)
@@ -141,11 +148,12 @@ func setupApp(cmd *cobra.Command) (*app.App, error) {
 		return nil, err
 	}
 
-	cfg, err := config.Init(cwd, dataDir, debug)
+	store, err := config.Init(cwd, dataDir, debug)
 	if err != nil {
 		return nil, err
 	}
 
+	cfg := store.Config()
 	if cfg.Permissions == nil {
 		cfg.Permissions = &config.Permissions{}
 	}
@@ -167,7 +175,7 @@ func setupApp(cmd *cobra.Command) (*app.App, error) {
 		return nil, err
 	}
 
-	appInstance, err := app.New(ctx, conn, cfg)
+	appInstance, err := app.New(ctx, conn, store)
 	if err != nil {
 		slog.Error("Failed to create app instance", "error", err)
 		return nil, err
@@ -233,11 +241,20 @@ func createDotCrushDir(dir string) error {
 	}
 
 	gitIgnorePath := filepath.Join(dir, ".gitignore")
-	if _, err := os.Stat(gitIgnorePath); os.IsNotExist(err) {
-		if err := os.WriteFile(gitIgnorePath, []byte("*\n"), 0o644); err != nil {
+	content, err := os.ReadFile(gitIgnorePath)
+
+	// create or update if old version
+	if os.IsNotExist(err) || string(content) == oldGitIgnore {
+		if err := os.WriteFile(gitIgnorePath, []byte(defaultGitIgnore), 0o644); err != nil {
 			return fmt.Errorf("failed to create .gitignore file: %q %w", gitIgnorePath, err)
 		}
 	}
 
 	return nil
 }
+
+//go:embed gitignore/old
+var oldGitIgnore string
+
+//go:embed gitignore/default
+var defaultGitIgnore string

@@ -17,7 +17,10 @@ import (
 	"github.com/charmbracelet/crush/internal/stringext"
 )
 
-const FetchToolName = "fetch"
+const (
+	FetchToolName = "fetch"
+	MaxFetchSize  = 1 * 1024 * 1024 // 1MB
+)
 
 //go:embed fetch.md
 var fetchDescription []byte
@@ -106,11 +109,7 @@ func NewFetchTool(permissions permission.Service, workingDir string, client *htt
 				return fantasy.NewTextErrorResponse(fmt.Sprintf("Request failed with status code: %d", resp.StatusCode)), nil
 			}
 
-			// maxFetchResponseSizeBytes is the maximum size of response body to read (5MB)
-			const maxFetchResponseSizeBytes = int64(5 * 1024 * 1024)
-
-			maxSize := maxFetchResponseSizeBytes
-			body, err := io.ReadAll(io.LimitReader(resp.Body, maxSize))
+			body, err := io.ReadAll(io.LimitReader(resp.Body, MaxFetchSize))
 			if err != nil {
 				return fantasy.NewTextErrorResponse("Failed to read response body: " + err.Error()), nil
 			}
@@ -162,9 +161,9 @@ func NewFetchTool(permissions permission.Service, workingDir string, client *htt
 				}
 			}
 			// truncate content if it exceeds max read size
-			if int64(len(content)) > MaxReadSize {
-				content = stringext.Truncate(content, int(MaxReadSize))
-				content += fmt.Sprintf("\n\n[Content truncated to %d bytes]", MaxReadSize)
+			if int64(len(content)) > MaxFetchSize {
+				content = stringext.Truncate(content, int(MaxFetchSize))
+				content += fmt.Sprintf("\n\n[Content truncated to %d bytes]", MaxFetchSize)
 			}
 
 			return fantasy.NewTextResponse(content), nil

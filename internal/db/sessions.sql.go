@@ -109,6 +109,32 @@ func (q *Queries) DeleteSession(ctx context.Context, id string) error {
 	return err
 }
 
+const getLastSession = `-- name: GetLastSession :one
+SELECT id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos
+FROM sessions
+ORDER BY updated_at DESC
+LIMIT 1
+`
+
+func (q *Queries) GetLastSession(ctx context.Context) (Session, error) {
+	row := q.queryRow(ctx, q.getLastSessionStmt, getLastSession)
+	var i Session
+	err := row.Scan(
+		&i.ID,
+		&i.ParentSessionID,
+		&i.Title,
+		&i.MessageCount,
+		&i.PromptTokens,
+		&i.CompletionTokens,
+		&i.Cost,
+		&i.UpdatedAt,
+		&i.CreatedAt,
+		&i.SummaryMessageID,
+		&i.Todos,
+	)
+	return i, err
+}
+
 const getSessionByID = `-- name: GetSessionByID :one
 SELECT id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id, system_prompt, yolo_enabled, large_model_reasoning_effort, small_model_reasoning_effort
 FROM sessions
@@ -206,6 +232,23 @@ type SetSessionYoloParams struct {
 
 func (q *Queries) SetSessionYolo(ctx context.Context, arg SetSessionYoloParams) error {
 	_, err := q.exec(ctx, q.setSessionYoloStmt, setSessionYolo, arg.YoloEnabled, arg.ID)
+	return err
+}
+
+const renameSession = `-- name: RenameSession :exec
+UPDATE sessions
+SET
+    title = ?
+WHERE id = ?
+`
+
+type RenameSessionParams struct {
+	Title string `json:"title"`
+	ID    string `json:"id"`
+}
+
+func (q *Queries) RenameSession(ctx context.Context, arg RenameSessionParams) error {
+	_, err := q.exec(ctx, q.renameSessionStmt, renameSession, arg.Title, arg.ID)
 	return err
 }
 
