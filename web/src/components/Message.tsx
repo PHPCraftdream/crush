@@ -508,7 +508,7 @@ export const Message = memo(function Message({
             <UserContent message={message} editing={editing} onSaveEdit={handleSaveEdit} onCancelEdit={handleEditClose} />
           </div>
         ) : (
-          <div className="w-full">
+          <div className="w-full min-w-0">
             <AssistantContent message={message} thinkingDone={thinkingDone} editing={editing} onSaveEdit={handleSaveEdit} onCancelEdit={handleEditClose} />
           </div>
         )}

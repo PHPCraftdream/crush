@@ -8,7 +8,7 @@
    Raw CSS usages wrap with rgb(): rgb(var(--color-X))
    ─────────────────────────────────────────────────────────────────────────── */
 :root {
-  --chat-font-size: 20px;
+  --chat-font-size: 14px;
 
   --color-canvas:       255 255 255;
   --color-base-subtle:  248 250 252;
@@ -66,23 +66,24 @@
 @layer components {
   /* Global chat font — applies to all modal/panel content */
   .chat-font { font-size: var(--chat-font-size); }
-  .chat-font * { font-size: inherit; }
 
   /* Markdown content — all font sizes inherit --chat-font-size, no overrides */
   .md { font-size: var(--chat-font-size); line-height: 1.65; overflow-wrap: break-word; word-break: break-word; }
-  .md * { font-size: inherit; }
   .md h1 { @apply mt-8 mb-4 text-text font-bold; font-size: 1.75em; }
   .md h2 { @apply mt-7 mb-3 text-text font-semibold; font-size: 1.5em; }
   .md h3 { @apply mt-6 mb-3 text-text font-semibold; font-size: 1.25em; }
   .md h4 { @apply mt-5 mb-2 text-text font-semibold; font-size: 1.1em; }
   .md p { @apply my-3; line-height: 1.65; }
   .md pre {
-    @apply bg-base-overlay border border-surface rounded-xl p-5 overflow-x-auto my-4 font-mono leading-relaxed;
+    @apply bg-base-overlay border border-surface rounded-xl p-5 my-4 font-mono leading-relaxed;
     font-size: var(--chat-font-size);
+    white-space: pre-wrap;
+    overflow-wrap: break-word;
+    word-break: break-word;
   }
   .md code:not(pre code) {
     @apply bg-base-overlay border border-surface px-1.5 py-0.5 rounded font-mono text-text;
-    font-size: inherit;
+    overflow-wrap: break-word;
   }
   .md ul { @apply pl-7 my-3 list-disc; }
   .md ol { @apply pl-7 my-3 list-decimal; }
@@ -95,6 +96,8 @@
   .md td { @apply border border-surface px-4 py-2.5; }
   .md a {
     @apply text-accent underline underline-offset-2;
+    overflow-wrap: break-word;
+    word-break: break-all;
     &:hover { @apply text-accent/80; }
   }
   .md strong { @apply font-semibold text-text; }
@@ -104,6 +107,8 @@
   .tool-block {
     @apply my-3 px-5 py-4 bg-base-subtle border border-surface rounded-xl font-mono leading-relaxed;
     font-size: var(--chat-font-size);
+    overflow-wrap: break-word;
+    word-break: break-word;
   }
 
   /* Primary action button — vivid on light, muted on dark */
