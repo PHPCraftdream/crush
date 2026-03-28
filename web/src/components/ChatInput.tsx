@@ -295,6 +295,21 @@ export function ChatInput() {
     setAttachments((prev) => [...prev, ...reads]);
   }
 
+  async function onPaste(e: React.ClipboardEvent) {
+    const items = Array.from(e.clipboardData.items);
+    const imageFiles: File[] = [];
+    for (const item of items) {
+      if (item.type.startsWith("image/")) {
+        const file = item.getAsFile();
+        if (file) imageFiles.push(file);
+      }
+    }
+    if (imageFiles.length === 0) return;
+    e.preventDefault();
+    const reads = await Promise.all(imageFiles.map(readFileAsBase64));
+    setAttachments((prev) => [...prev, ...reads]);
+  }
+
   const canSend = !!text.trim() && !!activeSessionID;
   const placeholder = activeSessionID
     ? agentBusy
@@ -351,6 +366,7 @@ export function ChatInput() {
             value={text}
             onChange={onInput}
             onKeyDown={onKey}
+            onPaste={onPaste}
             placeholder={placeholder}
             disabled={!activeSessionID}
             autoFocus
@@ -413,7 +429,7 @@ export function ChatInput() {
         </div>
       </div>
       <p className="text-center text-text-subtle text-sm mt-3 font-medium">
-        Shift+Enter / Ctrl+Enter for newline · Drop files to attach
+        Shift+Enter / Ctrl+Enter for newline · Paste or drop files to attach
       </p>
     </div>
   );

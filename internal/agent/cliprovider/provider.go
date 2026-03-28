@@ -14,8 +14,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -625,7 +627,15 @@ func (m *cliModel) Generate(ctx context.Context, call fantasy.Call) (*fantasy.Re
 
 func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.StreamResponse, error) {
 	yolo := m.yoloFn != nil && m.yoloFn()
-	prompt := formatPrompt(call.Prompt)
+
+	// Save any attached files (images, etc.) to temp dir so the CLI agent
+	// can access them via its file-reading tools.
+	attachTmpDir, filePaths, fileErr := saveFileParts(call.Prompt)
+	if fileErr != nil {
+		slog.Warn("cliprovider: failed to save attachments", "err", fileErr)
+	}
+
+	prompt := formatPrompt(call.Prompt, filePaths)
 
 	args := m.spec.BuildArgs(yolo)
 
@@ -911,6 +921,9 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 		if mcpTmpCfg != "" {
 			defer os.Remove(mcpTmpCfg)
 		}
+		if attachTmpDir != "" {
+			defer os.RemoveAll(attachTmpDir)
+		}
 		if qwenMCPName != "" {
 			defer deregisterQwenMCP(qwenMCPName)
 		}
@@ -1079,14 +1092,66 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 	}, nil
 }
 
+// saveFileParts extracts FilePart entries from messages, writes them to a temp
+// directory on disk, and returns the directory path and a per-message list of
+// saved file paths. The caller must os.RemoveAll(tempDir) when done.
+// Returns ("", nil, nil) if no file parts are found.
+func saveFileParts(msgs fantasy.Prompt) (tempDir string, filePaths map[int][]string, err error) {
+	// Collect file parts with their message indices.
+	type entry struct {
+		msgIdx int
+		fp     fantasy.FilePart
+	}
+	var entries []entry
+	for i, msg := range msgs {
+		for _, part := range msg.Content {
+			if fp, ok := fantasy.AsMessagePart[fantasy.FilePart](part); ok {
+				entries = append(entries, entry{msgIdx: i, fp: fp})
+			}
+		}
+	}
+	if len(entries) == 0 {
+		return "", nil, nil
+	}
+
+	tempDir, err = os.MkdirTemp("", "crush-attachments-*")
+	if err != nil {
+		return "", nil, fmt.Errorf("create attachment temp dir: %w", err)
+	}
+
+	filePaths = make(map[int][]string)
+	for seq, e := range entries {
+		name := e.fp.Filename
+		if name == "" {
+			ext := ".bin"
+			if exts, _ := mime.ExtensionsByType(e.fp.MediaType); len(exts) > 0 {
+				ext = exts[0]
+			}
+			name = fmt.Sprintf("attachment-%d%s", seq, ext)
+		}
+		// Sanitize: keep only the base name.
+		name = filepath.Base(name)
+		path := filepath.Join(tempDir, name)
+		if werr := os.WriteFile(path, e.fp.Data, 0o644); werr != nil {
+			slog.Warn("cliprovider: failed to write attachment", "path", path, "err", werr)
+			continue
+		}
+		filePaths[e.msgIdx] = append(filePaths[e.msgIdx], path)
+	}
+	return tempDir, filePaths, nil
+}
+
 // formatPrompt converts a fantasy.Prompt into a single text string for the CLI.
 // The full conversation (system prompt + message history) is formatted so the
 // CLI model receives as much context as possible.
-func formatPrompt(msgs fantasy.Prompt) string {
+// filePaths maps message indices to on-disk file paths for attached files;
+// nil means no files were attached.
+func formatPrompt(msgs fantasy.Prompt, filePaths map[int][]string) string {
 	var sb strings.Builder
-	for _, msg := range msgs {
+	for i, msg := range msgs {
 		text := extractText(msg)
-		if text == "" {
+		files := filePaths[i]
+		if text == "" && len(files) == 0 {
 			continue
 		}
 		switch msg.Role {
@@ -1097,6 +1162,11 @@ func formatPrompt(msgs fantasy.Prompt) string {
 		case fantasy.MessageRoleUser:
 			sb.WriteString("User: ")
 			sb.WriteString(text)
+			for _, f := range files {
+				sb.WriteString("\n[Attached file: ")
+				sb.WriteString(f)
+				sb.WriteString("]")
+			}
 			sb.WriteString("\n\n")
 		case fantasy.MessageRoleAssistant:
 			sb.WriteString("Assistant: ")

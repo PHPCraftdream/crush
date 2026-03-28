@@ -77,11 +77,100 @@ func TestFormatPrompt(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := formatPrompt(tt.prompt)
+			got := formatPrompt(tt.prompt, nil)
 			if got != tt.want {
 				t.Errorf("formatPrompt() =\n%q\nwant:\n%q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestFormatPromptWithFilePaths(t *testing.T) {
+	msgs := fantasy.Prompt{
+		fantasy.NewUserMessage("Look at this"),
+	}
+	paths := map[int][]string{
+		0: {"/tmp/image.png"},
+	}
+	got := formatPrompt(msgs, paths)
+	want := "User: Look at this\n[Attached file: /tmp/image.png]"
+	if got != want {
+		t.Errorf("formatPrompt() =\n%q\nwant:\n%q", got, want)
+	}
+}
+
+func TestFormatPromptFileOnlyMessage(t *testing.T) {
+	msgs := fantasy.Prompt{
+		{Role: fantasy.MessageRoleUser, Content: []fantasy.MessagePart{
+			fantasy.FilePart{Filename: "test.png", Data: []byte("fake"), MediaType: "image/png"},
+		}},
+	}
+	paths := map[int][]string{
+		0: {"/tmp/test.png"},
+	}
+	got := formatPrompt(msgs, paths)
+	want := "User: \n[Attached file: /tmp/test.png]"
+	if got != want {
+		t.Errorf("formatPrompt() =\n%q\nwant:\n%q", got, want)
+	}
+}
+
+func TestSaveFileParts(t *testing.T) {
+	msgs := fantasy.Prompt{
+		{Role: fantasy.MessageRoleUser, Content: []fantasy.MessagePart{
+			fantasy.TextPart{Text: "Check this"},
+			fantasy.FilePart{Filename: "screenshot.png", Data: []byte("PNG_DATA"), MediaType: "image/png"},
+		}},
+		{Role: fantasy.MessageRoleUser, Content: []fantasy.MessagePart{
+			fantasy.FilePart{Filename: "", Data: []byte("JPEG_DATA"), MediaType: "image/jpeg"},
+		}},
+	}
+
+	tmpDir, paths, err := saveFileParts(msgs)
+	if err != nil {
+		t.Fatalf("saveFileParts() error: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	if len(paths[0]) != 1 {
+		t.Fatalf("expected 1 file for msg 0, got %d", len(paths[0]))
+	}
+	if len(paths[1]) != 1 {
+		t.Fatalf("expected 1 file for msg 1, got %d", len(paths[1]))
+	}
+
+	// Check file contents.
+	data, err := os.ReadFile(paths[0][0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "PNG_DATA" {
+		t.Errorf("file content = %q, want %q", data, "PNG_DATA")
+	}
+	if filepath.Base(paths[0][0]) != "screenshot.png" {
+		t.Errorf("filename = %q, want screenshot.png", filepath.Base(paths[0][0]))
+	}
+
+	// Second file: auto-generated name from MIME type.
+	data2, err := os.ReadFile(paths[1][0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data2) != "JPEG_DATA" {
+		t.Errorf("file content = %q, want %q", data2, "JPEG_DATA")
+	}
+}
+
+func TestSaveFilePartsNoFiles(t *testing.T) {
+	msgs := fantasy.Prompt{
+		fantasy.NewUserMessage("just text"),
+	}
+	tmpDir, paths, err := saveFileParts(msgs)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if tmpDir != "" || paths != nil {
+		t.Errorf("expected no temp dir for text-only prompt, got dir=%q paths=%v", tmpDir, paths)
 	}
 }
 
