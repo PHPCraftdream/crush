@@ -214,7 +214,7 @@ export function Chat() {
 
   return (
     <div className="flex-1 flex flex-col overflow-hidden relative bg-canvas">
-      <div ref={scrollRef} onScroll={handleScroll} onWheel={handleWheel} className="flex-1 overflow-y-auto py-8 flex flex-col">
+      <div ref={scrollRef} onScroll={handleScroll} onWheel={handleWheel} className="flex-1 overflow-y-auto overflow-x-hidden py-8 flex flex-col">
         {!activeSessionID ? (
           <div className="empty-state">
             <div className="empty-state-icon">

@@ -68,7 +68,7 @@
   .chat-font { font-size: var(--chat-font-size); }
 
   /* Markdown content — all font sizes inherit --chat-font-size, no overrides */
-  .md { font-size: var(--chat-font-size); line-height: 1.65; overflow-wrap: break-word; word-break: break-word; }
+  .md { font-size: var(--chat-font-size); line-height: 1.65; overflow-wrap: anywhere; }
   .md h1 { @apply mt-8 mb-4 text-text font-bold; font-size: 1.75em; }
   .md h2 { @apply mt-7 mb-3 text-text font-semibold; font-size: 1.5em; }
   .md h3 { @apply mt-6 mb-3 text-text font-semibold; font-size: 1.25em; }
