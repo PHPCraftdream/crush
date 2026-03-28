@@ -634,6 +634,9 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 	if fileErr != nil {
 		slog.Warn("cliprovider: failed to save attachments", "err", fileErr)
 	}
+	if len(filePaths) > 0 {
+		slog.Info("cliprovider: saved attachments to temp dir", "dir", attachTmpDir, "count", len(filePaths))
+	}
 
 	prompt := formatPrompt(call.Prompt, filePaths)
 
@@ -1106,10 +1109,12 @@ func saveFileParts(msgs fantasy.Prompt) (tempDir string, filePaths map[int][]str
 	for i, msg := range msgs {
 		for _, part := range msg.Content {
 			if fp, ok := fantasy.AsMessagePart[fantasy.FilePart](part); ok {
+				slog.Debug("cliprovider: found FilePart", "msgIdx", i, "filename", fp.Filename, "mediaType", fp.MediaType, "dataLen", len(fp.Data))
 				entries = append(entries, entry{msgIdx: i, fp: fp})
 			}
 		}
 	}
+	slog.Debug("cliprovider: saveFileParts scan", "totalMessages", len(msgs), "filePartsFound", len(entries))
 	if len(entries) == 0 {
 		return "", nil, nil
 	}

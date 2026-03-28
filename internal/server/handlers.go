@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"time"
@@ -154,6 +155,22 @@ func handleIncoming(ctx context.Context, a *appPkg.App, c *Client, raw []byte) {
 	}
 }
 
+// saveAttachmentToDisk saves an attachment to .crush/attachments/ with a
+// timestamped filename and returns the absolute path.
+func saveAttachmentToDisk(workingDir, fileName string, data []byte) (string, error) {
+	dir := filepath.Join(workingDir, ".crush", "attachments")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("create attachments dir: %w", err)
+	}
+	ts := time.Now().Format("2006-01-02_15-04-05")
+	name := ts + "_" + filepath.Base(fileName)
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return "", fmt.Errorf("write attachment: %w", err)
+	}
+	return path, nil
+}
+
 func handleSendMessage(ctx context.Context, a *appPkg.App, c *Client, msg WSMessage) {
 	var p SendMessagePayload
 	if err := json.Unmarshal(msg.Payload, &p); err != nil {
@@ -163,9 +180,21 @@ func handleSendMessage(ctx context.Context, a *appPkg.App, c *Client, msg WSMess
 
 	slog.Info("ws: handleSendMessage", "sessionID", p.SessionID, "content", p.Content, "attachments", len(p.Attachments))
 
+	// Save attachments to disk and append file paths to the prompt text.
+	// This ensures CLI-based agents can access files via their read tools.
 	var attachments []message.Attachment
 	for _, att := range p.Attachments {
 		slog.Info("ws: attachment received", "fileName", att.FileName, "mimeType", att.MimeType, "dataLen", len(att.Data))
+
+		// Save to .crush/attachments/ with timestamped name.
+		savedPath, saveErr := saveAttachmentToDisk(a.Store().WorkingDir(), att.FileName, att.Data)
+		if saveErr != nil {
+			slog.Warn("ws: failed to save attachment to disk", "err", saveErr)
+		} else {
+			p.Content += "\n[Attached file: " + savedPath + "]"
+			slog.Info("ws: attachment saved", "path", savedPath)
+		}
+
 		attachments = append(attachments, message.Attachment{
 			FileName: att.FileName,
 			MimeType: att.MimeType,
