@@ -27,7 +27,8 @@ export function ChatToolbar() {
   if (!activeSessionID) return null;
 
   return (
-    <div className="px-8 pt-3 pb-1 border-t border-surface bg-canvas shrink-0 flex items-center justify-end gap-2 flex-wrap">
+    <div className="px-5 pt-3 pb-1 border-t border-surface bg-canvas shrink-0 flex items-center gap-2 flex-wrap">
+      <span className="text-text-subtle text-xs font-medium mr-auto">Shift+Enter for newline · Paste or drop files to attach</span>
       <ModelSelector session={activeSession} modelType="large" />
       <ModelSelector session={activeSession} modelType="small" />
 

@@ -318,7 +318,7 @@ export function ChatInput() {
     : "Select or create a session";
 
   return (
-    <div className="px-8 pt-2 pb-6 bg-canvas shrink-0">
+    <div className="px-5 pt-2 pb-4 bg-canvas shrink-0">
       {/* Attachment badges */}
       {attachments.length > 0 && (
         <div className="flex flex-wrap gap-2 mb-2">
@@ -428,9 +428,6 @@ export function ChatInput() {
           </div>
         </div>
       </div>
-      <p className="text-center text-text-subtle text-sm mt-3 font-medium">
-        Shift+Enter / Ctrl+Enter for newline · Paste or drop files to attach
-      </p>
     </div>
   );
 }

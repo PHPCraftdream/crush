@@ -249,7 +249,7 @@ export function Chat() {
         )}
 
         {agentError && (
-          <div className="px-10 py-2">
+          <div className="px-5 py-2">
             <div className="chat-error-banner">
               <span className="text-red text-lg shrink-0 mt-0.5">⚠</span>
               <p className="text-[15px] text-red/80 leading-relaxed flex-1 break-words">{agentError}</p>
@@ -261,7 +261,7 @@ export function Chat() {
         )}
 
         {isBusy && (
-          <div className="flex items-center gap-3 px-10 py-2">
+          <div className="flex items-center gap-3 px-5 py-2">
             <div className="flex gap-1.5 animate-pulse-dots">
               <span className="w-2 h-2 rounded-full bg-accent inline-block" />
               <span className="w-2 h-2 rounded-full bg-accent inline-block" />
@@ -282,7 +282,7 @@ export function Chat() {
 
       {queuedItems.length > 0 && activeSessionID && (
         <div className="shrink-0 border-t border-surface bg-canvas">
-          <div className="flex items-center gap-2 px-10 py-1.5">
+          <div className="flex items-center gap-2 px-5 py-1.5">
             <div className="divider-line" />
             <span className="section-label">Queue · {queuedItems.length}</span>
             <div className="divider-line" />

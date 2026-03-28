@@ -244,7 +244,7 @@ export function Header() {
 
   return (
     <>
-    <header data-test-id="header" className="flex items-center gap-6 px-8 py-6 border-b border-surface bg-canvas shrink-0">
+    <header data-test-id="header" className="flex items-center gap-4 px-5 py-4 border-b border-surface bg-canvas shrink-0">
       <div className="flex-1 min-w-0">
         <SessionTitle session={activeSession} cwd={config?.cwd} />
       </div>

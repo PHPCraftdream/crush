@@ -489,7 +489,7 @@ export const Message = memo(function Message({
 
   return (
     <div
-      className={`flex flex-col px-8 py-3 transition-colors ${isSelected ? "bg-accent/5" : ""} ${message.Pinned ? "border-l-4 border-yellow/60 bg-yellow/[5%]" : ""}`}
+      className={`flex flex-col px-5 py-3 transition-colors ${isSelected ? "bg-accent/5" : ""} ${message.Pinned ? "border-l-4 border-yellow/60 bg-yellow/[5%]" : ""}`}
       onMouseEnter={handleMouseEnter}
       onMouseLeave={handleMouseLeave}
     >
@@ -508,7 +508,7 @@ export const Message = memo(function Message({
             <UserContent message={message} editing={editing} onSaveEdit={handleSaveEdit} onCancelEdit={handleEditClose} />
           </div>
         ) : (
-          <div className="w-full max-w-[92%]">
+          <div className="w-full">
             <AssistantContent message={message} thinkingDone={thinkingDone} editing={editing} onSaveEdit={handleSaveEdit} onCancelEdit={handleEditClose} />
           </div>
         )}

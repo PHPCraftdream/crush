@@ -237,6 +237,10 @@ export function TodoList({ sessionID, todos }: { sessionID: string; todos: Todo[
     setAddingNew(false);
   }
 
+  function clearCompleted() {
+    update(todos.filter((t) => t.status !== "completed"));
+  }
+
   function startAdding() {
     setCollapsed(false);
     setAddingNew(true);
@@ -267,7 +271,17 @@ export function TodoList({ sessionID, todos }: { sessionID: string; todos: Todo[
           )}
         </button>
 
-        {/* Add task button */}
+        {/* Clear completed / Add task buttons */}
+        {completed > 0 && (
+          <button
+            data-test-id="todo-clear-completed"
+            onClick={clearCompleted}
+            title="Clear completed tasks"
+            className="px-2 py-1.5 text-text-subtle hover:text-red transition-colors text-[11px] leading-none"
+          >
+            ✕ Done
+          </button>
+        )}
         <button
           data-test-id="todo-add-btn"
           onClick={startAdding}
