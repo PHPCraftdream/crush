@@ -390,7 +390,7 @@ var All = []CLISpec{
 	{
 		ModelID:        "cli-claude-sonnet",
 		ModelName:      "Claude Sonnet (CLI)",
-		ContextWindow:  200_000,
+		ContextWindow:  1_000_000,
 		Binary:         "claude",
 		PromptFlag:     "-p",
 		BuildArgs:      claudeArgs("sonnet"),
@@ -401,7 +401,7 @@ var All = []CLISpec{
 	{
 		ModelID:        "cli-claude-opus",
 		ModelName:      "Claude Opus (CLI)",
-		ContextWindow:  200_000,
+		ContextWindow:  1_000_000,
 		Binary:         "claude",
 		PromptFlag:     "-p",
 		BuildArgs:      claudeArgs("opus"),
@@ -412,7 +412,7 @@ var All = []CLISpec{
 	{
 		ModelID:        "cli-claude-sonnet-thinking",
 		ModelName:      "Claude Sonnet Thinking (CLI)",
-		ContextWindow:  200_000,
+		ContextWindow:  1_000_000,
 		Binary:         "claude",
 		PromptFlag:     "-p",
 		BuildArgs:      claudeArgs("sonnet", "--effort", "high"),
@@ -423,7 +423,7 @@ var All = []CLISpec{
 	{
 		ModelID:        "cli-claude-opus-thinking",
 		ModelName:      "Claude Opus Thinking (CLI)",
-		ContextWindow:  200_000,
+		ContextWindow:  1_000_000,
 		Binary:         "claude",
 		PromptFlag:     "-p",
 		BuildArgs:      claudeArgs("opus", "--effort", "high"),

@@ -38,8 +38,8 @@ function makeClaudeConfig() {
         enabled: true,
         type: "cli",
         models: [
-          { id: "cli-claude-opus", name: "Claude Opus (CLI)", contextWindow: 200_000 },
-          { id: "cli-claude-sonnet", name: "Claude Sonnet (CLI)", contextWindow: 200_000 },
+          { id: "cli-claude-opus", name: "Claude Opus (CLI)", contextWindow: 1_000_000 },
+          { id: "cli-claude-sonnet", name: "Claude Sonnet (CLI)", contextWindow: 1_000_000 },
           { id: "gemini-flash", name: "Gemini Flash", contextWindow: 200_000 },
         ],
       },
