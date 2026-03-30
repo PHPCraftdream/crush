@@ -54,6 +54,7 @@ func loadMCPJSON(path string) (map[string]MCPConfig, error) {
 			URL:     entry.URL,
 			Headers: entry.Headers,
 			Source:  MCPSourceExternal,
+			Timeout: 60, // Higher default for external servers (uvx, npx etc. may be slow to start).
 		}
 	}
 	return result, nil
