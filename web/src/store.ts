@@ -25,6 +25,9 @@ export const $subAgentSessions = atom<Map<string, string>>(new Map());
 // Maps sub-agent session ID → messages
 export const $subAgentMessages = atom<Map<string, Message[]>>(new Map());
 
+// Block breaks for zebra pattern: indices where a new visual block starts (5s gap)
+export const $messageBlockBreaks = atom<Map<string, Set<number>>>(new Map());
+
 // ── Actions ──────────────────────────────────────────────────────────────────
 export function setSkills(skills: SkillInfo[]) {
   $skills.set(skills);
@@ -220,6 +223,27 @@ export function setSubAgentMessages(sessionID: string, msgs: Message[]) {
   const map = new Map($subAgentMessages.get());
   map.set(sessionID, msgs);
   $subAgentMessages.set(map);
+}
+
+const _msgPartTracker = new Map<string, { time: number; count: number }>();
+
+export function trackMessageParts(msgID: string, parts: { type: string }[]) {
+  const count = parts.length;
+  const now = Date.now();
+  const prev = _msgPartTracker.get(msgID);
+
+  if (prev && count > prev.count && now - prev.time > 5000) {
+    const newPart = parts[prev.count];
+    if (newPart && newPart.type !== "tool_result" && newPart.type !== "finish") {
+      const map = new Map($messageBlockBreaks.get());
+      const set = new Set(map.get(msgID) ?? []);
+      set.add(prev.count);
+      map.set(msgID, set);
+      $messageBlockBreaks.set(map);
+    }
+  }
+
+  _msgPartTracker.set(msgID, { time: now, count });
 }
 
 export function setSessionBusy(sessionID: string, busy: boolean) {

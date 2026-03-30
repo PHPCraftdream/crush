@@ -293,6 +293,11 @@
   }
 
   /* Sub-agent inline block */
+  .msg-block-sep {
+    @apply mt-4 pt-3;
+    border-top: 1px solid rgb(var(--color-surface) / 0.6);
+  }
+
   .sub-agent-block { @apply my-3 border border-accent/20 rounded-xl overflow-hidden shadow-sm; }
   .sub-agent-toggle {
     @apply px-5 py-3 cursor-pointer select-none text-base text-text-muted

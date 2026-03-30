@@ -33,6 +33,7 @@ import {
   getParentSessionID,
   upsertSubAgentMessage,
   setSubAgentMessages,
+  trackMessageParts,
 } from "./store";
 import type { WSMessage, Session, Message, PermissionRequest, ConfigPayload, LSPSnapshot, MCPState, AgentBusyPayload, SkillsSnapshot, SummarizeQueuedPayload } from "./types";
 
@@ -180,6 +181,9 @@ export function useWS() {
         }
         const activeID = $activeSessionID.get();
         if (!activeID || m.SessionID !== activeID) return;
+        if (m.Role === "assistant") {
+          trackMessageParts(m.ID, m.Parts);
+        }
         upsertMessage(m);
       }),
       ws.on("message_deleted", (msg: WSMessage) => {

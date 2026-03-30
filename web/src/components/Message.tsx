@@ -9,6 +9,7 @@ import { BrainCircuit, Check, Copy, GitFork, Pencil, RotateCcw, Star, Trash2, Bo
 import { SubAgentBlock } from "./SubAgentBlock";
 import {
   $busySessions,
+  $messageBlockBreaks,
   toggleMessageSelection,
   updateMessageContent,
   updateMessageThinking,
@@ -302,6 +303,52 @@ const ThinkingPart = memo(function ThinkingPart({ thinking, messageID, partIndex
   );
 });
 
+// ── Block grouping for zebra pattern ──────────────────────────────────────
+
+const EMPTY_BREAKS = new Set<number>();
+
+type BlockKind = "thinking" | "text" | "tool" | "other";
+
+interface VisualBlock {
+  kind: BlockKind;
+  items: { part: ContentPart; idx: number }[];
+  thinkingDone: boolean;
+}
+
+function classifyPart(part: ContentPart): BlockKind {
+  switch (part.type) {
+    case "thinking":    return "thinking";
+    case "text":        return "text";
+    case "tool_call":
+    case "tool_result": return "tool";
+    default:            return "other";
+  }
+}
+
+function groupPartsIntoBlocks(parts: ContentPart[], breaks: Set<number>): VisualBlock[] {
+  const blocks: VisualBlock[] = [];
+  let cur: VisualBlock | null = null;
+
+  for (let i = 0; i < parts.length; i++) {
+    const kind = classifyPart(parts[i]);
+    if (!cur || cur.kind !== kind || breaks.has(i)) {
+      cur = { kind, items: [], thinkingDone: false };
+      blocks.push(cur);
+    }
+    cur.items.push({ part: parts[i], idx: i });
+  }
+
+  for (let b = 0; b < blocks.length; b++) {
+    if (blocks[b].kind === "thinking") {
+      blocks[b].thinkingDone = blocks.slice(b + 1).some(
+        bb => bb.kind === "text" || bb.kind === "other"
+      );
+    }
+  }
+
+  return blocks;
+}
+
 // ── Part router ───────────────────────────────────────────────────────────────
 
 const Part = memo(function Part({ part, index, isUser, messageID, thinkingDone }: { part: ContentPart; index: number; isUser: boolean; messageID: string; thinkingDone: boolean }) {
@@ -354,14 +401,17 @@ const UserContent = memo(function UserContent({
 });
 
 const AssistantContent = memo(function AssistantContent({
-  message, thinkingDone, editing, onSaveEdit, onCancelEdit,
+  message, editing, onSaveEdit, onCancelEdit,
 }: {
   message: Msg;
-  thinkingDone: boolean;
   editing: boolean;
   onSaveEdit: (text: string) => void;
   onCancelEdit: () => void;
 }) {
+  const breakMap = useStore($messageBlockBreaks);
+  const breaks = useMemo(() => breakMap.get(message.ID) ?? EMPTY_BREAKS, [breakMap, message.ID]);
+  const blocks = useMemo(() => groupPartsIntoBlocks(message.Parts, breaks), [message.Parts, breaks]);
+
   if (editing) {
     return (
       <EditForm
@@ -375,7 +425,13 @@ const AssistantContent = memo(function AssistantContent({
   }
   return (
     <div className="text-text leading-relaxed" style={{ fontSize: "var(--chat-font-size)" }}>
-      {message.Parts.map((part, i) => <Part key={i} part={part} index={i} isUser={false} messageID={message.ID} thinkingDone={thinkingDone} />)}
+      {blocks.map((block, bi) => (
+        <div key={bi} className={bi > 0 ? "msg-block-sep" : undefined}>
+          {block.items.map(({ part, idx }) => (
+            <Part key={idx} part={part} index={idx} isUser={false} messageID={message.ID} thinkingDone={block.thinkingDone} />
+          ))}
+        </div>
+      ))}
     </div>
   );
 });
@@ -467,7 +523,6 @@ export const Message = memo(function Message({
     if (!copyThinking) return "";
     return copyText ? `<thinking>\n${copyThinking}\n</thinking>\n\n${copyText}` : copyThinking;
   }, [copyText, copyThinking]);
-  const thinkingDone = useMemo(() => !isUser && message.Parts.some(p => p.type === "text" || p.type === "finish"), [isUser, message.Parts]);
   const hasContent   = useMemo(() => !isUser && message.Parts.some(p => ["text","tool_call","tool_result","finish"].includes(p.type)), [isUser, message.Parts]);
 
   const [editing, setEditing] = useState(false);
@@ -520,7 +575,7 @@ export const Message = memo(function Message({
           </div>
         ) : (
           <div className="w-full min-w-0">
-            <AssistantContent message={message} thinkingDone={thinkingDone} editing={editing} onSaveEdit={handleSaveEdit} onCancelEdit={handleEditClose} />
+            <AssistantContent message={message} editing={editing} onSaveEdit={handleSaveEdit} onCancelEdit={handleEditClose} />
           </div>
         )}
       </div>
