@@ -292,6 +292,14 @@ func claudeArgs(model string, extra ...string) func(bool) []string {
 	}
 }
 
+// npxClaudeArgs returns a BuildArgs func for claude invoked via npx @anthropic-ai/claude-code.
+func npxClaudeArgs(model string, extra ...string) func(bool) []string {
+	inner := claudeArgs(model, extra...)
+	return func(yolo bool) []string {
+		return append([]string{"@anthropic-ai/claude-code"}, inner(yolo)...)
+	}
+}
+
 // codexEvent is the top-level JSONL envelope emitted by `codex exec --json`.
 type codexEvent struct {
 	Type string `json:"type"`
@@ -429,6 +437,51 @@ var All = []CLISpec{
 		Binary:         "claude",
 		PromptFlag:     "-p",
 		BuildArgs:      claudeArgs("opus", "--effort", "high"),
+		NewPartParser:  claudePartParser,
+		ParseUsageLine: claudeParseUsageLine,
+		UseCrushMCP:    true,
+	},
+	// npx @anthropic-ai/claude-code variants
+	{
+		ModelID:        "cli-npx-claude-sonnet",
+		ModelName:      "Claude Sonnet (npx)",
+		ContextWindow:  1_000_000,
+		Binary:         "npx",
+		PromptFlag:     "-p",
+		BuildArgs:      npxClaudeArgs("sonnet"),
+		NewPartParser:  claudePartParser,
+		ParseUsageLine: claudeParseUsageLine,
+		UseCrushMCP:    true,
+	},
+	{
+		ModelID:        "cli-npx-claude-opus",
+		ModelName:      "Claude Opus (npx)",
+		ContextWindow:  1_000_000,
+		Binary:         "npx",
+		PromptFlag:     "-p",
+		BuildArgs:      npxClaudeArgs("opus"),
+		NewPartParser:  claudePartParser,
+		ParseUsageLine: claudeParseUsageLine,
+		UseCrushMCP:    true,
+	},
+	{
+		ModelID:        "cli-npx-claude-sonnet-thinking",
+		ModelName:      "Claude Sonnet Thinking (npx)",
+		ContextWindow:  1_000_000,
+		Binary:         "npx",
+		PromptFlag:     "-p",
+		BuildArgs:      npxClaudeArgs("sonnet", "--effort", "high"),
+		NewPartParser:  claudePartParser,
+		ParseUsageLine: claudeParseUsageLine,
+		UseCrushMCP:    true,
+	},
+	{
+		ModelID:        "cli-npx-claude-opus-thinking",
+		ModelName:      "Claude Opus Thinking (npx)",
+		ContextWindow:  1_000_000,
+		Binary:         "npx",
+		PromptFlag:     "-p",
+		BuildArgs:      npxClaudeArgs("opus", "--effort", "high"),
 		NewPartParser:  claudePartParser,
 		ParseUsageLine: claudeParseUsageLine,
 		UseCrushMCP:    true,
