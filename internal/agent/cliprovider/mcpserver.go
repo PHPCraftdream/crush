@@ -112,7 +112,7 @@ func newCrushMCPServer(ctx context.Context, perms permission.Service, sessions s
 	toolCh := make(chan mcpToolEvent, 32)
 	registerMCPTools(srv, perms, sessions, sessionID, workingDir, toolCh)
 	if mcpProxy != nil {
-		registerExternalMCPTools(ctx, srv, mcpProxy, toolCh)
+		registerExternalMCPTools(ctx, srv, perms, workingDir, mcpProxy, toolCh)
 	}
 
 	rawHandler := mcp.NewStreamableHTTPHandler(
@@ -200,7 +200,9 @@ func emitToolEnd(toolCh chan mcpToolEvent, id string) {
 // registerExternalMCPTools exposes all enabled external MCP tools (from the
 // internal mcp package) on the crush MCP HTTP server, so CLI models can call
 // them. Tool names are prefixed with the server name to avoid collisions.
-func registerExternalMCPTools(ctx context.Context, srv *mcp.Server, proxy ExternalMCPProxy, toolCh chan mcpToolEvent) {
+// Each tool call goes through perms.Request so the user can approve/deny it
+// in the crush UI (or auto-approve in yolo mode).
+func registerExternalMCPTools(ctx context.Context, srv *mcp.Server, perms permission.Service, workingDir string, proxy ExternalMCPProxy, toolCh chan mcpToolEvent) {
 	for _, ext := range proxy.ListTools() {
 		ext := ext // capture
 		toolName := ext.ServerName + "__" + ext.Name
@@ -226,6 +228,33 @@ func registerExternalMCPTools(ctx context.Context, srv *mcp.Server, proxy Extern
 
 			emitToolStart(toolCh, id, toolName, inputJSON)
 			defer emitToolEnd(toolCh, id)
+
+			// Request permission via crush UI (respects yolo mode).
+			if perms != nil {
+				var params any
+				_ = json.Unmarshal(req.Params.Arguments, &params)
+				granted, err := perms.Request(reqCtx, permission.CreatePermissionRequest{
+					SessionID:   mcpSessionID,
+					ToolCallID:  id,
+					ToolName:    "mcp_" + toolName,
+					Description: fmt.Sprintf("call %s on MCP server %s", ext.Name, ext.ServerName),
+					Action:      "execute",
+					Params:      params,
+					Path:        workingDir,
+				})
+				if err != nil {
+					return &mcp.CallToolResult{
+						Content: []mcp.Content{&mcp.TextContent{Text: "permission request failed: " + err.Error()}},
+						IsError: true,
+					}, nil
+				}
+				if !granted {
+					return &mcp.CallToolResult{
+						Content: []mcp.Content{&mcp.TextContent{Text: "tool call denied by user"}},
+						IsError: true,
+					}, nil
+				}
+			}
 
 			result, err := proxy.CallTool(reqCtx, ext.ServerName, ext.Name, inputJSON)
 			if err != nil {
