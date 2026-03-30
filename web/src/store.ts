@@ -509,6 +509,15 @@ export function dequeueNextMessage(sessionID: string): string | undefined {
   return first.content;
 }
 
+export function dequeueAllMessages(sessionID: string): string | undefined {
+  const q = new Map($messageQueue.get());
+  const msgs = q.get(sessionID) ?? [];
+  if (!msgs.length) return undefined;
+  q.delete(sessionID);
+  $messageQueue.set(q);
+  return msgs.map((m) => m.content).join("\n\n");
+}
+
 export function removeQueuedMessage(sessionID: string, id: string) {
   const q = new Map($messageQueue.get());
   const msgs = (q.get(sessionID) ?? []).filter((m) => m.id !== id);

@@ -24,7 +24,7 @@ import {
   $recentLargeModels,
   $recentSmallModels,
   trackModelUsage,
-  dequeueNextMessage,
+  dequeueAllMessages,
   applyTheme,
   setSkills,
   setSummarizeQueued,
@@ -279,11 +279,11 @@ export function useWS() {
       ws.on("agent_busy", (msg: WSMessage) => {
         const p = msg.payload as AgentBusyPayload;
         setSessionBusy(p.SessionID, p.Busy);
-        // When the agent finishes, auto-send the next queued message (if any).
+        // When the agent finishes, send all queued messages as one combined message.
         if (!p.Busy) {
-          const next = dequeueNextMessage(p.SessionID);
-          if (next) {
-            ws.send("send_message", { sessionID: p.SessionID, content: next });
+          const combined = dequeueAllMessages(p.SessionID);
+          if (combined) {
+            ws.send("send_message", { sessionID: p.SessionID, content: combined });
           }
         }
       }),
