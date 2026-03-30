@@ -19,6 +19,12 @@ export const $busySessions = atom<Set<string>>(new Set());
 // Sessions where the user has queued a compact/summarise request.
 export const $summarizeQueued = atom<Set<string>>(new Set());
 
+// ── Sub-agent state ─────────────────────────────────────────────────────────
+// Maps sub-agent session ID → parent session ID
+export const $subAgentSessions = atom<Map<string, string>>(new Map());
+// Maps sub-agent session ID → messages
+export const $subAgentMessages = atom<Map<string, Message[]>>(new Map());
+
 // ── Actions ──────────────────────────────────────────────────────────────────
 export function setSkills(skills: SkillInfo[]) {
   $skills.set(skills);
@@ -181,6 +187,39 @@ export function deletePermissionRule(sessionID: string, ruleID: string) {
 
 export function fetchPermissionRules(sessionID: string) {
   ws.send("list_session_permissions", { sessionID });
+}
+
+export function registerSubAgentSession(subSessionID: string, parentSessionID: string) {
+  const map = new Map($subAgentSessions.get());
+  map.set(subSessionID, parentSessionID);
+  $subAgentSessions.set(map);
+}
+
+export function isSubAgentSession(sessionID: string): boolean {
+  return $subAgentSessions.get().has(sessionID);
+}
+
+export function getParentSessionID(subSessionID: string): string | undefined {
+  return $subAgentSessions.get().get(subSessionID);
+}
+
+export function upsertSubAgentMessage(sessionID: string, msg: Message) {
+  const map = new Map($subAgentMessages.get());
+  const msgs = [...(map.get(sessionID) ?? [])];
+  const idx = msgs.findIndex((m) => m.ID === msg.ID);
+  if (idx === -1) {
+    msgs.push(msg);
+  } else {
+    msgs[idx] = msg;
+  }
+  map.set(sessionID, msgs);
+  $subAgentMessages.set(map);
+}
+
+export function setSubAgentMessages(sessionID: string, msgs: Message[]) {
+  const map = new Map($subAgentMessages.get());
+  map.set(sessionID, msgs);
+  $subAgentMessages.set(map);
 }
 
 export function setSessionBusy(sessionID: string, busy: boolean) {

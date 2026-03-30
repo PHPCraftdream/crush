@@ -12,7 +12,8 @@ function formatTokens(n: number): string {
 }
 
 export function Sidebar() {
-  const sessions = useStore($sessions);
+  const allSessions = useStore($sessions);
+  const sessions = allSessions.filter((s) => !s.ParentSessionID);
   const activeID = useStore($activeSessionID);
   const busySessions = useStore($busySessions);
   const [editingID, setEditingID] = useState<string | null>(null);

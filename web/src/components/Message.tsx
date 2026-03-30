@@ -6,6 +6,7 @@ import remarkBreaks from "remark-breaks";
 import rehypeHighlight from "rehype-highlight";
 import type { Message as Msg, ContentPart } from "../types";
 import { BrainCircuit, Check, Copy, GitFork, Pencil, RotateCcw, Star, Trash2, BookMarked } from "lucide-react";
+import { SubAgentBlock } from "./SubAgentBlock";
 import {
   $busySessions,
   toggleMessageSelection,
@@ -307,8 +308,18 @@ const Part = memo(function Part({ part, index, isUser, messageID, thinkingDone }
   switch (part.type) {
     case "text":     return <TextBlock text={part.Text} isUser={isUser} />;
     case "thinking": return <ThinkingPart thinking={part.Thinking} messageID={messageID} partIndex={index} done={thinkingDone} />;
-    case "tool_call":    return <ToolCallBlock   name={part.Name} input={part.Input}     finished={part.Finished} />;
-    case "tool_result":  return <ToolResultBlock name={part.Name} content={part.Content} isError={part.IsError}  />;
+    case "tool_call": {
+      if (part.Name === "agent") {
+        let prompt = "";
+        try { prompt = JSON.parse(part.Input).prompt ?? part.Input; } catch { prompt = part.Input; }
+        return <SubAgentBlock messageID={messageID} toolCallID={part.ID} prompt={prompt} />;
+      }
+      return <ToolCallBlock name={part.Name} input={part.Input} finished={part.Finished} />;
+    }
+    case "tool_result": {
+      if (part.Name === "agent") return null;
+      return <ToolResultBlock name={part.Name} content={part.Content} isError={part.IsError} />;
+    }
     case "finish": return null;
     default:       return null;
   }

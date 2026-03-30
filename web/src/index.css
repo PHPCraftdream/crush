@@ -292,6 +292,19 @@
            flex items-center gap-2.5 font-medium;
   }
 
+  /* Sub-agent inline block */
+  .sub-agent-block { @apply my-3 border border-accent/20 rounded-xl overflow-hidden shadow-sm; }
+  .sub-agent-toggle {
+    @apply px-5 py-3 cursor-pointer select-none text-base text-text-muted
+           bg-accent/[5%] hover:bg-accent/[8%] transition-colors
+           flex items-center gap-2.5 font-medium list-none;
+  }
+  .sub-agent-toggle::-webkit-details-marker { display: none; }
+  .sub-agent-body {
+    @apply px-5 py-3 bg-base-subtle border-t border-accent/10 max-h-96 overflow-y-auto;
+    font-size: var(--chat-font-size);
+  }
+
   /* Context-condensed summary card */
   .summary-card { @apply rounded-2xl border border-yellow/30 bg-yellow/5 overflow-hidden; }
 

@@ -28,6 +28,11 @@ import {
   applyTheme,
   setSkills,
   setSummarizeQueued,
+  registerSubAgentSession,
+  isSubAgentSession,
+  getParentSessionID,
+  upsertSubAgentMessage,
+  setSubAgentMessages,
 } from "./store";
 import type { WSMessage, Session, Message, PermissionRequest, ConfigPayload, LSPSnapshot, MCPState, AgentBusyPayload, SkillsSnapshot, SummarizeQueuedPayload } from "./types";
 
@@ -82,9 +87,13 @@ export function useWS() {
 
       ws.on("session_created", (msg: WSMessage) => {
         const s = msg.payload as Session;
-        console.log("[useWS] session_created:", s.ID, "YoloEnabled:", s.YoloEnabled);
+        console.log("[useWS] session_created:", s.ID, "ParentSessionID:", s.ParentSessionID, "YoloEnabled:", s.YoloEnabled);
         upsertSession(s);
-        // Always select newly created session (whether auto-created or manual)
+        if (s.ParentSessionID) {
+          registerSubAgentSession(s.ID, s.ParentSessionID);
+          ws.send("load_messages", { sessionID: s.ID });
+          return;
+        }
         setActiveSession(s.ID);
         ws.send("load_messages", { sessionID: s.ID });
       }),
@@ -108,8 +117,14 @@ export function useWS() {
         const sessions = (msg.payload as Session[]) ?? [];
         setSessions(sessions);
 
-        if (sessions.length === 0) {
-          // No sessions? Auto-create one.
+        for (const s of sessions) {
+          if (s.ParentSessionID) {
+            registerSubAgentSession(s.ID, s.ParentSessionID);
+          }
+        }
+
+        const topLevelSessions = sessions.filter((s) => !s.ParentSessionID);
+        if (topLevelSessions.length === 0) {
           ws.send("create_session");
           return;
         }
@@ -132,8 +147,8 @@ export function useWS() {
           }
         }
 
-        // If no valid hash or session not found, pick the most recent one (first in list)
-        const latest = sessions[0];
+        // If no valid hash or session not found, pick the most recent non-sub-agent session
+        const latest = sessions.find((s) => !s.ParentSessionID);
         if (latest && activeID !== latest.ID) {
           setActiveSession(latest.ID);
           // Sync YOLO state from backend
@@ -146,7 +161,10 @@ export function useWS() {
 
       ws.on("message_created", (msg: WSMessage) => {
         const m = msg.payload as Message;
-        // Only process messages for the active session
+        if (isSubAgentSession(m.SessionID)) {
+          upsertSubAgentMessage(m.SessionID, m);
+          return;
+        }
         const activeID = $activeSessionID.get();
         if (!activeID || m.SessionID !== activeID) return;
         upsertMessage(m);
@@ -156,7 +174,10 @@ export function useWS() {
       }),
       ws.on("message_updated", (msg: WSMessage) => {
         const m = msg.payload as Message;
-        // Only process messages for the active session
+        if (isSubAgentSession(m.SessionID)) {
+          upsertSubAgentMessage(m.SessionID, m);
+          return;
+        }
         const activeID = $activeSessionID.get();
         if (!activeID || m.SessionID !== activeID) return;
         upsertMessage(m);
@@ -168,9 +189,14 @@ export function useWS() {
         if (!activeID || m.SessionID !== activeID) return;
         removeMessage(m.ID);
       }),
-      ws.on("messages_list", (msg: WSMessage) =>
-        setMessages((msg.payload as Message[]) ?? [])
-      ),
+      ws.on("messages_list", (msg: WSMessage) => {
+        const msgs = (msg.payload as Message[]) ?? [];
+        if (msgs.length > 0 && isSubAgentSession(msgs[0].SessionID)) {
+          setSubAgentMessages(msgs[0].SessionID, msgs);
+          return;
+        }
+        setMessages(msgs);
+      }),
 
       ws.on("permission_request", (msg: WSMessage) => {
         const p = msg.payload as PermissionRequest;
