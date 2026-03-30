@@ -21,6 +21,7 @@ import (
 	"github.com/charmbracelet/crush/internal/agent/notify"
 	"github.com/charmbracelet/crush/internal/agent/prompt"
 	"github.com/charmbracelet/crush/internal/agent/tools"
+	mcp "github.com/charmbracelet/crush/internal/agent/tools/mcp"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/filetracker"
 	"github.com/charmbracelet/crush/internal/history"
@@ -971,10 +972,39 @@ func (c *coordinator) buildProvider(providerCfg config.ProviderConfig, model con
 	case hyper.Name:
 		return c.buildHyperProvider(apiKey)
 	case cliprovider.ProviderType:
-		return cliprovider.New(c.cfg.WorkingDir(), c.permissions.SkipRequests, c.permissions, c.sessions), nil
+		return cliprovider.New(c.cfg.WorkingDir(), c.permissions.SkipRequests, c.permissions, c.sessions, &externalMCPProxy{cfg: c.cfg}), nil
 	default:
 		return nil, fmt.Errorf("provider type not supported: %q", providerCfg.Type)
 	}
+}
+
+// externalMCPProxy implements cliprovider.ExternalMCPProxy by delegating to
+// the internal mcp package for tool listing and execution.
+type externalMCPProxy struct {
+	cfg *config.ConfigStore
+}
+
+func (p *externalMCPProxy) ListTools() []cliprovider.ExternalMCPTool {
+	var result []cliprovider.ExternalMCPTool
+	for serverName, tools := range mcp.Tools() {
+		for _, t := range tools {
+			result = append(result, cliprovider.ExternalMCPTool{
+				ServerName:  serverName,
+				Name:        t.Name,
+				Description: t.Description,
+				InputSchema: t.InputSchema,
+			})
+		}
+	}
+	return result
+}
+
+func (p *externalMCPProxy) CallTool(ctx context.Context, serverName, toolName, inputJSON string) (string, error) {
+	result, err := mcp.RunTool(ctx, p.cfg, serverName, toolName, inputJSON)
+	if err != nil {
+		return "", err
+	}
+	return result.Content, nil
 }
 
 func isExactoSupported(modelID string) bool {

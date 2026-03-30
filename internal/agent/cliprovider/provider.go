@@ -628,7 +628,25 @@ type cliProvider struct {
 	yoloFn     func() bool
 	perms      permission.Service
 	sessions   session.Service
+	mcpProxy   ExternalMCPProxy
 	specs      map[string]CLISpec
+}
+
+// ExternalMCPTool describes an external MCP tool to expose through the crush MCP bridge.
+type ExternalMCPTool struct {
+	ServerName  string
+	Name        string
+	Description string
+	InputSchema any // JSON schema
+}
+
+// ExternalMCPProxy provides access to external MCP tools and the ability
+// to call them. Implemented by the coordinator to avoid circular imports.
+type ExternalMCPProxy interface {
+	// ListTools returns all enabled external MCP tools.
+	ListTools() []ExternalMCPTool
+	// CallTool invokes a tool on the named MCP server and returns the text result.
+	CallTool(ctx context.Context, serverName, toolName, inputJSON string) (string, error)
 }
 
 // New creates a CLI provider that runs all specs from [All].
@@ -636,12 +654,13 @@ type cliProvider struct {
 // yoloFn is called at request time to decide whether to pass the auto-accept flag.
 // perms is used to show crush's permission dialog when UseCrushMCP specs are invoked.
 // sessions is used by the todos MCP tool to persist task lists.
-func New(workingDir string, yoloFn func() bool, perms permission.Service, sessions session.Service) fantasy.Provider {
+// mcpProxy, if non-nil, is used for proxying external MCP tools to CLI models.
+func New(workingDir string, yoloFn func() bool, perms permission.Service, sessions session.Service, mcpProxy ExternalMCPProxy) fantasy.Provider {
 	specs := make(map[string]CLISpec, len(All))
 	for _, s := range All {
 		specs[s.ModelID] = s
 	}
-	return &cliProvider{workingDir: workingDir, yoloFn: yoloFn, perms: perms, sessions: sessions, specs: specs}
+	return &cliProvider{workingDir: workingDir, yoloFn: yoloFn, perms: perms, sessions: sessions, mcpProxy: mcpProxy, specs: specs}
 }
 
 func (p *cliProvider) Name() string { return ProviderID }
@@ -651,11 +670,12 @@ func (p *cliProvider) LanguageModel(_ context.Context, modelID string) (fantasy.
 	if !ok {
 		return nil, fmt.Errorf("unknown CLI model: %q", modelID)
 	}
-	return &cliModel{spec: spec, workingDir: p.workingDir, yoloFn: p.yoloFn, perms: p.perms, sessions: p.sessions}, nil
+	return &cliModel{spec: spec, workingDir: p.workingDir, yoloFn: p.yoloFn, perms: p.perms, sessions: p.sessions, mcpProxy: p.mcpProxy}, nil
 }
 
 type cliModel struct {
 	spec       CLISpec
+	mcpProxy   ExternalMCPProxy
 	workingDir string
 	yoloFn     func() bool
 	perms      permission.Service
@@ -748,7 +768,7 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 	var geminiMCPName string // registered name in ~/.gemini/settings.json; "" if not used
 	if m.spec.UseCrushMCP && !yolo && m.perms != nil {
 		var err error
-		mcpSrv, err = newCrushMCPServer(ctx, m.perms, m.sessions, sessionID, m.workingDir, "")
+		mcpSrv, err = newCrushMCPServer(ctx, m.perms, m.sessions, sessionID, m.workingDir, "", m.mcpProxy)
 		if err != nil {
 			slog.Warn("cliprovider: failed to start MCP server, falling back to CLI permissions", "err", err)
 		} else {
@@ -791,9 +811,23 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 	// (which persists tasks to the crush session) instead of the CLI-native
 	// TodoWrite tool that writes to a local file unknown to the crush UI.
 	if mcpSrv != nil {
+		allowed := []string{
+			"mcp__crush__Bash",
+			"mcp__crush__Read",
+			"mcp__crush__Write",
+			"mcp__crush__Glob",
+			"mcp__crush__Grep",
+			"mcp__crush__todos",
+		}
+		// Include external MCP tools registered on the crush MCP bridge.
+		if m.mcpProxy != nil {
+			for _, ext := range m.mcpProxy.ListTools() {
+				allowed = append(allowed, "mcp__crush__"+ext.ServerName+"__"+ext.Name)
+			}
+		}
 		args = append(args,
 			"--allowedTools",
-			"mcp__crush__Bash,mcp__crush__Read,mcp__crush__Write,mcp__crush__Glob,mcp__crush__Grep,mcp__crush__todos",
+			strings.Join(allowed, ","),
 			"--disallowedTools",
 			"TodoWrite",
 		)
@@ -812,7 +846,7 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 			// Use the stable project ID as the token — it's unique per project and
 			// already stored in .crush/qwen-mcp-id, so no separate secret is needed.
 			var err error
-			mcpSrv, err = newCrushMCPServer(ctx, m.perms, m.sessions, sessionID, m.workingDir, id)
+			mcpSrv, err = newCrushMCPServer(ctx, m.perms, m.sessions, sessionID, m.workingDir, id, m.mcpProxy)
 			if err != nil {
 				slog.Warn("cliprovider: failed to start qwen MCP server", "err", err)
 			} else {
@@ -856,7 +890,7 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 			slog.Warn("cliprovider: failed to get gemini MCP ID", "err", idErr)
 		} else {
 			var err error
-			mcpSrv, err = newCrushMCPServer(ctx, m.perms, m.sessions, sessionID, m.workingDir, "")
+			mcpSrv, err = newCrushMCPServer(ctx, m.perms, m.sessions, sessionID, m.workingDir, "", m.mcpProxy)
 			if err != nil {
 				slog.Warn("cliprovider: failed to start gemini MCP server", "err", err)
 			} else {
@@ -880,7 +914,7 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 	// authenticate requests without needing env-var injection.
 	if m.spec.CodexMCPIntegration && m.perms != nil {
 		var err error
-		mcpSrv, err = newCrushMCPServer(ctx, m.perms, m.sessions, sessionID, m.workingDir, "")
+		mcpSrv, err = newCrushMCPServer(ctx, m.perms, m.sessions, sessionID, m.workingDir, "", m.mcpProxy)
 		if err != nil {
 			slog.Warn("cliprovider: failed to start codex MCP server", "err", err)
 		} else {

@@ -93,7 +93,7 @@ func (s *crushMCPServer) mcpURL() string {
 // The token is accepted via Authorization: Bearer header OR ?token= query param.
 // If token is empty a cryptographically random one is generated.
 // sessions and sessionID are used by the todos tool to persist task updates.
-func newCrushMCPServer(ctx context.Context, perms permission.Service, sessions session.Service, sessionID string, workingDir string, token string) (*crushMCPServer, error) {
+func newCrushMCPServer(ctx context.Context, perms permission.Service, sessions session.Service, sessionID string, workingDir string, token string, mcpProxy ExternalMCPProxy) (*crushMCPServer, error) {
 	if token == "" {
 		// 32-byte random token → 64-char hex string.
 		tokenBytes := make([]byte, 32)
@@ -111,6 +111,9 @@ func newCrushMCPServer(ctx context.Context, perms permission.Service, sessions s
 
 	toolCh := make(chan mcpToolEvent, 32)
 	registerMCPTools(srv, perms, sessions, sessionID, workingDir, toolCh)
+	if mcpProxy != nil {
+		registerExternalMCPTools(ctx, srv, mcpProxy, toolCh)
+	}
 
 	rawHandler := mcp.NewStreamableHTTPHandler(
 		func(*http.Request) *mcp.Server { return srv },
@@ -191,6 +194,52 @@ func emitToolEnd(toolCh chan mcpToolEvent, id string) {
 	case toolCh <- mcpToolEvent{id: id}:
 	default:
 		slog.Debug("cliprovider: toolCh full, dropping end event", "id", id)
+	}
+}
+
+// registerExternalMCPTools exposes all enabled external MCP tools (from the
+// internal mcp package) on the crush MCP HTTP server, so CLI models can call
+// them. Tool names are prefixed with the server name to avoid collisions.
+func registerExternalMCPTools(ctx context.Context, srv *mcp.Server, proxy ExternalMCPProxy, toolCh chan mcpToolEvent) {
+	for _, ext := range proxy.ListTools() {
+		ext := ext // capture
+		toolName := ext.ServerName + "__" + ext.Name
+
+		// Build the InputSchema as json.RawMessage from the external tool's schema.
+		var rawSchema json.RawMessage
+		if ext.InputSchema != nil {
+			if b, err := json.Marshal(ext.InputSchema); err == nil {
+				rawSchema = b
+			}
+		}
+		if rawSchema == nil {
+			rawSchema = json.RawMessage(`{"type":"object"}`)
+		}
+
+		srv.AddTool(&mcp.Tool{
+			Name:        toolName,
+			Description: ext.Description,
+			InputSchema: rawSchema,
+		}, func(reqCtx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			id := uuid.New().String()
+			inputJSON := string(req.Params.Arguments)
+
+			emitToolStart(toolCh, id, toolName, inputJSON)
+			defer emitToolEnd(toolCh, id)
+
+			result, err := proxy.CallTool(reqCtx, ext.ServerName, ext.Name, inputJSON)
+			if err != nil {
+				return &mcp.CallToolResult{
+					Content: []mcp.Content{&mcp.TextContent{Text: "error: " + err.Error()}},
+					IsError: true,
+				}, nil
+			}
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{&mcp.TextContent{Text: result}},
+			}, nil
+		})
+
+		slog.Info("cliprovider: registered external MCP tool", "tool", toolName, "server", ext.ServerName)
 	}
 }
 
