@@ -36,6 +36,14 @@ type sessionIDContextKey struct{}
 // before calling Stream so the MCP todos tool knows which session to update.
 var SessionIDContextKey = sessionIDContextKey{}
 
+// reasoningEffortContextKey is a private key type for the reasoning effort value.
+type reasoningEffortContextKey struct{}
+
+// ReasoningEffortContextKey is the context key for the reasoning effort level
+// (e.g. "low", "medium", "high", "max"), set by the agent before calling
+// Stream so CLI models can inject the --effort flag dynamically.
+var ReasoningEffortContextKey = reasoningEffortContextKey{}
+
 // ProviderType is the catwalk.Type value used for CLI providers.
 const ProviderType = "cli"
 
@@ -694,6 +702,22 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 	prompt := formatPrompt(call.Prompt, filePaths)
 
 	args := m.spec.BuildArgs(yolo)
+
+	// Apply dynamic reasoning effort from context, replacing any hardcoded
+	// --effort value from BuildArgs so the UI toggle actually takes effect.
+	if effort, ok := ctx.Value(ReasoningEffortContextKey).(string); ok && effort != "" {
+		replaced := false
+		for i, a := range args {
+			if a == "--effort" && i+1 < len(args) {
+				args[i+1] = effort
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			args = append(args, "--effort", effort)
+		}
+	}
 
 	// Extract session ID from context (set by agent.go before calling Stream).
 	sessionID, _ := ctx.Value(SessionIDContextKey).(string)
