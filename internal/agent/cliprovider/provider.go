@@ -25,6 +25,7 @@ import (
 	"charm.land/fantasy"
 	"charm.land/fantasy/object"
 	gopty "github.com/aymanbagabas/go-pty"
+	"github.com/charmbracelet/crush/internal/csync"
 	"github.com/charmbracelet/crush/internal/permission"
 	"github.com/charmbracelet/crush/internal/session"
 )
@@ -119,12 +120,19 @@ type CLISpec struct {
 	// codex via a -c flag (inline config override), so no persistent changes
 	// are made to ~/.codex/config.toml.
 	CodexMCPIntegration bool
+	// SupportsResume enables --resume <session_id> for CLI models that
+	// support it (Claude CLI). This lets the CLI reload its own conversation
+	// history from its local DB, enabling API-level prompt caching across
+	// multiple messages in the same crush session.
+	SupportsResume bool
 }
 
 // streamEvent is the JSON envelope for Claude CLI stream-json output.
 // Only the fields relevant to text extraction are parsed.
 type streamEvent struct {
-	Type string `json:"type"`
+	Type      string `json:"type"`
+	Subtype   string `json:"subtype,omitempty"`    // "init" for system init events
+	SessionID string `json:"session_id,omitempty"` // CLI session ID from init/stream events
 	// stream_event: raw Anthropic API SSE event forwarded by claude CLI (--verbose).
 	// content_block_delta events carry text tokens (text_delta) or thinking (thinking_delta).
 	Event struct {
@@ -421,6 +429,7 @@ var All = []CLISpec{
 		NewPartParser:  claudePartParser,
 		ParseUsageLine: claudeParseUsageLine,
 		UseCrushMCP:    true,
+		SupportsResume: true,
 	},
 	{
 		ModelID:        "cli-claude-opus",
@@ -432,6 +441,7 @@ var All = []CLISpec{
 		NewPartParser:  claudePartParser,
 		ParseUsageLine: claudeParseUsageLine,
 		UseCrushMCP:    true,
+		SupportsResume: true,
 	},
 	{
 		ModelID:        "cli-claude-sonnet-thinking",
@@ -443,6 +453,7 @@ var All = []CLISpec{
 		NewPartParser:  claudePartParser,
 		ParseUsageLine: claudeParseUsageLine,
 		UseCrushMCP:    true,
+		SupportsResume: true,
 	},
 	{
 		ModelID:        "cli-claude-opus-thinking",
@@ -454,6 +465,7 @@ var All = []CLISpec{
 		NewPartParser:  claudePartParser,
 		ParseUsageLine: claudeParseUsageLine,
 		UseCrushMCP:    true,
+		SupportsResume: true,
 	},
 	// npx @anthropic-ai/claude-code variants.
 	// NoPTY is required because npx.cmd on Windows doesn't relay
@@ -469,6 +481,7 @@ var All = []CLISpec{
 		ParseUsageLine: claudeParseUsageLine,
 		UseCrushMCP:    true,
 		NoPTY:          true,
+		SupportsResume: true,
 	},
 	{
 		ModelID:        "cli-npx-claude-opus",
@@ -481,6 +494,7 @@ var All = []CLISpec{
 		ParseUsageLine: claudeParseUsageLine,
 		UseCrushMCP:    true,
 		NoPTY:          true,
+		SupportsResume: true,
 	},
 	{
 		ModelID:        "cli-npx-claude-sonnet-thinking",
@@ -493,6 +507,7 @@ var All = []CLISpec{
 		ParseUsageLine: claudeParseUsageLine,
 		UseCrushMCP:    true,
 		NoPTY:          true,
+		SupportsResume: true,
 	},
 	{
 		ModelID:        "cli-npx-claude-opus-thinking",
@@ -505,6 +520,7 @@ var All = []CLISpec{
 		ParseUsageLine: claudeParseUsageLine,
 		UseCrushMCP:    true,
 		NoPTY:          true,
+		SupportsResume: true,
 	},
 	{
 		ModelID:              "cli-gemini-flash",
@@ -624,12 +640,13 @@ func Available() []CLISpec {
 }
 
 type cliProvider struct {
-	workingDir string
-	yoloFn     func() bool
-	perms      permission.Service
-	sessions   session.Service
-	mcpProxy   ExternalMCPProxy
-	specs      map[string]CLISpec
+	workingDir    string
+	yoloFn        func() bool
+	perms         permission.Service
+	sessions      session.Service
+	mcpProxy      ExternalMCPProxy
+	specs         map[string]CLISpec
+	cliSessionIDs *csync.Map[string, string] // crush session key → CLI session ID for --resume
 }
 
 // ExternalMCPTool describes an external MCP tool to expose through the crush MCP bridge.
@@ -660,7 +677,15 @@ func New(workingDir string, yoloFn func() bool, perms permission.Service, sessio
 	for _, s := range All {
 		specs[s.ModelID] = s
 	}
-	return &cliProvider{workingDir: workingDir, yoloFn: yoloFn, perms: perms, sessions: sessions, mcpProxy: mcpProxy, specs: specs}
+	return &cliProvider{
+		workingDir:    workingDir,
+		yoloFn:        yoloFn,
+		perms:         perms,
+		sessions:      sessions,
+		mcpProxy:      mcpProxy,
+		specs:         specs,
+		cliSessionIDs: csync.NewMap[string, string](),
+	}
 }
 
 func (p *cliProvider) Name() string { return ProviderID }
@@ -670,12 +695,13 @@ func (p *cliProvider) LanguageModel(_ context.Context, modelID string) (fantasy.
 	if !ok {
 		return nil, fmt.Errorf("unknown CLI model: %q", modelID)
 	}
-	return &cliModel{spec: spec, workingDir: p.workingDir, yoloFn: p.yoloFn, perms: p.perms, sessions: p.sessions, mcpProxy: p.mcpProxy}, nil
+	return &cliModel{spec: spec, workingDir: p.workingDir, yoloFn: p.yoloFn, perms: p.perms, sessions: p.sessions, mcpProxy: p.mcpProxy, cliSessionIDs: p.cliSessionIDs}, nil
 }
 
 type cliModel struct {
-	spec       CLISpec
-	mcpProxy   ExternalMCPProxy
+	spec          CLISpec
+	mcpProxy      ExternalMCPProxy
+	cliSessionIDs *csync.Map[string, string]
 	workingDir string
 	yoloFn     func() bool
 	perms      permission.Service
@@ -733,6 +759,9 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 
 	prompt := formatPrompt(call.Prompt, filePaths)
 
+	// Will be overridden below if resuming (only the new user message is needed).
+	var resumePrompt string
+
 	args := m.spec.BuildArgs(yolo)
 
 	// Apply dynamic reasoning effort from context, replacing any hardcoded
@@ -753,6 +782,25 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 
 	// Extract session ID from context (set by agent.go before calling Stream).
 	sessionID, _ := ctx.Value(SessionIDContextKey).(string)
+
+	// Resume a previous CLI session if available, to leverage API prompt caching.
+	// The key includes the model ID so switching models starts a fresh session.
+	var resuming bool
+	var cliSessionKey string
+	if m.spec.SupportsResume && sessionID != "" {
+		cliSessionKey = sessionID + ":" + m.spec.ModelID
+		if cliSessID, ok := m.cliSessionIDs.Get(cliSessionKey); ok {
+			args = append(args, "--resume", cliSessID)
+			resuming = true
+			// When resuming, only send the latest user message — the CLI
+			// already has the full history in its own DB.
+			resumePrompt = extractLatestUserMessage(call.Prompt, filePaths)
+			slog.Info("cliprovider: resuming CLI session", "crushSession", sessionID, "cliSession", cliSessID, "resumePromptLen", len(resumePrompt))
+		}
+	}
+	if resuming {
+		prompt = resumePrompt
+	}
 
 	// When running in non-yolo mode with a spec that opts into crush's MCP
 	// server, start an in-process MCP server and pass its config to the CLI
@@ -1194,6 +1242,15 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 				slog.Debug("cliprovider: raw line", "raw", string(raw))
 				line := bytes.TrimSpace(ansiEscape.ReplaceAll(raw, nil))
 
+				// Capture CLI session ID from the system init event for --resume.
+				if m.spec.SupportsResume && cliSessionKey != "" {
+					var initEv streamEvent
+					if json.Unmarshal(line, &initEv) == nil && initEv.Type == "system" && initEv.Subtype == "init" && initEv.SessionID != "" {
+						m.cliSessionIDs.Set(cliSessionKey, initEv.SessionID)
+						slog.Info("cliprovider: captured CLI session ID", "key", cliSessionKey, "cliSession", initEv.SessionID)
+					}
+				}
+
 				if m.spec.ParseUsageLine != nil {
 					if u, ok := m.spec.ParseUsageLine(line); ok {
 						finalUsage = u
@@ -1238,6 +1295,11 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 
 		stderr, waitErr := proc.wait()
 		slog.Info("cliprovider: process finished", "binary", m.spec.Binary, "err", waitErr, "stderrLen", len(stderr))
+		// If resume failed, clear the stale CLI session mapping so next call starts fresh.
+		if waitErr != nil && resuming && cliSessionKey != "" {
+			m.cliSessionIDs.Del(cliSessionKey)
+			slog.Warn("cliprovider: resume failed, cleared CLI session mapping", "key", cliSessionKey)
+		}
 		if waitErr != nil {
 			var exitErr error
 			if stderr != "" {
@@ -1314,6 +1376,30 @@ func saveFileParts(msgs fantasy.Prompt) (tempDir string, filePaths map[int][]str
 // CLI model receives as much context as possible.
 // filePaths maps message indices to on-disk file paths for attached files;
 // nil means no files were attached.
+// extractLatestUserMessage returns only the text of the last user message
+// from the prompt, for use with --resume where the CLI already has history.
+func extractLatestUserMessage(msgs fantasy.Prompt, filePaths map[int][]string) string {
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == fantasy.MessageRoleUser {
+			text := extractText(msgs[i])
+			files := filePaths[i]
+			if len(files) > 0 {
+				var sb strings.Builder
+				sb.WriteString(text)
+				for _, f := range files {
+					sb.WriteString("\n[Attached file: ")
+					sb.WriteString(f)
+					sb.WriteString("]")
+				}
+				return sb.String()
+			}
+			return text
+		}
+	}
+	// Fallback: full prompt if no user message found.
+	return formatPrompt(msgs, filePaths)
+}
+
 func formatPrompt(msgs fantasy.Prompt, filePaths map[int][]string) string {
 	var sb strings.Builder
 	for i, msg := range msgs {
