@@ -151,6 +151,16 @@ func (m *Message) Content() TextContent {
 	return TextContent{}
 }
 
+func (m *Message) FullText() string {
+	var parts []string
+	for _, part := range m.Parts {
+		if c, ok := part.(TextContent); ok {
+			parts = append(parts, c.Text)
+		}
+	}
+	return strings.Join(parts, "\n\n")
+}
+
 func (m *Message) ReasoningContent() ReasoningContent {
 	for _, part := range m.Parts {
 		if c, ok := part.(ReasoningContent); ok {

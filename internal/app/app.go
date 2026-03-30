@@ -245,6 +245,7 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt,
 
 	messageEvents := app.Messages.Subscribe(ctx)
 	messageReadBytes := make(map[string]int)
+	seenToolCalls := make(map[string]bool)
 	var printed bool
 
 	defer func() {
@@ -281,7 +282,16 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt,
 			if msg.SessionID == sess.ID && msg.Role == message.Assistant && len(msg.Parts) > 0 {
 				stopSpinner()
 
-				content := msg.Content().String()
+				if stderrTTY {
+					for _, p := range msg.Parts {
+						if tc, ok := p.(message.ToolCall); ok && tc.Name != "" && !seenToolCalls[tc.ID] {
+							seenToolCalls[tc.ID] = true
+							fmt.Fprintf(os.Stderr, "\r"+ansi.EraseEntireLine+"▶ %s\n", tc.Name)
+						}
+					}
+				}
+
+				content := msg.FullText()
 				readBytes := messageReadBytes[msg.ID]
 
 				if len(content) < readBytes {
