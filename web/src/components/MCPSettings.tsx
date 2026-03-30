@@ -237,6 +237,9 @@ function ServerRow({ info, onRemove }: { info: MCPServerInfo; onRemove: () => vo
           <div className="flex items-center gap-2">
             <span className="text-sm font-semibold text-text truncate">{info.name}</span>
             <StatusBadge info={info} />
+            {info.source === "external" && (
+              <span className="px-1.5 py-0.5 text-[10px] font-mono bg-surface text-text-subtle rounded">.mcp.json</span>
+            )}
           </div>
           {info.serverType && (
             <span className="text-[11px] text-text-subtle font-mono">
@@ -248,14 +251,16 @@ function ServerRow({ info, onRemove }: { info: MCPServerInfo; onRemove: () => vo
         </div>
 
         <div className="flex items-center gap-1 shrink-0">
-          {/* Edit */}
-          <button
-            onClick={() => setEditing(true)}
-            title="Edit server"
-            className="p-1 text-text-subtle hover:text-accent transition-colors rounded"
-          >
-            <Pencil size={14} />
-          </button>
+          {/* Edit (not available for external/.mcp.json servers) */}
+          {info.source !== "external" && (
+            <button
+              onClick={() => setEditing(true)}
+              title="Edit server"
+              className="p-1 text-text-subtle hover:text-accent transition-colors rounded"
+            >
+              <Pencil size={14} />
+            </button>
+          )}
 
           {/* Toggle */}
           <button
@@ -266,27 +271,31 @@ function ServerRow({ info, onRemove }: { info: MCPServerInfo; onRemove: () => vo
             {info.disabled ? <ToggleLeft size={22} /> : <ToggleRight size={22} />}
           </button>
 
-          {/* Remove */}
-          {confirmRemove ? (
-            <div className="flex items-center gap-1 ml-1">
-              <span className="text-xs text-text-subtle">Remove?</span>
-              <button
-                onClick={() => { onRemove(); setConfirmRemove(false); }}
-                className="px-2 py-0.5 text-xs font-medium bg-red-fill text-white/90 rounded hover:opacity-90 transition-opacity"
-              >Yes</button>
-              <button
-                onClick={() => setConfirmRemove(false)}
-                className="px-2 py-0.5 text-xs text-text-subtle hover:text-text transition-colors rounded"
-              >No</button>
-            </div>
-          ) : (
-            <button
-              onClick={() => setConfirmRemove(true)}
-              title="Remove server"
-              className="p-1 text-text-subtle hover:text-red transition-colors rounded"
-            >
-              <Trash2 size={14} />
-            </button>
+          {/* Remove (not available for external/.mcp.json servers) */}
+          {info.source !== "external" && (
+            <>
+              {confirmRemove ? (
+                <div className="flex items-center gap-1 ml-1">
+                  <span className="text-xs text-text-subtle">Remove?</span>
+                  <button
+                    onClick={() => { onRemove(); setConfirmRemove(false); }}
+                    className="px-2 py-0.5 text-xs font-medium bg-red-fill text-white/90 rounded hover:opacity-90 transition-opacity"
+                  >Yes</button>
+                  <button
+                    onClick={() => setConfirmRemove(false)}
+                    className="px-2 py-0.5 text-xs text-text-subtle hover:text-text transition-colors rounded"
+                  >No</button>
+                </div>
+              ) : (
+                <button
+                  onClick={() => setConfirmRemove(true)}
+                  title="Remove server"
+                  className="p-1 text-text-subtle hover:text-red transition-colors rounded"
+                >
+                  <Trash2 size={14} />
+                </button>
+              )}
+            </>
           )}
         </div>
       </div>

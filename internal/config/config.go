@@ -166,6 +166,16 @@ const (
 	MCPHttp  MCPType = "http"
 )
 
+// MCPSource identifies where an MCP server configuration originated.
+type MCPSource string
+
+const (
+	// MCPSourceUser is the default: configured in crush.json by the user.
+	MCPSourceUser MCPSource = ""
+	// MCPSourceExternal means the server was loaded from a .mcp.json file.
+	MCPSourceExternal MCPSource = "external"
+)
+
 type MCPConfig struct {
 	Command       string            `json:"command,omitempty" jsonschema:"description=Command to execute for stdio MCP servers,example=npx"`
 	Env           map[string]string `json:"env,omitempty" jsonschema:"description=Environment variables to set for the MCP server"`
@@ -178,6 +188,9 @@ type MCPConfig struct {
 
 	// TODO: maybe make it possible to get the value from the env
 	Headers map[string]string `json:"headers,omitempty" jsonschema:"description=HTTP headers for HTTP/SSE MCP servers"`
+
+	// Source tracks where this config came from (runtime only, not serialized).
+	Source MCPSource `json:"-"`
 }
 
 type LSPConfig struct {

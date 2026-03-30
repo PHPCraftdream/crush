@@ -71,6 +71,13 @@ func Load(workingDir, dataDir string, debug bool) (*ConfigStore, error) {
 		}
 	}
 
+	// Load MCP servers from .mcp.json files (Claude Code format) and merge
+	// them into the config. Servers defined in crush.json take precedence;
+	// the disabled state for external servers is read from crush's own config.
+	if external := loadExternalMCPServers(workingDir); len(external) > 0 {
+		mergeExternalMCPServers(cfg, store, external)
+	}
+
 	if !isInsideWorktree() {
 		const depth = 2
 		const items = 100

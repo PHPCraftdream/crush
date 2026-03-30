@@ -250,6 +250,7 @@ func buildMCPSnapshot(cfg *config.Config) MCPSnapshot {
 				srv.URL = mcpCfg.URL
 				srv.Env = mcpCfg.Env
 				srv.Headers = mcpCfg.Headers
+				srv.Source = string(mcpCfg.Source)
 			}
 		}
 		servers = append(servers, srv)

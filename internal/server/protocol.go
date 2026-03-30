@@ -249,6 +249,7 @@ type MCPServerInfo struct {
 	URL        string            `json:"url,omitempty"`
 	Env        map[string]string `json:"env,omitempty"`
 	Headers    map[string]string `json:"headers,omitempty"`
+	Source     string            `json:"source,omitempty"`
 }
 
 // MCPSnapshot is the full MCP state broadcast to clients.

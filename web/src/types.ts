@@ -192,6 +192,7 @@ export interface MCPServerInfo {
   url?: string;
   env?: Record<string, string>;
   headers?: Record<string, string>;
+  source?: string;
 }
 
 export interface MCPState {

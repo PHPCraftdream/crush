@@ -308,8 +308,13 @@ func DisableServer(ctx context.Context, cfg *config.ConfigStore, name string) er
 	c := cfg.Config()
 	c.MCP[name] = mcpCfg
 
-	// Persist to config file
-	if err := cfg.SetConfigField(config.ScopeGlobal, fmt.Sprintf("mcp.%s.disabled", name), true); err != nil {
+	// External servers (.mcp.json) persist disabled state to workspace config;
+	// user-configured servers persist to global config.
+	scope := config.ScopeGlobal
+	if mcpCfg.Source == config.MCPSourceExternal {
+		scope = config.ScopeWorkspace
+	}
+	if err := cfg.SetConfigField(scope, fmt.Sprintf("mcp.%s.disabled", name), true); err != nil {
 		slog.Warn("Failed to persist MCP disabled state", "name", name, "err", err)
 	}
 
@@ -328,8 +333,13 @@ func EnableServer(ctx context.Context, cfg *config.ConfigStore, name string) err
 	c := cfg.Config()
 	c.MCP[name] = mcpCfg
 
-	// Persist to config file
-	if err := cfg.SetConfigField(config.ScopeGlobal, fmt.Sprintf("mcp.%s.disabled", name), false); err != nil {
+	// External servers (.mcp.json) persist enabled state to workspace config;
+	// user-configured servers persist to global config.
+	scope := config.ScopeGlobal
+	if mcpCfg.Source == config.MCPSourceExternal {
+		scope = config.ScopeWorkspace
+	}
+	if err := cfg.SetConfigField(scope, fmt.Sprintf("mcp.%s.disabled", name), false); err != nil {
 		slog.Warn("Failed to persist MCP enabled state", "name", name, "err", err)
 	}
 
@@ -374,10 +384,15 @@ func AddServer(ctx context.Context, cfg *config.ConfigStore, name string, mcpCfg
 }
 
 // RemoveServer removes an MCP server, closes its session, and removes it from config.
+// External servers (from .mcp.json) cannot be removed — only disabled.
 func RemoveServer(cfg *config.ConfigStore, name string) error {
 	c := cfg.Config()
-	if _, exists := c.MCP[name]; !exists {
+	mcpCfg, exists := c.MCP[name]
+	if !exists {
 		return fmt.Errorf("MCP server %q not found", name)
+	}
+	if mcpCfg.Source == config.MCPSourceExternal {
+		return fmt.Errorf("MCP server %q is from .mcp.json and cannot be removed (disable it instead)", name)
 	}
 
 	// Close session
