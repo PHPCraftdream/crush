@@ -892,12 +892,20 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 	// TodoWrite tool that writes to a local file unknown to the crush UI.
 	if mcpSrv != nil {
 		allowed := []string{
+			// Crush MCP bridge tools (go through crush's permission system).
 			"mcp__crush__Bash",
 			"mcp__crush__Read",
 			"mcp__crush__Write",
 			"mcp__crush__Glob",
 			"mcp__crush__Grep",
 			"mcp__crush__todos",
+			// CLI built-in tools that crush doesn't replicate.
+			// These are safe read-only or internal tools that don't need
+			// crush's permission system.
+			"WebSearch",
+			"WebFetch",
+			"Task",
+			"Agent",
 		}
 		// Include external MCP tools registered on the crush MCP bridge.
 		if m.mcpProxy != nil {
