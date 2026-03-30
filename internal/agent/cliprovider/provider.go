@@ -978,24 +978,44 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 			"args", strings.Join(args, " "),
 			"useStdin", useStdin,
 			"promptLen", len(prompt),
+			"noPTY", m.spec.NoPTY,
 		)
+
+		// For NoPTY models (e.g. npx wrappers), merge stdout and stderr
+		// into a single reader. Claude CLI may send JSON to stderr when
+		// the prompt is delivered via stdin instead of -p flag.
+		var reader io.Reader
 		var stderrBuf bytes.Buffer
-		cmd.Stderr = &stderrBuf
-		pipe, pipeErr := cmd.StdoutPipe()
-		if pipeErr != nil {
-			return nil, fmt.Errorf("stdout pipe: %w", pipeErr)
-		}
-		if startErr := cmd.Start(); startErr != nil {
-			return nil, fmt.Errorf("start %s: %w", m.spec.Binary, startErr)
+		if m.spec.NoPTY {
+			pr, pw, pipeErr := os.Pipe()
+			if pipeErr != nil {
+				return nil, fmt.Errorf("os.Pipe: %w", pipeErr)
+			}
+			cmd.Stdout = pw
+			cmd.Stderr = pw
+			if startErr := cmd.Start(); startErr != nil {
+				_ = pr.Close()
+				_ = pw.Close()
+				return nil, fmt.Errorf("start %s: %w", m.spec.Binary, startErr)
+			}
+			_ = pw.Close() // close write-end in parent so reader gets EOF
+			reader = pr
+		} else {
+			cmd.Stderr = &stderrBuf
+			pipe, pipeErr := cmd.StdoutPipe()
+			if pipeErr != nil {
+				return nil, fmt.Errorf("stdout pipe: %w", pipeErr)
+			}
+			if startErr := cmd.Start(); startErr != nil {
+				return nil, fmt.Errorf("start %s: %w", m.spec.Binary, startErr)
+			}
+			reader = pipe
 		}
 		slog.Info("cliprovider: process started", "binary", m.spec.Binary, "pid", cmd.Process.Pid)
 		proc = procHandle{
-			stdout:   pipe,
+			stdout:   reader,
 			usingPTY: false,
 			kill: func() {
-				// Just kill the process; do NOT call cmd.Wait() here.
-				// exec.CommandContext already handles killing on ctx cancellation.
-				// wait() below is the only place cmd.Wait() is called.
 				if cmd.Process != nil {
 					_ = cmd.Process.Kill()
 				}
