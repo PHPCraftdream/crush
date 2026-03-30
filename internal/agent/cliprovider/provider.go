@@ -301,10 +301,11 @@ func claudeArgs(model string, extra ...string) func(bool) []string {
 }
 
 // npxClaudeArgs returns a BuildArgs func for claude invoked via npx @anthropic-ai/claude-code.
+// --yes skips the install confirmation prompt that npx may show.
 func npxClaudeArgs(model string, extra ...string) func(bool) []string {
 	inner := claudeArgs(model, extra...)
 	return func(yolo bool) []string {
-		return append([]string{"@anthropic-ai/claude-code"}, inner(yolo)...)
+		return append([]string{"--yes", "@anthropic-ai/claude-code"}, inner(yolo)...)
 	}
 }
 
@@ -449,50 +450,52 @@ var All = []CLISpec{
 		ParseUsageLine: claudeParseUsageLine,
 		UseCrushMCP:    true,
 	},
-	// npx @anthropic-ai/claude-code variants
+	// npx @anthropic-ai/claude-code variants.
+	// AlwaysStdin is required because npx.cmd on Windows doesn't relay
+	// child-process output through ConPTY reliably.
 	{
 		ModelID:        "cli-npx-claude-sonnet",
 		ModelName:      "Claude Sonnet (npx)",
 		ContextWindow:  1_000_000,
 		Binary:         "npx",
-		PromptFlag:     "-p",
 		BuildArgs:      npxClaudeArgs("sonnet"),
 		NewPartParser:  claudePartParser,
 		ParseUsageLine: claudeParseUsageLine,
 		UseCrushMCP:    true,
+		AlwaysStdin:    true,
 	},
 	{
 		ModelID:        "cli-npx-claude-opus",
 		ModelName:      "Claude Opus (npx)",
 		ContextWindow:  1_000_000,
 		Binary:         "npx",
-		PromptFlag:     "-p",
 		BuildArgs:      npxClaudeArgs("opus"),
 		NewPartParser:  claudePartParser,
 		ParseUsageLine: claudeParseUsageLine,
 		UseCrushMCP:    true,
+		AlwaysStdin:    true,
 	},
 	{
 		ModelID:        "cli-npx-claude-sonnet-thinking",
 		ModelName:      "Claude Sonnet Thinking (npx)",
 		ContextWindow:  1_000_000,
 		Binary:         "npx",
-		PromptFlag:     "-p",
 		BuildArgs:      npxClaudeArgs("sonnet", "--effort", "high"),
 		NewPartParser:  claudePartParser,
 		ParseUsageLine: claudeParseUsageLine,
 		UseCrushMCP:    true,
+		AlwaysStdin:    true,
 	},
 	{
 		ModelID:        "cli-npx-claude-opus-thinking",
 		ModelName:      "Claude Opus Thinking (npx)",
 		ContextWindow:  1_000_000,
 		Binary:         "npx",
-		PromptFlag:     "-p",
 		BuildArgs:      npxClaudeArgs("opus", "--effort", "high"),
 		NewPartParser:  claudePartParser,
 		ParseUsageLine: claudeParseUsageLine,
 		UseCrushMCP:    true,
+		AlwaysStdin:    true,
 	},
 	{
 		ModelID:              "cli-gemini-flash",
