@@ -982,23 +982,31 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 		)
 
 		// For NoPTY models (e.g. npx wrappers), merge stdout and stderr
-		// into a single reader. Claude CLI may send JSON to stderr when
-		// the prompt is delivered via stdin instead of -p flag.
+		// into a single reader via io.Pipe + concurrent copy goroutines.
+		// Claude CLI may send JSON to stderr when the prompt is delivered
+		// via stdin instead of -p flag. We use cmd.StdoutPipe/StderrPipe
+		// (not os.Pipe) because Go's exec package handles Windows handle
+		// inheritance correctly for those.
 		var reader io.Reader
 		var stderrBuf bytes.Buffer
 		if m.spec.NoPTY {
-			pr, pw, pipeErr := os.Pipe()
+			stdoutPipe, pipeErr := cmd.StdoutPipe()
 			if pipeErr != nil {
-				return nil, fmt.Errorf("os.Pipe: %w", pipeErr)
+				return nil, fmt.Errorf("stdout pipe: %w", pipeErr)
 			}
-			cmd.Stdout = pw
-			cmd.Stderr = pw
+			stderrPipe, pipeErr := cmd.StderrPipe()
+			if pipeErr != nil {
+				return nil, fmt.Errorf("stderr pipe: %w", pipeErr)
+			}
 			if startErr := cmd.Start(); startErr != nil {
-				_ = pr.Close()
-				_ = pw.Close()
 				return nil, fmt.Errorf("start %s: %w", m.spec.Binary, startErr)
 			}
-			_ = pw.Close() // close write-end in parent so reader gets EOF
+			pr, pw := io.Pipe()
+			var copyWg sync.WaitGroup
+			copyWg.Add(2)
+			go func() { _, _ = io.Copy(pw, stdoutPipe); copyWg.Done() }()
+			go func() { _, _ = io.Copy(pw, stderrPipe); copyWg.Done() }()
+			go func() { copyWg.Wait(); pw.Close() }()
 			reader = pr
 		} else {
 			cmd.Stderr = &stderrBuf
