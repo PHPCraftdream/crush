@@ -98,6 +98,11 @@ type CLISpec struct {
 	// mode rather than emitting JSON, even when --output-format stream-json
 	// is specified.
 	AlwaysStdin bool
+	// NoPTY skips PTY mode and always uses pipe-based I/O, while still
+	// passing the prompt via PromptFlag (unlike AlwaysStdin which also
+	// forces stdin delivery). Use this for wrapper binaries like npx.cmd
+	// that don't relay child-process output through ConPTY on Windows.
+	NoPTY bool
 	// QwenMCPIntegration starts crush's MCP server and registers it in
 	// ~/.qwen/settings.json under a stable per-project ID stored in
 	// <workingDir>/.crush/qwen-mcp-id. The entry is removed when the CLI
@@ -451,51 +456,55 @@ var All = []CLISpec{
 		UseCrushMCP:    true,
 	},
 	// npx @anthropic-ai/claude-code variants.
-	// AlwaysStdin is required because npx.cmd on Windows doesn't relay
+	// NoPTY is required because npx.cmd on Windows doesn't relay
 	// child-process output through ConPTY reliably.
 	{
 		ModelID:        "cli-npx-claude-sonnet",
 		ModelName:      "Claude Sonnet (npx)",
 		ContextWindow:  1_000_000,
 		Binary:         "npx",
+		PromptFlag:     "-p",
 		BuildArgs:      npxClaudeArgs("sonnet"),
 		NewPartParser:  claudePartParser,
 		ParseUsageLine: claudeParseUsageLine,
 		UseCrushMCP:    true,
-		AlwaysStdin:    true,
+		NoPTY:          true,
 	},
 	{
 		ModelID:        "cli-npx-claude-opus",
 		ModelName:      "Claude Opus (npx)",
 		ContextWindow:  1_000_000,
 		Binary:         "npx",
+		PromptFlag:     "-p",
 		BuildArgs:      npxClaudeArgs("opus"),
 		NewPartParser:  claudePartParser,
 		ParseUsageLine: claudeParseUsageLine,
 		UseCrushMCP:    true,
-		AlwaysStdin:    true,
+		NoPTY:          true,
 	},
 	{
 		ModelID:        "cli-npx-claude-sonnet-thinking",
 		ModelName:      "Claude Sonnet Thinking (npx)",
 		ContextWindow:  1_000_000,
 		Binary:         "npx",
+		PromptFlag:     "-p",
 		BuildArgs:      npxClaudeArgs("sonnet", "--effort", "high"),
 		NewPartParser:  claudePartParser,
 		ParseUsageLine: claudeParseUsageLine,
 		UseCrushMCP:    true,
-		AlwaysStdin:    true,
+		NoPTY:          true,
 	},
 	{
 		ModelID:        "cli-npx-claude-opus-thinking",
 		ModelName:      "Claude Opus Thinking (npx)",
 		ContextWindow:  1_000_000,
 		Binary:         "npx",
+		PromptFlag:     "-p",
 		BuildArgs:      npxClaudeArgs("opus", "--effort", "high"),
 		NewPartParser:  claudePartParser,
 		ParseUsageLine: claudeParseUsageLine,
 		UseCrushMCP:    true,
-		AlwaysStdin:    true,
+		NoPTY:          true,
 	},
 	{
 		ModelID:              "cli-gemini-flash",
@@ -899,7 +908,7 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 
 	var proc procHandle
 
-	if !useStdin {
+	if !useStdin && !m.spec.NoPTY {
 		// Use a PTY so the subprocess (e.g. Node.js claude CLI) sees a TTY on
 		// stdout and does not buffer output internally. go-pty supports both
 		// Unix PTY and Windows ConPTY transparently.
@@ -964,6 +973,12 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 		if useStdin {
 			cmd.Stdin = strings.NewReader(prompt)
 		}
+		slog.Info("cliprovider: launching pipe mode",
+			"binary", m.spec.Binary,
+			"args", strings.Join(args, " "),
+			"useStdin", useStdin,
+			"promptLen", len(prompt),
+		)
 		var stderrBuf bytes.Buffer
 		cmd.Stderr = &stderrBuf
 		pipe, pipeErr := cmd.StdoutPipe()
@@ -973,6 +988,7 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 		if startErr := cmd.Start(); startErr != nil {
 			return nil, fmt.Errorf("start %s: %w", m.spec.Binary, startErr)
 		}
+		slog.Info("cliprovider: process started", "binary", m.spec.Binary, "pid", cmd.Process.Pid)
 		proc = procHandle{
 			stdout:   pipe,
 			usingPTY: false,
@@ -985,7 +1001,11 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 				}
 			},
 			wait: func() (string, error) {
-				return strings.TrimSpace(stderrBuf.String()), cmd.Wait()
+				stderr := strings.TrimSpace(stderrBuf.String())
+				if stderr != "" {
+					slog.Warn("cliprovider: process stderr", "binary", m.spec.Binary, "stderr", stderr)
+				}
+				return stderr, cmd.Wait()
 			},
 		}
 	}
@@ -1155,6 +1175,7 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 		}
 
 		stderr, waitErr := proc.wait()
+		slog.Info("cliprovider: process finished", "binary", m.spec.Binary, "err", waitErr, "stderrLen", len(stderr))
 		if waitErr != nil {
 			var exitErr error
 			if stderr != "" {
