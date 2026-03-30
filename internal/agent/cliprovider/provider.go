@@ -889,7 +889,7 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 		}
 	}
 
-	useStdin := m.spec.AlwaysStdin || len(prompt) > maxPromptArgLen
+	useStdin := m.spec.AlwaysStdin || m.spec.NoPTY || len(prompt) > maxPromptArgLen
 	if !useStdin && m.spec.PromptFlag != "" {
 		args = append(args, m.spec.PromptFlag, prompt)
 	}
