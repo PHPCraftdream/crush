@@ -21,7 +21,7 @@ const EFFORT_LABELS: Record<string, string> = { low: "L", medium: "M", high: "H"
 
 // Returns true if the model is a CLI Claude model (supports reasoning_effort)
 function isCLIClaudeModel(provider: string, model: string): boolean {
-  return provider === "local-cli" && model.startsWith("cli-claude-");
+  return provider === "local-cli" && (model.startsWith("cli-claude-") || model.startsWith("cli-npx-claude-"));
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
