@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log/slog"
 	"mime"
@@ -267,6 +268,20 @@ func claudeParseUsageLine(line []byte) (fantasy.Usage, bool) {
 	inputTotal := ev.Usage.InputTokens + ev.Usage.CacheCreationInputTokens + ev.Usage.CacheReadInputTokens
 	if inputTotal == 0 && ev.Usage.OutputTokens == 0 {
 		return fantasy.Usage{}, false
+	}
+	// Log cache statistics for visibility.
+	if inputTotal > 0 {
+		cacheHitPct := float64(0)
+		if inputTotal > 0 {
+			cacheHitPct = float64(ev.Usage.CacheReadInputTokens) / float64(inputTotal) * 100
+		}
+		slog.Info("cliprovider: token usage",
+			"input", ev.Usage.InputTokens,
+			"cache_create", ev.Usage.CacheCreationInputTokens,
+			"cache_read", ev.Usage.CacheReadInputTokens,
+			"output", ev.Usage.OutputTokens,
+			"cache_hit_pct", fmt.Sprintf("%.1f%%", cacheHitPct),
+		)
 	}
 	return fantasy.Usage{
 		InputTokens:  inputTotal,
@@ -639,6 +654,14 @@ func Available() []CLISpec {
 	return result
 }
 
+// cliSessionEntry stores a CLI session ID along with a hash of the conversation
+// prefix (all messages except the last), so we can detect edits/deletes that
+// would make the CLI session's history stale.
+type cliSessionEntry struct {
+	CLISessionID string
+	PrefixHash   uint64
+}
+
 type cliProvider struct {
 	workingDir    string
 	yoloFn        func() bool
@@ -646,7 +669,7 @@ type cliProvider struct {
 	sessions      session.Service
 	mcpProxy      ExternalMCPProxy
 	specs         map[string]CLISpec
-	cliSessionIDs *csync.Map[string, string] // crush session key → CLI session ID for --resume
+	cliSessions   *csync.Map[string, cliSessionEntry] // crush session key → CLI session entry
 }
 
 // ExternalMCPTool describes an external MCP tool to expose through the crush MCP bridge.
@@ -684,7 +707,7 @@ func New(workingDir string, yoloFn func() bool, perms permission.Service, sessio
 		sessions:      sessions,
 		mcpProxy:      mcpProxy,
 		specs:         specs,
-		cliSessionIDs: csync.NewMap[string, string](),
+		cliSessions: csync.NewMap[string, cliSessionEntry](),
 	}
 }
 
@@ -695,13 +718,13 @@ func (p *cliProvider) LanguageModel(_ context.Context, modelID string) (fantasy.
 	if !ok {
 		return nil, fmt.Errorf("unknown CLI model: %q", modelID)
 	}
-	return &cliModel{spec: spec, workingDir: p.workingDir, yoloFn: p.yoloFn, perms: p.perms, sessions: p.sessions, mcpProxy: p.mcpProxy, cliSessionIDs: p.cliSessionIDs}, nil
+	return &cliModel{spec: spec, workingDir: p.workingDir, yoloFn: p.yoloFn, perms: p.perms, sessions: p.sessions, mcpProxy: p.mcpProxy, cliSessions: p.cliSessions}, nil
 }
 
 type cliModel struct {
-	spec          CLISpec
-	mcpProxy      ExternalMCPProxy
-	cliSessionIDs *csync.Map[string, string]
+	spec        CLISpec
+	mcpProxy    ExternalMCPProxy
+	cliSessions *csync.Map[string, cliSessionEntry]
 	workingDir string
 	yoloFn     func() bool
 	perms      permission.Service
@@ -785,17 +808,26 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 
 	// Resume a previous CLI session if available, to leverage API prompt caching.
 	// The key includes the model ID so switching models starts a fresh session.
+	// We also hash the conversation prefix (all messages except the last user
+	// message) and only resume if the hash matches — this detects edits/deletes
+	// that would make the CLI session's history stale.
 	var resuming bool
 	var cliSessionKey string
+	var prefixHash uint64
 	if m.spec.SupportsResume && sessionID != "" {
 		cliSessionKey = sessionID + ":" + m.spec.ModelID
-		if cliSessID, ok := m.cliSessionIDs.Get(cliSessionKey); ok {
-			args = append(args, "--resume", cliSessID)
-			resuming = true
-			// When resuming, only send the latest user message — the CLI
-			// already has the full history in its own DB.
-			resumePrompt = extractLatestUserMessage(call.Prompt, filePaths)
-			slog.Info("cliprovider: resuming CLI session", "crushSession", sessionID, "cliSession", cliSessID, "resumePromptLen", len(resumePrompt))
+		prefixHash = hashPromptPrefix(call.Prompt)
+		if entry, ok := m.cliSessions.Get(cliSessionKey); ok {
+			if entry.PrefixHash == prefixHash {
+				args = append(args, "--resume", entry.CLISessionID)
+				resuming = true
+				resumePrompt = extractLatestUserMessage(call.Prompt, filePaths)
+				slog.Info("cliprovider: resuming CLI session", "crushSession", sessionID, "cliSession", entry.CLISessionID, "resumePromptLen", len(resumePrompt))
+			} else {
+				// History was edited/deleted — start fresh CLI session.
+				m.cliSessions.Del(cliSessionKey)
+				slog.Info("cliprovider: conversation prefix changed, starting fresh CLI session", "crushSession", sessionID)
+			}
 		}
 	}
 	if resuming {
@@ -1246,7 +1278,7 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 				if m.spec.SupportsResume && cliSessionKey != "" {
 					var initEv streamEvent
 					if json.Unmarshal(line, &initEv) == nil && initEv.Type == "system" && initEv.Subtype == "init" && initEv.SessionID != "" {
-						m.cliSessionIDs.Set(cliSessionKey, initEv.SessionID)
+						m.cliSessions.Set(cliSessionKey, cliSessionEntry{CLISessionID: initEv.SessionID, PrefixHash: prefixHash})
 						slog.Info("cliprovider: captured CLI session ID", "key", cliSessionKey, "cliSession", initEv.SessionID)
 					}
 				}
@@ -1297,7 +1329,7 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 		slog.Info("cliprovider: process finished", "binary", m.spec.Binary, "err", waitErr, "stderrLen", len(stderr))
 		// If resume failed, clear the stale CLI session mapping so next call starts fresh.
 		if waitErr != nil && resuming && cliSessionKey != "" {
-			m.cliSessionIDs.Del(cliSessionKey)
+			m.cliSessions.Del(cliSessionKey)
 			slog.Warn("cliprovider: resume failed, cleared CLI session mapping", "key", cliSessionKey)
 		}
 		if waitErr != nil {
@@ -1376,6 +1408,28 @@ func saveFileParts(msgs fantasy.Prompt) (tempDir string, filePaths map[int][]str
 // CLI model receives as much context as possible.
 // filePaths maps message indices to on-disk file paths for attached files;
 // nil means no files were attached.
+// hashPromptPrefix returns a hash of all messages except the last user message.
+// Used to detect conversation edits/deletes that would make a CLI session stale.
+func hashPromptPrefix(msgs fantasy.Prompt) uint64 {
+	h := fnv.New64a()
+	// Find the last user message index.
+	lastUser := -1
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == fantasy.MessageRoleUser {
+			lastUser = i
+			break
+		}
+	}
+	// Hash everything before the last user message.
+	for i := 0; i < len(msgs); i++ {
+		if i == lastUser {
+			break
+		}
+		fmt.Fprintf(h, "%d:%s:%s\n", i, msgs[i].Role, extractText(msgs[i]))
+	}
+	return h.Sum64()
+}
+
 // extractLatestUserMessage returns only the text of the last user message
 // from the prompt, for use with --resume where the CLI already has history.
 func extractLatestUserMessage(msgs fantasy.Prompt, filePaths map[int][]string) string {
