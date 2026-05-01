@@ -1,4 +1,4 @@
-package cmd
+﻿package cmd
 
 import (
 	"context"
@@ -59,7 +59,7 @@ var rootCmd = &cobra.Command{
 crush
 
 # Run non-interactively
-crush run "Guess my 5 favorite Pokémon"
+crush run "Guess my 5 favorite Pok├⌐mon"
 
 # Run a non-interactively with pipes and redirection
 cat README.md | crush run "make this more glamorous" > GLAMOROUS_README.md
@@ -103,11 +103,11 @@ func runWebMode(cmd *cobra.Command) error {
 	onReady := func(boundAddr string) {
 		url := fmt.Sprintf("http://%s", boundAddr)
 		fmt.Println()
-		fmt.Printf("  crush web UI  →  %s\n", url)
+		fmt.Printf("  crush web UI  ΓåÆ  %s\n", url)
 		if err := clipboard.WriteAll(token); err == nil {
-			fmt.Printf("  Access token  →  %s (copied to clipboard)\n", token)
+			fmt.Printf("  Access token  ΓåÆ  %s (copied to clipboard)\n", token)
 		} else {
-			fmt.Printf("  Access token  →  %s\n", token)
+			fmt.Printf("  Access token  ΓåÆ  %s\n", token)
 		}
 		fmt.Println()
 

@@ -103,7 +103,7 @@ func mergeTodos(dbTodos []session.Todo, modelItems []TodoItem) ([]session.Todo, 
 func NewTodosTool(sessions session.Service) fantasy.AgentTool {
 	return fantasy.NewAgentTool(
 		TodosToolName,
-		string(todosDescription),
+		FirstLineDescription(todosDescription),
 		func(ctx context.Context, params TodosParams, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
 			sessionID := GetSessionFromContext(ctx)
 			if sessionID == "" {

@@ -120,16 +120,17 @@ type HourDayHeatmapPt struct {
 }
 
 func runStats(cmd *cobra.Command, _ []string) error {
-
 	dataDir, _ := cmd.Flags().GetString("data-dir")
 	ctx := cmd.Context()
 
+	cfg, err := config.Init("", dataDir, false)
+	if err != nil {
+		return fmt.Errorf("failed to initialize config: %w", err)
+	}
 	if dataDir == "" {
-		cfg, err := config.Init("", "", false)
-		if err != nil {
-			return fmt.Errorf("failed to initialize config: %w", err)
-		}
 		dataDir = cfg.Config().Options.DataDirectory
+	}
+	if shouldEnableMetrics(cfg.Config()) {
 	}
 
 	conn, err := db.Connect(ctx, dataDir)

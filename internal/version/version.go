@@ -5,13 +5,12 @@ import (
 	"runtime/debug"
 )
 
-// Build-time parameters set via -ldflags
 var (
 	Version  = "devel"
+	Commit   = "unknown"
 	BuildTime = "unknown"
 )
 
-// FullVersion returns version with build time
 func FullVersion() string {
 	if BuildTime != "unknown" {
 		return fmt.Sprintf("%s (%s)", Version, BuildTime)

@@ -1,4 +1,4 @@
-package server
+﻿package server
 
 import (
 	"context"
@@ -44,7 +44,7 @@ func subscribeAndBroadcast(ctx context.Context, a *appPkg.App, h *Hub) {
 		}
 	}()
 
-	// Messages — batch streaming updates to avoid flooding the client.
+	// Messages ΓÇö batch streaming updates to avoid flooding the client.
 	go func() {
 		ch := a.Messages.Subscribe(ctx)
 		ticker := time.NewTicker(batchInterval)
@@ -135,7 +135,7 @@ func subscribeAndBroadcast(ctx context.Context, a *appPkg.App, h *Hub) {
 		}
 	}()
 
-	// MCP state changes — broadcast a full snapshot of all servers on each event.
+	// MCP state changes ΓÇö broadcast a full snapshot of all servers on each event.
 	go func() {
 		ch := mcp.SubscribeEvents(ctx)
 		for {
@@ -151,7 +151,7 @@ func subscribeAndBroadcast(ctx context.Context, a *appPkg.App, h *Hub) {
 		}
 	}()
 
-	// LSP state changes — broadcast a full snapshot on each event.
+	// LSP state changes ΓÇö broadcast a full snapshot on each event.
 	go func() {
 		ch := appPkg.SubscribeLSPEvents(ctx)
 		for {
@@ -172,7 +172,7 @@ func subscribeAndBroadcast(ctx context.Context, a *appPkg.App, h *Hub) {
 
 	slog.Debug("ws: event subscriptions started")
 
-	// Unused imports guard — referenced through the generic channels above.
+	// Unused imports guard ΓÇö referenced through the generic channels above.
 	_ = session.Session{}
 	_ = message.Message{}
 	_ = permission.PermissionRequest{}

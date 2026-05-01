@@ -1,6 +1,7 @@
 package stringext
 
 import (
+	"encoding/base64"
 	"strings"
 	"unicode/utf8"
 
@@ -82,4 +83,19 @@ func TruncateEndAt(s string, maxLen int) (truncated string, startPos int) {
 		start++
 	}
 	return s, 0
+}
+
+// IsValidBase64 reports whether s is canonical base64 under standard
+// encoding (RFC 4648). It requires that s round-trips through
+// decode/encode unchanged — rejecting whitespace, missing padding,
+// and other leniencies that DecodeString alone would accept.
+func IsValidBase64(s string) bool {
+	if s == "" {
+		return false
+	}
+	decoded, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return false
+	}
+	return base64.StdEncoding.EncodeToString(decoded) == s
 }

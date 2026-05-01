@@ -1,4 +1,4 @@
-package cmd
+﻿package cmd
 
 import (
 	"context"
@@ -21,7 +21,7 @@ var runCmd = &cobra.Command{
 The prompt can be provided as arguments or piped from stdin.`,
 	Example: `
 # Run a simple prompt
-crush run "Guess my 5 favorite Pokémon"
+crush run "Guess my 5 favorite Pok├⌐mon"
 
 # Pipe input from stdin
 curl https://charm.land | crush run "Summarize this website"
@@ -139,5 +139,5 @@ func resolveSessionID(ctx context.Context, svc session.Service, id string) (sess
 	for _, s := range matches {
 		fmt.Fprintf(&sb, "  %s  %s\n", session.HashID(s.ID), s.Title)
 	}
-	return session.Session{}, fmt.Errorf(sb.String())
+	return session.Session{}, fmt.Errorf("%s", sb.String())
 }

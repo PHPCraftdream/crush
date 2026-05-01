@@ -1,4 +1,4 @@
-// Package hyper provides a fantasy.Provider that proxies requests to Hyper.
+﻿// Package hyper provides a fantasy.Provider that proxies requests to Hyper.
 package hyper
 
 import (

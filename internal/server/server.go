@@ -1,4 +1,4 @@
-// Package server implements the HTTP + WebSocket server for crush's web mode.
+﻿// Package server implements the HTTP + WebSocket server for crush's web mode.
 // It serves the embedded React application and bridges the app's pubsub
 // event system to connected browsers over WebSocket.
 package server
@@ -28,7 +28,7 @@ type Server struct {
 	hub    *Hub
 	auth   *Auth
 	addr   string
-	static fs.FS // embedded React dist; nil means dev-proxy mode
+	static fs.FS
 }
 
 // New creates a Server. Pass a nil staticFS to proxy the dev server instead.
@@ -59,11 +59,11 @@ func (s *Server) Start(ctx context.Context, onReady func(addr string)) error {
 
 	mux := http.NewServeMux()
 
-	// Auth endpoints — no cookie required.
+	// Auth endpoints ΓÇö no cookie required.
 	mux.HandleFunc("/auth", s.auth.HandleAuth)
 	mux.HandleFunc("/auth/check", s.auth.HandleAuthCheck)
 
-	// WebSocket — requires valid session cookie.
+	// WebSocket ΓÇö requires valid session cookie.
 	mux.Handle("/ws", s.auth.Middleware(http.HandlerFunc(s.handleWS)))
 
 	if s.static != nil {
@@ -92,7 +92,7 @@ func (s *Server) Start(ctx context.Context, onReady func(addr string)) error {
 
 	slog.Info("crush web server listening", "addr", ln.Addr().String())
 
-	// Notify caller synchronously — address is known, server not yet serving.
+	// Notify caller synchronously ΓÇö address is known, server not yet serving.
 	if onReady != nil {
 		onReady(ln.Addr().String())
 	}
@@ -163,7 +163,7 @@ func spaHandler(fsys fs.FS) http.Handler {
 			fileServer.ServeHTTP(w, r)
 			return
 		}
-		// Not found — serve index.html so React Router can handle it.
+		// Not found ΓÇö serve index.html so React Router can handle it.
 		r.URL.Path = "/"
 		fileServer.ServeHTTP(w, r)
 	})

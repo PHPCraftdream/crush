@@ -89,6 +89,22 @@ func (m *mockSessionService) IsAgentToolSession(sessionID string) bool {
 	return ok
 }
 
+func (m *mockSessionService) SetYolo(context.Context, string, bool) error {
+	return nil
+}
+
+func (m *mockSessionService) UpdateModels(context.Context, string, string, string, string, string) error {
+	return nil
+}
+
+func (m *mockSessionService) UpdateReasoningEffort(context.Context, string, string, string) error {
+	return nil
+}
+
+func (m *mockSessionService) UpdateSystemPrompt(context.Context, string, string) error {
+	return nil
+}
+
 func newTestApp(sessions session.Service) *App {
 	return &App{Sessions: sessions}
 }

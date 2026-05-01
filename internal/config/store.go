@@ -11,6 +11,7 @@ import (
 
 	"charm.land/catwalk/pkg/catwalk"
 	hyperp "github.com/charmbracelet/crush/internal/agent/hyper"
+	"github.com/charmbracelet/crush/internal/env"
 	"github.com/charmbracelet/crush/internal/oauth"
 	"github.com/charmbracelet/crush/internal/oauth/copilot"
 	"github.com/charmbracelet/crush/internal/oauth/hyper"
@@ -18,16 +19,37 @@ import (
 	"github.com/tidwall/sjson"
 )
 
+// fileSnapshot captures metadata about a config file at a point in time.
+type fileSnapshot struct {
+	Path    string
+	Exists  bool
+	Size    int64
+	ModTime int64 // UnixNano
+}
+
+// RuntimeOverrides holds per-session settings that are never persisted to
+// disk. They are applied on top of the loaded Config and survive only for
+// the lifetime of the process (or workspace).
+type RuntimeOverrides struct {
+	SkipPermissionRequests bool
+}
+
 // ConfigStore is the single entry point for all config access. It owns the
 // pure-data Config, runtime state (working directory, resolver, known
 // providers), and persistence to both global and workspace config files.
 type ConfigStore struct {
-	config         *Config
-	workingDir     string
-	resolver       VariableResolver
-	globalDataPath string // ~/.local/share/crush/crush.json
-	workspacePath  string // .crush/crush.json
-	knownProviders []catwalk.Provider
+	config             *Config
+	workingDir         string
+	resolver           VariableResolver
+	globalDataPath     string   // ~/.local/share/crush/crush.json
+	workspacePath      string   // .crush/crush.json
+	loadedPaths        []string // config files that were successfully loaded
+	knownProviders     []catwalk.Provider
+	overrides          RuntimeOverrides
+	trackedConfigPaths []string                // unique, normalized config file paths
+	snapshots          map[string]fileSnapshot // path -> snapshot at last capture
+	autoReloadDisabled bool                    // set during load/reload to prevent re-entrancy
+	reloadInProgress   bool                    // set during reload to avoid disk writes mid-reload
 }
 
 // Config returns the pure-data config struct (read-only after load).
@@ -63,20 +85,37 @@ func (s *ConfigStore) SetupAgents() {
 	s.config.SetupAgents()
 }
 
+// Overrides returns the runtime overrides for this store.
+func (s *ConfigStore) Overrides() *RuntimeOverrides {
+	return &s.overrides
+}
+
+// LoadedPaths returns the config file paths that were successfully loaded.
+func (s *ConfigStore) LoadedPaths() []string {
+	return slices.Clone(s.loadedPaths)
+}
+
 // configPath returns the file path for the given scope.
-func (s *ConfigStore) configPath(scope Scope) string {
+func (s *ConfigStore) configPath(scope Scope) (string, error) {
 	switch scope {
 	case ScopeWorkspace:
-		return s.workspacePath
+		if s.workspacePath == "" {
+			return "", ErrNoWorkspaceConfig
+		}
+		return s.workspacePath, nil
 	default:
-		return s.globalDataPath
+		return s.globalDataPath, nil
 	}
 }
 
 // HasConfigField checks whether a key exists in the config file for the given
 // scope.
 func (s *ConfigStore) HasConfigField(scope Scope, key string) bool {
-	data, err := os.ReadFile(s.configPath(scope))
+	path, err := s.configPath(scope)
+	if err != nil {
+		return false
+	}
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return false
 	}
@@ -84,8 +123,13 @@ func (s *ConfigStore) HasConfigField(scope Scope, key string) bool {
 }
 
 // SetConfigField sets a key/value pair in the config file for the given scope.
+// After a successful write, it automatically reloads config to keep in-memory
+// state fresh.
 func (s *ConfigStore) SetConfigField(scope Scope, key string, value any) error {
-	path := s.configPath(scope)
+	path, err := s.configPath(scope)
+	if err != nil {
+		return fmt.Errorf("%s: %w", key, err)
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -105,12 +149,26 @@ func (s *ConfigStore) SetConfigField(scope Scope, key string, value any) error {
 	if err := os.WriteFile(path, []byte(newValue), 0o600); err != nil {
 		return fmt.Errorf("failed to write config file: %w", err)
 	}
+
+	// Auto-reload to keep in-memory state fresh after config edits.
+	// We use context.Background() since this is an internal operation that
+	// shouldn't be cancelled by user context.
+	if err := s.autoReload(context.Background()); err != nil {
+		// Log warning but don't fail the write - disk is already updated.
+		slog.Warn("Config file updated but failed to reload in-memory state", "error", err)
+	}
+
 	return nil
 }
 
 // RemoveConfigField removes a key from the config file for the given scope.
+// After a successful write, it automatically reloads config to keep in-memory
+// state fresh.
 func (s *ConfigStore) RemoveConfigField(scope Scope, key string) error {
-	path := s.configPath(scope)
+	path, err := s.configPath(scope)
+	if err != nil {
+		return fmt.Errorf("%s: %w", key, err)
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("failed to read config file: %w", err)
@@ -126,6 +184,12 @@ func (s *ConfigStore) RemoveConfigField(scope Scope, key string) error {
 	if err := os.WriteFile(path, []byte(newValue), 0o600); err != nil {
 		return fmt.Errorf("failed to write config file: %w", err)
 	}
+
+	// Auto-reload to keep in-memory state fresh after config edits.
+	if err := s.autoReload(context.Background()); err != nil {
+		slog.Warn("Config file updated but failed to reload in-memory state", "error", err)
+	}
+
 	return nil
 }
 
@@ -311,6 +375,14 @@ func (s *ConfigStore) recordRecentModel(scope Scope, modelType SelectedModelType
 	return nil
 }
 
+// NewTestStore creates a ConfigStore for testing purposes.
+func NewTestStore(cfg *Config, loadedPaths ...string) *ConfigStore {
+	return &ConfigStore{
+		config:      cfg,
+		loadedPaths: loadedPaths,
+	}
+}
+
 // ImportCopilot attempts to import a GitHub Copilot token from disk.
 func (s *ConfigStore) ImportCopilot() (*oauth.Token, bool) {
 	if s.HasConfigField(ScopeGlobal, "providers.copilot.api_key") || s.HasConfigField(ScopeGlobal, "providers.copilot.oauth") {
@@ -356,7 +428,6 @@ func (s *ConfigStore) SetTheme(scope Scope, theme string) error {
 	return s.SetConfigField(scope, "options.tui.theme", theme)
 }
 
-
 // RemoveProviderAPIKey removes the API key for the given provider from disk and
 // removes it from the in-memory enabled providers list.
 func (s *ConfigStore) RemoveProviderAPIKey(scope Scope, providerID string) error {
@@ -382,7 +453,7 @@ func (s *ConfigStore) RemoveRecentModel(scope Scope, modelType SelectedModelType
 		return m.Provider == model.Provider && m.Model == model.Model
 	})
 	if len(updated) == len(current) {
-		return nil // nothing changed
+		return nil
 	}
 	s.config.RecentModels[modelType] = updated
 	if err := s.SetConfigField(scope, fmt.Sprintf("recent_models.%s", modelType), updated); err != nil {
@@ -397,4 +468,225 @@ func (s *ConfigStore) LogPath() string {
 		return ""
 	}
 	return filepath.Join(s.config.Options.DataDirectory, "logs", "crush.log")
+}
+
+// StalenessResult contains the result of a staleness check.
+type StalenessResult struct {
+	Dirty   bool
+	Changed []string
+	Missing []string
+	Errors  map[string]error
+}
+
+// ConfigStaleness checks whether any tracked config files have changed on disk
+// since the last snapshot.
+func (s *ConfigStore) ConfigStaleness() StalenessResult {
+	var result StalenessResult
+	result.Errors = make(map[string]error)
+
+	for _, path := range s.trackedConfigPaths {
+		snapshot, hadSnapshot := s.snapshots[path]
+
+		info, err := os.Stat(path)
+		exists := err == nil && !info.IsDir()
+
+		if err != nil && !os.IsNotExist(err) {
+			result.Errors[path] = err
+			result.Dirty = true
+		}
+
+		if !exists {
+			if hadSnapshot && snapshot.Exists {
+				result.Missing = append(result.Missing, path)
+				result.Dirty = true
+			}
+			continue
+		}
+
+		if !hadSnapshot || !snapshot.Exists {
+			result.Changed = append(result.Changed, path)
+			result.Dirty = true
+			continue
+		}
+
+		if snapshot.Size != info.Size() || snapshot.ModTime != info.ModTime().UnixNano() {
+			result.Changed = append(result.Changed, path)
+			result.Dirty = true
+		}
+	}
+
+	slices.Sort(result.Changed)
+	slices.Sort(result.Missing)
+
+	return result
+}
+
+// RefreshStalenessSnapshot captures fresh snapshots of all tracked config files.
+func (s *ConfigStore) RefreshStalenessSnapshot() error {
+	if s.snapshots == nil {
+		s.snapshots = make(map[string]fileSnapshot)
+	}
+
+	for _, path := range s.trackedConfigPaths {
+		info, err := os.Stat(path)
+		exists := err == nil && !info.IsDir()
+
+		snapshot := fileSnapshot{
+			Path:   path,
+			Exists: exists,
+		}
+
+		if exists {
+			snapshot.Size = info.Size()
+			snapshot.ModTime = info.ModTime().UnixNano()
+		}
+
+		s.snapshots[path] = snapshot
+	}
+
+	return nil
+}
+
+// CaptureStalenessSnapshot captures snapshots for the given paths.
+func (s *ConfigStore) CaptureStalenessSnapshot(paths []string) {
+	seen := make(map[string]struct{})
+	for _, p := range paths {
+		if p == "" {
+			continue
+		}
+		abs, err := filepath.Abs(p)
+		if err != nil {
+			abs = p
+		}
+		seen[abs] = struct{}{}
+	}
+
+	if s.workspacePath != "" {
+		abs, err := filepath.Abs(s.workspacePath)
+		if err == nil {
+			seen[abs] = struct{}{}
+		}
+	}
+	if s.globalDataPath != "" {
+		abs, err := filepath.Abs(s.globalDataPath)
+		if err == nil {
+			seen[abs] = struct{}{}
+		}
+	}
+
+	s.trackedConfigPaths = make([]string, 0, len(seen))
+	for p := range seen {
+		s.trackedConfigPaths = append(s.trackedConfigPaths, p)
+	}
+	slices.Sort(s.trackedConfigPaths)
+
+	s.RefreshStalenessSnapshot()
+}
+
+func (s *ConfigStore) captureStalenessSnapshot(paths []string) {
+	s.CaptureStalenessSnapshot(paths)
+}
+
+// ReloadFromDisk re-runs the config load/merge flow and updates the in-memory
+// config atomically.
+func (s *ConfigStore) ReloadFromDisk(ctx context.Context) error {
+	if s.workingDir == "" {
+		return fmt.Errorf("cannot reload: working directory not set")
+	}
+
+	s.autoReloadDisabled = true
+	s.reloadInProgress = true
+	defer func() {
+		s.autoReloadDisabled = false
+		s.reloadInProgress = false
+	}()
+
+	configPaths := lookupConfigs(s.workingDir)
+	cfg, loadedPaths, err := loadFromConfigPaths(configPaths)
+	if err != nil {
+		return fmt.Errorf("failed to reload config: %w", err)
+	}
+
+	var dataDir string
+	if s.config != nil && s.config.Options != nil {
+		dataDir = s.config.Options.DataDirectory
+	}
+	cfg.setDefaults(s.workingDir, dataDir)
+
+	workspacePath := filepath.Join(cfg.Options.DataDirectory, fmt.Sprintf("%s.json", appName))
+	if wsData, err := os.ReadFile(workspacePath); err == nil && len(wsData) > 0 {
+		merged, mergeErr := loadFromBytes(append([][]byte{mustMarshalConfig(cfg)}, wsData))
+		if mergeErr == nil {
+			dataDir := cfg.Options.DataDirectory
+			*cfg = *merged
+			cfg.setDefaults(s.workingDir, dataDir)
+			loadedPaths = append(loadedPaths, workspacePath)
+		}
+	}
+
+	if err := cfg.ValidateHooks(); err != nil {
+		return fmt.Errorf("invalid hook configuration on reload: %w", err)
+	}
+
+	overrides := s.overrides
+
+	env := env.New()
+	resolver := NewShellVariableResolver(env)
+	providers, err := Providers(cfg)
+	if err != nil {
+		return fmt.Errorf("failed to load providers during reload: %w", err)
+	}
+
+	if err := cfg.configureProviders(s, env, resolver, providers); err != nil {
+		return fmt.Errorf("failed to configure providers during reload: %w", err)
+	}
+
+	oldConfig := s.config
+	oldLoadedPaths := s.loadedPaths
+	oldResolver := s.resolver
+	oldKnownProviders := s.knownProviders
+	oldOverrides := s.overrides
+	oldWorkspacePath := s.workspacePath
+
+	s.config = cfg
+	s.loadedPaths = loadedPaths
+	s.resolver = resolver
+	s.knownProviders = providers
+	s.overrides = overrides
+	s.workspacePath = workspacePath
+
+	var setupErr error
+	if !cfg.IsConfigured() {
+		slog.Warn("No providers configured after reload")
+	} else {
+		if err := configureSelectedModels(s, providers, false); err != nil {
+			setupErr = fmt.Errorf("failed to configure selected models during reload: %w", err)
+		} else {
+			s.SetupAgents()
+		}
+	}
+
+	if setupErr != nil {
+		s.config = oldConfig
+		s.loadedPaths = oldLoadedPaths
+		s.resolver = oldResolver
+		s.knownProviders = oldKnownProviders
+		s.overrides = oldOverrides
+		s.workspacePath = oldWorkspacePath
+		return setupErr
+	}
+
+	s.captureStalenessSnapshot(loadedPaths)
+
+	return nil
+}
+
+func (s *ConfigStore) autoReload(ctx context.Context) error {
+	if s.autoReloadDisabled {
+		return nil
+	}
+	if s.workingDir == "" {
+		return nil
+	}
+	return s.ReloadFromDisk(ctx)
 }

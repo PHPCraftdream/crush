@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"slices"
 	"strconv"
@@ -23,19 +24,18 @@ import (
 	"github.com/charmbracelet/crush/internal/env"
 	"github.com/charmbracelet/crush/internal/fsext"
 	"github.com/charmbracelet/crush/internal/home"
-	"github.com/charmbracelet/crush/internal/log"
 	powernapConfig "github.com/charmbracelet/x/powernap/pkg/config"
 	"github.com/qjebbs/go-jsons"
 )
 
-const defaultCatwalkURL = "https://catwalk.charm.sh"
+const defaultCatwalkURL = "https://catwalk.charm.land"
 
 // Load loads the configuration from the default paths and returns a
 // ConfigStore that owns both the pure-data Config and all runtime state.
 func Load(workingDir, dataDir string, debug bool) (*ConfigStore, error) {
 	configPaths := lookupConfigs(workingDir)
 
-	cfg, err := loadFromConfigPaths(configPaths)
+	cfg, loadedPaths, err := loadFromConfigPaths(configPaths)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load config from paths %v: %w", configPaths, err)
 	}
@@ -47,17 +47,12 @@ func Load(workingDir, dataDir string, debug bool) (*ConfigStore, error) {
 		workingDir:     workingDir,
 		globalDataPath: GlobalConfigData(),
 		workspacePath:  filepath.Join(cfg.Options.DataDirectory, fmt.Sprintf("%s.json", appName)),
+		loadedPaths:    loadedPaths,
 	}
 
 	if debug {
 		cfg.Options.Debug = true
 	}
-
-	// Setup logs
-	log.Setup(
-		filepath.Join(cfg.Options.DataDirectory, "logs", fmt.Sprintf("%s.log", appName)),
-		cfg.Options.Debug,
-	)
 
 	// Load workspace config last so it has highest priority.
 	if wsData, err := os.ReadFile(store.workspacePath); err == nil && len(wsData) > 0 {
@@ -68,6 +63,7 @@ func Load(workingDir, dataDir string, debug bool) (*ConfigStore, error) {
 			*cfg = *merged
 			cfg.setDefaults(workingDir, dataDir)
 			store.config = cfg
+			store.loadedPaths = append(store.loadedPaths, store.workspacePath)
 		}
 	}
 
@@ -76,6 +72,12 @@ func Load(workingDir, dataDir string, debug bool) (*ConfigStore, error) {
 	// the disabled state for external servers is read from crush's own config.
 	if external := loadExternalMCPServers(workingDir); len(external) > 0 {
 		mergeExternalMCPServers(cfg, store, external)
+	}
+
+	// Validate hooks after all config merging is complete so workspace
+	// hooks also get their matcher regexes compiled.
+	if err := cfg.ValidateHooks(); err != nil {
+		return nil, fmt.Errorf("invalid hook configuration: %w", err)
 	}
 
 	if !isInsideWorktree() {
@@ -104,6 +106,12 @@ func Load(workingDir, dataDir string, debug bool) (*ConfigStore, error) {
 	// Configure providers
 	valueResolver := NewShellVariableResolver(env)
 	store.resolver = valueResolver
+
+	// Disable auto-reload during initial load to prevent nested calls from
+	// config-modifying operations inside configureProviders.
+	store.autoReloadDisabled = true
+	defer func() { store.autoReloadDisabled = false }()
+
 	if err := cfg.configureProviders(store, env, valueResolver, store.knownProviders); err != nil {
 		return nil, fmt.Errorf("failed to configure providers: %w", err)
 	}
@@ -113,10 +121,14 @@ func Load(workingDir, dataDir string, debug bool) (*ConfigStore, error) {
 		return store, nil
 	}
 
-	if err := configureSelectedModels(store, store.knownProviders); err != nil {
+	if err := configureSelectedModels(store, store.knownProviders, true); err != nil {
 		return nil, fmt.Errorf("failed to configure selected models: %w", err)
 	}
 	store.SetupAgents()
+
+	// Capture initial staleness snapshot
+	store.captureStalenessSnapshot(loadedPaths)
+
 	return store, nil
 }
 
@@ -245,7 +257,9 @@ func (c *Config) configureProviders(store *ConfigStore, env env.Env, resolver Va
 		switch {
 		case p.ID == catwalk.InferenceProviderAnthropic && config.OAuthToken != nil:
 			// Claude Code subscription is not supported anymore. Remove to show onboarding.
-			store.RemoveConfigField(ScopeGlobal, "providers.anthropic")
+			if !store.reloadInProgress {
+				store.RemoveConfigField(ScopeGlobal, "providers.anthropic")
+			}
 			c.Providers.Del(string(p.ID))
 			continue
 		case p.ID == catwalk.InferenceProviderCopilot && config.OAuthToken != nil:
@@ -294,6 +308,20 @@ func (c *Config) configureProviders(store *ConfigStore, env env.Env, resolver Va
 			for _, model := range p.Models {
 				if !strings.HasPrefix(model.ID, "anthropic.") {
 					return fmt.Errorf("bedrock provider only supports anthropic models for now, found: %s", model.ID)
+				}
+			}
+		case catwalk.InferenceProvider("hyper"):
+			if apiKey := env.Get("HYPER_API_KEY"); apiKey != "" {
+				prepared.APIKey = apiKey
+				prepared.APIKeyTemplate = apiKey
+			} else {
+				v, err := resolver.ResolveValue(p.APIKey)
+				if v == "" || err != nil {
+					if configExists {
+						slog.Warn("Skipping Hyper provider due to missing API key", "provider", p.ID)
+						c.Providers.Del(string(p.ID))
+					}
+					continue
 				}
 			}
 		default:
@@ -594,7 +622,7 @@ func (c *Config) defaultModelSelection(knownProviders []catwalk.Provider) (large
 	return largeModel, smallModel, err
 }
 
-func configureSelectedModels(store *ConfigStore, knownProviders []catwalk.Provider) error {
+func configureSelectedModels(store *ConfigStore, knownProviders []catwalk.Provider, persist bool) error {
 	c := store.config
 	defaultLarge, defaultSmall, err := c.defaultModelSelection(knownProviders)
 	if err != nil {
@@ -613,10 +641,10 @@ func configureSelectedModels(store *ConfigStore, knownProviders []catwalk.Provid
 		model := c.GetModel(large.Provider, large.Model)
 		if model == nil {
 			large = defaultLarge
-			// override the model type to large
-			err := store.UpdatePreferredModel(ScopeGlobal, SelectedModelTypeLarge, large)
-			if err != nil {
-				return fmt.Errorf("failed to update preferred large model: %w", err)
+			if persist {
+				if err := store.UpdatePreferredModel(ScopeGlobal, SelectedModelTypeLarge, large); err != nil {
+					return fmt.Errorf("failed to update preferred large model: %w", err)
+				}
 			}
 		} else {
 			if largeModelSelected.MaxTokens > 0 {
@@ -657,10 +685,10 @@ func configureSelectedModels(store *ConfigStore, knownProviders []catwalk.Provid
 		model := c.GetModel(small.Provider, small.Model)
 		if model == nil {
 			small = defaultSmall
-			// override the model type to small
-			err := store.UpdatePreferredModel(ScopeGlobal, SelectedModelTypeSmall, small)
-			if err != nil {
-				return fmt.Errorf("failed to update preferred small model: %w", err)
+			if persist {
+				if err := store.UpdatePreferredModel(ScopeGlobal, SelectedModelTypeSmall, small); err != nil {
+					return fmt.Errorf("failed to update preferred small model: %w", err)
+				}
 			}
 		} else {
 			if smallModelSelected.MaxTokens > 0 {
@@ -716,8 +744,9 @@ func lookupConfigs(cwd string) []string {
 	return append(configPaths, foundConfigs...)
 }
 
-func loadFromConfigPaths(configPaths []string) (*Config, error) {
+func loadFromConfigPaths(configPaths []string) (*Config, []string, error) {
 	var configs [][]byte
+	var loaded []string
 
 	for _, path := range configPaths {
 		data, err := os.ReadFile(path)
@@ -725,15 +754,20 @@ func loadFromConfigPaths(configPaths []string) (*Config, error) {
 			if os.IsNotExist(err) {
 				continue
 			}
-			return nil, fmt.Errorf("failed to open config file %s: %w", path, err)
+			return nil, nil, fmt.Errorf("failed to open config file %s: %w", path, err)
 		}
 		if len(data) == 0 {
 			continue
 		}
 		configs = append(configs, data)
+		loaded = append(loaded, path)
 	}
 
-	return loadFromBytes(configs)
+	cfg, err := loadFromBytes(configs)
+	if err != nil {
+		return nil, nil, err
+	}
+	return cfg, loaded, nil
 }
 
 func loadFromBytes(configs [][]byte) (*Config, error) {
@@ -786,10 +820,26 @@ func GlobalConfig() string {
 	if crushGlobal := os.Getenv("CRUSH_GLOBAL_CONFIG"); crushGlobal != "" {
 		return filepath.Join(crushGlobal, fmt.Sprintf("%s.json", appName))
 	}
-	if xdgConfigHome := os.Getenv("XDG_CONFIG_HOME"); xdgConfigHome != "" {
-		return filepath.Join(xdgConfigHome, appName, fmt.Sprintf("%s.json", appName))
+	return filepath.Join(home.Config(), appName, fmt.Sprintf("%s.json", appName))
+}
+
+// GlobalCacheDir returns the path to the global cache directory for the
+// application.
+func GlobalCacheDir() string {
+	if crushCache := os.Getenv("CRUSH_CACHE_DIR"); crushCache != "" {
+		return crushCache
 	}
-	return filepath.Join(home.Dir(), ".config", appName, fmt.Sprintf("%s.json", appName))
+	if xdgCacheHome := os.Getenv("XDG_CACHE_HOME"); xdgCacheHome != "" {
+		return filepath.Join(xdgCacheHome, appName)
+	}
+	if runtime.GOOS == "windows" {
+		localAppData := cmp.Or(
+			os.Getenv("LOCALAPPDATA"),
+			filepath.Join(os.Getenv("USERPROFILE"), "AppData", "Local"),
+		)
+		return filepath.Join(localAppData, appName, "cache")
+	}
+	return filepath.Join(home.Dir(), ".cache", appName)
 }
 
 // GlobalConfigData returns the path to the main data directory for the application.
@@ -816,6 +866,15 @@ func GlobalConfigData() string {
 	return filepath.Join(home.Dir(), ".local", "share", appName, fmt.Sprintf("%s.json", appName))
 }
 
+// GlobalWorkspaceDir returns the path to the global server workspace
+// directory. This directory acts as a meta-workspace for the server
+// process, giving it a real workingDir so that config loading, scoped
+// writes, and provider resolution behave identically to project
+// workspaces.
+func GlobalWorkspaceDir() string {
+	return filepath.Dir(GlobalConfigData())
+}
+
 func assignIfNil[T any](ptr **T, val T) {
 	if *ptr == nil {
 		*ptr = &val
@@ -839,14 +898,9 @@ func GlobalSkillsDirs() []string {
 		return []string{crushSkills}
 	}
 
-	configHome := cmp.Or(
-		os.Getenv("XDG_CONFIG_HOME"),
-		filepath.Join(home.Dir(), ".config"),
-	)
-
 	paths := []string{
-		filepath.Join(configHome, appName, "skills"),
-		filepath.Join(configHome, "agents", "skills"),
+		filepath.Join(home.Config(), appName, "skills"),
+		filepath.Join(home.Config(), "agents", "skills"),
 	}
 
 	// On Windows, also load from app data on top of `$HOME/.config/crush`.
@@ -878,3 +932,46 @@ func ProjectSkillsDir(workingDir string) []string {
 }
 
 func isAppleTerminal() bool { return os.Getenv("TERM_PROGRAM") == "Apple_Terminal" }
+
+// normalizeHookEvent maps user-provided event names to their canonical
+// form. Matching is case-insensitive and accepts snake_case variants
+// (e.g. "pre_tool_use" → "PreToolUse").
+func normalizeHookEvent(name string) string {
+	switch strings.ToLower(strings.ReplaceAll(name, "_", "")) {
+	case "pretooluse":
+		return "PreToolUse"
+	default:
+		return name
+	}
+}
+
+// ValidateHooks normalizes event names and checks that every configured
+// hook has a command and a syntactically valid matcher regex. Matcher
+// compilation used for matching is owned by hooks.Runner; this function
+// only validates up front so the user sees config errors at load time
+// rather than on the first tool call.
+func (c *Config) ValidateHooks() error {
+	// Normalize event name keys.
+	for event, eventHooks := range c.Hooks {
+		canonical := normalizeHookEvent(event)
+		if canonical != event {
+			c.Hooks[canonical] = append(c.Hooks[canonical], eventHooks...)
+			delete(c.Hooks, event)
+		}
+	}
+
+	for event, eventHooks := range c.Hooks {
+		for i, h := range eventHooks {
+			if h.Command == "" {
+				return fmt.Errorf("hook %s[%d]: command is required", event, i)
+			}
+			if h.Matcher == "" {
+				continue
+			}
+			if _, err := regexp.Compile(h.Matcher); err != nil {
+				return fmt.Errorf("hook %s[%d]: invalid matcher regex %q: %w", event, i, h.Matcher, err)
+			}
+		}
+	}
+	return nil
+}
