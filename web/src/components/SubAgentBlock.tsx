@@ -11,7 +11,8 @@ import type { Message, ContentPart } from "../types";
 const MD_REMARK = [remarkGfm, remarkBreaks];
 const MD_REHYPE = [rehypeHighlight];
 
-function extractTextFromParts(parts: ContentPart[]): string {
+function extractTextFromParts(parts?: ContentPart[]): string {
+  if (!parts) return "";
   return parts
     .filter((p) => p.type === "text")
     .map((p) => (p as { type: "text"; Text: string }).Text)
@@ -19,13 +20,13 @@ function extractTextFromParts(parts: ContentPart[]): string {
 }
 
 function isFinished(msg: Message): boolean {
-  return msg.Parts.some((p) => p.type === "finish");
+  return msg.Parts?.some((p) => p.type === "finish") ?? false;
 }
 
 const SubAgentMessage = memo(function SubAgentMessage({ message }: { message: Message }) {
   const text = useMemo(() => extractTextFromParts(message.Parts), [message.Parts]);
   const toolCalls = useMemo(
-    () => message.Parts.filter((p) => p.type === "tool_call") as Array<{ type: "tool_call"; Name: string; Input: string; Finished: boolean }>,
+    () => (message.Parts ?? []).filter((p) => p.type === "tool_call") as Array<{ type: "tool_call"; Name: string; Input: string; Finished: boolean }>,
     [message.Parts],
   );
 
