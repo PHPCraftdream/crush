@@ -69,6 +69,7 @@ export const SubAgentBlock = memo(function SubAgentBlock({
   );
 
   const label = useMemo(() => {
+    if (!prompt) return "";
     const maxLen = 80;
     const text = prompt.length > maxLen ? prompt.slice(0, maxLen) + "..." : prompt;
     return text;
