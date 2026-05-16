@@ -367,9 +367,31 @@ const Part = memo(function Part({ part, index, isUser, messageID, thinkingDone }
       if (part.Name === "agent") return null;
       return <ToolResultBlock name={part.Name} content={part.Content} isError={part.IsError} />;
     }
-    case "finish": return null;
-    default:       return null;
+    // Fork patch: render explicit error/empty finish parts so a failed turn is
+    // never silently rendered as a blank block. See CHANGELOG.fork.md.
+    case "finish": {
+      if (part.Reason === "error" || part.Reason === "canceled") {
+        return <FinishErrorBlock reason={part.Reason} message={part.Message} details={part.Details} />;
+      }
+      return null;
+    }
+    default: return null;
   }
+});
+
+// Fork patch: visible block for error / canceled finish parts (replaces the
+// previous "render nothing" behaviour that produced blank assistant bubbles).
+const FinishErrorBlock = memo(function FinishErrorBlock({ reason, message, details }: { reason: string; message: string; details: string }) {
+  const title = message || (reason === "canceled" ? "Canceled" : "Error");
+  return (
+    <div data-test-id="finish-error" className="tool-block my-2 border-red/40 bg-red/[6%]">
+      <div className="flex items-center gap-2 mb-1">
+        <span className="text-red font-semibold text-sm">{title}</span>
+        <span className="badge-error">{reason}</span>
+      </div>
+      {details && <pre className="tool-output whitespace-pre-wrap">{details}</pre>}
+    </div>
+  );
 });
 
 // ── Message content areas — own editing state ─────────────────────────────────
@@ -411,6 +433,23 @@ const AssistantContent = memo(function AssistantContent({
   const breakMap = useStore($messageBlockBreaks);
   const breaks = useMemo(() => breakMap.get(message.ID) ?? EMPTY_BREAKS, [breakMap, message.ID]);
   const blocks = useMemo(() => groupPartsIntoBlocks(message.Parts, breaks), [message.Parts, breaks]);
+  const busy = useStore($busySessions);
+
+  // Fork patch: detect assistant messages that produced no visible content
+  // (no text / tool_call / tool_result / thinking). This used to render as a
+  // blank block in the WUI. We now show an explicit "empty response" notice
+  // for finished turns and a "streaming…" placeholder for live turns.
+  const hasVisibleContent = useMemo(
+    () => message.Parts.some(p =>
+      p.type === "text" || p.type === "tool_call" || p.type === "tool_result" || p.type === "thinking"
+    ),
+    [message.Parts]
+  );
+  const isFinished = useMemo(() => message.Parts.some(p => p.type === "finish"), [message.Parts]);
+  const finishPart = useMemo(
+    () => message.Parts.find(p => p.type === "finish") as (typeof message.Parts[number] & { type: "finish"; Reason: string; Message: string; Details: string }) | undefined,
+    [message.Parts]
+  );
 
   if (editing) {
     return (
@@ -421,6 +460,24 @@ const AssistantContent = memo(function AssistantContent({
         onSave={onSaveEdit}
         onCancel={onCancelEdit}
       />
+    );
+  }
+  if (!hasVisibleContent) {
+    if (isFinished) {
+      const reason = finishPart?.Reason ?? "unknown";
+      const msg = finishPart?.Message || "Empty response";
+      const details = finishPart?.Details || "The provider closed the stream without returning any content. Please retry.";
+      return (
+        <div className="text-text leading-relaxed" style={{ fontSize: "var(--chat-font-size)" }}>
+          <FinishErrorBlock reason={reason} message={msg} details={details} />
+        </div>
+      );
+    }
+    const isLive = busy.has(message.SessionID);
+    return (
+      <div className="text-text-subtle leading-relaxed italic" style={{ fontSize: "var(--chat-font-size)" }}>
+        {isLive ? "streaming…" : "(no content)"}
+      </div>
     );
   }
   return (

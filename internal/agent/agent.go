@@ -568,7 +568,34 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 					}
 				}
 			}
-			currentAssistant.AddFinish(finishReason, "", "")
+			// Fork patch: surface empty-stream as a visible error.
+			// Some providers (e.g. z.ai) sometimes close the stream without
+			// sending any content (no text, no tool_call, no reasoning) and
+			// without an explicit finish reason. The upstream code records this
+			// as FinishReasonUnknown with empty parts, which the WUI renders as
+			// a blank assistant block — looking like a session lockup. Convert
+			// this case to an error so both the WUI fallback and the user see
+			// an actionable message. See CHANGELOG.fork.md section 4.D.
+			if finishReason == message.FinishReasonUnknown &&
+				currentAssistant.FullText() == "" &&
+				currentAssistant.ReasoningContent().Thinking == "" &&
+				len(currentAssistant.ToolCalls()) == 0 {
+				slog.Warn("agent: empty stream from provider — recording as error",
+					"sessionID", call.SessionID,
+					"provider", largeModel.ModelCfg.Provider,
+					"model", largeModel.ModelCfg.Model,
+				)
+				currentAssistant.AddFinish(
+					message.FinishReasonError,
+					"Empty response",
+					fmt.Sprintf(
+						"Provider %q closed the stream for model %q without returning any content. This is usually a transient provider/network issue — please retry.",
+						largeModel.ModelCfg.Provider, largeModel.ModelCfg.Model,
+					),
+				)
+			} else {
+				currentAssistant.AddFinish(finishReason, "", "")
+			}
 			// Drain any pending UI snapshot so the ticker goroutine does not
 			// publish a stale state after messages.Update writes the final one.
 			select {
