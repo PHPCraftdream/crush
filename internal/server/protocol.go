@@ -42,6 +42,7 @@ const (
 // Inbound command types (client → server).
 const (
 	CmdSendMessage                  = "send_message"
+	CmdInterruptAndSend             = "interrupt_and_send"
 	CmdCancelAgent                  = "cancel_agent"
 	CmdCreateSession                = "create_session"
 	CmdForkSession                  = "fork_session"

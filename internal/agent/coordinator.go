@@ -112,6 +112,10 @@ type Coordinator interface {
 	QueuedPrompts(sessionID string) int
 	QueuedPromptsList(sessionID string) []string
 	ClearQueue(sessionID string)
+	// InterruptAndSend queues a new user message and cancels the running
+	// turn so the queued message picks up immediately with everything
+	// produced so far retained in history.
+	InterruptAndSend(ctx context.Context, sessionID, prompt string, large, small *ModelOverride, attachments ...message.Attachment) error
 	Summarize(context.Context, string) error
 	SummarizeQueued(sessionID string) bool
 	TakeSummarizeQueue(sessionID string) (fantasy.ProviderOptions, bool)
@@ -269,6 +273,74 @@ func (c *coordinator) applyModelOverrides(ctx context.Context, large, small *Mod
 	return nil
 }
 
+// resolveSessionSystemPrompt loads the per-session system prompt from the DB,
+// building and persisting one on the fly when missing. Shared by runInternal
+// and buildCall.
+func (c *coordinator) resolveSessionSystemPrompt(ctx context.Context, sessionID string) string {
+	sess, err := c.sessions.Get(ctx, sessionID)
+	if err != nil {
+		return ""
+	}
+	if sess.SystemPrompt != "" {
+		return sess.SystemPrompt
+	}
+	if c.prompt == nil {
+		return ""
+	}
+	built, buildErr := c.prompt.Build(ctx, c.currentAgent.Model().ModelCfg.Provider, c.currentAgent.Model().ModelCfg.Model, c.cfg)
+	if buildErr != nil || built == "" {
+		return ""
+	}
+	if saveErr := c.sessions.UpdateSystemPrompt(ctx, sessionID, built); saveErr != nil {
+		slog.Warn("coordinator: failed to save system prompt to session", "sessionID", sessionID, "err", saveErr)
+	}
+	return built
+}
+
+// buildCall assembles the SessionAgentCall for the current agent + model
+// state. Extracted so InterruptAndSend can queue a call shaped exactly like
+// runInternal would.
+func (c *coordinator) buildCall(ctx context.Context, sessionID, prompt string, attachments []message.Attachment) (SessionAgentCall, error) {
+	model := c.currentAgent.Model()
+
+	maxTokens := model.CatwalkCfg.DefaultMaxTokens
+	if model.ModelCfg.MaxTokens != 0 {
+		maxTokens = model.ModelCfg.MaxTokens
+	}
+
+	if !model.CatwalkCfg.SupportsImages && attachments != nil {
+		filteredAttachments := make([]message.Attachment, 0, len(attachments))
+		for _, att := range attachments {
+			if att.IsText() {
+				filteredAttachments = append(filteredAttachments, att)
+			}
+		}
+		attachments = filteredAttachments
+	}
+
+	providerCfg, ok := c.cfg.Config().Providers.Get(model.ModelCfg.Provider)
+	if !ok {
+		return SessionAgentCall{}, errModelProviderNotConfigured
+	}
+
+	mergedOptions, temp, topP, topK, freqPenalty, presPenalty := mergeCallOptions(model, providerCfg)
+	sessionSystemPrompt := c.resolveSessionSystemPrompt(ctx, sessionID)
+
+	return SessionAgentCall{
+		SessionID:            sessionID,
+		Prompt:               prompt,
+		Attachments:          attachments,
+		MaxOutputTokens:      maxTokens,
+		ProviderOptions:      mergedOptions,
+		Temperature:          temp,
+		TopP:                 topP,
+		TopK:                 topK,
+		FrequencyPenalty:     freqPenalty,
+		PresencePenalty:      presPenalty,
+		SystemPromptOverride: sessionSystemPrompt,
+	}, nil
+}
+
 // runInternal executes the agent with whatever models are currently set, handling 401 retries.
 func (c *coordinator) runInternal(ctx context.Context, sessionID string, prompt string, attachments ...message.Attachment) (*fantasy.AgentResult, error) {
 	model := c.currentAgent.Model()
@@ -302,20 +374,7 @@ func (c *coordinator) runInternal(ctx context.Context, sessionID string, prompt 
 		slog.Error("Failed to refresh OAuth2 token. Proceeding with existing token.", "error", err)
 	}
 
-	// Use per-session system prompt from DB; generate and persist it if missing.
-	var sessionSystemPrompt string
-	if sess, err := c.sessions.Get(ctx, sessionID); err == nil {
-		if sess.SystemPrompt != "" {
-			sessionSystemPrompt = sess.SystemPrompt
-		} else if c.prompt != nil {
-			if built, buildErr := c.prompt.Build(ctx, c.currentAgent.Model().ModelCfg.Provider, c.currentAgent.Model().ModelCfg.Model, c.cfg); buildErr == nil && built != "" {
-				sessionSystemPrompt = built
-				if saveErr := c.sessions.UpdateSystemPrompt(ctx, sessionID, built); saveErr != nil {
-					slog.Warn("coordinator: failed to save system prompt to session", "sessionID", sessionID, "err", saveErr)
-				}
-			}
-		}
-	}
+	sessionSystemPrompt := c.resolveSessionSystemPrompt(ctx, sessionID)
 
 	run := func() (*fantasy.AgentResult, error) {
 		return c.currentAgent.Run(ctx, SessionAgentCall{
@@ -1101,6 +1160,29 @@ func (c *coordinator) CancelAll() {
 
 func (c *coordinator) ClearQueue(sessionID string) {
 	c.currentAgent.ClearQueue(sessionID)
+}
+
+// InterruptAndSend queues a user message and cancels the running turn.
+// agent.Run()'s cancel-handling branch drains the queue and the queued
+// message becomes the next Run() — with all assistant content produced so
+// far preserved in the DB (the cancel path writes a FinishReasonCanceled
+// to the in-flight assistant message before unwinding).
+func (c *coordinator) InterruptAndSend(ctx context.Context, sessionID, prompt string, large, small *ModelOverride, attachments ...message.Attachment) error {
+	if err := c.readyWg.Wait(); err != nil {
+		return err
+	}
+	if large != nil || small != nil {
+		if applyErr := c.applyModelOverrides(ctx, large, small); applyErr != nil {
+			return applyErr
+		}
+	}
+	call, err := c.buildCall(ctx, sessionID, prompt, attachments)
+	if err != nil {
+		return err
+	}
+	c.currentAgent.QueueMessage(call)
+	c.currentAgent.Cancel(sessionID)
+	return nil
 }
 
 func (c *coordinator) IsBusy() bool {

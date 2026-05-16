@@ -41,6 +41,8 @@ func handleIncoming(ctx context.Context, a *appPkg.App, c *Client, raw []byte) {
 	switch msg.Type {
 	case CmdSendMessage:
 		go handleSendMessage(ctx, a, c, msg)
+	case CmdInterruptAndSend:
+		go handleInterruptAndSend(ctx, a, c, msg)
 	case CmdCancelAgent:
 		go handleCancelAgent(ctx, a, c, msg)
 	case CmdCreateSession:
@@ -268,6 +270,77 @@ func handleSendMessage(ctx context.Context, a *appPkg.App, c *Client, msg WSMess
 		}
 		c.hub.Broadcast(EventAgentBusy, AgentBusyPayload{SessionID: p.SessionID, Busy: false})
 	}
+}
+
+// handleInterruptAndSend cancels the running turn and queues a new user
+// message in one shot. The in-flight agent.Run() finalises the cancelled
+// assistant message with FinishReasonCanceled, then its cancel-handling
+// branch drains the queue and immediately re-enters Run() with the new
+// message — so the user keeps everything produced so far plus their new
+// instruction.
+func handleInterruptAndSend(ctx context.Context, a *appPkg.App, c *Client, msg WSMessage) {
+	var p SendMessagePayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		c.reply(msg.ID, EventError, nil, "invalid payload")
+		return
+	}
+
+	slog.Info("ws: handleInterruptAndSend", "sessionID", p.SessionID, "content", p.Content, "attachments", len(p.Attachments))
+
+	if a.AgentCoordinator == nil {
+		c.reply(msg.ID, EventError, nil, "agent not configured")
+		return
+	}
+
+	// Same attachments path as handleSendMessage: save to disk, append paths
+	// to the prompt text so CLI tools can read them, and forward attachment
+	// metadata so vision-capable providers can ingest images.
+	var attachments []message.Attachment
+	for _, att := range p.Attachments {
+		savedPath, saveErr := saveAttachmentToDisk(a.Store().WorkingDir(), att.FileName, att.Data)
+		if saveErr != nil {
+			slog.Warn("ws: failed to save attachment to disk", "err", saveErr)
+		} else {
+			p.Content += "\n[Attached file: " + savedPath + "]"
+		}
+		attachments = append(attachments, message.Attachment{
+			FileName: att.FileName,
+			MimeType: att.MimeType,
+			Content:  att.Data,
+		})
+	}
+
+	// Model overrides follow the same priority as handleSendMessage:
+	// payload > DB session record > global defaults.
+	var largeOverride, smallOverride *agent.ModelOverride
+	if p.LargeModel != nil {
+		largeOverride = &agent.ModelOverride{Provider: p.LargeModel.Provider, Model: p.LargeModel.Model}
+	}
+	if p.SmallModel != nil {
+		smallOverride = &agent.ModelOverride{Provider: p.SmallModel.Provider, Model: p.SmallModel.Model}
+	}
+	if largeOverride == nil || smallOverride == nil {
+		if sess, err := a.Sessions.Get(ctx, p.SessionID); err == nil {
+			if largeOverride == nil && sess.LargeModelID != "" {
+				largeOverride = &agent.ModelOverride{Provider: sess.LargeModelProvider, Model: sess.LargeModelID}
+			}
+			if smallOverride == nil && sess.SmallModelID != "" {
+				smallOverride = &agent.ModelOverride{Provider: sess.SmallModelProvider, Model: sess.SmallModelID}
+			}
+		}
+	}
+
+	agentCtx := context.WithoutCancel(ctx)
+	if err := a.AgentCoordinator.InterruptAndSend(agentCtx, p.SessionID, p.Content, largeOverride, smallOverride, attachments...); err != nil {
+		slog.Error("ws: interrupt-and-send failed", "err", err)
+		c.reply(msg.ID, EventError, nil, err.Error())
+		return
+	}
+	// Don't toggle EventAgentBusy here: the running handleSendMessage
+	// goroutine will publish busy=false when its Run() returns, and the
+	// queue drain inside Run() will publish busy=true again for the new
+	// turn. Touching the flag here would create a flicker.
+	c.reply(msg.ID, EventResponse, map[string]string{"status": "queued"}, "")
 }
 
 func handleSetSessionModels(ctx context.Context, a *appPkg.App, c *Client, msg WSMessage) {

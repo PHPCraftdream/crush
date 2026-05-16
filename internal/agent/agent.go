@@ -109,6 +109,11 @@ type SessionAgent interface {
 	QueuedPrompts(sessionID string) int
 	QueuedPromptsList(sessionID string) []string
 	ClearQueue(sessionID string)
+	// QueueMessage appends a call to the session's pending queue without
+	// starting a Run. Used by the "interrupt and send" path in the web
+	// server: the caller queues, then Cancel()s the running turn, and the
+	// in-flight Run() drains the queue from its cancel-handling branch.
+	QueueMessage(call SessionAgentCall)
 	// Summarize compresses the session history. If the session is currently
 	// busy the request is queued; call TakeSummarizeQueue after the task
 	// finishes to pick it up.  Returns ErrSummarizeQueued when queued.
@@ -753,6 +758,22 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 		updateErr := a.messages.Update(ctx, *currentAssistant)
 		if updateErr != nil {
 			return nil, updateErr
+		}
+
+		// Drain the message queue on cancel. The "interrupt and send" web
+		// flow queues a user message and then cancels the turn; without
+		// this drain that message would sit in the queue until another
+		// /send arrives. Release the active-request slot and the goroutine
+		// cancel func first so the recursive Run() doesn't see the session
+		// as busy.
+		if isCancelErr {
+			if queuedMessages, ok := a.messageQueue.Get(call.SessionID); ok && len(queuedMessages) > 0 {
+				firstQueuedMessage := queuedMessages[0]
+				a.messageQueue.Set(call.SessionID, queuedMessages[1:])
+				a.activeRequests.Del(call.SessionID)
+				cancel()
+				return a.Run(ctx, firstQueuedMessage)
+			}
 		}
 		return nil, err
 	}
@@ -1532,6 +1553,11 @@ func (a *sessionAgent) ClearQueue(sessionID string) {
 		slog.Debug("Clearing queued prompts", "session_id", sessionID)
 		a.messageQueue.Del(sessionID)
 	}
+}
+
+func (a *sessionAgent) QueueMessage(call SessionAgentCall) {
+	existing, _ := a.messageQueue.Get(call.SessionID)
+	a.messageQueue.Set(call.SessionID, append(existing, call))
 }
 
 func (a *sessionAgent) CancelAll() {

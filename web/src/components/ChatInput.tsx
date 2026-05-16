@@ -6,11 +6,12 @@ import {
   $skills,
   $lastUsedSkill,
   enqueueMessage,
+  dequeueAllMessages,
   sendWithSmallModel,
   setLastUsedSkill,
 } from "../store";
 import { ws } from "../ws";
-import { ListOrdered, Send, SendHorizonal, Paperclip, X } from "lucide-react";
+import { ListOrdered, Send, SendHorizonal, Paperclip, X, Zap } from "lucide-react";
 import type { SkillInfo } from "../types";
 
 interface PendingAttachment {
@@ -229,6 +230,37 @@ export function ChatInput() {
     if (textareaRef.current) textareaRef.current.style.height = "auto";
   }, [text, activeSessionID, agentBusy]);
 
+  // Interrupt the in-flight turn AND submit immediately. The server's
+  // interrupt_and_send handler queues the new message and cancels the
+  // running turn; agent.Run()'s cancel-handling branch drains the queue
+  // and re-enters Run() with this message — so the partial assistant
+  // output stays in history and the new instruction picks up right away.
+  // We also fold anything sitting in the local front-end queue into the
+  // submitted text, otherwise those would race the cancel and arrive in
+  // a separate send_message after the interrupt-turn finishes.
+  const interrupt = useCallback(() => {
+    if (!activeSessionID) return;
+    const queued = dequeueAllMessages(activeSessionID);
+    const parts: string[] = [];
+    if (queued) parts.push(queued);
+    const msg = text.trim();
+    if (msg) parts.push(msg);
+    const content = parts.join("\n\n");
+    if (!content) return;
+    const payload: Record<string, unknown> = { sessionID: activeSessionID, content };
+    if (attachments.length > 0) {
+      payload.attachments = attachments.map((a) => ({
+        fileName: a.fileName,
+        mimeType: a.mimeType,
+        data: a.data,
+      }));
+    }
+    ws.send("interrupt_and_send", payload);
+    setText("");
+    setAttachments([]);
+    if (textareaRef.current) textareaRef.current.style.height = "auto";
+  }, [text, activeSessionID, attachments]);
+
   function onKey(e: React.KeyboardEvent<HTMLTextAreaElement>) {
     if (slashOpen && filteredSkills.length > 0) {
       if (e.key === "ArrowDown") {
@@ -401,6 +433,18 @@ export function ChatInput() {
                 className="btn-input-action"
               >
                 <SendHorizonal size={18} />
+              </button>
+            )}
+            {agentBusy && (
+              <button
+                onClick={interrupt}
+                disabled={!canSend}
+                data-test-id="chat-input-interrupt-button"
+                title="Cancel the current turn and submit this message immediately. The partial assistant reply stays in history."
+                className="font-bold rounded-xl px-4 py-2.5 text-sm disabled:opacity-30 active:scale-95 transition-all shadow-sm flex items-center gap-2 bg-yellow/15 border border-yellow/40 text-yellow hover:bg-yellow/25"
+              >
+                <Zap size={15} />
+                Interrupt
               </button>
             )}
             <button
