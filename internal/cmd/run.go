@@ -10,6 +10,7 @@ import (
 
 	"charm.land/log/v2"
 	"github.com/charmbracelet/crush/internal/app"
+	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/session"
 	"github.com/spf13/cobra"
 )
@@ -19,6 +20,12 @@ var runCmd = &cobra.Command{
 	Use:     "run [prompt...]",
 	Short:   "Run a single non-interactive prompt",
 	Long: `Run a single prompt in non-interactive mode and exit.
+
+--role is REQUIRED: every invocation must declare whether it wants the
+strong/slow model ("--role smart" or "--role large") or the cheap/fast
+one ("--role fast" or "--role small"). The actual model id behind each
+role comes from "crush models show"; --model overrides it for one
+invocation. This avoids silently burning premium tokens on a one-liner.
 
 Prompt sources (combined as "<stdin>\n\n<args>"):
   - positional args:   crush run "your prompt"
@@ -91,8 +98,14 @@ git diff HEAD~1 | crush run --system-prompt-file ./reviewer-prompt.md \
                             --session "pr-42" \
                             "Review this diff"
 
+# Required role flag — pick the strong model
+crush run --role smart "design a migration for X"
+
+# …or the cheap one for a quick one-liner
+crush run --role fast "tldr this readme" < README.md
+
 # Watch the agent think token-by-token (legacy output mode)
-crush run --stream "explain this codebase"
+crush run --role smart --stream "explain this codebase"
 
 # Machine-readable summary for wrapper scripts
 crush run --json --session "pr-42" "review the diff" | jq .final_text
@@ -108,6 +121,7 @@ crush run --timeout 5m --session "long-task" "refactor the storage layer"
 			stream, _           = cmd.Flags().GetBool("stream")
 			asJSON, _           = cmd.Flags().GetBool("json")
 			timeout, _          = cmd.Flags().GetDuration("timeout")
+			role, _             = cmd.Flags().GetString("role")
 			largeModel, _       = cmd.Flags().GetString("model")
 			smallModel, _       = cmd.Flags().GetString("small-model")
 			sessionID, _        = cmd.Flags().GetString("session")
@@ -115,6 +129,22 @@ crush run --timeout 5m --session "long-task" "refactor the storage layer"
 			systemPrompt, _     = cmd.Flags().GetString("system-prompt")
 			systemPromptFile, _ = cmd.Flags().GetString("system-prompt-file")
 		)
+
+		// --role is required so a `crush run` invocation always declares
+		// its intent (cheap-and-fast vs strong-and-slow), instead of
+		// silently defaulting to large and burning tokens unintentionally.
+		// "smart" / "fast" are friendly aliases for "large" / "small".
+		var roleLarge bool
+		switch role {
+		case "large", "smart":
+			roleLarge = true
+		case "small", "fast":
+			roleLarge = false
+		case "":
+			return fmt.Errorf("--role is required: pass --role smart (large) or --role fast (small)")
+		default:
+			return fmt.Errorf("--role: invalid value %q (allowed: smart|large, fast|small)", role)
+		}
 
 		if systemPrompt != "" && systemPromptFile != "" {
 			return fmt.Errorf("--system-prompt and --system-prompt-file are mutually exclusive")
@@ -160,6 +190,20 @@ crush run --timeout 5m --session "long-task" "refactor the storage layer"
 			return fmt.Errorf("no providers configured - please run 'crush' to set up a provider interactively")
 		}
 
+		// Fold --role into largeModel. When the user picked "fast" without
+		// also passing an explicit --model, we point the agent at whatever
+		// the config has saved as the small model — that's the user's
+		// pre-declared "cheap/quick" choice. The agent always uses its
+		// `large` slot for the turn; --role just decides which catalog
+		// entry fills it.
+		if !roleLarge && largeModel == "" {
+			small, ok := a.Config().Models[config.SelectedModelTypeSmall]
+			if !ok || small.Model == "" {
+				return fmt.Errorf("--role fast: no small model configured (run \"crush models set small <model>\" first)")
+			}
+			largeModel = small.Provider + "/" + small.Model
+		}
+
 		if verbose {
 			slog.SetDefault(slog.New(log.New(os.Stderr)))
 		}
@@ -196,6 +240,7 @@ crush run --timeout 5m --session "long-task" "refactor the storage layer"
 func init() {
 	runCmd.Flags().BoolP("quiet", "q", false, "Hide spinner")
 	runCmd.Flags().BoolP("verbose", "v", false, "Show logs")
+	runCmd.Flags().String("role", "", "REQUIRED. Which preselected model to use: smart|large (the strong one) or fast|small (the cheap one). The actual model id comes from `crush models show`; override with --model.")
 	runCmd.Flags().Bool("stream", false, "Stream every assistant token to stdout. Default is terse: tool-call names on stderr + final answer on stdout.")
 	runCmd.Flags().Bool("json", false, "Emit one JSON object on stdout summarising the run (session_id, final_text, tool_calls, usage, duration, exit_reason). Mutually exclusive with --stream.")
 	runCmd.Flags().Duration("timeout", 0, "Abort the run after this duration (e.g. 30s, 5m, 1h). 0 = no timeout.")
