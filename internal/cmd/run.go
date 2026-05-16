@@ -18,42 +18,81 @@ var runCmd = &cobra.Command{
 	Use:     "run [prompt...]",
 	Short:   "Run a single non-interactive prompt",
 	Long: `Run a single prompt in non-interactive mode and exit.
-The prompt can be provided as arguments or piped from stdin.`,
+
+Prompt sources (combined as "<stdin>\n\n<args>"):
+  - positional args:   crush run "your prompt"
+  - stdin pipe/redir:  echo "hello" | crush run     |     crush run < prompt.md
+  - both (stdin = context, args = question)
+
+Sessions: --session takes either an existing session id (or hash prefix)
+to continue, OR an arbitrary new id to start a fresh session with that
+exact id — handy for CI where the build matrix maps to a stable key.
+
+System prompt: --system-prompt / --system-prompt-file persists the prompt
+on the session so subsequent runs with the same --session pick it up.`,
 	Example: `
 # Run a simple prompt
 crush run "Guess my 5 favorite Pokémon"
 
-# Pipe input from stdin
+# Pipe input from stdin (stdin is prepended to the args prompt)
 curl https://charm.land | crush run "Summarize this website"
 
-# Read from a file
-crush run "What is this code doing?" <<< prrr.go
+# Read the prompt from a file
+crush run < prompt.md
 
 # Redirect output to a file
 crush run "Generate a hot README for this project" > MY_HOT_README.md
 
-# Run in quiet mode (hide the spinner)
-crush run --quiet "Generate a README for this project"
-
-# Run in verbose mode (show logs)
+# Quiet mode (hide the spinner) / verbose mode (show logs)
+crush run --quiet  "Generate a README for this project"
 crush run --verbose "Generate a README for this project"
 
-# Continue a previous session
+# Continue a previous session by id (or hash prefix)
 crush run --session {session-id} "Follow up on your last response"
 
 # Continue the most recent session
 crush run --continue "Follow up on your last response"
 
+# Idempotent CI: same id across runs continues the same conversation;
+# the first run creates it. Use a stable key like a PR number.
+crush run --session "pr-42" "Review the latest changes"
+
+# Override the session's system prompt from a flag
+crush run --system-prompt "You are a terse senior reviewer." \
+          --session "pr-42" "Review the latest changes"
+
+# Or from a file (mutually exclusive with --system-prompt)
+crush run --system-prompt-file ./reviewer-prompt.md \
+          --session "pr-42" "Review the latest changes"
+
+# Stdin user-prompt + file system-prompt + stable session id — the three
+# inputs are independent, so this works as one pipeline:
+git diff HEAD~1 | crush run --system-prompt-file ./reviewer-prompt.md \
+                            --session "pr-42" \
+                            "Review this diff"
   `,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		var (
-			quiet, _      = cmd.Flags().GetBool("quiet")
-			verbose, _    = cmd.Flags().GetBool("verbose")
-			largeModel, _ = cmd.Flags().GetString("model")
-			smallModel, _ = cmd.Flags().GetString("small-model")
-			sessionID, _  = cmd.Flags().GetString("session")
-			useLast, _    = cmd.Flags().GetBool("continue")
+			quiet, _            = cmd.Flags().GetBool("quiet")
+			verbose, _          = cmd.Flags().GetBool("verbose")
+			largeModel, _       = cmd.Flags().GetString("model")
+			smallModel, _       = cmd.Flags().GetString("small-model")
+			sessionID, _        = cmd.Flags().GetString("session")
+			useLast, _          = cmd.Flags().GetBool("continue")
+			systemPrompt, _     = cmd.Flags().GetString("system-prompt")
+			systemPromptFile, _ = cmd.Flags().GetString("system-prompt-file")
 		)
+
+		if systemPrompt != "" && systemPromptFile != "" {
+			return fmt.Errorf("--system-prompt and --system-prompt-file are mutually exclusive")
+		}
+		if systemPromptFile != "" {
+			bts, err := os.ReadFile(systemPromptFile)
+			if err != nil {
+				return fmt.Errorf("failed to read --system-prompt-file: %w", err)
+			}
+			systemPrompt = string(bts)
+		}
 
 		// Cancel on SIGINT or SIGTERM.
 		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, os.Kill)
@@ -65,12 +104,14 @@ crush run --continue "Follow up on your last response"
 		}
 		defer app.Shutdown()
 
+		// resolveSessionID handles the lookup path (exact id / hash prefix).
+		// If it fails to find anything we fall through with the raw value:
+		// app.resolveSession's get-or-create branch will create a session
+		// whose ID is exactly the user-supplied string.
 		if sessionID != "" {
-			sess, err := resolveSessionID(ctx, app.Sessions, sessionID)
-			if err != nil {
-				return err
+			if sess, err := resolveSessionID(ctx, app.Sessions, sessionID); err == nil {
+				sessionID = sess.ID
 			}
-			sessionID = sess.ID
 		}
 
 		if !app.Config().IsConfigured() {
@@ -93,8 +134,7 @@ crush run --continue "Follow up on your last response"
 			return fmt.Errorf("no prompt provided")
 		}
 
-
-		return app.RunNonInteractive(ctx, os.Stdout, prompt, largeModel, smallModel, quiet || verbose, sessionID, useLast)
+		return app.RunNonInteractive(ctx, os.Stdout, prompt, largeModel, smallModel, systemPrompt, quiet || verbose, sessionID, useLast)
 	},
 }
 
@@ -103,9 +143,12 @@ func init() {
 	runCmd.Flags().BoolP("verbose", "v", false, "Show logs")
 	runCmd.Flags().StringP("model", "m", "", "Model to use. Accepts 'model' or 'provider/model' to disambiguate models with the same name across providers")
 	runCmd.Flags().String("small-model", "", "Small model to use. If not provided, uses the default small model for the provider")
-	runCmd.Flags().StringP("session", "s", "", "Continue a previous session by ID")
+	runCmd.Flags().StringP("session", "s", "", "Session ID to continue OR create. If a session with this id exists it is continued; otherwise a new one is created with this id. Accepts a hash prefix for existing sessions only.")
 	runCmd.Flags().BoolP("continue", "C", false, "Continue the most recent session")
+	runCmd.Flags().String("system-prompt", "", "Override the session's system prompt with this string (persisted on the session)")
+	runCmd.Flags().String("system-prompt-file", "", "Read the system prompt from this file (mutually exclusive with --system-prompt)")
 	runCmd.MarkFlagsMutuallyExclusive("session", "continue")
+	runCmd.MarkFlagsMutuallyExclusive("system-prompt", "system-prompt-file")
 }
 
 // resolveSessionID resolves a session by exact UUID or hash prefix.

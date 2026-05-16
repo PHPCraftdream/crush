@@ -158,13 +158,21 @@ func (app *App) resolveSession(ctx context.Context, continueSessionID string, us
 			return session.Session{}, fmt.Errorf("cannot continue an agent tool session: %s", continueSessionID)
 		}
 		sess, err := app.Sessions.Get(ctx, continueSessionID)
-		if err != nil {
-			return session.Session{}, fmt.Errorf("session not found: %s", continueSessionID)
+		if err == nil {
+			if sess.ParentSessionID != "" {
+				return session.Session{}, fmt.Errorf("cannot continue a child session: %s", continueSessionID)
+			}
+			return sess, nil
 		}
-		if sess.ParentSessionID != "" {
-			return session.Session{}, fmt.Errorf("cannot continue a child session: %s", continueSessionID)
+		// Get-or-create semantics: --session <id> with an unknown id creates
+		// a brand-new top-level session with that exact id. Lets CI / scripts
+		// pick a deterministic key (e.g. an issue number) and re-run idempotently.
+		created, createErr := app.Sessions.CreateWithID(ctx, continueSessionID, continueSessionID)
+		if createErr != nil {
+			return session.Session{}, fmt.Errorf("session %q not found and could not be created: %w", continueSessionID, createErr)
 		}
-		return sess, nil
+		slog.Info("Created session on demand from --session id", "session_id", created.ID)
+		return created, nil
 
 	case useLast:
 		sess, err := app.Sessions.GetLast(ctx)
@@ -180,7 +188,7 @@ func (app *App) resolveSession(ctx context.Context, continueSessionID string, us
 
 // RunNonInteractive runs the application in non-interactive mode with the
 // given prompt, printing to stdout.
-func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt, largeModel, smallModel string, hideSpinner bool, continueSessionID string, useLast bool) error {
+func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt, largeModel, smallModel, systemPrompt string, hideSpinner bool, continueSessionID string, useLast bool) error {
 	slog.Info("Running in non-interactive mode")
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -233,6 +241,16 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt,
 		slog.Info("Continuing session for non-interactive run", "session_id", sess.ID)
 	} else {
 		slog.Info("Created session for non-interactive run", "session_id", sess.ID)
+	}
+
+	// Persist the requested system prompt for this session. Coordinator's
+	// resolveSessionSystemPrompt will pick it up on the next Run(); leaving
+	// systemPrompt empty preserves whatever was previously stored (or causes
+	// the default prompt to be built and stored on first run).
+	if systemPrompt != "" {
+		if err := app.Sessions.UpdateSystemPrompt(ctx, sess.ID, systemPrompt); err != nil {
+			return fmt.Errorf("failed to set system prompt for session: %w", err)
+		}
 	}
 
 	// Automatically approve all permission requests for this non-interactive

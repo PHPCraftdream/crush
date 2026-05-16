@@ -28,6 +28,19 @@ func (m *mockSessionService) Create(_ context.Context, title string) (session.Se
 	return s, nil
 }
 
+// createWithIDErr lets a test simulate a UNIQUE-constraint or DB failure.
+var _createWithIDErr error // populated per-test if non-nil
+
+func (m *mockSessionService) CreateWithID(_ context.Context, id, title string) (session.Session, error) {
+	if _createWithIDErr != nil {
+		return session.Session{}, _createWithIDErr
+	}
+	s := session.Session{ID: id, Title: title}
+	m.created = append(m.created, s)
+	m.sessions = append(m.sessions, s)
+	return s, nil
+}
+
 func (m *mockSessionService) CreateTitleSession(context.Context, string) (session.Session, error) {
 	return session.Session{}, nil
 }
@@ -134,13 +147,29 @@ func TestResolveSession_ContinueByID(t *testing.T) {
 	require.Empty(t, mock.created)
 }
 
-func TestResolveSession_ContinueByID_NotFound(t *testing.T) {
+// Fork patch: was "expect error when id not found". The semantic changed to
+// get-or-create — see internal/app/app.go's resolveSession.
+func TestResolveSession_ContinueByID_NotFound_CreatesNew(t *testing.T) {
 	mock := &mockSessionService{}
 	app := newTestApp(mock)
 
-	_, err := app.resolveSession(t.Context(), "nonexistent", false)
+	sess, err := app.resolveSession(t.Context(), "pr-42", false)
+	require.NoError(t, err)
+	require.Equal(t, "pr-42", sess.ID, "session must use the caller-supplied id verbatim")
+	require.Equal(t, "pr-42", sess.Title, "title defaults to the id for ad-hoc-created sessions")
+	require.Len(t, mock.created, 1)
+}
+
+func TestResolveSession_ContinueByID_NotFound_CreateError(t *testing.T) {
+	mock := &mockSessionService{}
+	app := newTestApp(mock)
+
+	_createWithIDErr = fmt.Errorf("UNIQUE constraint failed")
+	t.Cleanup(func() { _createWithIDErr = nil })
+
+	_, err := app.resolveSession(t.Context(), "duplicate-id", false)
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "session not found")
+	require.Contains(t, err.Error(), "could not be created")
 }
 
 func TestResolveSession_ContinueByID_ChildSession(t *testing.T) {
