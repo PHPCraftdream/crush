@@ -35,7 +35,13 @@ Output: terse by default. Tool-call names are written to stderr as
 "▶ <toolName>" (one per call), and only the final assistant message is
 written to stdout. Use --stream to get every assistant token in real
 time. Use --timeout to bound the run from outside (the agent gets a
-clean cancel + the partial answer is preserved in the session).`,
+clean cancel + the partial answer is preserved in the session).
+
+Permissions: non-interactive runs auto-approve every permission request
+(no one is on the keyboard to confirm). The agent gets the full tool
+set with no prompting. This is fast but irreversible — only run
+"crush run" in a workspace whose contents you can afford to lose, and
+prefer --cwd /some/sandbox-or-temp-dir for one-shot scripts.`,
 	Example: `
 # Run a simple prompt
 crush run "Guess my 5 favorite Pokémon"
