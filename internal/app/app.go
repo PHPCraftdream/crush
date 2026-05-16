@@ -5,11 +5,13 @@ package app
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -188,16 +190,88 @@ func (app *App) resolveSession(ctx context.Context, continueSessionID string, us
 
 // RunNonInteractive runs the application in non-interactive mode with the
 // given prompt, printing to stdout.
+// runResult is the JSON shape emitted by `crush run --json`. Wire-stable:
+// fields here are part of the public contract for wrapper scripts.
+type runResult struct {
+	SessionID  string         `json:"session_id"`
+	ExitReason string         `json:"exit_reason"` // "stop","error","canceled","max_tokens","unknown","tool_use"
+	FinalText  string         `json:"final_text"`
+	Error      string         `json:"error,omitempty"`
+	ToolCalls  []toolCallStat `json:"tool_calls"`
+	Usage      usageInfo      `json:"usage"`
+	DurationMs int64          `json:"duration_ms"`
+}
+
+type toolCallStat struct {
+	Name  string `json:"name"`
+	Count int    `json:"count"`
+}
+
+type usageInfo struct {
+	DeltaTokens  int64   `json:"delta_tokens"`
+	DeltaCostUSD float64 `json:"delta_cost_usd"`
+}
+
+// buildRunResult assembles runResult from the bits collected during the
+// run. exit_reason follows the same vocabulary the WUI uses (see
+// message.FinishReason*) plus a synthetic "canceled" / "error" when the
+// agent never finalised a message.
+func buildRunResult(sessionID, finalText, finalReason string, err error, canceled bool, toolCounts map[string]int, deltaTokens int64, deltaCost float64, duration time.Duration) runResult {
+	reason := finalReason
+	if reason == "" {
+		switch {
+		case canceled:
+			reason = "canceled"
+		case err != nil:
+			reason = "error"
+		default:
+			reason = "unknown"
+		}
+	}
+	calls := make([]toolCallStat, 0, len(toolCounts))
+	for name, count := range toolCounts {
+		calls = append(calls, toolCallStat{Name: name, Count: count})
+	}
+	// Stable ordering so the JSON diffs cleanly across runs.
+	sort.Slice(calls, func(i, j int) bool { return calls[i].Name < calls[j].Name })
+	errMsg := ""
+	if err != nil && !canceled {
+		errMsg = err.Error()
+	}
+	return runResult{
+		SessionID:  sessionID,
+		ExitReason: reason,
+		FinalText:  finalText,
+		Error:      errMsg,
+		ToolCalls:  calls,
+		Usage: usageInfo{
+			DeltaTokens:  deltaTokens,
+			DeltaCostUSD: deltaCost,
+		},
+		DurationMs: duration.Milliseconds(),
+	}
+}
+
+// RunMode picks the output format for RunNonInteractive.
+type RunMode int
+
+const (
+	// RunModeTerse: tool-call names on stderr, final assistant message on
+	// stdout. Default — small output, friendly to wrapper scripts.
+	RunModeTerse RunMode = iota
+	// RunModeStream: every assistant token streams to stdout as it arrives.
+	// Legacy behaviour; useful when a human is watching.
+	RunModeStream
+	// RunModeJSON: stdout gets exactly one JSON object summarising the run
+	// (session id, final text, tool-call counts, token usage, duration,
+	// exit reason). Tool-call heartbeat still goes to stderr so wrappers
+	// can show progress without parsing JSON deltas.
+	RunModeJSON
+)
+
 // RunNonInteractive runs a single agent turn and writes its result to
-// `output`. By default it is terse: tool-call names are printed on stderr
-// (one short line per call), and only the *final* assistant message
-// (the one that carries the FinishReason) goes to stdout. Pass
-// `streamOutput=true` to get the legacy live-streaming behaviour that
-// prints every assistant token as it arrives. The terse default exists
-// so a wrapper (CI, an agent driving crush, a script piping into another
-// tool) can capture only the answer without drowning in intermediate
-// "let me first check…" prose.
-func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt, largeModel, smallModel, systemPrompt string, hideSpinner, streamOutput bool, continueSessionID string, useLast bool) error {
+// `output`. See RunMode for the available output shapes.
+func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt, largeModel, smallModel, systemPrompt string, hideSpinner bool, mode RunMode, continueSessionID string, useLast bool) error {
 	slog.Info("Running in non-interactive mode")
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -271,6 +345,9 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt,
 		err    error
 	}
 	done := make(chan response, 1)
+	runStart := time.Now()
+	tokensBefore := sess.PromptTokens + sess.CompletionTokens
+	costBefore := sess.Cost
 
 	go func(ctx context.Context, sessionID, prompt string) {
 		result, err := app.AgentCoordinator.Run(ctx, sess.ID, prompt)
@@ -288,7 +365,10 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt,
 	messageEvents := app.Messages.Subscribe(ctx)
 	messageReadBytes := make(map[string]int)
 	seenToolCalls := make(map[string]bool)
-	printedFinal := make(map[string]bool) // for terse mode: print once per finished assistant msg
+	toolCallCounts := make(map[string]int) // name → count, for JSON output
+	printedFinal := make(map[string]bool)  // for terse mode: print once per finished assistant msg
+	var finalText string                    // last assistant FullText seen, for JSON output
+	var finalReason string                  // last assistant Finish.Reason seen, for JSON output
 	var printed bool
 
 	defer func() {
@@ -296,9 +376,12 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt,
 			_, _ = fmt.Fprintf(os.Stderr, ansi.ResetProgressBar)
 		}
 
-		// Always print a newline at the end. If output is a TTY this will
-		// prevent the prompt from overwriting the last line of output.
-		_, _ = fmt.Fprintln(output)
+		// JSON mode emits its own trailing newline via json.Encoder; the
+		// terse/stream modes need a bare \n so a follow-up shell prompt
+		// doesn't overwrite the last token.
+		if mode != RunModeJSON {
+			_, _ = fmt.Fprintln(output)
+		}
 	}()
 
 	for {
@@ -311,12 +394,38 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt,
 		select {
 		case result := <-done:
 			stopSpinner()
-			if result.err != nil {
-				if errors.Is(result.err, context.Canceled) || errors.Is(result.err, agent.ErrRequestCancelled) {
+			runErr := result.err
+			isCanceled := runErr != nil && (errors.Is(runErr, context.Canceled) || errors.Is(runErr, agent.ErrRequestCancelled))
+
+			if mode == RunModeJSON {
+				// Re-fetch the session row so the usage delta reflects
+				// the writes the agent made during the run.
+				freshSess, _ := app.Sessions.Get(ctx, sess.ID)
+				summary := buildRunResult(
+					sess.ID, finalText, finalReason, runErr, isCanceled,
+					toolCallCounts,
+					freshSess.PromptTokens+freshSess.CompletionTokens-tokensBefore,
+					freshSess.Cost-costBefore,
+					time.Since(runStart),
+				)
+				enc := json.NewEncoder(output)
+				if encErr := enc.Encode(summary); encErr != nil {
+					return fmt.Errorf("failed to encode JSON result: %w", encErr)
+				}
+				if isCanceled || runErr == nil {
+					return nil
+				}
+				// Non-cancel error: JSON already carries it; surface a
+				// non-zero exit code by returning the err.
+				return runErr
+			}
+
+			if runErr != nil {
+				if isCanceled {
 					slog.Debug("Non-interactive: agent processing cancelled", "session_id", sess.ID)
 					return nil
 				}
-				return fmt.Errorf("agent processing failed: %w", result.err)
+				return fmt.Errorf("agent processing failed: %w", runErr)
 			}
 			return nil
 
@@ -331,6 +440,7 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt,
 				for _, p := range msg.Parts {
 					if tc, ok := p.(message.ToolCall); ok && tc.Name != "" && !seenToolCalls[tc.ID] {
 						seenToolCalls[tc.ID] = true
+						toolCallCounts[tc.Name]++
 						prefix := ""
 						if stderrTTY {
 							prefix = "\r" + ansi.EraseEntireLine
@@ -339,11 +449,24 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt,
 					}
 				}
 
-				// Terse mode (default): wait for the message to carry a
-				// Finish part, then dump its final text once. Skipping
-				// intermediate "let me first…" prose is the whole point —
-				// it keeps script output and wrapper context small.
-				if !streamOutput {
+				// Track final state for JSON mode regardless of which
+				// output mode is active — JSON output materialises after
+				// the run completes, so we accumulate as we go.
+				if msg.IsFinished() {
+					finalText = msg.FullText()
+					for _, p := range msg.Parts {
+						if f, ok := p.(message.Finish); ok {
+							finalReason = string(f.Reason)
+							break
+						}
+					}
+				}
+
+				switch mode {
+				case RunModeJSON:
+					// Suppress per-message stdout entirely; the summary is
+					// printed below after `done` fires.
+				case RunModeTerse:
 					if !msg.IsFinished() || printedFinal[msg.ID] {
 						continue
 					}
@@ -353,31 +476,23 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt,
 						printed = true
 						fmt.Fprint(output, text)
 					}
-					continue
+				case RunModeStream:
+					content := msg.FullText()
+					readBytes := messageReadBytes[msg.ID]
+					if len(content) < readBytes {
+						slog.Error("Non-interactive: message content is shorter than read bytes", "message_length", len(content), "read_bytes", readBytes)
+						return fmt.Errorf("message content is shorter than read bytes: %d < %d", len(content), readBytes)
+					}
+					part := content[readBytes:]
+					if readBytes == 0 {
+						part = strings.TrimLeft(part, " \t")
+					}
+					if printed || strings.TrimSpace(part) != "" {
+						printed = true
+						fmt.Fprint(output, part)
+					}
+					messageReadBytes[msg.ID] = len(content)
 				}
-
-				// Streaming mode (--stream): print every new token as
-				// the assistant produces it. This is the legacy behaviour.
-				content := msg.FullText()
-				readBytes := messageReadBytes[msg.ID]
-
-				if len(content) < readBytes {
-					slog.Error("Non-interactive: message content is shorter than read bytes", "message_length", len(content), "read_bytes", readBytes)
-					return fmt.Errorf("message content is shorter than read bytes: %d < %d", len(content), readBytes)
-				}
-
-				part := content[readBytes:]
-				// Trim leading whitespace. Sometimes the LLM includes leading
-				// formatting and intentation, which we don't want here.
-				if readBytes == 0 {
-					part = strings.TrimLeft(part, " \t")
-				}
-				// Ignore initial whitespace-only messages.
-				if printed || strings.TrimSpace(part) != "" {
-					printed = true
-					fmt.Fprint(output, part)
-				}
-				messageReadBytes[msg.ID] = len(content)
 			}
 
 		case <-ctx.Done():

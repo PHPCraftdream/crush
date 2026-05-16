@@ -18,7 +18,9 @@ var webCmd = &cobra.Command{
 
 Launches an HTTP server with a React UI and a WebSocket endpoint for
 real-time communication with the agent. Sessions, permissions, model
-selection, logs, queueing and turn-interruption all happen in the browser.
+selection, logs, message queueing, and turn-interruption (the yellow
+"Interrupt" button that cancels the running turn while keeping
+everything produced so far) all happen in the browser.
 
 At startup the server prints the URL and a one-time access token. The
 token is also copied to your clipboard. Paste it in the browser to

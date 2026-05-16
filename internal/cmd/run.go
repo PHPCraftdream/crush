@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"charm.land/log/v2"
+	"github.com/charmbracelet/crush/internal/app"
 	"github.com/charmbracelet/crush/internal/session"
 	"github.com/spf13/cobra"
 )
@@ -31,11 +32,18 @@ exact id — handy for CI where the build matrix maps to a stable key.
 System prompt: --system-prompt / --system-prompt-file persists the prompt
 on the session so subsequent runs with the same --session pick it up.
 
-Output: terse by default. Tool-call names are written to stderr as
-"▶ <toolName>" (one per call), and only the final assistant message is
-written to stdout. Use --stream to get every assistant token in real
-time. Use --timeout to bound the run from outside (the agent gets a
-clean cancel + the partial answer is preserved in the session).
+Output modes (mutually exclusive --stream / --json):
+  - default (terse): tool-call names on stderr as "▶ <toolName>"; only
+    the final assistant message on stdout.
+  - --stream:        every assistant token streamed live to stdout.
+  - --json:          a single JSON object on stdout when the run ends —
+                     {session_id, exit_reason, final_text, tool_calls,
+                      usage, duration_ms, error}. Tool-call heartbeat
+                     still goes to stderr so wrappers can show progress.
+
+Use --timeout to bound the run from outside (the agent gets a clean
+cancel + the partial answer is preserved in the session and is included
+in --json output).
 
 Permissions: non-interactive runs auto-approve every permission request
 (no one is on the keyboard to confirm). The agent gets the full tool
@@ -86,7 +94,11 @@ git diff HEAD~1 | crush run --system-prompt-file ./reviewer-prompt.md \
 # Watch the agent think token-by-token (legacy output mode)
 crush run --stream "explain this codebase"
 
+# Machine-readable summary for wrapper scripts
+crush run --json --session "pr-42" "review the diff" | jq .final_text
+
 # Hard time limit — partial answer is still preserved in the session
+# (and surfaced in --json's exit_reason / final_text)
 crush run --timeout 5m --session "long-task" "refactor the storage layer"
   `,
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -94,6 +106,7 @@ crush run --timeout 5m --session "long-task" "refactor the storage layer"
 			quiet, _            = cmd.Flags().GetBool("quiet")
 			verbose, _          = cmd.Flags().GetBool("verbose")
 			stream, _           = cmd.Flags().GetBool("stream")
+			asJSON, _           = cmd.Flags().GetBool("json")
 			timeout, _          = cmd.Flags().GetDuration("timeout")
 			largeModel, _       = cmd.Flags().GetString("model")
 			smallModel, _       = cmd.Flags().GetString("small-model")
@@ -127,23 +140,23 @@ crush run --timeout 5m --session "long-task" "refactor the storage layer"
 			defer timeoutCancel()
 		}
 
-		app, err := setupApp(cmd)
+		a, err := setupApp(cmd)
 		if err != nil {
 			return err
 		}
-		defer app.Shutdown()
+		defer a.Shutdown()
 
 		// resolveSessionID handles the lookup path (exact id / hash prefix).
 		// If it fails to find anything we fall through with the raw value:
-		// app.resolveSession's get-or-create branch will create a session
+		// resolveSession's get-or-create branch will create a session
 		// whose ID is exactly the user-supplied string.
 		if sessionID != "" {
-			if sess, err := resolveSessionID(ctx, app.Sessions, sessionID); err == nil {
+			if sess, err := resolveSessionID(ctx, a.Sessions, sessionID); err == nil {
 				sessionID = sess.ID
 			}
 		}
 
-		if !app.Config().IsConfigured() {
+		if !a.Config().IsConfigured() {
 			return fmt.Errorf("no providers configured - please run 'crush' to set up a provider interactively")
 		}
 
@@ -163,7 +176,20 @@ crush run --timeout 5m --session "long-task" "refactor the storage layer"
 			return fmt.Errorf("no prompt provided")
 		}
 
-		return app.RunNonInteractive(ctx, os.Stdout, prompt, largeModel, smallModel, systemPrompt, quiet || verbose, stream, sessionID, useLast)
+		if stream && asJSON {
+			return fmt.Errorf("--stream and --json are mutually exclusive")
+		}
+		mode := app.RunModeTerse
+		switch {
+		case asJSON:
+			mode = app.RunModeJSON
+		case stream:
+			mode = app.RunModeStream
+		}
+		// JSON mode forces quiet (hide spinner) so the spinner glyphs don't
+		// leak into stdout. The summary line on stderr we still emit.
+		hideSpinner := quiet || verbose || asJSON
+		return a.RunNonInteractive(ctx, os.Stdout, prompt, largeModel, smallModel, systemPrompt, hideSpinner, mode, sessionID, useLast)
 	},
 }
 
@@ -171,6 +197,7 @@ func init() {
 	runCmd.Flags().BoolP("quiet", "q", false, "Hide spinner")
 	runCmd.Flags().BoolP("verbose", "v", false, "Show logs")
 	runCmd.Flags().Bool("stream", false, "Stream every assistant token to stdout. Default is terse: tool-call names on stderr + final answer on stdout.")
+	runCmd.Flags().Bool("json", false, "Emit one JSON object on stdout summarising the run (session_id, final_text, tool_calls, usage, duration, exit_reason). Mutually exclusive with --stream.")
 	runCmd.Flags().Duration("timeout", 0, "Abort the run after this duration (e.g. 30s, 5m, 1h). 0 = no timeout.")
 	runCmd.Flags().StringP("model", "m", "", "Model to use. Accepts 'model' or 'provider/model' to disambiguate models with the same name across providers")
 	runCmd.Flags().String("small-model", "", "Small model to use. If not provided, uses the default small model for the provider")
@@ -180,6 +207,7 @@ func init() {
 	runCmd.Flags().String("system-prompt-file", "", "Read the system prompt from this file (mutually exclusive with --system-prompt)")
 	runCmd.MarkFlagsMutuallyExclusive("session", "continue")
 	runCmd.MarkFlagsMutuallyExclusive("system-prompt", "system-prompt-file")
+	runCmd.MarkFlagsMutuallyExclusive("stream", "json")
 }
 
 // resolveSessionID resolves a session by exact UUID or hash prefix.

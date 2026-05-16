@@ -63,11 +63,15 @@ starts a local HTTP + WebSocket server, prints the URL and a one-time
 access token, and opens your default browser to the UI.
 
 The web UI lets you chat with the agent, switch models per session, inspect
-and revoke tool permissions, browse logs, and queue or interrupt the
-running turn.
+and revoke tool permissions, browse logs, queue messages while the agent
+is busy, and interrupt the running turn (yellow Interrupt button) to fold
+a correction into the next step while keeping everything produced so far.
 
-For scripting and one-shot prompts use the ` + "`crush run`" + ` subcommand,
-which keeps the original non-interactive behaviour (stdin/stdout-friendly).`,
+Companion CLI subcommands for scripting and CI:
+  - ` + "`crush run`" + `             one-shot prompt; supports --session id (get-or-create),
+                          --system-prompt[-file], --json output, --timeout.
+  - ` + "`crush sessions`" + `        list / delete / reset stored sessions.
+  - ` + "`crush system-prompt`" + `   print the system prompt that would be sent.`,
 	Example: `
 # Start the web UI on a random free port and open the browser
 crush
@@ -92,6 +96,13 @@ crush run "Summarise the changes on this branch"
 
 # Pipe stdin into a one-shot prompt
 cat README.md | crush run "Make this more glamorous" > GLAMOROUS_README.md
+
+# Idempotent CI invocation with structured output
+crush run --session "pr-42" --json "Review the diff" | jq .final_text
+
+# Inspect / clean up stored sessions
+crush sessions list
+crush sessions delete pr-42
   `,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return runWebMode(cmd)
