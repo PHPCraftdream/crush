@@ -1,5 +1,21 @@
 package message
 
+// Fork patch: this file diverges from upstream in two ways.
+//
+//  1. CreateMessageParams adds `ReasoningEffort` and `Hidden`; the Service
+//     interface adds `Notify` (DB-less pubsub for streaming deltas) and
+//     `SetPinned`. Matching DB migrations live under
+//     `internal/db/migrations/20260310*`, `20260311*`, `20260313000001`.
+//
+//  2. We removed upstream's debounced/coalesced update layer (defaultUpdate-
+//     Debounce, pendingState, Flush/FlushAll). Our streaming path uses the
+//     in-process pubsub (Notify) for high-frequency UI updates and falls back
+//     to synchronous Update for terminal-state writes — this matches the
+//     latest-snapshot ticker in `internal/agent/agent.go`.
+//
+// Before merging upstream changes here: read CHANGELOG.fork.md section 2
+// ("internal/message/message.go") and section 4.C (DB migrations).
+
 import (
 	"context"
 	"database/sql"

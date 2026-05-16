@@ -1,5 +1,24 @@
 package agent
 
+// Fork patch: this Coordinator drives N concurrent web sessions, not a single
+// TUI run. The fork-specific additions visible in the diff against upstream
+// include:
+//
+//   - ModelOverride struct + RunWithOverrides path used by `handleSendMessage`
+//     in `internal/server/handlers.go` so the WUI can pick a model per turn.
+//   - TakeSummarizeQueue + queued background summarisation that does not
+//     block the user's next message (paired with agent.go's sliding window).
+//   - Wiring to `internal/agent/cliprovider` for npx-claude-code / Gemini /
+//     Codex CLI providers, including MCP bridge initialisation.
+//
+// Upstream's `copilotResponsesModels` table and per-model Responses-API
+// special-casing were removed when the dispatch was refactored. Keep an eye
+// on that during merges: if upstream adds a new Responses-only model, the
+// adapter selection in this file is where it needs to land.
+//
+// See CHANGELOG.fork.md sections 4.D (agent extensions) and 4.E (CLI
+// providers) before resolving a merge conflict.
+
 import (
 	"bytes"
 	"cmp"

@@ -1,5 +1,20 @@
 package config
 
+// Fork patch: differs from upstream in two ways.
+//
+//  1. The `Hooks` block in the config schema is exposed via this package and
+//     documented in `docs/hooks/README.md` so users can wire shell hooks (Pre/
+//     PostToolUse) from `crush.json`. Matching schema entries live in
+//     `schema.json`. See CHANGELOG.fork.md section 4.F.
+//
+//  2. ExtraHeaders / ExtraBody / FlatRate documentation was simplified
+//     (shell-expansion details and PLAN.md cross-refs removed). Upstream
+//     keeps the verbose comments. This is cosmetic — behaviour is unchanged
+//     — but it will produce noisy textual conflicts on every upstream merge.
+//
+// Before merging upstream changes: read CHANGELOG.fork.md section 2
+// ("internal/config/config.go").
+
 import (
 	"cmp"
 	"context"

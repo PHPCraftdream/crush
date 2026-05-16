@@ -1,5 +1,12 @@
 ﻿package cmd
 
+// Fork patch: upstream's login wires its REST client (`internal/client`) into
+// the auth flow so the daemon can pick up new credentials over the Unix
+// socket. This fork has no Go client — the web UI manages credentials
+// directly — so the import is replaced with the local `internal/agent/hyper`
+// catalog and the daemon-sync calls are dropped. See CHANGELOG.fork.md
+// section 2 ("internal/cmd/login.go") before merging.
+
 import (
 	"cmp"
 	"context"

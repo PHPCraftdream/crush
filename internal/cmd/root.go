@@ -1,5 +1,13 @@
 ﻿package cmd
 
+// Fork patch: the upstream `rootCmd` launches the Bubble Tea TUI. In this fork
+// it launches the embedded web server (`crush web`) by default, opens the
+// browser, and exposes the `--host`, `--port`, `--no-open` flags. The TUI
+// import tree (bubbletea, fang/v2 client wiring, internal/ui/model, etc.) and
+// the `--host`-as-REST-client logic from upstream are intentionally removed
+// here. See CHANGELOG.fork.md section 2 ("internal/cmd/root.go") and section
+// 4.A ("WebSocket server") before resolving any merge conflict in this file.
+
 import (
 	"context"
 	_ "embed"

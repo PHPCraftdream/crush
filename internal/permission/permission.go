@@ -1,5 +1,19 @@
 package permission
 
+// Fork patch: permission rules are persisted per-session in the SQLite store
+// (see DB migration `20260308000002_add_session_permissions.sql` and the
+// `enabled` flag from `20260312000002`). The Service interface adds
+// ListSessionPermissions / UpdatePermissionEnabled / DeletePermission for the
+// web UI's permissions modal. Upstream keeps the rules in memory only.
+//
+// The PermissionRequest / PermissionNotification structs lost their JSON tags
+// on purpose: the web wire format is defined in `internal/server/protocol.go`,
+// not on these in-memory types — keeping the tags would cause subtle drift
+// between the two layers.
+//
+// See CHANGELOG.fork.md section 4.C (DB migrations) and section 4.A
+// (WebSocket protocol) before resolving a merge conflict in this file.
+
 import (
 	"context"
 	"log/slog"
