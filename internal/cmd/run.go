@@ -29,7 +29,13 @@ to continue, OR an arbitrary new id to start a fresh session with that
 exact id — handy for CI where the build matrix maps to a stable key.
 
 System prompt: --system-prompt / --system-prompt-file persists the prompt
-on the session so subsequent runs with the same --session pick it up.`,
+on the session so subsequent runs with the same --session pick it up.
+
+Output: terse by default. Tool-call names are written to stderr as
+"▶ <toolName>" (one per call), and only the final assistant message is
+written to stdout. Use --stream to get every assistant token in real
+time. Use --timeout to bound the run from outside (the agent gets a
+clean cancel + the partial answer is preserved in the session).`,
 	Example: `
 # Run a simple prompt
 crush run "Guess my 5 favorite Pokémon"
@@ -70,11 +76,19 @@ crush run --system-prompt-file ./reviewer-prompt.md \
 git diff HEAD~1 | crush run --system-prompt-file ./reviewer-prompt.md \
                             --session "pr-42" \
                             "Review this diff"
+
+# Watch the agent think token-by-token (legacy output mode)
+crush run --stream "explain this codebase"
+
+# Hard time limit — partial answer is still preserved in the session
+crush run --timeout 5m --session "long-task" "refactor the storage layer"
   `,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		var (
 			quiet, _            = cmd.Flags().GetBool("quiet")
 			verbose, _          = cmd.Flags().GetBool("verbose")
+			stream, _           = cmd.Flags().GetBool("stream")
+			timeout, _          = cmd.Flags().GetDuration("timeout")
 			largeModel, _       = cmd.Flags().GetString("model")
 			smallModel, _       = cmd.Flags().GetString("small-model")
 			sessionID, _        = cmd.Flags().GetString("session")
@@ -97,6 +111,15 @@ git diff HEAD~1 | crush run --system-prompt-file ./reviewer-prompt.md \
 		// Cancel on SIGINT or SIGTERM.
 		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, os.Kill)
 		defer cancel()
+
+		// Optional hard deadline. The agent run gets context.DeadlineExceeded
+		// instead of context.Canceled, and the in-flight assistant message
+		// finishes with FinishReasonCanceled, just like an explicit cancel.
+		if timeout > 0 {
+			var timeoutCancel context.CancelFunc
+			ctx, timeoutCancel = context.WithTimeout(ctx, timeout)
+			defer timeoutCancel()
+		}
 
 		app, err := setupApp(cmd)
 		if err != nil {
@@ -134,13 +157,15 @@ git diff HEAD~1 | crush run --system-prompt-file ./reviewer-prompt.md \
 			return fmt.Errorf("no prompt provided")
 		}
 
-		return app.RunNonInteractive(ctx, os.Stdout, prompt, largeModel, smallModel, systemPrompt, quiet || verbose, sessionID, useLast)
+		return app.RunNonInteractive(ctx, os.Stdout, prompt, largeModel, smallModel, systemPrompt, quiet || verbose, stream, sessionID, useLast)
 	},
 }
 
 func init() {
 	runCmd.Flags().BoolP("quiet", "q", false, "Hide spinner")
 	runCmd.Flags().BoolP("verbose", "v", false, "Show logs")
+	runCmd.Flags().Bool("stream", false, "Stream every assistant token to stdout. Default is terse: tool-call names on stderr + final answer on stdout.")
+	runCmd.Flags().Duration("timeout", 0, "Abort the run after this duration (e.g. 30s, 5m, 1h). 0 = no timeout.")
 	runCmd.Flags().StringP("model", "m", "", "Model to use. Accepts 'model' or 'provider/model' to disambiguate models with the same name across providers")
 	runCmd.Flags().String("small-model", "", "Small model to use. If not provided, uses the default small model for the provider")
 	runCmd.Flags().StringP("session", "s", "", "Session ID to continue OR create. If a session with this id exists it is continued; otherwise a new one is created with this id. Accepts a hash prefix for existing sessions only.")

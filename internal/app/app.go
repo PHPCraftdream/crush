@@ -188,7 +188,16 @@ func (app *App) resolveSession(ctx context.Context, continueSessionID string, us
 
 // RunNonInteractive runs the application in non-interactive mode with the
 // given prompt, printing to stdout.
-func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt, largeModel, smallModel, systemPrompt string, hideSpinner bool, continueSessionID string, useLast bool) error {
+// RunNonInteractive runs a single agent turn and writes its result to
+// `output`. By default it is terse: tool-call names are printed on stderr
+// (one short line per call), and only the *final* assistant message
+// (the one that carries the FinishReason) goes to stdout. Pass
+// `streamOutput=true` to get the legacy live-streaming behaviour that
+// prints every assistant token as it arrives. The terse default exists
+// so a wrapper (CI, an agent driving crush, a script piping into another
+// tool) can capture only the answer without drowning in intermediate
+// "let me first check…" prose.
+func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt, largeModel, smallModel, systemPrompt string, hideSpinner, streamOutput bool, continueSessionID string, useLast bool) error {
 	slog.Info("Running in non-interactive mode")
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -279,6 +288,7 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt,
 	messageEvents := app.Messages.Subscribe(ctx)
 	messageReadBytes := make(map[string]int)
 	seenToolCalls := make(map[string]bool)
+	printedFinal := make(map[string]bool) // for terse mode: print once per finished assistant msg
 	var printed bool
 
 	defer func() {
@@ -315,15 +325,39 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt,
 			if msg.SessionID == sess.ID && msg.Role == message.Assistant && len(msg.Parts) > 0 {
 				stopSpinner()
 
-				if stderrTTY {
-					for _, p := range msg.Parts {
-						if tc, ok := p.(message.ToolCall); ok && tc.Name != "" && !seenToolCalls[tc.ID] {
-							seenToolCalls[tc.ID] = true
-							fmt.Fprintf(os.Stderr, "\r"+ansi.EraseEntireLine+"▶ %s\n", tc.Name)
+				// Tool-call names always go to stderr — one short line per
+				// new call. This gives wrappers and humans a heartbeat
+				// without exposing inputs / outputs.
+				for _, p := range msg.Parts {
+					if tc, ok := p.(message.ToolCall); ok && tc.Name != "" && !seenToolCalls[tc.ID] {
+						seenToolCalls[tc.ID] = true
+						prefix := ""
+						if stderrTTY {
+							prefix = "\r" + ansi.EraseEntireLine
 						}
+						fmt.Fprintf(os.Stderr, prefix+"▶ %s\n", tc.Name)
 					}
 				}
 
+				// Terse mode (default): wait for the message to carry a
+				// Finish part, then dump its final text once. Skipping
+				// intermediate "let me first…" prose is the whole point —
+				// it keeps script output and wrapper context small.
+				if !streamOutput {
+					if !msg.IsFinished() || printedFinal[msg.ID] {
+						continue
+					}
+					text := strings.TrimLeft(msg.FullText(), " \t\n")
+					if text != "" {
+						printedFinal[msg.ID] = true
+						printed = true
+						fmt.Fprint(output, text)
+					}
+					continue
+				}
+
+				// Streaming mode (--stream): print every new token as
+				// the assistant produces it. This is the legacy behaviour.
 				content := msg.FullText()
 				readBytes := messageReadBytes[msg.ID]
 
