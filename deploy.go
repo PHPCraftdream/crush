@@ -106,11 +106,14 @@ func binaryName() string {
 
 // resolveDest decides what file to overwrite. Priority:
 //  1. $CRUSH_DEPLOY_PATH (used as-is).
-//  2. `exec.LookPath("crush")` — what users actually launch.
-//
-// On Windows, when LookPath returns a wrapper script (e.g. the npm
-// `crush` POSIX shim), we look for a sibling `crush.exe` and target it
-// instead — that's the real binary the shim execs.
+//  2. The npm-packaged binary at
+//     <npm-dir>/node_modules/@charmland/crush/bin/crush(.exe) — that's
+//     the file the npm wrapper actually execs, and it's the case you
+//     hit when `npm i -g @charmland/crush` put crush on your PATH.
+//     (Replacing the sibling crush.exe of the wrapper does nothing —
+//     the wrapper is a JS loader that points elsewhere.)
+//  3. `exec.LookPath("crush")` — the wrapper itself, as a last resort
+//     (covers the case where someone dropped a plain binary on PATH).
 func resolveDest() (string, error) {
 	if env := os.Getenv("CRUSH_DEPLOY_PATH"); env != "" {
 		return env, nil
@@ -119,10 +122,16 @@ func resolveDest() (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// If the discovered crush is a wrapper next to an npm package, the
+	// real binary lives at node_modules/@charmland/crush/bin/crush(.exe).
+	dir := filepath.Dir(p)
+	npmBin := filepath.Join(dir, "node_modules", "@charmland", "crush", "bin", binaryName())
+	if _, err := os.Stat(npmBin); err == nil {
+		return npmBin, nil
+	}
+	// Otherwise, on Windows, prefer a sibling crush.exe if the wrapper
+	// is a .cmd/.ps1/POSIX shim.
 	if runtime.GOOS == "windows" {
-		// LookPath may return crush, crush.cmd, crush.ps1, etc. Always
-		// prefer the .exe sibling if it exists — that's the real binary.
-		dir := filepath.Dir(p)
 		exe := filepath.Join(dir, "crush.exe")
 		if _, err := os.Stat(exe); err == nil {
 			return exe, nil
