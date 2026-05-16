@@ -36,9 +36,11 @@ func main() {
 	}
 
 	fmt.Println("→ Building crush binary...")
-	// Get current time for build timestamp
+	// Fork merge note (origin/main 2026-05-16): upstream renamed BuildTime to
+	// BuildID (commit 9e126c27). We keep the timestamp value — it satisfies
+	// BuildID's "unique per build" contract — but write it into the new field.
 	buildTime := time.Now().Format("2006-01-02_15-04-05")
-	ldflags := fmt.Sprintf("-X=github.com/charmbracelet/crush/internal/version.BuildTime=%s", buildTime)
+	ldflags := fmt.Sprintf("-X=github.com/charmbracelet/crush/internal/version.BuildID=%s", buildTime)
 	run(root, "go", "build", "-ldflags", ldflags, "-o", out, ".")
 
 	fmt.Printf("✓ Done → %s\n", out)

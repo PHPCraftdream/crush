@@ -128,6 +128,7 @@ type Model struct {
 	Model      fantasy.LanguageModel
 	CatwalkCfg catwalk.Model
 	ModelCfg   config.SelectedModel
+	FlatRate   bool
 }
 
 type sessionAgent struct {
@@ -282,6 +283,11 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 
 	defer cancel()
 	defer a.activeRequests.Del(call.SessionID)
+	// Fork merge note (origin/main 6938dedd "perf: batch streaming message
+	// updates"): upstream introduced a debounced flush layer in
+	// message.Service. We removed that layer (see message/message.go fork
+	// patch); our Notify() path goes through pubsub directly and Update()
+	// writes synchronously, so there is nothing to flush here.
 
 	history, files := a.preparePrompt(msgs, currentSession.Todos, call.Attachments...)
 
@@ -751,16 +757,6 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 		return nil, err
 	}
 
-	// Send notification that agent has finished its turn (skip for
-	// nested/non-interactive sessions).
-	if !call.NonInteractive && a.notify != nil {
-		a.notify.Publish(pubsub.CreatedEvent, notify.Notification{
-			SessionID:    call.SessionID,
-			SessionTitle: currentSession.Title,
-			Type:         notify.TypeAgentFinished,
-		})
-	}
-
 	if shouldSummarize {
 		a.activeRequests.Del(call.SessionID)
 		if summarizeErr := a.Summarize(genCtx, call.SessionID, call.ProviderOptions); summarizeErr != nil {
@@ -778,10 +774,19 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 		}
 	}
 
-
 	// Release active request before processing queued messages.
 	a.activeRequests.Del(call.SessionID)
 	cancel()
+
+	// Send notification that agent has finished its turn (skip for
+	// nested/non-interactive sessions).
+	if !call.NonInteractive && a.notify != nil {
+		a.notify.Publish(pubsub.CreatedEvent, notify.Notification{
+			SessionID:    call.SessionID,
+			SessionTitle: currentSession.Title,
+			Type:         notify.TypeAgentFinished,
+		})
+	}
 
 	queuedMessages, ok := a.messageQueue.Get(call.SessionID)
 	if !ok || len(queuedMessages) == 0 {
@@ -847,6 +852,8 @@ func (a *sessionAgent) runSummarize(ctx context.Context, sessionID string, opts 
 	a.activeRequests.Set(summarizeKey, cancel)
 	defer a.activeRequests.Del(summarizeKey)
 	defer cancel()
+	// Fork merge note: FlushAll deleted with the debounced layer — see the
+	// Run() entry point above for context.
 
 	agent := fantasy.NewAgent(largeModel.Model,
 		fantasy.WithSystemPrompt(string(summaryPrompt)),
@@ -902,6 +909,12 @@ func (a *sessionAgent) runSummarize(ctx context.Context, sessionID string, opts 
 			deleteErr := a.messages.Delete(ctx, summaryMessage.ID)
 			return deleteErr
 		}
+		// Mark the summary message as finished with an error so the UI
+		// stops spinning.
+		summaryMessage.AddFinish(message.FinishReasonError, "Summarization Error", err.Error())
+		if updateErr := a.messages.Update(ctx, summaryMessage); updateErr != nil {
+			return updateErr
+		}
 		return err
 	}
 
@@ -936,8 +949,27 @@ func (a *sessionAgent) runSummarize(ctx context.Context, sessionID string, opts 
 	freshSession.SummaryMessageID = summaryMessage.ID
 	freshSession.CompletionTokens = usage.OutputTokens
 	freshSession.PromptTokens = 0
-	_, err = a.sessions.Save(genCtx, freshSession)
-	return err
+	if _, err = a.sessions.Save(genCtx, freshSession); err != nil {
+		return err
+	}
+
+	// Fork merge note (origin/main 61f49b23 "drain queued messages after manual
+	// session summarize"): upstream added this drain to keep the user's queued
+	// messages flowing after a manual /compact. Our Summarize() outer wrapper
+	// uses a separate summarizeQueue keyed by sessionID, so the busy state
+	// here is the "-summarize" key — releasing it does NOT release the main
+	// Run()'s lock. The drain below runs only if a user message landed in
+	// messageQueue during summarisation.
+	a.activeRequests.Del(sessionID + "-summarize")
+	cancel()
+	queuedMessages, ok := a.messageQueue.Get(sessionID)
+	if !ok || len(queuedMessages) == 0 {
+		return nil
+	}
+	firstQueuedMessage := queuedMessages[0]
+	a.messageQueue.Set(sessionID, queuedMessages[1:])
+	_, qErr := a.Run(ctx, firstQueuedMessage)
+	return qErr
 }
 
 // runSummarizeSilent compacts the oldest half of the session's messages in
@@ -1168,7 +1200,14 @@ If not, please feel free to ignore. Again do not mention this message to the use
 			}
 			continue
 		}
-		history = append(history, m.ToAIMessage()...)
+		aiMsgs := m.ToAIMessage()
+		// Fork merge note (origin/main 6d95ecc5 "skip image attachments in
+		// history when model doesn't support them"): we intentionally skip
+		// upstream's per-message filter here — the same scrub happens in
+		// workaroundProviderMediaLimitations() which runs once per Stream
+		// call inside PrepareStep, so doing it twice would just walk the
+		// history twice.
+		history = append(history, aiMsgs...)
 
 		if m.Role == message.Assistant {
 			if msg, ok := syntheticToolResultsForOrphanedCalls(m, knownToolResultIDs); ok {
@@ -1190,6 +1229,20 @@ If not, please feel free to ignore. Again do not mention this message to the use
 	}
 
 	return history, files
+}
+
+// filterFileParts removes fantasy.FilePart entries from a slice of message
+// parts. Used to strip image attachments from historical user messages when
+// the current model does not support them.
+func filterFileParts(parts []fantasy.MessagePart) []fantasy.MessagePart {
+	filtered := make([]fantasy.MessagePart, 0, len(parts))
+	for _, part := range parts {
+		if _, ok := fantasy.AsMessagePart[fantasy.FilePart](part); ok {
+			continue
+		}
+		filtered = append(filtered, part)
+	}
+	return filtered
 }
 
 // filterOrphanedToolResults converts a tool message to a fantasy.Message,
@@ -1399,6 +1452,11 @@ func (a *sessionAgent) generateTitle(ctx context.Context, sessionID string, user
 		cost = *openrouterCost
 	}
 
+	// Skip cost accumulation
+	if model.FlatRate {
+		cost = 0
+	}
+
 	promptTokens := resp.TotalUsage.InputTokens + resp.TotalUsage.CacheCreationTokens
 	completionTokens := resp.TotalUsage.OutputTokens
 
@@ -1432,12 +1490,17 @@ func (a *sessionAgent) updateSessionUsage(model Model, session *session.Session,
 		modelConfig.CostPer1MOut/1e6*float64(usage.OutputTokens)
 
 
+	// Use override cost if available (e.g., from OpenRouter).
 	if overrideCost != nil {
-		session.Cost += *overrideCost
-	} else {
-		session.Cost += cost
+		cost = *overrideCost
 	}
 
+	// Skip cost accumulation
+	if model.FlatRate {
+		cost = 0
+	}
+
+	session.Cost += cost
 	session.CompletionTokens = usage.OutputTokens
 	session.PromptTokens = usage.InputTokens + usage.CacheReadTokens
 }

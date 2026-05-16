@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/charmbracelet/crush/internal/db"
 	"github.com/charmbracelet/crush/internal/history"
 	"github.com/charmbracelet/crush/internal/permission"
 	"github.com/charmbracelet/crush/internal/pubsub"
@@ -36,6 +37,21 @@ func (m *mockPermissionService) SkipRequests() bool {
 
 func (m *mockPermissionService) SubscribeNotifications(ctx context.Context) <-chan pubsub.Event[permission.PermissionNotification] {
 	return make(<-chan pubsub.Event[permission.PermissionNotification])
+}
+
+// Fork merge note: persistent-permission CRUD methods that satisfy the
+// fork-extended Service interface. No-ops in tests — see view_test.go for the
+// matching pattern.
+func (m *mockPermissionService) ListSessionPermissions(sessionID string) ([]db.SessionPermission, error) {
+	return nil, nil
+}
+
+func (m *mockPermissionService) UpdatePermissionEnabled(ruleID string, enabled bool) error {
+	return nil
+}
+
+func (m *mockPermissionService) DeletePermission(ruleID string) error {
+	return nil
 }
 
 type mockHistoryService struct {

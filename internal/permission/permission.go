@@ -95,8 +95,13 @@ type Service interface {
 type permissionService struct {
 	*pubsub.Broker[PermissionRequest]
 
-	notificationBroker    *pubsub.Broker[PermissionNotification]
-	workingDir            string
+	notificationBroker *pubsub.Broker[PermissionNotification]
+	workingDir         string
+	// Fork merge note: upstream switched this field to `csync.Map[PermissionKey,
+	// bool]` for O(1) lookup. We keep a slice of PermissionRequest because we
+	// need the full record (ID, SessionID, etc.) to round-trip through the
+	// SQLite store, and the typical N here is small enough that O(N) scan is
+	// not a bottleneck.
 	sessionPermissions    []PermissionRequest
 	sessionPermissionsMu  sync.RWMutex
 	pendingRequests       *csync.Map[string, chan bool]
@@ -213,12 +218,13 @@ func (s *permissionService) Request(ctx context.Context, opts CreatePermissionRe
 		return true, nil
 	}
 
+	s.requestMu.Lock()
+	defer s.requestMu.Unlock()
+
 	// tell the UI that a permission was requested
 	s.notificationBroker.Publish(pubsub.CreatedEvent, PermissionNotification{
 		ToolCallID: opts.ToolCallID,
 	})
-	s.requestMu.Lock()
-	defer s.requestMu.Unlock()
 
 	s.autoApproveSessionsMu.RLock()
 	autoApprove := s.autoApproveSessions[opts.SessionID]
@@ -285,12 +291,6 @@ func (s *permissionService) Request(ctx context.Context, opts CreatePermissionRe
 		toolMatch := p.ToolName == permission.ToolName
 		actionMatch := p.Action == permission.Action
 		pathMatch := p.Path == permission.Path
-		slog.Debug("permission: comparing grant",
-			"grant_tool", p.ToolName, "tool_match", toolMatch,
-			"grant_action", p.Action, "action_match", actionMatch,
-			"grant_session", p.SessionID, "session_match", sessionMatch,
-			"grant_path", p.Path, "path_match", pathMatch,
-		)
 		if toolMatch && actionMatch && sessionMatch && pathMatch {
 			s.sessionPermissionsMu.RUnlock()
 			s.notificationBroker.Publish(pubsub.CreatedEvent, PermissionNotification{
@@ -353,7 +353,6 @@ func NewPermissionService(ctx context.Context, workingDir string, skip bool, all
 		Broker:              pubsub.NewBroker[PermissionRequest](),
 		notificationBroker:  pubsub.NewBroker[PermissionNotification](),
 		workingDir:          workingDir,
-		sessionPermissions:  make([]PermissionRequest, 0),
 		autoApproveSessions: make(map[string]bool),
 		skip:                skip,
 		allowedTools:        allowedTools,
@@ -369,7 +368,7 @@ func NewPermissionService(ctx context.Context, workingDir string, skip bool, all
 					continue
 				}
 				svc.sessionPermissions = append(svc.sessionPermissions, PermissionRequest{
-					ID:       r.ID,
+					ID: r.ID,
 					// SessionID is intentionally empty: persistent permissions
 					// match requests from any session.
 					ToolName: r.ToolName,

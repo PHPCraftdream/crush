@@ -22,7 +22,7 @@ import (
 )
 
 //go:embed write.md
-var writeDescription []byte
+var writeDescription string
 
 type WriteParams struct {
 	FilePath string `json:"file_path" description:"The path to the file to write"`
@@ -52,14 +52,10 @@ func NewWriteTool(
 ) fantasy.AgentTool {
 	return fantasy.NewAgentTool(
 		WriteToolName,
-		FirstLineDescription(writeDescription),
+		writeDescription,
 		func(ctx context.Context, params WriteParams, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
 			if params.FilePath == "" {
 				return fantasy.NewTextErrorResponse("file_path is required"), nil
-			}
-
-			if params.Content == "" {
-				return fantasy.NewTextErrorResponse("content is required"), nil
 			}
 
 			sessionID := GetSessionFromContext(ctx)

@@ -1,4 +1,4 @@
-﻿package cmd
+package cmd
 
 // Fork patch: upstream's login wires its REST client (`internal/client`) into
 // the auth flow so the daemon can pick up new credentials over the Unix
@@ -25,6 +25,14 @@ import (
 	"github.com/spf13/cobra"
 )
 
+func init() {
+	// Fork merge note (origin/main 2026-05-16 / 303b153b): upstream added
+	// --force so re-running login on an already-authenticated provider
+	// reports the existing token instead of starting a new device-auth dance.
+	// Useful UX, kept verbatim.
+	loginCmd.Flags().BoolP("force", "f", false, "Force re-authentication even if already logged in")
+}
+
 var loginCmd = &cobra.Command{
 	Aliases: []string{"auth"},
 	Use:     "login [platform]",
@@ -38,6 +46,9 @@ crush login
 
 # Authenticate with GitHub Copilot
 crush login copilot
+
+# Force re-authentication even if already logged in
+crush login -f copilot
   `,
 	ValidArgs: []cobra.Completion{
 		"hyper",
@@ -57,22 +68,35 @@ crush login copilot
 		if len(args) > 0 {
 			provider = args[0]
 		}
+		force, _ := cmd.Flags().GetBool("force")
+		// Fork merge note: upstream's signature here is (c *client.Client,
+		// wsID string, force bool) because login talks to the daemon over
+		// the Unix socket. Our binary IS the daemon, so we hand the local
+		// ConfigStore directly and only forward `force`.
 		switch provider {
 		case "hyper":
-			return loginHyper(app.Store())
+			return loginHyper(app.Store(), force)
 		case "copilot", "github", "github-copilot":
-			return loginCopilot(app.Store())
+			return loginCopilot(app.Store(), force)
 		default:
 			return fmt.Errorf("unknown platform: %s", args[0])
 		}
 	},
 }
 
-func loginHyper(cfg *config.ConfigStore) error {
+func loginHyper(cfg *config.ConfigStore, force bool) error {
 	if !hyperp.Enabled() {
 		return fmt.Errorf("hyper not enabled")
 	}
 	ctx := getLoginContext()
+
+	// Fork merge note: upstream does this check via c.GetConfig(ctx, wsID).
+	// We have direct access to ConfigStore so it's a local field lookup.
+	if !force && cfg.HasConfigField(config.ScopeGlobal, "providers.hyper.oauth") {
+		fmt.Println("You are already logged in to Hyper.")
+		fmt.Println("Use --force to re-authenticate.")
+		return nil
+	}
 
 	resp, err := hyper.InitiateDeviceAuth(ctx)
 	if err != nil {
@@ -130,11 +154,12 @@ func loginHyper(cfg *config.ConfigStore) error {
 	return nil
 }
 
-func loginCopilot(cfg *config.ConfigStore) error {
+func loginCopilot(cfg *config.ConfigStore, force bool) error {
 	ctx := getLoginContext()
 
-	if cfg.HasConfigField(config.ScopeGlobal, "providers.copilot.oauth") {
+	if !force && cfg.HasConfigField(config.ScopeGlobal, "providers.copilot.oauth") {
 		fmt.Println("You are already logged in to GitHub Copilot.")
+		fmt.Println("Use --force to re-authenticate.")
 		return nil
 	}
 

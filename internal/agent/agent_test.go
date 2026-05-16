@@ -656,6 +656,12 @@ func BenchmarkBuildSummaryPrompt(b *testing.B) {
 	}
 }
 
+// Fork merge note: upstream's TestPreparePrompt_FiltersImageAttachments was
+// removed at merge time — it tests the `supportsImages bool` parameter that
+// we don't carry on preparePrompt(). Our equivalent scrub lives in
+// workaroundProviderMediaLimitations() and is exercised by the higher-level
+// streaming tests.
+
 func TestPreparePrompt_OrphanedToolUse(t *testing.T) {
 	env := testEnv(t)
 	sa := testSessionAgent(env, nil, nil, "test prompt")
