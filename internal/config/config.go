@@ -76,6 +76,14 @@ const (
 	AgentTask  string = "task"
 )
 
+// ModelPreset is a saved (large, small) pair that can be activated with
+// `crush models preset use <name>`. Empty Large / Small means "leave the
+// current selection in that slot alone".
+type ModelPreset struct {
+	Large *SelectedModel `json:"large,omitempty" jsonschema:"description=Large/smart slot for this preset"`
+	Small *SelectedModel `json:"small,omitempty" jsonschema:"description=Small/fast slot for this preset"`
+}
+
 type SelectedModel struct {
 	// The model id as used by the provider API.
 	// Required.
@@ -606,6 +614,12 @@ type Config struct {
 
 	// Recently used models stored in the data directory config.
 	RecentModels map[SelectedModelType][]SelectedModel `json:"recent_models,omitempty" jsonschema:"-"`
+
+	// Named pairs of (large, small) models that can be swapped in atomically
+	// via `crush models preset use <name>`. Lives in the same config files
+	// as everything else and is written through SetConfigFields under the
+	// path "model_presets.<name>".
+	ModelPresets map[string]ModelPreset `json:"model_presets,omitempty" jsonschema:"description=Named (large,small) model pairs swappable with 'crush models preset use'"`
 
 	// The providers that are configured
 	Providers *csync.Map[string, ProviderConfig] `json:"providers,omitempty" jsonschema:"description=AI provider configurations"`
