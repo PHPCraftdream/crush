@@ -38,13 +38,10 @@ func init() {
 	rootCmd.PersistentFlags().StringP("data-dir", "D", "", "Custom crush data directory")
 	rootCmd.PersistentFlags().BoolP("debug", "d", false, "Debug")
 	rootCmd.Flags().BoolP("help", "h", false, "Help")
-	rootCmd.Flags().BoolP("yolo", "y", false, "Automatically accept all permissions (dangerous mode)")
-	rootCmd.Flags().StringP("host", "H", "localhost", "Web mode: host to listen on")
-	rootCmd.Flags().IntP("port", "p", 0, "Web mode: port to listen on (0 = random free port)")
-	rootCmd.Flags().Bool("no-open", false, "Web mode: do not open browser automatically")
-	rootCmd.Flags().StringP("session", "s", "", "Continue a previous session by ID")
-	rootCmd.Flags().BoolP("continue", "C", false, "Continue the most recent session")
-	rootCmd.MarkFlagsMutuallyExclusive("session", "continue")
+	rootCmd.Flags().BoolP("yolo", "y", false, "Auto-approve every permission request (dangerous)")
+	rootCmd.Flags().StringP("host", "H", "localhost", "Host to bind the web UI to")
+	rootCmd.Flags().IntP("port", "p", 0, "Port to bind the web UI to (0 = pick a free one)")
+	rootCmd.Flags().Bool("no-open", false, "Do not open the browser after the server starts")
 
 	rootCmd.AddCommand(
 		runCmd,
@@ -60,32 +57,41 @@ func init() {
 
 var rootCmd = &cobra.Command{
 	Use:   "crush",
-	Short: "A terminal-first AI assistant for software development",
-	Long:  "A glamorous, terminal-first AI assistant for software development and adjacent tasks",
+	Short: "Run the Crush coding agent with a browser-based UI",
+	Long: `Crush is an AI coding assistant. Running ` + "`crush`" + ` (or ` + "`crush web`" + `)
+starts a local HTTP + WebSocket server, prints the URL and a one-time
+access token, and opens your default browser to the UI.
+
+The web UI lets you chat with the agent, switch models per session, inspect
+and revoke tool permissions, browse logs, and queue or interrupt the
+running turn.
+
+For scripting and one-shot prompts use the ` + "`crush run`" + ` subcommand,
+which keeps the original non-interactive behaviour (stdin/stdout-friendly).`,
 	Example: `
-# Run in interactive mode
+# Start the web UI on a random free port and open the browser
 crush
 
-# Run non-interactively
-crush run "Guess my 5 favorite Pok├⌐mon"
+# Pin the port and bind to all interfaces (e.g. for a remote dev box)
+crush --host 0.0.0.0 --port 9000
 
-# Run a non-interactively with pipes and redirection
-cat README.md | crush run "make this more glamorous" > GLAMOROUS_README.md
+# Start the server without opening the browser (useful for IDE integrations)
+crush --no-open --port 8080
 
-# Run with debug logging in a specific directory
-crush --debug --cwd /path/to/project
-
-# Run in yolo mode (auto-accept all permissions; use with care)
+# Auto-approve every permission request — only use in a disposable workspace
 crush --yolo
 
-# Run with custom data directory
+# Run with debug logging from a specific working directory
+crush --debug --cwd /path/to/project
+
+# Use a non-default data directory for state (.crush/)
 crush --data-dir /path/to/custom/.crush
 
-# Continue a previous session
-crush --session {session-id}
+# Non-interactive one-shot prompt (see "crush run --help" for more)
+crush run "Summarise the changes on this branch"
 
-# Continue the most recent session
-crush --continue
+# Pipe stdin into a one-shot prompt
+cat README.md | crush run "Make this more glamorous" > GLAMOROUS_README.md
   `,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return runWebMode(cmd)

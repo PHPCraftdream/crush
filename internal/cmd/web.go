@@ -9,21 +9,24 @@ func init() {
 	rootCmd.AddCommand(webCmd)
 }
 
-// webCmd keeps `crush web` as an alias for `crush --web` for convenience.
+// webCmd is an explicit alias for the bare ` + "`crush`" + ` command. Both start the
+// embedded web server — webCmd just makes the intent obvious in scripts.
 var webCmd = &cobra.Command{
 	Use:   "web",
-	Short: "Start crush in web mode (alias for crush --web)",
-	Long: `Start crush in web mode.
+	Short: "Start the Crush web UI (same as running 'crush' with no subcommand)",
+	Long: `Start the Crush web UI.
 
-Launches an HTTP server with a React-based web interface and a WebSocket
-endpoint for real-time communication. All agent, session, and permission
-interactions happen over WebSocket — no TUI is started.
+Launches an HTTP server with a React UI and a WebSocket endpoint for
+real-time communication with the agent. Sessions, permissions, model
+selection, logs, queueing and turn-interruption all happen in the browser.
 
-A one-time access token is printed at startup; enter it in the browser to
-authenticate. The token is never transmitted in the URL.
+At startup the server prints the URL and a one-time access token. The
+token is also copied to your clipboard. Paste it in the browser to
+authenticate — it is never transmitted as part of the URL.
 
   crush web
   crush web --port 8080 --no-open
+  crush web --host 0.0.0.0 --port 9000   # bind on all interfaces
 `,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return runWebMode(cmd)

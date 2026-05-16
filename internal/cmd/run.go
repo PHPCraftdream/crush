@@ -21,7 +21,7 @@ var runCmd = &cobra.Command{
 The prompt can be provided as arguments or piped from stdin.`,
 	Example: `
 # Run a simple prompt
-crush run "Guess my 5 favorite Pok├⌐mon"
+crush run "Guess my 5 favorite Pokémon"
 
 # Pipe input from stdin
 curl https://charm.land | crush run "Summarize this website"
