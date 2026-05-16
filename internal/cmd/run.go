@@ -122,6 +122,7 @@ crush run --timeout 5m --session "long-task" "refactor the storage layer"
 			asJSON, _           = cmd.Flags().GetBool("json")
 			timeout, _          = cmd.Flags().GetDuration("timeout")
 			role, _             = cmd.Flags().GetString("role")
+			effort, _           = cmd.Flags().GetString("effort")
 			largeModel, _       = cmd.Flags().GetString("model")
 			smallModel, _       = cmd.Flags().GetString("small-model")
 			sessionID, _        = cmd.Flags().GetString("session")
@@ -129,6 +130,14 @@ crush run --timeout 5m --session "long-task" "refactor the storage layer"
 			systemPrompt, _     = cmd.Flags().GetString("system-prompt")
 			systemPromptFile, _ = cmd.Flags().GetString("system-prompt-file")
 		)
+
+		if effort != "" {
+			switch effort {
+			case "low", "medium", "high":
+			default:
+				return fmt.Errorf("--effort: invalid value %q (allowed: low|medium|high)", effort)
+			}
+		}
 
 		// --role is required so a `crush run` invocation always declares
 		// its intent (cheap-and-fast vs strong-and-slow), instead of
@@ -233,7 +242,14 @@ crush run --timeout 5m --session "long-task" "refactor the storage layer"
 		// JSON mode forces quiet (hide spinner) so the spinner glyphs don't
 		// leak into stdout. The summary line on stderr we still emit.
 		hideSpinner := quiet || verbose || asJSON
-		return a.RunNonInteractive(ctx, os.Stdout, prompt, largeModel, smallModel, systemPrompt, hideSpinner, mode, sessionID, useLast)
+		overrides := app.RunOverrides{
+			LargeModel:      largeModel,
+			SmallModel:      smallModel,
+			SystemPrompt:    systemPrompt,
+			ReasoningEffort: effort,
+			RoleLarge:       roleLarge,
+		}
+		return a.RunNonInteractive(ctx, os.Stdout, prompt, overrides, hideSpinner, mode, sessionID, useLast)
 	},
 }
 
@@ -241,6 +257,7 @@ func init() {
 	runCmd.Flags().BoolP("quiet", "q", false, "Hide spinner")
 	runCmd.Flags().BoolP("verbose", "v", false, "Show logs")
 	runCmd.Flags().String("role", "", "REQUIRED. Which preselected model to use: smart|large (the strong one) or fast|small (the cheap one). The actual model id comes from `crush models show`; override with --model.")
+	runCmd.Flags().String("effort", "", "Reasoning effort for this turn: low|medium|high. Applies to whichever slot --role picked. Persisted on the session so subsequent runs inherit it.")
 	runCmd.Flags().Bool("stream", false, "Stream every assistant token to stdout. Default is terse: tool-call names on stderr + final answer on stdout.")
 	runCmd.Flags().Bool("json", false, "Emit one JSON object on stdout summarising the run (session_id, final_text, tool_calls, usage, duration, exit_reason). Mutually exclusive with --stream.")
 	runCmd.Flags().Duration("timeout", 0, "Abort the run after this duration (e.g. 30s, 5m, 1h). 0 = no timeout.")

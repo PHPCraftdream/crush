@@ -183,6 +183,35 @@ crush sessions delete "<id>"     # remove session + messages
 crush sessions reset  "<id>"     # wipe messages, keep id + role
 ` + "```" + `
 
+### crush can orchestrate sub-agents — use it for parallel/branched work
+
+` + "`crush`" + ` ships with an ` + "`agent`" + ` tool that spawns child sessions. From your
+side that means a single ` + "`crush run`" + ` call can fan out into several
+parallel sub-tasks and collate the results, instead of you having to
+script multiple ` + "`crush run`" + ` invocations and stitch them together
+yourself. Lean into this when:
+
+- the work decomposes into independent pieces ("for each subpackage,
+  add tests");
+- you want competing approaches evaluated ("draft three implementations
+  of X and pick the one that passes the suite");
+- the outer task is "research, then act" — let the outer agent
+  delegate the research to a sub-agent with a tighter system prompt.
+
+Just describe the structure in the prompt; ` + "`crush`" + ` decides when to call
+its ` + "`agent`" + ` tool. You don't manage the child sessions by hand — they
+appear as ` + "`agent`" + ` tool calls in the parent's transcript and the parent's
+final answer already incorporates their output. The ` + "`--json`" + ` summary
+counts every tool call (` + "`tool_calls[].name == \"agent\"`" + `) so you can see
+how much delegation happened.
+
+When ` + "*you*" + ` orchestrate parallel ` + "`crush run`" + ` calls vs delegating inside
+one: spawn parallel ` + "`crush run`" + `s when the tasks need different roles,
+different system prompts, or different sessions you want to address
+separately later. Use a single ` + "`crush run`" + ` with sub-agent delegation
+when the tasks share a system prompt and you only need one consolidated
+answer back.
+
 ### Background-friendly
 
 Launch ` + "`crush run ...`" + ` in the background, keep talking to the user, and

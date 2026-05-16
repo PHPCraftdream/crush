@@ -94,6 +94,46 @@ func newTestDB(t *testing.T) (*sql.DB, *db.Queries) {
 	return sqlDB, db.New(sqlDB)
 }
 
+// CreateWithID is the primitive behind `crush run --session <id>` idempotent
+// CI invocations and behind `app.resolveSession`'s get-or-create branch.
+// It must (a) honour the caller-chosen id verbatim, (b) round-trip the title,
+// and (c) refuse a second insert with the same id (so the get-or-create flow
+// can distinguish "race lost" from a real failure).
+func TestCreateWithID(t *testing.T) {
+	sqlDB, q := newTestDB(t)
+	svc := NewService(q, sqlDB)
+	ctx := t.Context()
+
+	t.Run("creates with caller-supplied id", func(t *testing.T) {
+		s, err := svc.CreateWithID(ctx, "pr-42", "Review PR 42")
+		require.NoError(t, err)
+		assert.Equal(t, "pr-42", s.ID)
+		assert.Equal(t, "Review PR 42", s.Title)
+
+		got, err := svc.Get(ctx, "pr-42")
+		require.NoError(t, err)
+		assert.Equal(t, "pr-42", got.ID)
+		assert.Equal(t, "Review PR 42", got.Title)
+	})
+
+	t.Run("rejects duplicate id", func(t *testing.T) {
+		_, err := svc.CreateWithID(ctx, "dup", "first")
+		require.NoError(t, err)
+		_, err = svc.CreateWithID(ctx, "dup", "second")
+		require.Error(t, err, "second insert with the same id must fail (UNIQUE constraint)")
+	})
+
+	t.Run("does not collide with uuid-allocated Create", func(t *testing.T) {
+		// Create() picks a random UUID; CreateWithID() picks a literal — they
+		// must coexist in the same table without trouble.
+		uuidSess, err := svc.Create(ctx, "uuid sess")
+		require.NoError(t, err)
+		idSess, err := svc.CreateWithID(ctx, "named-sess", "named")
+		require.NoError(t, err)
+		assert.NotEqual(t, uuidSess.ID, idSess.ID)
+	})
+}
+
 func TestUpdateReasoningEffort(t *testing.T) {
 	sqlDB, q := newTestDB(t)
 	svc := NewService(q, sqlDB)

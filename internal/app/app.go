@@ -269,9 +269,30 @@ const (
 	RunModeJSON
 )
 
+// RunOverrides bundles the optional per-invocation overrides for
+// RunNonInteractive so the signature doesn't keep growing.
+//
+// Persistence: every non-empty field is written to the session BEFORE
+// the agent runs, so a subsequent `crush run --session <same>` without
+// those flags continues with the same overrides. Empty fields are
+// left alone (they don't reset what's already on the session).
+type RunOverrides struct {
+	LargeModel   string // "model" or "provider/model"; overrides selected large
+	SmallModel   string // same as LargeModel, for the small slot
+	SystemPrompt string // persisted on the session (Sessions.UpdateSystemPrompt)
+	// ReasoningEffort applies to whichever slot is "active" for this run —
+	// the large one if RoleLarge is true, the small one otherwise. Persisted
+	// via Sessions.UpdateReasoningEffort.
+	ReasoningEffort string
+	RoleLarge       bool
+}
+
 // RunNonInteractive runs a single agent turn and writes its result to
 // `output`. See RunMode for the available output shapes.
-func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt, largeModel, smallModel, systemPrompt string, hideSpinner bool, mode RunMode, continueSessionID string, useLast bool) error {
+func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt string, overrides RunOverrides, hideSpinner bool, mode RunMode, continueSessionID string, useLast bool) error {
+	largeModel := overrides.LargeModel
+	smallModel := overrides.SmallModel
+	systemPrompt := overrides.SystemPrompt
 	slog.Info("Running in non-interactive mode")
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -333,6 +354,22 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt,
 	if systemPrompt != "" {
 		if err := app.Sessions.UpdateSystemPrompt(ctx, sess.ID, systemPrompt); err != nil {
 			return fmt.Errorf("failed to set system prompt for session: %w", err)
+		}
+	}
+
+	// Persist reasoning effort onto the active slot. We pass the current
+	// stored value for the *other* slot through so we don't clobber it —
+	// UpdateReasoningEffort takes both fields as a single transaction.
+	if overrides.ReasoningEffort != "" {
+		large := sess.LargeModelReasoningEffort
+		small := sess.SmallModelReasoningEffort
+		if overrides.RoleLarge {
+			large = overrides.ReasoningEffort
+		} else {
+			small = overrides.ReasoningEffort
+		}
+		if err := app.Sessions.UpdateReasoningEffort(ctx, sess.ID, large, small); err != nil {
+			return fmt.Errorf("failed to set reasoning effort: %w", err)
 		}
 	}
 
