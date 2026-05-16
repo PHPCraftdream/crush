@@ -74,6 +74,24 @@ func filter(modelFilter, providerFilter, model, provider string) bool {
 		(providerFilter == "" || strings.EqualFold(provider, providerFilter))
 }
 
+// ResolveModel does the same smart lookup that --model on `crush run` does,
+// but exposed as a public method so the `crush models set` CLI can share
+// the rules. modelStr is "model" or "provider/model"; the returned values
+// are the unique provider id and the canonical model id from its catalog.
+// Returns an error on no-match or ambiguity.
+func (app *App) ResolveModel(modelStr string) (provider, modelID string, err error) {
+	providers := app.config.Config().Providers.Copy()
+	matches, _, fErr := findModels(providers, modelStr, "")
+	if fErr != nil {
+		return "", "", fErr
+	}
+	m, vErr := validateMatches(matches, modelStr, "model")
+	if vErr != nil {
+		return "", "", vErr
+	}
+	return m.provider, m.modelID, nil
+}
+
 // Validate and return a single match.
 func validateMatches(matches []modelMatch, modelID, label string) (modelMatch, error) {
 	switch {

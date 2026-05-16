@@ -34,8 +34,8 @@ import (
 )
 
 func init() {
-	rootCmd.PersistentFlags().StringP("cwd", "c", "", "Current working directory")
-	rootCmd.PersistentFlags().StringP("data-dir", "D", "", "Custom crush data directory")
+	rootCmd.PersistentFlags().StringP("cwd", "c", "", "Working directory crush operates in (absolute or relative). Applies to every subcommand; the .crush/ store and any tool-side relative paths resolve against it.")
+	rootCmd.PersistentFlags().StringP("data-dir", "D", "", "Override the .crush/ data directory (sessions DB, logs, attachments). Defaults to <cwd>/.crush.")
 	rootCmd.PersistentFlags().BoolP("debug", "d", false, "Debug")
 	rootCmd.Flags().BoolP("help", "h", false, "Help")
 	rootCmd.Flags().BoolP("yolo", "y", false, "Auto-approve every permission request (dangerous)")
