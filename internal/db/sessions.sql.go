@@ -271,6 +271,59 @@ func (q *Queries) ListSessions(ctx context.Context) ([]Session, error) {
 	return items, nil
 }
 
+const listSubSessions = `-- name: ListSubSessions :many
+SELECT id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id, system_prompt, yolo_enabled, large_model_reasoning_effort, small_model_reasoning_effort
+FROM sessions
+WHERE parent_session_id = ?
+ORDER BY created_at ASC
+`
+
+// Returns every session whose parent_session_id matches the argument,
+// ordered oldest-first so callers reconstructing a fan-out get the
+// sub-agent results in dispatch order.
+func (q *Queries) ListSubSessions(ctx context.Context, parentSessionID sql.NullString) ([]Session, error) {
+	rows, err := q.query(ctx, q.listSubSessionsStmt, listSubSessions, parentSessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Session{}
+	for rows.Next() {
+		var i Session
+		if err := rows.Scan(
+			&i.ID,
+			&i.ParentSessionID,
+			&i.Title,
+			&i.MessageCount,
+			&i.PromptTokens,
+			&i.CompletionTokens,
+			&i.Cost,
+			&i.UpdatedAt,
+			&i.CreatedAt,
+			&i.SummaryMessageID,
+			&i.Todos,
+			&i.LargeModelProvider,
+			&i.LargeModelID,
+			&i.SmallModelProvider,
+			&i.SmallModelID,
+			&i.SystemPrompt,
+			&i.YoloEnabled,
+			&i.LargeModelReasoningEffort,
+			&i.SmallModelReasoningEffort,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const renameSession = `-- name: RenameSession :exec
 UPDATE sessions
 SET

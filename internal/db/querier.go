@@ -6,6 +6,7 @@ package db
 
 import (
 	"context"
+	"database/sql"
 )
 
 type Querier interface {
@@ -54,6 +55,10 @@ type Querier interface {
 	ListSessionPermissions(ctx context.Context, sessionID string) ([]SessionPermission, error)
 	ListSessionReadFiles(ctx context.Context, sessionID string) ([]ReadFile, error)
 	ListSessions(ctx context.Context) ([]Session, error)
+	// Returns every session whose parent_session_id matches the argument,
+	// ordered oldest-first so callers reconstructing a fan-out get the
+	// sub-agent results in dispatch order.
+	ListSubSessions(ctx context.Context, parentSessionID sql.NullString) ([]Session, error)
 	ListUserMessagesBySession(ctx context.Context, sessionID string) ([]Message, error)
 	// Returns the row id of an enabled "always allow" rule that matches the
 	// given (sessionID, toolName, action, path) tuple, or sql.ErrNoRows.

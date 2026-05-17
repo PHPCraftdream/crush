@@ -132,6 +132,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.listSessionsStmt, err = db.PrepareContext(ctx, listSessions); err != nil {
 		return nil, fmt.Errorf("error preparing query ListSessions: %w", err)
 	}
+	if q.listSubSessionsStmt, err = db.PrepareContext(ctx, listSubSessions); err != nil {
+		return nil, fmt.Errorf("error preparing query ListSubSessions: %w", err)
+	}
 	if q.listUserMessagesBySessionStmt, err = db.PrepareContext(ctx, listUserMessagesBySession); err != nil {
 		return nil, fmt.Errorf("error preparing query ListUserMessagesBySession: %w", err)
 	}
@@ -356,6 +359,11 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing listSessionsStmt: %w", cerr)
 		}
 	}
+	if q.listSubSessionsStmt != nil {
+		if cerr := q.listSubSessionsStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing listSubSessionsStmt: %w", cerr)
+		}
+	}
 	if q.listUserMessagesBySessionStmt != nil {
 		if cerr := q.listUserMessagesBySessionStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing listUserMessagesBySessionStmt: %w", cerr)
@@ -496,6 +504,7 @@ type Queries struct {
 	listSessionPermissionsStmt       *sql.Stmt
 	listSessionReadFilesStmt         *sql.Stmt
 	listSessionsStmt                 *sql.Stmt
+	listSubSessionsStmt              *sql.Stmt
 	listUserMessagesBySessionStmt    *sql.Stmt
 	matchSessionPermissionStmt       *sql.Stmt
 	recordFileReadStmt               *sql.Stmt
@@ -551,6 +560,7 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		listSessionPermissionsStmt:       q.listSessionPermissionsStmt,
 		listSessionReadFilesStmt:         q.listSessionReadFilesStmt,
 		listSessionsStmt:                 q.listSessionsStmt,
+		listSubSessionsStmt:              q.listSubSessionsStmt,
 		listUserMessagesBySessionStmt:    q.listUserMessagesBySessionStmt,
 		matchSessionPermissionStmt:       q.matchSessionPermissionStmt,
 		recordFileReadStmt:               q.recordFileReadStmt,

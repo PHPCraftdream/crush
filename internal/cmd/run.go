@@ -82,6 +82,28 @@ Sub-agent policy:
                             agent-allow   -- default. Tool present, model
                                              decides whether to use it.
 
+Sub-agent aggregation (only matters when --agents permits fan-out):
+  --aggregation <summary|concat|attach>
+                            summary  -- default. Parent composes a
+                                        wrap-up; sub-agent detail lives
+                                        only in the DB. Easy on the
+                                        envelope, can lose information.
+                            concat   -- prompt-nudge asks the parent to
+                                        include each sub-agent's reply
+                                        verbatim in final_text. Bigger
+                                        final_text but no detail lost.
+                            attach   -- each sub-agent's last assistant
+                                        text is collected into the
+                                        envelope's sub_agent_outputs
+                                        array; final_text becomes a
+                                        brief wrap-up. Best for
+                                        machine consumers that want the
+                                        structured set.
+                            A reduction-loss warning ALWAYS fires in
+                            envelope.warnings when parent collapses
+                            sub-agent outputs to <40% of their combined
+                            character count.
+
 Use --timeout to bound the run from outside (the agent gets a clean
 cancel + the partial answer is preserved in the session and is included
 in --json output).
@@ -181,6 +203,16 @@ crush run --role smart --agents single --session "linear-task" "..."
 # model whether it actually decomposes the work).
 crush run --role smart --agents with-agents --session "parallel-audit" "..."
 
+# Fan-out and recover every sub-agent's full text via the envelope.
+# Parent's final_text becomes a brief wrap-up; sub_agent_outputs
+# array carries the verbatim sub-agent replies.
+crush run --role smart --json --agents with-agents --aggregation attach \
+          --session "structured-audit" < /tmp/p.txt > /tmp/audit.json
+
+# Fan-out but keep everything in final_text verbatim (one big string).
+crush run --role smart --json --agents with-agents --aggregation concat \
+          --session "flat-audit" < /tmp/p.txt > /tmp/audit.json
+
 # Hard time limit — partial answer is still preserved in the session
 # (and surfaced in --json's exit_reason / final_text)
 crush run --timeout 5m --session "long-task" "refactor the storage layer"
@@ -202,9 +234,12 @@ crush run --timeout 5m --session "long-task" "refactor the storage layer"
 			systemPromptFile, _ = cmd.Flags().GetString("system-prompt-file")
 			// Fork patch (orchestrator UX): --format injects a per-turn
 			// output-shape hint into the user prompt; --agents controls
-			// the sub-agent dispatch policy. See run_format.go.
-			formatFlag, _ = cmd.Flags().GetString("format")
-			agentsMode, _ = cmd.Flags().GetString("agents")
+			// the sub-agent dispatch policy; --aggregation controls how
+			// sub-agent fan-out output reaches the orchestrator. See
+			// run_format.go.
+			formatFlag, _      = cmd.Flags().GetString("format")
+			agentsMode, _      = cmd.Flags().GetString("agents")
+			aggregationMode, _ = cmd.Flags().GetString("aggregation")
 		)
 
 		if effort != "" {
@@ -263,6 +298,21 @@ crush run --timeout 5m --session "long-task" "refactor the storage layer"
 		formatHint, err := resolveFormatHint(formatFlag)
 		if err != nil {
 			return err
+		}
+
+		// Fork patch (orchestrator UX): validate --aggregation up-front
+		// and append the matching prompt hint to the user prompt below.
+		// "" / "summary" = no hint (upstream-default behaviour).
+		var aggregationHint string
+		switch aggregationMode {
+		case "", "summary":
+			// no hint
+		case "concat":
+			aggregationHint = aggregationConcatPromptHint
+		case "attach":
+			aggregationHint = aggregationAttachPromptHint
+		default:
+			return fmt.Errorf("--aggregation: invalid value %q (allowed: summary|concat|attach)", aggregationMode)
 		}
 
 		// Cancel on SIGINT or SIGTERM.
@@ -328,10 +378,11 @@ crush run --timeout 5m --session "long-task" "refactor the storage layer"
 			return fmt.Errorf("no prompt provided")
 		}
 
-		// Fork patch (orchestrator UX): append the format/agents hints
-		// AFTER stdin read so the user's prompt content stays at the
-		// top of the model's context (attention favours the start).
-		prompt = composeUserPrompt(prompt, formatHint, agentsHint)
+		// Fork patch (orchestrator UX): append the format/agents/
+		// aggregation hints AFTER stdin read so the user's prompt
+		// content stays at the top of the model's context (attention
+		// favours the start).
+		prompt = composeUserPrompt(prompt, formatHint, agentsHint, aggregationHint)
 
 		if stream && asJSON {
 			return fmt.Errorf("--stream and --json are mutually exclusive")
@@ -352,12 +403,21 @@ crush run --timeout 5m --session "long-task" "refactor the storage layer"
 			SystemPrompt:    systemPrompt,
 			ReasoningEffort: effort,
 			RoleLarge:       roleLarge,
-			// Fork patch (orchestrator UX): the two new fields. JSON
-			// stripping is enabled only when the user actually asked
-			// for JSON output OR JSON format (both are honest signals
-			// that the model was instructed to emit raw JSON).
+			// Fork patch (orchestrator UX): the two new fields.
+			//
+			// StripJSONFences activates ONLY when --format json (or
+			// --format json-schema:*) was passed. --json by itself is
+			// purely an *envelope* shape — the operator may want the
+			// envelope and a markdown final_text inside. Wiring
+			// --json into the trigger (the original batch-6 code) was
+			// a false-positive trap: every plain `crush run --json`
+			// against a model returning markdown got
+			// exit_reason="invalid_json". See the 2026-05-17 session
+			// #3 audit feedback. The envelope vs content shape are
+			// orthogonal.
 			DisableSubAgents: agentsDisable,
-			StripJSONFences:  asJSON || formatFlag == "json" || strings.HasPrefix(formatFlag, "json-schema:"),
+			StripJSONFences:  formatFlag == "json" || strings.HasPrefix(formatFlag, "json-schema:"),
+			AggregationMode:  aggregationMode,
 		}
 		return a.RunNonInteractive(ctx, os.Stdout, prompt, overrides, hideSpinner, mode, sessionID, useLast)
 	},
@@ -381,6 +441,7 @@ func init() {
 	// policy. Neither persists on the session.
 	runCmd.Flags().String("format", "", "Per-turn output-shape hint appended to the user prompt. Presets: 'json' (final answer must be a single JSON value, no fences, no prose) | 'json-schema:<file>' (json + conform to this schema) | '@<file>' (use file contents verbatim as the hint) | any other text (used as a freeform 'Output format:' instruction). With --json or --format json, the envelope's final_text is also post-processed to strip ```json fences and prose preamble; the original is preserved in assistant_notes.")
 	runCmd.Flags().String("agents", "", "Sub-agent dispatch policy for this run. 'single' (no sub-agents — the `agent` tool is removed from the toolset for this process) | 'with-agents' (model is nudged to fan out via the `agent` tool) | 'agent-allow' (default — tool present, model decides).")
+	runCmd.Flags().String("aggregation", "", "How sub-agent fan-out output reaches the orchestrator. 'summary' (default — parent composes a wrap-up, sub-agent detail lives in DB only) | 'concat' (prompt-nudge: parent includes each sub-agent reply verbatim in final_text) | 'attach' (collect each sub-agent's last assistant text into envelope.sub_agent_outputs; final_text becomes a brief wrap-up). An always-on reduction-loss warning fires regardless when parent collapses sub-agent outputs to <40% of their combined size.")
 	runCmd.MarkFlagsMutuallyExclusive("session", "continue")
 	runCmd.MarkFlagsMutuallyExclusive("system-prompt", "system-prompt-file")
 	runCmd.MarkFlagsMutuallyExclusive("stream", "json")

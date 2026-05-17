@@ -263,8 +263,14 @@ type runResult struct {
 	// and we restored the original). Surfaces observability for the
 	// "model keeps writing a preamble" failure mode — orchestrators
 	// can graph this over time.
-	StrippedBytes int    `json:"stripped_bytes,omitempty"`
-	Error         string `json:"error,omitempty"`
+	StrippedBytes int `json:"stripped_bytes,omitempty"`
+	// SubAgentOutputs is populated only when --aggregation=attach was
+	// passed. Each entry is one sub-session that the parent's `agent`
+	// tool dispatched during this run; FinalText is the sub-agent's
+	// last assistant message. Lets the orchestrator recover detail
+	// the parent over-summarised away.
+	SubAgentOutputs []subAgentOutput `json:"sub_agent_outputs,omitempty"`
+	Error           string           `json:"error,omitempty"`
 	// Warnings are non-fatal observations about the run that an
 	// orchestrator should know about even when exit_reason looks happy.
 	// Examples: agent fan-out finished with empty final_text (model
@@ -281,6 +287,18 @@ type runResult struct {
 type toolCallStat struct {
 	Name  string `json:"name"`
 	Count int    `json:"count"`
+}
+
+// subAgentOutput is one row of runResult.SubAgentOutputs. Populated by
+// the --aggregation=attach path. Title and ID are kept so the
+// orchestrator can correlate with `crush sessions list`.
+type subAgentOutput struct {
+	SessionID string `json:"session_id"`
+	Title     string `json:"title,omitempty"`
+	FinalText string `json:"final_text"`
+	// CharCount is convenience for the orchestrator — saves a
+	// json.length call when deciding which sub-output to show first.
+	CharCount int `json:"char_count"`
 }
 
 type usageInfo struct {
@@ -307,7 +325,7 @@ type usageInfo struct {
 // non-empty, OVERRIDES the model's finalReason so the envelope tells
 // the orchestrator "you asked for JSON, it didn't validate" instead of
 // the model's optimistic "stop"/"end_turn".
-func buildRunResult(sessionID, finalText, assistantNotes, finalReason string, err error, canceled bool, toolCounts map[string]int, deltaTokens int64, deltaCost float64, duration time.Duration, finalErrTitle, finalErrDetails string, strippedBytes int, stripErrMsg, stripErrReason string) runResult {
+func buildRunResult(sessionID, finalText, assistantNotes, finalReason string, err error, canceled bool, toolCounts map[string]int, deltaTokens int64, deltaCost float64, duration time.Duration, finalErrTitle, finalErrDetails string, strippedBytes int, stripErrMsg, stripErrReason string, subAgentOutputs []subAgentOutput, reductionWarning string) runResult {
 	reason := finalReason
 	if reason == "" {
 		switch {
@@ -401,15 +419,23 @@ func buildRunResult(sessionID, finalText, assistantNotes, finalReason string, er
 			errMsg = errMsg + "; " + stripErrMsg
 		}
 	}
+	// Fork patch (orchestrator UX): the reduction-loss warning is an
+	// always-on observation about sub-agent fan-out. Appended last so
+	// the more critical fan-out-empty + truncation warnings stay
+	// first in the array.
+	if reductionWarning != "" {
+		warnings = append(warnings, reductionWarning)
+	}
 	return runResult{
-		SessionID:      sessionID,
-		ExitReason:     reason,
-		FinalText:      finalText,
-		AssistantNotes: assistantNotes,
-		StrippedBytes:  strippedBytes,
-		Error:          errMsg,
-		Warnings:       warnings,
-		ToolCalls:      calls,
+		SessionID:       sessionID,
+		ExitReason:      reason,
+		FinalText:       finalText,
+		AssistantNotes:  assistantNotes,
+		StrippedBytes:   strippedBytes,
+		SubAgentOutputs: subAgentOutputs,
+		Error:           errMsg,
+		Warnings:        warnings,
+		ToolCalls:       calls,
 		Usage: usageInfo{
 			DeltaTokens:  deltaTokens,
 			DeltaCostUSD: deltaCost,
@@ -471,6 +497,16 @@ type RunOverrides struct {
 	// original is preserved in runResult.AssistantNotes.
 	DisableSubAgents bool
 	StripJSONFences  bool
+	// AggregationMode controls how sub-agent fan-out output reaches
+	// the orchestrator. "" / "summary" = upstream default (parent
+	// composes a wrap-up, sub-agent details live in the DB only).
+	// "concat" = the user prompt carries a nudge asking the parent to
+	// include each sub-agent's reply verbatim in final_text. "attach"
+	// = after Run the app collects each sub-session's last assistant
+	// text into runResult.SubAgentOutputs so the orchestrator gets
+	// the structured set even if parent over-summarised.
+	// See run_format.go and the 2026-05-17 session-#3 audit feedback.
+	AggregationMode string
 }
 
 // RunNonInteractive runs a single agent turn and writes its result to
@@ -668,6 +704,40 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt 
 						stripErrReason = "invalid_json"
 					}
 				}
+				// Fork patch (orchestrator UX): sub-agent aggregation.
+				// session-#3 (2026-05-17) feedback measured a 7×
+				// reduction where parent collapsed sub-agent outputs
+				// into a one-paragraph wrap-up. Two responses:
+				//
+				// 1. ALWAYS-ON warning when reduction ratio is bad
+				//    (≥3 sub-agents emitted output AND final_text is
+				//    <40% of their combined chars). Operator sees it
+				//    in envelope.warnings without flipping a flag.
+				// 2. OPT-IN --aggregation=attach: collect each
+				//    sub-agent's last assistant text into
+				//    envelope.SubAgentOutputs so the orchestrator
+				//    recovers the lost detail.
+				var subOutputs []subAgentOutput
+				var reductionWarning string
+				if mode == RunModeJSON {
+					subAgentCalls := toolCallCounts["agent"] + toolCallCounts["agentic_fetch"]
+					if subAgentCalls > 0 {
+						count, totalChars := app.subAgentSummaryStats(ctx, sess.ID)
+						if count >= 2 && totalChars > 0 {
+							parentChars := len(finalTextOut)
+							ratio := float64(parentChars) / float64(totalChars)
+							if ratio < 0.4 {
+								reductionWarning = fmt.Sprintf(
+									"reduction-loss: final_text is %d chars (%.0f%% of %d combined sub-agent chars across %d sub-session(s)). The parent likely summarised away detail. Re-run with --aggregation=attach or --aggregation=concat to recover; or query the sub-sessions directly.",
+									parentChars, ratio*100, totalChars, count,
+								)
+							}
+						}
+					}
+					if overrides.AggregationMode == "attach" {
+						subOutputs = app.collectSubAgentOutputs(ctx, sess.ID)
+					}
+				}
 				summary := buildRunResult(
 					sess.ID, finalTextOut, assistantNotes, finalReason, runErr, isCanceled,
 					toolCallCounts,
@@ -676,6 +746,7 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt 
 					time.Since(runStart),
 					finalErrTitle, finalErrDetails,
 					strippedBytes, stripErr, stripErrReason,
+					subOutputs, reductionWarning,
 				)
 				enc := json.NewEncoder(output)
 				if encErr := enc.Encode(summary); encErr != nil {

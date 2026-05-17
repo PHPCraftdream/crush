@@ -65,6 +65,19 @@ func (m *mockSessionService) GetLast(_ context.Context) (session.Session, error)
 	return session.Session{}, sql.ErrNoRows
 }
 
+// ListSubSessions: mock that filters in-memory by ParentSessionID.
+// Added when Service.ListSubSessions was introduced for the
+// reduction-loss warning and --aggregation=attach plumbing.
+func (m *mockSessionService) ListSubSessions(_ context.Context, parentID string) ([]session.Session, error) {
+	var out []session.Session
+	for _, s := range m.sessions {
+		if s.ParentSessionID == parentID {
+			out = append(out, s)
+		}
+	}
+	return out, nil
+}
+
 func (m *mockSessionService) List(context.Context) ([]session.Session, error) {
 	return m.sessions, nil
 }

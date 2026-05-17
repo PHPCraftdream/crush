@@ -20,7 +20,7 @@ var claudeInitBlockPattern = regexp.MustCompile(`(?s)<!-- crush-claude-init:v\d+
 // already exists. Bumping the v<N> version forces a re-write on the
 // next run (old block is rewritten, not duplicated).
 const (
-	claudeInitMarkerStart      = "<!-- crush-claude-init:v6 -->"
+	claudeInitMarkerStart      = "<!-- crush-claude-init:v7 -->"
 	claudeInitMarkerEnd        = "<!-- /crush-claude-init -->"
 	claudeMdFile               = "CLAUDE.md"
 	claudeSlashCommandPath     = ".claude/commands/crush.md"
@@ -42,6 +42,7 @@ var previousMarkers = []string{
 	"<!-- crush-claude-init:v3 -->",
 	"<!-- crush-claude-init:v4 -->",
 	"<!-- crush-claude-init:v5 -->",
+	"<!-- crush-claude-init:v6 -->",
 }
 
 var claudeInitCmd = &cobra.Command{
@@ -354,6 +355,42 @@ the instruction anyway (the original wrapped text is preserved in
 The hint is appended to the user prompt for THIS turn only — it does
 not persist on the session, so a follow-up ` + "`crush run --session <same>`" + `
 without ` + "`--format`" + ` reverts to the model's default verbosity.
+
+### Sub-agent aggregation: ` + "`--aggregation`" + `
+
+A known failure mode (measured on real audit runs): when the model
+fans out via the ` + "`agent`" + ` tool and you let ` + "`--agents agent-allow`" + ` or
+` + "`--agents with-agents`" + ` run, the parent often **summarises** the
+sub-agent outputs into a one-paragraph wrap-up — a 7× information loss
+was observed in extreme cases. The orchestrator on top sees just
+` + "`final_text`" + ` and never gets the lost detail.
+
+Three modes:
+
+- ` + "`--aggregation summary`" + ` (default) — parent composes a wrap-up,
+  sub-agent detail lives in the SQLite DB only. Cheap envelope, but
+  detail loss is invisible without inspecting the DB.
+- ` + "`--aggregation concat`" + ` — adds a prompt nudge asking the parent to
+  include each sub-agent's reply **verbatim** in ` + "`final_text`" + `, with
+  labelled section headings. Bigger ` + "`final_text`" + ` but no detail loss.
+  Best when you want one big string to grep through.
+- ` + "`--aggregation attach`" + ` — each sub-agent's last assistant text is
+  collected by crush after the run and put into the envelope's
+  ` + "`sub_agent_outputs: [{session_id, title, final_text, char_count}]`" + `
+  array. ` + "`final_text`" + ` becomes a brief wrap-up. Best for machine
+  consumers that want the structured set.
+
+**Reduction-loss warning is ALWAYS on**: when the parent dispatched
+≥2 sub-agents and ` + "`final_text`" + ` is <40% of the combined character
+count of those sub-agents, ` + "`envelope.warnings`" + ` gets a line like
+*"reduction-loss: final_text is 1421 chars (14% of 10162 combined
+sub-agent chars across 3 sub-session(s))…"*. If you see that warning
+in a wrapper's logs, re-run with ` + "`--aggregation=attach`" + ` (or
+` + "`concat`" + `) to recover the lost detail.
+
+If you don't pass ` + "`--aggregation`" + `, you get ` + "`summary`" + `. For audits
+and report-generation tasks, **prefer ` + "`attach`" + `** — the envelope
+fields keep the orchestrator's parsing logic clean.
 
 ### Sub-agent dispatch: ` + "`--agents`" + `
 

@@ -19,6 +19,7 @@ func TestBuildRunResult_HappyPath(t *testing.T) {
 		2*time.Second+500*time.Millisecond,
 		"", "",
 		0, "", "",
+		nil, "",
 	)
 	assert.Equal(t, "s1", r.SessionID)
 	assert.Equal(t, "stop", r.ExitReason)
@@ -51,7 +52,7 @@ func TestBuildRunResult_FallbackExitReason(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			r := buildRunResult("s", "", "", tc.finishStr, tc.err, tc.canceled, nil, 0, 0, 0, "", "", 0, "", "")
+			r := buildRunResult("s", "", "", tc.finishStr, tc.err, tc.canceled, nil, 0, 0, 0, "", "", 0, "", "", nil, "")
 			assert.Equal(t, tc.wantReason, r.ExitReason)
 			if tc.wantErrSet {
 				assert.NotEmpty(t, r.Error, "Error must surface non-cancel errors")
@@ -64,7 +65,7 @@ func TestBuildRunResult_FallbackExitReason(t *testing.T) {
 
 func TestBuildRunResult_StableToolCallOrder(t *testing.T) {
 	r := buildRunResult("s", "", "", "stop", nil, false,
-		map[string]int{"zeta": 1, "alpha": 1, "mu": 2}, 0, 0, 0, "", "", 0, "", "")
+		map[string]int{"zeta": 1, "alpha": 1, "mu": 2}, 0, 0, 0, "", "", 0, "", "", nil, "")
 	names := make([]string, len(r.ToolCalls))
 	for i, t := range r.ToolCalls {
 		names[i] = t.Name
@@ -73,7 +74,7 @@ func TestBuildRunResult_StableToolCallOrder(t *testing.T) {
 }
 
 func TestBuildRunResult_NoToolCalls(t *testing.T) {
-	r := buildRunResult("s", "done", "", "stop", nil, false, nil, 0, 0, 0, "", "", 0, "", "")
+	r := buildRunResult("s", "done", "", "stop", nil, false, nil, 0, 0, 0, "", "", 0, "", "", nil, "")
 	require.NotNil(t, r.ToolCalls)
 	assert.Empty(t, r.ToolCalls)
 }
@@ -83,7 +84,71 @@ func TestBuildRunResult_AgentErrRequestCancelledIsHandledByCaller(t *testing.T) 
 	// the call site classifies it as canceled and passes canceled=true.
 	// Verify that with canceled=true the Error stays empty even though
 	// the err itself is non-nil.
-	r := buildRunResult("s", "", "", "", agent.ErrRequestCancelled, true, nil, 0, 0, 0, "", "", 0, "", "")
+	r := buildRunResult("s", "", "", "", agent.ErrRequestCancelled, true, nil, 0, 0, 0, "", "", 0, "", "", nil, "")
 	assert.Equal(t, "canceled", r.ExitReason)
 	assert.Empty(t, r.Error)
+}
+
+// --- batch-7 additions: reduction warning + sub_agent_outputs --------
+
+// TestBuildRunResult_ReductionWarningAppended verifies the always-on
+// "reduction-loss" warning that fires when parent summarises sub-agent
+// fan-out too aggressively. The warning text is computed in
+// RunNonInteractive (it needs DB access for sub-session sizes) and
+// passed in as the last positional argument; buildRunResult's job is
+// only to append it AFTER the other warnings.
+func TestBuildRunResult_ReductionWarningAppended(t *testing.T) {
+	warn := "reduction-loss: final_text is 200 chars (10% of 2000 combined sub-agent chars across 3 sub-session(s))."
+	r := buildRunResult(
+		"s", "summary text", "", "stop", nil, false,
+		map[string]int{"agent": 3}, 0, 0, 0, "", "",
+		0, "", "",
+		nil, warn,
+	)
+	require.NotEmpty(t, r.Warnings)
+	assert.Equal(t, warn, r.Warnings[len(r.Warnings)-1],
+		"reduction-loss warning must land LAST in the array so existing fan-out warnings stay first")
+}
+
+// TestBuildRunResult_NoReductionWarning verifies that when caller
+// passes "" for reductionWarning, nothing is appended.
+func TestBuildRunResult_NoReductionWarning(t *testing.T) {
+	r := buildRunResult(
+		"s", "ok", "", "stop", nil, false, nil, 0, 0, 0, "", "",
+		0, "", "",
+		nil, "",
+	)
+	for _, w := range r.Warnings {
+		assert.NotContains(t, w, "reduction-loss")
+	}
+}
+
+// TestBuildRunResult_SubAgentOutputsAttached verifies the envelope
+// field that --aggregation=attach populates.
+func TestBuildRunResult_SubAgentOutputsAttached(t *testing.T) {
+	subs := []subAgentOutput{
+		{SessionID: "sub-1", Title: "Topic A", FinalText: "verbatim A", CharCount: 10},
+		{SessionID: "sub-2", Title: "Topic B", FinalText: "verbatim B much longer text", CharCount: 27},
+	}
+	r := buildRunResult(
+		"parent", "wrap-up", "", "stop", nil, false,
+		map[string]int{"agent": 2}, 0, 0, 0, "", "",
+		0, "", "",
+		subs, "",
+	)
+	require.Len(t, r.SubAgentOutputs, 2)
+	assert.Equal(t, "sub-1", r.SubAgentOutputs[0].SessionID)
+	assert.Equal(t, "verbatim A", r.SubAgentOutputs[0].FinalText)
+	assert.Equal(t, 27, r.SubAgentOutputs[1].CharCount)
+}
+
+func TestBuildRunResult_NoSubAgentOutputsByDefault(t *testing.T) {
+	// summary-mode (the default) must NOT spuriously emit an empty
+	// array — `omitempty` on the struct tag should drop the field.
+	r := buildRunResult(
+		"s", "ok", "", "stop", nil, false, nil, 0, 0, 0, "", "",
+		0, "", "",
+		nil, "",
+	)
+	assert.Nil(t, r.SubAgentOutputs, "default (summary) must yield nil so omitempty drops the JSON key")
 }

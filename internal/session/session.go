@@ -82,6 +82,12 @@ type Service interface {
 	Get(ctx context.Context, id string) (Session, error)
 	GetLast(ctx context.Context) (Session, error)
 	List(ctx context.Context) ([]Session, error)
+	// ListSubSessions returns every session whose parent_session_id
+	// equals the argument, ordered oldest-first. Used by the
+	// --aggregation=attach path and the reduction-loss warning to
+	// gather a parent run's sub-agent fan-out outputs after Run()
+	// returns.
+	ListSubSessions(ctx context.Context, parentSessionID string) ([]Session, error)
 	Save(ctx context.Context, session Session) (Session, error)
 	// IncrementCost atomically adds delta to the session's cost via an
 	// additive SQL UPDATE. Use this instead of read-modify-write through
@@ -392,6 +398,23 @@ func (s *service) Rename(ctx context.Context, id string, title string) error {
 		ID:    id,
 		Title: title,
 	})
+}
+
+// ListSubSessions implementation: thin wrapper around the sqlc-
+// generated query. Returns an empty slice when no sub-sessions exist.
+func (s *service) ListSubSessions(ctx context.Context, parentSessionID string) ([]Session, error) {
+	dbSessions, err := s.q.ListSubSessions(ctx, sql.NullString{
+		String: parentSessionID,
+		Valid:  parentSessionID != "",
+	})
+	if err != nil {
+		return nil, err
+	}
+	sessions := make([]Session, len(dbSessions))
+	for i, dbSession := range dbSessions {
+		sessions[i] = s.fromDBItem(dbSession)
+	}
+	return sessions, nil
 }
 
 func (s *service) List(ctx context.Context) ([]Session, error) {

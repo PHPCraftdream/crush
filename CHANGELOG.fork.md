@@ -767,3 +767,80 @@ internal/config/hyper.go             TTL skip mirror
 internal/config/load_test.go         TestMain disables TTL for the pkg
 CHANGELOG.fork.md                    this entry
 ```
+
+### Batch 7 — sub-agent aggregation + invalid_json regression fix (2026-05-17, session #3 feedback)
+
+The shamir-db session #3 audit (5 parallel agents, glm-5.1,
+markdown output) surfaced two issues:
+
+**BUG (regression I introduced in batch 6): `exit_reason="invalid_json"`
+fires under `--json` even when the operator did NOT pass
+`--format json`.** Root cause: `StripJSONFences` trigger included
+`asJSON` (the envelope flag). But `--json` is purely an envelope
+shape; an operator can legitimately want JSON envelope with
+markdown final_text inside. Wiring `--json` into the JSON-validation
+trigger was a false-positive trap. Fix: trigger only on
+`--format json` / `--format json-schema:*`. ~2 LoC + 11 unit tests
+in `internal/cmd/run_format_test.go` covering format flag flow and
+`composeUserPrompt` ordering.
+
+**HIGH: parent collapses sub-agent fan-out output 7× in extreme
+cases.** When the model uses the `agent` tool and you let
+`--agents agent-allow` (default) run, the parent often *summarises*
+sub-agent outputs into a one-paragraph wrap-up. The orchestrator
+sees only the wrap-up, the detail lives in DB sub-sessions where
+the upper LLM cannot easily reach it. Three-layer response:
+
+1. **ALWAYS-ON warning.** When parent dispatched ≥2 sub-agents and
+   `final_text` is <40% of their combined character count, append
+   `"reduction-loss: final_text is N chars (X% of M combined
+   sub-agent chars across K sub-session(s)). Re-run with
+   --aggregation=attach or --aggregation=concat to recover…"` to
+   `envelope.warnings`. No opt-in — the operator sees it whether
+   or not they know the flag exists.
+
+2. **OPT-IN `--aggregation concat`.** Appends a prompt nudge
+   (`aggregationConcatPromptHint`) asking the parent to include
+   each sub-agent's reply verbatim in `final_text`, in dispatch
+   order, with labelled headings. Best for "I want one big string
+   to grep through" workflows.
+
+3. **OPT-IN `--aggregation attach`.** After Run completes, app
+   queries the session DB for every sub-session with
+   `parent_session_id == this run`, fetches each sub-session's
+   last finished assistant message via `Messages.List` +
+   `lastAssistantText`, truncates to `maxSubAgentTextChars` per
+   entry, and surfaces them as
+   `envelope.sub_agent_outputs: [{session_id, title, final_text,
+   char_count}]`. Parent's `final_text` becomes a brief wrap-up
+   (driven by `aggregationAttachPromptHint`). Best for machine
+   consumers that want the structured set.
+
+New SQL `ListSubSessions(parentSessionID)` (in `db/sql/sessions.sql`,
+indexed on `parent_session_id` already). New service method
+`Session.ListSubSessions`. `mockSessionService` updated accordingly.
+New helper file `internal/app/sub_agents.go` with
+`collectSubAgentOutputs`, `subAgentSummaryStats`, `lastAssistantText`
++ `maxSubAgentTextChars` cap.
+
+`composeUserPrompt` now takes 4 hint arguments
+(`format → agents → aggregation`) matching reasoning order.
+
+Files touched:
+
+```
+internal/db/sql/sessions.sql            new ListSubSessions query
+internal/db/sessions.sql.go             sqlc regen
+internal/session/session.go             Service.ListSubSessions + impl
+internal/app/app.go                     reduction warning logic, sub_agent_outputs plumbing, RunOverrides.AggregationMode, runResult.SubAgentOutputs
+internal/app/sub_agents.go              new — collector + stats + lastAssistantText
+internal/app/sub_agents_test.go         new — 6 lastAssistantText cases + bound check
+internal/app/run_result_test.go         4 new tests: reduction warning + sub_agent_outputs
+internal/app/resolve_session_test.go    mockSessionService.ListSubSessions
+internal/cmd/run.go                     --aggregation flag, invalid_json regression fix (drop asJSON from StripJSONFences trigger)
+internal/cmd/run_format.go              composeUserPrompt 4-arg, aggregationConcatPromptHint, aggregationAttachPromptHint
+internal/cmd/run_format_test.go         new — 16 tests for resolveFormatHint, composeUserPrompt, hint constants
+internal/cmd/claude_init.go             v6 → v7 marker, new "Sub-agent aggregation" section
+README.md                               --aggregation flag, sub_agent_outputs envelope field, reduction-loss warning
+CHANGELOG.fork.md                       this entry
+```

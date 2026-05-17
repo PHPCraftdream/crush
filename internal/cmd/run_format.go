@@ -91,18 +91,58 @@ const agentsModePromptHint = `## Sub-agents
 
 You have access to the ` + "`agent`" + ` tool. Use it to parallelise independent searches/lookups across multiple files or topics. The orchestrator explicitly requested fan-out for this run — prefer one ` + "`agent`" + ` dispatch per independent sub-task over doing them sequentially in your own turn.`
 
-// composeUserPrompt joins the user's prompt with optional format and
-// agents hints. The hints are appended (not prepended) so the user's
-// original request stays at the top of the model's context, which most
-// providers' attention curves still favour. Empty hints contribute
-// nothing — no separator, no whitespace.
-func composeUserPrompt(prompt, formatHint, agentsHint string) string {
+// aggregationConcatPromptHint is appended to the user prompt when
+// --aggregation=concat is on. The motivation, from the 2026-05-17
+// session #3 audit feedback: when the model dispatches multiple
+// sub-agents via the ` + "`agent`" + ` tool, it often summarises their
+// outputs into a one-paragraph wrap-up instead of preserving the
+// detail (a 7× reduction was observed). With concat the orchestrator
+// is asking the parent to include each sub-agent's reply verbatim in
+// final_text. Compliance is best-effort (LLM hint), not guaranteed —
+// pair with --aggregation=attach if you need the structured set.
+const aggregationConcatPromptHint = `## Sub-agent Aggregation (mandatory)
+
+If you dispatch sub-agents via the ` + "`agent`" + ` tool during this turn, your final answer MUST include each sub-agent's full reply verbatim, in dispatch order, separated by a clearly labelled heading. Do NOT summarise, paraphrase, condense, or "extract the key points". The orchestrator on top is parsing your final_text to recover sub-agent detail and any summarisation loses information it cannot get back.
+
+Recommended layout:
+
+` + "```" + `
+## Sub-agent 1: <topic>
+<verbatim sub-agent reply>
+
+## Sub-agent 2: <topic>
+<verbatim sub-agent reply>
+` + "```" + `
+
+A short top-level wrap-up paragraph BEFORE the sub-agent sections is fine; a wrap-up AFTER is also fine. The sub-agent verbatim sections must appear.`
+
+// aggregationAttachPromptHint is the counterpart for --aggregation=attach.
+// Here the orchestrator gets sub-agent outputs structured in
+// envelope.sub_agent_outputs, so the parent's final_text is the place
+// for a short wrap-up only. We don't want the model to also reproduce
+// the sub-agent text inline — that would double the payload.
+const aggregationAttachPromptHint = `## Sub-agent Aggregation
+
+If you dispatch sub-agents via the ` + "`agent`" + ` tool during this turn, the orchestrator will receive each sub-agent's full reply separately in the envelope's ` + "`sub_agent_outputs`" + ` field. Your ` + "`final_text`" + ` should therefore be a brief wrap-up only: the synthesis, the conclusions, the cross-cutting observations — NOT a verbatim copy of the sub-agent outputs. Repeat detail only when it is essential for the wrap-up to make sense.`
+
+// composeUserPrompt joins the user's prompt with optional format,
+// agents and aggregation hints. The hints are appended (not prepended)
+// so the user's original request stays at the top of the model's
+// context, which most providers' attention curves still favour. Empty
+// hints contribute nothing — no separator, no whitespace. Order:
+// format → agents → aggregation; chosen so that "output shape" comes
+// before "sub-agent policy" comes before "what to do with sub-agent
+// output", which matches reasoning order.
+func composeUserPrompt(prompt, formatHint, agentsHint, aggregationHint string) string {
 	parts := []string{strings.TrimRight(prompt, "\n")}
 	if formatHint != "" {
 		parts = append(parts, formatHint)
 	}
 	if agentsHint != "" {
 		parts = append(parts, agentsHint)
+	}
+	if aggregationHint != "" {
+		parts = append(parts, aggregationHint)
 	}
 	return strings.Join(parts, "\n\n")
 }

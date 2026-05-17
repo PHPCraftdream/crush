@@ -60,6 +60,15 @@ FROM sessions
 WHERE parent_session_id is NULL
 ORDER BY updated_at DESC;
 
+-- name: ListSubSessions :many
+-- Returns every session whose parent_session_id matches the argument,
+-- ordered oldest-first so callers reconstructing a fan-out get the
+-- sub-agent results in dispatch order.
+SELECT *
+FROM sessions
+WHERE parent_session_id = ?
+ORDER BY created_at ASC;
+
 -- name: UpdateSession :one
 -- Overwrites title/prompt_tokens/completion_tokens/summary/todos but NOT
 -- cost. Cost is mutated only via IncrementSessionCost so concurrent

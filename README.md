@@ -111,6 +111,16 @@ jq -r '.error' "$out"         # error.message if non-success
   the toolset entirely so the model literally cannot dispatch
   sub-agents. `with-agents` nudges the model to fan out. `agent-allow`
   (default) leaves the choice to the model.
+- **`--aggregation summary | concat | attach`** — how sub-agent fan-out
+  output reaches the orchestrator. `summary` (default) lets the parent
+  compose a wrap-up; detail lives in the DB only. `concat` adds a
+  prompt nudge so the parent includes each sub-agent's reply verbatim
+  in `final_text`. `attach` collects each sub-agent's last assistant
+  text into `envelope.sub_agent_outputs` so the orchestrator gets the
+  structured set; `final_text` becomes a brief wrap-up. An always-on
+  warning fires in `envelope.warnings` when parent collapses sub-agent
+  outputs to <40% of their combined character count, regardless of
+  which mode is in use.
 - **`--timeout <duration>`** — hard wall-clock cap; the partial answer
   is preserved in the session and surfaced in the envelope.
 - **`--system-prompt[-file]`** — persists onto the session so follow-up
@@ -125,11 +135,16 @@ jq -r '.error' "$out"         # error.message if non-success
 - `tool_calls: [{name, count}]` — post-hoc inventory of what tools the
   model actually used. Useful to verify `--agents single` actually
   blocked fan-out.
+- `sub_agent_outputs[]` — present only with `--aggregation attach`.
+  Each entry is `{session_id, title, final_text, char_count}` for one
+  sub-session the parent's `agent` tool dispatched during this run.
 - `warnings[]` — non-fatal observations. Includes `final_text appears
   truncated` when the run errored mid-composition (so the operator
-  sees the model was about to continue), and `final_text is empty
-  after N sub-agent fan-out call(s)` when the model dispatched
-  sub-agents but never composed a top-level reply.
+  sees the model was about to continue); `final_text is empty after N
+  sub-agent fan-out call(s)` when the model dispatched sub-agents but
+  never composed a top-level reply; and `reduction-loss: final_text
+  is X% of N combined sub-agent chars` when the parent over-summarised
+  (re-run with `--aggregation=attach` or `concat` to recover).
 - `error` — present whenever `exit_reason` is non-success. If the
   provider's Finish part had no message (some providers emit a bare
   error finish), a fallback names the most likely causes (provider
