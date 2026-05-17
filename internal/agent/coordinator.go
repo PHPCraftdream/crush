@@ -100,6 +100,26 @@ var copilotResponsesModels = map[string]bool{
 	"gpt-5-mini":    true,
 }
 
+const (
+	// streamStallRetriesDefault is the default Options.StreamStallRetries
+	// when the config key is absent or zero. We default to 2 (3 total
+	// attempts per turn) rather than 0 because the user-visible failure
+	// mode of a single stall is a hard turn-error that the orchestrator
+	// then has to handle — silently absorbing 1-2 provider hiccups is
+	// almost always what an operator wants.
+	streamStallRetriesDefault = 2
+	// streamStallRetryBaseBackoff and streamStallRetryBackoffMultiplier
+	// shape exponential backoff: 10s → 30s → 90s. Long enough to let a
+	// rate-limit window roll over, short enough to keep one turn under
+	// ~5 min including the prior watchdog timeout.
+	streamStallRetryBaseBackoff       = 10 * time.Second
+	streamStallRetryBackoffMultiplier = 3.0
+	// streamStalledFinishTitle is the canonical Message field that
+	// agent.Run writes on a watchdog stall. Match against this exact
+	// string when deciding whether to retry.
+	streamStalledFinishTitle = "Stream stalled"
+)
+
 type Coordinator interface {
 	// INFO: (kujtim) this is not used yet we will use this when we have multiple agents
 	// SetMainAgent(string)
@@ -402,7 +422,70 @@ func (c *coordinator) runInternal(ctx context.Context, sessionID string, prompt 
 		}
 	}
 
+	// Auto-retry on watchdog stall. The agent already wrote
+	// FinishReasonError("Stream stalled") to the last assistant message;
+	// we re-run the turn with the same prompt after exponential backoff.
+	// "Solve it ourselves before bothering the user" — provider hiccups
+	// (rate limits, HTTP/2 stalls, brief capacity drops) usually clear
+	// within tens of seconds, so 2 retries after 10s + 30s of backoff
+	// absorb the common cases without the orchestrator having to know.
+	// The retried turn appears in session history as a fresh user+
+	// assistant pair, which the model sees alongside the previous
+	// failed attempt — slightly noisy but functionally correct.
+	maxRetries := streamStallRetriesDefault
+	if opts := c.cfg.Config().Options; opts != nil && opts.StreamStallRetries != nil {
+		// Explicit override (including explicit 0 to disable entirely).
+		maxRetries = *opts.StreamStallRetries
+		if maxRetries < 0 {
+			maxRetries = 0
+		}
+	}
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		if !c.lastTurnStalled(ctx, sessionID) {
+			break
+		}
+		backoff := streamStallRetryBaseBackoff
+		for i := 1; i < attempt; i++ {
+			backoff = time.Duration(float64(backoff) * streamStallRetryBackoffMultiplier)
+		}
+		slog.Warn("coordinator: retrying after stream stall",
+			"session_id", sessionID,
+			"attempt", attempt+1,
+			"max_attempts", maxRetries+1,
+			"backoff", backoff.String(),
+		)
+		select {
+		case <-ctx.Done():
+			return result, ctx.Err()
+		case <-time.After(backoff):
+		}
+		result, originalErr = run()
+	}
+
 	return result, originalErr
+}
+
+// lastTurnStalled reports whether the most recent assistant message in
+// the given session was finished with FinishReasonError("Stream stalled")
+// — i.e. the watchdog fired. Used by the retry loop in runInternal.
+// Errors querying the DB are treated as "not stalled" so a transient
+// DB hiccup doesn't trigger unnecessary retries.
+func (c *coordinator) lastTurnStalled(ctx context.Context, sessionID string) bool {
+	msgs, err := c.messages.List(ctx, sessionID)
+	if err != nil {
+		return false
+	}
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role != message.Assistant {
+			continue
+		}
+		fp := msgs[i].FinishPart()
+		if fp == nil {
+			return false
+		}
+		return fp.Reason == message.FinishReasonError && fp.Message == streamStalledFinishTitle
+	}
+	return false
 }
 
 // RunWithOverrides implements Coordinator. It is like Run but uses the given
@@ -644,6 +727,7 @@ func (c *coordinator) buildAgent(ctx context.Context, prompt *prompt.Prompt, age
 		Tools:                nil,
 		Notify:               c.notify,
 		StreamIdleTimeout:    streamIdleTimeout,
+		DataDirectory:        c.cfg.Config().Options.DataDirectory,
 	})
 
 	c.readyWg.Go(func() error {

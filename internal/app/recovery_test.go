@@ -3,6 +3,7 @@ package app
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/charmbracelet/crush/internal/db"
 	"github.com/charmbracelet/crush/internal/message"
@@ -22,9 +23,16 @@ func newRecoveryTestApp(t *testing.T) *App {
 	t.Cleanup(func() { conn.Close() })
 
 	q := db.New(conn)
+	// Zero orphan-age threshold so tests don't need to sleep for the
+	// production default (30s) to elapse before recovery considers a
+	// freshly-created assistant an orphan. Production safety net for
+	// concurrent-process race is exercised separately in
+	// TestRecoverInterruptedTurns_RespectsAgeFilter.
+	zero := time.Duration(0)
 	return &App{
-		Sessions: session.NewService(q, conn),
-		Messages: message.NewService(q),
+		Sessions:          session.NewService(q, conn),
+		Messages:          message.NewService(q),
+		recoveryOrphanAge: &zero,
 	}
 }
 
@@ -127,6 +135,37 @@ func TestRecoverInterruptedTurns_SessionWithUserMessageOnly_LeavesItAlone(t *tes
 	require.NoError(t, err)
 	require.Len(t, msgs, 1)
 	assert.Equal(t, message.User, msgs[0].Role)
+}
+
+// TestRecoverInterruptedTurns_RespectsAgeFilter verifies the
+// concurrent-process safety net: a freshly-created (just-now) orphan
+// assistant must NOT be marked as restarted, because it might be a
+// live in-progress message from a parallel crush process. We exercise
+// this by NOT zeroing the threshold (overriding the default 30s).
+func TestRecoverInterruptedTurns_RespectsAgeFilter(t *testing.T) {
+	app := newRecoveryTestApp(t)
+	// Restore production threshold for this test.
+	defaultThreshold := 30 * time.Second
+	app.recoveryOrphanAge = &defaultThreshold
+	ctx := t.Context()
+
+	sess, err := app.Sessions.Create(ctx, "fresh-orphan")
+	require.NoError(t, err)
+	orphan, err := app.Messages.Create(ctx, sess.ID, message.CreateMessageParams{
+		Role: message.Assistant,
+		Parts: []message.ContentPart{
+			message.ToolCall{ID: "x", Name: "bash", Input: "{}", Finished: true},
+		},
+	})
+	require.NoError(t, err)
+	require.False(t, orphan.IsFinished())
+
+	app.recoverInterruptedTurns(ctx)
+
+	got, err := app.Messages.Get(ctx, orphan.ID)
+	require.NoError(t, err)
+	assert.False(t, got.IsFinished(),
+		"recovery must skip recently-created assistants — could be a fresh message from a parallel crush process")
 }
 
 // TestRecoverInterruptedTurns_MultipleSessions_OnlyOrphansTouched mirrors

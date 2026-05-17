@@ -39,17 +39,25 @@ func Setup(logFile string, debug bool, ws ...io.Writer) {
 			AddSource: true,
 		}
 
+		// Tag every entry with this process's PID. When two crush
+		// processes share a .crush dir (common with parallel `crush run
+		// --session X` orchestration), the lumberjack file gets
+		// interleaved writes from both. The pid attribute lets
+		// post-hoc filtering split them cleanly: `jq 'select(.pid==N)'`.
+		// Cheap (one int per log line) and harmless when there's only
+		// one process.
+		pid := os.Getpid()
 		var handlers []slog.Handler
-		handlers = append(handlers, slog.NewJSONHandler(logRotator, opts))
+		handlers = append(handlers, slog.NewJSONHandler(logRotator, opts).WithAttrs([]slog.Attr{slog.Int("pid", pid)}))
 
 		for _, w := range ws {
 			if w == nil {
 				continue
 			}
 			if f, ok := w.(term.File); ok && term.IsTerminal(f.Fd()) {
-				handlers = append(handlers, slog.NewTextHandler(w, opts))
+				handlers = append(handlers, slog.NewTextHandler(w, opts).WithAttrs([]slog.Attr{slog.Int("pid", pid)}))
 			} else {
-				handlers = append(handlers, slog.NewJSONHandler(w, opts))
+				handlers = append(handlers, slog.NewJSONHandler(w, opts).WithAttrs([]slog.Attr{slog.Int("pid", pid)}))
 			}
 		}
 

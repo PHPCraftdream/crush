@@ -65,6 +65,10 @@ func NewWriteTool(
 
 			filePath := filepathext.SmartJoin(workingDir, params.FilePath)
 
+			if err := CheckForbiddenWrite(filePath); err != nil {
+				return fantasy.NewTextErrorResponse(err.Error()), nil
+			}
+
 			fileInfo, err := os.Stat(filePath)
 			if err == nil {
 				if fileInfo.IsDir() {

@@ -57,6 +57,12 @@ type App struct {
 	cleanupFuncs       []func(context.Context) error
 	agentNotifications *pubsub.Broker[notify.Notification]
 	events             *pubsub.Broker[any]
+
+	// recoveryOrphanAge — internal test seam for recoverInterruptedTurns.
+	// nil = use the production default (30s). Tests set it to 0 so they
+	// don't have to sleep waiting for fresh messages to "age out" before
+	// recovery considers them orphans.
+	recoveryOrphanAge *time.Duration
 }
 
 // New initializes a new application instance.
@@ -206,6 +212,14 @@ type runResult struct {
 	ExitReason string         `json:"exit_reason"` // "stop","error","canceled","max_tokens","unknown","tool_use"
 	FinalText  string         `json:"final_text"`
 	Error      string         `json:"error,omitempty"`
+	// Warnings are non-fatal observations about the run that an
+	// orchestrator should know about even when exit_reason looks happy.
+	// Examples: agent fan-out finished with empty final_text (model
+	// dispatched sub-agents but never composed a final reply, so
+	// orchestrators expecting structured output get nothing); write tool
+	// hit a stdout-redirect target. Wrappers can ignore the field if
+	// they don't care.
+	Warnings   []string       `json:"warnings,omitempty"`
 	ToolCalls  []toolCallStat `json:"tool_calls"`
 	Usage      usageInfo      `json:"usage"`
 	DurationMs int64          `json:"duration_ms"`
@@ -225,7 +239,13 @@ type usageInfo struct {
 // run. exit_reason follows the same vocabulary the WUI uses (see
 // message.FinishReason*) plus a synthetic "canceled" / "error" when the
 // agent never finalised a message.
-func buildRunResult(sessionID, finalText, finalReason string, err error, canceled bool, toolCounts map[string]int, deltaTokens int64, deltaCost float64, duration time.Duration) runResult {
+//
+// finalErrTitle and finalErrDetails come from the assistant message's
+// Finish part when Reason=error (e.g. "Stream stalled" /
+// "Provider X stopped sending streaming data for over 3m0s..."). They
+// surface into runResult.Error so orchestrators see WHY a turn errored,
+// not just THAT it did.
+func buildRunResult(sessionID, finalText, finalReason string, err error, canceled bool, toolCounts map[string]int, deltaTokens int64, deltaCost float64, duration time.Duration, finalErrTitle, finalErrDetails string) runResult {
 	reason := finalReason
 	if reason == "" {
 		switch {
@@ -243,15 +263,50 @@ func buildRunResult(sessionID, finalText, finalReason string, err error, cancele
 	}
 	// Stable ordering so the JSON diffs cleanly across runs.
 	sort.Slice(calls, func(i, j int) bool { return calls[i].Name < calls[j].Name })
+
+	// Warnings: non-fatal observations the orchestrator should see.
+	var warnings []string
+	// Fan-out without composition: model dispatched at least one sub-agent
+	// (`agent`/`agentic_fetch`) but the turn ended with no final text. The
+	// orchestrator asked for a structured answer and got an empty string,
+	// which usually means the model expected the sub-agents to "be the
+	// answer" — but `crush run` returns ONLY the top-level final_text, so
+	// the actual content sits in the sub-session DB rows the orchestrator
+	// can't easily see. Telling them to either prompt for a wrap-up
+	// summary or fetch the sub-session data explicitly.
+	if reason != "error" && reason != "canceled" && strings.TrimSpace(finalText) == "" {
+		fanoutCalls := toolCounts["agent"] + toolCounts["agentic_fetch"]
+		if fanoutCalls > 0 {
+			warnings = append(warnings, fmt.Sprintf(
+				"final_text is empty after %d sub-agent fan-out call(s). The model dispatched sub-agents but did not compose a top-level reply — query the sub-session DB rows directly, or prompt the model to summarise into final_text.",
+				fanoutCalls,
+			))
+		}
+	}
 	errMsg := ""
-	if err != nil && !canceled {
+	switch {
+	case err != nil && !canceled:
 		errMsg = err.Error()
+	case reason == "error":
+		// In-band error: the agent finished its turn but the model's
+		// Finish part says reason=error (e.g. watchdog stall, provider
+		// error, empty stream). Surface title + details so wrappers
+		// don't have to re-query the DB.
+		switch {
+		case finalErrTitle != "" && finalErrDetails != "":
+			errMsg = finalErrTitle + ": " + finalErrDetails
+		case finalErrTitle != "":
+			errMsg = finalErrTitle
+		case finalErrDetails != "":
+			errMsg = finalErrDetails
+		}
 	}
 	return runResult{
 		SessionID:  sessionID,
 		ExitReason: reason,
 		FinalText:  finalText,
 		Error:      errMsg,
+		Warnings:   warnings,
 		ToolCalls:  calls,
 		Usage: usageInfo{
 			DeltaTokens:  deltaTokens,
@@ -415,6 +470,7 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt 
 	printedFinal := make(map[string]bool)  // for terse mode: print once per finished assistant msg
 	var finalText string                    // last assistant FullText seen, for JSON output
 	var finalReason string                  // last assistant Finish.Reason seen, for JSON output
+	var finalErrTitle, finalErrDetails string // Finish.Message + Finish.Details, surfaced into envelope.Error when reason=error
 	var printed bool
 
 	defer func() {
@@ -453,6 +509,7 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt 
 					freshSess.PromptTokens+freshSess.CompletionTokens-tokensBefore,
 					freshSess.Cost-costBefore,
 					time.Since(runStart),
+					finalErrTitle, finalErrDetails,
 				)
 				enc := json.NewEncoder(output)
 				if encErr := enc.Encode(summary); encErr != nil {
@@ -503,6 +560,8 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt 
 					for _, p := range msg.Parts {
 						if f, ok := p.(message.Finish); ok {
 							finalReason = string(f.Reason)
+							finalErrTitle = f.Message
+							finalErrDetails = f.Details
 							break
 						}
 					}
@@ -691,12 +750,23 @@ func (app *App) recoverInterruptedTurns(ctx context.Context) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	start := time.Now()
+	// Age threshold for "this orphan is really orphan" vs "this is a
+	// fresh assistant another concurrent process just created". 30s is
+	// long enough to cover startup + the first inter-process
+	// notification roundtrip; short enough that recovery doesn't wait
+	// 5 minutes for stale orphans. See bug-analyzer audit, #7
+	// "Recovery vs new turn race".
+	orphanAgeThreshold := 30 * time.Second
+	if app.recoveryOrphanAge != nil {
+		orphanAgeThreshold = *app.recoveryOrphanAge
+	}
+	staleBefore := start.Add(-orphanAgeThreshold).Unix()
 	sessions, err := app.Sessions.List(ctx)
 	if err != nil {
 		slog.Warn("startup recovery: failed to list sessions", "err", err)
 		return
 	}
-	var recovered int
+	var recovered, skippedFresh int
 	for _, sess := range sessions {
 		msgs, err := app.Messages.List(ctx, sess.ID)
 		if err != nil {
@@ -715,6 +785,13 @@ func (app *App) recoverInterruptedTurns(ctx context.Context) {
 		if lastAssistant == nil || lastAssistant.IsFinished() {
 			continue
 		}
+		// Age filter: skip messages another concurrent crush process
+		// might have just created. Without this, recovery would mark a
+		// fresh streaming assistant as "Process restarted" mid-stream.
+		if lastAssistant.CreatedAt > staleBefore {
+			skippedFresh++
+			continue
+		}
 		lastAssistant.AddFinish(
 			message.FinishReasonError,
 			"Process restarted",
@@ -731,9 +808,10 @@ func (app *App) recoverInterruptedTurns(ctx context.Context) {
 		recovered++
 	}
 	elapsed := time.Since(start)
-	if recovered > 0 {
-		slog.Info("startup recovery: rehabilitated orphan assistant messages",
-			"count", recovered,
+	if recovered > 0 || skippedFresh > 0 {
+		slog.Info("startup recovery: completed",
+			"recovered", recovered,
+			"skipped_fresh", skippedFresh,
 			"total_sessions_scanned", len(sessions),
 			"elapsed", elapsed.String(),
 		)

@@ -329,6 +329,15 @@ type Options struct {
 	// model may legitimately pause for minutes while reasoning. 0 (the
 	// default when omitted) keeps the 3-minute built-in value.
 	StreamIdleTimeoutSeconds int `json:"stream_idle_timeout_seconds,omitempty" jsonschema:"description=Override the stream watchdog idle timeout in seconds. Default 180 (3 min). Raise for extended-thinking models that pause for long reasoning gaps. 0 = use default.,default=0,example=600"`
+	// StreamStallRetries is the number of times to automatically retry a
+	// turn that ended in FinishReasonError("Stream stalled"). Embodies
+	// "solve it ourselves before bothering the user": instead of
+	// surfacing a stall on the first occurrence, crush waits with
+	// exponential backoff (10s, 30s, 90s) and retries. Pointer so we
+	// can distinguish nil ("use built-in default") from 0 ("explicitly
+	// disable retries — surface stall on first occurrence"). Built-in
+	// default is 2 retries (3 total attempts).
+	StreamStallRetries *int `json:"stream_stall_retries,omitempty" jsonschema:"description=Number of automatic retries after a Stream stalled finish. Omit to use the default (2 retries\\, 3 total attempts). 0 = disabled. Useful under parallel-session provider load. Exponential backoff: 10s\\, 30s\\, 90s.,example=3"`
 }
 
 type MCPs map[string]MCPConfig

@@ -170,6 +170,10 @@ type sessionAgent struct {
 	// every Run() on this agent. Set from Options.StreamIdleTimeoutSeconds
 	// via SessionAgentOptions at construction. 0 = use the default.
 	streamIdleTimeout time.Duration
+	// dataDir is the absolute path to .crush/, used for the per-session
+	// inter-process file lock. Empty means locking is disabled (legacy
+	// callers / tests). Plumbed from SessionAgentOptions.DataDirectory.
+	dataDir string
 
 	messageQueue   *csync.Map[string, []SessionAgentCall]
 	activeRequests *csync.Map[string, context.CancelFunc]
@@ -192,7 +196,12 @@ type SessionAgentOptions struct {
 	Notify               pubsub.Publisher[notify.Notification]
 	// StreamIdleTimeout overrides streamIdleTimeoutDefault when > 0.
 	// Plumbed from Options.StreamIdleTimeoutSeconds in the coordinator.
-	StreamIdleTimeout    time.Duration
+	StreamIdleTimeout time.Duration
+	// DataDirectory is the absolute path to .crush/. Used by Run() to
+	// acquire an inter-process file lock per session (prevents two
+	// crush processes from accidentally working on the same session
+	// id — see internal/session/lock.go).
+	DataDirectory string
 }
 
 func NewSessionAgent(
@@ -214,6 +223,7 @@ func NewSessionAgent(
 		activeRequests:       csync.NewMap[string, context.CancelFunc](),
 		summarizeQueue:       csync.NewMap[string, fantasy.ProviderOptions](),
 		streamIdleTimeout:    opts.StreamIdleTimeout,
+		dataDir:              opts.DataDirectory,
 	}
 }
 
@@ -234,6 +244,43 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 		existing = append(existing, call)
 		a.messageQueue.Set(call.SessionID, existing)
 		return nil, nil
+	}
+
+	// Inter-process session lock. The IsSessionBusy check above is
+	// per-process (in-memory map); two crush processes wouldn't see
+	// each other's busy state and could both start streaming into the
+	// same session id — the accidental-double-spawn race documented in
+	// the parallel-process audit (#6 CRITICAL). The OS-level lock
+	// auto-releases on process death, so a crashed holder never leaves
+	// a stuck session id. Sub-agents skip the lock because they live
+	// inside the parent process whose lock is already held.
+	var ipcLock *session.SessionLock
+	if !a.isSubAgent && a.dataDir != "" {
+		lk, lockErr := session.TryAcquireSessionLock(a.dataDir, call.SessionID)
+		if lockErr != nil {
+			var busyErr *session.SessionLockBusyError
+			if errors.As(lockErr, &busyErr) {
+				slog.Warn("agent.Run: rejected — session locked by another process",
+					"session_id", call.SessionID,
+					"holder_pid", busyErr.HolderPID,
+					"lock_path", busyErr.Path,
+				)
+				return nil, fmt.Errorf("session %q is already in use: %w", call.SessionID, lockErr)
+			}
+			// Non-busy errors (IO, permission denied on locks dir) —
+			// log and continue without the inter-process guard rather
+			// than fail the whole run. The in-process IsSessionBusy
+			// check still protects against intra-process races.
+			slog.Warn("agent.Run: failed to acquire inter-process session lock, continuing without it",
+				"session_id", call.SessionID, "err", lockErr)
+		} else {
+			ipcLock = lk
+			defer func() {
+				if relErr := ipcLock.Release(); relErr != nil {
+					slog.Debug("agent.Run: release session lock failed", "session_id", call.SessionID, "err", relErr)
+				}
+			}()
+		}
 	}
 
 	// Copy mutable fields under lock to avoid races with SetTools/SetModels.

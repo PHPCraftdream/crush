@@ -76,6 +76,10 @@ func NewEditTool(
 
 			params.FilePath = filepathext.SmartJoin(workingDir, params.FilePath)
 
+			if err := CheckForbiddenWrite(params.FilePath); err != nil {
+				return fantasy.NewTextErrorResponse(err.Error()), nil
+			}
+
 			var response fantasy.ToolResponse
 			var err error
 
