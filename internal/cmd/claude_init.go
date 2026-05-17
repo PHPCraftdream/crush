@@ -20,20 +20,24 @@ var claudeInitBlockPattern = regexp.MustCompile(`(?s)<!-- crush-claude-init:v\d+
 // already exists. Bumping the v<N> version forces a re-write on the
 // next run (old block is rewritten, not duplicated).
 const (
-	claudeInitMarkerStart = "<!-- crush-claude-init:v2 -->"
+	claudeInitMarkerStart = "<!-- crush-claude-init:v3 -->"
 	claudeInitMarkerEnd   = "<!-- /crush-claude-init -->"
 	claudeMdFile          = "CLAUDE.md"
 	// Versioned sentinel: bumping the v<N> on changes means an LLM that
-	// already inserted v1 into CLAUDE.md will, on the next `claude-init`,
-	// see "no v2 marker → write fresh block". v1 stays in the file but
-	// becomes visually-superseded text. Use --force if you want to drop
-	// the older copy explicitly.
+	// already inserted v1/v2 into CLAUDE.md will, on the next
+	// `claude-init`, see "no v3 marker → write fresh block". The old
+	// marker stays in the file but becomes visually-superseded text.
+	// Use --replace to strip every prior version cleanly in one shot.
 )
 
 // previousMarkers lists every prior sentinel so a future --replace flag
-// could find and excise them. Currently unused but kept here so the
-// version history is documented in one place.
-var previousMarkers = []string{"<!-- crush-claude-init:v1 -->"}
+// could find and excise them. Currently unused at runtime — the regex in
+// claudeInitBlockPattern matches any v\d+ — but kept here so the version
+// history is documented in one place.
+var previousMarkers = []string{
+	"<!-- crush-claude-init:v1 -->",
+	"<!-- crush-claude-init:v2 -->",
+}
 
 var claudeInitCmd = &cobra.Command{
 	Use:   "claude-init",
@@ -136,32 +140,76 @@ func init() {
 
 func claudeInitBlock() string {
 	return claudeInitMarkerStart + `
-## Delegate heavy work to ` + "`crush`" + `
+## Working with ` + "`crush`" + `: you are the strategist, ` + "`crush`" + ` is the worker
 
-This workspace has [crush](https://github.com/charmbracelet/crush) installed.
-` + "`crush`" + ` is a CLI agent with its own persistent sessions, its own LLM provider
-config, and its own approval policy. Use it as a **sub-agent** when running
-the work yourself would burn through your context, when several tasks can
-proceed in parallel, or when a task is exploratory enough that you'd
-rather not pay for the false starts in your own scrollback.
+This workspace has [crush](https://github.com/charmbracelet/crush)
+installed. ` + "`crush`" + ` is a CLI agent with its own persistent sessions,
+its own LLM provider config, and its own approval policy. Treat it as
+your **execution arm**, not as a fallback you reach for when a task
+"feels big".
 
-### When to delegate vs do it yourself
+### Default posture: delegate the doing, own the thinking
 
-Delegate to ` + "`crush`" + ` when **any** of these are true:
+Your job here is to be the strategist, planner, reviewer, and the
+person on the hook with the user. The actual *doing* — reading the
+codebase, writing patches, running tests, debugging stack traces,
+exploring unfamiliar dirs — belongs to ` + "`crush`" + ` sub-agents you launch.
+This split exists for a concrete reason: your context window is the
+scarce resource for *judgement* (the user's intent, the trade-offs,
+the why), so spending it on raw implementation tokens is a waste.
 
-- the task touches more files than you can hold in your head at once
-  (large refactors, repo-wide renames, codebase exploration);
-- the task is repetitive (apply pattern X to every file matching Y);
-- the task is open-ended exploration likely to spawn a lot of tool
-  calls before producing the answer you actually want;
-- you want several attempts in parallel ("try approach A, B, and C and
-  tell me which one passes the tests");
-- the user is fine with you working in the background while they keep
-  the conversation going.
+What stays in your hand:
 
-Do it yourself when the task is short, depends on context from the
-current conversation that's hard to serialise, or when fast feedback to
-the user matters more than offloading the work.
+- **Understanding the user's intent** and re-interpreting fuzzy
+  requests into concrete tasks.
+- **Decomposing the work** into independently-shippable pieces with
+  a clear pass criterion each. Writing the prompt for each piece is
+  *your* high-leverage move.
+- **Choosing the right role** (smart vs fast) and the right session
+  topology (one shared session for iterative work, separate
+  sessions for parallel branches).
+- **Reading back results**, sanity-checking them against the spec,
+  spotting hallucinated file paths or skipped tests, and feeding the
+  next iteration if needed.
+- **Reporting back to the user**, asking blocking questions,
+  pushing back on bad requests, and taking responsibility for the
+  final outcome.
+
+What goes to ` + "`crush`" + ` by default:
+
+- Anything that needs to **read** more than a couple of files.
+- Anything that involves **writing or editing** code or config —
+  even a "small" edit. Resist the "I'll just do it myself, it's two
+  lines" instinct: those two lines come with surrounding context you
+  haven't loaded.
+- Running test suites, linters, type checkers, build commands.
+- Searching the codebase, grepping for callers, mapping
+  dependencies.
+- Reproducing a bug, isolating it, drafting a fix.
+- Anything repetitive or large-fan-out ("for each file matching X
+  do Y").
+
+The few legitimate exceptions for doing work yourself:
+
+- A single ` + "`Read`" + ` of a file whose path you already know and whose
+  contents you genuinely need in your own context (to talk about it
+  with the user, not to act on it).
+- A one-line shell command the user explicitly asked you to run.
+- Reading a ` + "`crush`" + ` result file and summarising it for the user.
+- **Tactical follow-up after review.** Once a ` + "`crush`" + ` run has
+  returned and you've reviewed the diff/output, it is fine — and
+  often the right call — to make small, surgical fixes yourself
+  rather than re-delegating: a typo, a missed import, a one-line
+  test tweak, a comment, a renamed variable. The rule is that the
+  *bulk* implementation work was done by ` + "`crush`" + ` and your fix is
+  the cherry on top, not the other way around. If the follow-up
+  starts to grow past a handful of edits, that's the signal to
+  hand it back to ` + "`crush`" + ` with a precise "now do X on top of what
+  you just produced" prompt to the same session.
+
+If you catch yourself reaching for ` + "`Edit`" + ` / ` + "`Write`" + ` / ` + "`Grep`" + ` / ` + "`Bash`" + `
+to *start* a task rather than to finish one, pause and write a
+` + "`crush run`" + ` prompt instead.
 
 ### Channels — what goes where
 

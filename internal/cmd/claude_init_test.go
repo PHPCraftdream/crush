@@ -25,8 +25,11 @@ func TestClaudeInitBlock_ShapeAndContent(t *testing.T) {
 		"crush sessions list",
 		"crush providers list",
 		"crush models show",
-		"orchestrate sub-agents",       // crush's own agent tool
-		"`agent` tool that spawns",     // explanation of how delegation works
+		"orchestrate sub-agents",        // crush's own agent tool
+		"`agent` tool that spawns",      // explanation of how delegation works
+		"strategist, planner, reviewer", // v3 posture statement
+		"What stays in your hand",       // v3 stays-in-hand list
+		"What goes to `crush` by default", // v3 goes-to-crush list
 	} {
 		assert.Contains(t, block, must, "block must mention %q", must)
 	}
