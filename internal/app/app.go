@@ -140,6 +140,35 @@ func New(ctx context.Context, conn *sql.DB, store *config.ConfigStore) (*App, er
 }
 
 // Config returns the pure-data configuration.
+// disableSubAgentToolsInConfig drops the "agent" and "agentic_fetch"
+// tools from the coder agent's AllowedTools list in the in-memory
+// config. Used by RunNonInteractive when overrides.DisableSubAgents
+// (`crush run --agents single`) is set. Mutation does not touch the
+// on-disk config and only outlives this process if a future caller
+// reloads the in-memory config from disk — `crush run` exits
+// immediately after the agent turn so this is moot in practice.
+//
+// Fork patch (orchestrator UX): see CHANGELOG.fork.md (Section 4.J).
+func (app *App) disableSubAgentToolsInConfig() {
+	cfg := app.config.Config()
+	if cfg == nil {
+		return
+	}
+	coder, ok := cfg.Agents[config.AgentCoder]
+	if !ok {
+		return
+	}
+	filtered := coder.AllowedTools[:0:0]
+	for _, t := range coder.AllowedTools {
+		if t == "agent" || t == "agentic_fetch" {
+			continue
+		}
+		filtered = append(filtered, t)
+	}
+	coder.AllowedTools = filtered
+	cfg.Agents[config.AgentCoder] = coder
+}
+
 func (app *App) Config() *config.Config {
 	return app.config.Config()
 }
@@ -211,6 +240,13 @@ type runResult struct {
 	SessionID  string         `json:"session_id"`
 	ExitReason string         `json:"exit_reason"` // "stop","error","canceled","max_tokens","unknown","tool_use"
 	FinalText  string         `json:"final_text"`
+	// Fork patch (orchestrator UX): when --json or --format json
+	// triggered the fence/preamble stripper and the model HAD wrapped
+	// its answer in prose or a markdown fence, the unstripped original
+	// is preserved here so the orchestrator can audit what the model
+	// actually said. Empty when no stripping was applied or when the
+	// model returned clean JSON already.
+	AssistantNotes string         `json:"assistant_notes,omitempty"`
 	Error      string         `json:"error,omitempty"`
 	// Warnings are non-fatal observations about the run that an
 	// orchestrator should know about even when exit_reason looks happy.
@@ -245,7 +281,10 @@ type usageInfo struct {
 // "Provider X stopped sending streaming data for over 3m0s..."). They
 // surface into runResult.Error so orchestrators see WHY a turn errored,
 // not just THAT it did.
-func buildRunResult(sessionID, finalText, finalReason string, err error, canceled bool, toolCounts map[string]int, deltaTokens int64, deltaCost float64, duration time.Duration, finalErrTitle, finalErrDetails string) runResult {
+// Fork patch (orchestrator UX): assistantNotes added. Carries the
+// stripped prose/fence content when --json or --format json triggered
+// stripJSONEnvelope and the model had wrapped the JSON; "" otherwise.
+func buildRunResult(sessionID, finalText, assistantNotes, finalReason string, err error, canceled bool, toolCounts map[string]int, deltaTokens int64, deltaCost float64, duration time.Duration, finalErrTitle, finalErrDetails string) runResult {
 	reason := finalReason
 	if reason == "" {
 		switch {
@@ -302,12 +341,13 @@ func buildRunResult(sessionID, finalText, finalReason string, err error, cancele
 		}
 	}
 	return runResult{
-		SessionID:  sessionID,
-		ExitReason: reason,
-		FinalText:  finalText,
-		Error:      errMsg,
-		Warnings:   warnings,
-		ToolCalls:  calls,
+		SessionID:      sessionID,
+		ExitReason:     reason,
+		FinalText:      finalText,
+		AssistantNotes: assistantNotes,
+		Error:          errMsg,
+		Warnings:       warnings,
+		ToolCalls:      calls,
 		Usage: usageInfo{
 			DeltaTokens:  deltaTokens,
 			DeltaCostUSD: deltaCost,
@@ -349,6 +389,16 @@ type RunOverrides struct {
 	// via Sessions.UpdateReasoningEffort.
 	ReasoningEffort string
 	RoleLarge       bool
+	// Fork patch (orchestrator UX): DisableSubAgents drops the `agent`
+	// and `agentic_fetch` tools from the coder agent for this run so a
+	// `crush run --agents single` invocation cannot fan out. Mutation
+	// is per-process — `crush run` is single-shot, so the change does
+	// not leak across invocations. StripJSONFences asks
+	// RunNonInteractive to post-process the envelope's final_text
+	// (markdown fence + prose preamble removal); the unstripped
+	// original is preserved in runResult.AssistantNotes.
+	DisableSubAgents bool
+	StripJSONFences  bool
 }
 
 // RunNonInteractive runs a single agent turn and writes its result to
@@ -393,6 +443,16 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt 
 	// Wait for MCP initialization to complete before reading MCP tools.
 	if err := mcp.WaitForInit(ctx); err != nil {
 		return fmt.Errorf("failed to wait for MCP initialization: %w", err)
+	}
+
+	// Fork patch (orchestrator UX): --agents single. Drop the agent /
+	// agentic_fetch tools from the coder agent's AllowedTools BEFORE
+	// UpdateModels rebuilds the toolset so the model literally cannot
+	// fan out. Mutation is in-process only (crush run is a single-shot
+	// process — exit drops the change), so this is safe even though
+	// it touches the global config. See run.go and run_format.go.
+	if overrides.DisableSubAgents {
+		app.disableSubAgentToolsInConfig()
 	}
 
 	// force update of agent models before running so mcp tools are loaded
@@ -503,8 +563,18 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt 
 				// Re-fetch the session row so the usage delta reflects
 				// the writes the agent made during the run.
 				freshSess, _ := app.Sessions.Get(ctx, sess.ID)
+				// Fork patch (orchestrator UX): when the caller asked
+				// for JSON, defang the persistent "model wrapped its
+				// final JSON in a ```json fence and added prose" case
+				// here so wrappers can pipe final_text straight into
+				// jq. The original is preserved in assistant_notes.
+				finalTextOut := finalText
+				assistantNotes := ""
+				if overrides.StripJSONFences && finalReason != "error" && finalReason != "canceled" {
+					finalTextOut, assistantNotes = stripJSONEnvelope(finalText)
+				}
 				summary := buildRunResult(
-					sess.ID, finalText, finalReason, runErr, isCanceled,
+					sess.ID, finalTextOut, assistantNotes, finalReason, runErr, isCanceled,
 					toolCallCounts,
 					freshSess.PromptTokens+freshSess.CompletionTokens-tokensBefore,
 					freshSess.Cost-costBefore,

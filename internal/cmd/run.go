@@ -44,9 +44,43 @@ Output modes (mutually exclusive --stream / --json):
     the final assistant message on stdout.
   - --stream:        every assistant token streamed live to stdout.
   - --json:          a single JSON object on stdout when the run ends —
-                     {session_id, exit_reason, final_text, tool_calls,
-                      usage, duration_ms, error}. Tool-call heartbeat
-                     still goes to stderr so wrappers can show progress.
+                     {session_id, exit_reason, final_text, assistant_notes,
+                      tool_calls, usage, duration_ms, error}. Tool-call
+                     heartbeat still goes to stderr so wrappers can show
+                     progress.
+
+Shaping the model's output:
+  --format <preset|string>  Appends an in-prompt hint that asks the model
+                            to produce a specific shape for this turn
+                            only (not persisted). Presets:
+                              json              -> final answer is one
+                                                   raw JSON value, no
+                                                   fence, no prose.
+                              json-schema:<f>   -> same + conform to <f>.
+                              @<file>           -> use <file> contents
+                                                   verbatim as the hint.
+                              <any other text>  -> freeform "Output
+                                                   format: ..." instruction.
+                            With --json or --format json, the envelope's
+                            final_text is also post-processed: a
+                            triple-backtick "json" fence and prose
+                            preamble/suffix are stripped so
+                            "jq .final_text" works directly. The
+                            original (unstripped) text is preserved in
+                            envelope.assistant_notes when stripping ran.
+
+Sub-agent policy:
+  --agents <single|with-agents|agent-allow>
+                            single        -- the "agent" and "agentic_fetch"
+                                             tools are removed from the
+                                             toolset for this run; the
+                                             model literally cannot fan
+                                             out.
+                            with-agents   -- model is nudged to fan out
+                                             via the "agent" tool when
+                                             work is decomposable.
+                            agent-allow   -- default. Tool present, model
+                                             decides whether to use it.
 
 Use --timeout to bound the run from outside (the agent gets a clean
 cancel + the partial answer is preserved in the session and is included
@@ -110,6 +144,25 @@ crush run --role smart --stream "explain this codebase"
 # Machine-readable summary for wrapper scripts
 crush run --json --session "pr-42" "review the diff" | jq .final_text
 
+# Force raw JSON in final_text (model is instructed AND envelope is
+# post-stripped; markdown fences and prose preamble go to
+# assistant_notes).
+crush run --role smart --json --format json \
+          --session "audit-A" "..." < /tmp/audit-prompt.md
+
+# JSON conforming to a schema
+crush run --role smart --json \
+          --format json-schema:./schemas/audit.json \
+          --session "audit-A" "..." < /tmp/audit-prompt.md
+
+# Disable sub-agent fan-out (the "agent" tool is removed from the
+# toolset entirely so the model cannot dispatch even if it wants to).
+crush run --role smart --agents single --session "linear-task" "..."
+
+# Tell the model to fan out (system-prompt nudge — still up to the
+# model whether it actually decomposes the work).
+crush run --role smart --agents with-agents --session "parallel-audit" "..."
+
 # Hard time limit — partial answer is still preserved in the session
 # (and surfaced in --json's exit_reason / final_text)
 crush run --timeout 5m --session "long-task" "refactor the storage layer"
@@ -129,6 +182,11 @@ crush run --timeout 5m --session "long-task" "refactor the storage layer"
 			useLast, _          = cmd.Flags().GetBool("continue")
 			systemPrompt, _     = cmd.Flags().GetString("system-prompt")
 			systemPromptFile, _ = cmd.Flags().GetString("system-prompt-file")
+			// Fork patch (orchestrator UX): --format injects a per-turn
+			// output-shape hint into the user prompt; --agents controls
+			// the sub-agent dispatch policy. See run_format.go.
+			formatFlag, _ = cmd.Flags().GetString("format")
+			agentsMode, _ = cmd.Flags().GetString("agents")
 		)
 
 		if effort != "" {
@@ -164,6 +222,29 @@ crush run --timeout 5m --session "long-task" "refactor the storage layer"
 				return fmt.Errorf("failed to read --system-prompt-file: %w", err)
 			}
 			systemPrompt = string(bts)
+		}
+
+		// Fork patch (orchestrator UX): validate --agents up-front so a
+		// typo doesn't waste a billed turn. Allowed values mirror the
+		// three real policies the user can want.
+		var (
+			agentsDisable bool
+			agentsHint    string
+		)
+		switch agentsMode {
+		case "", "agent-allow":
+			// default: tool present, no nudge — model decides.
+		case "with-agents":
+			agentsHint = agentsModePromptHint
+		case "single":
+			agentsDisable = true
+		default:
+			return fmt.Errorf("--agents: invalid value %q (allowed: single|with-agents|agent-allow)", agentsMode)
+		}
+
+		formatHint, err := resolveFormatHint(formatFlag)
+		if err != nil {
+			return err
 		}
 
 		// Cancel on SIGINT or SIGTERM.
@@ -229,6 +310,11 @@ crush run --timeout 5m --session "long-task" "refactor the storage layer"
 			return fmt.Errorf("no prompt provided")
 		}
 
+		// Fork patch (orchestrator UX): append the format/agents hints
+		// AFTER stdin read so the user's prompt content stays at the
+		// top of the model's context (attention favours the start).
+		prompt = composeUserPrompt(prompt, formatHint, agentsHint)
+
 		if stream && asJSON {
 			return fmt.Errorf("--stream and --json are mutually exclusive")
 		}
@@ -248,6 +334,12 @@ crush run --timeout 5m --session "long-task" "refactor the storage layer"
 			SystemPrompt:    systemPrompt,
 			ReasoningEffort: effort,
 			RoleLarge:       roleLarge,
+			// Fork patch (orchestrator UX): the two new fields. JSON
+			// stripping is enabled only when the user actually asked
+			// for JSON output OR JSON format (both are honest signals
+			// that the model was instructed to emit raw JSON).
+			DisableSubAgents: agentsDisable,
+			StripJSONFences:  asJSON || formatFlag == "json" || strings.HasPrefix(formatFlag, "json-schema:"),
 		}
 		return a.RunNonInteractive(ctx, os.Stdout, prompt, overrides, hideSpinner, mode, sessionID, useLast)
 	},
@@ -267,6 +359,10 @@ func init() {
 	runCmd.Flags().BoolP("continue", "C", false, "Continue the most recent session")
 	runCmd.Flags().String("system-prompt", "", "Override the session's system prompt with this string (persisted on the session)")
 	runCmd.Flags().String("system-prompt-file", "", "Read the system prompt from this file (mutually exclusive with --system-prompt)")
+	// Fork patch (orchestrator UX): per-turn output-shape and sub-agent
+	// policy. Neither persists on the session.
+	runCmd.Flags().String("format", "", "Per-turn output-shape hint appended to the user prompt. Presets: 'json' (final answer must be a single JSON value, no fences, no prose) | 'json-schema:<file>' (json + conform to this schema) | '@<file>' (use file contents verbatim as the hint) | any other text (used as a freeform 'Output format:' instruction). With --json or --format json, the envelope's final_text is also post-processed to strip ```json fences and prose preamble; the original is preserved in assistant_notes.")
+	runCmd.Flags().String("agents", "", "Sub-agent dispatch policy for this run. 'single' (no sub-agents — the `agent` tool is removed from the toolset for this process) | 'with-agents' (model is nudged to fan out via the `agent` tool) | 'agent-allow' (default — tool present, model decides).")
 	runCmd.MarkFlagsMutuallyExclusive("session", "continue")
 	runCmd.MarkFlagsMutuallyExclusive("system-prompt", "system-prompt-file")
 	runCmd.MarkFlagsMutuallyExclusive("stream", "json")

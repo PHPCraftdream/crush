@@ -73,6 +73,20 @@ func (m *mockSessionService) Save(_ context.Context, s session.Session) (session
 	return s, nil
 }
 
+// IncrementCost: mock that mutates the in-memory session if found,
+// returns it (or an empty one with the id-not-found semantics matching
+// the real DB layer). Added when Service.IncrementCost was introduced
+// as part of the parallel-process cost-race fix.
+func (m *mockSessionService) IncrementCost(_ context.Context, id string, delta float64) (session.Session, error) {
+	for i, s := range m.sessions {
+		if s.ID == id {
+			m.sessions[i].Cost += delta
+			return m.sessions[i], nil
+		}
+	}
+	return session.Session{}, nil
+}
+
 func (m *mockSessionService) UpdateTitleAndUsage(context.Context, string, string, int64, int64, float64) error {
 	return nil
 }

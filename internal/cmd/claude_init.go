@@ -20,7 +20,7 @@ var claudeInitBlockPattern = regexp.MustCompile(`(?s)<!-- crush-claude-init:v\d+
 // already exists. Bumping the v<N> version forces a re-write on the
 // next run (old block is rewritten, not duplicated).
 const (
-	claudeInitMarkerStart      = "<!-- crush-claude-init:v4 -->"
+	claudeInitMarkerStart      = "<!-- crush-claude-init:v5 -->"
 	claudeInitMarkerEnd        = "<!-- /crush-claude-init -->"
 	claudeMdFile               = "CLAUDE.md"
 	claudeSlashCommandPath     = ".claude/commands/crush.md"
@@ -40,6 +40,7 @@ var previousMarkers = []string{
 	"<!-- crush-claude-init:v1 -->",
 	"<!-- crush-claude-init:v2 -->",
 	"<!-- crush-claude-init:v3 -->",
+	"<!-- crush-claude-init:v4 -->",
 }
 
 var claudeInitCmd = &cobra.Command{
@@ -331,6 +332,50 @@ invocation below for the full pattern.
   root-level flag, not a ` + "`run`" + ` flag, and ` + "`run`" + ` already auto-approves).
   Run only in workspaces you can afford to lose, and prefer
   ` + "`--cwd /tmp/sandbox`" + ` or a worktree for risky calls.
+
+### Shaping the model's output: ` + "`--format`" + `
+
+When you actually need to parse the answer (not just read it), pair
+` + "`--json`" + ` with ` + "`--format json`" + `. The first guarantees the wrapper-stable
+envelope on stdout; the second instructs the model that ` + "`final_text`" + `
+must be raw JSON with no markdown fence and no prose preamble, AND
+makes ` + "`crush run`" + ` post-strip a stray ` + "```" + `json fence if the model ignored
+the instruction anyway (the original wrapped text is preserved in
+` + "`assistant_notes`" + ` so you can audit what the model actually said).
+
+- ` + "`--format json`" + ` — final answer is a single raw JSON value.
+- ` + "`--format json-schema:<file>`" + ` — same + conform to ` + "`<file>`" + `.
+- ` + "`--format @<file>`" + ` — use ` + "`<file>`" + `'s contents verbatim as a freeform
+  output-shape instruction (good for "respond in this exact template"
+  prompts that don't fit on the CLI).
+- ` + "`--format \"<any text>\"`" + ` — same idea, inline.
+
+The hint is appended to the user prompt for THIS turn only — it does
+not persist on the session, so a follow-up ` + "`crush run --session <same>`" + `
+without ` + "`--format`" + ` reverts to the model's default verbosity.
+
+### Sub-agent dispatch: ` + "`--agents`" + `
+
+` + "`crush`" + ` ships with an ` + "`agent`" + ` tool (see the dedicated section below for
+how it actually works). ` + "`--agents`" + ` decides whether the model can or must
+use it for this run:
+
+- ` + "`--agents single`" + ` — the ` + "`agent`" + ` and ` + "`agentic_fetch`" + ` tools are
+  REMOVED from the toolset for this run. The model literally cannot
+  fan out. Pick this when you want a deterministic single-path
+  execution (typical for audits where you need every step in one
+  session's transcript, or for cheap-and-quick tasks where fan-out
+  would be overkill).
+- ` + "`--agents with-agents`" + ` — the ` + "`agent`" + ` tool is present AND the user
+  prompt carries a nudge telling the model "parallelise independent
+  sub-tasks via ` + "`agent`" + `". Use when the task is genuinely
+  decomposable (per-file scans, A/B/C alternatives, multi-section
+  audits) and you want the model to actually use the fan-out.
+- ` + "`--agents agent-allow`" + ` (default) — the tool is present, no
+  nudge. The model decides.
+
+If you don't pass ` + "`--agents`" + `, you get ` + "`agent-allow`" + `. State your
+intent explicitly when it matters for cost/latency planning.
 
 ### Read-only discovery commands (always safe)
 

@@ -1,4 +1,154 @@
-# Crush
+# Crush — this fork
+
+> **Heads-up:** this repository is a long-running fork of
+> [`charmbracelet/crush`](https://github.com/charmbracelet/crush) that
+> turned the upstream terminal-UI coding agent into a **browser-driven
+> long-lived web service + orchestrator-friendly CLI**. If you are
+> looking for the canonical, blessed-by-Charm distribution, go upstream.
+> If you want to drive Crush from a browser tab, embed it in a wrapper
+> script, or run several Crush processes in parallel against the same
+> repo, this fork is built for that.
+
+## What this fork actually is
+
+The single design choice that everything else follows: **drop the TUI,
+ship a web UI, and treat the CLI as a first-class orchestration target.**
+Once that decision is made, the divergences below are forced.
+
+| Area | Upstream | This fork |
+| ---- | -------- | --------- |
+| Front-end | Bubble Tea TUI (~495 files under `internal/ui/`) | React/Tailwind SPA in `web/`, embedded into the binary via `go:embed` |
+| Transport | REST `/v1/...` over Unix socket / Windows named pipe | WebSocket `/ws` over TCP loopback (single embedded server) |
+| Auth | None (local-socket trust) | Token-based, see `internal/server/auth.go` |
+| Sessions | One model per agent role, set globally | Per-session model overrides + per-session system prompt + per-session YOLO flag, all persisted in SQLite |
+| Permissions | In-memory rules during a TUI run | Persistent per-session rules in SQLite; cross-process visible |
+| Parallel runs | Not a target | First-class — flock per session, OS-level lock release on crash, atomic file writes, additive cost SQL, MCP-id flock |
+| `crush run` | Single-shot quick fire | Wrapper-friendly: `--role`, `--session` get-or-create, `--json` envelope, `--format`, `--agents`, `--timeout`, `--stream` |
+| CLI providers | Limited bridge | npx Claude Code, Gemini CLI, Codex CLI, MCP bridge for external tools, session resume for Anthropic prompt caching |
+| Web UI features | n/a | Slash-command + skill autocomplete, dark/light theme, pinned messages, fork-session button, LSP/MCP/provider management modals, file/image attachments |
+
+The full per-file decision log lives in [`CHANGELOG.fork.md`](./CHANGELOG.fork.md).
+That document is also the survival guide for merging upstream `main`
+into the fork — every divergence is annotated with a `// Fork patch:`
+comment in the code so conflicts surface at the right line.
+
+## Running Crush in this fork
+
+Two complementary entry points; pick whichever fits the job.
+
+### 1. `crush web` — the browser UI
+
+```bash
+crush web                            # default port + open browser
+crush web --port 8080 --no-open      # for a remote workstation
+```
+
+A long-lived process. Sessions live in `.crush/crush.db`, the UI loads
+the React bundle from inside the binary, the WebSocket is local-only +
+token-authed. This replaces upstream's TUI.
+
+### 2. `crush run` — the orchestration CLI
+
+```bash
+# Idempotent: same --session id continues the same conversation, new
+# id creates a fresh one. Required --role keeps you honest about
+# cost/latency.
+crush run --role smart --session "pr-42" --json \
+          --format json --timeout 5m \
+          < /tmp/review.prompt > /tmp/review.json 2>/tmp/review.err
+```
+
+What this fork added on top of upstream's `crush run`:
+
+- **`--role smart|fast` is required** — no silent default to the
+  expensive model.
+- **`--session <id>`** is get-or-create — pass the same id again to
+  continue, or a new id to start fresh. Works as a stable key for CI
+  matrices and orchestrator wrappers.
+- **`--json`** emits a single wrapper-stable envelope on stdout
+  (`{session_id, exit_reason, final_text, assistant_notes, tool_calls,
+  usage, duration_ms, error, warnings}`).
+- **`--format json|json-schema:<f>|@<f>|<any text>`** appends a
+  per-turn output-shape hint to the prompt AND post-strips markdown
+  fences + prose preamble from `final_text` so `jq .final_text`
+  works directly. The original wrapped reply is preserved in
+  `assistant_notes`.
+- **`--agents single|with-agents|agent-allow`** controls sub-agent
+  fan-out: completely disable, nudge the model to use, or default
+  laissez-faire.
+- **`--timeout <duration>`** hard wall-clock cap; the partial answer is
+  preserved in the session and surfaced in the JSON envelope.
+- **`--system-prompt[-file]`** persists onto the session so follow-up
+  runs inherit it.
+- **`--stream`** streams every token to stdout for live wrappers.
+- Permissions are auto-approved in `crush run` (non-interactive — no
+  one is on the keyboard). Mirror this with `--cwd /tmp/sandbox` or a
+  worktree when running model-written code against shared state.
+
+### 3. Parallel processes against one `.crush/`
+
+The fork explicitly supports running 5+ `crush run --session X` against
+the same working directory concurrently (the canonical use case is
+multi-section code audits). The defence layers:
+
+- Per-session OS flock (`internal/session/lock.go`) — two processes
+  cannot share a session id.
+- SQLite WAL + `busy_timeout=30000` + single-writer-per-process
+  connection pool.
+- Cost mutations go through additive SQL (`IncrementSessionCost`) so
+  concurrent sub-agent goroutines AND parallel processes cannot lose
+  cost via read-modify-write.
+- Atomic file writes (`fsext.AtomicWriteFile`) in `write`/`edit`/
+  `multiedit` tools — `kill -9` mid-write cannot truncate the user's
+  file.
+- Per-process `pid=N` attribute in every log line — interleaved Windows
+  log writes can be split post-hoc with `jq 'select(.pid==N)'`.
+- Permission grants ("Always allow") are DB-direct on every check, so
+  a grant made in process A is immediately visible in process B
+  without restart.
+- MCP `qwen/gemini-mcp-id` and `~/.{qwen,gemini}/settings.json` writes
+  are flock'd with a 30s timeout so a wedged sibling cannot freeze
+  the fleet.
+
+See [`CHANGELOG.fork.md`](./CHANGELOG.fork.md) Section 4.I for the full
+parallel-process audit and the trade-offs we explicitly kept (e.g. N
+processes still spawn N stdio children of every configured MCP server
+— use HTTP/SSE-transport MCPs in parallel runs).
+
+### 4. Bootstrap helpers for an orchestrator
+
+If you drive Crush from another LLM (e.g. Claude Code), run once:
+
+```bash
+crush claude-init                 # append a delegation guide to ./CLAUDE.md
+crush claude-init --replace       # overwrite any older version cleanly
+```
+
+This drops two things into the workspace:
+- A versioned block in `CLAUDE.md` teaching the upper LLM when and how
+  to delegate work to `crush run` (channels, `--role`, `--session`
+  conventions, backgrounding rules).
+- A `.claude/commands/crush.md` slash command that says "for this task,
+  delegate via `crush run` per the rules in CLAUDE.md".
+
+## When NOT to use this fork
+
+- You want the TUI experience. Use upstream.
+- You want a stable, blessed-by-Charm distribution path
+  (Homebrew/winget/AUR releases of this fork are not published).
+- You want the official REST `/v1/...` protocol for wrapping. This fork
+  speaks WebSocket only.
+
+---
+
+The original upstream README follows below, kept verbatim because most
+of its content (installation, configuration, MCP/LSP setup, model
+providers) applies unchanged to this fork. Where the fork diverges,
+either the text above or `CHANGELOG.fork.md` overrides.
+
+---
+
+# Crush (upstream)
 
 <p align="center">
     <a href="https://stuff.charm.sh/crush/charm-crush.png"><img width="450" alt="Charm Crush Logo" src="https://github.com/user-attachments/assets/cf8ca3ce-8b02-43f0-9d0f-5a331488da4b" /></a><br />
