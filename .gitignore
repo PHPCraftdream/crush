@@ -55,6 +55,7 @@ completions/crush.*sh
 .prettierignore
 .task
 /web/test-results/
+/test-results/
 
 /web/dist/
 /web/node_modules/
