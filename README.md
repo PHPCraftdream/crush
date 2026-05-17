@@ -1,29 +1,52 @@
 # Crush — this fork
 
 > **Heads-up:** this repository is a long-running fork of
-> [`charmbracelet/crush`](https://github.com/charmbracelet/crush) that
-> turned the upstream terminal-UI coding agent into a **browser-driven
-> long-lived web service + orchestrator-friendly CLI**. If you are
-> looking for the canonical, blessed-by-Charm distribution, go upstream.
-> If you want to drive Crush from a browser tab, embed it in a wrapper
-> script, or run several Crush processes in parallel against the same
-> repo, this fork is built for that.
+> [`charmbracelet/crush`](https://github.com/charmbracelet/crush). The
+> upstream is a terminal-UI coding agent for humans. **This fork
+> specialises in being a tool that other AI agents drive.** If you
+> want a polished TUI to chat with, go upstream. If you want a binary
+> that an orchestrator (Claude Code, your own LLM wrapper, a CI job,
+> a multi-agent fleet) can spawn 5+ times in parallel against the same
+> repo and reliably parse the result of, this fork is built for that.
 
 ## What this fork actually is
 
-The single design choice that everything else follows: **drop the TUI,
-ship a web UI, and treat the CLI as a first-class orchestration target.**
-Once that decision is made, the divergences below are forced.
+The product is **`crush` as an agent's hands**, not as a human's coding
+companion. Every divergence below follows from that single repositioning:
+
+- The TUI is gone — a human is no longer the primary user of the
+  process. A React/Tailwind **web UI** stays for the cases where a
+  human DOES want to look in, but the design centre is the CLI.
+- The CLI is the contract. `crush run` exposes a **wrapper-stable JSON
+  envelope** with a small, frozen set of fields an orchestrator parses
+  without surprises. New flags (`--role`, `--session`, `--format`,
+  `--agents`, `--timeout`, …) all exist to give the upper LLM precise
+  control over a delegated turn.
+- Multiple instances are a first-class concern. Five `crush run` against
+  one `.crush/` directory cannot corrupt each other's state — sessions,
+  cost accounting, log writes, MCP-id files and SQLite are all
+  defended explicitly.
+- Honest error reporting. When the model fails its contract (returns
+  invalid JSON, runs out of context, stalls the stream) the envelope
+  says so — there is no silent success because the agent on top
+  cannot read the operator's mind.
+- Bootstrap helpers (`crush claude-init`) drop a delegation guide into
+  the workspace so the upper LLM knows when and how to delegate to
+  `crush run` instead of grepping the codebase itself.
+
+The browser UI is the second-class entry point for humans peeking in,
+the orchestrator-facing CLI is first-class.
 
 | Area | Upstream | This fork |
 | ---- | -------- | --------- |
-| Front-end | Bubble Tea TUI (~495 files under `internal/ui/`) | React/Tailwind SPA in `web/`, embedded into the binary via `go:embed` |
+| Primary user | Human in a terminal | Another agent (LLM, CI, orchestrator) calling the CLI |
+| Front-end | Bubble Tea TUI (~495 files under `internal/ui/`) | React/Tailwind SPA in `web/`, embedded via `go:embed`. Optional. |
 | Transport | REST `/v1/...` over Unix socket / Windows named pipe | WebSocket `/ws` over TCP loopback (single embedded server) |
 | Auth | None (local-socket trust) | Token-based, see `internal/server/auth.go` |
 | Sessions | One model per agent role, set globally | Per-session model overrides + per-session system prompt + per-session YOLO flag, all persisted in SQLite |
 | Permissions | In-memory rules during a TUI run | Persistent per-session rules in SQLite; cross-process visible |
 | Parallel runs | Not a target | First-class — flock per session, OS-level lock release on crash, atomic file writes, additive cost SQL, MCP-id flock |
-| `crush run` | Single-shot quick fire | Wrapper-friendly: `--role`, `--session` get-or-create, `--json` envelope, `--format`, `--agents`, `--timeout`, `--stream` |
+| `crush run` | Single-shot quick fire | Wrapper-friendly: `--role`, `--session` get-or-create, `--json`/`--format`/`--agents`/`--timeout`/`--stream`, JSON-envelope validation, `assistant_notes`, fallback error messages |
 | CLI providers | Limited bridge | npx Claude Code, Gemini CLI, Codex CLI, MCP bridge for external tools, session resume for Anthropic prompt caching |
 | Web UI features | n/a | Slash-command + skill autocomplete, dark/light theme, pinned messages, fork-session button, LSP/MCP/provider management modals, file/image attachments |
 
@@ -47,43 +70,88 @@ A long-lived process. Sessions live in `.crush/crush.db`, the UI loads
 the React bundle from inside the binary, the WebSocket is local-only +
 token-authed. This replaces upstream's TUI.
 
-### 2. `crush run` — the orchestration CLI
+### 2. `crush run` — the orchestration CLI (the main thing)
+
+The canonical pattern an orchestrator should be writing:
 
 ```bash
-# Idempotent: same --session id continues the same conversation, new
-# id creates a fresh one. Required --role keeps you honest about
-# cost/latency.
-crush run --role smart --session "pr-42" --json \
-          --format json --timeout 5m \
-          < /tmp/review.prompt > /tmp/review.json 2>/tmp/review.err
+out=/tmp/audit-A.json
+CRUSH_FORBID_WRITES="$out" \
+  crush run --role smart --session "audit-A" \
+            --json --format json --timeout 10m \
+            < /tmp/audit-A.prompt > "$out" 2>"$out.err"
+jq -r '.exit_reason' "$out"   # "end_turn" on success, "invalid_json" if model broke contract, "error" otherwise
+jq -r '.final_text'   "$out"  # the raw JSON the model produced (validated)
+jq -r '.assistant_notes' "$out" # any prose preamble that was stripped
+jq -r '.error' "$out"         # error.message if non-success
 ```
 
-What this fork added on top of upstream's `crush run`:
+#### Flags
 
-- **`--role smart|fast` is required** — no silent default to the
+- **`--role smart|fast` (required)** — no silent default to the
   expensive model.
-- **`--session <id>`** is get-or-create — pass the same id again to
+- **`--session <id>`** — get-or-create. Pass the same id again to
   continue, or a new id to start fresh. Works as a stable key for CI
   matrices and orchestrator wrappers.
-- **`--json`** emits a single wrapper-stable envelope on stdout
-  (`{session_id, exit_reason, final_text, assistant_notes, tool_calls,
-  usage, duration_ms, error, warnings}`).
-- **`--format json|json-schema:<f>|@<f>|<any text>`** appends a
-  per-turn output-shape hint to the prompt AND post-strips markdown
-  fences + prose preamble from `final_text` so `jq .final_text`
-  works directly. The original wrapped reply is preserved in
-  `assistant_notes`.
-- **`--agents single|with-agents|agent-allow`** controls sub-agent
-  fan-out: completely disable, nudge the model to use, or default
-  laissez-faire.
-- **`--timeout <duration>`** hard wall-clock cap; the partial answer is
-  preserved in the session and surfaced in the JSON envelope.
-- **`--system-prompt[-file]`** persists onto the session so follow-up
+- **`--json`** — emits a single wrapper-stable envelope on stdout:
+  `{session_id, exit_reason, final_text, assistant_notes, stripped_bytes,
+  tool_calls, usage, duration_ms, error, warnings}`.
+- **`--format json | json-schema:<f> | @<f> | <any text>`** — appends a
+  per-turn output-shape hint to the prompt AND post-validates `final_text`.
+  With `json` or `json-schema:`, the envelope is also post-processed:
+  markdown fences and prose preamble are stripped; `json.Valid` runs on
+  what remains. **If the model returns syntactically broken JSON**
+  (e.g. forgot a `]` somewhere), `exit_reason="invalid_json"` is set,
+  the original (unstripped) text is preserved in `final_text`, the
+  failed strip attempt goes to `assistant_notes`, and `error` carries
+  a `json.SyntaxError` with a byte offset. Wrappers can branch on
+  `exit_reason` instead of trusting the model's optimistic `"stop"`.
+- **`--agents single | with-agents | agent-allow`** — sub-agent fan-out
+  policy. `single` removes the `agent` and `agentic_fetch` tools from
+  the toolset entirely so the model literally cannot dispatch
+  sub-agents. `with-agents` nudges the model to fan out. `agent-allow`
+  (default) leaves the choice to the model.
+- **`--timeout <duration>`** — hard wall-clock cap; the partial answer
+  is preserved in the session and surfaced in the envelope.
+- **`--system-prompt[-file]`** — persists onto the session so follow-up
   runs inherit it.
-- **`--stream`** streams every token to stdout for live wrappers.
-- Permissions are auto-approved in `crush run` (non-interactive — no
-  one is on the keyboard). Mirror this with `--cwd /tmp/sandbox` or a
-  worktree when running model-written code against shared state.
+- **`--stream`** — streams every token to stdout for live wrappers.
+
+#### Envelope fields worth knowing
+
+- `stripped_bytes` — how many bytes were removed from `final_text` by
+  the JSON stripper (when `--json`+`--format json` were active). Graph
+  it across runs to track how often your model wraps in prose.
+- `tool_calls: [{name, count}]` — post-hoc inventory of what tools the
+  model actually used. Useful to verify `--agents single` actually
+  blocked fan-out.
+- `warnings[]` — non-fatal observations. Includes `final_text appears
+  truncated` when the run errored mid-composition (so the operator
+  sees the model was about to continue), and `final_text is empty
+  after N sub-agent fan-out call(s)` when the model dispatched
+  sub-agents but never composed a top-level reply.
+- `error` — present whenever `exit_reason` is non-success. If the
+  provider's Finish part had no message (some providers emit a bare
+  error finish), a fallback names the most likely causes (provider
+  HTTP error, stream stall, OOM, context overflow).
+
+#### Env-vars to know
+
+- **`CRUSH_FORBID_WRITES`** — comma-separated paths the `write`/`edit`/
+  `multiedit` tools must NOT touch. **Set this to the stdout-redirect
+  target before every `crush run`** — otherwise the model can pick the
+  same filename it sees in the prompt and overwrite your envelope
+  output. Tool calls to forbidden paths fail visibly to the model;
+  it then falls back to returning content via `final_text`.
+- **`CRUSH_PROVIDER_CACHE_TTL`** — duration (`24h` default, `0s` to
+  always refresh). Caches the Catwalk/Hyper provider catalog locally
+  so `crush models show` and similar read-only commands skip the
+  ~3-second HTTP round-trip when the on-disk cache is fresher than
+  the TTL.
+
+Permissions are auto-approved in `crush run` (non-interactive — no
+one is on the keyboard). Mirror this with `--cwd /tmp/sandbox` or a
+worktree when running model-written code against shared state.
 
 ### 3. Parallel processes against one `.crush/`
 
@@ -127,17 +195,59 @@ crush claude-init --replace       # overwrite any older version cleanly
 This drops two things into the workspace:
 - A versioned block in `CLAUDE.md` teaching the upper LLM when and how
   to delegate work to `crush run` (channels, `--role`, `--session`
-  conventions, backgrounding rules).
+  conventions, backgrounding rules, the `CRUSH_FORBID_WRITES`
+  pattern, when to use `--format json` and `--agents single`).
 - A `.claude/commands/crush.md` slash command that says "for this task,
   delegate via `crush run` per the rules in CLAUDE.md".
 
+The block is versioned (`<!-- crush-claude-init:vN -->`). Re-run
+`crush claude-init --replace` after a fork update to refresh it
+cleanly — every prior version is recognised and excised in one shot.
+
+### 5. `crush models` — picking and inspecting models
+
+```bash
+crush models show
+# large : zai / glm-5.1 ctx=204.8k
+#         $1.40 / 1M in, $4.40 / 1M out (cached-in $0.26)
+# small : zai / glm-5-turbo ctx=200k
+#         $1.20 / 1M in, $4.00 / 1M out (cached-in $0.24)
+
+crush models set --global --large zai/glm-5.1 --small zai/glm-5-turbo
+crush models set --local  --large openai/gpt-5@high  # workspace-only override with effort
+```
+
+`models show` prints context window + per-1M-token pricing pulled from
+the catwalk catalog so an orchestrator can decide cost/latency before
+launching the turn. Same fields appear under `cost_per_1m_*` keys with
+`--json`. Custom/local models without a catalog entry silently omit
+pricing (no broken display).
+
 ## When NOT to use this fork
 
-- You want the TUI experience. Use upstream.
-- You want a stable, blessed-by-Charm distribution path
-  (Homebrew/winget/AUR releases of this fork are not published).
-- You want the official REST `/v1/...` protocol for wrapping. This fork
-  speaks WebSocket only.
+- **You want the TUI experience.** Use upstream — the fork removed it.
+- **You want a stable, blessed-by-Charm distribution path.** This fork
+  does not publish Homebrew/winget/AUR releases.
+- **You want the official REST `/v1/...` protocol for wrapping.** This
+  fork speaks WebSocket only.
+- **You're a human typing into one terminal session at a time.**
+  Upstream's TUI is genuinely nicer for that. This fork's CLI is shaped
+  for scripts and orchestrators; the web UI is for peeking in, not for
+  daily-driving conversational work.
+
+## When this fork is exactly the right tool
+
+- You're building a multi-agent system where one LLM delegates code
+  work to another. `crush run` is that worker; the envelope is the
+  protocol between them.
+- You run a multi-section audit / refactor / migration as 5+ parallel
+  `crush run` invocations against one repo and need the cost
+  accounting + lock-file + atomic-write guarantees that follow.
+- You wrap LLMs in CI: stable `--session` key per build matrix,
+  `--timeout` for budget control, `--json` for jq-parseable output,
+  `--format json` for raw JSON contracts with validation.
+- You want a long-running embedded coding agent reachable over a
+  browser-served WebSocket from a thin React UI.
 
 ---
 
@@ -150,16 +260,13 @@ either the text above or `CHANGELOG.fork.md` overrides.
 
 # Crush (upstream)
 
-<p align="center">
-    <a href="https://stuff.charm.sh/crush/charm-crush.png"><img width="450" alt="Charm Crush Logo" src="https://github.com/user-attachments/assets/cf8ca3ce-8b02-43f0-9d0f-5a331488da4b" /></a><br />
-    <a href="https://github.com/charmbracelet/crush/releases"><img src="https://img.shields.io/github/release/charmbracelet/crush" alt="Latest Release"></a>
-    <a href="https://github.com/charmbracelet/crush/actions"><img src="https://github.com/charmbracelet/crush/actions/workflows/build.yml/badge.svg" alt="Build Status"></a>
-</p>
-
-<p align="center">Your new coding bestie, now available in your favourite terminal.<br />Your tools, your code, and your workflows, wired into your LLM of choice.</p>
-<p align="center">终端里的编程新搭档，<br />无缝接入你的工具、代码与工作流，全面兼容主流 LLM 模型。</p>
-
-<p align="center"><img width="800" alt="Crush Demo" src="https://github.com/user-attachments/assets/58280caf-851b-470a-b6f7-d5c4ea8a1968" /></p>
+> Logo, release badge, build-status badge and demo GIF removed — they
+> point at upstream `charmbracelet/crush` artifacts (Charm's logo,
+> upstream's GitHub Actions status, upstream's release tag) and would
+> misrepresent this fork's identity, release cadence and CI status.
+> The text below is the upstream README's prose, kept verbatim because
+> the installation / configuration / providers material applies to
+> this fork unchanged.
 
 ## Features
 
@@ -373,7 +480,8 @@ Is there a provider you’d like to see in Crush? Is there an existing model tha
 
 Crush’s default model listing is managed in [Catwalk](https://github.com/charmbracelet/catwalk), a community-supported, open source repository of Crush-compatible models, and you’re welcome to contribute.
 
-<a href="https://github.com/charmbracelet/catwalk"><img width="174" height="174" alt="Catwalk Badge" src="https://github.com/user-attachments/assets/95b49515-fe82-4409-b10d-5beb0873787d" /></a>
+(Upstream's Catwalk badge image removed — see the project at
+[charmbracelet/catwalk](https://github.com/charmbracelet/catwalk).)
 
 ## Configuration
 
@@ -1024,9 +1132,10 @@ We’d love to hear your thoughts on this project. Need help? We gotchu. You can
 
 ---
 
-Part of [Charm](https://charm.land).
-
-<a href="https://charm.land/"><img alt="The Charm logo" width="400" src="https://stuff.charm.sh/charm-banner-softy.jpg" /></a>
+Upstream is part of [Charm](https://charm.land). This fork is an
+independent project living under the same FSL-1.1-MIT license but
+with no affiliation to Charm Industries beyond the shared upstream
+codebase.
 
 <!--prettier-ignore-->
 Charm热爱开源 • Charm loves open source

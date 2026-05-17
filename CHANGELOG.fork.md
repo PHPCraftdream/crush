@@ -13,15 +13,43 @@ back here.
 
 ## 1. Why this fork exists
 
-Upstream Crush is a **terminal UI** (TUI) coding agent. The optional
-`client/server` mode in upstream still drives the TUI — its REST API
-under `/v1/...` is just a transport between the TUI front-end (running
-in a separate terminal) and the agent back-end (running on a Unix socket
-or Windows named pipe).
+Upstream Crush is a **terminal UI** (TUI) coding agent — built around
+a human typing into a terminal session. The optional `client/server`
+mode in upstream still drives the TUI; its REST API under `/v1/...` is
+just a transport between the TUI front-end (running in a separate
+terminal) and the agent back-end (Unix socket / Windows named pipe).
 
-This fork has a different goal: **run Crush as a long-lived embedded web
-service**, with a React/Tailwind UI in the browser. Everything we kept,
-removed, or rewrote follows from that single choice.
+This fork has a fundamentally different goal: **make `crush` a tool
+that other AI agents can drive.** The primary user is not a human at
+a keyboard — it is an orchestrator (Claude Code, a custom LLM wrapper,
+a CI job, a multi-agent fleet) that spawns `crush run` and parses the
+JSON envelope on stdout. A React/Tailwind web UI stays for the cases
+where a human DOES want to peek in, but the design centre is the CLI
+and the orchestrator-facing contract.
+
+Concretely, this single repositioning forces everything that follows:
+
+- The TUI is removed because the primary user no longer types.
+- `crush run` grows a wrapper-stable JSON envelope, a frozen set of
+  flags (`--role`, `--session`, `--format`, `--agents`, `--timeout`,
+  `--json`, `--stream`), and post-validation guarantees so a script
+  on top can branch deterministically on the result.
+- Multiple concurrent `crush run` against one repo become a supported
+  scenario (multi-section audits, fan-out refactors) — so the storage
+  layer, lock files, log writes and MCP-id files all get hardened
+  against process races.
+- Errors are honest: when the model breaks its contract (invalid JSON,
+  context overflow, mid-stream stall, sub-agent fan-out without a
+  final composition) the envelope says so. The agent on top cannot
+  read minds; silent success is the worst class of failure.
+- Bootstrap helpers (`crush claude-init`) drop a delegation guide into
+  the workspace so an upper LLM learns the rules of engagement
+  without trial-and-error.
+
+Everything we kept, removed, or rewrote — including the React web UI,
+the persistent SQLite-backed sessions, the cross-process file locks,
+the additive cost SQL — follows from "be a good tool for an agent on
+top".
 
 ### High-level differences from upstream
 
