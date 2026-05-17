@@ -62,6 +62,23 @@ const (
 	largeContextWindowThreshold = 200_000
 	largeContextWindowBuffer    = 20_000
 	smallContextWindowRatio     = 0.2
+
+	// streamIdleTimeoutDefault is the default tolerance for "no streaming
+	// event for this long" before the watchdog cancels the LLM request.
+	// Configurable per-app via Options.StreamIdleTimeoutSeconds, plumbed
+	// through SessionAgentOptions.StreamIdleTimeout. Read at Run()-time
+	// via effectiveStreamIdleTimeout below.
+	//
+	// 3 min covers most non-thinking turns comfortably (network jitter +
+	// model decode time). Extended-thinking models (Opus 4.7 / Sonnet 4.5
+	// with thinking_budget ~32k) can legitimately stall mid-reasoning for
+	// >5 min; those callers should set Options.StreamIdleTimeoutSeconds.
+	streamIdleTimeoutDefault = 3 * time.Minute
+	// streamWatchdogTick is how often the watchdog re-checks the
+	// last-activity timestamp. Keep small enough that a stall is detected
+	// promptly (well under streamIdleTimeout) but large enough not to
+	// dominate logs.
+	streamWatchdogTick = 30 * time.Second
 )
 
 var userAgent = fmt.Sprintf("Charm-Crush/%s (https://charm.land/crush)", version.Version)
@@ -149,6 +166,10 @@ type sessionAgent struct {
 	disableAutoSummarize bool
 	isYolo               bool
 	notify               pubsub.Publisher[notify.Notification]
+	// streamIdleTimeout, when > 0, overrides streamIdleTimeoutDefault for
+	// every Run() on this agent. Set from Options.StreamIdleTimeoutSeconds
+	// via SessionAgentOptions at construction. 0 = use the default.
+	streamIdleTimeout time.Duration
 
 	messageQueue   *csync.Map[string, []SessionAgentCall]
 	activeRequests *csync.Map[string, context.CancelFunc]
@@ -169,6 +190,9 @@ type SessionAgentOptions struct {
 	Messages             message.Service
 	Tools                []fantasy.AgentTool
 	Notify               pubsub.Publisher[notify.Notification]
+	// StreamIdleTimeout overrides streamIdleTimeoutDefault when > 0.
+	// Plumbed from Options.StreamIdleTimeoutSeconds in the coordinator.
+	StreamIdleTimeout    time.Duration
 }
 
 func NewSessionAgent(
@@ -189,6 +213,7 @@ func NewSessionAgent(
 		messageQueue:         csync.NewMap[string, []SessionAgentCall](),
 		activeRequests:       csync.NewMap[string, context.CancelFunc](),
 		summarizeQueue:       csync.NewMap[string, fantasy.ProviderOptions](),
+		streamIdleTimeout:    opts.StreamIdleTimeout,
 	}
 }
 
@@ -286,6 +311,32 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	genCtx, cancel := context.WithCancel(ctx)
 	a.activeRequests.Set(call.SessionID, cancel)
 
+	// Stream-progress watchdog (see streamWatchdog doc in stream_watchdog.go
+	// for the invariant). Every fantasy stream callback below calls
+	// bumpActivity(); if no callback fires for idleTimeout, the watchdog
+	// cancels genCtx and the agent.Stream call below returns with
+	// context.Canceled, routing into the error path that records
+	// FinishReasonError("Stream stalled") on the assistant message.
+	idleTimeout := streamIdleTimeoutDefault
+	if a.streamIdleTimeout > 0 {
+		idleTimeout = a.streamIdleTimeout
+	}
+	wd := startStreamWatchdog(genCtx, cancel, idleTimeout, streamWatchdogTick,
+		func(idle time.Duration) {
+			slog.Warn("agent: stream watchdog firing — no provider activity, force-cancelling",
+				"session_id", call.SessionID,
+				"provider", largeModel.ModelCfg.Provider,
+				"model", largeModel.ModelCfg.Model,
+				"idle_duration", idle.String(),
+				"threshold", idleTimeout.String(),
+			)
+		},
+	)
+	bumpActivity := wd.bump
+	// Defer order matters: <-wd.done is deferred FIRST so it runs LAST
+	// (LIFO), AFTER cancel() has signalled the goroutine to exit.
+	// Without this the wait would deadlock the function return.
+	defer func() { <-wd.done }()
 	defer cancel()
 	defer a.activeRequests.Del(call.SessionID)
 	// Fork merge note (origin/main 6938dedd "perf: batch streaming message
@@ -372,6 +423,12 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 		TopK:             call.TopK,
 		FrequencyPenalty: call.FrequencyPenalty,
 		PrepareStep: func(callContext context.Context, options fantasy.PrepareStepFunctionOptions) (_ context.Context, prepared fantasy.PrepareStepResult, err error) {
+			// PrepareStep runs before the first token of the step and can
+			// take non-trivial time (sliding-window trim, background
+			// summarise kickoff, cache-control wiring). Bump first so a
+			// slow prepare doesn't trip the watchdog before the stream
+			// even starts.
+			bumpActivity()
 			prepared.Messages = options.Messages
 			for i := range prepared.Messages {
 				prepared.Messages[i].ProviderOptions = nil
@@ -469,16 +526,19 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			return callContext, prepared, err
 		},
 		OnReasoningStart: func(id string, reasoning fantasy.ReasoningContent) error {
+			bumpActivity()
 			slog.Debug("agent: OnReasoningStart called", "id", id)
 			currentAssistant.AppendReasoningContent(reasoning.Text)
 			return a.messages.Update(genCtx, *currentAssistant)
 		},
 		OnReasoningDelta: func(id string, text string) error {
+			bumpActivity()
 			slog.Debug("agent: OnReasoningDelta called", "len", len(text))
 			currentAssistant.AppendReasoningContent(text)
 			return notifyUI()
 		},
 		OnReasoningEnd: func(id string, reasoning fantasy.ReasoningContent) error {
+			bumpActivity()
 			// handle anthropic signature
 			if anthropicData, ok := reasoning.ProviderMetadata[anthropic.Name]; ok {
 				if reasoning, ok := anthropicData.(*anthropic.ReasoningOptionMetadata); ok {
@@ -499,6 +559,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			return a.messages.Update(genCtx, *currentAssistant)
 		},
 		OnTextDelta: func(id string, text string) error {
+			bumpActivity()
 			// Strip leading newline from initial text content. This is is
 			// particularly important in non-interactive mode where leading
 			// newlines are very visible.
@@ -510,6 +571,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			return notifyUI()
 		},
 		OnToolInputStart: func(id string, toolName string) error {
+			bumpActivity()
 			toolCall := message.ToolCall{
 				ID:               id,
 				Name:             toolName,
@@ -522,17 +584,21 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			return a.messages.Update(ctx, *currentAssistant)
 		},
 		OnToolInputDelta: func(id string, delta string) error {
+			bumpActivity()
 			currentAssistant.AppendToolCallInput(id, delta)
 			return nil // don't spam DB on every delta; ToolInputEnd will persist
 		},
 		OnToolInputEnd: func(id string) error {
+			bumpActivity()
 			currentAssistant.FinishToolCall(id)
 			return a.messages.Update(genCtx, *currentAssistant)
 		},
 		OnRetry: func(err *fantasy.ProviderError, delay time.Duration) {
+			bumpActivity()
 			slog.Warn("Provider request failed, retrying", providerRetryLogFields(err, delay)...)
 		},
 		OnToolCall: func(tc fantasy.ToolCallContent) error {
+			bumpActivity()
 			toolCall := message.ToolCall{
 				ID:               tc.ToolCallID,
 				Name:             tc.ToolName,
@@ -546,6 +612,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			return a.messages.Update(ctx, *currentAssistant)
 		},
 		OnToolResult: func(result fantasy.ToolResultContent) error {
+			bumpActivity()
 			toolResult := a.convertToToolResult(result)
 			// Use parent ctx instead of genCtx to ensure the message is created
 			// even if the request is canceled mid-stream
@@ -558,6 +625,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			return createMsgErr
 		},
 		OnStepFinish: func(stepResult fantasy.StepResult) error {
+			bumpActivity()
 			finishReason := message.FinishReasonUnknown
 			switch stepResult.FinishReason {
 			case fantasy.FinishReasonLength:
@@ -660,14 +728,26 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	if err != nil {
 		isHyper := largeModel.ModelCfg.Provider == hyper.Name
 		isCancelErr := errors.Is(err, context.Canceled)
+		isWatchdogStall := isCancelErr && wd.stalled.Load()
 		if currentAssistant == nil {
 			return result, err
 		}
+		// All DB writes in the error path use a detached context. The outer
+		// ctx may itself be cancelled — in `crush run` it's the
+		// signal.NotifyContext from fang, so Ctrl-C cancels it too; in the
+		// web UI a request abort cancels it; the stream watchdog above
+		// cancels genCtx (whose parent is ctx, so it doesn't cancel ctx,
+		// but defensively we still detach). Without a detached ctx the
+		// finish part Update fails with context.Canceled and the assistant
+		// ends up half-saved in the DB — the "silent dying" pattern
+		// observed in 162-promise-all. Codec must surface control: the
+		// finish part MUST land on disk before we return.
+		flushCtx, flushCancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+		defer flushCancel()
 		// Ensure we finish thinking on error to close the reasoning state.
 		currentAssistant.FinishThinking()
 		toolCalls := currentAssistant.ToolCalls()
-		// INFO: we use the parent context here because the genCtx has been cancelled.
-		msgs, createErr := a.messages.List(ctx, currentAssistant.SessionID)
+		msgs, createErr := a.messages.List(flushCtx, currentAssistant.SessionID)
 		if createErr != nil {
 			return nil, createErr
 		}
@@ -676,7 +756,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 				tc.Finished = true
 				tc.Input = "{}"
 				currentAssistant.AddToolCall(tc)
-				updateErr := a.messages.Update(ctx, *currentAssistant)
+				updateErr := a.messages.Update(flushCtx, *currentAssistant)
 				if updateErr != nil {
 					return nil, updateErr
 				}
@@ -700,7 +780,9 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 				continue
 			}
 			content := "There was an error while executing the tool"
-			if isCancelErr {
+			if isWatchdogStall {
+				content = fmt.Sprintf("Tool call was cancelled: the provider stream stalled for >%s and the watchdog aborted the turn.", idleTimeout)
+			} else if isCancelErr {
 				content = "Error: user cancelled assistant tool calling"
 			}
 			toolResult := message.ToolResult{
@@ -709,7 +791,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 				Content:    content,
 				IsError:    true,
 			}
-			_, createErr = a.messages.Create(ctx, currentAssistant.SessionID, message.CreateMessageParams{
+			_, createErr = a.messages.Create(flushCtx, currentAssistant.SessionID, message.CreateMessageParams{
 				Role: message.Tool,
 				Parts: []message.ContentPart{
 					toolResult,
@@ -722,7 +804,24 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 		var fantasyErr *fantasy.Error
 		var providerErr *fantasy.ProviderError
 		const defaultTitle = "Provider Error"
-		if isCancelErr {
+		if isWatchdogStall {
+			// Close the observability loop: the watchdog goroutine already
+			// emitted its slog.Warn at fire-time, but a log reader
+			// chasing the trail needs to see that the stall actually
+			// made it into the user-visible finish part on this session.
+			slog.Info("agent: watchdog stall surfaced as FinishReasonError",
+				"session_id", call.SessionID,
+				"provider", largeModel.ModelCfg.Provider,
+			)
+			currentAssistant.AddFinish(
+				message.FinishReasonError,
+				"Stream stalled",
+				fmt.Sprintf(
+					"Provider %q stopped sending streaming data for over %s — the request was auto-cancelled by the stream watchdog. Retry the prompt; if it keeps happening, try a different model or provider.",
+					largeModel.ModelCfg.Provider, idleTimeout,
+				),
+			)
+		} else if isCancelErr {
 			currentAssistant.AddFinish(message.FinishReasonCanceled, "User canceled request", "")
 		} else if isHyper && errors.As(err, &providerErr) && providerErr.StatusCode == http.StatusUnauthorized {
 			currentAssistant.AddFinish(message.FinishReasonError, "Unauthorized", `Please re-authenticate with Hyper. You can also run "crush auth" to re-authenticate.`)
@@ -753,10 +852,17 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 		} else {
 			currentAssistant.AddFinish(message.FinishReasonError, defaultTitle, err.Error())
 		}
-		// Note: we use the parent context here because the genCtx has been
-		// cancelled.
-		updateErr := a.messages.Update(ctx, *currentAssistant)
+		// Detached flush (flushCtx is context.WithoutCancel + 15s timeout,
+		// created at the top of this error block). This is the call that
+		// MUST land on disk — without it the assistant message has tool
+		// calls but no finish part, and the WUI/recovery sees it as still
+		// in-flight forever.
+		updateErr := a.messages.Update(flushCtx, *currentAssistant)
 		if updateErr != nil {
+			slog.Error("agent: failed to persist final finish part",
+				"session_id", call.SessionID,
+				"err", updateErr,
+			)
 			return nil, updateErr
 		}
 

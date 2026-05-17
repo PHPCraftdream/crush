@@ -90,6 +90,15 @@ func New(ctx context.Context, conn *sql.DB, store *config.ConfigStore) (*App, er
 	// Check for updates in the background.
 	go app.checkForUpdates(ctx)
 
+	// Startup recovery: any assistant message left without a finish part
+	// from a previous run is treated as an interrupted turn — we add a
+	// FinishReasonError to it so the UI/non-interactive callers don't see
+	// it as still in-flight. Backs the "Codec must surface control"
+	// invariant: even when the previous process died ungracefully (kill,
+	// power loss, panic) we release the session on next startup. See
+	// the 162-promise-all post-mortem in CHANGELOG.fork.md section 4.D.
+	app.recoverInterruptedTurns(ctx)
+
 	go mcp.Initialize(ctx, app.Permissions, store)
 
 	// Release the shared database connection on shutdown. The pool
@@ -658,6 +667,85 @@ func (app *App) InitCoderAgent(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+// recoverInterruptedTurns is the startup safety net for the "silent dying"
+// pattern: a previous crush process that died ungracefully (kill -9, power
+// loss, OS reboot, panic without recovery, or even a graceful Ctrl-C during
+// the brief window where ctx.Canceled would bypass the in-flight Update)
+// can leave assistant messages in the DB with tool calls but no finish
+// part. Without recovery, the WUI renders those as "still streaming"
+// forever, and `crush sessions reset` is the only escape.
+//
+// This sweep runs once at app start, before the coordinator is wired up.
+// For every session, it finds the LAST assistant message and, if it has no
+// finish part, adds a FinishReasonError marking it as a process-restart
+// interruption. Cheap (O(sessions × 1 query each)), non-fatal on error,
+// silent when there is nothing to recover.
+func (app *App) recoverInterruptedTurns(ctx context.Context) {
+	// Bound the whole sweep so a slow disk (network mount, AV scan,
+	// fsync stall) cannot block app startup. 10s is generous for a
+	// linear scan of sessions + targeted updates against SQLite; if it
+	// trips we'd rather skip recovery than hang the user's first
+	// `crush run`.
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	start := time.Now()
+	sessions, err := app.Sessions.List(ctx)
+	if err != nil {
+		slog.Warn("startup recovery: failed to list sessions", "err", err)
+		return
+	}
+	var recovered int
+	for _, sess := range sessions {
+		msgs, err := app.Messages.List(ctx, sess.ID)
+		if err != nil {
+			slog.Debug("startup recovery: skipping session, list failed",
+				"session_id", sess.ID, "err", err)
+			continue
+		}
+		var lastAssistant *message.Message
+		for i := len(msgs) - 1; i >= 0; i-- {
+			if msgs[i].Role == message.Assistant {
+				m := msgs[i]
+				lastAssistant = &m
+				break
+			}
+		}
+		if lastAssistant == nil || lastAssistant.IsFinished() {
+			continue
+		}
+		lastAssistant.AddFinish(
+			message.FinishReasonError,
+			"Process restarted",
+			"The previous crush process exited before this turn completed (silent dying — see CHANGELOG.fork.md section 4.D). The assistant message had tool calls but no finish part. Cleanly recovered on startup; you can retry from the previous user message.",
+		)
+		if err := app.Messages.Update(ctx, *lastAssistant); err != nil {
+			slog.Warn("startup recovery: failed to mark orphan assistant",
+				"session_id", sess.ID,
+				"message_id", lastAssistant.ID,
+				"err", err,
+			)
+			continue
+		}
+		recovered++
+	}
+	elapsed := time.Since(start)
+	if recovered > 0 {
+		slog.Info("startup recovery: rehabilitated orphan assistant messages",
+			"count", recovered,
+			"total_sessions_scanned", len(sessions),
+			"elapsed", elapsed.String(),
+		)
+	} else if elapsed > time.Second {
+		// Silent normally, but if the sweep took noticeable time
+		// (10k+ sessions on slow disk), surface it so the user can
+		// diagnose a slow startup without enabling debug logs.
+		slog.Info("startup recovery: nothing to recover",
+			"total_sessions_scanned", len(sessions),
+			"elapsed", elapsed.String(),
+		)
+	}
 }
 
 // Shutdown performs a graceful shutdown of the application.

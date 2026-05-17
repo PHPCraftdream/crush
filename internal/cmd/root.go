@@ -23,6 +23,7 @@ import (
 	"github.com/charmbracelet/crush/internal/app"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/db"
+	crushlog "github.com/charmbracelet/crush/internal/log"
 	"github.com/charmbracelet/crush/internal/projects"
 	"github.com/charmbracelet/crush/internal/server"
 	"github.com/charmbracelet/crush/internal/version"
@@ -187,6 +188,15 @@ func setupApp(cmd *cobra.Command) (*app.App, error) {
 	if err := createDotCrushDir(cfg.Options.DataDirectory); err != nil {
 		return nil, err
 	}
+
+	// Fork merge note: when we dropped upstream's serverCmd + connectToServer
+	// during the May-16 merge we accidentally dropped the only two callers
+	// of crushlog.Setup(). The slog.Default() handler then stayed at the
+	// terminal-writing default, so .crush/logs/crush.log silently stopped
+	// receiving new entries for both `crush` (web) and `crush run`. Wiring
+	// the call here in setupApp re-points the default logger at the same
+	// file path the WUI/Logs modal already expects to read from.
+	crushlog.Setup(filepath.Join(cfg.Options.DataDirectory, "logs", "crush.log"), debug)
 
 	// Register this project in the centralized projects list.
 	if err := projects.Register(cwd, cfg.Options.DataDirectory); err != nil {

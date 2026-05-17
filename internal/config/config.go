@@ -319,6 +319,16 @@ type Options struct {
 	Progress                  *bool        `json:"progress,omitempty" jsonschema:"description=Show indeterminate progress updates during long operations,default=true"`
 	DisableNotifications      bool         `json:"disable_notifications,omitempty" jsonschema:"description=Disable desktop notifications,default=false"`
 	DisabledSkills            []string     `json:"disabled_skills,omitempty" jsonschema:"description=List of skill names to disable and hide from the agent,example=crush-config"`
+	// StreamIdleTimeoutSeconds overrides the default 3-minute stream
+	// watchdog timeout (see internal/agent/stream_watchdog.go). The
+	// watchdog cancels the LLM streaming request if the provider stops
+	// sending data for this many seconds — surfaces control as
+	// FinishReasonError("Stream stalled") instead of an indefinite hang.
+	// Set higher (e.g. 900 = 15 min) when using extended-thinking models
+	// (Opus 4.7 / Sonnet 4.5 with large thinking budgets) where the
+	// model may legitimately pause for minutes while reasoning. 0 (the
+	// default when omitted) keeps the 3-minute built-in value.
+	StreamIdleTimeoutSeconds int `json:"stream_idle_timeout_seconds,omitempty" jsonschema:"description=Override the stream watchdog idle timeout in seconds. Default 180 (3 min). Raise for extended-thinking models that pause for long reasoning gaps. 0 = use default.,default=0,example=600"`
 }
 
 type MCPs map[string]MCPConfig

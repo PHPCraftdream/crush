@@ -216,6 +216,41 @@ Patches and additions in `agent.go`, `coordinator.go`:
   rendered as a blank block). Added in agent.go's `OnStepFinish`. See
   also Section 4.G for the matching front-end fallback. Marker:
   `// Fork patch: surface empty-stream as a visible error.`
+- **Stream-progress watchdog** (`internal/agent/stream_watchdog.go`) —
+  every fantasy stream callback bumps an atomic activity timestamp;
+  a watchdog goroutine cancels the generation context if no callback
+  fires for `streamIdleTimeoutDefault` (3 min default), overridable
+  per app via `Options.StreamIdleTimeoutSeconds` in `crush.json`.
+  Adds the "Codec must surface control" invariant: a provider that
+  holds the HTTP body open but stops sending bytes (rate-limit,
+  HTTP/2 stall, backend hiccup) can no longer freeze the agent
+  indefinitely. On fire, the assistant message gets a
+  `FinishReasonError("Stream stalled")` with the duration so the user
+  knows why their turn ended. Backed by the 162-promise-all
+  post-mortem (D:\dev\garnet-team\.crush): four streams (parent + 3
+  sub-agents) all froze in a 9-second window when a provider stopped
+  responding mid-stream, and the agent waited 1.5h before the user
+  killed the process. **Tune up to 10–15 minutes** (e.g.
+  `"stream_idle_timeout_seconds": 900`) when running extended-thinking
+  models (Opus 4.7 / Sonnet 4.5 with large thinking_budget) — a long
+  reasoning gap can legitimately exceed 3 min.
+- **Detached-context flush at the error path** — the final
+  `messages.Update` that records the assistant's finish part now uses
+  `context.WithoutCancel(ctx)` + a short timeout, instead of the
+  outer ctx. Without this, Ctrl-C in `crush run` (which cancels the
+  signal.NotifyContext that fang gives every subcommand) would
+  propagate `ctx.Canceled` into `Update` and leave the assistant
+  message half-saved: tool calls present, no finish part — the
+  "silent dying" pattern. Same fix applied to all error-path
+  `Create`/`Update`/`List` calls.
+- **Startup recovery of orphan assistants**
+  (`internal/app/app.go::recoverInterruptedTurns`) — on every app
+  start, before the coordinator is wired up, scan all sessions; any
+  assistant message left without a finish part from a previous run
+  gets a `FinishReasonError("Process restarted")` so the WUI
+  immediately renders it as an interrupted turn rather than spinning
+  forever. Safety net for cases the in-process defences can't catch:
+  `kill -9`, power loss, OS reboot, panic-without-recovery.
 
 ### 4.E — CLI providers (`internal/agent/cliprovider/`)
 

@@ -34,6 +34,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
 	"charm.land/catwalk/pkg/catwalk"
 	"charm.land/fantasy"
@@ -625,6 +626,11 @@ func (c *coordinator) buildAgent(ctx context.Context, prompt *prompt.Prompt, age
 	}
 
 	largeProviderCfg, _ := c.cfg.Config().Providers.Get(large.ModelCfg.Provider)
+	opts := c.cfg.Config().Options
+	var streamIdleTimeout time.Duration
+	if opts != nil && opts.StreamIdleTimeoutSeconds > 0 {
+		streamIdleTimeout = time.Duration(opts.StreamIdleTimeoutSeconds) * time.Second
+	}
 	result := NewSessionAgent(SessionAgentOptions{
 		LargeModel:           large,
 		SmallModel:           small,
@@ -637,6 +643,7 @@ func (c *coordinator) buildAgent(ctx context.Context, prompt *prompt.Prompt, age
 		Messages:             c.messages,
 		Tools:                nil,
 		Notify:               c.notify,
+		StreamIdleTimeout:    streamIdleTimeout,
 	})
 
 	c.readyWg.Go(func() error {
