@@ -87,18 +87,17 @@ internal/
 ## Build/Test/Lint Commands
 
 - **Build**: `go build .` or `go run .`
-- **Test**: `task test` or `go test ./...` (run single test:
+- **Test**: `go test ./...` (run single test:
   `go test ./internal/llm/prompt -run TestGetContextFromPaths`)
 - **Update Golden Files**: `go test ./... -update` (regenerates `.golden`
   files when test output changes)
   - Update specific package:
     `go test ./internal/tui/components/core -update` (in this case,
     we're updating "core")
-- **Lint**: `task lint:fix`
-- **Format**: `task fmt` (`gofumpt -w .`)
-- **Modernize**: `task modernize` (runs `modernize` which makes code
-  simplifications)
-- **Dev**: `task dev` (runs with profiling enabled)
+- **Lint**: `golangci-lint run --fix --path-mode=abs --config=.golangci.yml --timeout=5m`
+- **Format**: `gofumpt -w .`
+- **Modernize**: `go run golang.org/x/tools/go/analysis/passes/modernize/cmd/modernize@latest -fix -test ./...`
+- **Dev**: `CRUSH_PROFILE=true go run .`
 
 ## Code Style Guidelines
 
