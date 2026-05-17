@@ -205,6 +205,42 @@ func (s *ConfigStore) RemoveConfigField(scope Scope, key string) error {
 	return nil
 }
 
+// ReadModelsAtScope reads the per-scope `models.large` / `models.small` entries
+// directly from the on-disk file for the given scope, ignoring any merge with
+// the other scope. Returns (nil, nil) for a slot that the scope's file does not
+// define; returns an error only on read/parse failure. Used by `crush models
+// state` to show "what each scope says" alongside the effective merged view.
+//
+// Fork patch: batch 11 — `crush models state` needs per-scope visibility.
+func (s *ConfigStore) ReadModelsAtScope(scope Scope) (large, small *SelectedModel, err error) {
+	path, perr := s.configPath(scope)
+	if perr != nil {
+		// No path for this scope (e.g. workspace not initialised) — treat as
+		// "nothing set". Not an error.
+		return nil, nil, nil
+	}
+	data, rerr := os.ReadFile(path)
+	if rerr != nil {
+		if os.IsNotExist(rerr) {
+			return nil, nil, nil
+		}
+		return nil, nil, fmt.Errorf("read %s: %w", path, rerr)
+	}
+	var sm struct {
+		Models map[SelectedModelType]SelectedModel `json:"models"`
+	}
+	if err := json.Unmarshal(data, &sm); err != nil {
+		return nil, nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	if v, ok := sm.Models[SelectedModelTypeLarge]; ok {
+		large = &v
+	}
+	if v, ok := sm.Models[SelectedModelTypeSmall]; ok {
+		small = &v
+	}
+	return large, small, nil
+}
+
 // UpdatePreferredModel updates the preferred model for the given type and
 // persists it to the config file at the given scope.
 func (s *ConfigStore) UpdatePreferredModel(scope Scope, modelType SelectedModelType, model SelectedModel) error {

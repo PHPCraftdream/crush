@@ -237,22 +237,53 @@ removes the block and the slash command cleanly.
 
 ### 5. `crush models` — picking and inspecting models
 
-```bash
-crush models show
-# large : zai / glm-5.1 ctx=204.8k
-#         $1.40 / 1M in, $4.40 / 1M out (cached-in $0.26)
-# small : zai / glm-5-turbo ctx=200k
-#         $1.20 / 1M in, $4.00 / 1M out (cached-in $0.24)
+Three commands cover the whole surface:
 
-crush models set --global --large zai/glm-5.1 --small zai/glm-5-turbo
-crush models set --local  --large openai/gpt-5@high  # workspace-only override with effort
+```bash
+crush models list           # show available atoms + raw provider/model ids
+crush models use <large> <small> [--global | --local]
+crush models state          # what's effective + per-scope breakdown (alias: `show`)
 ```
 
-`models show` prints context window + per-1M-token pricing pulled from
-the catwalk catalog so an orchestrator can decide cost/latency before
-launching the turn. Same fields appear under `cost_per_1m_*` keys with
-`--json`. Custom/local models without a catalog entry silently omit
-pricing (no broken display).
+**Atoms** are short, friendly aliases. `list` prints them filtered by your
+currently-enabled providers — disabled providers' atoms are hidden so the
+list only shows what actually works right now:
+
+```
+ATOMS (combine as `crush models use <large> <small>`):
+
+  Anthropic:
+    via local `claude` CLI
+    opus-low, opus-medium, opus-high, opus-xhigh, opus-max            Claude Opus    (1M ctx)
+    sonnet-low, sonnet-medium, sonnet-high, sonnet-xhigh, sonnet-max  Claude Sonnet  (1M ctx)
+    haiku-low, haiku-medium, haiku-high, haiku-xhigh, haiku-max       Claude Haiku   (200k ctx)
+
+  Zai:
+    openai-compat, no effort
+    glm5_1        GLM 5.1      (204.8k ctx)
+    glm5          GLM 5        (204.8k ctx)
+    glm5_turbo    GLM 5 turbo  (200k ctx)
+    ...
+```
+
+Anthropic atoms require a level suffix (`opus-high`, `sonnet-low`, etc.) —
+the level list comes from parsing `claude --help` at first use, so it stays
+correct as Anthropic adds tiers. Z.AI atoms do not accept levels because
+Z.AI via openai-compat doesn't expose an effort parameter.
+
+```bash
+crush models use opus-high glm5_turbo                # mixed Anthropic large + Z.AI small
+crush models use --local glm5_1 glm5_turbo           # workspace-only override
+crush models use openai/gpt-5@high zai/glm-5-turbo   # raw provider/model fallback for anything not in the atom list
+```
+
+`models state` shows the currently-effective pair and the per-scope
+breakdown so you always know whether your `--local` workspace overrides
+your global default or vice versa.
+
+> **Removed in batch 11:** `crush models set --large X --small Y` and the
+> entire `crush models preset` subtree (save/use/list/delete). Both
+> commands now print a redirect notice pointing at `crush models use`.
 
 ## When NOT to use this fork
 

@@ -973,3 +973,62 @@ internal/agent/cliprovider/provider_test.go   TestAll_HaikuModelsRegistered
 CHANGELOG.fork.md                             this entry
 README.md                                     mention Haiku in CLI provider table
 ```
+
+### Batch 11 — `crush models use/list/state`; `preset` and `set` removed (2026-05-17)
+
+Reworked the model-selection UX around a small **atom registry** plus three
+sharp commands. The previous two-pronged surface (`crush models set
+--large X --small Y` plus the `crush models preset save/use/list/delete`
+machinery) is gone — both are replaced by a single positional command and
+a discoverability pair.
+
+**1. `crush models use <large> <small>` [--global | --local].**
+Two positional atoms, no flags for the model names themselves. Each
+argument is either an atom from the registry (e.g. `opus-high`,
+`glm5_turbo`) or a raw `provider/model[@level]` string as fallback for
+anything not in the registry. `--global` (default) writes to the global
+crush.json; `--local` to `./.crush/crush.json`.
+
+**2. `crush models list`** prints the atom registry (filtered by
+`EnabledProviders()` — disabled providers' atoms are hidden) followed by
+an "OTHER MODELS" block listing every model id from every enabled
+provider as raw `provider/model`. `--json` emits a structured object
+`{atoms: [...], other_models: [...]}`. The atom rows render every effort
+variant comma-separated on one line per model — opus-low through
+opus-max all on the same row — so the operator can copy the exact string
+they want.
+
+**3. `crush models state` [--json]** shows the EFFECTIVE large/small
+pair plus a per-scope breakdown (global / local) annotated with
+`(effective)` / `(overridden by local)` / `(not set)`. When the
+effective model matches an atom, the atom name is shown in parens:
+`local-cli/cli-claude-opus effort=high (atom: opus-high)`. Aliased as
+`crush models show` for backwards compat.
+
+**Atom registry** (internal/cmd/models_atoms.go): 3 Anthropic atoms
+(`opus`, `sonnet`, `haiku`) × 5 effort levels read from `claude --help`
+at first use (cached per process, fallback `[low, medium, high, xhigh,
+max]`) plus 10 Z.AI atoms with no effort. Mixed pairs supported
+(`opus-high glm5_turbo`).
+
+**Removals:**
+- `crush models set` → hidden cobra with `DisableFlagParsing` that prints
+  a redirect notice to stderr and exits 2.
+- `crush models preset` (entire `save`/`use`/`list`/`delete` ветвь) → same
+  hidden-redirect treatment. The `ModelPresets` field in crush.json is
+  silently ignored from now on.
+
+Files touched:
+
+```
+internal/cmd/models_atoms.go        new — registry, parseAtom, parseAtomOrRaw, renderAtomsBlock
+internal/cmd/models_effort.go       new — claude --help parser, per-binary cache, test seam
+internal/cmd/models_use.go          new — `crush models use <large> <small>`
+internal/cmd/models_list.go         new — `crush models list` + --json
+internal/cmd/models_state.go        new — `crush models state` + --json (aliased as `show`)
+internal/cmd/models_set.go          rewrite — splitModelEffort helper + hidden redirect
+internal/cmd/models_preset.go       rewrite — hidden redirect only
+internal/cmd/models_atoms_test.go   new — 10 tests covering parser + lookup
+internal/config/store.go            new ReadModelsAtScope helper for per-scope visibility
+CHANGELOG.fork.md                   this entry
+```
