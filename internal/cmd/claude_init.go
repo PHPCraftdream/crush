@@ -20,14 +20,14 @@ var claudeInitBlockPattern = regexp.MustCompile(`(?s)<!-- crush-claude-init:v\d+
 // already exists. Bumping the v<N> version forces a re-write on the
 // next run (old block is rewritten, not duplicated).
 const (
-	claudeInitMarkerStart = "<!-- crush-claude-init:v3 -->"
+	claudeInitMarkerStart = "<!-- crush-claude-init:v4 -->"
 	claudeInitMarkerEnd   = "<!-- /crush-claude-init -->"
 	claudeMdFile          = "CLAUDE.md"
 	// Versioned sentinel: bumping the v<N> on changes means an LLM that
-	// already inserted v1/v2 into CLAUDE.md will, on the next
-	// `claude-init`, see "no v3 marker → write fresh block". The old
-	// marker stays in the file but becomes visually-superseded text.
-	// Use --replace to strip every prior version cleanly in one shot.
+	// already inserted an older version into CLAUDE.md will, on the next
+	// `claude-init`, see "no current marker → write fresh block". The old
+	// marker stays in the file but becomes visually-superseded text. Use
+	// --replace to strip every prior version cleanly in one shot.
 )
 
 // previousMarkers lists every prior sentinel so a future --replace flag
@@ -37,6 +37,7 @@ const (
 var previousMarkers = []string{
 	"<!-- crush-claude-init:v1 -->",
 	"<!-- crush-claude-init:v2 -->",
+	"<!-- crush-claude-init:v3 -->",
 }
 
 var claudeInitCmd = &cobra.Command{
@@ -228,63 +229,11 @@ to *start* a task rather than to finish one, pause and write a
 
 ### Long prompts: pipe from a file
 
-Anything bigger than one sentence belongs in a file, not in a shell
-argument. Quoting hell + tool-call traces in stderr + LLM
-mis-tokenisation if your prompt has special chars all hurt at once:
-
-` + "```bash" + `
-cat ./prompts/refactor.md | crush run \
-  --role smart --session "refactor-storage" \
-  > /tmp/crush-out.log 2>&1
-` + "```" + `
-
-The file is also a great handle for re-runs: same prompt content,
-same ` + "`--session`" + ` id, and ` + "`crush`" + ` continues where the previous attempt
-left off.
-
-### Quick patterns
-
-**Quickly summarise something** (cheap model, plain text out — terse
-mode already gives you just the final answer on stdout, no parsing
-needed):
-` + "```bash" + `
-crush run --role fast "summarise the last 200 lines of this log" < dev.log \
-  > /tmp/summary.txt 2>/dev/null
-` + "```" + `
-
-**Same task, with metadata** (token cost, tool-call counts, exit
-reason) — use ` + "`--json`" + ` and then read the file yourself; the object is
-small enough that an LLM can parse it by eye, no ` + "`jq`" + ` needed:
-` + "```bash" + `
-crush run --role fast --json "summarise dev.log" < dev.log \
-  > /tmp/result.json 2>/dev/null
-` + "```" + `
-
-**Long task with persistent role and session** — first run sets the
-system prompt; subsequent runs with the same ` + "`--session`" + ` inherit it:
-` + "```bash" + `
-crush run --role smart --session "refactor-storage" \
-  --system-prompt-file ./prompts/reviewer-role.md \
-  "do the first pass"
-crush run --role smart --session "refactor-storage" \
-  "address the comments from the diff review"
-` + "```" + `
-
-**Background-friendly** — launch, keep talking to the human, pick up
-the result when the process exits:
-` + "```bash" + `
-crush run --role smart --session "explore" --json \
-  --timeout 10m \
-  "investigate why test X is flaky" \
-  > /tmp/explore.json 2>/tmp/explore.err &
-` + "```" + `
-
-**Hard deadline** — partial work is preserved on the session, so a
-follow-up ` + "`crush run --session same`" + ` keeps building on it:
-` + "```bash" + `
-crush run --role smart --timeout 5m --session "deploy-check" \
-  "verify the deploy is green; if not, summarise what failed"
-` + "```" + `
+Anything bigger than one sentence belongs in a file (use ` + "`Write`" + `),
+then ` + "`< /tmp/task.md`" + ` to feed it in. Avoids quoting hell, lost
+newlines, and ` + "`$VAR`" + `/backtick expansion. The file is also a handle
+for re-runs against the same ` + "`--session`" + ` id. See the canonical
+invocation below for the full pattern.
 
 ### Conventions
 
@@ -317,21 +266,6 @@ crush run --role smart --timeout 5m --session "deploy-check" \
   would send. Round-trip into a file, edit it, write back with
   ` + "`crush run --system-prompt-file ...`" + `.
 
-### Writing prompts: brief the agent like a new colleague
-
-` + "`crush`" + ` starts a fresh agent every Run that has zero memory of your
-current conversation with the user. The prompt is the entire briefing.
-Write it accordingly:
-
-- One sentence at the top stating the goal.
-- The analysis / dependency map you already did — so the sub-agent
-  doesn't re-investigate from scratch and re-discover what you know.
-- Exact files to touch, exact substitution rules. Vague prompts get
-  vague output and wasted tokens.
-- The verification command and the pass criterion.
-- End with "Don't commit. Leave the working tree dirty." so the diff
-  is yours to review before it lands.
-
 ### Expected noise at end-of-run
 
 You'll usually see, after the answer:
@@ -352,34 +286,15 @@ crush sessions delete "<id>"     # remove session + messages
 crush sessions reset  "<id>"     # wipe messages, keep id + role
 ` + "```" + `
 
-### crush can orchestrate sub-agents — use it for parallel/branched work
+### crush can fan-out inside one run — use the ` + "`agent`" + ` tool
 
-` + "`crush`" + ` ships with an ` + "`agent`" + ` tool that spawns child sessions. From your
-side that means a single ` + "`crush run`" + ` call can fan out into several
-parallel sub-tasks and collate the results, instead of you having to
-script multiple ` + "`crush run`" + ` invocations and stitch them together
-yourself. Lean into this when:
-
-- the work decomposes into independent pieces ("for each subpackage,
-  add tests");
-- you want competing approaches evaluated ("draft three implementations
-  of X and pick the one that passes the suite");
-- the outer task is "research, then act" — let the outer agent
-  delegate the research to a sub-agent with a tighter system prompt.
-
-Just describe the structure in the prompt; ` + "`crush`" + ` decides when to call
-its ` + "`agent`" + ` tool. You don't manage the child sessions by hand — they
-appear as ` + "`agent`" + ` tool calls in the parent's transcript and the parent's
-final answer already incorporates their output. The ` + "`--json`" + ` summary
-counts every tool call (` + "`tool_calls[].name == \"agent\"`" + `) so you can see
-how much delegation happened.
-
-When ` + "*you*" + ` orchestrate parallel ` + "`crush run`" + ` calls vs delegating inside
-one: spawn parallel ` + "`crush run`" + `s when the tasks need different roles,
-different system prompts, or different sessions you want to address
-separately later. Use a single ` + "`crush run`" + ` with sub-agent delegation
-when the tasks share a system prompt and you only need one consolidated
-answer back.
+` + "`crush`" + ` has its own ` + "`agent`" + ` tool that spawns child sessions. Describe a
+decomposable task in the prompt (e.g. "for each subpackage do X",
+"try approaches A/B/C and pick the best") and ` + "`crush`" + ` calls ` + "`agent`" + ` to
+fan out internally — you get one consolidated answer back. Reach for
+multiple parallel ` + "`crush run`" + `s instead only when the branches need
+different system prompts or roles, or when you want the resulting
+sessions addressable separately later.
 
 ### Background-friendly — DO NOT block on it
 
