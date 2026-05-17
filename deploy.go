@@ -141,7 +141,15 @@ func resolveDests() ([]string, error) {
 	if env := os.Getenv("CRUSH_DEPLOY_PATH"); env != "" {
 		return []string{env}, nil
 	}
-	p, err := exec.LookPath("crush")
+	// We can't use exec.LookPath here: deploy.go is run from the repo
+	// root which itself contains a freshly built crush.exe (the build
+	// artifact). Go 1.19+ exec.LookPath refuses to return executables
+	// found via the cwd entry of PATH (returns exec.ErrDot) to defend
+	// against directory-planting attacks. That defence is exactly
+	// wrong for us — we WANT the OTHER crush on PATH (the npm-installed
+	// or system one), not the local build artifact. Walk PATH ourselves,
+	// skipping anything that resolves to cwd.
+	p, err := lookPathExcludingCwd("crush")
 	if err != nil {
 		return nil, err
 	}
@@ -190,6 +198,73 @@ func resolveDests() ([]string, error) {
 		return nil, fmt.Errorf("LookPath returned %s but no replaceable binary was found around it", p)
 	}
 	return out, nil
+}
+
+// lookPathExcludingCwd walks $PATH manually and returns the first
+// `name` executable found in a directory that is NOT the current
+// working directory. Mirrors exec.LookPath's semantics (uses PATHEXT
+// on Windows, the exec bit on Unix) but treats the cwd entry as
+// invisible so the local build artifact in `D:\dev\go\crush\c` cannot
+// be picked when we run `go run deploy.go` from there.
+//
+// Returns a helpful error message that names what was already
+// discarded — saves the operator from "why isn't it finding crush"
+// confusion when only the local copy exists.
+func lookPathExcludingCwd(name string) (string, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("getwd: %w", err)
+	}
+	cwdAbs, _ := filepath.Abs(cwd)
+
+	var exts []string
+	if runtime.GOOS == "windows" {
+		if pathext := os.Getenv("PATHEXT"); pathext != "" {
+			for _, e := range filepath.SplitList(pathext) {
+				exts = append(exts, strings.ToLower(strings.TrimSpace(e)))
+			}
+		} else {
+			exts = []string{".exe", ".cmd", ".bat", ".com"}
+		}
+	} else {
+		exts = []string{""}
+	}
+
+	skippedCwdHit := ""
+	for _, dir := range filepath.SplitList(os.Getenv("PATH")) {
+		if dir == "" {
+			// On Windows an empty PATH entry historically meant cwd —
+			// skip it for the same reason exec.LookPath does.
+			continue
+		}
+		absDir, derr := filepath.Abs(dir)
+		if derr == nil && strings.EqualFold(absDir, cwdAbs) {
+			// Record what we'd have picked here so the error names it.
+			for _, ext := range exts {
+				cand := filepath.Join(dir, name+ext)
+				if fi, err := os.Stat(cand); err == nil && !fi.IsDir() {
+					skippedCwdHit = cand
+					break
+				}
+			}
+			continue
+		}
+		for _, ext := range exts {
+			cand := filepath.Join(dir, name+ext)
+			fi, err := os.Stat(cand)
+			if err != nil || fi.IsDir() {
+				continue
+			}
+			if runtime.GOOS != "windows" && fi.Mode()&0o111 == 0 {
+				continue
+			}
+			return cand, nil
+		}
+	}
+	if skippedCwdHit != "" {
+		return "", fmt.Errorf("only candidate found was %s (in current directory — deploy.go refuses to overwrite the just-built artifact with itself). Install crush via npm/winget first, or set CRUSH_DEPLOY_PATH=/full/path/to/crush.exe", skippedCwdHit)
+	}
+	return "", fmt.Errorf("%s not found on PATH (excluding current directory)", name)
 }
 
 // isReplaceableExe reports whether p is a native executable we should
