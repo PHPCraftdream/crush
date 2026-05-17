@@ -285,6 +285,10 @@ your global default or vice versa.
 > entire `crush models preset` subtree (save/use/list/delete). Both
 > commands now print a redirect notice pointing at `crush models use`.
 
+To clear an override and fall back to the other scope: `crush models unset
+[large|small|both] [--local|--global]`. Defaults to clearing both slots in
+the global scope. Missing keys are a no-op.
+
 ## When NOT to use this fork
 
 - **You want the TUI experience.** Use upstream — the fork removed it.

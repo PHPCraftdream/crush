@@ -1032,3 +1032,27 @@ internal/cmd/models_atoms_test.go   new — 10 tests covering parser + lookup
 internal/config/store.go            new ReadModelsAtScope helper for per-scope visibility
 CHANGELOG.fork.md                   this entry
 ```
+
+### Batch 13 — `crush models unset` (2026-05-17)
+
+Adds a one-liner way to remove a model override from the chosen scope
+so the other scope takes effect, replacing the `rm .crush/crush.json`
+workaround (which would destroy any unrelated settings in that file).
+
+```
+crush models unset [large|small|both] [--global | --local]
+```
+
+- Defaults to `both` slots and global scope.
+- Missing keys are a no-op (exit 0) with a friendly note.
+- After deletion, an empty `models: {}` object is stripped so the file
+  stays clean.
+
+Files touched:
+
+```
+internal/cmd/models_unset.go        new — unset command
+internal/cmd/models_unset_test.go   new — positional + registration tests
+README.md                            mention unset in the models section
+CHANGELOG.fork.md                    this entry
+```
