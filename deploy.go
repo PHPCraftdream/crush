@@ -65,35 +65,50 @@ func main() {
 		fatal("expected build artifact at %s: %v", src, err)
 	}
 
-	// 2. Find destination. CRUSH_DEPLOY_PATH wins; otherwise pick the
-	//    crush on PATH so "what `which crush` returns" gets replaced.
-	dst, err := resolveDest()
+	// 2. Find destinations. CRUSH_DEPLOY_PATH wins (single target);
+	//    otherwise we collect every crush binary on PATH that should be
+	//    kept in sync — typically the npm-shim sibling AND the
+	//    node_modules real binary, because Windows cmd's PATH resolution
+	//    can pick either depending on the order of npm-dir vs other
+	//    entries. Deploying to both stops "crush --version is fresh but
+	//    crush claude-init says Unknown flag --replace" puzzles.
+	dsts, err := resolveDests()
 	if err != nil {
 		fatal("could not determine deploy destination: %v\n  set CRUSH_DEPLOY_PATH=/full/path/to/crush(.exe) to force one", err)
 	}
-	if sameFile(src, dst) {
-		fatal("source and destination are the same file (%s) — nothing to replace", dst)
+	for _, dst := range dsts {
+		if sameFile(src, dst) {
+			fatal("source and destination are the same file (%s) — nothing to replace", dst)
+		}
 	}
-	step("Will replace: %s", dst)
+	step("Will replace %d path(s):", len(dsts))
+	for _, dst := range dsts {
+		fmt.Printf("    %s\n", dst)
+	}
 
 	// 3. Kill any running crush so the file is no longer locked (Windows)
 	//    and the new binary takes effect on next launch (Unix).
 	killAllCrush()
 
-	// 4. Copy with a temp + rename to make the swap atomic. If the dst
-	//    is a shim script (npm wrapper case), back it up next to itself
-	//    rather than overwriting — the .exe sibling is what we really
-	//    want to update.
-	if err := replaceFile(src, dst); err != nil {
-		fatal("replace %s: %v", dst, err)
+	// 4. Copy with a temp + rename to make the swap atomic for each
+	//    target. If any single replace fails we bail — leaving a mixed
+	//    state is worse than leaving the original.
+	for _, dst := range dsts {
+		if err := replaceFile(src, dst); err != nil {
+			fatal("replace %s: %v", dst, err)
+		}
+		ok("Replaced %s", dst)
 	}
-	ok("Replaced %s", dst)
 
-	// 5. Verify by running the newly installed binary.
-	if v, err := exec.Command(dst, "--version").CombinedOutput(); err == nil {
-		ok("Installed: %s", strings.TrimSpace(string(v)))
-	} else {
-		warn("--version probe failed (this may be fine if the dst is a non-exe shim): %v", err)
+	// 5. Verify by running the newly installed binary at every
+	//    destination — catches mismatched sibling files that would
+	//    silently keep an old build alive.
+	for _, dst := range dsts {
+		if v, err := exec.Command(dst, "--version").CombinedOutput(); err == nil {
+			ok("Installed (%s): %s", filepath.Base(dst), strings.TrimSpace(string(v)))
+		} else {
+			warn("--version probe failed for %s (may be fine for non-exe shim): %v", dst, err)
+		}
 	}
 }
 
@@ -104,40 +119,97 @@ func binaryName() string {
 	return "crush"
 }
 
-// resolveDest decides what file to overwrite. Priority:
-//  1. $CRUSH_DEPLOY_PATH (used as-is).
-//  2. The npm-packaged binary at
-//     <npm-dir>/node_modules/@charmland/crush/bin/crush(.exe) — that's
-//     the file the npm wrapper actually execs, and it's the case you
-//     hit when `npm i -g @charmland/crush` put crush on your PATH.
-//     (Replacing the sibling crush.exe of the wrapper does nothing —
-//     the wrapper is a JS loader that points elsewhere.)
-//  3. `exec.LookPath("crush")` — the wrapper itself, as a last resort
-//     (covers the case where someone dropped a plain binary on PATH).
-func resolveDest() (string, error) {
+// resolveDests decides what files to overwrite. Priority:
+//  1. $CRUSH_DEPLOY_PATH set → single forced target, used as-is.
+//  2. Otherwise we discover the npm-installed crush via exec.LookPath
+//     and return EVERY binary we can find around it:
+//       a. <npm-dir>/node_modules/@charmland/crush/bin/crush(.exe)
+//          — the real binary the JS wrapper execs via `node`.
+//       b. <npm-dir>/crush.exe (Windows only) — a sibling native
+//          binary that `cmd` may pick BEFORE the JS wrapper depending
+//          on PATHEXT and PATH ordering. Historically this slot
+//          received an out-of-band copy from a previous install and
+//          then drifted, producing "crush --version is fresh but
+//          claude-init --replace is unknown" symptoms.
+//       c. The LookPath result itself, only if it is an executable
+//          (.exe on Windows, no extension on Unix) — covers raw
+//          binaries dropped on PATH without an npm package around
+//          them.
+// We deduplicate by absolute path so the same file isn't replaced
+// twice on a same-file collision.
+func resolveDests() ([]string, error) {
 	if env := os.Getenv("CRUSH_DEPLOY_PATH"); env != "" {
-		return env, nil
+		return []string{env}, nil
 	}
 	p, err := exec.LookPath("crush")
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	// If the discovered crush is a wrapper next to an npm package, the
-	// real binary lives at node_modules/@charmland/crush/bin/crush(.exe).
 	dir := filepath.Dir(p)
+
+	var cands []string
+	// (a) node_modules real binary.
 	npmBin := filepath.Join(dir, "node_modules", "@charmland", "crush", "bin", binaryName())
 	if _, err := os.Stat(npmBin); err == nil {
-		return npmBin, nil
+		cands = append(cands, npmBin)
 	}
-	// Otherwise, on Windows, prefer a sibling crush.exe if the wrapper
-	// is a .cmd/.ps1/POSIX shim.
+	// (b) sibling crush.exe in npm bin dir (Windows only). This is the
+	// one that Windows `cmd` may pick when PATHEXT resolves `crush` to
+	// `crush.exe` before considering `crush.cmd`/`crush.ps1`.
 	if runtime.GOOS == "windows" {
-		exe := filepath.Join(dir, "crush.exe")
-		if _, err := os.Stat(exe); err == nil {
-			return exe, nil
+		sibling := filepath.Join(dir, "crush.exe")
+		if _, err := os.Stat(sibling); err == nil {
+			cands = append(cands, sibling)
 		}
 	}
-	return p, nil
+	// (c) the LookPath result itself, only if it looks like an
+	// executable (not a script/shim). On Windows that means .exe; on
+	// Unix it means no extension and an executable mode bit. We add
+	// only if not already covered.
+	if isReplaceableExe(p) {
+		cands = append(cands, p)
+	}
+
+	// Deduplicate by absolute path resolution — symlinks / case-only
+	// differences on Windows shouldn't cause duplicate writes.
+	seen := make(map[string]bool, len(cands))
+	out := cands[:0]
+	for _, c := range cands {
+		abs, err := filepath.Abs(c)
+		if err != nil {
+			abs = c
+		}
+		key := strings.ToLower(abs) // Windows is case-insensitive
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, c)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("LookPath returned %s but no replaceable binary was found around it", p)
+	}
+	return out, nil
+}
+
+// isReplaceableExe reports whether p is a native executable we should
+// overwrite — not a .cmd/.ps1/POSIX shim. On Windows that means a .exe
+// extension; on Unix it means an executable mode bit and no extension
+// that screams "script".
+func isReplaceableExe(p string) bool {
+	ext := strings.ToLower(filepath.Ext(p))
+	if runtime.GOOS == "windows" {
+		return ext == ".exe"
+	}
+	switch ext {
+	case ".sh", ".bash", ".py", ".js", ".cjs", ".mjs":
+		return false
+	}
+	fi, err := os.Stat(p)
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&0o111 != 0
 }
 
 func sameFile(a, b string) bool {
