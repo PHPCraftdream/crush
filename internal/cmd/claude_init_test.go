@@ -172,6 +172,52 @@ func TestClaudeInit_ReplaceStripsOldVersions(t *testing.T) {
 // future bug where someone forgets the cmd.MarkFlagsMutuallyExclusive
 // equivalent — they currently can't both be true because the RunE
 // returns early on the combination.
+// TestClaudeInit_CreatesSlashCommand verifies the .claude/commands/crush.md
+// drop-in is written next to the CLAUDE.md update. The slash command file
+// gives Claude Code users a "/crush <task>" trigger that points at the
+// claude-init block.
+func TestClaudeInit_CreatesSlashCommand(t *testing.T) {
+	dir := t.TempDir()
+	runClaudeInitInDir(t, dir, "")
+
+	slashPath := filepath.Join(dir, ".claude", "commands", "crush.md")
+	bts, err := os.ReadFile(slashPath)
+	require.NoError(t, err, "slash command file must exist after claude-init")
+	got := string(bts)
+	assert.Contains(t, got, claudeSlashCommandSentinel)
+	assert.Contains(t, got, "$ARGUMENTS", "must carry the Claude Code arg placeholder")
+	assert.Contains(t, got, "crush run", "must instruct to invoke crush run")
+	assert.Contains(t, got, "--role smart", "must spell out the smart-default rule")
+}
+
+func TestClaudeInit_SlashCommandIdempotent(t *testing.T) {
+	dir := t.TempDir()
+	runClaudeInitInDir(t, dir, "")
+	slashPath := filepath.Join(dir, ".claude", "commands", "crush.md")
+	first, err := os.ReadFile(slashPath)
+	require.NoError(t, err)
+
+	runClaudeInitInDir(t, dir, "")
+	second, err := os.ReadFile(slashPath)
+	require.NoError(t, err)
+	assert.Equal(t, string(first), string(second), "second run must be a no-op for the slash command too")
+}
+
+func TestClaudeInit_SlashCommandReplaceRewrites(t *testing.T) {
+	dir := t.TempDir()
+	slashPath := filepath.Join(dir, ".claude", "commands", "crush.md")
+	// Pre-seed with a stale fake. --replace must overwrite it.
+	require.NoError(t, os.MkdirAll(filepath.Dir(slashPath), 0o755))
+	require.NoError(t, os.WriteFile(slashPath, []byte("stale content, no sentinel"), 0o644))
+
+	runClaudeInitInDir(t, dir, "replace")
+	bts, err := os.ReadFile(slashPath)
+	require.NoError(t, err)
+	got := string(bts)
+	assert.NotContains(t, got, "stale content", "--replace must overwrite, not preserve")
+	assert.Contains(t, got, claudeSlashCommandSentinel)
+}
+
 func TestClaudeInit_ForceAndReplaceMutuallyExclusive(t *testing.T) {
 	dir := t.TempDir()
 	orig, err := os.Getwd()

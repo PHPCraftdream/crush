@@ -20,9 +20,11 @@ var claudeInitBlockPattern = regexp.MustCompile(`(?s)<!-- crush-claude-init:v\d+
 // already exists. Bumping the v<N> version forces a re-write on the
 // next run (old block is rewritten, not duplicated).
 const (
-	claudeInitMarkerStart = "<!-- crush-claude-init:v4 -->"
-	claudeInitMarkerEnd   = "<!-- /crush-claude-init -->"
-	claudeMdFile          = "CLAUDE.md"
+	claudeInitMarkerStart      = "<!-- crush-claude-init:v4 -->"
+	claudeInitMarkerEnd        = "<!-- /crush-claude-init -->"
+	claudeMdFile               = "CLAUDE.md"
+	claudeSlashCommandPath     = ".claude/commands/crush.md"
+	claudeSlashCommandSentinel = "<!-- crush-slash-command:v1 -->"
 	// Versioned sentinel: bumping the v<N> on changes means an LLM that
 	// already inserted an older version into CLAUDE.md will, on the next
 	// `claude-init`, see "no current marker → write fresh block". The old
@@ -129,8 +131,82 @@ crush claude-init --cwd /path/to/project --replace
 		default:
 			fmt.Fprintf(os.Stderr, "appended to %s\n", path)
 		}
+
+		// Also drop a Claude Code slash command at
+		// .claude/commands/crush.md so the user (or another LLM) can
+		// type "/crush <task>" and the harness expands it into the
+		// "delegate-this-via-crush-run" prompt template. Idempotent on
+		// our own sentinel; --replace rewrites; --force is a no-op for
+		// the slash command since duplicating it would change "/crush"
+		// behaviour silently.
+		if err := writeSlashCommand(cwd, replace); err != nil {
+			return fmt.Errorf("slash command: %w", err)
+		}
 		return nil
 	},
+}
+
+func writeSlashCommand(cwd string, replace bool) error {
+	path := filepath.Join(cwd, claudeSlashCommandPath)
+	if data, err := os.ReadFile(path); err == nil {
+		if strings.Contains(string(data), claudeSlashCommandSentinel) && !replace {
+			fmt.Fprintf(os.Stderr, "%s already present — nothing to do\n", path)
+			return nil
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("read %s: %w", path, err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", filepath.Dir(path), err)
+	}
+	if err := os.WriteFile(path, []byte(claudeSlashCommandContent()), 0o644); err != nil {
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	fmt.Fprintf(os.Stderr, "wrote %s\n", path)
+	return nil
+}
+
+// claudeSlashCommandContent returns the body of `.claude/commands/crush.md`.
+// Kept short on purpose: the heavy lifting (when to delegate, channels,
+// patterns) lives in CLAUDE.md's claude-init block, which Claude Code
+// reads automatically. This file is just the trigger that says "for THIS
+// task, apply that block".
+func claudeSlashCommandContent() string {
+	return claudeSlashCommandSentinel + `
+---
+description: Delegate this task to a crush sub-agent instead of doing it yourself
+---
+
+Do not implement the following task yourself. Build a ` + "`crush run`" + ` invocation
+using the rules in this repo's CLAUDE.md (search the file for
+"crush-claude-init" — that block has the canonical patterns,
+` + "`--role`" + ` / ` + "`--session`" + ` / ` + "`--json`" + ` semantics, and the DO-NOT-block-on-it
+rules for background launches).
+
+Defaults to apply unless the user said otherwise:
+
+- ` + "`--role smart`" + ` for non-trivial work; ` + "`--role fast`" + ` for one-liners.
+- A stable, task-meaningful ` + "`--session`" + ` id (issue / branch / topic slug).
+  Same id continues across runs.
+- ` + "`--timeout`" + ` proportional to the scope (5–15 min typical).
+- Launch in the background (` + "`Bash`" + ` with ` + "`run_in_background: true`" + `),
+  redirect ` + "`> /tmp/<task>.json 2>/tmp/<task>.err`" + `, and react when the
+  harness fires the completion notification. Do NOT poll with sleep.
+- For multi-line prompts, ` + "`Write`" + ` them to a file and feed via stdin
+  (` + "`< file`" + `). Avoid positional ` + "`\"…\"`" + ` for anything past one line.
+
+Once the run finishes:
+
+1. ` + "`Read`" + ` the result file.
+2. Sanity-check the diff/output against the user's intent.
+3. Apply any small tactical fixes yourself (typos, missed imports);
+   re-delegate to the same ` + "`--session`" + ` for anything bigger.
+4. Report back to the user with the summary + cost + what changed.
+
+Task:
+
+$ARGUMENTS
+`
 }
 
 func init() {
