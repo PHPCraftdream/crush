@@ -1056,3 +1056,30 @@ internal/cmd/models_unset_test.go   new — positional + registration tests
 README.md                            mention unset in the models section
 CHANGELOG.fork.md                    this entry
 ```
+
+### Batch 14 — `crush run` auto-bypasses inner CLI permissions (2026-05-18)
+
+Fixes the silent-hang bug where `crush run` spawns an inner CLI sub-process
+(`claude`, `codex`, or `gemini`) and the inner process blocks waiting for an
+interactive permission prompt that nobody is there to answer.
+
+Mechanism: `RunNonInteractive` now seeds the agent context with
+`cliprovider.NonInteractiveContextKey = true`. Inside `cliModel.Stream`,
+this key short-circuits to `yolo = true` even when the caller did NOT pass
+the root `--yolo` flag. Consequence: `claudeArgs(yolo=true)` adds
+`--dangerously-skip-permissions`, `codexArgs(yolo=true)` adds
+`--approval-mode yolo`, etc. — all transparently.
+
+Rationale: `crush run` IS the non-interactive entry point by design. Asking
+operators to remember `crush --yolo run` is fragile (CLAUDE.md actively
+discouraged it). The fix makes the right thing happen automatically while
+preserving the explicit `--yolo` semantics for interactive TUI/web sessions
+which still go through the original `yoloFn` path.
+
+Files touched:
+
+```
+internal/agent/cliprovider/provider.go   new NonInteractiveContextKey + override in Stream
+internal/app/app.go                       seed context with NonInteractiveContextKey in RunNonInteractive
+CHANGELOG.fork.md                         this entry
+```

@@ -19,6 +19,7 @@ import (
 	"charm.land/catwalk/pkg/catwalk"
 	"charm.land/fantasy"
 	"github.com/charmbracelet/crush/internal/agent"
+	"github.com/charmbracelet/crush/internal/agent/cliprovider"
 	"github.com/charmbracelet/crush/internal/agent/notify"
 	"github.com/charmbracelet/crush/internal/agent/tools/mcp"
 	"github.com/charmbracelet/crush/internal/config"
@@ -546,6 +547,13 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt 
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
+	// Fork patch: batch 14 — mark the agent context as non-interactive.
+	// cliprovider.Stream reads this and forces bypass-permissions on the
+	// inner CLI sub-process (claude / codex / gemini) so it doesn't hang
+	// waiting for a permission prompt that no human is there to answer.
+	// See cliprovider.NonInteractiveContextKey.
+	ctx = context.WithValue(ctx, cliprovider.NonInteractiveContextKey, true)
 
 	if largeModel != "" || smallModel != "" {
 		if err := app.overrideModelsForNonInteractive(ctx, largeModel, smallModel); err != nil {

@@ -46,6 +46,22 @@ type reasoningEffortContextKey struct{}
 // Stream so CLI models can inject the --effort flag dynamically.
 var ReasoningEffortContextKey = reasoningEffortContextKey{}
 
+// Fork patch: batch 14 — non-interactive context propagation.
+//
+// nonInteractiveContextKey marks the request as coming from `crush run` (a
+// non-interactive entry point with no human at the keyboard). When set, the
+// CLI sub-process is launched with its own bypass-permissions flag
+// (claude --dangerously-skip-permissions, codex --approval-mode yolo,
+// gemini --yolo) regardless of the runtime yoloFn. Otherwise the inner
+// CLI would block waiting for an interactive permission prompt that
+// nobody is there to answer, and `crush run` would hang silently.
+type nonInteractiveContextKey struct{}
+
+// NonInteractiveContextKey is set by app.RunNonInteractive on the agent
+// context so cliprovider.Stream can force bypass-permissions for the inner
+// CLI when there is provably no human to confirm.
+var NonInteractiveContextKey = nonInteractiveContextKey{}
+
 // ProviderType is the catwalk.Type value used for CLI providers.
 const ProviderType = "cli"
 
@@ -819,6 +835,14 @@ func (m *cliModel) Generate(ctx context.Context, call fantasy.Call) (*fantasy.Re
 
 func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.StreamResponse, error) {
 	yolo := m.yoloFn != nil && m.yoloFn()
+	// Fork patch: batch 14 — `crush run` has no human at the keyboard, so any
+	// inner CLI process MUST get bypass-permissions or it will hang on the
+	// interactive permission prompt. RunNonInteractive sets this context key.
+	if !yolo {
+		if v, ok := ctx.Value(NonInteractiveContextKey).(bool); ok && v {
+			yolo = true
+		}
+	}
 
 	// Save any attached files (images, etc.) to temp dir so the CLI agent
 	// can access them via its file-reading tools.
