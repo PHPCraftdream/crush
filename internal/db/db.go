@@ -11,10 +11,10 @@ import (
 )
 
 type DBTX interface {
-	ExecContext(context.Context, string, ...any) (sql.Result, error)
+	ExecContext(context.Context, string, ...interface{}) (sql.Result, error)
 	PrepareContext(context.Context, string) (*sql.Stmt, error)
-	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
-	QueryRowContext(context.Context, string, ...any) *sql.Row
+	QueryContext(context.Context, string, ...interface{}) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...interface{}) *sql.Row
 }
 
 func New(db DBTX) *Queries {
@@ -99,6 +99,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.getUsageByModelStmt, err = db.PrepareContext(ctx, getUsageByModel); err != nil {
 		return nil, fmt.Errorf("error preparing query GetUsageByModel: %w", err)
 	}
+	if q.incrementSessionCostStmt, err = db.PrepareContext(ctx, incrementSessionCost); err != nil {
+		return nil, fmt.Errorf("error preparing query IncrementSessionCost: %w", err)
+	}
 	if q.listAllSessionPermissionsStmt, err = db.PrepareContext(ctx, listAllSessionPermissions); err != nil {
 		return nil, fmt.Errorf("error preparing query ListAllSessionPermissions: %w", err)
 	}
@@ -132,14 +135,17 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.listUserMessagesBySessionStmt, err = db.PrepareContext(ctx, listUserMessagesBySession); err != nil {
 		return nil, fmt.Errorf("error preparing query ListUserMessagesBySession: %w", err)
 	}
+	if q.matchSessionPermissionStmt, err = db.PrepareContext(ctx, matchSessionPermission); err != nil {
+		return nil, fmt.Errorf("error preparing query MatchSessionPermission: %w", err)
+	}
 	if q.recordFileReadStmt, err = db.PrepareContext(ctx, recordFileRead); err != nil {
 		return nil, fmt.Errorf("error preparing query RecordFileRead: %w", err)
 	}
-	if q.setSessionYoloStmt, err = db.PrepareContext(ctx, setSessionYolo); err != nil {
-		return nil, fmt.Errorf("error preparing query SetSessionYolo: %w", err)
-	}
 	if q.renameSessionStmt, err = db.PrepareContext(ctx, renameSession); err != nil {
 		return nil, fmt.Errorf("error preparing query RenameSession: %w", err)
+	}
+	if q.setSessionYoloStmt, err = db.PrepareContext(ctx, setSessionYolo); err != nil {
+		return nil, fmt.Errorf("error preparing query SetSessionYolo: %w", err)
 	}
 	if q.updateMessageStmt, err = db.PrepareContext(ctx, updateMessage); err != nil {
 		return nil, fmt.Errorf("error preparing query UpdateMessage: %w", err)
@@ -295,6 +301,11 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing getUsageByModelStmt: %w", cerr)
 		}
 	}
+	if q.incrementSessionCostStmt != nil {
+		if cerr := q.incrementSessionCostStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing incrementSessionCostStmt: %w", cerr)
+		}
+	}
 	if q.listAllSessionPermissionsStmt != nil {
 		if cerr := q.listAllSessionPermissionsStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing listAllSessionPermissionsStmt: %w", cerr)
@@ -350,19 +361,24 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing listUserMessagesBySessionStmt: %w", cerr)
 		}
 	}
+	if q.matchSessionPermissionStmt != nil {
+		if cerr := q.matchSessionPermissionStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing matchSessionPermissionStmt: %w", cerr)
+		}
+	}
 	if q.recordFileReadStmt != nil {
 		if cerr := q.recordFileReadStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing recordFileReadStmt: %w", cerr)
 		}
 	}
-	if q.setSessionYoloStmt != nil {
-		if cerr := q.setSessionYoloStmt.Close(); cerr != nil {
-			err = fmt.Errorf("error closing setSessionYoloStmt: %w", cerr)
-		}
-	}
 	if q.renameSessionStmt != nil {
 		if cerr := q.renameSessionStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing renameSessionStmt: %w", cerr)
+		}
+	}
+	if q.setSessionYoloStmt != nil {
+		if cerr := q.setSessionYoloStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing setSessionYoloStmt: %w", cerr)
 		}
 	}
 	if q.updateMessageStmt != nil {
@@ -469,6 +485,7 @@ type Queries struct {
 	getUsageByDayOfWeekStmt          *sql.Stmt
 	getUsageByHourStmt               *sql.Stmt
 	getUsageByModelStmt              *sql.Stmt
+	incrementSessionCostStmt         *sql.Stmt
 	listAllSessionPermissionsStmt    *sql.Stmt
 	listAllUserMessagesStmt          *sql.Stmt
 	listFilesByPathStmt              *sql.Stmt
@@ -480,6 +497,7 @@ type Queries struct {
 	listSessionReadFilesStmt         *sql.Stmt
 	listSessionsStmt                 *sql.Stmt
 	listUserMessagesBySessionStmt    *sql.Stmt
+	matchSessionPermissionStmt       *sql.Stmt
 	recordFileReadStmt               *sql.Stmt
 	renameSessionStmt                *sql.Stmt
 	setSessionYoloStmt               *sql.Stmt
@@ -522,6 +540,7 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		getUsageByDayOfWeekStmt:          q.getUsageByDayOfWeekStmt,
 		getUsageByHourStmt:               q.getUsageByHourStmt,
 		getUsageByModelStmt:              q.getUsageByModelStmt,
+		incrementSessionCostStmt:         q.incrementSessionCostStmt,
 		listAllSessionPermissionsStmt:    q.listAllSessionPermissionsStmt,
 		listAllUserMessagesStmt:          q.listAllUserMessagesStmt,
 		listFilesByPathStmt:              q.listFilesByPathStmt,
@@ -533,6 +552,7 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		listSessionReadFilesStmt:         q.listSessionReadFilesStmt,
 		listSessionsStmt:                 q.listSessionsStmt,
 		listUserMessagesBySessionStmt:    q.listUserMessagesBySessionStmt,
+		matchSessionPermissionStmt:       q.matchSessionPermissionStmt,
 		recordFileReadStmt:               q.recordFileReadStmt,
 		renameSessionStmt:                q.renameSessionStmt,
 		setSessionYoloStmt:               q.setSessionYoloStmt,

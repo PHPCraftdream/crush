@@ -83,6 +83,21 @@ type Service interface {
 	GetLast(ctx context.Context) (Session, error)
 	List(ctx context.Context) ([]Session, error)
 	Save(ctx context.Context, session Session) (Session, error)
+	// IncrementCost atomically adds delta to the session's cost via an
+	// additive SQL UPDATE. Use this instead of read-modify-write through
+	// Save when accruing per-step or per-sub-agent cost: it is race-free
+	// under fan-out (multiple sub-agent goroutines completing concurrently
+	// and each charging the same parent) and across processes that ever
+	// share a session ID. Returns the refreshed session snapshot.
+	//
+	// Semantics for delta = 0: the implementation short-circuits to a
+	// plain Get so callers can use IncrementCost(id, 0) as a "verify the
+	// session exists and grab its current snapshot" call without paying
+	// the cost of an UPDATE. This preserves the not-found error path for
+	// callers like coordinator.updateParentSessionCost where a child
+	// with zero accrued cost still wants to fail if the parent went
+	// away. Pass a non-zero delta only when you actually want to charge.
+	IncrementCost(ctx context.Context, sessionID string, delta float64) (Session, error)
 	UpdateTitleAndUsage(ctx context.Context, sessionID, title string, promptTokens, completionTokens int64, cost float64) error
 	UpdateModels(ctx context.Context, sessionID, largeProvider, largeModel, smallProvider, smallModel string) error
 	UpdateReasoningEffort(ctx context.Context, sessionID, largeEffort, smallEffort string) error
@@ -204,6 +219,14 @@ func (s *service) GetLast(ctx context.Context) (Session, error) {
 	return s.fromDBItem(dbSession), nil
 }
 
+// Save overwrites title/tokens/summary/todos for a session. Cost is NOT
+// written by this call (the underlying UpdateSession SQL was reshaped to
+// exclude it) so a stale in-memory session.Cost cannot stomp cost that
+// other goroutines accrued concurrently. Use IncrementCost for cost
+// mutations.
+//
+// Fork patch (concurrency): the upstream Save also wrote the cost
+// column. See CHANGELOG.fork.md (Section 4.I).
 func (s *service) Save(ctx context.Context, session Session) (Session, error) {
 	todosJSON, err := marshalTodos(session.Todos)
 	if err != nil {
@@ -219,7 +242,6 @@ func (s *service) Save(ctx context.Context, session Session) (Session, error) {
 			String: session.SummaryMessageID,
 			Valid:  session.SummaryMessageID != "",
 		},
-		Cost: session.Cost,
 		Todos: sql.NullString{
 			String: todosJSON,
 			Valid:  todosJSON != "",
@@ -229,6 +251,24 @@ func (s *service) Save(ctx context.Context, session Session) (Session, error) {
 		return Session{}, err
 	}
 	session = s.fromDBItem(dbSession)
+	s.Publish(pubsub.UpdatedEvent, session)
+	return session, nil
+}
+
+// IncrementCost adds delta to the session cost atomically. See interface
+// doc on Service.IncrementCost for rationale.
+func (s *service) IncrementCost(ctx context.Context, sessionID string, delta float64) (Session, error) {
+	if delta == 0 {
+		return s.Get(ctx, sessionID)
+	}
+	dbSession, err := s.q.IncrementSessionCost(ctx, db.IncrementSessionCostParams{
+		ID:   sessionID,
+		Cost: delta,
+	})
+	if err != nil {
+		return Session{}, err
+	}
+	session := s.fromDBItem(dbSession)
 	s.Publish(pubsub.UpdatedEvent, session)
 	return session, nil
 }

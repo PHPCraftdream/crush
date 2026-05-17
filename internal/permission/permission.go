@@ -97,13 +97,12 @@ type permissionService struct {
 
 	notificationBroker *pubsub.Broker[PermissionNotification]
 	workingDir         string
-	// Fork merge note: upstream switched this field to `csync.Map[PermissionKey,
-	// bool]` for O(1) lookup. We keep a slice of PermissionRequest because we
-	// need the full record (ID, SessionID, etc.) to round-trip through the
-	// SQLite store, and the typical N here is small enough that O(N) scan is
-	// not a bottleneck.
-	sessionPermissions    []PermissionRequest
-	sessionPermissionsMu  sync.RWMutex
+	// Fork patch (concurrency): the upstream in-memory grant cache was
+	// removed. Request now consults the DB on every call via
+	// MatchSessionPermission so a grant created in another crush process
+	// (parallel `crush run`) is immediately visible without restart. See
+	// CHANGELOG.fork.md and the original fork note about why this used
+	// to be a []PermissionRequest slice.
 	pendingRequests       *csync.Map[string, chan bool]
 	autoApproveSessions   map[string]bool
 	autoApproveSessionsMu sync.RWMutex
@@ -134,17 +133,21 @@ func (s *permissionService) GrantPersistent(permission PermissionRequest) {
 		respCh <- true
 	}
 
-	// Persistent permissions are now session-specific.
-	s.sessionPermissionsMu.Lock()
-	s.sessionPermissions = append(s.sessionPermissions, permission)
-	s.sessionPermissionsMu.Unlock()
-
-	// Persist to DB so it survives restarts.
+	// Fork patch (concurrency): the in-memory append was dropped — the DB
+	// is the single source of truth so other processes see this grant on
+	// their next Request without a restart. See CHANGELOG.fork.md.
+	//
+	// session_id is intentionally stored as "" so the grant matches
+	// requests from ANY session. This preserves the upstream loader's
+	// behaviour (which used to overwrite session_id with "" when reading
+	// rows into the in-memory cache) and the cross-session contract
+	// exercised by TestAlwaysAllow_CrossSession. MatchSessionPermission's
+	// WHERE clause (session_id = '' OR session_id = ?) handles the read.
 	// Guard: only persist if we have a valid permission (activeRequest matched).
 	if s.q != nil && permission.ToolName != "" && permission.Action != "" {
 		if err := s.q.CreateSessionPermission(context.Background(), db.CreateSessionPermissionParams{
 			ID:        uuid.New().String(),
-			SessionID: permission.SessionID,
+			SessionID: "",
 			ToolName:  permission.ToolName,
 			Action:    permission.Action,
 			Path:      permission.Path,
@@ -274,25 +277,20 @@ func (s *permissionService) Request(ctx context.Context, opts CreatePermissionRe
 		Params:      opts.Params,
 	}
 
-	s.sessionPermissionsMu.RLock()
-	slog.Debug("permission: checking persistent grants",
-		"count", len(s.sessionPermissions),
-		"req_tool", permission.ToolName,
-		"req_action", permission.Action,
-		"req_session", permission.SessionID,
-		"req_path", permission.Path,
-	)
-	for _, p := range s.sessionPermissions {
-		// Skip empty/corrupt entries loaded from DB.
-		if p.ToolName == "" || p.Action == "" {
-			continue
-		}
-		sessionMatch := p.SessionID == "" || p.SessionID == permission.SessionID
-		toolMatch := p.ToolName == permission.ToolName
-		actionMatch := p.Action == permission.Action
-		pathMatch := p.Path == permission.Path
-		if toolMatch && actionMatch && sessionMatch && pathMatch {
-			s.sessionPermissionsMu.RUnlock()
+	// Fork patch (concurrency): query the persistent-grant table directly
+	// on every Request instead of consulting an in-memory cache that was
+	// populated only at startup. Under parallel `crush run` processes,
+	// the old cache made an "always allow" granted in process A invisible
+	// to process B until B restarted, causing B to re-prompt (or block in
+	// non-interactive mode). Query cost is one indexed SELECT; the cache
+	// scan it replaces was O(N) anyway. See CHANGELOG.fork.md.
+	if s.q != nil {
+		if _, err := s.q.MatchSessionPermission(ctx, db.MatchSessionPermissionParams{
+			ToolName:  permission.ToolName,
+			Action:    permission.Action,
+			Path:      permission.Path,
+			SessionID: permission.SessionID,
+		}); err == nil {
 			s.notificationBroker.Publish(pubsub.CreatedEvent, PermissionNotification{
 				ToolCallID: opts.ToolCallID,
 				Granted:    true,
@@ -300,7 +298,6 @@ func (s *permissionService) Request(ctx context.Context, opts CreatePermissionRe
 			return true, nil
 		}
 	}
-	s.sessionPermissionsMu.RUnlock()
 
 	s.activeRequestMu.Lock()
 	s.activeRequest = &permission
@@ -360,26 +357,10 @@ func NewPermissionService(ctx context.Context, workingDir string, skip bool, all
 		q:                   q,
 	}
 
-	// Load previously persisted "always allow" permissions from DB.
-	if q != nil {
-		if rows, err := q.ListAllSessionPermissions(ctx); err == nil {
-			for _, r := range rows {
-				if r.Enabled == 0 {
-					continue
-				}
-				svc.sessionPermissions = append(svc.sessionPermissions, PermissionRequest{
-					ID: r.ID,
-					// SessionID is intentionally empty: persistent permissions
-					// match requests from any session.
-					ToolName: r.ToolName,
-					Action:   r.Action,
-					Path:     r.Path,
-				})
-			}
-		} else {
-			slog.Warn("permission: failed to load persisted permissions", "err", err)
-		}
-	}
+	// Fork patch (concurrency): startup pre-load into an in-memory cache
+	// was removed. Request now queries the DB directly on every call so
+	// grants from other processes are immediately visible. See
+	// CHANGELOG.fork.md.
 
 	return svc
 }

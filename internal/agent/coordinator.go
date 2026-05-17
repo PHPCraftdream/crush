@@ -1496,22 +1496,26 @@ func (c *coordinator) runSubAgent(ctx context.Context, params subAgentParams) (f
 	return fantasy.NewTextResponse(result.Response.Content.Text()), nil
 }
 
-// updateParentSessionCost accumulates the cost from a child session to its parent session.
+// updateParentSessionCost accumulates the cost from a child session into
+// its parent session. Uses the atomic additive UPDATE (IncrementCost) so
+// concurrent sub-agent fan-out (multiple children finishing in different
+// goroutines and each charging the same parent) cannot lose cost via
+// read-modify-write the way the old Get+modify+Save pattern would.
+//
+// Fork patch (concurrency): rewritten from Get-parent → modify Cost →
+// Save back. See CHANGELOG.fork.md (Section 4.I).
 func (c *coordinator) updateParentSessionCost(ctx context.Context, childSessionID, parentSessionID string) error {
 	childSession, err := c.sessions.Get(ctx, childSessionID)
 	if err != nil {
 		return fmt.Errorf("get child session: %w", err)
 	}
 
-	parentSession, err := c.sessions.Get(ctx, parentSessionID)
-	if err != nil {
-		return fmt.Errorf("get parent session: %w", err)
-	}
-
-	parentSession.Cost += childSession.Cost
-
-	if _, err := c.sessions.Save(ctx, parentSession); err != nil {
-		return fmt.Errorf("save parent session: %w", err)
+	// IncrementCost handles the zero-delta case by routing to Get, which
+	// surfaces a not-found error if the parent session was deleted between
+	// the child finishing and this call — preserves the previous error
+	// semantics.
+	if _, err := c.sessions.IncrementCost(ctx, parentSessionID, childSession.Cost); err != nil {
+		return fmt.Errorf("increment parent session cost: %w", err)
 	}
 
 	return nil

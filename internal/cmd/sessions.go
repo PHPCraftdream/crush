@@ -143,6 +143,12 @@ crush run --session pr-42 "try again with the fresh context"
 		}
 		// Zero the per-session usage counters so a follow-up run starts
 		// from an honest "empty context" estimate.
+		//
+		// Fork patch (concurrency): cost is mutated only through
+		// IncrementCost now — Save no longer writes the column. Zero it
+		// by applying a negative delta equal to the current value. See
+		// CHANGELOG.fork.md (Section 4.I).
+		previousCost := sess.Cost
 		sess.MessageCount = 0
 		sess.PromptTokens = 0
 		sess.CompletionTokens = 0
@@ -150,6 +156,11 @@ crush run --session pr-42 "try again with the fresh context"
 		sess.SummaryMessageID = ""
 		if _, err := a.Sessions.Save(cmd.Context(), sess); err != nil {
 			return fmt.Errorf("failed to reset session counters for %s: %w", sess.ID, err)
+		}
+		if previousCost != 0 {
+			if _, err := a.Sessions.IncrementCost(cmd.Context(), sess.ID, -previousCost); err != nil {
+				return fmt.Errorf("failed to reset session cost for %s: %w", sess.ID, err)
+			}
 		}
 		fmt.Fprintf(os.Stderr, "reset session %s (%s)\n", sess.ID, short(session.HashID(sess.ID)))
 		return nil

@@ -259,14 +259,9 @@ func TestRunSubAgent(t *testing.T) {
 		require.NoError(t, err)
 
 		agent := newMockAgent(providerID, 4096, func(ctx context.Context, call SessionAgentCall) (*fantasy.AgentResult, error) {
-			// Simulate the agent incurring cost by updating the child session.
-			childSession, err := env.sessions.Get(ctx, call.SessionID)
-			if err != nil {
-				return nil, err
-			}
-			childSession.Cost = 0.05
-			_, err = env.sessions.Save(ctx, childSession)
-			if err != nil {
+			// Simulate the agent incurring cost on the child session via the
+			// race-safe additive API (Save no longer writes the cost column).
+			if _, err := env.sessions.IncrementCost(ctx, call.SessionID, 0.05); err != nil {
 				return nil, err
 			}
 			return agentResultWithText("ok"), nil
@@ -301,9 +296,8 @@ func TestUpdateParentSessionCost(t *testing.T) {
 		child, err := env.sessions.CreateTaskSession(t.Context(), "tool-1", parent.ID, "Child")
 		require.NoError(t, err)
 
-		// Set child cost.
-		child.Cost = 0.10
-		_, err = env.sessions.Save(t.Context(), child)
+		// Set child cost via the additive API (Save no longer writes cost).
+		_, err = env.sessions.IncrementCost(t.Context(), child.ID, 0.10)
 		require.NoError(t, err)
 
 		err = coord.updateParentSessionCost(t.Context(), child.ID, parent.ID)
@@ -325,14 +319,12 @@ func TestUpdateParentSessionCost(t *testing.T) {
 
 		child1, err := env.sessions.CreateTaskSession(t.Context(), "tool-1", parent.ID, "Child1")
 		require.NoError(t, err)
-		child1.Cost = 0.05
-		_, err = env.sessions.Save(t.Context(), child1)
+		_, err = env.sessions.IncrementCost(t.Context(), child1.ID, 0.05)
 		require.NoError(t, err)
 
 		child2, err := env.sessions.CreateTaskSession(t.Context(), "tool-2", parent.ID, "Child2")
 		require.NoError(t, err)
-		child2.Cost = 0.03
-		_, err = env.sessions.Save(t.Context(), child2)
+		_, err = env.sessions.IncrementCost(t.Context(), child2.ID, 0.03)
 		require.NoError(t, err)
 
 		err = coord.updateParentSessionCost(t.Context(), child1.ID, parent.ID)
@@ -372,7 +364,7 @@ func TestUpdateParentSessionCost(t *testing.T) {
 
 		err = coord.updateParentSessionCost(t.Context(), child.ID, "non-existent")
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "get parent session")
+		assert.Contains(t, err.Error(), "increment parent session cost")
 	})
 
 	t.Run("zero cost handled correctly", func(t *testing.T) {

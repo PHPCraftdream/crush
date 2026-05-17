@@ -1,5 +1,11 @@
 package tools
 
+// Fork patch (concurrency): both file writes in this file
+// (processMultiEditWithCreation, processMultiEditExistingFile) use
+// fsext.AtomicWriteFile (write-to-tmp + rename) instead of
+// os.WriteFile so a kill -9 / OOM mid-write cannot leave the user's
+// file half-truncated. See CHANGELOG.fork.md (Section 4.I).
+
 import (
 	"context"
 	_ "embed"
@@ -203,7 +209,7 @@ func processMultiEditWithCreation(edit editContext, params MultiEditParams, call
 	}
 
 	// Write the file
-	err = os.WriteFile(params.FilePath, []byte(currentContent), 0o644)
+	err = fsext.AtomicWriteFile(params.FilePath, []byte(currentContent), 0o644)
 	if err != nil {
 		return fantasy.ToolResponse{}, fmt.Errorf("failed to write file: %w", err)
 	}
@@ -348,7 +354,7 @@ func processMultiEditExistingFile(edit editContext, params MultiEditParams, call
 	}
 
 	// Write the updated content
-	err = os.WriteFile(params.FilePath, []byte(currentContent), 0o644)
+	err = fsext.AtomicWriteFile(params.FilePath, []byte(currentContent), 0o644)
 	if err != nil {
 		return fantasy.ToolResponse{}, fmt.Errorf("failed to write file: %w", err)
 	}

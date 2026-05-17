@@ -12,6 +12,7 @@ import (
 const createSessionPermission = `-- name: CreateSessionPermission :exec
 INSERT INTO session_permissions (id, session_id, tool_name, action, path, enabled)
 VALUES (?, ?, ?, ?, ?, 1)
+ON CONFLICT(session_id, tool_name, action, path) DO NOTHING
 `
 
 type CreateSessionPermissionParams struct {
@@ -22,6 +23,11 @@ type CreateSessionPermissionParams struct {
 	Path      string `json:"path"`
 }
 
+// ON CONFLICT DO NOTHING relies on idx_session_permissions_uniq from
+// migration 20260517000001. Without it a repeated Always-Allow click
+// on the same (session, tool, action, path) tuple would create a fresh
+// row instead of being a no-op. Re-enabling a disabled-then-regranted
+// rule is handled explicitly via UpdatePermissionEnabled, not here.
 func (q *Queries) CreateSessionPermission(ctx context.Context, arg CreateSessionPermissionParams) error {
 	_, err := q.exec(ctx, q.createSessionPermissionStmt, createSessionPermission,
 		arg.ID,
@@ -114,6 +120,40 @@ func (q *Queries) ListSessionPermissions(ctx context.Context, sessionID string) 
 		return nil, err
 	}
 	return items, nil
+}
+
+const matchSessionPermission = `-- name: MatchSessionPermission :one
+SELECT id
+FROM session_permissions
+WHERE enabled = 1
+  AND tool_name = ?
+  AND action = ?
+  AND path = ?
+  AND (session_id = '' OR session_id = ?)
+LIMIT 1
+`
+
+type MatchSessionPermissionParams struct {
+	ToolName  string `json:"tool_name"`
+	Action    string `json:"action"`
+	Path      string `json:"path"`
+	SessionID string `json:"session_id"`
+}
+
+// Returns the row id of an enabled "always allow" rule that matches the
+// given (sessionID, toolName, action, path) tuple, or sql.ErrNoRows.
+// session_id is empty for global rules; we accept either empty or the
+// exact session_id so the same query handles both.
+func (q *Queries) MatchSessionPermission(ctx context.Context, arg MatchSessionPermissionParams) (string, error) {
+	row := q.queryRow(ctx, q.matchSessionPermissionStmt, matchSessionPermission,
+		arg.ToolName,
+		arg.Action,
+		arg.Path,
+		arg.SessionID,
+	)
+	var id string
+	err := row.Scan(&id)
+	return id, err
 }
 
 const updatePermissionEnabled = `-- name: UpdatePermissionEnabled :exec

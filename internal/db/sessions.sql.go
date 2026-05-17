@@ -110,7 +110,7 @@ func (q *Queries) DeleteSession(ctx context.Context, id string) error {
 }
 
 const getLastSession = `-- name: GetLastSession :one
-SELECT id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos
+SELECT id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id, system_prompt, yolo_enabled, large_model_reasoning_effort, small_model_reasoning_effort
 FROM sessions
 ORDER BY updated_at DESC
 LIMIT 1
@@ -131,6 +131,14 @@ func (q *Queries) GetLastSession(ctx context.Context) (Session, error) {
 		&i.CreatedAt,
 		&i.SummaryMessageID,
 		&i.Todos,
+		&i.LargeModelProvider,
+		&i.LargeModelID,
+		&i.SmallModelProvider,
+		&i.SmallModelID,
+		&i.SystemPrompt,
+		&i.YoloEnabled,
+		&i.LargeModelReasoningEffort,
+		&i.SmallModelReasoningEffort,
 	)
 	return i, err
 }
@@ -143,6 +151,51 @@ WHERE id = ? LIMIT 1
 
 func (q *Queries) GetSessionByID(ctx context.Context, id string) (Session, error) {
 	row := q.queryRow(ctx, q.getSessionByIDStmt, getSessionByID, id)
+	var i Session
+	err := row.Scan(
+		&i.ID,
+		&i.ParentSessionID,
+		&i.Title,
+		&i.MessageCount,
+		&i.PromptTokens,
+		&i.CompletionTokens,
+		&i.Cost,
+		&i.UpdatedAt,
+		&i.CreatedAt,
+		&i.SummaryMessageID,
+		&i.Todos,
+		&i.LargeModelProvider,
+		&i.LargeModelID,
+		&i.SmallModelProvider,
+		&i.SmallModelID,
+		&i.SystemPrompt,
+		&i.YoloEnabled,
+		&i.LargeModelReasoningEffort,
+		&i.SmallModelReasoningEffort,
+	)
+	return i, err
+}
+
+const incrementSessionCost = `-- name: IncrementSessionCost :one
+UPDATE sessions
+SET
+    cost = cost + ?,
+    updated_at = strftime('%s', 'now')
+WHERE id = ?
+RETURNING id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id, system_prompt, yolo_enabled, large_model_reasoning_effort, small_model_reasoning_effort
+`
+
+type IncrementSessionCostParams struct {
+	Cost float64 `json:"cost"`
+	ID   string  `json:"id"`
+}
+
+// Atomic additive update for session cost. Safe under fan-out (multiple
+// sub-agent goroutines finishing concurrently and each charging the
+// parent) and across processes (orchestrator with parallel crush runs).
+// Returns the updated row so the caller can refresh its snapshot.
+func (q *Queries) IncrementSessionCost(ctx context.Context, arg IncrementSessionCostParams) (Session, error) {
+	row := q.queryRow(ctx, q.incrementSessionCostStmt, incrementSessionCost, arg.Cost, arg.ID)
 	var i Session
 	err := row.Scan(
 		&i.ID,
@@ -218,23 +271,6 @@ func (q *Queries) ListSessions(ctx context.Context) ([]Session, error) {
 	return items, nil
 }
 
-const setSessionYolo = `-- name: SetSessionYolo :exec
-UPDATE sessions
-SET yolo_enabled = ?,
-    updated_at = strftime('%s', 'now')
-WHERE id = ?
-`
-
-type SetSessionYoloParams struct {
-	YoloEnabled int64  `json:"yolo_enabled"`
-	ID          string `json:"id"`
-}
-
-func (q *Queries) SetSessionYolo(ctx context.Context, arg SetSessionYoloParams) error {
-	_, err := q.exec(ctx, q.setSessionYoloStmt, setSessionYolo, arg.YoloEnabled, arg.ID)
-	return err
-}
-
 const renameSession = `-- name: RenameSession :exec
 UPDATE sessions
 SET
@@ -252,6 +288,23 @@ func (q *Queries) RenameSession(ctx context.Context, arg RenameSessionParams) er
 	return err
 }
 
+const setSessionYolo = `-- name: SetSessionYolo :exec
+UPDATE sessions
+SET yolo_enabled = ?,
+    updated_at = strftime('%s', 'now')
+WHERE id = ?
+`
+
+type SetSessionYoloParams struct {
+	YoloEnabled int64  `json:"yolo_enabled"`
+	ID          string `json:"id"`
+}
+
+func (q *Queries) SetSessionYolo(ctx context.Context, arg SetSessionYoloParams) error {
+	_, err := q.exec(ctx, q.setSessionYoloStmt, setSessionYolo, arg.YoloEnabled, arg.ID)
+	return err
+}
+
 const updateSession = `-- name: UpdateSession :one
 UPDATE sessions
 SET
@@ -259,7 +312,6 @@ SET
     prompt_tokens = ?,
     completion_tokens = ?,
     summary_message_id = ?,
-    cost = ?,
     todos = ?,
     updated_at = strftime('%s', 'now')
 WHERE id = ?
@@ -271,18 +323,20 @@ type UpdateSessionParams struct {
 	PromptTokens     int64          `json:"prompt_tokens"`
 	CompletionTokens int64          `json:"completion_tokens"`
 	SummaryMessageID sql.NullString `json:"summary_message_id"`
-	Cost             float64        `json:"cost"`
 	Todos            sql.NullString `json:"todos"`
 	ID               string         `json:"id"`
 }
 
+// Overwrites title/prompt_tokens/completion_tokens/summary/todos but NOT
+// cost. Cost is mutated only via IncrementSessionCost so concurrent
+// sub-agent goroutines (and parallel crush processes that ever share a
+// session) cannot lose accrued cost via read-modify-write.
 func (q *Queries) UpdateSession(ctx context.Context, arg UpdateSessionParams) (Session, error) {
 	row := q.queryRow(ctx, q.updateSessionStmt, updateSession,
 		arg.Title,
 		arg.PromptTokens,
 		arg.CompletionTokens,
 		arg.SummaryMessageID,
-		arg.Cost,
 		arg.Todos,
 		arg.ID,
 	)

@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/bmatcuk/doublestar/v4"
+	"github.com/charmbracelet/crush/internal/fsext"
 	"github.com/charmbracelet/crush/internal/permission"
 	"github.com/charmbracelet/crush/internal/session"
 	"github.com/google/uuid"
@@ -686,12 +687,33 @@ func runShell(ctx context.Context, command, dir string) (string, error) {
 	return buf.String(), err
 }
 
+// mcpConfigLockTimeout caps how long an MCP id/settings flock will
+// wait before failing. Fork patch (concurrency): chosen so a wedged
+// sibling crush process (debugger, suspended shell, frozen NFS mount)
+// cannot freeze the entire parallel-run fleet on a shared id/settings
+// file — see CHANGELOG.fork.md (Section 4.I).
+const mcpConfigLockTimeout = 30 * time.Second
+
+// acquireMCPConfigLock is a thin wrapper around
+// session.AcquireFileLockContext that enforces mcpConfigLockTimeout.
+// All MCP id/settings critical sections in this file use it.
+func acquireMCPConfigLock(lockPath string) (*session.FileLock, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), mcpConfigLockTimeout)
+	defer cancel()
+	return session.AcquireFileLockContext(ctx, lockPath)
+}
+
 // ── qwen MCP registration ─────────────────────────────────────────────────────
 
 // qwenMCPID returns a stable MCP server name for the given workingDir.
 // If <workingDir>/.crush/ already exists, the ID is stored there in qwen-mcp-id.
 // Otherwise a temp file keyed by workingDir is used so we never create .crush/
 // in directories that don't already have a crush project.
+//
+// Fork patch (concurrency): wrap the read-then-write of the id file with
+// a flock (session.AcquireFileLock) so two parallel `crush run` processes
+// in the same workingDir cannot both miss the file, both generate a UUID,
+// and end up with a split-brain MCP server name. See CHANGELOG.fork.md.
 func qwenMCPID(workingDir string) (string, error) {
 	var idFile string
 	crushDir := filepath.Join(workingDir, ".crush")
@@ -707,6 +729,12 @@ func qwenMCPID(workingDir string) (string, error) {
 		}
 		idFile = filepath.Join(os.TempDir(), "crush-qwen-mcp-"+h)
 	}
+	// Fork patch: serialise the read-modify-write below across processes.
+	lock, err := acquireMCPConfigLock(idFile + ".lock")
+	if err != nil {
+		return "", fmt.Errorf("cliprovider: lock qwen-mcp-id: %w", err)
+	}
+	defer lock.Release()
 	if data, err := os.ReadFile(idFile); err == nil {
 		if id := strings.TrimSpace(string(data)); id != "" {
 			return id, nil
@@ -714,7 +742,7 @@ func qwenMCPID(workingDir string) (string, error) {
 	}
 	// Generate a short stable ID for this project.
 	id := "crush-" + uuid.New().String()[:8]
-	if err := os.WriteFile(idFile, []byte(id), 0o644); err != nil {
+	if err := fsext.AtomicWriteFile(idFile, []byte(id), 0o644); err != nil {
 		return "", fmt.Errorf("cliprovider: write qwen-mcp-id: %w", err)
 	}
 	slog.Info("cliprovider: created qwen MCP ID", "id", id, "file", idFile)
@@ -734,11 +762,25 @@ func qwenSettingsPath() (string, error) {
 // It removes any stale entry with the same name first, then writes the new URL.
 // The token is embedded in the URL as a query parameter (?token=...) since
 // qwen's settings format does not support custom HTTP headers.
+//
+// Fork patch (concurrency): the read-modify-write of settings.json is
+// guarded by a sibling .lock file so parallel `crush run` processes (or
+// concurrent crush + qwen invocations) cannot stomp each other's
+// entries, and the write itself is atomic so a kill mid-write cannot
+// leave a half-truncated settings.json. See CHANGELOG.fork.md.
 func registerQwenMCP(serverName, url string) error {
 	path, err := qwenSettingsPath()
 	if err != nil {
 		return err
 	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("cliprovider: mkdir qwen settings dir: %w", err)
+	}
+	lock, err := acquireMCPConfigLock(path + ".lock")
+	if err != nil {
+		return fmt.Errorf("cliprovider: lock qwen settings: %w", err)
+	}
+	defer lock.Release()
 	var settings map[string]any
 	if data, rerr := os.ReadFile(path); rerr == nil {
 		_ = json.Unmarshal(data, &settings)
@@ -759,15 +801,22 @@ func registerQwenMCP(serverName, url string) error {
 		return err
 	}
 	slog.Info("cliprovider: registered qwen MCP server", "name", serverName, "url", url)
-	return os.WriteFile(path, data, 0o644)
+	return fsext.AtomicWriteFile(path, data, 0o644)
 }
 
 // deregisterQwenMCP removes the crush MCP entry from ~/.qwen/settings.json.
+//
+// Fork patch (concurrency): same flock + atomic-write as registerQwenMCP.
 func deregisterQwenMCP(serverName string) {
 	path, err := qwenSettingsPath()
 	if err != nil {
 		return
 	}
+	lock, err := acquireMCPConfigLock(path + ".lock")
+	if err != nil {
+		return
+	}
+	defer lock.Release()
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return
@@ -789,7 +838,7 @@ func deregisterQwenMCP(serverName string) {
 	if data, err = json.MarshalIndent(settings, "", "  "); err != nil {
 		return
 	}
-	_ = os.WriteFile(path, data, 0o644)
+	_ = fsext.AtomicWriteFile(path, data, 0o644)
 	slog.Info("cliprovider: deregistered qwen MCP server", "name", serverName)
 }
 
@@ -797,6 +846,9 @@ func deregisterQwenMCP(serverName string) {
 
 // geminiMCPID returns a stable MCP server name for the given workingDir.
 // Mirrors the logic of qwenMCPID but uses a separate ID file (gemini-mcp-id).
+//
+// Fork patch (concurrency): same flock + atomic-write treatment as
+// qwenMCPID — see that function's note.
 func geminiMCPID(workingDir string) (string, error) {
 	var idFile string
 	crushDir := filepath.Join(workingDir, ".crush")
@@ -809,13 +861,18 @@ func geminiMCPID(workingDir string) (string, error) {
 		}
 		idFile = filepath.Join(os.TempDir(), "crush-gemini-mcp-"+h)
 	}
+	lock, err := acquireMCPConfigLock(idFile + ".lock")
+	if err != nil {
+		return "", fmt.Errorf("cliprovider: lock gemini-mcp-id: %w", err)
+	}
+	defer lock.Release()
 	if data, err := os.ReadFile(idFile); err == nil {
 		if id := strings.TrimSpace(string(data)); id != "" {
 			return id, nil
 		}
 	}
 	id := "crush-" + uuid.New().String()[:8]
-	if err := os.WriteFile(idFile, []byte(id), 0o644); err != nil {
+	if err := fsext.AtomicWriteFile(idFile, []byte(id), 0o644); err != nil {
 		return "", fmt.Errorf("cliprovider: write gemini-mcp-id: %w", err)
 	}
 	slog.Info("cliprovider: created gemini MCP ID", "id", id, "file", idFile)
@@ -835,11 +892,20 @@ func geminiSettingsPath() (string, error) {
 // The Authorization: Bearer header is stored in the settings so Gemini sends
 // it with each MCP request. trust:true bypasses Gemini's own confirmation
 // prompts so tool calls flow directly to crush's permission dialog.
+// Fork patch (concurrency): flock + atomic-write — see registerQwenMCP.
 func registerGeminiMCP(serverName, addr, token string) error {
 	path, err := geminiSettingsPath()
 	if err != nil {
 		return err
 	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	lock, err := acquireMCPConfigLock(path + ".lock")
+	if err != nil {
+		return fmt.Errorf("cliprovider: lock gemini settings: %w", err)
+	}
+	defer lock.Release()
 	var settings map[string]any
 	if data, rerr := os.ReadFile(path); rerr == nil {
 		_ = json.Unmarshal(data, &settings)
@@ -864,19 +930,23 @@ func registerGeminiMCP(serverName, addr, token string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
 	slog.Info("cliprovider: registered gemini MCP server", "name", serverName, "addr", addr)
-	return os.WriteFile(path, data, 0o644)
+	return fsext.AtomicWriteFile(path, data, 0o644)
 }
 
 // deregisterGeminiMCP removes the crush MCP entry from ~/.gemini/settings.json.
+//
+// Fork patch (concurrency): flock + atomic-write — see registerQwenMCP.
 func deregisterGeminiMCP(serverName string) {
 	path, err := geminiSettingsPath()
 	if err != nil {
 		return
 	}
+	lock, err := acquireMCPConfigLock(path + ".lock")
+	if err != nil {
+		return
+	}
+	defer lock.Release()
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return
@@ -898,7 +968,7 @@ func deregisterGeminiMCP(serverName string) {
 	if data, err = json.MarshalIndent(settings, "", "  "); err != nil {
 		return
 	}
-	_ = os.WriteFile(path, data, 0o644)
+	_ = fsext.AtomicWriteFile(path, data, 0o644)
 	slog.Info("cliprovider: deregistered gemini MCP server", "name", serverName)
 }
 

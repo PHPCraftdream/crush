@@ -3,16 +3,26 @@ package permission
 import (
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/charmbracelet/crush/internal/db"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-// newTestService creates a permission service with no DB (in-memory only).
+// newTestService creates a permission service backed by a real temp-dir
+// SQLite DB. Fork patch (concurrency): the in-memory grant cache was
+// removed and persistent-grant lookup now goes through the DB on every
+// Request, so tests need a non-nil *db.Queries to exercise the
+// auto-approve path. The nil-q legacy mode would silently skip the
+// match and cause Always-Allow tests to hang forever waiting for a
+// permission event that the test then has to drain manually.
 func newTestService(t *testing.T, skip bool, allowedTools []string) Service {
 	t.Helper()
-	return NewPermissionService(t.Context(), "/tmp", skip, allowedTools, nil)
+	conn, err := db.Connect(t.Context(), t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() { conn.Close() })
+	return NewPermissionService(t.Context(), "/tmp", skip, allowedTools, db.New(conn))
 }
 
 func TestPermissionService_SkipMode(t *testing.T) {
@@ -209,37 +219,64 @@ func TestAlwaysAllow_DifferentPath(t *testing.T) {
 	assert.False(t, result2, "different path must not be auto-approved")
 }
 
-// TestDisabledPermissions_NotLoaded verifies that permissions with enabled=0
-// in the database are NOT loaded into the auto-approve list on startup.
-func TestDisabledPermissions_NotLoaded(t *testing.T) {
+// TestDisabledPermissions_NotMatched verifies that a row with enabled=0
+// in session_permissions is NOT auto-approved on a subsequent Request.
+// Fork patch (concurrency): the in-memory cache was removed and the
+// check moved to the SQL WHERE clause (MatchSessionPermission.enabled=1),
+// so the test now exercises Request directly rather than the loader.
+func TestDisabledPermissions_NotMatched(t *testing.T) {
 	conn, err := db.Connect(t.Context(), t.TempDir())
 	require.NoError(t, err)
 	t.Cleanup(func() { conn.Close() })
 
 	q := db.New(conn)
 
-	// Create two permissions: one enabled, one that we'll disable.
+	// Enabled rule for bash:run on /tmp — should be auto-approved.
 	err = q.CreateSessionPermission(t.Context(), db.CreateSessionPermissionParams{
 		ID: "perm-enabled", SessionID: "s1", ToolName: "bash", Action: "run", Path: "/tmp",
 	})
 	require.NoError(t, err)
 
+	// Disabled rule for write:run on /tmp — should NOT auto-approve.
 	err = q.CreateSessionPermission(t.Context(), db.CreateSessionPermissionParams{
 		ID: "perm-disabled", SessionID: "s1", ToolName: "write", Action: "run", Path: "/tmp",
 	})
 	require.NoError(t, err)
-
-	// Disable the second permission.
 	err = q.UpdatePermissionEnabled(t.Context(), db.UpdatePermissionEnabledParams{
 		ID: "perm-disabled", Enabled: 0,
 	})
 	require.NoError(t, err)
 
-	// Create a new permission service — it should only load the enabled permission.
 	svc := NewPermissionService(t.Context(), "/tmp", false, nil, q)
-	ps := svc.(*permissionService)
+	events := svc.Subscribe(t.Context())
 
-	// Only the enabled permission should have been loaded.
-	assert.Len(t, ps.sessionPermissions, 1)
-	assert.Equal(t, "perm-enabled", ps.sessionPermissions[0].ID)
+	// Enabled rule auto-approves without raising an event.
+	result1, err := svc.Request(t.Context(), CreatePermissionRequest{
+		SessionID: "s1", ToolName: "bash", Action: "run", Path: "/tmp",
+	})
+	require.NoError(t, err)
+	assert.True(t, result1, "enabled rule must auto-approve")
+
+	// Disabled rule must surface as a prompt; Deny it to unblock the test.
+	var wg sync.WaitGroup
+	wg.Add(1)
+	var result2 bool
+	go func() {
+		defer wg.Done()
+		result2, _ = svc.Request(t.Context(), CreatePermissionRequest{
+			SessionID: "s1", ToolName: "write", Action: "run", Path: "/tmp",
+		})
+	}()
+	// Fork patch (concurrency): bounded receive — if Request silently
+	// auto-approves the disabled rule (regression) the event never fires
+	// and an unbounded `<-events` would hang the suite until go test's
+	// outer timeout.
+	select {
+	case ev := <-events:
+		svc.Deny(ev.Payload)
+	case <-time.After(2 * time.Second):
+		t.Fatal("disabled rule produced no permission event within 2s")
+	}
+	wg.Wait()
+	assert.False(t, result2, "disabled rule must NOT auto-approve")
 }

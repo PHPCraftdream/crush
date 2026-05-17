@@ -735,7 +735,12 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			if getSessionErr != nil {
 				return getSessionErr
 			}
-			a.updateSessionUsage(largeModel, &updatedSession, stepResult.Usage, a.openrouterCost(stepResult.ProviderMetadata))
+			costDelta := a.updateSessionUsage(largeModel, &updatedSession, stepResult.Usage, a.openrouterCost(stepResult.ProviderMetadata))
+			if costDelta != 0 {
+				if _, costErr := a.sessions.IncrementCost(ctx, updatedSession.ID, costDelta); costErr != nil {
+					return costErr
+				}
+			}
 			_, sessionErr := a.sessions.Save(ctx, updatedSession)
 			if sessionErr != nil {
 				return sessionErr
@@ -1116,7 +1121,12 @@ func (a *sessionAgent) runSummarize(ctx context.Context, sessionID string, opts 
 	if err != nil {
 		return fmt.Errorf("failed to re-fetch session before save: %w", err)
 	}
-	a.updateSessionUsage(largeModel, &freshSession, resp.TotalUsage, openrouterCost)
+	costDelta := a.updateSessionUsage(largeModel, &freshSession, resp.TotalUsage, openrouterCost)
+	if costDelta != 0 {
+		if _, costErr := a.sessions.IncrementCost(genCtx, freshSession.ID, costDelta); costErr != nil {
+			return costErr
+		}
+	}
 
 	// Just in case, get just the last usage info.
 	usage := resp.Response.Usage
@@ -1278,7 +1288,12 @@ func (a *sessionAgent) runSummarizeSilent(ctx context.Context, sessionID string,
 			*openrouterCost += *stepCost
 		}
 	}
-	a.updateSessionUsage(largeModel, &freshSession, resp.TotalUsage, openrouterCost)
+	costDelta := a.updateSessionUsage(largeModel, &freshSession, resp.TotalUsage, openrouterCost)
+	if costDelta != 0 {
+		if _, costErr := a.sessions.IncrementCost(genCtx, freshSession.ID, costDelta); costErr != nil {
+			return costErr
+		}
+	}
 	freshSession.SummaryMessageID = summaryMessage.ID
 	freshSession.CompletionTokens = resp.Response.Usage.OutputTokens
 	freshSession.PromptTokens = 0
@@ -1656,7 +1671,17 @@ func (a *sessionAgent) openrouterCost(metadata fantasy.ProviderMetadata) *float6
 	return &opts.Usage.Cost
 }
 
-func (a *sessionAgent) updateSessionUsage(model Model, session *session.Session, usage fantasy.Usage, overrideCost *float64) {
+// updateSessionUsage computes the cost delta for this step, applies the
+// new token snapshot to session in-place (token fields are last-snapshot
+// overwrite semantics), and returns the cost delta. The caller MUST
+// persist the cost delta via sessions.IncrementCost (race-safe additive
+// UPDATE) rather than relying on Save, because Save no longer writes the
+// cost column.
+//
+// Fork patch (concurrency): upstream version was void; we now return
+// the delta and rely on the caller to drive IncrementCost. See
+// CHANGELOG.fork.md (Section 4.I).
+func (a *sessionAgent) updateSessionUsage(model Model, session *session.Session, usage fantasy.Usage, overrideCost *float64) float64 {
 	modelConfig := model.CatwalkCfg
 	cost := modelConfig.CostPer1MInCached/1e6*float64(usage.CacheCreationTokens) +
 		modelConfig.CostPer1MOutCached/1e6*float64(usage.CacheReadTokens) +
@@ -1677,6 +1702,7 @@ func (a *sessionAgent) updateSessionUsage(model Model, session *session.Session,
 	session.Cost += cost
 	session.CompletionTokens = usage.OutputTokens
 	session.PromptTokens = usage.InputTokens + usage.CacheReadTokens
+	return cost
 }
 
 func (a *sessionAgent) Cancel(sessionID string) {

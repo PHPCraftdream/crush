@@ -1,5 +1,10 @@
 package tools
 
+// Fork patch (concurrency): the file write at the bottom of NewWriteTool
+// uses fsext.AtomicWriteFile (write-to-tmp + rename) instead of
+// os.WriteFile so a kill -9 / OOM mid-write cannot leave the user's
+// file half-truncated. See CHANGELOG.fork.md (Section 4.I).
+
 import (
 	"context"
 	_ "embed"
@@ -132,7 +137,7 @@ func NewWriteTool(
 				return NewPermissionDeniedResponse(), nil
 			}
 
-			err = os.WriteFile(filePath, []byte(params.Content), 0o644)
+			err = fsext.AtomicWriteFile(filePath, []byte(params.Content), 0o644)
 			if err != nil {
 				return fantasy.ToolResponse{}, fmt.Errorf("error writing file: %w", err)
 			}

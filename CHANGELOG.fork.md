@@ -303,6 +303,135 @@ configure PreToolUse/PostToolUse hooks via the standard config file
   REST-side rebirth could autogenerate docs; the WS server is the real
   API surface.
 
+### 4.I — Parallel-process / multi-agent concurrency
+
+Crush in this fork is increasingly used as a **sub-agent** spawned by an
+orchestrator: typically 5+ `crush run --session X --json` processes
+running concurrently in the same working directory and sharing one
+`.crush/` folder (the shamir-db audit workflow is the canonical case).
+On top of that, each process fan-outs internally to sub-agents in
+separate goroutines. The defence layers live in two clusters.
+
+**Cluster A — landed in `cfad5391` (2026-05-17)**
+
+- `internal/session/lock.go` + `lock_unix.go` + `lock_windows.go` —
+  cross-platform per-session exclusive file lock under
+  `.crush/locks/session-<id>.lock` (flock on POSIX, LockFileEx on
+  Windows). `agent.Run` acquires it after the in-process
+  `IsSessionBusy` check so two crush processes cannot share a session
+  id. OS auto-releases on death — no stale-lock cleanup. PID stamped
+  for diagnostics.
+- `recoverInterruptedTurns` age-filtered (>30s) so a starting process
+  cannot mark a fresh streaming message from a parallel process as
+  orphan.
+- `log.go` per-entry `pid=N` attribute so interleaved Windows log
+  writes can be split post-hoc via `jq 'select(.pid==N)'`.
+- SQLite `busy_timeout=30000` + `synchronous=NORMAL` (already present
+  via `db/connect.go`).
+- `envelope.Error` / `envelope.Warnings` for orchestrator feedback.
+- `CRUSH_FORBID_WRITES` env to block the model from writing through
+  the write/edit tool into paths the orchestrator owns.
+- coordinator auto-retry on `FinishReasonError("Stream stalled")`.
+
+**Cluster B — landed in the follow-up (this section's commit)**
+
+Cluster A closed the loudest races but the audit (recorded in chat
+history) flagged remaining HIGH-severity gaps:
+
+- **Atomic file writes.** `tools/write.go`, `tools/edit.go`,
+  `tools/multiedit.go` previously used `os.WriteFile`, which is not
+  atomic — a `kill -9` / OOM mid-write left the user's file
+  truncated and the DB history snapshot taken *after* the write made
+  no recovery possible. All six sites now use `fsext.AtomicWriteFile`
+  (write to a sibling `.tmp` file, fsync, rename). The helper lives
+  at `internal/fsext/atomic.go`.
+- **Session cost: read-modify-write → atomic additive.** The
+  `UpdateSession` SQL was reshaped to drop the `cost` column, and a
+  new `IncrementSessionCost` (`cost = cost + ?`) was added. The
+  `session.Save` Go API still exists for title/tokens/summary/todos
+  but does not touch cost. New `Service.IncrementCost(ctx, id, delta)`
+  for the additive path. `coordinator.updateParentSessionCost` and
+  `agent.updateSessionUsage` (three call sites) now route cost
+  through `IncrementCost` so concurrent sub-agent fan-out cannot lose
+  accrued cost via interleaved Get-modify-Save. Token fields keep
+  overwrite semantics (each step's `usage` is a cumulative snapshot,
+  not a delta).
+- **MCP id and settings.json flock.** `cliprovider/mcpserver.go`'s
+  `qwenMCPID`, `geminiMCPID`, `registerQwen/GeminiMCP`,
+  `deregisterQwen/GeminiMCP` previously did read-then-write of
+  `.crush/{qwen,gemini}-mcp-id` and `~/.{qwen,gemini}/settings.json`
+  without locking — two parallel `crush run` startups on a fresh
+  project could both miss the id file, both generate distinct UUIDs,
+  and end up with a split-brain MCP server name; settings.json edits
+  could clobber each other. All six now wrap the critical section in
+  `session.AcquireFileLock` (blocking variant of `TryAcquireSessionLock`,
+  exposed via the new `internal/session/file_lock.go` +
+  `file_lock_{unix,windows}.go`) and use `fsext.AtomicWriteFile` for
+  the write.
+- **Log rotation actually runs.** `internal/log/log.go` raised
+  `MaxBackups` from 0 (= rotation disabled) to 3 and enabled
+  `Compress`. Without this the active log file would grow unbounded
+  the moment MaxSize was exceeded under parallel-process write
+  pressure.
+- **Permission cache invalidation.** `internal/permission/permission.go`
+  previously held an in-memory cache of persistent grants loaded
+  exactly once at startup, with `Request` scanning it under a RWMutex.
+  An "always allow" granted in process A was therefore invisible to
+  process B until B restarted (and in non-interactive `crush run` B
+  would block on the prompt). The cache was removed; `Request` now
+  hits the DB via a new indexed `MatchSessionPermission` SQL on every
+  call. `GrantPersistent` stores `session_id=""` so the row matches
+  any session, preserving the cross-session contract of the old
+  loader.
+
+**Follow-up polish (from the post-batch code review):**
+
+- `internal/cmd/sessions.go` `sessions reset` was broken by the
+  Save-drops-cost contract change — it set `sess.Cost=0` then called
+  Save (which now ignores cost). Fixed by tracking the previous cost
+  and applying a negative `IncrementCost` delta.
+- `session.AcquireFileLockContext(ctx, path)` added next to the
+  indefinite-blocking `AcquireFileLock`. Implemented as polling
+  `TryAcquireFileLock` with exponential backoff (25→500ms cap) so a
+  cancelled ctx does not leak an orphan goroutine holding the lock.
+  `cliprovider/mcpserver.go` introduces `acquireMCPConfigLock` that
+  wraps it with a hard 30s timeout — all six MCP id/settings flocks
+  now use it, so a wedged sibling crush process cannot freeze the
+  whole parallel-run fleet.
+- New migration `20260517000001_permissions_dedup_and_indexes.sql`
+  adds two things: a UNIQUE index on
+  `session_permissions(session_id, tool_name, action, path)` to
+  support `INSERT … ON CONFLICT DO NOTHING` in CreateSessionPermission
+  (prevents duplicate rows on repeated Always-Allow clicks now that
+  the in-memory cache is gone), and a composite index on
+  `(tool_name, action, path, enabled)` so `MatchSessionPermission`'s
+  WHERE clause is index-backed under multi-process auto-approve load.
+  The migration also pre-dedups any existing duplicate rows (keeping
+  the oldest by id) so the UNIQUE constraint can be applied
+  retroactively.
+- `Service.IncrementCost` docstring on the interface now spells out
+  the `delta == 0 → Get` short-circuit (used by
+  `coordinator.updateParentSessionCost` to keep the parent-not-found
+  error path).
+- `TestDisabledPermissions_NotMatched` wraps its event receive in a
+  `select` with a 2s deadline so a regression that silently
+  auto-approves the disabled rule fails fast instead of waiting for
+  `go test -timeout`.
+
+**Audit items intentionally deferred (still HIGH but lower urgency):**
+
+- The original audit listed "filetracker mtime persisted per-process"
+  as deferred HIGH. A re-read of the code in this follow-up showed
+  the filetracker is **already DB-backed** via the `read_files` table
+  with `ON CONFLICT … DO UPDATE SET read_at = excluded.read_at`
+  (`internal/db/sql/read_files.sql`). Last-writer-wins is benign for
+  the cross-process case. Item resolved as a no-op — please don't
+  re-open it.
+- The audit's "parallel MCP stdio children" item (N processes spawn
+  N children of every configured MCP server) is a design-level issue
+  that needs documentation + an HTTP/SSE-transport recommendation,
+  not a code fix. Tracked separately.
+
 ## 5. In-code markers
 
 Whenever we patch an **upstream** file in a non-obvious way we leave a
@@ -335,10 +464,45 @@ they don't pollute `go doc` output):
 - `web/src/components/Message.tsx` — `FinishErrorBlock` rendering and
   empty-content fallback (Section 4.G). Two inline markers, one per
   patch site.
+- `internal/agent/tools/write.go` / `edit.go` / `multiedit.go` —
+  atomic file writes via `fsext.AtomicWriteFile` (write to tmp +
+  rename) so a `kill -9` / OOM mid-write cannot leave the user's file
+  half-truncated. Six sites total. See Section 4.I.
+- `internal/db/sql/sessions.sql` — `UpdateSession` no longer writes
+  the `cost` column; new `IncrementSessionCost` provides
+  `cost = cost + ?` atomic accumulation. Matches
+  `internal/session/session.go` `IncrementCost` service method. See
+  Section 4.I.
+- `internal/agent/agent.go` — `updateSessionUsage` now returns the
+  cost delta; three call sites (main step-finish, summarize, manual
+  summarize) call `sessions.IncrementCost` for the additive write.
+  Marker is on the function comment.
+- `internal/agent/coordinator.go` — `updateParentSessionCost`
+  rewritten to use `IncrementCost` so concurrent sub-agent fan-out
+  does not lose accrued cost via read-modify-write. See Section 4.I.
+- `internal/agent/cliprovider/mcpserver.go` — `qwenMCPID`,
+  `geminiMCPID`, `registerQwenMCP`, `deregisterQwenMCP`,
+  `registerGeminiMCP`, `deregisterGeminiMCP` are wrapped in a
+  `session.AcquireFileLock` on a sibling `.lock` file and switched to
+  `fsext.AtomicWriteFile` so two parallel `crush run` processes
+  cannot split-brain MCP IDs or clobber `~/.{qwen,gemini}/settings.json`.
+  See Section 4.I.
+- `internal/log/log.go` — lumberjack `MaxBackups` raised from 0 to 3
+  and `Compress` enabled so the log file does not grow unbounded
+  under parallel-process workloads. See Section 4.I.
+- `internal/permission/permission.go` — startup pre-load into an
+  in-memory cache was dropped; `Request` now consults the
+  `MatchSessionPermission` SQL on every call so a persistent "always
+  allow" granted in process A is immediately visible in process B
+  without restart. `GrantPersistent` stores `session_id=""` to
+  preserve the cross-session contract. See Section 4.I.
 
 Larger fork-only files (the entire WebSocket server, `web/`,
 `cliprovider` additions, etc.) do not need per-site markers — their
-existence is the marker.
+existence is the marker. Fork-only utility files added for the
+concurrency layer (`internal/fsext/atomic.go`,
+`internal/session/file_lock*.go`) are also marker-free for the same
+reason.
 
 ## 6. Chronological commit log
 
@@ -471,3 +635,38 @@ Open work, not yet committed:
 - This document.
 
 When this batch lands, replace this paragraph with the new commit list.
+
+### Batch 5 — Parallel-process safety, cluster B (2026-05-17)
+
+The cluster A work landed as `cfad5391`. Cluster B (this batch) closes
+the remaining HIGH-severity items from the post-`cfad5391` audit and
+re-classifies one item (filetracker) as already-fixed.
+
+Files touched (no merge from upstream pending; all our own):
+
+```
+internal/agent/tools/write.go            atomic write (fsext.AtomicWriteFile)
+internal/agent/tools/edit.go             atomic write × 3
+internal/agent/tools/multiedit.go        atomic write × 2
+internal/fsext/atomic.go                 new helper, write-tmp + rename
+internal/db/sql/sessions.sql             UpdateSession drops cost; new IncrementSessionCost
+internal/db/sql/permissions.sql          new MatchSessionPermission
+internal/db/{sessions,permissions}.sql.go  regenerated via sqlc
+internal/session/session.go              Service.IncrementCost
+internal/session/file_lock.go            generic FileLock (Acquire/TryAcquire)
+internal/session/file_lock_{unix,windows}.go  blocking variants of tryLockFile
+internal/agent/agent.go                  updateSessionUsage returns delta; 3 IncrementCost sites
+internal/agent/coordinator.go            updateParentSessionCost → IncrementCost
+internal/agent/coordinator_test.go       tests updated for IncrementCost API
+internal/agent/cliprovider/mcpserver.go  flock + atomic write on qwen/gemini id + settings.json
+internal/log/log.go                      lumberjack MaxBackups 3 + Compress
+internal/permission/permission.go        in-memory cache dropped; DB-direct lookup
+internal/permission/permission_test.go   tests updated for DB-backed flow
+CHANGELOG.fork.md                        this entry + Section 4.I
+```
+
+When the commit hash is known, append a line below:
+
+```
+<hash> 2026-05-17 feat(concurrency): atomic writes, additive cost, MCP flock, permission DB lookup
+```

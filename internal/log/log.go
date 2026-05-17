@@ -21,12 +21,18 @@ var (
 
 func Setup(logFile string, debug bool, ws ...io.Writer) {
 	initOnce.Do(func() {
+		// Fork patch (concurrency): MaxBackups was 0 upstream, which
+		// effectively disabled rotation — once a process reached MaxSize
+		// the file grew indefinitely. Under parallel `crush run` the
+		// shared log file balloons quickly. Keep 3 compressed backups so
+		// rotation actually runs but disk usage stays bounded. See
+		// CHANGELOG.fork.md.
 		logRotator := &lumberjack.Logger{
 			Filename:   logFile,
-			MaxSize:    10,    // Max size in MB
-			MaxBackups: 0,     // Number of backups
-			MaxAge:     30,    // Days
-			Compress:   false, // Enable compression
+			MaxSize:    10, // Max size in MB
+			MaxBackups: 3,  // keep last 3 rotated files
+			MaxAge:     30, // Days
+			Compress:   true,
 		}
 
 		level := slog.LevelInfo

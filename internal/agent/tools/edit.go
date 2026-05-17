@@ -1,5 +1,11 @@
 package tools
 
+// Fork patch (concurrency): the three file writes in this file
+// (createNewFile, deleteContent, replaceContent) all use
+// fsext.AtomicWriteFile (write-to-tmp + rename) instead of
+// os.WriteFile so a kill -9 / OOM mid-write cannot leave the user's
+// file half-truncated. See CHANGELOG.fork.md (Section 4.I).
+
 import (
 	"context"
 	_ "embed"
@@ -159,7 +165,7 @@ func createNewFile(edit editContext, filePath, content string, call fantasy.Tool
 		return NewPermissionDeniedResponse(), nil
 	}
 
-	err = os.WriteFile(filePath, []byte(content), 0o644)
+	err = fsext.AtomicWriteFile(filePath, []byte(content), 0o644)
 	if err != nil {
 		return fantasy.ToolResponse{}, fmt.Errorf("failed to write file: %w", err)
 	}
@@ -281,7 +287,7 @@ func deleteContent(edit editContext, filePath, oldString string, replaceAll bool
 		newContent, _ = fsext.ToWindowsLineEndings(newContent)
 	}
 
-	err = os.WriteFile(filePath, []byte(newContent), 0o644)
+	err = fsext.AtomicWriteFile(filePath, []byte(newContent), 0o644)
 	if err != nil {
 		return fantasy.ToolResponse{}, fmt.Errorf("failed to write file: %w", err)
 	}
@@ -410,7 +416,7 @@ func replaceContent(edit editContext, filePath, oldString, newString string, rep
 		newContent, _ = fsext.ToWindowsLineEndings(newContent)
 	}
 
-	err = os.WriteFile(filePath, []byte(newContent), 0o644)
+	err = fsext.AtomicWriteFile(filePath, []byte(newContent), 0o644)
 	if err != nil {
 		return fantasy.ToolResponse{}, fmt.Errorf("failed to write file: %w", err)
 	}

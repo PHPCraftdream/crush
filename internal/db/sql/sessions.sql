@@ -61,14 +61,29 @@ WHERE parent_session_id is NULL
 ORDER BY updated_at DESC;
 
 -- name: UpdateSession :one
+-- Overwrites title/prompt_tokens/completion_tokens/summary/todos but NOT
+-- cost. Cost is mutated only via IncrementSessionCost so concurrent
+-- sub-agent goroutines (and parallel crush processes that ever share a
+-- session) cannot lose accrued cost via read-modify-write.
 UPDATE sessions
 SET
     title = ?,
     prompt_tokens = ?,
     completion_tokens = ?,
     summary_message_id = ?,
-    cost = ?,
     todos = ?,
+    updated_at = strftime('%s', 'now')
+WHERE id = ?
+RETURNING *;
+
+-- name: IncrementSessionCost :one
+-- Atomic additive update for session cost. Safe under fan-out (multiple
+-- sub-agent goroutines finishing concurrently and each charging the
+-- parent) and across processes (orchestrator with parallel crush runs).
+-- Returns the updated row so the caller can refresh its snapshot.
+UPDATE sessions
+SET
+    cost = cost + ?,
     updated_at = strftime('%s', 'now')
 WHERE id = ?
 RETURNING *;

@@ -12,6 +12,11 @@ type Querier interface {
 	CreateFile(ctx context.Context, arg CreateFileParams) (File, error)
 	CreateMessage(ctx context.Context, arg CreateMessageParams) (Message, error)
 	CreateSession(ctx context.Context, arg CreateSessionParams) (Session, error)
+	// ON CONFLICT DO NOTHING relies on idx_session_permissions_uniq from
+	// migration 20260517000001. Without it a repeated Always-Allow click
+	// on the same (session, tool, action, path) tuple would create a fresh
+	// row instead of being a no-op. Re-enabling a disabled-then-regranted
+	// rule is handled explicitly via UpdatePermissionEnabled, not here.
 	CreateSessionPermission(ctx context.Context, arg CreateSessionPermissionParams) error
 	DeleteFile(ctx context.Context, id string) error
 	DeleteMessage(ctx context.Context, id string) error
@@ -34,6 +39,11 @@ type Querier interface {
 	GetUsageByDayOfWeek(ctx context.Context) ([]GetUsageByDayOfWeekRow, error)
 	GetUsageByHour(ctx context.Context) ([]GetUsageByHourRow, error)
 	GetUsageByModel(ctx context.Context) ([]GetUsageByModelRow, error)
+	// Atomic additive update for session cost. Safe under fan-out (multiple
+	// sub-agent goroutines finishing concurrently and each charging the
+	// parent) and across processes (orchestrator with parallel crush runs).
+	// Returns the updated row so the caller can refresh its snapshot.
+	IncrementSessionCost(ctx context.Context, arg IncrementSessionCostParams) (Session, error)
 	ListAllSessionPermissions(ctx context.Context) ([]SessionPermission, error)
 	ListAllUserMessages(ctx context.Context) ([]Message, error)
 	ListFilesByPath(ctx context.Context, path string) ([]File, error)
@@ -45,12 +55,21 @@ type Querier interface {
 	ListSessionReadFiles(ctx context.Context, sessionID string) ([]ReadFile, error)
 	ListSessions(ctx context.Context) ([]Session, error)
 	ListUserMessagesBySession(ctx context.Context, sessionID string) ([]Message, error)
+	// Returns the row id of an enabled "always allow" rule that matches the
+	// given (sessionID, toolName, action, path) tuple, or sql.ErrNoRows.
+	// session_id is empty for global rules; we accept either empty or the
+	// exact session_id so the same query handles both.
+	MatchSessionPermission(ctx context.Context, arg MatchSessionPermissionParams) (string, error)
 	RecordFileRead(ctx context.Context, arg RecordFileReadParams) error
-	SetSessionYolo(ctx context.Context, arg SetSessionYoloParams) error
 	RenameSession(ctx context.Context, arg RenameSessionParams) error
+	SetSessionYolo(ctx context.Context, arg SetSessionYoloParams) error
 	UpdateMessage(ctx context.Context, arg UpdateMessageParams) error
 	UpdateMessagePinned(ctx context.Context, arg UpdateMessagePinnedParams) error
 	UpdatePermissionEnabled(ctx context.Context, arg UpdatePermissionEnabledParams) error
+	// Overwrites title/prompt_tokens/completion_tokens/summary/todos but NOT
+	// cost. Cost is mutated only via IncrementSessionCost so concurrent
+	// sub-agent goroutines (and parallel crush processes that ever share a
+	// session) cannot lose accrued cost via read-modify-write.
 	UpdateSession(ctx context.Context, arg UpdateSessionParams) (Session, error)
 	UpdateSessionModels(ctx context.Context, arg UpdateSessionModelsParams) error
 	UpdateSessionReasoningEffort(ctx context.Context, arg UpdateSessionReasoningEffortParams) error
