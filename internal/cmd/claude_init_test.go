@@ -40,7 +40,7 @@ func TestClaudeInitBlock_ShapeAndContent(t *testing.T) {
 // that locks the directory so the test's TempDir cleanup can't RemoveAll
 // it. We restore cwd as a t.Cleanup so the test framework can delete the
 // temp dir afterwards.
-func runClaudeInitInDir(t *testing.T, dir string, force bool) {
+func runClaudeInitInDir(t *testing.T, dir string, mode string) {
 	t.Helper()
 	orig, err := os.Getwd()
 	require.NoError(t, err)
@@ -52,9 +52,10 @@ func runClaudeInitInDir(t *testing.T, dir string, force bool) {
 	cmd := &cobra.Command{}
 	cmd.Flags().StringP("cwd", "c", "", "")
 	cmd.Flags().Bool("force", false, "")
+	cmd.Flags().Bool("replace", false, "")
 	args := []string{"--cwd", dir}
-	if force {
-		args = append(args, "--force")
+	if mode != "" {
+		args = append(args, "--"+mode)
 	}
 	require.NoError(t, cmd.ParseFlags(args))
 	require.NoError(t, claudeInitCmd.RunE(cmd, nil))
@@ -62,7 +63,7 @@ func runClaudeInitInDir(t *testing.T, dir string, force bool) {
 
 func TestClaudeInit_CreatesWhenAbsent(t *testing.T) {
 	dir := t.TempDir()
-	runClaudeInitInDir(t, dir, false)
+	runClaudeInitInDir(t, dir, "")
 
 	bts, err := os.ReadFile(filepath.Join(dir, claudeMdFile))
 	require.NoError(t, err)
@@ -76,7 +77,7 @@ func TestClaudeInit_AppendsToExisting(t *testing.T) {
 	const pre = "# Existing project notes\n\nSome content.\n"
 	require.NoError(t, os.WriteFile(path, []byte(pre), 0o644))
 
-	runClaudeInitInDir(t, dir, false)
+	runClaudeInitInDir(t, dir, "")
 
 	bts, err := os.ReadFile(path)
 	require.NoError(t, err)
@@ -87,11 +88,11 @@ func TestClaudeInit_AppendsToExisting(t *testing.T) {
 
 func TestClaudeInit_IdempotentWithoutForce(t *testing.T) {
 	dir := t.TempDir()
-	runClaudeInitInDir(t, dir, false)
+	runClaudeInitInDir(t, dir, "")
 	first, err := os.ReadFile(filepath.Join(dir, claudeMdFile))
 	require.NoError(t, err)
 
-	runClaudeInitInDir(t, dir, false)
+	runClaudeInitInDir(t, dir, "")
 	second, err := os.ReadFile(filepath.Join(dir, claudeMdFile))
 	require.NoError(t, err)
 
@@ -101,11 +102,84 @@ func TestClaudeInit_IdempotentWithoutForce(t *testing.T) {
 
 func TestClaudeInit_ForceReappends(t *testing.T) {
 	dir := t.TempDir()
-	runClaudeInitInDir(t, dir, false)
-	runClaudeInitInDir(t, dir, true)
+	runClaudeInitInDir(t, dir, "")
+	runClaudeInitInDir(t, dir, "force")
 
 	bts, err := os.ReadFile(filepath.Join(dir, claudeMdFile))
 	require.NoError(t, err)
 	assert.Equal(t, 2, strings.Count(string(bts), claudeInitMarkerStart),
 		"--force must duplicate the marker (callers know what they're doing)")
+}
+
+func TestClaudeInit_ReplaceSwapsCurrentVersion(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, claudeMdFile)
+
+	runClaudeInitInDir(t, dir, "")
+	before, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, 1, strings.Count(string(before), claudeInitMarkerStart))
+
+	runClaudeInitInDir(t, dir, "replace")
+	after, err := os.ReadFile(path)
+	require.NoError(t, err)
+	// Still exactly one current block (no duplicate, no leftover).
+	assert.Equal(t, 1, strings.Count(string(after), claudeInitMarkerStart),
+		"--replace must leave exactly one block of the current version")
+	assert.Equal(t, 1, strings.Count(string(after), claudeInitMarkerEnd))
+}
+
+// TestClaudeInit_ReplaceStripsOldVersions verifies the safety hatch in
+// action: a CLAUDE.md that has older-version blocks scattered in it (from
+// when v1 was current) gets cleanly collapsed to one v2 block on
+// `claude-init --replace`. The regex matches *any* "crush-claude-init:v\d+"
+// sentinel, not just the current one, so versions can be bumped without
+// abandoning copies in users' files.
+func TestClaudeInit_ReplaceStripsOldVersions(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, claudeMdFile)
+
+	// Hand-craft a file with two stale blocks (v1) sandwiched around
+	// some user content.
+	stale := "# Project notes\n\n" +
+		"<!-- crush-claude-init:v1 -->\nold v1 body line 1\nold v1 body line 2\n<!-- /crush-claude-init -->\n\n" +
+		"## Section the user wrote\n\nsome text\n\n" +
+		"<!-- crush-claude-init:v1 -->\nstray second copy\n<!-- /crush-claude-init -->\n"
+	require.NoError(t, os.WriteFile(path, []byte(stale), 0o644))
+
+	runClaudeInitInDir(t, dir, "replace")
+	after, err := os.ReadFile(path)
+	require.NoError(t, err)
+
+	got := string(after)
+	// No v1 should survive.
+	assert.NotContains(t, got, "<!-- crush-claude-init:v1 -->",
+		"--replace must strip every prior version, not just the current one")
+	assert.NotContains(t, got, "old v1 body line 1")
+	assert.NotContains(t, got, "stray second copy")
+	// Exactly one fresh block of the current version.
+	assert.Equal(t, 1, strings.Count(got, claudeInitMarkerStart))
+	// User content is preserved.
+	assert.Contains(t, got, "## Section the user wrote")
+	assert.Contains(t, got, "# Project notes")
+}
+
+// TestClaudeInit_ForceAndReplaceMutuallyExclusive is a guard against a
+// future bug where someone forgets the cmd.MarkFlagsMutuallyExclusive
+// equivalent — they currently can't both be true because the RunE
+// returns early on the combination.
+func TestClaudeInit_ForceAndReplaceMutuallyExclusive(t *testing.T) {
+	dir := t.TempDir()
+	orig, err := os.Getwd()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.Chdir(orig) })
+
+	cmd := &cobra.Command{}
+	cmd.Flags().StringP("cwd", "c", "", "")
+	cmd.Flags().Bool("force", false, "")
+	cmd.Flags().Bool("replace", false, "")
+	require.NoError(t, cmd.ParseFlags([]string{"--cwd", dir, "--force", "--replace"}))
+	err = claudeInitCmd.RunE(cmd, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "mutually exclusive")
 }
