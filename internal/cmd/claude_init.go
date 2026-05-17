@@ -169,7 +169,10 @@ the user matters more than offloading the work.
 
 - **stdout**: in default (terse) mode → the final assistant text only.
   With ` + "`--stream`" + ` → every token streamed. With ` + "`--json`" + ` → one JSON
-  object at the end. Never tool-call traces, never spinner glyphs.
+  object **at the end** — the streaming progress is swallowed by
+  design, so reach for ` + "`--json`" + ` only when you actually need the
+  parsed envelope (cost, tool-call counts, exit reason). Never
+  tool-call traces, never spinner glyphs.
 - **stderr**: tool-call heartbeat ("▶ bash", "▶ grep") + ` + "`INFO`" + `/` + "`WARN`" + `
   log lines from the agent and provider clients. Always on, regardless
   of ` + "`--quiet`" + `. (` + "`--quiet`" + ` only hides the spinner.)
