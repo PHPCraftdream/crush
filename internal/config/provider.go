@@ -196,6 +196,22 @@ func newCache[T any](path string) cache[T] {
 	return cache[T]{path: path}
 }
 
+// Age returns how long ago the cache file on disk was last written.
+// Returns (math.MaxInt64, err) when the file does not exist or cannot
+// be stat'd — callers should treat that as "always refresh".
+//
+// Fork patch (orchestrator UX): used by catwalk/hyper syncers to skip
+// the network round-trip when the cache is fresh, so a read-only
+// `crush models show` does not spend ~3s on two HTTP requests every
+// invocation. See CHANGELOG.fork.md (Section 4.J).
+func (c cache[T]) Age() (time.Duration, error) {
+	fi, err := os.Stat(c.path)
+	if err != nil {
+		return 1<<62 - 1, err
+	}
+	return time.Since(fi.ModTime()), nil
+}
+
 func (c cache[T]) Get() (T, string, error) {
 	var v T
 	data, err := os.ReadFile(c.path)

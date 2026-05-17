@@ -20,7 +20,7 @@ var claudeInitBlockPattern = regexp.MustCompile(`(?s)<!-- crush-claude-init:v\d+
 // already exists. Bumping the v<N> version forces a re-write on the
 // next run (old block is rewritten, not duplicated).
 const (
-	claudeInitMarkerStart      = "<!-- crush-claude-init:v5 -->"
+	claudeInitMarkerStart      = "<!-- crush-claude-init:v6 -->"
 	claudeInitMarkerEnd        = "<!-- /crush-claude-init -->"
 	claudeMdFile               = "CLAUDE.md"
 	claudeSlashCommandPath     = ".claude/commands/crush.md"
@@ -41,6 +41,7 @@ var previousMarkers = []string{
 	"<!-- crush-claude-init:v2 -->",
 	"<!-- crush-claude-init:v3 -->",
 	"<!-- crush-claude-init:v4 -->",
+	"<!-- crush-claude-init:v5 -->",
 }
 
 var claudeInitCmd = &cobra.Command{
@@ -376,6 +377,34 @@ use it for this run:
 
 If you don't pass ` + "`--agents`" + `, you get ` + "`agent-allow`" + `. State your
 intent explicitly when it matters for cost/latency planning.
+
+### Protecting your output file from the model's write tool
+
+When you redirect ` + "`crush run > /tmp/x.json`" + `, the shell owns ` + "`x.json`" + `,
+not crush. The model has a ` + "`write`" + ` tool though, and if it sees the
+path in the prompt (or just decides on its own to dump findings to a
+file) it may write directly to ` + "`x.json`" + ` BEFORE the envelope arrives
+via stdout — leaving you with a mangled file (model's content on top,
+envelope partially overwriting it because ` + "`>`" + ` open in trunc mode but
+the envelope is shorter than the file already on disk).
+
+Defence: set ` + "`CRUSH_FORBID_WRITES`" + ` to a comma-separated list of paths
+the model must NOT touch via ` + "`write`" + `/` + "`edit`" + `/` + "`multiedit`" + `. The tool call
+fails with a visible error to the model and it falls back to returning
+the content via ` + "`final_text`" + ` — which is exactly where you wanted it.
+
+` + "```bash" + `
+out=/tmp/audit-A.json
+CRUSH_FORBID_WRITES="$out" \
+  crush run --role smart --json --format json \
+            --session "audit-A" --timeout 15m \
+            < /tmp/audit-A.prompt > "$out" 2>"$out.err"
+` + "```" + `
+
+A good general rule for the launching harness: include every
+redirected file (` + "`>` `2>`" + ` targets) in ` + "`CRUSH_FORBID_WRITES`" + ` for that
+run. This applies whether you' re launching one ` + "`crush run`" + ` or a
+parallel fan-out — each run can have its own list.
 
 ### Read-only discovery commands (always safe)
 

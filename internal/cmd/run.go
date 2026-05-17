@@ -90,7 +90,25 @@ Permissions: non-interactive runs auto-approve every permission request
 (no one is on the keyboard to confirm). The agent gets the full tool
 set with no prompting. This is fast but irreversible — only run
 "crush run" in a workspace whose contents you can afford to lose, and
-prefer --cwd /some/sandbox-or-temp-dir for one-shot scripts.`,
+prefer --cwd /some/sandbox-or-temp-dir for one-shot scripts.
+
+Protecting harness-owned files: when the orchestrator pipes "crush run"
+output through a shell redirect, the model can pick the same path for
+its write/edit tool (e.g. it sees ".tmp-audit-D.json" in the prompt
+and decides "I'll just write findings there directly"). Result: a
+mixed file where envelope and tool output overwrite each other in
+non-deterministic order. To block this set the CRUSH_FORBID_WRITES
+env-var to a comma-separated list of paths the write/edit/multiedit
+tools must NOT touch. Example:
+
+  out=/tmp/audit.json
+  CRUSH_FORBID_WRITES="$out" \
+    crush run --json --format json ... > "$out" 2>"$out.err"
+
+The tools fail with a visible error to the model when a forbidden path
+is targeted; the model then either retries with a different path or
+falls back to returning the content via final_text — both of which
+keep the redirect target intact.`,
 	Example: `
 # Run a simple prompt
 crush run "Guess my 5 favorite Pokémon"

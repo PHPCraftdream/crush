@@ -18,6 +18,13 @@ import (
 func TestMain(m *testing.M) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 
+	// Fork patch (orchestrator UX): disable the providers-cache TTL
+	// for the test pkg so the catwalk/hyper sync tests that exercise
+	// the network-fetch path are not short-circuited by the new
+	// time-based skip. TTL behaviour itself is covered by dedicated
+	// tests that re-enable a non-zero value via t.Setenv.
+	os.Setenv("CRUSH_PROVIDER_CACHE_TTL", "0")
+
 	exitVal := m.Run()
 	os.Exit(exitVal)
 }

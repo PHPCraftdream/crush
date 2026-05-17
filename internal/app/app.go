@@ -237,17 +237,34 @@ func (app *App) resolveSession(ctx context.Context, continueSessionID string, us
 // runResult is the JSON shape emitted by `crush run --json`. Wire-stable:
 // fields here are part of the public contract for wrapper scripts.
 type runResult struct {
-	SessionID  string         `json:"session_id"`
-	ExitReason string         `json:"exit_reason"` // "stop","error","canceled","max_tokens","unknown","tool_use"
-	FinalText  string         `json:"final_text"`
+	SessionID  string `json:"session_id"`
+	// ExitReason vocabulary:
+	//   "stop","end_turn","tool_use","max_tokens","unknown"  — model-level
+	//   "error"                                              — generic
+	//   "canceled"                                           — caller-cancel
+	//   "invalid_json" (fork-only)                           — --json /
+	//       --format json was active and stripped output failed
+	//       json.Valid; orchestrators that pipe final_text into jq
+	//       SHOULD branch on this instead of treating exit_reason=stop
+	//       as proof the content is valid JSON.
+	ExitReason string `json:"exit_reason"`
+	FinalText  string `json:"final_text"`
 	// Fork patch (orchestrator UX): when --json or --format json
 	// triggered the fence/preamble stripper and the model HAD wrapped
 	// its answer in prose or a markdown fence, the unstripped original
 	// is preserved here so the orchestrator can audit what the model
 	// actually said. Empty when no stripping was applied or when the
-	// model returned clean JSON already.
-	AssistantNotes string         `json:"assistant_notes,omitempty"`
-	Error      string         `json:"error,omitempty"`
+	// model returned clean JSON already. When ExitReason="invalid_json",
+	// AssistantNotes carries the strip attempt's (invalid) candidate
+	// for side-by-side comparison.
+	AssistantNotes string `json:"assistant_notes,omitempty"`
+	// StrippedBytes is how many bytes the stripper removed from
+	// final_text (0 when no strip happened or when validation failed
+	// and we restored the original). Surfaces observability for the
+	// "model keeps writing a preamble" failure mode — orchestrators
+	// can graph this over time.
+	StrippedBytes int    `json:"stripped_bytes,omitempty"`
+	Error         string `json:"error,omitempty"`
 	// Warnings are non-fatal observations about the run that an
 	// orchestrator should know about even when exit_reason looks happy.
 	// Examples: agent fan-out finished with empty final_text (model
@@ -284,7 +301,13 @@ type usageInfo struct {
 // Fork patch (orchestrator UX): assistantNotes added. Carries the
 // stripped prose/fence content when --json or --format json triggered
 // stripJSONEnvelope and the model had wrapped the JSON; "" otherwise.
-func buildRunResult(sessionID, finalText, assistantNotes, finalReason string, err error, canceled bool, toolCounts map[string]int, deltaTokens int64, deltaCost float64, duration time.Duration, finalErrTitle, finalErrDetails string) runResult {
+//
+// strippedBytes / stripErrMsg / stripErrReason are populated by the
+// JSON validation step (stripAndValidateJSON). stripErrReason, when
+// non-empty, OVERRIDES the model's finalReason so the envelope tells
+// the orchestrator "you asked for JSON, it didn't validate" instead of
+// the model's optimistic "stop"/"end_turn".
+func buildRunResult(sessionID, finalText, assistantNotes, finalReason string, err error, canceled bool, toolCounts map[string]int, deltaTokens int64, deltaCost float64, duration time.Duration, finalErrTitle, finalErrDetails string, strippedBytes int, stripErrMsg, stripErrReason string) runResult {
 	reason := finalReason
 	if reason == "" {
 		switch {
@@ -340,11 +363,50 @@ func buildRunResult(sessionID, finalText, assistantNotes, finalReason string, er
 			errMsg = finalErrDetails
 		}
 	}
+	// Fork patch (orchestrator UX): bug 4 from the 2026-05-17 audit
+	// feedback — when reason=="error" but the model's Finish part
+	// carried no Message/Details (some providers emit a bare error
+	// finish), errMsg stayed empty and the orchestrator had no clue
+	// WHY the turn died. Provide an informative fallback that names
+	// the most likely causes so the operator at least knows where to
+	// start looking. Also flag a truncation-hint when final_text
+	// looks unfinished (ends mid-sentence or with a leading-in
+	// punctuation like ":") so the operator sees "model was about to
+	// continue".
+	if reason == "error" && errMsg == "" {
+		errMsg = "unknown error (provider returned an error finish without a message — likely causes: provider HTTP error, stream stall before watchdog fired, OOM-kill, context-window overflow). Re-run with --verbose for stderr detail."
+	}
+	if reason == "error" {
+		trimmed := strings.TrimRight(strings.TrimSpace(finalText), " \t")
+		if n := len(trimmed); n > 0 {
+			last := trimmed[n-1]
+			if last == ':' || last == ',' || last == '-' {
+				warnings = append(warnings, fmt.Sprintf(
+					"final_text appears truncated (ends with %q) — model was likely composing more output when the error fired. Last 80 chars: %q",
+					string(last), tailN(trimmed, 80),
+				))
+			}
+		}
+	}
+	// Fork patch (orchestrator UX): strip-validation overrides reason
+	// + error when the operator asked for JSON and the stripped output
+	// did not parse. We DO want to clobber the model's optimistic
+	// "end_turn" / "stop" here because from the orchestrator's point
+	// of view this run failed its contract.
+	if stripErrReason != "" {
+		reason = stripErrReason
+		if errMsg == "" {
+			errMsg = stripErrMsg
+		} else {
+			errMsg = errMsg + "; " + stripErrMsg
+		}
+	}
 	return runResult{
 		SessionID:      sessionID,
 		ExitReason:     reason,
 		FinalText:      finalText,
 		AssistantNotes: assistantNotes,
+		StrippedBytes:  strippedBytes,
 		Error:          errMsg,
 		Warnings:       warnings,
 		ToolCalls:      calls,
@@ -354,6 +416,16 @@ func buildRunResult(sessionID, finalText, assistantNotes, finalReason string, er
 		},
 		DurationMs: duration.Milliseconds(),
 	}
+}
+
+// tailN returns the last n runes of s (or the whole s if shorter). Used
+// to put a small "what was the model writing when it died" snippet into
+// the truncation warning without dumping kilobytes into the envelope.
+func tailN(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return "..." + s[len(s)-n:]
 }
 
 // RunMode picks the output format for RunNonInteractive.
@@ -568,10 +640,33 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt 
 				// final JSON in a ```json fence and added prose" case
 				// here so wrappers can pipe final_text straight into
 				// jq. The original is preserved in assistant_notes.
+				//
+				// stripAndValidateJSON ALSO runs json.Valid on the
+				// stripped output; on failure it surfaces the original
+				// in final_text + the (invalid) candidate in
+				// assistant_notes + a wrapped ErrInvalidStripJSON so
+				// the envelope reports exit_reason=invalid_json. This
+				// closes the silent-success failure mode reported in
+				// the 2026-05-17 audit feedback (model emitted a JSON
+				// missing a closing bracket, walker said "balanced",
+				// orchestrator spent an hour in node-repl).
 				finalTextOut := finalText
 				assistantNotes := ""
+				strippedBytes := 0
+				stripErr := ""
+				stripErrReason := ""
 				if overrides.StripJSONFences && finalReason != "error" && finalReason != "canceled" {
-					finalTextOut, assistantNotes = stripJSONEnvelope(finalText)
+					cleaned, notes, vErr := stripAndValidateJSON(finalText)
+					finalTextOut = cleaned
+					assistantNotes = notes
+					strippedBytes = len(finalText) - len(cleaned)
+					if strippedBytes < 0 {
+						strippedBytes = 0
+					}
+					if vErr != nil {
+						stripErr = vErr.Error()
+						stripErrReason = "invalid_json"
+					}
 				}
 				summary := buildRunResult(
 					sess.ID, finalTextOut, assistantNotes, finalReason, runErr, isCanceled,
@@ -580,6 +675,7 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt 
 					freshSess.Cost-costBefore,
 					time.Since(runStart),
 					finalErrTitle, finalErrDetails,
+					strippedBytes, stripErr, stripErrReason,
 				)
 				enc := json.NewEncoder(output)
 				if encErr := enc.Encode(summary); encErr != nil {

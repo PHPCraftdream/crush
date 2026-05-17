@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // Fork-only tests (orchestrator UX): stripJSONEnvelope is the safety
@@ -78,6 +79,61 @@ func TestStripJSONEnvelope_NoJSONAtAll(t *testing.T) {
 	cleaned, notes := stripJSONEnvelope(in)
 	assert.Equal(t, in, cleaned)
 	assert.Empty(t, notes)
+}
+
+// Validation tests below cover stripAndValidateJSON (the runtime entry
+// point added 2026-05-17 after the audit feedback). The walker can
+// happily return a balanced {...} that is still invalid JSON — those
+// cases must produce ErrInvalidStripJSON with the original kept in
+// final_text and the candidate moved to assistant_notes.
+
+func TestStripAndValidateJSON_ValidClean(t *testing.T) {
+	cleaned, notes, err := stripAndValidateJSON(`{"findings":[1,2,3]}`)
+	require.NoError(t, err)
+	assert.Equal(t, `{"findings":[1,2,3]}`, cleaned)
+	assert.Empty(t, notes)
+}
+
+func TestStripAndValidateJSON_ValidWithFenceAndPreamble(t *testing.T) {
+	in := "Here we go:\n\n```json\n{\"k\":\"v\"}\n```\nbye."
+	cleaned, notes, err := stripAndValidateJSON(in)
+	require.NoError(t, err)
+	assert.Equal(t, `{"k":"v"}`, cleaned)
+	assert.NotEmpty(t, notes)
+}
+
+func TestStripAndValidateJSON_BalancedButInvalid_MissingBracket(t *testing.T) {
+	// Reproducer of the 2026-05-17 shamir-db audit-B finding: the
+	// model forgot the `]` before `,"post_flight":`. Outer braces
+	// balance, walker returns the value, json.Valid rejects it.
+	in := `{"findings":[ {"id":"a"}, {"id":"b"} ,"post_flight":{"ok":true}}`
+	cleaned, notes, err := stripAndValidateJSON(in)
+	require.ErrorIs(t, err, ErrInvalidStripJSON)
+	// final_text restored to the ORIGINAL so the orchestrator can
+	// inspect what the model actually said.
+	assert.Equal(t, in, cleaned)
+	// The (invalid) strip attempt should be in notes for side-by-side.
+	assert.NotEmpty(t, notes)
+}
+
+func TestStripAndValidateJSON_BalancedButInvalid_TrailingComma(t *testing.T) {
+	in := `{"a":1,"b":2,}`
+	cleaned, _, err := stripAndValidateJSON(in)
+	require.ErrorIs(t, err, ErrInvalidStripJSON)
+	assert.Equal(t, in, cleaned)
+}
+
+func TestStripAndValidateJSON_NoJSONAtAll(t *testing.T) {
+	in := "I refuse to produce JSON, here is prose instead."
+	cleaned, _, err := stripAndValidateJSON(in)
+	require.ErrorIs(t, err, ErrInvalidStripJSON)
+	assert.Equal(t, in, cleaned)
+}
+
+func TestStripAndValidateJSON_ErrorMentionsOffset(t *testing.T) {
+	_, _, err := stripAndValidateJSON(`{"a":1,"b":2,}`)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "byte offset", "operator needs an offset to jump to in assistant_notes")
 }
 
 func TestStripJSONEnvelope_RealShamirDBExample(t *testing.T) {

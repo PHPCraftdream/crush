@@ -668,5 +668,74 @@ CHANGELOG.fork.md                        this entry + Section 4.I
 When the commit hash is known, append a line below:
 
 ```
-<hash> 2026-05-17 feat(concurrency): atomic writes, additive cost, MCP flock, permission DB lookup
+505d0a9c 2026-05-17 feat(concurrency): cluster B — atomic writes, additive cost, MCP flock, permission DB lookup
+2d8c60b5 2026-05-17 feat(run): --format and --agents flags + JSON envelope stripper
+63bc98cc 2026-05-17 fix(deploy): walk PATH manually so Go 1.19+ exec.ErrDot doesn't break deploy from repo root
+```
+
+### Batch 6 — orchestrator UX hardening from 2026-05-17 audit feedback
+
+The shamir-db 2× parallel audit run produced a focused bug report
+(BUG 1 .. BUG 5 + Observation 6). This batch closes all of them.
+
+**BUG 1 (HIGH) — `--format json` could yield invalid JSON silently.**
+Stripper's brace-walker accepted balanced-but-not-valid output (real
+case: model forgot the closing `]` before `,"post_flight":`). Added
+`stripAndValidateJSON` which runs `json.Valid` on the stripped
+candidate; on failure the envelope reports
+`exit_reason="invalid_json"`, restores the ORIGINAL to `final_text`,
+moves the invalid candidate to `assistant_notes`, and puts a
+position-bearing `json.SyntaxError` in `error`. New `ErrInvalidStripJSON`
+sentinel. 6 new tests in `strip_json_test.go` including the exact
+shamir-db reproducer.
+
+**BUG 2 (MEDIUM) — model ignores "no preamble" hint.**
+Tightened `formatPresetJSON` (imperative voice, 8 explicit rules,
+last-line repeat). Added `StrippedBytes` field to the envelope so
+operators can graph compliance over time.
+
+**BUG 3 (LOW) — `crush models` dials home on every call.**
+Added `cache.Age()` + `providerCacheTTL` (24h default, override via
+`CRUSH_PROVIDER_CACHE_TTL` env). `catwalkSync` and `hyperSync` now
+skip the HTTP roundtrip when the on-disk cache is fresher than the
+TTL. Test pkg `TestMain` sets TTL=0 so existing network-path tests
+keep exercising it.
+
+**BUG 4 (MEDIUM) — empty `error.code` when `exit_reason=error`.**
+`buildRunResult` now emits a fallback message naming the most likely
+causes (provider HTTP error, stream stall, OOM, context overflow)
+when the model's Finish part carried no Message/Details. Also adds
+a `truncation_hint` warning when `final_text` ends with `: , -` —
+hints that the model was mid-composition when the error fired.
+
+**BUG 5 (MEDIUM) — write-tool overwrites the stdout-redirect target.**
+Already mitigated in `cfad5391` (CRUSH_FORBID_WRITES env). This batch
+documents it: `crush run --help` gained a "Protecting harness-owned
+files" section and the claude-init guide gained a matching section
+with the canonical `CRUSH_FORBID_WRITES="$out" crush run > "$out"`
+pattern. Marker bumped v5 → v6.
+
+**Observation 6 — show pricing in `crush models show`.**
+`modelsShowCmd` now prints `ctx=204.8k` + `$1.40 / 1M in, $4.40 / 1M
+out (cached-in $0.26)` on a second indented line per slot, sourced
+from the catwalk catalog. Same fields appear under `cost_per_1m_*`
+keys in `--json` output. Custom/local models without a catalog
+entry silently omit pricing (no broken display).
+
+Files touched:
+
+```
+internal/app/app.go                  fallback error msg, truncation warning, validation plumbing
+internal/app/strip_json.go           stripAndValidateJSON, ErrInvalidStripJSON
+internal/app/strip_json_test.go      6 new validation tests
+internal/app/run_result_test.go      updated for new buildRunResult signature
+internal/cmd/run.go                  CRUSH_FORBID_WRITES help section
+internal/cmd/run_format.go           tightened formatPresetJSON
+internal/cmd/claude_init.go          v5 → v6 marker, CRUSH_FORBID_WRITES section
+internal/cmd/models_set.go           pricing + ctx in `models show`, JSON keys
+internal/config/provider.go          cache.Age()
+internal/config/catwalk.go           providerCacheTTL + TTL skip
+internal/config/hyper.go             TTL skip mirror
+internal/config/load_test.go         TestMain disables TTL for the pkg
+CHANGELOG.fork.md                    this entry
 ```

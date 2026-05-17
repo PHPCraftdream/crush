@@ -12,18 +12,36 @@ import (
 // See CHANGELOG.fork.md (Section 4.J).
 
 // formatPresetJSON is the canonical instruction appended to the user
-// prompt when --format json is passed. Kept short on purpose: the
-// model's compliance rate drops quickly past ~3 bullet points. The
-// post-processor in app.go (stripJSONEnvelope) is the safety net for
-// the cases when the model ignores this anyway.
-const formatPresetJSON = `## Output Format
+// prompt when --format json is passed. The post-processor in app.go
+// (stripAndValidateJSON) is the safety net when the model ignores it
+// anyway. Wording tightened 2026-05-17 after the audit feedback
+// showed glm-5.1 reliably writing a prose preamble despite the
+// previous hint — the new version uses imperative voice, explains
+// the machine-parsing consequence, and ends with a hard last-line
+// instruction (most models attend to the LAST instruction more
+// strongly than the first).
+const formatPresetJSON = `## Output Format (mandatory, machine-parsed)
 
-Your final answer MUST be a single valid JSON value (object or array) and nothing else.
+Your reply is parsed by ` + "`jq`" + ` on the final_text field. Any character
+before the first ` + "`{`" + ` or ` + "`[`" + `, and any character after the matching
+closing ` + "`}`" + ` or ` + "`]`" + `, causes a parse failure that aborts the wrapper
+script. There is no human reading this turn's reply directly.
 
-- Do NOT wrap it in a markdown code fence (no ` + "```json`" + ` … ` + "`````" + `).
-- Do NOT print any prose before or after the JSON.
-- Do NOT add explanations, summaries, or sign-offs.
-- Your reply must start with ` + "`{`" + ` or ` + "`[`" + ` as the very first character.`
+Rules:
+
+1. Emit exactly one JSON value (object or array). Nothing else.
+2. The very first character of your reply MUST be ` + "`{`" + ` or ` + "`[`" + `.
+3. The very last character of your reply MUST be the matching ` + "`}`" + ` or ` + "`]`" + `.
+4. Validate brackets balance and every ` + "`,`" + ` is followed by a key or value
+   (no trailing commas, no missing ` + "`]`" + ` before another key).
+5. No markdown code fence. No ` + "```json`" + `, no ` + "`````" + ` anywhere.
+6. No prose preamble ("Here is...", "Let me compose...", "Now I'll output...").
+7. No suffix ("Let me know if...", "Hope this helps.").
+8. No explanations, sign-offs, or emojis outside of JSON string values.
+
+Last line, repeated for attention: your reply starts with ` + "`{`" + ` or ` + "`[`" + ` and
+ends with the matching ` + "`}`" + ` or ` + "`]`" + `. The wrapper does NOT strip prose for
+you — invalid JSON fails the run.`
 
 // resolveFormatHint turns the raw --format flag value into the text that
 // will be appended to the user prompt. Returns ("", nil) when the flag

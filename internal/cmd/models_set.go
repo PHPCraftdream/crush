@@ -31,11 +31,28 @@ your --local override.`,
 				out[string(t)] = nil
 				continue
 			}
-			out[string(t)] = map[string]any{
+			row := map[string]any{
 				"provider":         m.Provider,
 				"model":            m.Model,
 				"reasoning_effort": m.ReasoningEffort,
 			}
+			// Fork patch (orchestrator UX): pricing + context window
+			// pulled from the catwalk catalog so the operator sees the
+			// $/1M-token trade-off without first running a turn and
+			// inspecting the envelope's usage. Missing catalog entry
+			// (custom/local model) leaves the price fields off.
+			if cat := a.Config().GetModel(m.Provider, m.Model); cat != nil {
+				row["context_window"] = cat.ContextWindow
+				row["cost_per_1m_in"] = cat.CostPer1MIn
+				row["cost_per_1m_out"] = cat.CostPer1MOut
+				if cat.CostPer1MInCached != 0 {
+					row["cost_per_1m_in_cached"] = cat.CostPer1MInCached
+				}
+				if cat.CostPer1MOutCached != 0 {
+					row["cost_per_1m_out_cached"] = cat.CostPer1MOutCached
+				}
+			}
+			out[string(t)] = row
 		}
 
 		if asJSON {
@@ -51,10 +68,50 @@ your --local override.`,
 			if r, _ := v["reasoning_effort"].(string); r != "" {
 				eff = " effort=" + r
 			}
-			fmt.Fprintf(os.Stdout, "%-6s: %s / %s%s\n", t, v["provider"], v["model"], eff)
+			// Fork patch (orchestrator UX): print pricing on a second
+			// indented line when the catalog entry exists. Skipped
+			// silently for custom/local models so the human-readable
+			// view never blows up.
+			priceSuffix := ""
+			if ctx, ok := v["context_window"].(int64); ok && ctx > 0 {
+				priceSuffix += fmt.Sprintf(" ctx=%s", humanK(ctx))
+			}
+			fmt.Fprintf(os.Stdout, "%-6s: %s / %s%s%s\n", t, v["provider"], v["model"], eff, priceSuffix)
+			in, hasIn := v["cost_per_1m_in"].(float64)
+			outP, hasOut := v["cost_per_1m_out"].(float64)
+			if hasIn && hasOut && (in != 0 || outP != 0) {
+				fmt.Fprintf(os.Stdout, "        $%.2f / 1M in, $%.2f / 1M out", in, outP)
+				if c, ok := v["cost_per_1m_in_cached"].(float64); ok && c != 0 {
+					fmt.Fprintf(os.Stdout, " (cached-in $%.2f", c)
+					if co, ok := v["cost_per_1m_out_cached"].(float64); ok && co != 0 {
+						fmt.Fprintf(os.Stdout, ", cached-out $%.2f", co)
+					}
+					fmt.Fprint(os.Stdout, ")")
+				}
+				fmt.Fprintln(os.Stdout)
+			}
 		}
 		return nil
 	},
+}
+
+// humanK formats a context window as a compact "128k" / "1M". Avoids
+// pulling in a units helper for a one-call site.
+func humanK(n int64) string {
+	switch {
+	case n >= 1_000_000:
+		if n%1_000_000 == 0 {
+			return fmt.Sprintf("%dM", n/1_000_000)
+		}
+		return fmt.Sprintf("%.1fM", float64(n)/1_000_000)
+	case n >= 1_000:
+		if n%1_000 == 0 {
+			return fmt.Sprintf("%dk", n/1_000)
+		}
+		return fmt.Sprintf("%.1fk", float64(n)/1_000)
+	default:
+		return fmt.Sprintf("%d", n)
+	}
 }
 
 var modelsSetCmd = &cobra.Command{

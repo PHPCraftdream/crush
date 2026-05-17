@@ -57,6 +57,15 @@ func (s *hyperSync) Get(ctx context.Context) (catwalk.Provider, error) {
 			cached = hyper.Embedded()
 		}
 
+		// Fork patch (orchestrator UX): see catwalk.go's mirror of
+		// this block — TTL skip for the same reason (read-only
+		// `crush models show` latency).
+		if age, ageErr := s.cache.Age(); ageErr == nil && age < providerCacheTTL() && cached.ID != "" && cachedErr == nil {
+			slog.Debug("Hyper provider cache fresh, skipping fetch", "age", age, "ttl", providerCacheTTL())
+			s.result = cached
+			return
+		}
+
 		slog.Info("Fetching Hyper provider")
 		result, err := s.client.Get(ctx, etag)
 		if errors.Is(err, context.DeadlineExceeded) {
