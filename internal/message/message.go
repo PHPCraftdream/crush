@@ -153,7 +153,11 @@ func (s *service) Update(ctx context.Context, message Message) error {
 		return err
 	}
 	finishedAt := sql.NullInt64{}
-	if f := message.FinishPart(); f != nil {
+	// Fork patch: batch 8 — a Partial finish is NOT a real finish;
+	// finished_at stays NULL so the row is still "in progress".
+	// The auto-checkpoint ticker uses this to persist mid-stream state
+	// without confusing IsFinished / recovery.
+	if f := message.FinishPart(); f != nil && !f.Partial {
 		finishedAt.Int64 = f.Time
 		finishedAt.Valid = true
 	}

@@ -844,3 +844,132 @@ internal/cmd/claude_init.go             v6 → v7 marker, new "Sub-agent aggrega
 README.md                               --aggregation flag, sub_agent_outputs envelope field, reduction-loss warning
 CHANGELOG.fork.md                       this entry
 ```
+
+### Batch 8a — Multi-JSON extractor (side patch, 2026-05-17)
+
+Small models (GLM-5-turbo etc.) often emit prose preamble + JSON or even
+multiple JSON values separated by prose. The new `stripAndExtractJSON`
+replaces `stripAndValidateJSON` as the runtime entry point: it scans for
+ALL balanced JSON values, validates each, and wraps N≥2 into a JSON array
+with forensic notes. The old single-shot function is retained for existing
+tests.
+
+```
+internal/app/strip_json.go             findAllBalancedJSONValues, stripAndExtractJSON, buildStripNotes
+internal/app/strip_json_test.go        6 new TestStripAndExtractJSON_* tests
+internal/app/app.go                    route RunNonInteractive through stripAndExtractJSON
+CHANGELOG.fork.md                      this entry
+```
+
+### Batch 8 — Survive SIGTERM during final composition (2026-05-17)
+
+Four coordinated changes to prevent text loss when the process is killed
+during the final streaming phase:
+
+**1. Auto-checkpoint: periodic DB flush of in-progress assistant text.**
+A coalescing ticker goroutine inside `Run()` periodically clones the
+in-memory assistant message, adds `Finish{Partial: true}`, and calls
+`messages.Update` under `sessionLock`. The ticker only writes when
+`Parts` have actually changed (coalescing). The `Partial` finish marker
+does NOT set `finished_at` in DB and does NOT count as "finished" for
+`IsFinished()`. Default interval: 2s. Configurable via
+`Options.CheckpointIntervalSeconds` (>0 = that many seconds, -1 =
+explicitly disabled, 0 = use default). The goroutine is started on first
+`OnTextDelta` and stopped on `OnStepFinish`.
+
+**2. Smart timeout: `--timeout-extends-on-progress` resets deadline on
+streaming activity.** When enabled, the stream watchdog extends its
+deadline every time `bump()` is called (which happens on every streaming
+event). An absolute hard cap from start time is enforced via
+`--timeout-hard-cap` (0 = no cap). Without the flag, original idle-only
+behavior is preserved. Rate-limited INFO log for deadline extensions
+(every 30s). Flags are plumbed through `RunOverrides` →
+`Coordinator.SetAgentTimeoutOptions` → `SessionAgent.SetTimeoutOptions`.
+
+**3. Final composition log: INFO log when agent enters final text phase
+after tool boundaries.** A `sawToolBoundary` bool is set on every tool
+callback and reset after the first `OnTextDelta` that follows. When a
+text delta arrives after tool boundaries, a single `slog.Info` is
+emitted per step — a forensic marker for post-mortem debugging of
+"time from tool-use to final-text-started".
+
+**4. Recovery: `findOrphanPartial` surfaces orphan text in `--json`
+envelope.** Scans session messages backwards for the latest assistant
+with `IsPartial() && !IsFinished()`. Returns a `recoveredPartial`
+struct (`{message_id, chars, last_flush_at, text}`). When found, the
+JSON envelope gets `recovered_partial` populated and a WARN-level
+warning appended to `warnings[]`. Only the latest orphan is surfaced.
+
+Files touched:
+
+```
+internal/agent/agent.go                checkpoint ticker, final composition log, SetTimeoutOptions method
+internal/agent/agent_test.go           TestSetTimeoutOptions smoke test
+internal/agent/stream_watchdog.go      extendsOnProgress + hardCap deadline extension
+internal/agent/stream_watchdog_test.go 3 new ExtendsOnProgress tests
+internal/agent/checkpoint_test.go      new — 4 tests for Piece 1 checkpoint logic
+internal/agent/final_composition_test.go new — 3 tests for Piece 3 logging
+internal/agent/coordinator.go          wire checkpoint interval from config, SetAgentTimeoutOptions
+internal/agent/coordinator_test.go     mock SessionAgent.SetTimeoutOptions
+internal/message/content.go            Partial finish marker, IsPartial(), IsFinished() update
+internal/message/message.go            finished_at stays NULL for partial
+internal/config/config.go              CheckpointIntervalSeconds option
+internal/app/app.go                    runResult.RecoveredPartial, findOrphanPartial, RunOverrides wiring, SetAgentTimeoutOptions call
+internal/app/recovery_test.go          3 new TestFindOrphanPartial_* tests
+internal/cmd/run.go                    --timeout-extends-on-progress, --timeout-hard-cap flags
+CHANGELOG.fork.md                      this entry
+README.md                              flag table, envelope fields
+internal/cmd/claude_init.go            v7 → v8 marker, timeout/checkpoint/recovery section
+```
+
+### Batch 9 — claude-init always-replace, claude-del inverse, Markdown-first guideline (2026-05-17)
+
+Three coordinated changes:
+
+**1. `claude-init` always replaces.** Removed `--force` and `--replace`
+flags. Every invocation now strips ALL existing crush-claude-init blocks
+(any version) and writes a single fresh one. The slash command file
+`.claude/commands/crush.md` is overwritten if it carries our sentinel; a
+warning is printed if the file exists without the sentinel (someone else
+owns it).
+
+**2. `crush claude-del` (inverse).** New subcommand that undoes
+`claude-init`: strips all crush-claude-init blocks from CLAUDE.md
+(deletes the file if only our block was present), removes the slash
+command if it has our sentinel. Idempotent and safe.
+
+**3. Markdown-first output guideline.** Added "Output format: Markdown
+is usually fine" section to both the repo's own `CLAUDE.md` and the
+embedded `claude-init` template. Key idea: agents should default to
+Markdown; JSON only when a CI step, jq pipeline, or fan-out harness is
+the immediate consumer. Marker bumped v8 → v9.
+
+Files touched:
+
+```
+internal/cmd/claude_init.go            rewrite: remove --force/--replace, always replace; v9 marker + Markdown section
+internal/cmd/claude_del.go             new — inverse subcommand
+internal/cmd/claude_init_test.go       rewrite tests for new behaviour + 6 new claude-del tests
+CLAUDE.md                              Markdown-first guideline section
+README.md                              update bootstrap section (remove --force/--replace, add claude-del)
+CHANGELOG.fork.md                      this entry
+```
+
+### Batch 10 — Claude Haiku CLI model variants (2026-05-17)
+
+Add four `CLISpec` entries for Claude Haiku (`--model haiku`) to the
+`cliprovider.All` slice: `cli-claude-haiku`, `cli-claude-haiku-thinking`,
+`cli-npx-claude-haiku`, `cli-npx-claude-haiku-thinking`. ContextWindow set
+to 200_000 (Haiku 4.5 does not support 1M). Sonnet/Opus entries kept at
+1_000_000 — Opus 4.6+ supports 1M, confirmed via Anthropic docs. New
+test `TestAll_HaikuModelsRegistered` validates presence and context
+window for all four IDs.
+
+Files touched:
+
+```
+internal/agent/cliprovider/provider.go       4 new CLISpec entries in All
+internal/agent/cliprovider/provider_test.go   TestAll_HaikuModelsRegistered
+CHANGELOG.fork.md                             this entry
+README.md                                     mention Haiku in CLI provider table
+```

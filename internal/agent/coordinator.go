@@ -146,6 +146,10 @@ type Coordinator interface {
 	GetSystemPrompt() string
 	BuildSystemPrompt(ctx context.Context) (string, error)
 	UpdateSessionSystemPrompt(ctx context.Context, sessionID, prompt string) error
+	// SetAgentTimeoutOptions configures the stream watchdog's deadline
+	// extension on the current agent. Called from RunNonInteractive when
+	// --timeout-extends-on-progress is set. Fork patch: batch 8.
+	SetAgentTimeoutOptions(extendsOnProgress bool, hardCap time.Duration)
 }
 
 type coordinator struct {
@@ -219,6 +223,7 @@ func NewCoordinator(
 	c.agents[config.AgentCoder] = agent
 	return c, nil
 }
+
 // Run implements Coordinator.
 func (c *coordinator) Run(ctx context.Context, sessionID string, prompt string, attachments ...message.Attachment) (*fantasy.AgentResult, error) {
 	if err := c.readyWg.Wait(); err != nil {
@@ -714,6 +719,18 @@ func (c *coordinator) buildAgent(ctx context.Context, prompt *prompt.Prompt, age
 	if opts != nil && opts.StreamIdleTimeoutSeconds > 0 {
 		streamIdleTimeout = time.Duration(opts.StreamIdleTimeoutSeconds) * time.Second
 	}
+	// Fork patch: batch 8 — mid-stream checkpoint interval.
+	var checkpointInterval time.Duration
+	if opts != nil {
+		switch {
+		case opts.CheckpointIntervalSeconds > 0:
+			checkpointInterval = time.Duration(opts.CheckpointIntervalSeconds) * time.Second
+		case opts.CheckpointIntervalSeconds == -1:
+			checkpointInterval = 0 // explicitly disabled
+		default:
+			checkpointInterval = defaultCheckpointInterval
+		}
+	}
 	result := NewSessionAgent(SessionAgentOptions{
 		LargeModel:           large,
 		SmallModel:           small,
@@ -728,6 +745,7 @@ func (c *coordinator) buildAgent(ctx context.Context, prompt *prompt.Prompt, age
 		Notify:               c.notify,
 		StreamIdleTimeout:    streamIdleTimeout,
 		DataDirectory:        c.cfg.Config().Options.DataDirectory,
+		CheckpointInterval:   checkpointInterval, // Fork patch: batch 8
 	})
 
 	c.readyWg.Go(func() error {
@@ -1302,6 +1320,12 @@ func (c *coordinator) BuildSystemPrompt(ctx context.Context) (string, error) {
 
 func (c *coordinator) UpdateSessionSystemPrompt(ctx context.Context, sessionID, prompt string) error {
 	return c.sessions.UpdateSystemPrompt(ctx, sessionID, prompt)
+}
+
+// SetAgentTimeoutOptions delegates to the current agent's SetTimeoutOptions.
+// Fork patch: batch 8.
+func (c *coordinator) SetAgentTimeoutOptions(extendsOnProgress bool, hardCap time.Duration) {
+	c.currentAgent.SetTimeoutOptions(extendsOnProgress, hardCap)
 }
 
 func (c *coordinator) UpdateModels(ctx context.Context) error {

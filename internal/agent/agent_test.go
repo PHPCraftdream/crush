@@ -831,3 +831,19 @@ func TestProviderRetryLogFields(t *testing.T) {
 		}, fields)
 	})
 }
+
+// TestSetTimeoutOptions verifies that SetTimeoutOptions populates the internal
+// fields on the sessionAgent. Fork patch: batch 8.
+func TestSetTimeoutOptions(t *testing.T) {
+	env := testEnv(t)
+	sa := testSessionAgent(env, nil, nil, "test prompt")
+	agent := sa.(*sessionAgent)
+
+	require.False(t, agent.timeoutExtendsOnProgress, "default should be false")
+	require.Zero(t, agent.timeoutHardCap, "default should be 0")
+
+	sa.SetTimeoutOptions(true, 30*time.Second)
+
+	assert.True(t, agent.timeoutExtendsOnProgress)
+	assert.Equal(t, 30*time.Second, agent.timeoutHardCap)
+}

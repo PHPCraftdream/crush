@@ -90,7 +90,7 @@ func New(ctx context.Context, conn *sql.DB, store *config.ConfigStore) (*App, er
 
 		config:             store,
 		agentNotifications: pubsub.NewBroker[notify.Notification](),
-		events:            pubsub.NewBroker[any](),
+		events:             pubsub.NewBroker[any](),
 	}
 
 	// Check for updates in the background.
@@ -237,7 +237,7 @@ func (app *App) resolveSession(ctx context.Context, continueSessionID string, us
 // runResult is the JSON shape emitted by `crush run --json`. Wire-stable:
 // fields here are part of the public contract for wrapper scripts.
 type runResult struct {
-	SessionID  string `json:"session_id"`
+	SessionID string `json:"session_id"`
 	// ExitReason vocabulary:
 	//   "stop","end_turn","tool_use","max_tokens","unknown"  — model-level
 	//   "error"                                              — generic
@@ -282,6 +282,20 @@ type runResult struct {
 	ToolCalls  []toolCallStat `json:"tool_calls"`
 	Usage      usageInfo      `json:"usage"`
 	DurationMs int64          `json:"duration_ms"`
+	// RecoveredPartial is set when the session had an orphan assistant
+	// message from a previous interrupted run (detected by IsPartial()
+	// on the latest unfinished assistant row). Contains the partial text
+	// so the orchestrator can salvage it. Fork patch: batch 8.
+	RecoveredPartial *recoveredPartial `json:"recovered_partial,omitempty"`
+}
+
+// recoveredPartial describes an orphaned partial assistant message found
+// during session recovery. Fork patch: batch 8.
+type recoveredPartial struct {
+	MessageID   string `json:"message_id"`
+	Chars       int    `json:"chars"`
+	LastFlushAt int64  `json:"last_flush_at"`
+	Text        string `json:"text,omitempty"`
 }
 
 type toolCallStat struct {
@@ -321,7 +335,7 @@ type usageInfo struct {
 // stripJSONEnvelope and the model had wrapped the JSON; "" otherwise.
 //
 // strippedBytes / stripErrMsg / stripErrReason are populated by the
-// JSON validation step (stripAndValidateJSON). stripErrReason, when
+// JSON validation step (stripAndExtractJSON). stripErrReason, when
 // non-empty, OVERRIDES the model's finalReason so the envelope tells
 // the orchestrator "you asked for JSON, it didn't validate" instead of
 // the model's optimistic "stop"/"end_turn".
@@ -507,6 +521,19 @@ type RunOverrides struct {
 	// the structured set even if parent over-summarised.
 	// See run_format.go and the 2026-05-17 session-#3 audit feedback.
 	AggregationMode string
+	// CheckpointInterval, when > 0, enables mid-stream auto-checkpointing
+	// of the in-progress assistant Parts to DB. Bounds text loss on
+	// SIGTERM during final composition. 0 (default) = disabled.
+	// Fork patch: batch 8.
+	CheckpointInterval time.Duration
+	// TimeoutExtendsOnProgress, when true, makes the stream watchdog
+	// reset its deadline every time streaming progress occurs.
+	// Fork patch: batch 8.
+	TimeoutExtendsOnProgress bool
+	// TimeoutHardCap is the maximum wall-clock time the watchdog will
+	// allow even with continuous progress. 0 = no cap.
+	// Fork patch: batch 8.
+	TimeoutHardCap time.Duration
 }
 
 // RunNonInteractive runs a single agent turn and writes its result to
@@ -609,6 +636,15 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt 
 	// session.
 	app.Permissions.AutoApproveSession(sess.ID)
 
+	// Fork patch: batch 8 — wire per-invocation timeout extension flags to
+	// the coordinator's agent before the run starts.
+	if overrides.TimeoutExtendsOnProgress || overrides.TimeoutHardCap > 0 {
+		app.AgentCoordinator.SetAgentTimeoutOptions(
+			overrides.TimeoutExtendsOnProgress,
+			overrides.TimeoutHardCap,
+		)
+	}
+
 	type response struct {
 		result *fantasy.AgentResult
 		err    error
@@ -634,10 +670,10 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt 
 	messageEvents := app.Messages.Subscribe(ctx)
 	messageReadBytes := make(map[string]int)
 	seenToolCalls := make(map[string]bool)
-	toolCallCounts := make(map[string]int) // name → count, for JSON output
-	printedFinal := make(map[string]bool)  // for terse mode: print once per finished assistant msg
-	var finalText string                    // last assistant FullText seen, for JSON output
-	var finalReason string                  // last assistant Finish.Reason seen, for JSON output
+	toolCallCounts := make(map[string]int)    // name → count, for JSON output
+	printedFinal := make(map[string]bool)     // for terse mode: print once per finished assistant msg
+	var finalText string                      // last assistant FullText seen, for JSON output
+	var finalReason string                    // last assistant Finish.Reason seen, for JSON output
 	var finalErrTitle, finalErrDetails string // Finish.Message + Finish.Details, surfaced into envelope.Error when reason=error
 	var printed bool
 
@@ -677,22 +713,21 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt 
 				// here so wrappers can pipe final_text straight into
 				// jq. The original is preserved in assistant_notes.
 				//
-				// stripAndValidateJSON ALSO runs json.Valid on the
-				// stripped output; on failure it surfaces the original
-				// in final_text + the (invalid) candidate in
-				// assistant_notes + a wrapped ErrInvalidStripJSON so
-				// the envelope reports exit_reason=invalid_json. This
-				// closes the silent-success failure mode reported in
-				// the 2026-05-17 audit feedback (model emitted a JSON
-				// missing a closing bracket, walker said "balanced",
-				// orchestrator spent an hour in node-repl).
+				// Fork patch (orchestrator UX): stripAndExtractJSON handles
+				// the common small-model failure mode: prose preamble + JSON,
+				// or even multiple JSON values separated by prose (observed
+				// with GLM-5-turbo). Returns a wrapped JSON array when N≥2
+				// valid values are found, a single value for N=1, and
+				// ErrInvalidStripJSON for N=0 (original text preserved in
+				// final_text so the orchestrator can inspect what the model
+				// actually said).
 				finalTextOut := finalText
 				assistantNotes := ""
 				strippedBytes := 0
 				stripErr := ""
 				stripErrReason := ""
 				if overrides.StripJSONFences && finalReason != "error" && finalReason != "canceled" {
-					cleaned, notes, vErr := stripAndValidateJSON(finalText)
+					cleaned, notes, vErr := stripAndExtractJSON(finalText)
 					finalTextOut = cleaned
 					assistantNotes = notes
 					strippedBytes = len(finalText) - len(cleaned)
@@ -748,6 +783,14 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt 
 					strippedBytes, stripErr, stripErrReason,
 					subOutputs, reductionWarning,
 				)
+				// Fork patch: batch 8 — surface orphan partial text.
+				if partial := app.findOrphanPartial(ctx, sess.ID); partial != nil {
+					summary.RecoveredPartial = partial
+					summary.Warnings = append(summary.Warnings, fmt.Sprintf(
+						"recovered %d chars of partial assistant text from session %s — model run was interrupted",
+						partial.Chars, sess.ID,
+					))
+				}
 				enc := json.NewEncoder(output)
 				if encErr := enc.Encode(summary); encErr != nil {
 					return fmt.Errorf("failed to encode JSON result: %w", encErr)
@@ -1061,6 +1104,41 @@ func (app *App) recoverInterruptedTurns(ctx context.Context) {
 			"elapsed", elapsed.String(),
 		)
 	}
+}
+
+// findOrphanPartial scans the session for the latest assistant message that
+// has a Partial finish (mid-stream checkpoint) and is unfinished. Used by
+// RunNonInteractive to surface recovered text in the envelope.
+// Returns nil if no orphan found. Fork patch: batch 8.
+func (app *App) findOrphanPartial(ctx context.Context, sessionID string) *recoveredPartial {
+	msgs, err := app.Messages.List(ctx, sessionID)
+	if err != nil {
+		return nil
+	}
+	// Find the LATEST assistant message that is partial and unfinished.
+	for i := len(msgs) - 1; i >= 0; i-- {
+		m := msgs[i]
+		if m.Role != message.Assistant {
+			continue
+		}
+		if m.IsPartial() && !m.IsFinished() {
+			text := m.FullText()
+			var lastFlushAt int64
+			if f := m.FinishPart(); f != nil {
+				lastFlushAt = f.Time
+			}
+			return &recoveredPartial{
+				MessageID:   m.ID,
+				Chars:       len(text),
+				LastFlushAt: lastFlushAt,
+				Text:        text,
+			}
+		}
+		// Only surface the LATEST orphan — stop at the first assistant
+		// message we encounter (going backwards).
+		break
+	}
+	return nil
 }
 
 // Shutdown performs a graceful shutdown of the application.

@@ -1,6 +1,7 @@
 package app
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -147,4 +148,70 @@ func TestStripJSONEnvelope_RealShamirDBExample(t *testing.T) {
 	cleaned, notes := stripJSONEnvelope(in)
 	assert.Equal(t, `{"findings":[{"severity":"medium","id":"§C2","loc":"executor.rs:199"}]}`, cleaned)
 	assert.Contains(t, notes, "У меня есть все данные")
+}
+
+// --- stripAndExtractJSON tests (fork patch: multi-JSON extractor) ---
+
+func TestStripAndExtractJSON_SingleObjectNoPreamble(t *testing.T) {
+	cleaned, notes, err := stripAndExtractJSON(`{"findings":[1,2,3]}`)
+	require.NoError(t, err)
+	assert.Equal(t, `{"findings":[1,2,3]}`, cleaned)
+	assert.Empty(t, notes)
+}
+
+func TestStripAndExtractJSON_PreambleStrippedSingleObject(t *testing.T) {
+	in := "I have all the data. Final answer:\n\n{\"findings\":2}"
+	cleaned, notes, err := stripAndExtractJSON(in)
+	require.NoError(t, err)
+	assert.Equal(t, `{"findings":2}`, cleaned)
+	assert.NotEmpty(t, notes)
+	assert.Contains(t, notes, "I have all the data")
+}
+
+func TestStripAndExtractJSON_TwoObjectsWithProseBetween(t *testing.T) {
+	in := "Here is the first result: {\"a\":1} and then more prose before the second: {\"b\":2}"
+	cleaned, notes, err := stripAndExtractJSON(in)
+	require.NoError(t, err)
+	assert.True(t, json.Valid([]byte(cleaned)), "wrapped result must be valid JSON")
+
+	// The result should be a JSON array containing both objects.
+	var arr []json.RawMessage
+	require.NoError(t, json.Unmarshal([]byte(cleaned), &arr))
+	require.Len(t, arr, 2)
+	assert.Equal(t, `{"a":1}`, string(arr[0]))
+	assert.Equal(t, `{"b":2}`, string(arr[1]))
+
+	assert.Contains(t, notes, "extracted 2 JSON values")
+}
+
+func TestStripAndExtractJSON_OneValidOneInvalid(t *testing.T) {
+	// One balanced+valid object, one balanced-but-invalid (trailing comma).
+	in := "First: {\"a\":1} then invalid: {\"b\":2,}"
+	cleaned, notes, err := stripAndExtractJSON(in)
+	require.NoError(t, err)
+	// Only the valid one should be returned — no array wrap for single result.
+	assert.Equal(t, `{"a":1}`, cleaned)
+	assert.NotEmpty(t, notes)
+}
+
+func TestStripAndExtractJSON_AllInvalid(t *testing.T) {
+	in := "Here is broken JSON: {\"k\":\"v"
+	cleaned, _, err := stripAndExtractJSON(in)
+	require.ErrorIs(t, err, ErrInvalidStripJSON)
+	assert.Equal(t, in, cleaned, "original text preserved on total failure")
+}
+
+func TestStripAndExtractJSON_FencedBlockMultiple(t *testing.T) {
+	in := "```json\n{\"a\":1}{\"b\":2}\n```"
+	cleaned, notes, err := stripAndExtractJSON(in)
+	require.NoError(t, err)
+	assert.True(t, json.Valid([]byte(cleaned)), "wrapped result must be valid JSON")
+
+	var arr []json.RawMessage
+	require.NoError(t, json.Unmarshal([]byte(cleaned), &arr))
+	require.Len(t, arr, 2)
+	assert.Equal(t, `{"a":1}`, string(arr[0]))
+	assert.Equal(t, `{"b":2}`, string(arr[1]))
+
+	assert.Contains(t, notes, "extracted 2 JSON values")
 }

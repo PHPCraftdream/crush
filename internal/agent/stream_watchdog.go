@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"log/slog"
 	"sync/atomic"
 	"time"
 )
@@ -35,16 +36,57 @@ type streamWatchdog struct {
 // onFire, if non-nil, is invoked AFTER stalled is set to true and BEFORE
 // cancel() — typically used to emit a slog.Warn with diagnostic context the
 // watchdog itself does not have (session ID, model, provider, etc.).
+//
+// Fork patch: batch 8 — extendsOnProgress + hardCap parameters.
+// When extendsOnProgress is true, every bump() also extends the effective
+// deadline to max(absoluteDeadline, now+idleTimeout), capped at hardCap
+// from the start time. This prevents killing healthy long compositions
+// while still bounding the worst case.
 func startStreamWatchdog(
 	ctx context.Context,
 	cancel context.CancelFunc,
 	idleTimeout, tick time.Duration,
 	onFire func(idle time.Duration),
+	extendsOnProgress bool,
+	hardCap time.Duration,
 ) streamWatchdog {
 	var last atomic.Int64
-	last.Store(time.Now().UnixNano())
+	startTime := time.Now()
+	last.Store(startTime.UnixNano())
 	var stalled atomic.Bool
+	// absoluteDeadline is the original deadline from process start.
+	absoluteDeadline := startTime.Add(idleTimeout)
+	// hardDeadline is the hard cap (e.g. 4x idleTimeout).
+	hardDeadline := absoluteDeadline
+	if hardCap > 0 {
+		hardDeadline = startTime.Add(hardCap)
+	}
 	done := make(chan struct{})
+
+	// Rate-limited logging for deadline extensions.
+	var lastLogNanos atomic.Int64
+	const logInterval = 30 * time.Second
+
+	bump := func() {
+		now := time.Now()
+		last.Store(now.UnixNano())
+		if extendsOnProgress {
+			// Extend the absolute deadline, capped at hardDeadline.
+			newDeadline := now.Add(idleTimeout)
+			if newDeadline.After(hardDeadline) {
+				newDeadline = hardDeadline
+			}
+			// Rate-limited INFO log for extensions.
+			if now.UnixNano()-lastLogNanos.Load() > int64(logInterval) {
+				lastLogNanos.Store(now.UnixNano())
+				slog.Info("stream-watchdog deadline extended",
+					"new_deadline", newDeadline.Format(time.RFC3339),
+					"reason", "progress",
+				)
+			}
+		}
+	}
+
 	go func() {
 		defer close(done)
 		ticker := time.NewTicker(tick)
@@ -54,25 +96,46 @@ func startStreamWatchdog(
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				idle := time.Since(time.Unix(0, last.Load()))
-				if idle >= idleTimeout {
-					stalled.Store(true)
-					// Cancel FIRST so the unblock isn't gated on whatever
-					// onFire does. onFire is typically a slog.Warn, which
-					// is fast in default config, but a third-party handler
-					// (Datadog/Loki/etc.) could do network I/O — that
-					// must not delay surfacing control to the caller.
-					cancel()
-					if onFire != nil {
-						onFire(idle)
+				lastActivity := time.Unix(0, last.Load())
+				now := time.Now()
+				idle := now.Sub(lastActivity)
+
+				if extendsOnProgress {
+					// Effective deadline: max(absoluteDeadline,
+					// lastActivity+idleTimeout), capped at hardDeadline.
+					effectiveDeadline := absoluteDeadline
+					extended := lastActivity.Add(idleTimeout)
+					if extended.After(effectiveDeadline) {
+						effectiveDeadline = extended
 					}
-					return
+					if effectiveDeadline.After(hardDeadline) {
+						effectiveDeadline = hardDeadline
+					}
+					if now.After(effectiveDeadline) {
+						stalled.Store(true)
+						cancel()
+						if onFire != nil {
+							onFire(idle)
+						}
+						return
+					}
+				} else {
+					// Original behavior: fire if idle since last
+					// activity exceeds idleTimeout.
+					if idle >= idleTimeout {
+						stalled.Store(true)
+						cancel()
+						if onFire != nil {
+							onFire(idle)
+						}
+						return
+					}
 				}
 			}
 		}
 	}()
 	return streamWatchdog{
-		bump:    func() { last.Store(time.Now().UnixNano()) },
+		bump:    bump,
 		stalled: &stalled,
 		done:    done,
 	}

@@ -1139,6 +1139,35 @@ func TestCodexSpecsHaveCorrectBinary(t *testing.T) {
 	}
 }
 
+func TestAll_HaikuModelsRegistered(t *testing.T) {
+	want := []string{
+		"cli-claude-haiku",
+		"cli-claude-haiku-thinking",
+		"cli-npx-claude-haiku",
+		"cli-npx-claude-haiku-thinking",
+	}
+	byID := make(map[string]CLISpec, len(All))
+	for _, s := range All {
+		byID[s.ModelID] = s
+	}
+	for _, id := range want {
+		spec, ok := byID[id]
+		if !ok {
+			t.Errorf("missing expected spec %q in All", id)
+			continue
+		}
+		if spec.ContextWindow != 200_000 {
+			t.Errorf("spec %q ContextWindow = %d, want 200_000", id, spec.ContextWindow)
+		}
+		if spec.NewPartParser == nil {
+			t.Errorf("spec %q has nil NewPartParser", id)
+		}
+		if spec.ParseUsageLine == nil {
+			t.Errorf("spec %q has nil ParseUsageLine", id)
+		}
+	}
+}
+
 func contains(ss []string, s string) bool {
 	for _, v := range ss {
 		if v == s {

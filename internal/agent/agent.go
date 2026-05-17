@@ -79,6 +79,15 @@ const (
 	// promptly (well under streamIdleTimeout) but large enough not to
 	// dominate logs.
 	streamWatchdogTick = 30 * time.Second
+
+	// defaultCheckpointInterval is the default coalescing interval for
+	// mid-stream DB flushes of in-progress assistant text. When > 0,
+	// the auto-checkpoint ticker writes the Parts to DB at most once
+	// per interval, bounding the text lost to a SIGTERM during final
+	// composition. 0 disables checkpointing. Overridden by
+	// SessionAgentOptions.CheckpointInterval.
+	// Fork patch: batch 8.
+	defaultCheckpointInterval = 2 * time.Second
 )
 
 var userAgent = fmt.Sprintf("Charm-Crush/%s (https://charm.land/crush)", version.Version)
@@ -143,6 +152,11 @@ type SessionAgent interface {
 	TakeSummarizeQueue(sessionID string) (fantasy.ProviderOptions, bool)
 	// CancelQueuedSummarize removes a pending summarise from the queue.
 	CancelQueuedSummarize(sessionID string)
+	// SetTimeoutOptions configures the stream watchdog's deadline extension
+	// behaviour for the next and subsequent Run() calls. Called from
+	// RunNonInteractive when --timeout-extends-on-progress is set.
+	// Fork patch: batch 8.
+	SetTimeoutOptions(extendsOnProgress bool, hardCap time.Duration)
 	Model() Model
 }
 
@@ -174,6 +188,19 @@ type sessionAgent struct {
 	// inter-process file lock. Empty means locking is disabled (legacy
 	// callers / tests). Plumbed from SessionAgentOptions.DataDirectory.
 	dataDir string
+	// checkpointInterval is plumbed from SessionAgentOptions.
+	// When > 0 the Run method starts a coalescing ticker that flushes
+	// in-memory streaming Parts to DB mid-step, bounding text loss on
+	// SIGTERM. Fork patch: batch 8.
+	checkpointInterval time.Duration
+	// timeoutExtendsOnProgress, when true, makes the stream watchdog
+	// extend its deadline every time streaming progress occurs.
+	// Fork patch: batch 8.
+	timeoutExtendsOnProgress bool
+	// timeoutHardCap is the maximum wall-clock time the watchdog will
+	// allow, even with continuous progress. 0 = no cap.
+	// Fork patch: batch 8.
+	timeoutHardCap time.Duration
 
 	messageQueue   *csync.Map[string, []SessionAgentCall]
 	activeRequests *csync.Map[string, context.CancelFunc]
@@ -202,29 +229,58 @@ type SessionAgentOptions struct {
 	// crush processes from accidentally working on the same session
 	// id — see internal/session/lock.go).
 	DataDirectory string
+	// CheckpointInterval controls how often in-progress streaming
+	// text is flushed to the DB mid-step. When > 0, a coalescing
+	// ticker writes the in-memory Parts to the message row (with
+	// finished_at still NULL) at most once per interval — but only
+	// when Parts have actually changed since the last flush. This
+	// bounds the text lost to a SIGTERM during final composition.
+	// 0 (default) disables mid-stream checkpointing entirely.
+	// Fork patch: batch 8 — see CHANGELOG.fork.md section 6.
+	CheckpointInterval time.Duration
+	// TimeoutExtendsOnProgress, when true, makes the stream watchdog
+	// reset its deadline every time streaming progress occurs. This
+	// prevents killing healthy long compositions. Default: false.
+	// Fork patch: batch 8.
+	TimeoutExtendsOnProgress bool
+	// TimeoutHardCap is the maximum wall-clock time the watchdog will
+	// allow even with continuous progress. Default: 0 (no cap, but
+	// callers typically set 4x the idle timeout when extending).
+	// Fork patch: batch 8.
+	TimeoutHardCap time.Duration
 }
 
 func NewSessionAgent(
 	opts SessionAgentOptions,
 ) SessionAgent {
 	return &sessionAgent{
-		largeModel:           csync.NewValue(opts.LargeModel),
-		smallModel:           csync.NewValue(opts.SmallModel),
-		systemPromptPrefix:   csync.NewValue(opts.SystemPromptPrefix),
-		systemPrompt:         csync.NewValue(opts.SystemPrompt),
-		isSubAgent:           opts.IsSubAgent,
-		sessions:             opts.Sessions,
-		messages:             opts.Messages,
-		disableAutoSummarize: opts.DisableAutoSummarize,
-		tools:                csync.NewSliceFrom(opts.Tools),
-		isYolo:               opts.IsYolo,
-		notify:               opts.Notify,
-		messageQueue:         csync.NewMap[string, []SessionAgentCall](),
-		activeRequests:       csync.NewMap[string, context.CancelFunc](),
-		summarizeQueue:       csync.NewMap[string, fantasy.ProviderOptions](),
-		streamIdleTimeout:    opts.StreamIdleTimeout,
-		dataDir:              opts.DataDirectory,
+		largeModel:               csync.NewValue(opts.LargeModel),
+		smallModel:               csync.NewValue(opts.SmallModel),
+		systemPromptPrefix:       csync.NewValue(opts.SystemPromptPrefix),
+		systemPrompt:             csync.NewValue(opts.SystemPrompt),
+		isSubAgent:               opts.IsSubAgent,
+		sessions:                 opts.Sessions,
+		messages:                 opts.Messages,
+		disableAutoSummarize:     opts.DisableAutoSummarize,
+		tools:                    csync.NewSliceFrom(opts.Tools),
+		isYolo:                   opts.IsYolo,
+		notify:                   opts.Notify,
+		messageQueue:             csync.NewMap[string, []SessionAgentCall](),
+		activeRequests:           csync.NewMap[string, context.CancelFunc](),
+		summarizeQueue:           csync.NewMap[string, fantasy.ProviderOptions](),
+		streamIdleTimeout:        opts.StreamIdleTimeout,
+		dataDir:                  opts.DataDirectory,
+		checkpointInterval:       opts.CheckpointInterval,
+		timeoutExtendsOnProgress: opts.TimeoutExtendsOnProgress,
+		timeoutHardCap:           opts.TimeoutHardCap,
 	}
+}
+
+// SetTimeoutOptions configures the stream watchdog deadline extension.
+// Fork patch: batch 8.
+func (a *sessionAgent) SetTimeoutOptions(extendsOnProgress bool, hardCap time.Duration) {
+	a.timeoutExtendsOnProgress = extendsOnProgress
+	a.timeoutHardCap = hardCap
 }
 
 func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy.AgentResult, error) {
@@ -378,6 +434,8 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 				"threshold", idleTimeout.String(),
 			)
 		},
+		a.timeoutExtendsOnProgress, // Fork patch: batch 8
+		a.timeoutHardCap,           // Fork patch: batch 8
 	)
 	bumpActivity := wd.bump
 	// Defer order matters: <-wd.done is deferred FIRST so it runs LAST
@@ -394,13 +452,82 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 
 	history, files := a.preparePrompt(msgs, currentSession.Todos, call.Attachments...)
 
-
 	var currentAssistant *message.Message
 	var shouldSummarize bool
 
 	// bgSummarizeLaunched ensures we launch at most one background
 	// summarisation per Run() call (fired the first time we trim the window).
 	var bgSummarizeLaunched bool
+
+	// Fork patch: batch 8 — auto-checkpoint state for mid-stream
+	// persistence. See CHANGELOG.fork.md section 6.
+	//
+	// Invariant: sessionLock (already declared above) protects
+	// currentAssistant.Parts for all DB writes. The checkpoint
+	// goroutine acquires sessionLock before reading Parts and
+	// calling Update. The streaming callbacks that mutate Parts
+	// (OnTextDelta, OnToolInputStart, etc.) also hold sessionLock
+	// at their DB-write points. OnStepFinish drains the ticker
+	// and stops the goroutine before its final write.
+	var checkpointPartsLen int // last-flushed len(Parts), for coalescing
+	checkpointDone := make(chan struct{})
+	checkpointStarted := false
+	startCheckpoint := func() {
+		if a.checkpointInterval <= 0 || checkpointStarted {
+			return
+		}
+		checkpointStarted = true
+		go func() {
+			defer close(checkpointDone)
+			ticker := time.NewTicker(a.checkpointInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-genCtx.Done():
+					return
+				case <-ticker.C:
+					sessionLock.Lock()
+					if currentAssistant != nil && len(currentAssistant.Parts) != checkpointPartsLen {
+						// Snapshot the current Parts into a clone
+						// with a Partial Finish marker so the row
+						// is recognisable as mid-stream on recovery.
+						snap := currentAssistant.Clone()
+						snap.AddFinish(message.FinishReasonUnknown, "", "")
+						// Mark Partial on the just-added finish.
+						for i := len(snap.Parts) - 1; i >= 0; i-- {
+							if f, ok := snap.Parts[i].(message.Finish); ok {
+								f.Partial = true
+								snap.Parts[i] = f
+								break
+							}
+						}
+						if err := a.messages.Update(genCtx, snap); err != nil {
+							slog.Debug("agent: checkpoint flush failed",
+								"session_id", call.SessionID,
+								"message_id", snap.ID,
+								"err", err,
+							)
+						} else {
+							checkpointPartsLen = len(currentAssistant.Parts)
+						}
+					}
+					sessionLock.Unlock()
+				}
+			}
+		}()
+	}
+	stopCheckpoint := func() {
+		if checkpointStarted {
+			// The ticker goroutine exits on genCtx.Done (which
+			// fires on cancel() or natural completion). Just wait.
+			select {
+			case <-checkpointDone:
+			case <-time.After(5 * time.Second):
+				// Defensive: don't block the critical path.
+			}
+		}
+	}
+	_ = stopCheckpoint // used in OnStepFinish below
 
 	// latestMsgCh holds at most one pending UI snapshot (latest-value semantics).
 	// A ticker goroutine drains it at ~20fps, decoupling the token arrival rate
@@ -452,6 +579,11 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 		}
 		return nil
 	}
+
+	// Fork patch: batch 8 — track final composition phase for forensic
+	// logging. Set to true on each tool boundary; OnTextDelta checks and
+	// resets it to emit at most once per step.
+	sawToolBoundary := true
 
 	// Don't send MaxOutputTokens if 0 — some providers (e.g. LM Studio) reject it
 	var maxOutputTokens *int64
@@ -607,6 +739,21 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 		},
 		OnTextDelta: func(id string, text string) error {
 			bumpActivity()
+			// Fork patch: batch 8 — start the checkpoint ticker on the
+			// first text delta of this step (lazily, once only).
+			startCheckpoint()
+			// Fork patch: batch 8 — emit final-composition log at most
+			// once per step, on the first text delta after a tool boundary.
+			if sawToolBoundary && currentAssistant != nil {
+				sawToolBoundary = false
+				sessionLock.Lock()
+				slog.Info("agent: final composition started",
+					"session_id", call.SessionID,
+					"message_id", currentAssistant.ID,
+					"chars_in_message_so_far", len(currentAssistant.FullText()),
+				)
+				sessionLock.Unlock()
+			}
 			// Strip leading newline from initial text content. This is is
 			// particularly important in non-interactive mode where leading
 			// newlines are very visible.
@@ -619,6 +766,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 		},
 		OnToolInputStart: func(id string, toolName string) error {
 			bumpActivity()
+			sawToolBoundary = true // Fork patch: batch 8
 			toolCall := message.ToolCall{
 				ID:               id,
 				Name:             toolName,
@@ -646,6 +794,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 		},
 		OnToolCall: func(tc fantasy.ToolCallContent) error {
 			bumpActivity()
+			sawToolBoundary = true // Fork patch: batch 8
 			toolCall := message.ToolCall{
 				ID:               tc.ToolCallID,
 				Name:             tc.ToolName,
@@ -660,6 +809,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 		},
 		OnToolResult: func(result fantasy.ToolResultContent) error {
 			bumpActivity()
+			sawToolBoundary = true // Fork patch: batch 8
 			toolResult := a.convertToToolResult(result)
 			// Use parent ctx instead of genCtx to ensure the message is created
 			// even if the request is canceled mid-stream
@@ -673,6 +823,10 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 		},
 		OnStepFinish: func(stepResult fantasy.StepResult) error {
 			bumpActivity()
+			// Fork patch: batch 8 — stop the checkpoint ticker BEFORE the
+			// final write so the ticker doesn't race with OnStepFinish.
+			stopCheckpoint()
+			sawToolBoundary = true // Fork patch: batch 8 — reset for next step
 			finishReason := message.FinishReasonUnknown
 			switch stepResult.FinishReason {
 			case fantasy.FinishReasonLength:
@@ -775,7 +929,6 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			},
 		},
 	})
-
 
 	if err != nil {
 		isHyper := largeModel.ModelCfg.Provider == hyper.Name
@@ -1687,7 +1840,6 @@ func (a *sessionAgent) updateSessionUsage(model Model, session *session.Session,
 		modelConfig.CostPer1MOutCached/1e6*float64(usage.CacheReadTokens) +
 		modelConfig.CostPer1MIn/1e6*float64(usage.InputTokens) +
 		modelConfig.CostPer1MOut/1e6*float64(usage.OutputTokens)
-
 
 	// Use override cost if available (e.g., from OpenRouter).
 	if overrideCost != nil {

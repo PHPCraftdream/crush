@@ -338,6 +338,11 @@ type Options struct {
 	// disable retries — surface stall on first occurrence"). Built-in
 	// default is 2 retries (3 total attempts).
 	StreamStallRetries *int `json:"stream_stall_retries,omitempty" jsonschema:"description=Number of automatic retries after a Stream stalled finish. Omit to use the default (2 retries\\, 3 total attempts). 0 = disabled. Useful under parallel-session provider load. Exponential backoff: 10s\\, 30s\\, 90s.,example=3"`
+	// Fork patch: batch 8 — mid-stream auto-checkpoint interval.
+	// When > 0, the agent flushes in-progress streaming Parts to DB
+	// at most once per this interval, bounding text lost to SIGTERM
+	// during final composition. 0 = use the default (2s). -1 = disable.
+	CheckpointIntervalSeconds int `json:"checkpoint_interval_seconds,omitempty" jsonschema:"description=Mid-stream auto-checkpoint interval in seconds. Flushes in-progress assistant text to DB so SIGTERM during final composition does not lose work. Default 2. 0 = use default. -1 = disable.,default=0,example=5"`
 }
 
 type MCPs map[string]MCPConfig

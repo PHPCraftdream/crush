@@ -237,9 +237,12 @@ crush run --timeout 5m --session "long-task" "refactor the storage layer"
 			// the sub-agent dispatch policy; --aggregation controls how
 			// sub-agent fan-out output reaches the orchestrator. See
 			// run_format.go.
-			formatFlag, _      = cmd.Flags().GetString("format")
-			agentsMode, _      = cmd.Flags().GetString("agents")
-			aggregationMode, _ = cmd.Flags().GetString("aggregation")
+			formatFlag, _                = cmd.Flags().GetString("format")
+			agentsMode, _                = cmd.Flags().GetString("agents")
+			aggregationMode, _           = cmd.Flags().GetString("aggregation")
+			// Fork patch: batch 8 — timeout extension flags.
+			timeoutExtendsOnProgress, _ = cmd.Flags().GetBool("timeout-extends-on-progress")
+			timeoutHardCap, _           = cmd.Flags().GetDuration("timeout-hard-cap")
 		)
 
 		if effort != "" {
@@ -397,27 +400,17 @@ crush run --timeout 5m --session "long-task" "refactor the storage layer"
 		// JSON mode forces quiet (hide spinner) so the spinner glyphs don't
 		// leak into stdout. The summary line on stderr we still emit.
 		hideSpinner := quiet || verbose || asJSON
-		overrides := app.RunOverrides{
-			LargeModel:      largeModel,
-			SmallModel:      smallModel,
-			SystemPrompt:    systemPrompt,
-			ReasoningEffort: effort,
-			RoleLarge:       roleLarge,
-			// Fork patch (orchestrator UX): the two new fields.
-			//
-			// StripJSONFences activates ONLY when --format json (or
-			// --format json-schema:*) was passed. --json by itself is
-			// purely an *envelope* shape — the operator may want the
-			// envelope and a markdown final_text inside. Wiring
-			// --json into the trigger (the original batch-6 code) was
-			// a false-positive trap: every plain `crush run --json`
-			// against a model returning markdown got
-			// exit_reason="invalid_json". See the 2026-05-17 session
-			// #3 audit feedback. The envelope vs content shape are
-			// orthogonal.
-			DisableSubAgents: agentsDisable,
-			StripJSONFences:  formatFlag == "json" || strings.HasPrefix(formatFlag, "json-schema:"),
-			AggregationMode:  aggregationMode,
+			overrides := app.RunOverrides{
+			LargeModel:               largeModel,
+			SmallModel:               smallModel,
+			SystemPrompt:             systemPrompt,
+			ReasoningEffort:          effort,
+			RoleLarge:                roleLarge,
+			DisableSubAgents:         agentsDisable,
+			StripJSONFences:          formatFlag == "json" || strings.HasPrefix(formatFlag, "json-schema:"),
+			AggregationMode:          aggregationMode,
+			TimeoutExtendsOnProgress: timeoutExtendsOnProgress, // Fork patch: batch 8
+			TimeoutHardCap:           timeoutHardCap,           // Fork patch: batch 8
 		}
 		return a.RunNonInteractive(ctx, os.Stdout, prompt, overrides, hideSpinner, mode, sessionID, useLast)
 	},
@@ -442,6 +435,9 @@ func init() {
 	runCmd.Flags().String("format", "", "Per-turn output-shape hint appended to the user prompt. Presets: 'json' (final answer must be a single JSON value, no fences, no prose) | 'json-schema:<file>' (json + conform to this schema) | '@<file>' (use file contents verbatim as the hint) | any other text (used as a freeform 'Output format:' instruction). With --json or --format json, the envelope's final_text is also post-processed to strip ```json fences and prose preamble; the original is preserved in assistant_notes.")
 	runCmd.Flags().String("agents", "", "Sub-agent dispatch policy for this run. 'single' (no sub-agents — the `agent` tool is removed from the toolset for this process) | 'with-agents' (model is nudged to fan out via the `agent` tool) | 'agent-allow' (default — tool present, model decides).")
 	runCmd.Flags().String("aggregation", "", "How sub-agent fan-out output reaches the orchestrator. 'summary' (default — parent composes a wrap-up, sub-agent detail lives in DB only) | 'concat' (prompt-nudge: parent includes each sub-agent reply verbatim in final_text) | 'attach' (collect each sub-agent's last assistant text into envelope.sub_agent_outputs; final_text becomes a brief wrap-up). An always-on reduction-loss warning fires regardless when parent collapses sub-agent outputs to <40% of their combined size.")
+	// Fork patch: batch 8 — timeout extension flags.
+	runCmd.Flags().Bool("timeout-extends-on-progress", false, "Reset the stream watchdog deadline every time streaming progress occurs. Prevents killing healthy long compositions. Default: false (static deadline).")
+	runCmd.Flags().Duration("timeout-hard-cap", 0, "Maximum wall-clock time the watchdog allows even with --timeout-extends-on-progress and continuous progress. Default: 0 (no cap; recommend 4x --timeout).")
 	runCmd.MarkFlagsMutuallyExclusive("session", "continue")
 	runCmd.MarkFlagsMutuallyExclusive("system-prompt", "system-prompt-file")
 	runCmd.MarkFlagsMutuallyExclusive("stream", "json")

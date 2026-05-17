@@ -25,7 +25,7 @@ func TestStreamWatchdog_BumpKeepsItAlive(t *testing.T) {
 	var fired atomic.Int32
 	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(time.Duration) {
 		fired.Add(1)
-	})
+	}, false, 0)
 	defer func() {
 		cancel()
 		<-wd.done
@@ -63,7 +63,7 @@ func TestStreamWatchdog_FiresOnNoActivity(t *testing.T) {
 	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(observedIdle time.Duration) {
 		fired.Add(1)
 		firedIdle.Store(int64(observedIdle))
-	})
+	}, false, 0)
 
 	// Wait long enough for the watchdog to fire on its own.
 	select {
@@ -89,7 +89,7 @@ func TestStreamWatchdog_ExitsCleanlyOnCtxCancel(t *testing.T) {
 	var fired atomic.Int32
 	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(time.Duration) {
 		fired.Add(1)
-	})
+	}, false, 0)
 
 	// Cancel ctx externally — watchdog must exit promptly without firing.
 	time.Sleep(40 * time.Millisecond)
@@ -115,7 +115,7 @@ func TestStreamWatchdog_BumpAfterFireIsHarmless(t *testing.T) {
 	const idle = 30 * time.Millisecond
 	const tick = 5 * time.Millisecond
 
-	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(time.Duration) {})
+	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(time.Duration) {}, false, 0)
 
 	// Let it fire.
 	<-wd.done
@@ -123,11 +123,117 @@ func TestStreamWatchdog_BumpAfterFireIsHarmless(t *testing.T) {
 
 	// Calling bump() after the goroutine has exited is a no-op — it
 	// just stores into an atomic that nobody reads anymore. Must not
-	// panic or deadlock. This matters because callbacks can race
-	// with the watchdog cancelling: a late OnTextDelta from the
-	// pre-cancel stream chunk might still call bump().
+	// panic or deadlock.
 	require.NotPanics(t, func() {
 		wd.bump()
 		wd.bump()
 	})
+}
+
+// Fork patch: batch 8 — tests for progress-based deadline extension.
+
+// TestStreamWatchdog_ExtendsOnProgress verifies that with extendsOnProgress
+// enabled, continuous progress keeps the watchdog alive beyond the original
+// idle timeout.
+func TestStreamWatchdog_ExtendsOnProgress(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	const idle = 80 * time.Millisecond
+	const tick = 10 * time.Millisecond
+	const hardCap = 500 * time.Millisecond
+
+	var fired atomic.Int32
+	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(time.Duration) {
+		fired.Add(1)
+	}, true, hardCap)
+	defer func() {
+		cancel()
+		<-wd.done
+	}()
+
+	// Bump every 30ms for 300ms — extends the deadline each time.
+	stop := time.After(300 * time.Millisecond)
+loop:
+	for {
+		select {
+		case <-stop:
+			break loop
+		case <-time.After(30 * time.Millisecond):
+			wd.bump()
+		}
+	}
+
+	assert.Equal(t, int32(0), fired.Load(),
+		"watchdog must not fire while progress keeps arriving")
+	assert.False(t, wd.stalled.Load())
+}
+
+// TestStreamWatchdog_ExtendsOnProgress_FiresWhenIdle verifies that with
+// extendsOnProgress, the watchdog still fires when progress stops.
+func TestStreamWatchdog_ExtendsOnProgress_FiresWhenIdle(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(t.Context())
+
+	const idle = 60 * time.Millisecond
+	const tick = 10 * time.Millisecond
+	const hardCap = 500 * time.Millisecond
+
+	var fired atomic.Int32
+	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(time.Duration) {
+		fired.Add(1)
+	}, true, hardCap)
+
+	// Bump once to extend, then stop.
+	wd.bump()
+
+	select {
+	case <-wd.done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("watchdog should have fired after progress stopped")
+	}
+
+	assert.Equal(t, int32(1), fired.Load(), "watchdog must fire when progress stops")
+	assert.True(t, wd.stalled.Load())
+}
+
+// TestStreamWatchdog_HardCapRespected verifies that even with continuous
+// progress, the watchdog fires at the hard cap.
+func TestStreamWatchdog_HardCapRespected(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(t.Context())
+
+	const idle = 80 * time.Millisecond
+	const tick = 10 * time.Millisecond
+	const hardCap = 200 * time.Millisecond
+
+	var fired atomic.Int32
+	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(time.Duration) {
+		fired.Add(1)
+	}, true, hardCap)
+
+	start := time.Now()
+
+	// Bump rapidly — but hard cap should still kill it.
+	stop := time.After(500 * time.Millisecond)
+loop:
+	for {
+		select {
+		case <-wd.done:
+			break loop
+		case <-stop:
+			t.Fatal("watchdog should have fired at hard cap")
+		case <-time.After(10 * time.Millisecond):
+			wd.bump()
+		}
+	}
+
+	elapsed := time.Since(start)
+	assert.Equal(t, int32(1), fired.Load(), "watchdog must fire at hard cap")
+	assert.True(t, wd.stalled.Load())
+	// The hard cap is 200ms with a tick of 10ms, so it should fire
+	// somewhere between 200-250ms.
+	assert.LessOrEqual(t, elapsed, 350*time.Millisecond,
+		"watchdog must fire near the hard cap")
 }

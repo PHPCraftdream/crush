@@ -47,7 +47,7 @@ the orchestrator-facing CLI is first-class.
 | Permissions | In-memory rules during a TUI run | Persistent per-session rules in SQLite; cross-process visible |
 | Parallel runs | Not a target | First-class — flock per session, OS-level lock release on crash, atomic file writes, additive cost SQL, MCP-id flock |
 | `crush run` | Single-shot quick fire | Wrapper-friendly: `--role`, `--session` get-or-create, `--json`/`--format`/`--agents`/`--timeout`/`--stream`, JSON-envelope validation, `assistant_notes`, fallback error messages |
-| CLI providers | Limited bridge | npx Claude Code, Gemini CLI, Codex CLI, MCP bridge for external tools, session resume for Anthropic prompt caching |
+| CLI providers | Limited bridge | npx Claude Code, Gemini CLI, Codex CLI, MCP bridge for external tools, session resume for Anthropic prompt caching; Haiku available as `local-cli/cli-claude-haiku` (200k ctx, `@low\|medium\|high` effort) |
 | Web UI features | n/a | Slash-command + skill autocomplete, dark/light theme, pinned messages, fork-session button, LSP/MCP/provider management modals, file/image attachments |
 
 The full per-file decision log lives in [`CHANGELOG.fork.md`](./CHANGELOG.fork.md).
@@ -123,6 +123,14 @@ jq -r '.error' "$out"         # error.message if non-success
   which mode is in use.
 - **`--timeout <duration>`** — hard wall-clock cap; the partial answer
   is preserved in the session and surfaced in the envelope.
+- **`--timeout-extends-on-progress`** — when set, the stream watchdog
+  resets its idle deadline every time streaming activity occurs, so
+  long compositions (code generation, multi-section reports) are not
+  killed prematurely. Capped by `--timeout-hard-cap` if set.
+- **`--timeout-hard-cap <duration>`** — maximum wall-clock time the
+  watchdog will allow even with `--timeout-extends-on-progress`.
+  Without a cap a continuously-streaming response runs forever.
+  Typically set to 3–4× the idle timeout.
 - **`--system-prompt[-file]`** — persists onto the session so follow-up
   runs inherit it.
 - **`--stream`** — streams every token to stdout for live wrappers.
@@ -149,6 +157,14 @@ jq -r '.error' "$out"         # error.message if non-success
   provider's Finish part had no message (some providers emit a bare
   error finish), a fallback names the most likely causes (provider
   HTTP error, stream stall, OOM, context overflow).
+- `recovered_partial` — present when the session had an orphaned
+  partial assistant message from a previous interrupted run (detected
+  by `Finish{Partial: true}` on an unfinished row). Shape:
+  `{message_id, chars, last_flush_at, text}`. An always-on WARN in
+  `warnings[]` fires when this field is populated: *"recovered N chars
+  of partial assistant text — model run was interrupted"*. The text
+  may be incomplete but is usually the bulk of what the model produced
+  before the kill.
 
 #### Env-vars to know
 
@@ -203,8 +219,7 @@ processes still spawn N stdio children of every configured MCP server
 If you drive Crush from another LLM (e.g. Claude Code), run once:
 
 ```bash
-crush claude-init                 # append a delegation guide to ./CLAUDE.md
-crush claude-init --replace       # overwrite any older version cleanly
+crush claude-init                 # install or refresh the delegation guide in ./CLAUDE.md
 ```
 
 This drops two things into the workspace:
@@ -216,8 +231,9 @@ This drops two things into the workspace:
   delegate via `crush run` per the rules in CLAUDE.md".
 
 The block is versioned (`<!-- crush-claude-init:vN -->`). Re-run
-`crush claude-init --replace` after a fork update to refresh it
-cleanly — every prior version is recognised and excised in one shot.
+`crush claude-init` at any time to refresh it — every invocation strips
+all prior versions and writes a fresh one. To undo, `crush claude-del`
+removes the block and the slash command cleanly.
 
 ### 5. `crush models` — picking and inspecting models
 

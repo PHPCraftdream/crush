@@ -20,29 +20,152 @@ import (
 // envelope's final_text. Wrapped with the underlying json error.
 var ErrInvalidStripJSON = errors.New("model output is not valid JSON")
 
-// stripAndValidateJSON is the entry point the runtime should prefer
-// over stripJSONEnvelope when the operator explicitly asked for JSON
-// (i.e. --json or --format json was passed). It runs the strip, then
-// validates the result with json.Valid. Returns:
+// Fork patch (multi-JSON extractor): findAllBalancedJSONValues scans text
+// for ALL balanced JSON values (objects or arrays), advancing past each
+// match. Returns them in source order. The existing findBalancedJSONValue
+// walker is reused per iteration — quote-awareness is already handled.
+func findAllBalancedJSONValues(text string) []string {
+	var results []string
+	offset := 0
+	for {
+		remaining := text[offset:]
+		start, end, ok := findBalancedJSONValue(remaining)
+		if !ok {
+			break
+		}
+		results = append(results, remaining[start:end])
+		offset += end
+	}
+	return results
+}
+
+// Fork patch (multi-JSON extractor): stripAndExtractJSON is the new
+// runtime entry point that replaces stripAndValidateJSON. It handles
+// the common small-model failure mode where the model emits prose
+// preamble + one JSON value, or even MULTIPLE JSON values separated
+// by prose (observed with GLM-5-turbo and friends).
 //
-//   - cleaned: the stripped JSON when validation passed; the ORIGINAL
-//     untouched text when validation failed (so the orchestrator can
-//     still see the model's raw reply for debugging).
-//   - notes:   the prose preamble/suffix removed by strip on success;
-//     the stripped (but invalid) candidate on failure so the operator
-//     can compare original vs strip output side by side.
-//   - err:     nil on success; wraps ErrInvalidStripJSON with a
-//     position-bearing json.SyntaxError on failure. The caller turns
-//     this into runResult.Error + ExitReason="invalid_json" so a
-//     downstream `jq .final_text` script reliably fails fast instead
-//     of consuming structurally broken output.
-//
-// Rationale: the previous behaviour silently returned the stripped
-// candidate when it was internally balanced (matching `{...}` walker)
-// but not actually valid JSON — a real shamir-db audit run hit this
-// when the model forgot a `]` before `,"post_flight":`, the envelope
-// reported success, and an hour was spent in node-repl chasing it.
-// See the user feedback dated 2026-05-17.
+// Behaviour:
+//   - 0 valid JSON values found → ErrInvalidStripJSON, original text
+//     returned in cleaned (same as before).
+//   - 1 valid JSON value found  → returned as cleaned, notes carries
+//     the prose preamble/suffix that was stripped.
+//   - ≥2 valid JSON values found → returned as a JSON array wrapper
+//     `[json1, json2, ...]` (preserving each value as-is). notes
+//     includes a one-line marker "extracted N JSON values, M chars of
+//     prose discarded" for operator forensics.
+func stripAndExtractJSON(text string) (cleaned, notes string, err error) {
+	// Fork patch: run fence-strip first (same as before).
+	inner := text
+	var fenceOpenEnd, fenceCloseStart = -1, -1
+	if openEnd, closeStart, ok := findJSONFenceBounds(text); ok {
+		fenceOpenEnd = openEnd
+		fenceCloseStart = closeStart
+		inner = text[openEnd:closeStart]
+	}
+
+	// Fork patch: find ALL balanced JSON values in the (possibly
+	// fence-stripped) text.
+	candidates := findAllBalancedJSONValues(inner)
+
+	// Fork patch: validate each candidate with json.Valid.
+	var valid []string
+	for _, c := range candidates {
+		if json.Valid([]byte(c)) {
+			valid = append(valid, c)
+		}
+	}
+
+	switch len(valid) {
+	case 0:
+		// No valid JSON found — same behaviour as before.
+		syntaxErr := jsonSyntaxErrorOf(text)
+		return text, "", fmt.Errorf("%w: %s", ErrInvalidStripJSON, syntaxErr)
+	case 1:
+		// Exactly one valid JSON — return it with notes about stripped prose.
+		cleaned = valid[0]
+		proseChars := len(text) - len(cleaned)
+		notes = buildStripNotes(text, fenceOpenEnd, fenceCloseStart, cleaned, proseChars)
+		return cleaned, notes, nil
+	default:
+		// Fork patch: multiple valid JSON values — wrap as array.
+		// Build the array by joining the values with commas.
+		var buf strings.Builder
+		buf.WriteByte('[')
+		for i, v := range valid {
+			if i > 0 {
+				buf.WriteByte(',')
+			}
+			buf.WriteString(v)
+		}
+		buf.WriteByte(']')
+		cleaned = buf.String()
+
+		// The wrap MUST be valid JSON — verify.
+		if !json.Valid([]byte(cleaned)) {
+			// Should never happen since each element is valid JSON,
+			// but fall back to single-value mode if it does.
+			syntaxErr := jsonSyntaxErrorOf(cleaned)
+			return text, "", fmt.Errorf("%w: multi-value wrap failed validation: %s", ErrInvalidStripJSON, syntaxErr)
+		}
+
+		proseChars := len(text) - len(cleaned)
+		if proseChars < 0 {
+			proseChars = 0
+		}
+		notes = fmt.Sprintf("extracted %d JSON values, %d chars of prose discarded", len(valid), proseChars)
+		if fenceOpenEnd >= 0 || proseChars > 0 {
+			notes += " (" + buildStripNotes(text, fenceOpenEnd, fenceCloseStart, cleaned, proseChars) + ")"
+		}
+		return cleaned, notes, nil
+	}
+}
+
+// Fork patch (multi-JSON extractor): buildStripNotes reconstructs the
+// prose preamble/suffix notes for the single-value case, reusing the
+// same logic as stripJSONEnvelope but without the multi-value wrapping.
+func buildStripNotes(original string, fenceOpenEnd, fenceCloseStart int, cleaned string, proseChars int) string {
+	if proseChars == 0 {
+		return ""
+	}
+	var rawPrefix, rawSuffix string
+	if fenceOpenEnd >= 0 {
+		fenceLineStart := strings.LastIndex(original[:fenceOpenEnd], "```json")
+		if fenceLineStart < 0 {
+			fenceLineStart = strings.LastIndex(strings.ToLower(original[:fenceOpenEnd]), "```json")
+		}
+		if fenceLineStart >= 0 {
+			rawPrefix = original[:fenceLineStart]
+		}
+		closeLineEnd := fenceCloseStart + len("```")
+		if closeLineEnd <= len(original) {
+			rawSuffix = original[closeLineEnd:]
+		}
+	} else {
+		idx := strings.Index(original, cleaned)
+		if idx < 0 {
+			return fmt.Sprintf("%d chars stripped", proseChars)
+		}
+		rawPrefix = original[:idx]
+		rawSuffix = original[idx+len(cleaned):]
+	}
+	prefix := strings.TrimSpace(rawPrefix)
+	suffix := strings.TrimSpace(rawSuffix)
+	switch {
+	case prefix != "" && suffix != "":
+		return prefix + "\n\n[…JSON…]\n\n" + suffix
+	case prefix != "":
+		return prefix
+	case suffix != "":
+		return suffix
+	default:
+		return fmt.Sprintf("%d chars stripped", proseChars)
+	}
+}
+
+// stripAndValidateJSON is kept for backward compatibility but is no
+// longer the primary runtime entry point — stripAndExtractJSON is.
+// Fork patch: retained because it is referenced in comments and tests.
 func stripAndValidateJSON(text string) (cleaned, notes string, err error) {
 	stripped, notes := stripJSONEnvelope(text)
 	if json.Valid([]byte(stripped)) {

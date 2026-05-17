@@ -125,6 +125,14 @@ type Finish struct {
 	Time    int64        `json:"time"`
 	Message string       `json:"message,omitempty"`
 	Details string       `json:"details,omitempty"`
+	// Partial is set to true when this Finish was written by the
+	// auto-checkpoint ticker (batch 8). A process that dies mid-stream
+	// leaves an unfinished row where Finish has Partial=true and
+	// Reason="" — recovery code uses this to distinguish "mid-stream
+	// checkpoint" from "properly finished turn". A proper Finish
+	// overwrite removes this marker.
+	// Fork patch: batch 8 — see CHANGELOG.fork.md section 6.
+	Partial bool `json:"partial,omitempty"`
 }
 
 func (Finish) isPart() {}
@@ -214,9 +222,24 @@ func (m *Message) ToolResults() []ToolResult {
 	return toolResults
 }
 
+// Fork patch: batch 8 — IsPartial returns true when the message has a
+// Finish part with Partial=true. This means the row was written by the
+// mid-stream auto-checkpoint ticker, NOT by a proper step-end or error
+// handler. Recovery code uses this to distinguish "process died mid-composition"
+// from "properly finished turn". A partial Finish does NOT count as finished
+// for IsFinished().
+func (m *Message) IsPartial() bool {
+	for _, part := range m.Parts {
+		if f, ok := part.(Finish); ok && f.Partial {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *Message) IsFinished() bool {
 	for _, part := range m.Parts {
-		if _, ok := part.(Finish); ok {
+		if f, ok := part.(Finish); ok && !f.Partial {
 			return true
 		}
 	}

@@ -16,71 +16,38 @@ import (
 // in a row are excised separately, not merged into one giant span.
 var claudeInitBlockPattern = regexp.MustCompile(`(?s)<!-- crush-claude-init:v\d+ -->.*?<!-- /crush-claude-init -->\s*`)
 
-// claudeInitMarkerStart is searched for to decide whether the snippet
-// already exists. Bumping the v<N> version forces a re-write on the
-// next run (old block is rewritten, not duplicated).
 const (
-	claudeInitMarkerStart      = "<!-- crush-claude-init:v7 -->"
+	claudeInitMarkerStart      = "<!-- crush-claude-init:v9 -->"
 	claudeInitMarkerEnd        = "<!-- /crush-claude-init -->"
 	claudeMdFile               = "CLAUDE.md"
 	claudeSlashCommandPath     = ".claude/commands/crush.md"
 	claudeSlashCommandSentinel = "<!-- crush-slash-command:v1 -->"
-	// Versioned sentinel: bumping the v<N> on changes means an LLM that
-	// already inserted an older version into CLAUDE.md will, on the next
-	// `claude-init`, see "no current marker → write fresh block". The old
-	// marker stays in the file but becomes visually-superseded text. Use
-	// --replace to strip every prior version cleanly in one shot.
 )
-
-// previousMarkers lists every prior sentinel so a future --replace flag
-// could find and excise them. Currently unused at runtime — the regex in
-// claudeInitBlockPattern matches any v\d+ — but kept here so the version
-// history is documented in one place.
-var previousMarkers = []string{
-	"<!-- crush-claude-init:v1 -->",
-	"<!-- crush-claude-init:v2 -->",
-	"<!-- crush-claude-init:v3 -->",
-	"<!-- crush-claude-init:v4 -->",
-	"<!-- crush-claude-init:v5 -->",
-	"<!-- crush-claude-init:v6 -->",
-}
 
 var claudeInitCmd = &cobra.Command{
 	Use:   "claude-init",
-	Short: "Append a 'how to delegate work to crush' block to CLAUDE.md",
-	Long: `Append a block of instructions to the workspace's CLAUDE.md that
-teaches a Claude Code (or any other LLM following CLAUDE.md) how to
-delegate work to ` + "`crush run`" + `: when to use the fast vs smart role,
-how to pick stable session ids, how to parse --json output, and which
+	Short: "Install or refresh the 'how to delegate work to crush' block in CLAUDE.md",
+	Long: `Install (or refresh) a block of instructions in the workspace's
+CLAUDE.md that teaches a Claude Code (or any other LLM following CLAUDE.md)
+how to delegate work to ` + "`crush run`" + `: when to use the fast vs smart
+role, how to pick stable session ids, how to parse --json output, and which
 read-only commands are safe to discover state.
 
-Idempotent: the inserted block is wrapped in a versioned sentinel
-("` + claudeInitMarkerStart + `"). If the marker is already present, the
-command exits without touching the file.
+The block is wrapped in a versioned sentinel
+("` + claudeInitMarkerStart + `"). Every invocation strips ALL previously
+inserted blocks (any version) and writes a single fresh one — so re-running
+after a fork update is always safe and idempotent.
 
-To refresh after the guide has been updated upstream, use --replace —
-it strips every previously inserted block (any version) and writes a
-single fresh one in its place. --force, by contrast, appends a duplicate
-copy without removing the previous one and is mostly useful for debug.
-
-If CLAUDE.md does not exist yet it is created with the block as its
-only content.`,
+If CLAUDE.md does not exist yet it is created with the block as its only
+content.`,
 	Example: `
-# Append the block in the current workspace (no-op if already present)
+# Install or refresh in the current workspace
 crush claude-init
 
-# Refresh in-place: remove the previous block(s) and write a fresh one
-crush claude-init --replace
-
 # Scope to another project
-crush claude-init --cwd /path/to/project --replace
-  `,
+crush claude-init --cwd /path/to/project
+`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		force, _ := cmd.Flags().GetBool("force")
-		replace, _ := cmd.Flags().GetBool("replace")
-		if force && replace {
-			return fmt.Errorf("--force and --replace are mutually exclusive")
-		}
 		cwd, err := ResolveCwd(cmd)
 		if err != nil {
 			return err
@@ -95,27 +62,13 @@ crush claude-init --cwd /path/to/project --replace
 		}
 
 		body := string(existing)
-		hadCurrent := strings.Contains(body, claudeInitMarkerStart)
-		removed := 0
-		if replace {
-			// Excise every prior block (v1, v2, …, the current one)
-			// so the file ends up with exactly one fresh insertion.
-			matches := claudeInitBlockPattern.FindAllString(body, -1)
-			removed = len(matches)
-			body = claudeInitBlockPattern.ReplaceAllString(body, "")
-		} else if hadCurrent && !force {
-			fmt.Fprintf(os.Stderr, "%s already contains %s — nothing to do (use --replace to swap, --force to append a duplicate)\n", path, claudeInitMarkerStart)
-			return nil
-		}
+		matches := claudeInitBlockPattern.FindAllString(body, -1)
+		removed := len(matches)
+		body = claudeInitBlockPattern.ReplaceAllString(body, "")
 
 		out := strings.Builder{}
 		if len(body) > 0 {
-			out.WriteString(body)
-			// Ensure exactly one blank line between prior content and our
-			// block. ReplaceAllString may have left trailing whitespace
-			// or none — normalise.
 			trimmed := strings.TrimRight(body, " \t\n")
-			out.Reset()
 			out.WriteString(trimmed)
 			if trimmed != "" {
 				out.WriteString("\n\n")
@@ -127,7 +80,7 @@ crush claude-init --cwd /path/to/project --replace
 			return fmt.Errorf("failed to write %s: %w", path, err)
 		}
 		switch {
-		case replace && removed > 0:
+		case removed > 0:
 			fmt.Fprintf(os.Stderr, "replaced %d previous block(s) in %s\n", removed, path)
 		case len(existing) == 0:
 			fmt.Fprintf(os.Stderr, "created %s\n", path)
@@ -135,25 +88,18 @@ crush claude-init --cwd /path/to/project --replace
 			fmt.Fprintf(os.Stderr, "appended to %s\n", path)
 		}
 
-		// Also drop a Claude Code slash command at
-		// .claude/commands/crush.md so the user (or another LLM) can
-		// type "/crush <task>" and the harness expands it into the
-		// "delegate-this-via-crush-run" prompt template. Idempotent on
-		// our own sentinel; --replace rewrites; --force is a no-op for
-		// the slash command since duplicating it would change "/crush"
-		// behaviour silently.
-		if err := writeSlashCommand(cwd, replace); err != nil {
+		if err := writeSlashCommand(cwd); err != nil {
 			return fmt.Errorf("slash command: %w", err)
 		}
 		return nil
 	},
 }
 
-func writeSlashCommand(cwd string, replace bool) error {
+func writeSlashCommand(cwd string) error {
 	path := filepath.Join(cwd, claudeSlashCommandPath)
 	if data, err := os.ReadFile(path); err == nil {
-		if strings.Contains(string(data), claudeSlashCommandSentinel) && !replace {
-			fmt.Fprintf(os.Stderr, "%s already present — nothing to do\n", path)
+		if !strings.Contains(string(data), claudeSlashCommandSentinel) {
+			fmt.Fprintf(os.Stderr, "warning: %s exists but does not contain our sentinel — skipping (someone else owns that file)\n", path)
 			return nil
 		}
 	} else if !os.IsNotExist(err) {
@@ -213,8 +159,6 @@ $ARGUMENTS
 }
 
 func init() {
-	claudeInitCmd.Flags().Bool("force", false, "Append a fresh block even if one is already present (produces duplicates — use --replace if you want to swap)")
-	claudeInitCmd.Flags().Bool("replace", false, "Remove every previously inserted block (any version) and write a fresh one in its place — the safe way to refresh the guide")
 	rootCmd.AddCommand(claudeInitCmd)
 }
 
@@ -290,6 +234,16 @@ The few legitimate exceptions for doing work yourself:
 If you catch yourself reaching for ` + "`Edit`" + ` / ` + "`Write`" + ` / ` + "`Grep`" + ` / ` + "`Bash`" + `
 to *start* a task rather than to finish one, pause and write a
 ` + "`crush run`" + ` prompt instead.
+
+### Output format: Markdown is usually fine
+
+**Markdown beats JSON unless something downstream parses it.**
+Default to Markdown for any report a human (or another LLM acting as
+orchestrator) will read. JSON only when a CI step, jq pipeline, or
+fan-out harness is the immediate consumer. Wrapping prose around JSON
+to "make it look structured" makes it strictly worse — readers re-flow
+it, parsers reject it (validator fires ` + "`invalid_json`" + `), and you lose
+both readability and parseability.
 
 ### Channels — what goes where
 
@@ -545,6 +499,28 @@ crush run --role smart --session "approach-C" --json < /tmp/p.txt > /tmp/C.json 
 ` + "```" + `
 When all three notifications have come in, ` + "`Read`" + ` the three result
 files and report.
+
+### Crash resilience: checkpointing and recovery
+
+When ` + "`crush run`" + ` is killed (SIGTERM, OOM, timeout) during the
+final streaming phase, the in-progress assistant text is NOT lost:
+
+- **Auto-checkpoint** (always on, default 2s interval): a coalescing
+  ticker flushes in-memory streaming text to the SQLite DB with a
+  ` + "`Partial: true`" + ` finish marker. The marker does NOT set
+  ` + "`finished_at`" + `, so recovery code can distinguish checkpoints
+  from completed turns. Disable via
+  ` + "`checkpoint_interval_seconds: -1`" + ` in ` + "`crush.json`" + ` options.
+- **` + "`--timeout-extends-on-progress`" + `**: resets the stream watchdog
+  idle deadline on every streaming event, so long compositions are not
+  killed prematurely. Capped by ` + "`--timeout-hard-cap <duration>`" + `
+  (typically 3-4x the idle timeout; 0 = no cap).
+- **` + "`recovered_partial`" + ` envelope field**: when a subsequent
+  ` + "`crush run --session <same>`" + ` detects an orphaned partial
+  message, the JSON envelope includes
+  ` + "`{message_id, chars, last_flush_at, text}`" + ` and a WARN in
+  ` + "`warnings[]`" + `. The text may be incomplete but usually contains
+  the bulk of what the model produced before the kill.
 ` + claudeInitMarkerEnd + `
 `
 }

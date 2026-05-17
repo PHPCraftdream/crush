@@ -223,3 +223,102 @@ func TestRecoverInterruptedTurns_MultipleSessions_OnlyOrphansTouched(t *testing.
 	require.NoError(t, err)
 	require.Len(t, userMsgs, 1)
 }
+
+// --- Piece 4: findOrphanPartial (batch 8, crash-resilience) ---
+
+func TestFindOrphanPartial_WithPartialOrphan(t *testing.T) {
+	app := newRecoveryTestApp(t)
+	ctx := t.Context()
+
+	sess, err := app.Sessions.Create(ctx, "partial-session")
+	require.NoError(t, err)
+
+	// Create a user message so there's history before the partial assistant.
+	_, err = app.Messages.Create(ctx, sess.ID, message.CreateMessageParams{
+		Role:  message.User,
+		Parts: []message.ContentPart{message.TextContent{Text: "do the thing"}},
+	})
+	require.NoError(t, err)
+
+	// Simulate an assistant that was mid-stream when SIGTERM hit:
+	// text content + a Finish with Partial=true (set by the checkpoint goroutine).
+	asst, err := app.Messages.Create(ctx, sess.ID, message.CreateMessageParams{
+		Role: message.Assistant,
+		Parts: []message.ContentPart{
+			message.TextContent{Text: "Here is the answer you asked for: the result is 42"},
+			message.Finish{Reason: message.FinishReasonEndTurn, Partial: true},
+		},
+	})
+	require.NoError(t, err)
+	require.True(t, asst.IsPartial(), "precondition: must be partial")
+	require.False(t, asst.IsFinished(), "precondition: partial finish must NOT count as finished")
+
+	got := app.findOrphanPartial(ctx, sess.ID)
+	require.NotNil(t, got, "findOrphanPartial must find the partial orphan")
+	assert.Equal(t, asst.ID, got.MessageID)
+	assert.Equal(t, len("Here is the answer you asked for: the result is 42"), got.Chars)
+	assert.Contains(t, got.Text, "the result is 42")
+}
+
+func TestFindOrphanPartial_NoOrphan(t *testing.T) {
+	app := newRecoveryTestApp(t)
+	ctx := t.Context()
+
+	sess, err := app.Sessions.Create(ctx, "clean-session")
+	require.NoError(t, err)
+
+	// Empty session — no messages at all.
+	got := app.findOrphanPartial(ctx, sess.ID)
+	assert.Nil(t, got, "empty session must return nil")
+
+	// Session with only a finished assistant — also no orphan.
+	_, err = app.Messages.Create(ctx, sess.ID, message.CreateMessageParams{
+		Role: message.Assistant,
+		Parts: []message.ContentPart{
+			message.TextContent{Text: "all done"},
+			message.Finish{Reason: message.FinishReasonEndTurn},
+		},
+	})
+	require.NoError(t, err)
+
+	got = app.findOrphanPartial(ctx, sess.ID)
+	assert.Nil(t, got, "finished assistant must not be treated as orphan")
+}
+
+func TestFindOrphanPartial_OnlyLatestOrphan(t *testing.T) {
+	app := newRecoveryTestApp(t)
+	ctx := t.Context()
+
+	sess, err := app.Sessions.Create(ctx, "multi-partial")
+	require.NoError(t, err)
+
+	// Older partial assistant (simulating a previous interrupted turn).
+	older, err := app.Messages.Create(ctx, sess.ID, message.CreateMessageParams{
+		Role: message.Assistant,
+		Parts: []message.ContentPart{
+			message.TextContent{Text: "old partial text"},
+			message.Finish{Reason: message.FinishReasonEndTurn, Partial: true},
+		},
+	})
+	require.NoError(t, err)
+	require.True(t, older.IsPartial())
+
+	// Newer partial assistant (the most recent interrupted turn).
+	newer, err := app.Messages.Create(ctx, sess.ID, message.CreateMessageParams{
+		Role: message.Assistant,
+		Parts: []message.ContentPart{
+			message.TextContent{Text: "new partial text that is longer"},
+			message.Finish{Reason: message.FinishReasonEndTurn, Partial: true},
+		},
+	})
+	require.NoError(t, err)
+	require.True(t, newer.IsPartial())
+
+	got := app.findOrphanPartial(ctx, sess.ID)
+	require.NotNil(t, got, "must find the latest orphan")
+	assert.Equal(t, newer.ID, got.MessageID,
+		"must surface the NEWEST partial, not the oldest")
+	assert.Contains(t, got.Text, "new partial text")
+	assert.NotEqual(t, older.ID, got.MessageID,
+		"must NOT surface the older orphan")
+}
