@@ -6,35 +6,36 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
+)
+
+const (
+	lockHeartbeatInterval = 10 * time.Second
+	lockStaleDuration     = 20 * time.Second
 )
 
 // SessionLock is an inter-process exclusive lock for a single session ID.
 // Acquired around the entire `sessionAgent.Run()` call so two crush
-// processes can never write into the same session simultaneously (the
-// accidental-double-spawn scenario from the parallel-process audit:
-// orchestrator fires `crush run --session X` twice, both processes see
-// the per-process `IsSessionBusy` as false, both start streaming).
+// processes can never write into the same session simultaneously.
 //
 // Backed by OS-level advisory file locks (flock on POSIX, LockFileEx on
-// Windows) so the lock is automatically released when the holder
-// process dies — no stale-lock cleanup needed even after kill -9 or
-// power loss.
+// Windows) for mutual exclusion between live processes, PLUS a heartbeat
+// that touches the lock file every 10 seconds. If the file has not been
+// touched for 20 seconds the lock is considered stale (holder crashed or
+// was killed without releasing) and the next caller deletes it and
+// proceeds.
 type SessionLock struct {
 	// Path is the on-disk lock file. Kept for diagnostics.
 	Path string
-	// HolderPID is the PID that holds this lock. Set on successful
-	// acquire so callers can mention it in error messages.
+	// HolderPID is the PID that holds this lock.
 	HolderPID int
 
-	// f is the open file handle; Release uses it to call OS unlock and
-	// close. Package-internal — implementation detail.
-	f *os.File
+	f    *os.File
+	stop chan struct{} // closed by Release to stop the heartbeat goroutine
 }
 
 // SessionLockBusyError is returned by TryAcquireSessionLock when the
-// lock is already held by another process. Callers should surface the
-// holder PID and the lock file path to the user — the WUI/CLI uses
-// these to explain why their `crush run --session X` was rejected.
+// lock is already held by another process.
 type SessionLockBusyError struct {
 	Path      string
 	HolderPID int
@@ -49,13 +50,8 @@ func (e *SessionLockBusyError) Error() string {
 
 // TryAcquireSessionLock attempts to acquire an exclusive lock for the
 // given sessionID under <dataDir>/locks/. Returns a *SessionLock on
-// success that the caller MUST Release() (typically via defer).
-// Returns *SessionLockBusyError if another live process already holds
-// the lock. Other errors (IO, permission) returned as-is.
-//
-// dataDir is usually cfg.Options.DataDirectory (already absolute by the
-// time it reaches here). sessionID is the raw session id; it gets
-// sanitised so things like "audit/A" can't escape the locks dir.
+// success (caller MUST Release()). Returns *SessionLockBusyError if
+// another live process holds the lock. Other errors returned as-is.
 func TryAcquireSessionLock(dataDir, sessionID string) (*SessionLock, error) {
 	if dataDir == "" {
 		return nil, fmt.Errorf("TryAcquireSessionLock: dataDir is empty")
@@ -68,36 +64,48 @@ func TryAcquireSessionLock(dataDir, sessionID string) (*SessionLock, error) {
 		return nil, fmt.Errorf("TryAcquireSessionLock: create locks dir: %w", err)
 	}
 	path := filepath.Join(locksDir, "session-"+sanitiseSessionID(sessionID)+".lock")
-	// Open or create the lock file. We DON'T truncate yet — if the
-	// acquire fails because someone else holds it, we read the PID
-	// they wrote, so the busy-error can name the offender.
+
+	// Remove stale lock file before attempting OS lock.
+	if err := removeIfStale(path); err != nil {
+		return nil, err
+	}
+
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("TryAcquireSessionLock: open lock file: %w", err)
 	}
 	if err := tryLockFile(f); err != nil {
-		// Read the holder PID written by the current owner (best-effort).
 		holderPID := readLockHolderPID(path)
 		f.Close()
 		return nil, &SessionLockBusyError{Path: path, HolderPID: holderPID}
 	}
-	// We hold it. Stamp our PID for the next caller's busy-error.
+
 	myPID := os.Getpid()
 	_ = f.Truncate(0)
 	_, _ = f.Seek(0, 0)
 	_, _ = fmt.Fprintf(f, "%d\n", myPID)
-	_ = f.Sync() // make PID visible to a contending reader without close
-	return &SessionLock{Path: path, HolderPID: myPID, f: f}, nil
+	_ = f.Sync()
+
+	// Touch the file now so mtime is fresh from the start.
+	now := time.Now()
+	_ = os.Chtimes(path, now, now)
+
+	stop := make(chan struct{})
+	go heartbeat(path, stop)
+
+	return &SessionLock{Path: path, HolderPID: myPID, f: f, stop: stop}, nil
 }
 
-// Release unlocks and closes the lock file. Safe to call on nil.
-// Idempotent: subsequent calls return nil. The lock file itself is
-// left on disk; OS-level lock release happens on Close even if we
-// crash before reaching this line, so a leftover file with stale PID
-// content is harmless — the next acquire will overwrite the PID.
+// Release stops the heartbeat, unlocks and closes the lock file.
+// Safe to call on nil. Idempotent.
 func (l *SessionLock) Release() error {
 	if l == nil || l.f == nil {
 		return nil
+	}
+	// Stop heartbeat first so it doesn't touch the file after we release.
+	if l.stop != nil {
+		close(l.stop)
+		l.stop = nil
 	}
 	unlockErr := unlockFile(l.f)
 	closeErr := l.f.Close()
@@ -108,11 +116,40 @@ func (l *SessionLock) Release() error {
 	return closeErr
 }
 
-// sanitiseSessionID replaces filesystem-unsafe characters in a session
-// id so the resulting lock file lives inside the locks dir. Session ids
-// in this codebase already use uuids or caller-chosen tags (audit-A,
-// pr-42); the sanitiser exists as belt-and-suspenders against future
-// id schemes that include slashes.
+// heartbeat touches the lock file every lockHeartbeatInterval to signal
+// the holder is still alive. Stops when done is closed.
+func heartbeat(path string, done <-chan struct{}) {
+	t := time.NewTicker(lockHeartbeatInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-t.C:
+			now := time.Now()
+			_ = os.Chtimes(path, now, now)
+		}
+	}
+}
+
+// removeIfStale deletes the lock file if it exists and has not been
+// touched for lockStaleDuration. A missing file is not an error.
+func removeIfStale(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("removeIfStale: stat %s: %w", path, err)
+	}
+	if time.Since(info.ModTime()) > lockStaleDuration {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("removeIfStale: remove stale lock %s: %w", path, err)
+		}
+	}
+	return nil
+}
+
 func sanitiseSessionID(id string) string {
 	r := strings.NewReplacer(
 		"/", "_",
@@ -129,8 +166,6 @@ func sanitiseSessionID(id string) string {
 	return r.Replace(id)
 }
 
-// readLockHolderPID best-effort reads the PID stamped into a lock file
-// by the holder. Returns 0 if the file is empty / unreadable / malformed.
 func readLockHolderPID(path string) int {
 	bts, err := os.ReadFile(path)
 	if err != nil {

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -129,6 +130,55 @@ type errWithCause struct {
 
 func (e *errWithCause) Error() string { return e.msg }
 func (e *errWithCause) Unwrap() error { return e.cause }
+
+func TestTryAcquireSessionLock_StaleLockIsCleared(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "locks", "session-audit-A.lock")
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+
+	// Write a lock file with an old mtime (simulates a dead holder).
+	require.NoError(t, os.WriteFile(path, []byte("99999\n"), 0o644))
+	staleTime := time.Now().Add(-(lockStaleDuration + time.Second))
+	require.NoError(t, os.Chtimes(path, staleTime, staleTime))
+
+	// Should succeed despite the existing file because it is stale.
+	lk, err := TryAcquireSessionLock(dir, "audit-A")
+	require.NoError(t, err)
+	require.NotNil(t, lk)
+	require.NoError(t, lk.Release())
+}
+
+func TestTryAcquireSessionLock_FreshLockIsRespected(t *testing.T) {
+	dir := t.TempDir()
+	// Acquire a real lock so the file is fresh and OS-locked.
+	lk, err := TryAcquireSessionLock(dir, "audit-A")
+	require.NoError(t, err)
+	defer lk.Release()
+
+	// A second acquire must fail — the file is fresh (heartbeat running).
+	_, err = TryAcquireSessionLock(dir, "audit-A")
+	var busyErr *SessionLockBusyError
+	assert.True(t, errors.As(err, &busyErr), "expected SessionLockBusyError, got %v", err)
+}
+
+func TestHeartbeatTouchesFile(t *testing.T) {
+	dir := t.TempDir()
+	lk, err := TryAcquireSessionLock(dir, "audit-A")
+	require.NoError(t, err)
+
+	info1, err := os.Stat(lk.Path)
+	require.NoError(t, err)
+	before := info1.ModTime()
+
+	// Wait slightly longer than one heartbeat tick.
+	time.Sleep(lockHeartbeatInterval + 2*time.Second)
+
+	info2, err := os.Stat(lk.Path)
+	require.NoError(t, err)
+	assert.True(t, info2.ModTime().After(before), "heartbeat must have touched the file")
+
+	require.NoError(t, lk.Release())
+}
 
 func TestLockPathStructure(t *testing.T) {
 	dir := t.TempDir()
