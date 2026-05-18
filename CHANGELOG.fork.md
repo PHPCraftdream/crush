@@ -1153,3 +1153,57 @@ internal/agent/cliprovider/mcpserver.go               filter wired into Read han
 internal/agent/cliprovider/mcpserver_claudemd_test.go 11 tests: path detection + 5 strip scenarios
 CHANGELOG.fork.md                                     this entry
 ```
+
+### Batch 16 — agentguard: refuse nested AI-agent invocations from bash tool (2026-05-18)
+
+Hard wall around the recursion path that batch 15 only patched via the
+Read tool. A sub-agent that gets clever and tries to spawn another agent
+through bash (the obvious workaround once CLAUDE.md no longer tells it to
+delegate) now gets a tool-failure response with a clear message.
+
+New package `internal/agent/agentguard` exports `Check(command string) error`
+that returns a `*DeniedError` when the command would launch any known AI
+coding agent CLI. The check is wired into BOTH bash interfaces:
+
+  - `internal/agent/tools/bash.go` (native bash tool — used by crush
+    when it runs an agent without going through a CLI provider)
+  - `internal/agent/cliprovider/mcpserver.go` registerBashTool
+    (the MCP Bash tool used by claude / codex / gemini when they run
+    under `crush run` with --bare-style invocation)
+
+Denylist covers the 2026 agent landscape:
+
+  - Proprietary: claude, codex, gemini, qwen, cody, windsurf
+  - Open-source: opencode, aider, cline, cursor-agent, continue, amp,
+    goose, mentat, forge, tabby
+  - Self: crush (recursive crush invocations are never the right answer)
+
+Plus launch-form coverage:
+
+  - Direct binary with extensions: .exe / .cmd / .bat / .ps1 / .sh / .py
+  - Absolute and relative paths (`/usr/bin/claude`, `./claude`)
+  - Shell wrappers: bash/sh/dash/zsh/ksh/fish/nu `-c "X"`, cmd `/c X`,
+    powershell/pwsh `-Command X` / `-EncodedCommand X` — recursed into
+  - Package runners: npx, pnpm dlx, yarn dlx, bunx, bun x, pipx run,
+    uv tool run, uvx — checked against deniedNpmPackages / deniedPypiPackages
+  - Wrappers: exec, command, time, nohup — stripped before matching
+  - Leading env-var assignments (POSIX `FOO=bar BAR=baz claude`) skipped
+    before the executable token is read
+  - Chained commands: split on top-level `&&`, `||`, `;`, `|`; every
+    segment is independently checked
+  - Quote-aware tokenization so `claude -p "hello world"` is still
+    recognised as starting with `claude`
+
+False-positive risk on `continue` (shell keyword) and `command` (shell
+builtin) is accepted — typical scripts do not invoke them as the first
+token of a standalone command. If it surfaces we'll add an allowlist.
+
+Files touched:
+
+```
+internal/agent/agentguard/agentguard.go         new — Check + denylist + tokeniser
+internal/agent/agentguard/agentguard_test.go    new — 11 scenarios across launch forms
+internal/agent/tools/bash.go                    early Check; deny via NewTextErrorResponse
+internal/agent/cliprovider/mcpserver.go         early Check in registerBashTool; deny via toolError
+CHANGELOG.fork.md                                this entry
+```

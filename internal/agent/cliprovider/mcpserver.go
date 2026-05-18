@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/bmatcuk/doublestar/v4"
+	"github.com/charmbracelet/crush/internal/agent/agentguard"
 	"github.com/charmbracelet/crush/internal/fsext"
 	"github.com/charmbracelet/crush/internal/permission"
 	"github.com/charmbracelet/crush/internal/session"
@@ -288,6 +289,15 @@ func registerBashTool(srv *mcp.Server, perms permission.Service, workingDir stri
 		Description: "Execute a shell command. Requires user approval.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, input mcpBashInput) (*mcp.CallToolResult, any, error) {
 		slog.Debug("cliprovider: MCP Bash called", "command", input.Command, "description", input.Description)
+
+		// Fork patch: batch 16 — refuse invocations of other AI agent CLIs
+		// (claude, codex, gemini, opencode, aider, crush itself, …) before
+		// they reach the shell. A sub-agent should EXECUTE work, not
+		// re-delegate it — recursive nesting was burning hours of wall time
+		// for zero useful output. See internal/agent/agentguard.
+		if guardErr := agentguard.Check(input.Command); guardErr != nil {
+			return toolError(guardErr.Error()), nil, nil
+		}
 
 		wd := workingDir
 		if input.WorkingDir != "" {

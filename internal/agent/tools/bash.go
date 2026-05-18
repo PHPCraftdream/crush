@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"charm.land/fantasy"
+	"github.com/charmbracelet/crush/internal/agent/agentguard"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/fsext"
 	"github.com/charmbracelet/crush/internal/permission"
@@ -198,6 +199,16 @@ func NewBashTool(permissions permission.Service, workingDir string, attribution 
 		func(ctx context.Context, params BashParams, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
 			if params.Command == "" {
 				return fantasy.NewTextErrorResponse("missing command"), nil
+			}
+
+			// Fork patch: batch 16 — refuse invocations of other AI agent
+			// CLIs (claude, codex, gemini, opencode, aider, crush itself, …).
+			// Architectural rule: an agent inside crush should EXECUTE work,
+			// not re-delegate to yet another agent. Recursive nesting was
+			// silently burning wall time and tokens for no useful output.
+			// See internal/agent/agentguard for the denylist + tokenisation.
+			if guardErr := agentguard.Check(params.Command); guardErr != nil {
+				return fantasy.NewTextErrorResponse(guardErr.Error()), nil
 			}
 
 			// Determine working directory
