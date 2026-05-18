@@ -610,6 +610,7 @@ func sessionsLocksCmdRun(cmd *cobra.Command, args []string) error {
 
 	var locks []lockItem
 	now := time.Now()
+	const autoDeleteAfter = 60 * time.Second
 
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasPrefix(entry.Name(), "session-") || !strings.HasSuffix(entry.Name(), ".lock") {
@@ -620,7 +621,20 @@ func sessionsLocksCmdRun(cmd *cobra.Command, args []string) error {
 		sessionID = strings.TrimSuffix(sessionID, ".lock")
 
 		info, _ := entry.Info()
-		pulseSec := int64(now.Sub(info.ModTime()).Seconds())
+		age := now.Sub(info.ModTime())
+
+		lockPath := filepath.Join(locksDir, entry.Name())
+
+		// Auto-delete locks older than 1 minute — heartbeat would have
+		// touched the file every 10s if the holder were alive.
+		if age > autoDeleteAfter {
+			if err := os.Remove(lockPath); err == nil {
+				fmt.Fprintf(os.Stderr, "removed stale lock %s (age %ds)\n", entry.Name(), int(age.Seconds()))
+			}
+			continue
+		}
+
+		pulseSec := int64(age.Seconds())
 		pulse := lockPulseStatus(pulseSec)
 		stale := pulse == "offline"
 
@@ -628,7 +642,6 @@ func sessionsLocksCmdRun(cmd *cobra.Command, args []string) error {
 			continue
 		}
 
-		lockPath := filepath.Join(locksDir, entry.Name())
 		pidBytes, _ := os.ReadFile(lockPath)
 		pid := 0
 		fmt.Sscanf(strings.TrimSpace(string(pidBytes)), "%d", &pid)
