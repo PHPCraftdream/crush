@@ -1,6 +1,7 @@
 package agentguard
 
 import (
+	"encoding/base64"
 	"errors"
 	"strings"
 	"testing"
@@ -170,6 +171,48 @@ func TestCanonicalName(t *testing.T) {
 			assert.Equal(t, tc.want, canonicalName(tc.in))
 		})
 	}
+}
+
+func TestCheck_BlocksCommandWrappers(t *testing.T) {
+	cases := []string{
+		// cmd
+		"start claude",
+		`cmd /c "start claude --print hi"`,
+		"start /b claude",
+		// PowerShell cmdlets
+		"Start-Process claude",
+		"Start-Process -FilePath claude",
+		`powershell -c "Start-Process claude"`,
+		"Start-Job claude",
+		// iex / Invoke-Expression
+		`iex 'claude'`,
+		`Invoke-Expression "claude -p test"`,
+		`powershell -c "iex 'claude'"`,
+		// PowerShell & invocation operator
+		`powershell -c "& 'C:\Tools\claude.exe' -p hi"`,
+	}
+	for _, cmd := range cases {
+		t.Run(cmd, func(t *testing.T) {
+			err := Check(cmd)
+			require.Error(t, err, "should block: %s", cmd)
+		})
+	}
+}
+
+func TestCheck_BlocksEncodedCommand(t *testing.T) {
+	// Encode "claude -p test" as UTF-16LE → base64 (PowerShell convention).
+	// Verified output: c2EgIIA= is wrong — let's compute properly.
+	// "claude" in UTF-16LE bytes: c\0 l\0 a\0 u\0 d\0 e\0
+	// We do it programmatically in the test so it stays correct.
+	src := "claude"
+	u16 := make([]byte, 0, len(src)*2)
+	for _, r := range src {
+		u16 = append(u16, byte(r), 0)
+	}
+	encoded := base64.StdEncoding.EncodeToString(u16)
+	cmd := "powershell -EncodedCommand " + encoded
+	err := Check(cmd)
+	require.Error(t, err, "encoded command containing 'claude' must be decoded and blocked: %s", cmd)
 }
 
 func TestIsEnvAssignment(t *testing.T) {

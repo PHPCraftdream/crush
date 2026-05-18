@@ -15,9 +15,11 @@
 package agentguard
 
 import (
+	"encoding/base64"
 	"fmt"
 	"path/filepath"
 	"strings"
+	"unicode/utf16"
 )
 
 // DeniedError is returned by Check when a command is blocked. It is
@@ -119,6 +121,20 @@ var shellRunners = map[string]bool{
 	"nu":            true, // nushell
 }
 
+// commandWrappers are commands that take ANOTHER command as their first
+// non-flag argument and execute it. We strip them and re-check what they
+// were going to launch. Without this `start claude` / `Start-Process claude`
+// / `iex 'claude'` would bypass the denylist.
+var commandWrappers = map[string]bool{
+	"start":             true, // cmd: start <cmd> [args]
+	"start-process":     true, // PowerShell cmdlet
+	"start-job":         true, // PowerShell — runs in background but still launches the agent
+	"invoke-expression": true, // PowerShell: invoke-expression "<string>"
+	"iex":               true, // PowerShell alias for invoke-expression
+	"invoke-command":    true, // PowerShell remote/local exec
+	"icm":               true, // PowerShell alias for invoke-command
+}
+
 // Check inspects a shell command string and returns *DeniedError if it
 // would launch a denied agent. nil means the command is allowed.
 //
@@ -163,6 +179,12 @@ func checkSegment(segment string) error {
 		head = rest[0]
 		rest = rest[1:]
 	}
+	// PowerShell call operator: `& <command>` — strip the `&` so the actual
+	// command lands in `head`.
+	for head == "&" && len(rest) > 0 {
+		head = rest[0]
+		rest = rest[1:]
+	}
 
 	// Strip path + extension.
 	headCanon := canonicalName(head)
@@ -179,6 +201,18 @@ func checkSegment(segment string) error {
 	// Shell runner: ... -c "X" — re-check X.
 	if shellRunners[headCanon] {
 		if inner := extractShellInner(headCanon, rest); inner != "" {
+			if err := Check(inner); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	// Command wrapper (start / Start-Process / iex / Invoke-Expression …):
+	// first non-flag arg is the actual command we'd otherwise launch.
+	// Strip leading PS-style argv (`&`, quoted launcher) and recurse.
+	if commandWrappers[strings.ToLower(headCanon)] {
+		if inner := extractWrapperInner(rest); inner != "" {
 			if err := Check(inner); err != nil {
 				return err
 			}
@@ -330,6 +364,8 @@ func tokenize(s string) []string {
 }
 
 // extractShellInner reads -c / /c / -Command argument from a shell wrapper.
+// For -EncodedCommand the base64 payload is decoded (UTF-16LE per
+// PowerShell's convention) before being returned for re-checking.
 func extractShellInner(shell string, rest []string) string {
 	for i, t := range rest {
 		switch shell {
@@ -339,7 +375,16 @@ func extractShellInner(shell string, rest []string) string {
 				return strings.Join(rest[i+1:], " ")
 			}
 		case "powershell", "powershell.exe", "pwsh", "pwsh.exe":
-			if (strings.EqualFold(t, "-c") || strings.EqualFold(t, "-command") || strings.EqualFold(t, "-encodedcommand")) && i+1 < len(rest) {
+			// -EncodedCommand <base64-utf16le>: decode, then recurse.
+			if strings.EqualFold(t, "-encodedcommand") || strings.EqualFold(t, "-enc") || strings.EqualFold(t, "-e") {
+				if i+1 < len(rest) {
+					if decoded := decodePowerShellEncoded(rest[i+1]); decoded != "" {
+						return decoded
+					}
+				}
+				continue
+			}
+			if (strings.EqualFold(t, "-c") || strings.EqualFold(t, "-command")) && i+1 < len(rest) {
 				return strings.Join(rest[i+1:], " ")
 			}
 		default: // bash / sh / dash / zsh / ksh / fish / nu
@@ -347,6 +392,53 @@ func extractShellInner(shell string, rest []string) string {
 				return rest[i+1]
 			}
 		}
+	}
+	return ""
+}
+
+// decodePowerShellEncoded decodes the base64 payload of
+// `powershell -EncodedCommand <b64>`. PowerShell expects the input to be
+// UTF-16LE encoded BEFORE base64. Returns "" if anything goes wrong (we
+// then fall through to allowing the segment — safer than crashing).
+func decodePowerShellEncoded(b64 string) string {
+	raw, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		return ""
+	}
+	if len(raw)%2 != 0 {
+		return ""
+	}
+	u16 := make([]uint16, len(raw)/2)
+	for i := 0; i < len(u16); i++ {
+		u16[i] = uint16(raw[2*i]) | uint16(raw[2*i+1])<<8
+	}
+	return string(utf16.Decode(u16))
+}
+
+// extractWrapperInner pulls out the actual command from a wrapper-style
+// invocation (`start <cmd>`, `Start-Process <cmd>`, `iex "<cmd>"` …).
+// Skips leading PowerShell-isms — quoted strings, the `&` invocation
+// operator, and -Verb/-WindowStyle/-FilePath flag spellings.
+func extractWrapperInner(rest []string) string {
+	for i, t := range rest {
+		if t == "" {
+			continue
+		}
+		// PowerShell flags often paired with Start-Process: -FilePath <cmd>,
+		// -ArgumentList "..."; the actual exe sits behind -FilePath.
+		if strings.EqualFold(t, "-filepath") && i+1 < len(rest) {
+			return rest[i+1]
+		}
+		// Skip POSIX-style (-x) AND cmd-style (/x) flags. `start /b claude`,
+		// `start /min claude`, etc.
+		if strings.HasPrefix(t, "-") || strings.HasPrefix(t, "/") || t == "--" {
+			continue
+		}
+		// PowerShell call operator: & "<command>" or & 'command'
+		if t == "&" {
+			continue
+		}
+		return strings.Trim(t, `"'`)
 	}
 	return ""
 }
