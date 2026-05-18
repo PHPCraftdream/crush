@@ -920,7 +920,14 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 	var mcpTmpCfg string    // path to temp MCP config file (claude-style); "" if not used
 	var qwenMCPName string  // registered name in ~/.qwen/settings.json; "" if not used
 	var geminiMCPName string // registered name in ~/.gemini/settings.json; "" if not used
-	if m.spec.UseCrushMCP && !yolo && m.perms != nil {
+	// Fork patch: batch 20 — keep the MCP bridge active even in yolo/bypass mode.
+	// Before this fix, `!yolo` here meant that `crush run` (which sets yolo=true via
+	// NonInteractiveContextKey in batch 14) would skip MCP setup entirely. Inner
+	// claude then ran with no --allowedTools and could reach for its native Bash /
+	// Write / Task tools, bypassing agentguard (batch 16) and the MCP permission
+	// dialog. yolo only controls whether claude needs the bypass-permissions flag,
+	// not whether our MCP bridge sits in the loop.
+	if m.spec.UseCrushMCP && m.perms != nil {
 		var err error
 		mcpSrv, err = newCrushMCPServer(ctx, m.perms, m.sessions, sessionID, m.workingDir, "", m.mcpProxy)
 		if err != nil {
