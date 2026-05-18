@@ -82,6 +82,9 @@ type Service interface {
 	Get(ctx context.Context, id string) (Session, error)
 	GetLast(ctx context.Context) (Session, error)
 	List(ctx context.Context) ([]Session, error)
+	// ListAll returns every session including children (no parent_session_id
+	// filter). Used by sessions gc for garbage collection.
+	ListAll(ctx context.Context) ([]Session, error)
 	// ListSubSessions returns every session whose parent_session_id
 	// equals the argument, ordered oldest-first. Used by the
 	// --aggregation=attach path and the reduction-loss warning to
@@ -427,6 +430,31 @@ func (s *service) List(ctx context.Context) ([]Session, error) {
 		sessions[i] = s.fromDBItem(dbSession)
 	}
 	return sessions, nil
+}
+
+func (s *service) ListAll(ctx context.Context) ([]Session, error) {
+	rows, err := s.db.QueryContext(ctx, "SELECT id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id, system_prompt, yolo_enabled, large_model_reasoning_effort, small_model_reasoning_effort FROM sessions ORDER BY updated_at DESC")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var sessions []Session
+	for rows.Next() {
+		var item db.Session
+		if err := rows.Scan(
+			&item.ID, &item.ParentSessionID, &item.Title, &item.MessageCount,
+			&item.PromptTokens, &item.CompletionTokens, &item.Cost,
+			&item.UpdatedAt, &item.CreatedAt, &item.SummaryMessageID, &item.Todos,
+			&item.LargeModelProvider, &item.LargeModelID,
+			&item.SmallModelProvider, &item.SmallModelID,
+			&item.SystemPrompt, &item.YoloEnabled,
+			&item.LargeModelReasoningEffort, &item.SmallModelReasoningEffort,
+		); err != nil {
+			return nil, err
+		}
+		sessions = append(sessions, s.fromDBItem(item))
+	}
+	return sessions, rows.Err()
 }
 
 func (s service) fromDBItem(item db.Session) Session {

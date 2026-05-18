@@ -1,4 +1,4 @@
-﻿package cmd
+package cmd
 
 import (
 	"context"
@@ -6,7 +6,9 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
+	"time"
 
 	"charm.land/log/v2"
 	"github.com/charmbracelet/crush/internal/app"
@@ -22,17 +24,17 @@ var runCmd = &cobra.Command{
 	Long: `Run a single prompt in non-interactive mode and exit.
 
   WARNING — auto-bypass of inner CLI permissions:
-  `+"`crush run`"+` is non-interactive by design (no human at the keyboard),
+  ` + "`crush run`" + ` is non-interactive by design (no human at the keyboard),
   so any inner CLI sub-process it spawns (claude / codex / gemini) is
   launched with its own bypass-permissions flag (claude
   --dangerously-skip-permissions, codex --approval-mode yolo, gemini
   --yolo). The sub-process can read, write, and execute anywhere the
   invoking user has permission. There is no per-tool confirmation. Use
-  `+"`crush run`"+` only in workspaces you can afford to lose; if you need
+  ` + "`crush run`" + ` only in workspaces you can afford to lose; if you need
   real isolation, wrap the invocation in an OS-level sandbox (Sandboxie
   Plus, Windows Sandbox, WSL2 + landlock, Docker, etc.). Interactive
   sessions (TUI / web) keep the normal permission flow — this WARNING
-  applies only to `+"`crush run`"+`.
+  applies only to ` + "`crush run`" + `.
 
 --role is REQUIRED: every invocation must declare whether it wants the
 strong/slow model ("--role smart" or "--role large") or the cheap/fast
@@ -236,7 +238,7 @@ crush run --timeout 5m --session "long-task" "refactor the storage layer"
 			verbose, _          = cmd.Flags().GetBool("verbose")
 			stream, _           = cmd.Flags().GetBool("stream")
 			asJSON, _           = cmd.Flags().GetBool("json")
-			timeout, _          = cmd.Flags().GetDuration("timeout")
+			timeout, _          = cmd.Flags().GetString("timeout")
 			role, _             = cmd.Flags().GetString("role")
 			effort, _           = cmd.Flags().GetString("effort")
 			largeModel, _       = cmd.Flags().GetString("model")
@@ -250,12 +252,14 @@ crush run --timeout 5m --session "long-task" "refactor the storage layer"
 			// the sub-agent dispatch policy; --aggregation controls how
 			// sub-agent fan-out output reaches the orchestrator. See
 			// run_format.go.
-			formatFlag, _                = cmd.Flags().GetString("format")
-			agentsMode, _                = cmd.Flags().GetString("agents")
-			aggregationMode, _           = cmd.Flags().GetString("aggregation")
+			formatFlag, _      = cmd.Flags().GetString("format")
+			agentsMode, _      = cmd.Flags().GetString("agents")
+			aggregationMode, _ = cmd.Flags().GetString("aggregation")
 			// Fork patch: batch 8 — timeout extension flags.
 			timeoutExtendsOnProgress, _ = cmd.Flags().GetBool("timeout-extends-on-progress")
-			timeoutHardCap, _           = cmd.Flags().GetDuration("timeout-hard-cap")
+			timeoutHardCap, _           = cmd.Flags().GetString("timeout-hard-cap")
+			// Fork patch: batch 24 — on-finish hook.
+			onFinishHook, _ = cmd.Flags().GetString("on-finish")
 		)
 
 		if effort != "" {
@@ -331,6 +335,16 @@ crush run --timeout 5m --session "long-task" "refactor the storage layer"
 			return fmt.Errorf("--aggregation: invalid value %q (allowed: summary|concat|attach)", aggregationMode)
 		}
 
+		// Parse flexible duration flags.
+		timeoutDur, err := parseDurationFlexible(timeout)
+		if err != nil {
+			return fmt.Errorf("--timeout: %w", err)
+		}
+		hardCapDur, err := parseDurationFlexible(timeoutHardCap)
+		if err != nil {
+			return fmt.Errorf("--timeout-hard-cap: %w", err)
+		}
+
 		// Cancel on SIGINT or SIGTERM.
 		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, os.Kill)
 		defer cancel()
@@ -338,9 +352,9 @@ crush run --timeout 5m --session "long-task" "refactor the storage layer"
 		// Optional hard deadline. The agent run gets context.DeadlineExceeded
 		// instead of context.Canceled, and the in-flight assistant message
 		// finishes with FinishReasonCanceled, just like an explicit cancel.
-		if timeout > 0 {
+		if timeoutDur > 0 {
 			var timeoutCancel context.CancelFunc
-			ctx, timeoutCancel = context.WithTimeout(ctx, timeout)
+			ctx, timeoutCancel = context.WithTimeout(ctx, timeoutDur)
 			defer timeoutCancel()
 		}
 
@@ -413,7 +427,7 @@ crush run --timeout 5m --session "long-task" "refactor the storage layer"
 		// JSON mode forces quiet (hide spinner) so the spinner glyphs don't
 		// leak into stdout. The summary line on stderr we still emit.
 		hideSpinner := quiet || verbose || asJSON
-			overrides := app.RunOverrides{
+		overrides := app.RunOverrides{
 			LargeModel:               largeModel,
 			SmallModel:               smallModel,
 			SystemPrompt:             systemPrompt,
@@ -423,7 +437,8 @@ crush run --timeout 5m --session "long-task" "refactor the storage layer"
 			StripJSONFences:          formatFlag == "json" || strings.HasPrefix(formatFlag, "json-schema:"),
 			AggregationMode:          aggregationMode,
 			TimeoutExtendsOnProgress: timeoutExtendsOnProgress, // Fork patch: batch 8
-			TimeoutHardCap:           timeoutHardCap,           // Fork patch: batch 8
+			TimeoutHardCap:           hardCapDur,               // Fork patch: batch 8
+			OnFinishHook:             onFinishHook,             // Fork patch: batch 24
 		}
 		return a.RunNonInteractive(ctx, os.Stdout, prompt, overrides, hideSpinner, mode, sessionID, useLast)
 	},
@@ -436,7 +451,7 @@ func init() {
 	runCmd.Flags().String("effort", "", "Reasoning effort for this turn: low|medium|high. Applies to whichever slot --role picked. Persisted on the session so subsequent runs inherit it.")
 	runCmd.Flags().Bool("stream", false, "Stream every assistant token to stdout. Default is terse: tool-call names on stderr + final answer on stdout.")
 	runCmd.Flags().Bool("json", false, "Emit one JSON object on stdout summarising the run (session_id, final_text, tool_calls, usage, duration, exit_reason). Mutually exclusive with --stream.")
-	runCmd.Flags().Duration("timeout", 0, "Abort the run after this duration (e.g. 30s, 5m, 1h). 0 = no timeout.")
+	runCmd.Flags().String("timeout", "0", "Abort the run after this duration (e.g. 30s, 5m, 900 — plain number = seconds). 0 = no timeout.")
 	runCmd.Flags().StringP("model", "m", "", "Model to use. Accepts 'model' or 'provider/model' to disambiguate models with the same name across providers")
 	runCmd.Flags().String("small-model", "", "Small model to use. If not provided, uses the default small model for the provider")
 	runCmd.Flags().StringP("session", "s", "", "Session ID to continue OR create. If a session with this id exists it is continued; otherwise a new one is created with this id. Accepts a hash prefix for existing sessions only.")
@@ -450,7 +465,9 @@ func init() {
 	runCmd.Flags().String("aggregation", "", "How sub-agent fan-out output reaches the orchestrator. 'summary' (default — parent composes a wrap-up, sub-agent detail lives in DB only) | 'concat' (prompt-nudge: parent includes each sub-agent reply verbatim in final_text) | 'attach' (collect each sub-agent's last assistant text into envelope.sub_agent_outputs; final_text becomes a brief wrap-up). An always-on reduction-loss warning fires regardless when parent collapses sub-agent outputs to <40% of their combined size.")
 	// Fork patch: batch 8 — timeout extension flags.
 	runCmd.Flags().Bool("timeout-extends-on-progress", false, "Reset the stream watchdog deadline every time streaming progress occurs. Prevents killing healthy long compositions. Default: false (static deadline).")
-	runCmd.Flags().Duration("timeout-hard-cap", 0, "Maximum wall-clock time the watchdog allows even with --timeout-extends-on-progress and continuous progress. Default: 0 (no cap; recommend 4x --timeout).")
+	runCmd.Flags().String("timeout-hard-cap", "0", "Maximum wall-clock time the watchdog allows even with --timeout-extends-on-progress (e.g. 30s, 5m, 900 — plain number = seconds). Default: 0 (no cap).")
+	// Fork patch: batch 24 — on-finish hook.
+	runCmd.Flags().String("on-finish", "", "Shell command to execute after the run completes. Environment variables: CRUSH_SESSION_ID, CRUSH_EXIT_REASON, CRUSH_COST_USD, CRUSH_TOKENS, CRUSH_DURATION_SEC. Hook errors are printed to stderr but don't affect exit code.")
 	runCmd.MarkFlagsMutuallyExclusive("session", "continue")
 	runCmd.MarkFlagsMutuallyExclusive("system-prompt", "system-prompt-file")
 	runCmd.MarkFlagsMutuallyExclusive("stream", "json")
@@ -488,4 +505,16 @@ func resolveSessionID(ctx context.Context, svc session.Service, id string) (sess
 		fmt.Fprintf(&sb, "  %s  %s\n", session.HashID(s.ID), s.Title)
 	}
 	return session.Session{}, fmt.Errorf("%s", sb.String())
+}
+
+// parseDurationFlexible parses a duration string that can be a plain integer
+// (interpreted as seconds) or a Go duration string (e.g. "30s", "5m", "1h").
+func parseDurationFlexible(s string) (time.Duration, error) {
+	if s == "" || s == "0" {
+		return 0, nil
+	}
+	if n, err := strconv.Atoi(s); err == nil {
+		return time.Duration(n) * time.Second, nil
+	}
+	return time.ParseDuration(s)
 }

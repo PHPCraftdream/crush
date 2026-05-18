@@ -27,26 +27,26 @@ remains "local if set, else global".
 See ` + "`crush models list`" + ` for the full atom table.`,
 	Args: cobra.ExactArgs(2),
 	Example: `
-# Short codes: Opus 4.7 xhigh + Haiku 4.5 low (recommended default)
-crush models use o47-3 h45-0
+# Short codes: Opus 4.7 xhigh (1M ctx) + Haiku 4.5 low (200k ctx)
+crush models use o47x h45l
 
-# Sonnet 4.6 high + Haiku 4.5 low (cheaper than Opus, still smart)
-crush models use s46-2 h45-0
+# Sonnet 4.6 high (200k ctx) + Haiku 4.5 low — cheaper than Opus, still smart
+crush models use s46h h45l
 
-# Max thinking on large, fast on small
-crush models use o47-4 h45-0
+# Max thinking on large (1M ctx), fast on small
+crush models use o47xx h45l
 
 # Z.AI stack
 crush models use glm5_1 glm5_turbo
 
-# Mixed: Opus xhigh + Z.AI turbo
-crush models use o47-3 glm5_turbo
+# Mixed: Opus xhigh (1M ctx) + Z.AI turbo
+crush models use o47x glm5_turbo
 
 # Long-form atom syntax still works
 crush models use opus-high sonnet-low
 
 # Workspace-only override (writes ./.crush/crush.json, leaves global untouched).
-crush models use --local o47-3 h45-0
+crush models use --local o47x h45l
 
 # Raw "provider/model[@level]" syntax for models not in the registry.
 crush models use openai/gpt-5@high zai/glm-5-turbo

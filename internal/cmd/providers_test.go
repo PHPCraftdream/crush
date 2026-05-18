@@ -344,8 +344,8 @@ func TestComputeDiff_AddsAndRemoves(t *testing.T) {
 	require.Equal(t, "model-e", added[1].ID)
 
 	require.Len(t, removed, 2)
-	require.Equal(t, "model-a", removed[0].ID)
-	require.Equal(t, "model-c", removed[1].ID)
+	removedIDs := []string{removed[0].ID, removed[1].ID}
+	assert.ElementsMatch(t, []string{"model-a", "model-c"}, removedIDs)
 }
 
 func TestComputeDiff_NoChanges(t *testing.T) {

@@ -318,3 +318,138 @@ func TestClaudeDel_IdempotentOnSecondRun(t *testing.T) {
 	assert.Equal(t, string(first), string(second), "second run must not change the file")
 	assert.Contains(t, stderr, "no crush-claude-init block found")
 }
+
+// ---------------------------------------------------------------------------
+// claude-init agent tests (batch 29)
+// ---------------------------------------------------------------------------
+
+func TestClaudeInit_InstallsAgents(t *testing.T) {
+	tmp := t.TempDir()
+	agentsDir := filepath.Join(tmp, ".claude", "agents")
+	err := writeModelAgentsToDir(agentsDir)
+	require.NoError(t, err)
+
+	// Check a few representative files exist with correct content.
+	for _, name := range []string{"ao47h", "ao47xx", "as46m", "ah45l", "aol", "asl", "ahh"} {
+		path := filepath.Join(agentsDir, name+".md")
+		data, err := os.ReadFile(path)
+		require.NoError(t, err, "agent %s should exist", name)
+		content := string(data)
+		assert.Contains(t, content, "claude-", "agent %s should contain model name", name)
+		assert.Contains(t, content, claudeModelAgentSentinel, "agent %s should contain sentinel", name)
+		assert.Contains(t, content, "$ARGUMENTS", "agent %s should contain $ARGUMENTS", name)
+		assert.Contains(t, content, "name: "+name, "agent %s should have name frontmatter", name)
+	}
+}
+
+func TestClaudeInit_AgentFrontmatter(t *testing.T) {
+	tmp := t.TempDir()
+	agentsDir := filepath.Join(tmp, ".claude", "agents")
+	require.NoError(t, writeModelAgentsToDir(agentsDir))
+
+	// Check o47h has correct frontmatter fields.
+	path := filepath.Join(agentsDir, "ao47h.md")
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	content := string(data)
+	assert.Contains(t, content, "name: ao47h")
+	assert.Contains(t, content, "model: claude-opus-4-7")
+	assert.Contains(t, content, "effort=high")
+	assert.Contains(t, content, "You are a delegated worker invoked with reasoning effort: high")
+}
+
+func TestClaudeInit_AgentSkipsWithoutSentinel(t *testing.T) {
+	tmp := t.TempDir()
+	agentsDir := filepath.Join(tmp, ".claude", "agents")
+	require.NoError(t, os.MkdirAll(agentsDir, 0o755))
+
+	// Write a foreign file.
+	foreignPath := filepath.Join(agentsDir, "ao47h.md")
+	require.NoError(t, os.WriteFile(foreignPath, []byte("someone else's agent"), 0o644))
+
+	stderr := captureStderr(t, func() {
+		err := writeModelAgentsToDir(agentsDir)
+		require.NoError(t, err)
+	})
+	assert.Contains(t, stderr, "not ours — skipping")
+
+	// Foreign file untouched.
+	data, err := os.ReadFile(foreignPath)
+	require.NoError(t, err)
+	assert.Equal(t, "someone else's agent", string(data))
+}
+
+func TestClaudeDel_RemovesAgents(t *testing.T) {
+	tmp := t.TempDir()
+	agentsDir := filepath.Join(tmp, ".claude", "agents")
+	require.NoError(t, writeModelAgentsToDir(agentsDir))
+	require.NoError(t, removeModelAgentsFromDir(agentsDir))
+
+	// Verify all agent files are gone.
+	entries, err := os.ReadDir(agentsDir)
+	require.NoError(t, err)
+	assert.Empty(t, entries, "agents directory should be empty after removal")
+}
+
+func TestClaudeDel_AgentRefusesWithoutSentinel(t *testing.T) {
+	tmp := t.TempDir()
+	agentsDir := filepath.Join(tmp, ".claude", "agents")
+	require.NoError(t, os.MkdirAll(agentsDir, 0o755))
+
+	// Write a foreign agent file.
+	foreignPath := filepath.Join(agentsDir, "ao47h.md")
+	require.NoError(t, os.WriteFile(foreignPath, []byte("not our agent"), 0o644))
+
+	stderr := captureStderr(t, func() {
+		err := removeModelAgentsFromDir(agentsDir)
+		require.NoError(t, err)
+	})
+	assert.Contains(t, stderr, "refusing to delete")
+
+	// Foreign file still there.
+	data, err := os.ReadFile(foreignPath)
+	require.NoError(t, err)
+	assert.Equal(t, "not our agent", string(data))
+}
+
+func TestClaudeInit_InstallsBothCommandsAndAgents(t *testing.T) {
+	dir := t.TempDir()
+	runClaudeInitInDir(t, dir)
+
+	cmdDir := filepath.Join(dir, ".claude", "commands")
+	agentsDir := filepath.Join(dir, ".claude", "agents")
+
+	// Verify slash-commands exist.
+	for _, name := range []string{"o47h", "s46m", "hh"} {
+		_, err := os.Stat(filepath.Join(cmdDir, name+".md"))
+		require.NoError(t, err, "slash-command %s should exist", name)
+	}
+
+	// Verify agents exist.
+	for _, name := range []string{"ao47h", "as46m", "ahh"} {
+		_, err := os.Stat(filepath.Join(agentsDir, name+".md"))
+		require.NoError(t, err, "agent %s should exist", name)
+	}
+}
+
+func TestClaudeDel_RemovesBothCommandsAndAgents(t *testing.T) {
+	dir := t.TempDir()
+	runClaudeInitInDir(t, dir)
+
+	// Verify files exist.
+	cmdDir := filepath.Join(dir, ".claude", "commands")
+	agentsDir := filepath.Join(dir, ".claude", "agents")
+	_, err := os.Stat(filepath.Join(cmdDir, "o47h.md"))
+	require.NoError(t, err)
+	_, err = os.Stat(filepath.Join(agentsDir, "ao47h.md"))
+	require.NoError(t, err)
+
+	// Delete.
+	runClaudeDelInDir(t, dir)
+
+	// Verify both are gone.
+	_, err = os.Stat(filepath.Join(cmdDir, "o47h.md"))
+	assert.True(t, os.IsNotExist(err), "slash-command should be removed")
+	_, err = os.Stat(filepath.Join(agentsDir, "ao47h.md"))
+	assert.True(t, os.IsNotExist(err), "agent should be removed")
+}

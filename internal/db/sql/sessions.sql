@@ -60,6 +60,13 @@ FROM sessions
 WHERE parent_session_id is NULL
 ORDER BY updated_at DESC;
 
+-- name: ListAllSessions :many
+-- Returns every session including children (no parent_session_id filter).
+-- Used by sessions gc to enumerate all sessions for garbage collection.
+SELECT *
+FROM sessions
+ORDER BY updated_at DESC;
+
 -- name: ListSubSessions :many
 -- Returns every session whose parent_session_id matches the argument,
 -- ordered oldest-first so callers reconstructing a fan-out get the

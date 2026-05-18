@@ -307,8 +307,9 @@ func sessionsLastCmdRun(cmd *cobra.Command, args []string) error {
 	if len(messages) > n {
 		messages = messages[len(messages)-n:]
 	}
+	now := time.Now()
 	for _, msg := range messages {
-		printMessage(os.Stdout, msg, format)
+		printMessageWithTime(os.Stdout, msg, format, now)
 	}
 	return nil
 }
@@ -330,7 +331,7 @@ func init() {
 	sessionsLastCmd.Flags().IntP("n", "n", 10, "Number of messages to show")
 	sessionsLastCmd.Flags().String("format", "text", "Output format: text or ndjson")
 
-	sessionsCmd.AddCommand(sessionsListCmd, sessionsDeleteCmd, sessionsResetCmd, sessionsShowCmd, sessionsLocksCmd, sessionsTailCmd, sessionsLastCmd)
+	sessionsCmd.AddCommand(sessionsListCmd, sessionsDeleteCmd, sessionsResetCmd, sessionsShowCmd, sessionsLocksCmd, sessionsTailCmd, sessionsLastCmd, sessionsGcCmd, sessionsWatchCmd, sessionsPickCmd, sessionsGrepCmd, sessionsCostCmd, sessionsDiffCmd)
 	rootCmd.AddCommand(sessionsCmd)
 }
 
@@ -415,9 +416,9 @@ func sessionsShowCmdRun(cmd *cobra.Command, args []string) error {
 	}
 
 	type msgItem struct {
-		ID         string `json:"id"`
-		Role       string `json:"role"`
-		Preview    string `json:"preview"`
+		ID           string `json:"id"`
+		Role         string `json:"role"`
+		Preview      string `json:"preview"`
 		FinishReason string `json:"finish_reason,omitempty"`
 	}
 
@@ -553,10 +554,11 @@ func sessionsShowCmdRun(cmd *cobra.Command, args []string) error {
 
 // lockPulseStatus classifies a lock file by its heartbeat mtime.
 // Heartbeat interval = 10s, stale threshold = 20s (session.lockStaleDuration).
-//   0–10s  → "alive"    (fresh heartbeat)
-//   10–15s → "ping"     (one beat overdue, likely OK)
-//   15–20s → "stopping" (two beats missed, probably finishing)
-//   >20s   → "offline"  (stale — holder crashed or exited without Release)
+//
+//	0–10s  → "alive"    (fresh heartbeat)
+//	10–15s → "ping"     (one beat overdue, likely OK)
+//	15–20s → "stopping" (two beats missed, probably finishing)
+//	>20s   → "offline"  (stale — holder crashed or exited without Release)
 func lockPulseStatus(ageSec int64) string {
 	switch {
 	case ageSec <= 10:
@@ -743,8 +745,9 @@ func sessionsTailCmdRun(cmd *cobra.Command, args []string) error {
 	}
 
 	// Print messages
+	now := time.Now()
 	for _, msg := range messages {
-		printMessage(os.Stdout, msg, format)
+		printMessageWithTime(os.Stdout, msg, format, now)
 		lastPrinted = msg.ID
 	}
 
@@ -776,9 +779,10 @@ func sessionsTailCmdRun(cmd *cobra.Command, args []string) error {
 		}
 
 		// Print any new messages
+		now := time.Now()
 		for i := range messages {
 			if messages[i].ID != lastPrinted && (lastPrinted == "" || isAfter(&messages[i], findByID(messages, lastPrinted))) {
-				printMessage(os.Stdout, messages[i], format)
+				printMessageWithTime(os.Stdout, messages[i], format, now)
 				lastPrinted = messages[i].ID
 			}
 		}
@@ -806,6 +810,34 @@ func isAfter(a, b *message.Message) bool {
 		return true
 	}
 	return a.CreatedAt > b.CreatedAt || (a.CreatedAt == b.CreatedAt && a.ID > b.ID)
+}
+
+// formatAgo returns a human-friendly "X ago" string for the given duration.
+func formatAgo(d time.Duration) string {
+	switch {
+	case d < time.Minute:
+		return fmt.Sprintf("%ds ago", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm %ds ago", int(d.Minutes()), int(d.Seconds())%60)
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh %dm ago", int(d.Hours()), int(d.Minutes())%60)
+	default:
+		days := int(d.Hours()) / 24
+		hours := int(d.Hours()) % 24
+		return fmt.Sprintf("%dd %dh ago", days, hours)
+	}
+}
+
+// printMessageWithTime prints a timestamp header followed by the message
+// content. Only adds the header in text format when CreatedAt != 0.
+// A blank line is printed between messages for readability.
+func printMessageWithTime(w io.Writer, msg message.Message, format string, now time.Time) {
+	if format == "text" && msg.CreatedAt != 0 {
+		ts := time.Unix(msg.CreatedAt, 0)
+		ago := now.Sub(ts)
+		fmt.Fprintf(w, "[%s] (%s)\n", ts.Format("2006-01-02 15:04:05"), formatAgo(ago))
+	}
+	printMessage(w, msg, format)
 }
 
 func printMessage(w io.Writer, msg message.Message, format string) {

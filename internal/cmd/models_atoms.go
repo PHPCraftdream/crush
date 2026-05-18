@@ -24,7 +24,7 @@ type atom struct {
 
 var atomRegistry = map[string]atom{
 	"opus":         {Provider: "local-cli", Model: "cli-claude-opus", DisplayName: "Claude Opus", CtxLabel: "1M", Group: "anthropic", GroupNote: "via local `claude` CLI", EffortSource: claudeEffortSource},
-	"sonnet":       {Provider: "local-cli", Model: "cli-claude-sonnet", DisplayName: "Claude Sonnet", CtxLabel: "1M", Group: "anthropic", GroupNote: "via local `claude` CLI", EffortSource: claudeEffortSource},
+	"sonnet":       {Provider: "local-cli", Model: "cli-claude-sonnet", DisplayName: "Claude Sonnet", CtxLabel: "200k", Group: "anthropic", GroupNote: "via local `claude` CLI", EffortSource: claudeEffortSource},
 	"haiku":        {Provider: "local-cli", Model: "cli-claude-haiku", DisplayName: "Claude Haiku", CtxLabel: "200k", Group: "anthropic", GroupNote: "via local `claude` CLI", EffortSource: claudeEffortSource},
 	"glm5_1":       {Provider: "zai", Model: "glm-5.1", DisplayName: "GLM 5.1", CtxLabel: "204.8k", Group: "zai", GroupNote: "openai-compat, no effort"},
 	"glm5":         {Provider: "zai", Model: "glm-5", DisplayName: "GLM 5", CtxLabel: "204.8k", Group: "zai"},
@@ -173,11 +173,11 @@ func renderAtomsBlock(cfg *config.Config) string {
 	}
 	b.WriteString(renderShortCodesBlock())
 	b.WriteString("EXAMPLES:\n")
-	b.WriteString("  crush models use o47-3 h45-0     # Opus 4.7 xhigh + Haiku 4.5 low\n")
-	b.WriteString("  crush models use s46-2 h45-0     # Sonnet 4.6 high + Haiku 4.5 low\n")
+	b.WriteString("  crush models use o47x h45l       # Opus 4.7 xhigh + Haiku 4.5 low\n")
+	b.WriteString("  crush models use s46h h45l       # Sonnet 4.6 high + Haiku 4.5 low\n")
 	b.WriteString("  crush models use opus-high sonnet-low\n")
 	b.WriteString("  crush models use glm5_1 glm5_turbo\n")
-	b.WriteString("  crush models use o47-4 glm5_turbo  # mixed\n")
+	b.WriteString("  crush models use ox glm5_turbo    # mixed\n")
 	return b.String()
 }
 
@@ -211,8 +211,8 @@ func renderAtomsBlockFallback() string {
 	}
 	b.WriteString(renderShortCodesBlock())
 	b.WriteString("EXAMPLES:\n")
-	b.WriteString("  crush models use o47-3 h45-0\n")
-	b.WriteString("  crush models use s46-2 h45-0\n")
+	b.WriteString("  crush models use o47x h45l\n")
+	b.WriteString("  crush models use s46h h45l\n")
 	b.WriteString("  crush models use glm5_1 glm5_turbo\n")
 	return b.String()
 }
@@ -220,93 +220,161 @@ func renderAtomsBlockFallback() string {
 // renderShortCodesBlock returns a formatted table of the short-code aliases.
 func renderShortCodesBlock() string {
 	var b strings.Builder
-	b.WriteString("SHORT CODES (alias for atom+effort, e.g. `crush models use o47-3 h45-0`):\n\n")
-	b.WriteString("  Code     Model              Effort\n")
-	b.WriteString("  -------  -----------------  ------\n")
-	rows := []struct{ code, model, effort string }{
-		{"o47-0", "claude-opus-4-7", "low"},
-		{"o47-1", "claude-opus-4-7", "medium"},
-		{"o47-2", "claude-opus-4-7", "high"},
-		{"o47-3", "claude-opus-4-7", "xhigh"},
-		{"o47-4", "claude-opus-4-7", "max"},
-		{"o46-0", "claude-opus-4-6", "low"},
-		{"o46-1", "claude-opus-4-6", "medium"},
-		{"o46-2", "claude-opus-4-6", "high"},
-		{"o46-3", "claude-opus-4-6", "max"},
-		{"s46-0", "claude-sonnet-4-6", "low"},
-		{"s46-1", "claude-sonnet-4-6", "medium"},
-		{"s46-2", "claude-sonnet-4-6", "high"},
-		{"s46-3", "claude-sonnet-4-6", "max"},
-		{"s45-0", "claude-sonnet-4-5", "low"},
-		{"s45-1", "claude-sonnet-4-5", "medium"},
-		{"s45-2", "claude-sonnet-4-5", "high"},
-		{"h45-0", "claude-haiku-4-5", "low"},
-		{"h45-1", "claude-haiku-4-5", "medium"},
-		{"h45-2", "claude-haiku-4-5", "high"},
+	b.WriteString("SHORT CODES (alias for atom+effort, e.g. `crush models use o47x h45l`):\n\n")
+	b.WriteString("  Code     Model               CTX   Effort\n")
+	b.WriteString("  -------  ------------------  ----  ------\n")
+	rows := []struct{ code, model, ctx, effort string }{
+		// Versioned
+		{"o47l", "claude-opus-4-7", "1M", "low"},
+		{"o47m", "claude-opus-4-7", "1M", "medium"},
+		{"o47h", "claude-opus-4-7", "1M", "high"},
+		{"o47x", "claude-opus-4-7", "1M", "xhigh"},
+		{"o47xx", "claude-opus-4-7", "1M", "max"},
+		{"o46l", "claude-opus-4-6", "1M", "low"},
+		{"o46m", "claude-opus-4-6", "1M", "medium"},
+		{"o46h", "claude-opus-4-6", "1M", "high"},
+		{"o46xx", "claude-opus-4-6", "1M", "max"},
+		{"s46l", "claude-sonnet-4-6", "200k", "low"},
+		{"s46m", "claude-sonnet-4-6", "200k", "medium"},
+		{"s46h", "claude-sonnet-4-6", "200k", "high"},
+		{"s46xx", "claude-sonnet-4-6", "200k", "max"},
+		{"s45l", "claude-sonnet-4-5", "200k", "low"},
+		{"s45m", "claude-sonnet-4-5", "200k", "medium"},
+		{"s45h", "claude-sonnet-4-5", "200k", "high"},
+		{"h45l", "claude-haiku-4-5", "200k", "low"},
+		{"h45m", "claude-haiku-4-5", "200k", "medium"},
+		{"h45h", "claude-haiku-4-5", "200k", "high"},
+		// Top-model shortcuts
+		{"ol", "claude-opus-4-7", "1M", "low"},
+		{"om", "claude-opus-4-7", "1M", "medium"},
+		{"oh", "claude-opus-4-7", "1M", "high"},
+		{"ox", "claude-opus-4-7", "1M", "xhigh"},
+		{"oxx", "claude-opus-4-7", "1M", "max"},
+		{"sl", "claude-sonnet-4-6", "200k", "low"},
+		{"sm", "claude-sonnet-4-6", "200k", "medium"},
+		{"sh", "claude-sonnet-4-6", "200k", "high"},
+		{"sx", "claude-sonnet-4-6", "200k", "max"},
+		{"hl", "claude-haiku-4-5", "200k", "low"},
+		{"hm", "claude-haiku-4-5", "200k", "medium"},
+		{"hh", "claude-haiku-4-5", "200k", "high"},
 	}
 	tw := tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
 	for _, r := range rows {
-		fmt.Fprintf(tw, "  %s\t%s\t%s\n", r.code, r.model, r.effort)
+		fmt.Fprintf(tw, "  %s\t%s\t%s\t%s\n", r.code, r.model, r.ctx, r.effort)
 	}
 	tw.Flush()
 	b.WriteString("\n")
 	return b.String()
 }
 
-// shortCodeEffort maps the numeric suffix (0–4) to an effort level name.
-var shortCodeEffort = map[byte]string{
-	'0': "low",
-	'1': "medium",
-	'2': "high",
-	'3': "xhigh",
-	'4': "max",
+// shortCodeEffort maps the letter suffix to an effort level name.
+var shortCodeEffort = map[string]string{
+	"l":  "low",
+	"m":  "medium",
+	"h":  "high",
+	"x":  "xhigh",
+	"xx": "max",
 }
 
 // shortCodeBase maps the model prefix part of a short code to the
-// corresponding atom key in atomRegistry.
+// corresponding atom key in atomRegistry. Includes both versioned
+// prefixes (o47, s46, …) and top-model shortcuts (o, s, h).
 var shortCodeBase = map[string]string{
 	"o47": "opus",
 	"o46": "opus",
 	"s46": "sonnet",
 	"s45": "sonnet",
 	"h45": "haiku",
+	"o":   "opus",
+	"s":   "sonnet",
+	"h":   "haiku",
 }
 
-// parseShortCode tries to parse a short-code atom like "o47-3" or "h45-0".
+// shortCodeValidEfforts lists which effort suffixes each base accepts.
+var shortCodeValidEfforts = map[string][]string{
+	"o47": {"l", "m", "h", "x", "xx"},
+	"o46": {"l", "m", "h", "xx"},
+	"s46": {"l", "m", "h", "xx"},
+	"s45": {"l", "m", "h"},
+	"h45": {"l", "m", "h"},
+	"o":   {"l", "m", "h", "x", "xx"},
+	"s":   {"l", "m", "h", "xx"},
+	"h":   {"l", "m", "h"},
+}
+
+// parseShortCode tries to parse a short-code atom like "o47x" or "h45l".
 // Returns ok=false if the input doesn't match the pattern.
 func parseShortCode(name string) (config.SelectedModel, bool) {
-	// Expected format: "<base>-<digit>", e.g. "o47-3"
-	if len(name) != 5 || name[3] != '-' {
-		return config.SelectedModel{}, false
+	// Try to split into (base, suffix) by testing known bases longest-first.
+	// "o47xx" → base="o47", suffix="xx"; "ol" → base="o", suffix="l".
+	for _, base := range shortCodeBasesByLength {
+		if !strings.HasPrefix(name, base) {
+			continue
+		}
+		suffix := name[len(base):]
+		if suffix == "" {
+			continue
+		}
+		atomKey, ok := shortCodeBase[base]
+		if !ok {
+			continue
+		}
+		effort, ok := shortCodeEffort[suffix]
+		if !ok {
+			continue
+		}
+		// Validate effort is allowed for this base.
+		if !isValidEffort(base, suffix) {
+			return config.SelectedModel{}, false
+		}
+		a, ok := atomRegistry[atomKey]
+		if !ok {
+			return config.SelectedModel{}, false
+		}
+		return config.SelectedModel{
+			Provider:        a.Provider,
+			Model:           a.Model,
+			ReasoningEffort: effort,
+		}, true
 	}
-	base := name[:3]
-	digit := name[4]
-
-	atomKey, ok := shortCodeBase[base]
-	if !ok {
-		return config.SelectedModel{}, false
-	}
-	effort, ok := shortCodeEffort[digit]
-	if !ok {
-		return config.SelectedModel{}, false
-	}
-
-	a, ok := atomRegistry[atomKey]
-	if !ok {
-		return config.SelectedModel{}, false
-	}
-	return config.SelectedModel{
-		Provider:        a.Provider,
-		Model:           a.Model,
-		ReasoningEffort: effort,
-	}, true
+	return config.SelectedModel{}, false
 }
 
-// parseAtom takes a string like "o47-3", "opus-high", "glm5_turbo", or, as
+// isValidEffort checks whether the effort suffix is valid for the given base.
+func isValidEffort(base, suffix string) bool {
+	valid, ok := shortCodeValidEfforts[base]
+	if !ok {
+		return false
+	}
+	for _, v := range valid {
+		if v == suffix {
+			return true
+		}
+	}
+	return false
+}
+
+// shortCodeBasesByLength lists short-code bases sorted longest-first so
+// that "o47" is tried before "o" during parsing.
+var shortCodeBasesByLength = func() []string {
+	keys := make([]string, 0, len(shortCodeBase))
+	for k := range shortCodeBase {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if len(keys[i]) != len(keys[j]) {
+			return len(keys[i]) > len(keys[j])
+		}
+		return keys[i] < keys[j]
+	})
+	return keys
+}()
+
+// parseAtom takes a string like "o47x", "opus-high", "glm5_turbo", or, as
 // fallback, "openai/gpt-5@high" / "zai/glm-5.1". Returns a SelectedModel
 // ready for UpdatePreferredModel.
 func parseAtom(name string) (config.SelectedModel, error) {
-	// Try short-code notation first (o47-3, s46-1, h45-0, …).
+	// Try short-code notation first (o47x, h45l, oh, sl, …).
 	if sm, ok := parseShortCode(name); ok {
 		return sm, nil
 	}

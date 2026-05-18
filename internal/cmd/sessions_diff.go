@@ -1,0 +1,271 @@
+package cmd
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"sort"
+	"strings"
+
+	"github.com/charmbracelet/crush/internal/message"
+	"github.com/spf13/cobra"
+)
+
+var sessionsDiffCmd = &cobra.Command{
+	Use:   "diff <session-id>",
+	Short: "Show files touched by a session",
+	Long: `Analyze tool calls in a session to find files that were created, edited,
+or written by the agent. Works by scanning messages for ToolCall parts
+where the tool name is edit, write, multiedit, or create — no database
+migration needed.
+
+For each file found, tries git diff --name-status HEAD to show the
+current working-tree change (M/A/D). If not in a git repo or git fails,
+the file is listed without a status letter.
+
+Use --stat to include line-change statistics per file.
+Use --json for machine-readable output.`,
+	Example: `
+# Show files touched by a session
+crush sessions diff myid-123
+
+# Include line-change statistics
+crush sessions diff myid-123 --stat
+
+# Machine-readable output
+crush sessions diff myid-123 --json | jq '.files[] | .path'
+  `,
+	Args: cobra.ExactArgs(1),
+	RunE: sessionsDiffCmdRun,
+}
+
+// fileWritingTools are tool names that write to files.
+var fileWritingTools = map[string]bool{
+	"edit": true, "write": true, "multiedit": true, "create": true,
+}
+
+type diffFile struct {
+	Path   string `json:"path"`
+	Status string `json:"status"`
+}
+
+type diffOutput struct {
+	SessionID string     `json:"session_id"`
+	Files     []diffFile `json:"files"`
+}
+
+func sessionsDiffCmdRun(cmd *cobra.Command, args []string) error {
+	showStat, _ := cmd.Flags().GetBool("stat")
+	asJSON, _ := cmd.Flags().GetBool("json")
+
+	a, err := setupApp(cmd)
+	if err != nil {
+		return err
+	}
+	defer a.Shutdown()
+
+	sess, err := resolveSessionID(cmd.Context(), a.Sessions, args[0])
+	if err != nil {
+		return err
+	}
+
+	msgs, err := a.Messages.List(cmd.Context(), sess.ID)
+	if err != nil {
+		return fmt.Errorf("failed to list messages: %w", err)
+	}
+
+	// Collect file paths from ToolCall parts.
+	fileSet := make(map[string]bool)
+	for _, msg := range msgs {
+		for _, part := range msg.Parts {
+			tc, ok := part.(message.ToolCall)
+			if !ok {
+				continue
+			}
+			if !fileWritingTools[strings.ToLower(tc.Name)] {
+				continue
+			}
+			paths := extractFilePaths(tc.Name, tc.Input)
+			for _, p := range paths {
+				fileSet[p] = true
+			}
+		}
+	}
+
+	if len(fileSet) == 0 {
+		if asJSON {
+			enc := json.NewEncoder(os.Stdout)
+			_ = enc.Encode(diffOutput{
+				SessionID: sess.ID,
+				Files:     []diffFile{},
+			})
+		} else {
+			fmt.Fprintf(os.Stderr, "session %s: no file-modifying tool calls found\n", truncate(sess.Title, 40))
+		}
+		return nil
+	}
+
+	// Sort paths.
+	paths := make([]string, 0, len(fileSet))
+	for p := range fileSet {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+
+	// Try git status for each file.
+	gitStatus := make(map[string]string)
+	gitAvailable := isGitAvailable()
+	if gitAvailable {
+		for _, p := range paths {
+			gitStatus[p] = gitNameStatus(p)
+		}
+	}
+
+	if asJSON {
+		files := make([]diffFile, len(paths))
+		for i, p := range paths {
+			files[i] = diffFile{Path: p, Status: gitStatus[p]}
+		}
+		enc := json.NewEncoder(os.Stdout)
+		return enc.Encode(diffOutput{
+			SessionID: sess.ID,
+			Files:     files,
+		})
+	}
+
+	fmt.Fprintf(os.Stdout, "Files touched by session %s:\n", truncate(sess.Title, 40))
+	for _, p := range paths {
+		status := gitStatus[p]
+		if status == "" {
+			status = "?"
+		}
+		fmt.Fprintf(os.Stdout, "%s  %s\n", status, p)
+		if showStat && gitAvailable {
+			stat := gitDiffStat(p)
+			if stat != "" {
+				fmt.Fprintf(os.Stdout, "    %s\n", stat)
+			}
+		}
+	}
+	fmt.Fprintf(os.Stdout, "\n%d files changed\n", len(paths))
+	return nil
+}
+
+// extractFilePaths parses the JSON input of a tool call to find file_path
+// values. For multiedit, iterates the edits array.
+func extractFilePaths(toolName, input string) []string {
+	// Simple JSON key extraction without full parsing.
+	var paths []string
+
+	// For multiedit, look for file_path inside each edit object.
+	if strings.ToLower(toolName) == "multiedit" {
+		// Extract edits[].file_path using simple scanning.
+		paths = append(paths, extractJSONStringValues(input, "file_path")...)
+	} else {
+		// For edit/write/create, extract the top-level file_path.
+		if fp := extractJSONStringValue(input, "file_path"); fp != "" {
+			paths = append(paths, fp)
+		}
+	}
+	return paths
+}
+
+// extractJSONStringValue extracts a single string value for a key from JSON.
+func extractJSONStringValue(jsonStr, key string) string {
+	search := `"` + key + `"`
+	idx := strings.Index(jsonStr, search)
+	if idx == -1 {
+		return ""
+	}
+	// Skip past key and colon.
+	rest := jsonStr[idx+len(search):]
+	rest = strings.TrimLeft(rest, " \t\n\r:")
+	if len(rest) == 0 || rest[0] != '"' {
+		return ""
+	}
+	rest = rest[1:]
+	end := strings.IndexByte(rest, '"')
+	if end == -1 {
+		return ""
+	}
+	return rest[:end]
+}
+
+// extractJSONStringValues extracts all string values for a key from JSON.
+func extractJSONStringValues(jsonStr, key string) []string {
+	var values []string
+	search := `"` + key + `"`
+	remaining := jsonStr
+	for {
+		idx := strings.Index(remaining, search)
+		if idx == -1 {
+			break
+		}
+		rest := remaining[idx+len(search):]
+		rest = strings.TrimLeft(rest, " \t\n\r:")
+		if len(rest) > 0 && rest[0] == '"' {
+			rest = rest[1:]
+			end := strings.IndexByte(rest, '"')
+			if end != -1 {
+				values = append(values, rest[:end])
+			}
+		}
+		remaining = rest
+	}
+	return values
+}
+
+// isGitAvailable checks if git is usable in the current directory.
+func isGitAvailable() bool {
+	_, err := exec.LookPath("git")
+	if err != nil {
+		return false
+	}
+	cmd := exec.Command("git", "rev-parse", "--is-inside-work-tree")
+	cmd.Stderr = nil
+	cmd.Stdout = nil
+	return cmd.Run() == nil
+}
+
+// gitNameStatus returns the git status letter (M/A/D) for a file, or "" on error.
+func gitNameStatus(path string) string {
+	cmd := exec.Command("git", "diff", "--name-status", "HEAD", "--", path)
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	line := strings.TrimSpace(string(out))
+	if line == "" {
+		// Maybe untracked.
+		cmd2 := exec.Command("git", "ls-files", "--error-unmatch", "--", path)
+		if cmd2.Run() != nil {
+			return "?"
+		}
+		return ""
+	}
+	fields := strings.Fields(line)
+	if len(fields) >= 1 {
+		return fields[0]
+	}
+	return ""
+}
+
+// gitDiffStat returns the git diff --stat output for a file.
+func gitDiffStat(path string) string {
+	cmd := exec.Command("git", "diff", "--stat", "HEAD", "--", path)
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) > 0 {
+		return strings.TrimSpace(lines[len(lines)-1])
+	}
+	return ""
+}
+
+func init() {
+	sessionsDiffCmd.Flags().Bool("stat", false, "Show line-change statistics per file")
+	sessionsDiffCmd.Flags().Bool("json", false, "Emit JSON output")
+}

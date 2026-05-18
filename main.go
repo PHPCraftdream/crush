@@ -18,10 +18,15 @@ import (
 
 	"github.com/charmbracelet/crush/internal/cmd"
 	_ "github.com/charmbracelet/crush/internal/dns"
+	"github.com/charmbracelet/crush/internal/platform"
 	_ "github.com/joho/godotenv/autoload"
 )
 
 func main() {
+	if err := platform.AssignToNewJobObject(); err != nil {
+		slog.Debug("Job object assignment skipped", "error", err)
+	}
+
 	if os.Getenv("CRUSH_PROFILE") != "" {
 		go func() {
 			slog.Info("Serving pprof at localhost:6060")

@@ -535,6 +535,11 @@ type RunOverrides struct {
 	// allow even with continuous progress. 0 = no cap.
 	// Fork patch: batch 8.
 	TimeoutHardCap time.Duration
+	// OnFinishHook is an optional shell command to execute after the run
+	// completes. Environment variables are set with run metadata.
+	// Errors from the hook are printed to stderr but don't affect exit code.
+	// Fork patch: batch 24.
+	OnFinishHook string
 }
 
 // RunNonInteractive runs a single agent turn and writes its result to
@@ -653,14 +658,32 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt 
 		)
 	}
 
+	// Fork patch: batch 24 — on-finish hook support. Captures run
+	// metadata as it becomes available and executes the hook on return.
+	var (
+		hookExitReason string
+		hookCost       float64
+		hookTokens     int64
+	)
+	runStart := time.Now()
+	tokensBefore := sess.PromptTokens + sess.CompletionTokens
+	costBefore := sess.Cost
+	if overrides.OnFinishHook != "" {
+		defer func() {
+			if freshSess, err := app.Sessions.Get(context.Background(), sess.ID); err == nil {
+				hookTokens = freshSess.PromptTokens + freshSess.CompletionTokens - tokensBefore
+				hookCost = freshSess.Cost - costBefore
+			}
+			duration := time.Since(runStart)
+			runOnFinishHook(overrides.OnFinishHook, sess.ID, hookExitReason, hookCost, hookTokens, duration)
+		}()
+	}
+
 	type response struct {
 		result *fantasy.AgentResult
 		err    error
 	}
 	done := make(chan response, 1)
-	runStart := time.Now()
-	tokensBefore := sess.PromptTokens + sess.CompletionTokens
-	costBefore := sess.Cost
 
 	go func(ctx context.Context, sessionID, prompt string) {
 		result, err := app.AgentCoordinator.Run(ctx, sess.ID, prompt)
@@ -799,6 +822,7 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt 
 						partial.Chars, sess.ID,
 					))
 				}
+				hookExitReason = summary.ExitReason
 				enc := json.NewEncoder(output)
 				if encErr := enc.Encode(summary); encErr != nil {
 					return fmt.Errorf("failed to encode JSON result: %w", encErr)
@@ -811,13 +835,16 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt 
 				return runErr
 			}
 
+			hookExitReason = "cancelled"
 			if runErr != nil {
 				if isCanceled {
 					slog.Debug("Non-interactive: agent processing cancelled", "session_id", sess.ID)
 					return nil
 				}
+				hookExitReason = "error"
 				return fmt.Errorf("agent processing failed: %w", runErr)
 			}
+			hookExitReason = "stop"
 			return nil
 
 		case event := <-messageEvents:
@@ -890,6 +917,7 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt 
 
 		case <-ctx.Done():
 			stopSpinner()
+			hookExitReason = "cancelled"
 			return ctx.Err()
 		}
 	}
