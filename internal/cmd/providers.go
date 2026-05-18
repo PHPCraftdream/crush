@@ -251,25 +251,27 @@ crush providers add local-llm --name "Local LLM" --type openai-compat --base-url
 
 		provType := catwalk.Type(typeStr)
 
+		if provType == "cli" {
+			return fmt.Errorf("adding new CLI providers requires editing internal/agent/cliprovider/provider.go directly")
+		}
+
 		// Validate provider type
-		if provType != "cli" {
-			validTypes := catwalk.KnownProviderTypes()
-			validTypes = append(validTypes, "openai-compat")
-			isValid := false
-			for _, t := range validTypes {
-				if t == provType {
-					isValid = true
-					break
-				}
+		validTypes := catwalk.KnownProviderTypes()
+		validTypes = append(validTypes, "openai-compat")
+		isValid := false
+		for _, t := range validTypes {
+			if t == provType {
+				isValid = true
+				break
 			}
-			if !isValid {
-				fmt.Fprintf(os.Stderr, "Supported provider types: %v\n", validTypes)
-				return fmt.Errorf("unsupported provider type %q", typeStr)
-			}
+		}
+		if !isValid {
+			fmt.Fprintf(os.Stderr, "Supported provider types: %v\n", validTypes)
+			return fmt.Errorf("unsupported provider type %q", typeStr)
 		}
 
 		// If base-url not provided for catwalk-known, try to get from catwalk
-		if baseURL == "" && provType != "cli" {
+		if baseURL == "" {
 			for _, known := range a.Store().KnownProviders() {
 				if known.ID == catwalk.InferenceProvider(id) {
 					baseURL = known.APIEndpoint
@@ -303,14 +305,22 @@ crush providers add local-llm --name "Local LLM" --type openai-compat --base-url
 			return fmt.Errorf("failed to add provider: %w", err)
 		}
 
-		if enable && apiKey != "" {
+		fmt.Fprintf(os.Stderr, "✓ %s created\n", id)
+
+		// Test connection if API key provided
+		if apiKey != "" && !strings.HasPrefix(apiKey, "$") {
 			if err := pc.TestConnection(a.Store().Resolver()); err != nil {
-				fmt.Fprintf(os.Stderr, "✗ %s created but connection failed: %v\n", id, err)
-				return nil
+				fmt.Fprintf(os.Stderr, "✗ connection failed: %v (but provider saved; fix and re-enable)\n", err)
+			} else {
+				fmt.Fprintf(os.Stderr, "✓ connection verified\n")
 			}
-			fmt.Fprintf(os.Stderr, "✓ %s created and connected\n", id)
-		} else {
-			fmt.Fprintf(os.Stderr, "✓ %s created\n", id)
+		}
+
+		// Fetch models if enabled
+		if enable {
+			if err := updateSingleProvider(a, id); err != nil {
+				fmt.Fprintf(os.Stderr, "note: failed to fetch models: %v\n", err)
+			}
 		}
 
 		return nil
@@ -354,8 +364,77 @@ func updateSingleProvider(a *app.App, id string) error {
 		return fmt.Errorf("provider %q not found", id)
 	}
 
-	count := len(p.Models)
-	fmt.Fprintf(os.Stderr, "%s: %d models\n", id, count)
+	oldModels := p.Models
+	newModels, warnings, err := fetchModels(a, p)
+	if err != nil {
+		return err
+	}
+
+	added, removed := computeDiff(oldModels, newModels)
+
+	oldCount := len(oldModels)
+	newCount := len(newModels)
+
+	var diffStr strings.Builder
+	if newCount > oldCount {
+		diffStr.WriteString(fmt.Sprintf(" (+%d", newCount-oldCount))
+		if len(added) > 0 && len(added) <= 3 {
+			diffStr.WriteString(": ")
+			for i, m := range added {
+				if i > 0 {
+					diffStr.WriteString(", ")
+				}
+				diffStr.WriteString(m.ID)
+			}
+		}
+		diffStr.WriteString(")")
+	} else if newCount < oldCount {
+		diffStr.WriteString(fmt.Sprintf(" (-%d", oldCount-newCount))
+		if len(removed) > 0 && len(removed) <= 3 {
+			diffStr.WriteString(": ")
+			for i, m := range removed {
+				if i > 0 {
+					diffStr.WriteString(", ")
+				}
+				diffStr.WriteString(m.ID)
+			}
+		}
+		diffStr.WriteString(")")
+	}
+
+	fmt.Fprintf(os.Stderr, "%s: %d → %d models%s\n", id, oldCount, newCount, diffStr.String())
+
+	// Check for orphaned preferred slots
+	cfg := a.Config()
+	for modelType, model := range cfg.Models {
+		if model.Provider != id {
+			continue
+		}
+		for _, rm := range removed {
+			if rm.ID == model.Model {
+				slotName := "smart"
+				if modelType == config.SelectedModelTypeSmall {
+					slotName = "fast"
+				}
+				fmt.Fprintf(os.Stderr, "WARN: preferred %s = %s/%s no longer exists after update — your '%s' slot is broken. Run `crush models use <large> <small>` to fix.\n", slotName, id, model.Model, slotName)
+			}
+		}
+	}
+
+	// Save updated models to config
+	modelsJSON, _ := json.Marshal(newModels)
+	updates := map[string]any{
+		"providers." + id + ".models": json.RawMessage(modelsJSON),
+	}
+	if err := a.Store().SetConfigFields(config.ScopeGlobal, updates); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: failed to save updated models: %v\n", err)
+	}
+
+	// Print warnings
+	for _, w := range warnings {
+		fmt.Fprintf(os.Stderr, "note: %s\n", w)
+	}
+
 	return nil
 }
 
