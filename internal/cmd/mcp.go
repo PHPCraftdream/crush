@@ -7,16 +7,18 @@ import (
 	"sort"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/charmbracelet/crush/internal/config"
+	mcpmanager "github.com/charmbracelet/crush/internal/agent/tools/mcp"
 	"github.com/spf13/cobra"
 )
 
 var mcpCmd = &cobra.Command{
 	Use:   "mcp",
 	Short: "Inspect and manage Model Context Protocol servers",
-	Long: `Manage the MCP server entries crush will connect to. MCP servers can provide
-tools to extend the agent's capabilities.
+	Long: `Manage the MCP server entries crush will connect to. MCP servers
+provide additional tools that extend the agent's capabilities.
 
 MCP server config lives under "mcp.<id>" in crush.json. Two scopes
 exist and crush merges them at load time, workspace overriding global:
@@ -24,7 +26,7 @@ exist and crush merges them at load time, workspace overriding global:
   --global   ~/.local/share/crush/crush.json   (or %LocalAppData%\crush on Windows)
   --local    ./.crush/crush.json               (next to the project)
 
-If --global / --local is omitted the default is --global for write
+If --global / --local is omitted the default is --local for write
 operations and "both" for read operations.`,
 }
 
@@ -33,10 +35,14 @@ var mcpListCmd = &cobra.Command{
 	Short: "List configured MCP servers across both scopes",
 	Long: `Print the merged effective view of MCP servers (workspace overriding
 global). Use --json for one JSON object per server. Use --grep to filter
-by server ID, name, type, or command.`,
+by server ID, name, type, command, or URL (case-insensitive substring).
+
+The TOOLS column shows the number of tools discovered for servers that
+have been started in the current session, or "-" if the server has not
+been reached.`,
 	Example: `
 crush mcp list
-crush mcp list --json
+crush mcp list --json | jq 'select(.type=="stdio")'
 crush mcp list --grep stdio
   `,
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -55,14 +61,13 @@ crush mcp list --grep stdio
 		sort.Strings(ids)
 
 		grepPattern, _ := cmd.Flags().GetString("grep")
-		grepLower := strings.ToLower(grepPattern)
 
 		if asJSON {
 			enc := json.NewEncoder(os.Stdout)
 			for _, id := range ids {
 				m := mcps[id]
 				if grepPattern != "" {
-					if !matchesMCPGrep(id, m, grepLower) {
+					if !matchesMCPGrep(id, m, grepPattern) {
 						continue
 					}
 				}
@@ -75,11 +80,11 @@ crush mcp list --grep stdio
 		}
 
 		tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(tw, "ID\tTYPE\tSTATUS\tCOMMAND/URL")
+		fmt.Fprintln(tw, "ID\tNAME\tTYPE\tSTATUS\tTOOLS\tCOMMAND/URL")
 		for _, id := range ids {
 			m := mcps[id]
 			if grepPattern != "" {
-				if !matchesMCPGrep(id, m, grepLower) {
+				if !matchesMCPGrep(id, m, grepPattern) {
 					continue
 				}
 			}
@@ -91,10 +96,16 @@ crush mcp list --grep stdio
 			if m.URL != "" {
 				cmdOrURL = dash(m.URL)
 			}
-			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n",
+			tools := "-"
+			if info, ok := mcpmanager.GetState(id); ok {
+				tools = fmt.Sprintf("%d", info.Counts.Tools)
+			}
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n",
 				id,
+				"-",
 				dash(string(m.Type)),
 				status,
+				tools,
 				cmdOrURL,
 			)
 		}
@@ -104,8 +115,14 @@ crush mcp list --grep stdio
 
 var mcpShowCmd = &cobra.Command{
 	Use:   "show <id>",
-	Short: "Print an MCP server's configuration",
-	Args:  cobra.ExactArgs(1),
+	Short: "Print an MCP server's full configuration",
+	Long: `Display all configuration fields for a single MCP server: transport
+type, command, args, env, headers, URL, disabled flag, and tool filters.`,
+	Args: cobra.ExactArgs(1),
+	Example: `
+crush mcp show my-server
+crush mcp show my-server --json
+  `,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		asJSON, _ := cmd.Flags().GetBool("json")
 		a, err := setupApp(cmd)
@@ -149,6 +166,9 @@ var mcpShowCmd = &cobra.Command{
 		if len(item.EnabledTools) > 0 {
 			fmt.Fprintf(os.Stdout, "enabled_tools: %v\n", item.EnabledTools)
 		}
+		if item.Timeout > 0 {
+			fmt.Fprintf(os.Stdout, "timeout:  %ds\n", item.Timeout)
+		}
 		return nil
 	},
 }
@@ -156,9 +176,15 @@ var mcpShowCmd = &cobra.Command{
 var mcpEnableCmd = &cobra.Command{
 	Use:   "enable <id>",
 	Short: "Enable an MCP server",
-	Args:  cobra.ExactArgs(1),
+	Long: `Set mcp.<id>.disabled = false in the chosen scope. Warns if the
+server is already enabled.`,
+	Args: cobra.ExactArgs(1),
+	Example: `
+crush mcp enable my-server
+crush mcp enable my-server --global
+  `,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		scope, err := scopeFromFlags(cmd, config.ScopeGlobal)
+		scope, err := scopeFromFlags(cmd, config.ScopeWorkspace)
 		if err != nil {
 			return err
 		}
@@ -191,9 +217,15 @@ var mcpEnableCmd = &cobra.Command{
 var mcpDisableCmd = &cobra.Command{
 	Use:   "disable <id>",
 	Short: "Disable an MCP server",
-	Args:  cobra.ExactArgs(1),
+	Long: `Set mcp.<id>.disabled = true in the chosen scope. Warns if the
+server is already disabled.`,
+	Args: cobra.ExactArgs(1),
+	Example: `
+crush mcp disable my-server
+crush mcp disable my-server --local
+  `,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		scope, err := scopeFromFlags(cmd, config.ScopeGlobal)
+		scope, err := scopeFromFlags(cmd, config.ScopeWorkspace)
 		if err != nil {
 			return err
 		}
@@ -226,10 +258,15 @@ var mcpDisableCmd = &cobra.Command{
 var mcpRestartCmd = &cobra.Command{
 	Use:   "restart <id>",
 	Short: "Restart an MCP server",
-	Long: `Request that the MCP server be restarted. This requires the MCP manager
-to support hot-reload; if not available, a message will indicate that a
-full session restart is required.`,
+	Long: `Request that an MCP server be restarted.
+
+Hot-reload of running MCP servers is planned for a future release. For
+now, use "crush web" or restart "crush run" for the change to take
+effect.`,
 	Args: cobra.ExactArgs(1),
+	Example: `
+crush mcp restart my-server
+  `,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		a, err := setupApp(cmd)
 		if err != nil {
@@ -242,7 +279,7 @@ full session restart is required.`,
 			return fmt.Errorf("MCP server %q not found, see `crush mcp list`", id)
 		}
 
-		fmt.Fprintf(os.Stderr, "MCP restart not yet implemented; requires session restart to take effect\n")
+		fmt.Fprintf(os.Stderr, "restart requires crush web or crush run restart; hot-reload planned for future\n")
 		return nil
 	},
 }
@@ -250,9 +287,16 @@ full session restart is required.`,
 var mcpTestCmd = &cobra.Command{
 	Use:   "test <id>",
 	Short: "Test connectivity to an MCP server",
-	Long: `Attempt to connect to an MCP server and verify it responds.
-This is a basic connectivity test and does not verify all functionality.`,
+	Long: `Attempt to connect to an MCP server and verify it responds to a
+tools/list request. For stdio servers this spawns the process; for
+sse/http servers it sends an HTTP request.
+
+Reports "ok: N tools" on success or "error: <diagnostic>" on failure.`,
 	Args: cobra.ExactArgs(1),
+	Example: `
+crush mcp test my-server
+crush mcp test my-server --timeout 30s
+  `,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		a, err := setupApp(cmd)
 		if err != nil {
@@ -279,12 +323,16 @@ This is a basic connectivity test and does not verify all functionality.`,
 var mcpAddCmd = &cobra.Command{
 	Use:   "add <id>",
 	Short: "Add a new MCP server",
-	Long: `Add a new MCP server to the chosen scope (default: global). Specify the
-server type (stdio, sse, or http) and the appropriate connection details.
+	Long: `Add a new MCP server to the chosen scope (default: local). Specify
+the server type (stdio, sse, or http) and the appropriate connection
+details.
 
 For stdio servers, provide --command (and optionally --arg).
 For sse/http servers, provide --url.
-You can optionally set environment variables with --env and HTTP headers with --header.`,
+Set environment variables with --env and HTTP headers with --header.
+
+Errors with "use crush mcp set to modify" if the ID already exists in
+the chosen scope.`,
 	Args: cobra.ExactArgs(1),
 	Example: `
 # Add a stdio-based MCP server
@@ -293,11 +341,14 @@ crush mcp add my-server --type stdio --command "node" --arg server.js
 # Add an HTTP-based MCP server
 crush mcp add remote-server --type http --url http://localhost:3000/mcp
 
+# Add with environment variables
+crush mcp add my-server --type stdio --command "npx" --arg "mcp-server" --env "API_KEY=$MY_KEY"
+
 # Add with authentication headers
 crush mcp add auth-server --type http --url http://api.example.com/mcp --header "Authorization=Bearer $TOKEN"
   `,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		scope, err := scopeFromFlags(cmd, config.ScopeGlobal)
+		scope, err := scopeFromFlags(cmd, config.ScopeWorkspace)
 		if err != nil {
 			return err
 		}
@@ -309,7 +360,6 @@ crush mcp add auth-server --type http --url http://api.example.com/mcp --header 
 
 		id := args[0]
 
-		// Check if server already exists
 		if _, exists := a.Config().MCP[id]; exists {
 			return fmt.Errorf("MCP server %q already exists; use `crush mcp set %s` to modify", id, id)
 		}
@@ -326,21 +376,19 @@ crush mcp add auth-server --type http --url http://api.example.com/mcp --header 
 			return fmt.Errorf("invalid type %q; must be one of: stdio, sse, http", typeStr)
 		}
 
-		// Validate based on type
 		command, _ := cmd.Flags().GetString("command")
-		url, _ := cmd.Flags().GetString("url")
+		mcpURL, _ := cmd.Flags().GetString("url")
 
 		if mcpType == config.MCPStdio {
 			if command == "" {
 				return fmt.Errorf("--command is required for stdio type")
 			}
 		} else if mcpType == config.MCPSSE || mcpType == config.MCPHttp {
-			if url == "" {
+			if mcpURL == "" {
 				return fmt.Errorf("--url is required for %s type", mcpType)
 			}
 		}
 
-		// Build the config
 		fields := map[string]any{
 			"mcp." + id + ".type": typeStr,
 		}
@@ -348,8 +396,8 @@ crush mcp add auth-server --type http --url http://api.example.com/mcp --header 
 		if command != "" {
 			fields["mcp."+id+".command"] = command
 		}
-		if url != "" {
-			fields["mcp."+id+".url"] = url
+		if mcpURL != "" {
+			fields["mcp."+id+".url"] = mcpURL
 		}
 
 		argSlice, _ := cmd.Flags().GetStringSlice("arg")
@@ -385,12 +433,17 @@ var mcpRemoveCmd = &cobra.Command{
 	Aliases: []string{"rm"},
 	Short:   "Remove an MCP server from the chosen scope",
 	Long: `Delete the mcp.<id> object from the targeted config file. The
-server may still appear in "mcp list" if it is also defined in
-the other scope (workspace fallback to global, or vice versa) — run
+server may still appear in "mcp list" if it is also defined in the
+other scope (workspace fallback to global, or vice versa) — run
 remove with the matching --global / --local to fully clear it.`,
 	Args: cobra.ExactArgs(1),
+	Example: `
+crush mcp remove my-server
+crush mcp remove my-server --global
+crush mcp rm old-server --local
+  `,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		scope, err := scopeFromFlags(cmd, config.ScopeGlobal)
+		scope, err := scopeFromFlags(cmd, config.ScopeWorkspace)
 		if err != nil {
 			return err
 		}
@@ -413,22 +466,28 @@ remove with the matching --global / --local to fully clear it.`,
 var mcpSetCmd = &cobra.Command{
 	Use:   "set <id>",
 	Short: "Update an MCP server's configuration",
-	Long: `Set one or more MCP server fields in --global (default) or --local
+	Long: `Set one or more MCP server fields in --global (default: --local)
 scope. Only the flags you pass are written — unset fields are left
-untouched.`,
+untouched.
+
+Use --disabled=true to disable without removing; --disabled=false to
+re-enable.`,
 	Args: cobra.ExactArgs(1),
 	Example: `
 # Change the command for a stdio server
 crush mcp set my-server --command "npx" --arg "mcp-server"
 
 # Add headers to an HTTP server
-crush mcp set remote-server --header "Authorization=Bearer token"
+crush mcp set remote-server --header "Authorization=Bearer $TOKEN"
 
 # Disable a server without removing it
 crush mcp set my-server --disabled=true
+
+# Update the URL for an SSE server
+crush mcp set events --url http://new-host:4000/sse
   `,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		scope, err := scopeFromFlags(cmd, config.ScopeGlobal)
+		scope, err := scopeFromFlags(cmd, config.ScopeWorkspace)
 		if err != nil {
 			return err
 		}
@@ -493,10 +552,11 @@ func init() {
 	mcpListCmd.Flags().Bool("json", false, "Emit one JSON object per line instead of a table")
 	mcpListCmd.Flags().String("grep", "", "Filter servers by id, type, command, or url (case-insensitive substring match)")
 	mcpShowCmd.Flags().Bool("json", false, "Emit a JSON object instead of human-readable lines")
+	mcpTestCmd.Flags().String("timeout", "10s", "Timeout for the connectivity test")
 
 	for _, c := range []*cobra.Command{mcpEnableCmd, mcpDisableCmd, mcpAddCmd, mcpRemoveCmd, mcpSetCmd} {
-		c.Flags().Bool("global", false, "Target the global config (~/.local/share/crush/crush.json). Default when neither --global nor --local is given.")
-		c.Flags().Bool("local", false, "Target the workspace config (./.crush/crush.json).")
+		c.Flags().Bool("global", false, "Target the global config (~/.local/share/crush/crush.json).")
+		c.Flags().Bool("local", false, "Target the workspace config (./.crush/crush.json). Default when neither --global nor --local is given.")
 		c.MarkFlagsMutuallyExclusive("global", "local")
 	}
 
@@ -531,6 +591,7 @@ type mcpListItem struct {
 	DisabledTools []string          `json:"disabled_tools,omitempty"`
 	EnabledTools  []string          `json:"enabled_tools,omitempty"`
 	Timeout       int               `json:"timeout,omitempty"`
+	Source        string            `json:"source,omitempty"`
 }
 
 func makeMCPListItem(id string, m config.MCPConfig) mcpListItem {
@@ -546,10 +607,12 @@ func makeMCPListItem(id string, m config.MCPConfig) mcpListItem {
 		DisabledTools: m.DisabledTools,
 		EnabledTools:  m.EnabledTools,
 		Timeout:       m.Timeout,
+		Source:         string(m.Source),
 	}
 }
 
-func matchesMCPGrep(id string, m config.MCPConfig, patternLower string) bool {
+func matchesMCPGrep(id string, m config.MCPConfig, pattern string) bool {
+	patternLower := strings.ToLower(pattern)
 	fields := []string{
 		strings.ToLower(id),
 		strings.ToLower(string(m.Type)),
@@ -574,4 +637,13 @@ func parseKVPairs(pairs []string) map[string]string {
 		}
 	}
 	return result
+}
+
+// mcpTimeout returns the effective timeout for an MCP server config,
+// defaulting to 15s when not explicitly set.
+func mcpTimeout(m config.MCPConfig) time.Duration {
+	if m.Timeout > 0 {
+		return time.Duration(m.Timeout) * time.Second
+	}
+	return 15 * time.Second
 }

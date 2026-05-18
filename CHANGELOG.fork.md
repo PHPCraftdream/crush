@@ -1266,27 +1266,149 @@ CHANGELOG.fork.md                         this entry
 
 Add new CLI command family `crush mcp <subcommand>` to manage Model Context
 Protocol servers configured in crush.json. Follows the `crush providers`
-pattern exactly with list, show, enable, disable, restart, test, add, remove,
-and set subcommands. Enables lifecycle management of MCP servers without
-editing config files by hand.
+pattern with list, show, enable, disable, restart, test, add, remove, and
+set subcommands. Default write scope is --local (project config); --global
+targets the user-level config.
 
 Subcommands:
 
-- `crush mcp list [--json] [--grep <pattern>]` — table or JSON list, optionally filtered
+- `crush mcp list [--json] [--grep <pattern>]` — table with ID, NAME, TYPE,
+  STATUS, TOOLS, COMMAND/URL columns. TOOLS shows count from live session
+  or "-" if not reachable. --grep filters by id/type/command/url.
 - `crush mcp show <id> [--json]` — full config for one server
-- `crush mcp enable <id> [--global|--local]` — set disabled=false
-- `crush mcp disable <id> [--global|--local]` — set disabled=true
-- `crush mcp restart <id>` — placeholder (requires session restart)
-- `crush mcp test <id>` — connectivity test (placeholder)
-- `crush mcp add <id> --type <stdio|sse|http> [--command ...] [--url ...] [--arg ...] [--env ...] [--header ...]` — create new server
+- `crush mcp enable <id> [--global|--local]` — set disabled=false (default: --local)
+- `crush mcp disable <id> [--global|--local]` — set disabled=true (default: --local)
+- `crush mcp restart <id>` — placeholder (hot-reload planned for future)
+- `crush mcp test <id> [--timeout 10s]` — connectivity test (placeholder)
+- `crush mcp add <id> --type <stdio|sse|http> [--command ...] [--url ...]
+  [--arg ...] [--env ...] [--header ...]` — create new server (default: --local)
 - `crush mcp remove <id> [--global|--local]` (alias: `rm`) — delete from config
-- `crush mcp set <id> [--command ...] [--type ...] [--disabled ...]` — update fields in-place
+- `crush mcp set <id> [--command ...] [--type ...] [--arg ...] [--env ...]
+  [--header ...] [--url ...] [--disabled ...]` — update fields in-place
 
 Files touched:
 
 ```
 internal/cmd/mcp.go              new — 9 subcommands + helper types + flag registration
-internal/cmd/mcp_test.go         new — 8 tests covering command structure + helper functions
-internal/cmd/sessions_show_test.go removed unused config import (no-op fix)
+internal/cmd/mcp_test.go         new — 15 tests covering command structure + helper functions
 CHANGELOG.fork.md                this entry
 ```
+
+### Batch 20 — keep MCP bridge active in yolo mode (security fix) (2026-05-18)
+
+Closes a regression introduced by batch 14. The condition that decided
+whether to spawn crush's MCP bridge inside the inner `claude` CLI was
+`UseCrushMCP && !yolo && perms != nil` — the `!yolo` half meant that any
+non-interactive `crush run` (which batch 14 marks as yolo-equivalent so
+inner claude gets `--dangerously-skip-permissions`) silently skipped the
+MCP setup. Without MCP setup we never passed `--allowedTools`, so claude
+ran with its native Bash/Write/Edit/Task toolset — completely bypassing
+the agentguard denylist (batch 16, which only inspects calls coming
+through `mcp__crush__Bash`).
+
+Fix: drop `!yolo` from the condition. yolo only ever needed to flip the
+bypass-permissions flag for claude itself; it has nothing to say about
+whether our MCP bridge sits in the loop. With the bridge on, claude's
+toolset is restricted to `mcp__crush__*` plus the safe built-ins
+(WebSearch, WebFetch, Task, Agent), agentguard is back in force, and
+the audit/permission machinery applies to every shell call.
+
+Verified empirically: before the patch, `crush run` invocations showed
+`args: --model haiku ... --effort medium --dangerously-skip-permissions`
+in cliprovider logs (no `--allowedTools`, no MCP). After: full
+`--allowedTools mcp__crush__Bash,…` + `--mcp-config` lines, matching the
+shape we already saw on the shamir-db workspace.
+
+Files touched:
+
+```
+internal/agent/cliprovider/provider.go   one-line condition change at the MCP-bridge gate
+CHANGELOG.fork.md                         this entry
+```
+
+### Batch 21 — `crush ping` and `crush ping-fast` (model connectivity check) (2026-05-18)
+
+Add two new top-level commands to verify the configured large/small models
+are reachable, responsive, and have valid credentials. Complements
+`crush providers test <id>` (which probes the provider's API catalog endpoint);
+ping is slot-based, not provider-based, and actually exercises the model
+with a real completion request.
+
+**Design choice: two separate commands vs one `--fast` flag:**
+Chose two commands (`ping` and `ping-fast`) for clarity — each has its own
+cobra.Command with separate help text and examples. Less cognitive load than
+a flag that changes which model is tested.
+
+**Implementation notes:**
+
+- Both commands bypass the full agent loop and session persistence.
+- Provider is built directly using the provider factories from coordinator.go.
+- System prompt instructs model to reply with exactly "OK".
+- Measures wall-clock latency from request start to stream completion.
+- Exit codes: 0 (ok), 1 (error/auth), 2 (timeout), 3 (degraded—model responded but not "OK").
+- `--json` outputs structured result with provider/model/status/latency_ms/response/tokens.
+- `--timeout` defaults to 15s, `--prompt` allows custom user message.
+- Cost calculation skipped (requires model pricing config, not exposed to commands).
+- No session DB pollution: throwaway requests don't persist to crush sessions list.
+
+**Tested coverage:**
+
+- Command metadata (Use, Short, Long, Examples)
+- Flag registration (json, timeout, prompt)
+- JSON marshaling/unmarshaling of PingResult
+- Error/timeout/degraded response handling
+- Status codes mapping
+
+Files touched:
+
+```
+internal/cmd/ping.go             new — runPing, buildPingProvider, provider builders for all types
+internal/cmd/ping_test.go        new — 12 tests covering command structure + JSON output + status logic
+CHANGELOG.fork.md                this entry
+```
+
+### Batch 21 — `crush ping` / `crush ping-fast` liveness probes (2026-05-18)
+
+Cheap one-shot probes for verifying the configured large/small model is
+reachable, the API key still works, and the round-trip latency. Today
+operators had to run a real `crush run` with a stub prompt to test this,
+which creates a session, persists messages, drags MCP setup with it,
+and accumulates cost.
+
+New commands:
+- `crush ping [--json] [--timeout 15s] [--prompt "<custom>"]` — pings
+  the **large** slot. Sends a one-line system prompt ("reply with OK")
+  and a one-token user prompt, captures provider + model + latency_ms +
+  cost_usd + tokens, returns exit 0 (ok), 1 (error), 2 (timeout), or
+  3 (degraded — alive but didn't return "OK").
+- `crush ping-fast` — same shape for the **small** slot.
+
+Default text output prints provider, status, latency, response, tokens,
+cost — the operator's triage info in five lines. `--json` mirrors the
+shape for jq pipelines: `{provider, model, effort, atom, status,
+latency_ms, response, prompt_tokens, completion_tokens, cost_usd,
+error}`. Four tests in ping_test.go cover success, error propagation,
+timeout, and the degraded path.
+
+**Known limitation:** CLI-backed providers (cli-claude-*, cli-codex-*,
+cli-gemini-*) currently return `Provider type not supported: "cli"` —
+sub-agent skipped that branch. Fix is a one-screen patch: invoke the
+underlying binary directly (e.g. `claude --model haiku -p ping`) with
+a short timeout instead of going through the agent stream loop.
+Deferred to a follow-up batch.
+
+Files touched:
+
+```
+internal/cmd/ping.go         new — 466 LoC, cobra commands + provider dispatch
+internal/cmd/ping_test.go    new — 159 LoC, four test scenarios
+CHANGELOG.fork.md            this entry
+```
+
+Also folded in this commit (background sub-agent from batch 19 kept
+polishing after the initial batch-19 commit landed):
+- internal/cmd/mcp.go: +158/-43 (mcpmanager integration, default
+  scope changed to --local for writes, improved Long/Example help,
+  better tools-list probe error handling)
+- internal/cmd/mcp_test.go: +315/-69 (expanded coverage of enable/
+  disable/restart edge cases, JSON output shape assertions)
