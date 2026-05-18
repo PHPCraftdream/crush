@@ -67,7 +67,7 @@ type Session struct {
 
 	SystemPrompt    string
 	YoloEnabled     bool
-	CancelRequested bool
+	CancelRequested bool // Only populated by ListAll; use IsCancelRequested() for live checks.
 }
 
 type Service interface {

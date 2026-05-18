@@ -240,25 +240,36 @@ reason) are written back to the queue.`,
 			}
 			ch := make(chan taskResult, len(tasks))
 
-			for _, t := range tasks {
-				go func(task queue.Task) {
-					cost, tokens, exitReason, runErr := runQueueTask(ctx, cwd, task)
-					ch <- taskResult{task: task, cost: cost, tokens: tokens, exitReason: exitReason, err: runErr}
-				}(t)
-			}
+			batchErr := func() error {
+				runCtx, runCancel := context.WithCancel(ctx)
+				defer runCancel()
 
-			for range tasks {
-				r := <-ch
-				processed++
-				if r.err != nil {
-					slog.Error("queue task failed", "id", r.task.ID, "err", r.err)
-					_ = q.UpdateStatus(ctx, r.task.ID, queue.StatusFailed, r.cost, r.tokens, r.exitReason)
-					if stopOnFail {
-						return fmt.Errorf("task %s failed: %w", r.task.ID, r.err)
-					}
-				} else {
-					_ = q.UpdateStatus(ctx, r.task.ID, queue.StatusDone, r.cost, r.tokens, r.exitReason)
+				for _, t := range tasks {
+					go func(task queue.Task) {
+						cost, tokens, exitReason, runErr := runQueueTask(runCtx, cwd, task)
+						ch <- taskResult{task: task, cost: cost, tokens: tokens, exitReason: exitReason, err: runErr}
+					}(t)
 				}
+
+				var firstErr error
+				for range tasks {
+					r := <-ch
+					processed++
+					if r.err != nil {
+						slog.Error("queue task failed", "id", r.task.ID, "err", r.err)
+						_ = q.UpdateStatus(ctx, r.task.ID, queue.StatusFailed, r.cost, r.tokens, r.exitReason)
+						if stopOnFail && firstErr == nil {
+							firstErr = fmt.Errorf("task %s failed: %w", r.task.ID, r.err)
+							runCancel()
+						}
+					} else {
+						_ = q.UpdateStatus(ctx, r.task.ID, queue.StatusDone, r.cost, r.tokens, r.exitReason)
+					}
+				}
+				return firstErr
+			}()
+			if batchErr != nil {
+				return batchErr
 			}
 		}
 
@@ -325,14 +336,15 @@ func runQueueTask(ctx context.Context, cwd string, task queue.Task) (float64, in
 		return 0, 0, "", err
 	}
 
+	role := "smart"
+	if task.Role != "" {
+		role = task.Role
+	}
 	cmdArgs := []string{
 		"run",
 		"--session", sessionID,
 		"--json",
-		"--role", "smart",
-	}
-	if task.Role != "" {
-		cmdArgs[4] = task.Role
+		"--role", role,
 	}
 	if task.MaxCost > 0 {
 		cmdArgs = append(cmdArgs, "--max-cost", fmt.Sprintf("%.4f", task.MaxCost))

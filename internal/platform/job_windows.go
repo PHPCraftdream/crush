@@ -1,3 +1,7 @@
+//go:build windows
+
+// Fork patch: batch 24 — Windows Job Objects with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.
+// Kills all child processes when crush exits (even via kill -9).
 package platform
 
 import (

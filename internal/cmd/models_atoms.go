@@ -151,7 +151,7 @@ func renderAtomsBlock(cfg *config.Config) string {
 		if len(keys) == 0 {
 			continue
 		}
-		label := strings.Title(group)
+		label := titleCase(group)
 		b.WriteString("  " + label + ":\n")
 		note := ""
 		for _, k := range keys {
@@ -189,7 +189,7 @@ func renderAtomsBlockFallback() string {
 		if len(keys) == 0 {
 			continue
 		}
-		label := strings.Title(group)
+		label := titleCase(group)
 		b.WriteString("  " + label + ":\n")
 		note := ""
 		for _, k := range keys {
@@ -215,6 +215,15 @@ func renderAtomsBlockFallback() string {
 	b.WriteString("  crush models use s46h h45l\n")
 	b.WriteString("  crush models use glm5_1 glm5_turbo\n")
 	return b.String()
+}
+
+func titleCase(s string) string {
+	if s == "" {
+		return s
+	}
+	r := []rune(s)
+	r[0] = []rune(strings.ToUpper(string(r[0])))[0]
+	return string(r)
 }
 
 // renderShortCodesBlock returns a formatted table of the short-code aliases.

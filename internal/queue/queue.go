@@ -70,7 +70,7 @@ func (s *Service) Add(ctx context.Context, sessionID, prompt, role string, maxCo
 
 // List returns tasks filtered by status. Empty status means all.
 func (s *Service) List(ctx context.Context, status TaskStatus) ([]Task, error) {
-	query := "SELECT id, session_id, prompt, role, max_cost, max_tokens, timeout_sec, status, cost, tokens, exit_reason, created_at, started_at, finished_at FROM queue_tasks"
+	query := "SELECT id, COALESCE(session_id,''), prompt, COALESCE(role,''), COALESCE(max_cost,0), COALESCE(max_tokens,0), COALESCE(timeout_sec,0), status, cost, tokens, COALESCE(exit_reason,''), created_at, started_at, finished_at FROM queue_tasks"
 	var args []any
 	if status != "" {
 		query += " WHERE status = ?"
@@ -103,7 +103,7 @@ func (s *Service) List(ctx context.Context, status TaskStatus) ([]Task, error) {
 func (s *Service) Get(ctx context.Context, id string) (Task, error) {
 	var t Task
 	err := s.db.QueryRowContext(ctx,
-		"SELECT id, session_id, prompt, role, max_cost, max_tokens, timeout_sec, status, cost, tokens, exit_reason, created_at, started_at, finished_at FROM queue_tasks WHERE id = ?",
+		"SELECT id, COALESCE(session_id,''), prompt, COALESCE(role,''), COALESCE(max_cost,0), COALESCE(max_tokens,0), COALESCE(timeout_sec,0), status, cost, tokens, COALESCE(exit_reason,''), created_at, started_at, finished_at FROM queue_tasks WHERE id = ?",
 		id,
 	).Scan(&t.ID, &t.SessionID, &t.Prompt, &t.Role,
 		&t.MaxCost, &t.MaxTokens, &t.TimeoutSec, &t.Status,
@@ -123,7 +123,7 @@ func (s *Service) ClaimPending(ctx context.Context, n int) ([]Task, error) {
 	defer tx.Rollback()
 
 	rows, err := tx.QueryContext(ctx,
-		"SELECT id, session_id, prompt, role, max_cost, max_tokens, timeout_sec, status, cost, tokens, exit_reason, created_at, started_at, finished_at FROM queue_tasks WHERE status = 'pending' ORDER BY created_at ASC LIMIT ?", n)
+		"SELECT id, COALESCE(session_id,''), prompt, COALESCE(role,''), COALESCE(max_cost,0), COALESCE(max_tokens,0), COALESCE(timeout_sec,0), status, cost, tokens, COALESCE(exit_reason,''), created_at, started_at, finished_at FROM queue_tasks WHERE status = 'pending' ORDER BY created_at ASC LIMIT ?", n)
 	if err != nil {
 		return nil, err
 	}

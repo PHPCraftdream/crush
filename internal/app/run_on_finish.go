@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"os"
@@ -9,15 +10,22 @@ import (
 	"time"
 )
 
+// Fork patch: batch 24 (run --on-finish hook), review-fix (30s timeout to prevent hangs).
+const onFinishHookTimeout = 30 * time.Second
+
 // runOnFinishHook executes a shell command after the agent run completes.
 // Errors from the hook are printed to stderr but don't affect the exit code.
+// Uses CommandContext with 30s timeout so a misbehaving hook cannot hang crush.
 func runOnFinishHook(hook, sessionID, exitReason string, cost float64, tokens int64, duration time.Duration) {
+	ctx, cancel := context.WithTimeout(context.Background(), onFinishHookTimeout)
+	defer cancel()
+
 	var cmd *exec.Cmd
 	switch runtime.GOOS {
 	case "windows":
-		cmd = exec.Command("cmd", "/c", hook)
+		cmd = exec.CommandContext(ctx, "cmd", "/c", hook)
 	default:
-		cmd = exec.Command("bash", "-c", hook)
+		cmd = exec.CommandContext(ctx, "bash", "-c", hook)
 	}
 
 	cmd.Env = append(os.Environ(),

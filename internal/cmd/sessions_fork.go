@@ -107,11 +107,13 @@ crush sessions fork my-session-id --session new-id --title "My Fork"
 		// Copy messages.
 		for _, msg := range msgs {
 			params := message.CreateMessageParams{
-				Role:            msg.Role,
-				Parts:           msg.Parts,
-				Model:           msg.Model,
-				Provider:        msg.Provider,
-				ReasoningEffort: msg.ReasoningEffort,
+				Role:             msg.Role,
+				Parts:            msg.Parts,
+				Model:            msg.Model,
+				Provider:         msg.Provider,
+				ReasoningEffort:  msg.ReasoningEffort,
+				IsSummaryMessage: msg.IsSummaryMessage,
+				Hidden:           msg.Hidden,
 			}
 			if _, err := a.Messages.Create(ctx, newSess.ID, params); err != nil {
 				return fmt.Errorf("failed to copy message: %w", err)

@@ -3,6 +3,7 @@ package session
 import (
 	"errors"
 	"os"
+	"sync"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -74,6 +75,23 @@ func TestTryAcquireSessionLock_ReleaseTwice(t *testing.T) {
 	require.NoError(t, lk.Release())
 	// Second release is harmless.
 	require.NoError(t, lk.Release())
+}
+
+func TestTryAcquireSessionLock_ConcurrentRelease(t *testing.T) {
+	dir := t.TempDir()
+	lk, err := TryAcquireSessionLock(dir, "s")
+	require.NoError(t, err)
+
+	// 10 goroutines racing to Release — must not panic (double-close).
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = lk.Release()
+		}()
+	}
+	wg.Wait()
 }
 
 func TestTryAcquireSessionLock_BadInputs(t *testing.T) {

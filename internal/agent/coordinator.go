@@ -34,6 +34,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"charm.land/catwalk/pkg/catwalk"
@@ -177,9 +178,11 @@ type coordinator struct {
 	readyWg errgroup.Group
 
 	// Per-run limits. Set via SetRunLimits before Run(). Reset after use.
-	// Fork patch: batch 30.
-	maxCost   float64
-	maxTokens int64
+	// Fork patch: batch 30. Mutex added in review-fix (data race: SetRunLimits
+	// called from HTTP handler, read in runInternal on agent goroutine).
+	runLimitsMu sync.Mutex
+	maxCost     float64
+	maxTokens   int64
 }
 
 func NewCoordinator(
@@ -261,8 +264,10 @@ func (c *coordinator) Run(ctx context.Context, sessionID string, prompt string, 
 // SetRunLimits stores cost and token caps for the next Run call.
 // Fork patch: batch 30.
 func (c *coordinator) SetRunLimits(maxCost float64, maxTokens int64) {
+	c.runLimitsMu.Lock()
 	c.maxCost = maxCost
 	c.maxTokens = maxTokens
+	c.runLimitsMu.Unlock()
 }
 
 // applyModelOverrides sets up the agent with the given model overrides (modifies currentAgent in place).
@@ -418,10 +423,12 @@ func (c *coordinator) runInternal(ctx context.Context, sessionID string, prompt 
 	sessionSystemPrompt := c.resolveSessionSystemPrompt(ctx, sessionID)
 
 	// Fork patch: batch 30 — per-run limits, pass through to the agent.
+	c.runLimitsMu.Lock()
 	maxCost := c.maxCost
 	c.maxCost = 0
 	maxTokensRunLimit := c.maxTokens
 	c.maxTokens = 0
+	c.runLimitsMu.Unlock()
 
 	run := func() (*fantasy.AgentResult, error) {
 		return c.currentAgent.Run(ctx, SessionAgentCall{

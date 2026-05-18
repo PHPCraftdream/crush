@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -30,8 +31,9 @@ type SessionLock struct {
 	// HolderPID is the PID that holds this lock.
 	HolderPID int
 
-	f    *os.File
-	stop chan struct{} // closed by Release to stop the heartbeat goroutine
+	f       *os.File
+	stop    chan struct{} // closed by Release to stop the heartbeat goroutine
+	release sync.Once    // Fork patch: review-fix — prevents double-close panic on concurrent Release()
 }
 
 // SessionLockBusyError is returned by TryAcquireSessionLock when the
@@ -97,23 +99,27 @@ func TryAcquireSessionLock(dataDir, sessionID string) (*SessionLock, error) {
 }
 
 // Release stops the heartbeat, unlocks and closes the lock file.
-// Safe to call on nil. Idempotent.
+// Safe to call on nil. Idempotent and concurrency-safe.
 func (l *SessionLock) Release() error {
-	if l == nil || l.f == nil {
+	if l == nil {
 		return nil
 	}
-	// Stop heartbeat first so it doesn't touch the file after we release.
-	if l.stop != nil {
-		close(l.stop)
-		l.stop = nil
-	}
-	unlockErr := unlockFile(l.f)
-	closeErr := l.f.Close()
-	l.f = nil
-	if unlockErr != nil {
-		return unlockErr
-	}
-	return closeErr
+	var releaseErr error
+	l.release.Do(func() {
+		if l.stop != nil {
+			close(l.stop)
+		}
+		if l.f != nil {
+			unlockErr := unlockFile(l.f)
+			closeErr := l.f.Close()
+			if unlockErr != nil {
+				releaseErr = unlockErr
+			} else {
+				releaseErr = closeErr
+			}
+		}
+	})
+	return releaseErr
 }
 
 // heartbeat touches the lock file every lockHeartbeatInterval to signal
