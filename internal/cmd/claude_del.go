@@ -41,12 +41,44 @@ func runClaudeDel(cwd string) error {
 		return err
 	}
 
-	// 2. Remove slash command if ours.
+	// 2. Remove /crush slash command if ours.
 	if err := removeSlashCommand(cwd); err != nil {
 		return err
 	}
 
+	// 3. Remove per-model slash commands if ours.
+	if err := removeModelCommands(cwd); err != nil {
+		return err
+	}
+
 	_ = removed
+	return nil
+}
+
+func removeModelCommands(cwd string) error {
+	dir := filepath.Join(cwd, claudeCommandsDir)
+	removed := 0
+	for _, mc := range allModelCommands {
+		path := filepath.Join(dir, mc.name+".md")
+		data, err := os.ReadFile(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return fmt.Errorf("read %s: %w", path, err)
+		}
+		if !strings.Contains(string(data), claudeModelCmdSentinel) {
+			fmt.Fprintf(os.Stderr, "refusing to delete %s — missing sentinel\n", path)
+			continue
+		}
+		if err := os.Remove(path); err != nil {
+			return fmt.Errorf("remove %s: %w", path, err)
+		}
+		removed++
+	}
+	if removed > 0 {
+		fmt.Fprintf(os.Stderr, "removed %d model commands\n", removed)
+	}
 	return nil
 }
 

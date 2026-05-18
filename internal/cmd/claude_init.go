@@ -1,3 +1,5 @@
+// Fork patch: batch 23 — `claude-init` also installs per-model slash commands
+// (o47-0..o47-4, o46-0..o46-3, s46-0..s46-3, s45-0..s45-2, h45-0..h45-2).
 // Fork patch: batch 22 — `claude-init` no longer writes a delegation block
 // into CLAUDE.md. The block (versions v1..v10) was the proximate cause of
 // a recursive-delegation fork-bomb: any Claude Code session in the
@@ -35,7 +37,45 @@ const (
 	claudeMdFile               = "CLAUDE.md"
 	claudeSlashCommandPath     = ".claude/commands/crush.md"
 	claudeSlashCommandSentinel = "<!-- crush-slash-command:v1 -->"
+	claudeModelCmdSentinel     = "<!-- crush-model-command:v1 -->"
+	claudeCommandsDir          = ".claude/commands"
 )
+
+// modelCmd describes one per-model slash command.
+type modelCmd struct {
+	name    string // filename without .md, e.g. "o47-3"
+	model   string // full Anthropic model ID
+	effort  string // low/medium/high/xhigh/max
+	display string // human-readable label for description
+}
+
+// allModelCommands is the canonical list of per-model slash commands.
+var allModelCommands = []modelCmd{
+	// Opus 4.7 — low(0) medium(1) high(2) xhigh(3) max(4)
+	{"o47-0", "claude-opus-4-7", "low", "Opus 4.7 – low"},
+	{"o47-1", "claude-opus-4-7", "medium", "Opus 4.7 – medium"},
+	{"o47-2", "claude-opus-4-7", "high", "Opus 4.7 – high"},
+	{"o47-3", "claude-opus-4-7", "xhigh", "Opus 4.7 – xhigh"},
+	{"o47-4", "claude-opus-4-7", "max", "Opus 4.7 – max"},
+	// Opus 4.6 — low(0) medium(1) high(2) max(3)
+	{"o46-0", "claude-opus-4-6", "low", "Opus 4.6 – low"},
+	{"o46-1", "claude-opus-4-6", "medium", "Opus 4.6 – medium"},
+	{"o46-2", "claude-opus-4-6", "high", "Opus 4.6 – high"},
+	{"o46-3", "claude-opus-4-6", "max", "Opus 4.6 – max"},
+	// Sonnet 4.6 — low(0) medium(1) high(2) max(3)
+	{"s46-0", "claude-sonnet-4-6", "low", "Sonnet 4.6 – low"},
+	{"s46-1", "claude-sonnet-4-6", "medium", "Sonnet 4.6 – medium"},
+	{"s46-2", "claude-sonnet-4-6", "high", "Sonnet 4.6 – high"},
+	{"s46-3", "claude-sonnet-4-6", "max", "Sonnet 4.6 – max"},
+	// Sonnet 4.5 — low(0) medium(1) high(2)
+	{"s45-0", "claude-sonnet-4-5", "low", "Sonnet 4.5 – low"},
+	{"s45-1", "claude-sonnet-4-5", "medium", "Sonnet 4.5 – medium"},
+	{"s45-2", "claude-sonnet-4-5", "high", "Sonnet 4.5 – high"},
+	// Haiku 4.5 — low(0) medium(1) high(2)
+	{"h45-0", "claude-haiku-4-5", "low", "Haiku 4.5 – low"},
+	{"h45-1", "claude-haiku-4-5", "medium", "Haiku 4.5 – medium"},
+	{"h45-2", "claude-haiku-4-5", "high", "Haiku 4.5 – high"},
+}
 
 var claudeInitCmd = &cobra.Command{
 	Use:   "claude-init",
@@ -73,9 +113,14 @@ crush claude-init --cwd /path/to/project
 			return err
 		}
 
-		// 2. Install / refresh the slash-command.
+		// 2. Install / refresh the /crush slash-command.
 		if err := writeSlashCommand(cwd); err != nil {
 			return fmt.Errorf("slash command: %w", err)
+		}
+
+		// 3. Install / refresh per-model slash commands.
+		if err := writeModelCommands(cwd); err != nil {
+			return fmt.Errorf("model commands: %w", err)
 		}
 		return nil
 	},
@@ -173,6 +218,40 @@ Task:
 
 $ARGUMENTS
 `
+}
+
+// writeModelCommands installs one .claude/commands/<name>.md per entry in
+// allModelCommands. Each file contains a frontmatter model+effort directive
+// and passes $ARGUMENTS straight through. Files we don't own (missing
+// sentinel) are left alone with a warning.
+func writeModelCommands(cwd string) error {
+	dir := filepath.Join(cwd, claudeCommandsDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", dir, err)
+	}
+	for _, mc := range allModelCommands {
+		path := filepath.Join(dir, mc.name+".md")
+		if data, err := os.ReadFile(path); err == nil {
+			if !strings.Contains(string(data), claudeModelCmdSentinel) {
+				fmt.Fprintf(os.Stderr, "warning: %s exists but is not ours — skipping\n", path)
+				continue
+			}
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("read %s: %w", path, err)
+		}
+		content := claudeModelCmdSentinel + "\n" +
+			"---\n" +
+			"description: " + mc.display + "\n" +
+			"model: " + mc.model + "\n" +
+			"effort: " + mc.effort + "\n" +
+			"---\n\n" +
+			"$ARGUMENTS\n"
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			return fmt.Errorf("write %s: %w", path, err)
+		}
+	}
+	fmt.Fprintf(os.Stderr, "wrote %d model commands to %s\n", len(allModelCommands), dir)
+	return nil
 }
 
 func init() {
