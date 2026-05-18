@@ -838,8 +838,21 @@ func printMessage(w io.Writer, msg message.Message, format string) {
 		// text format
 		fmt.Fprintf(w, "[%s]\n", msg.Role)
 		for _, part := range msg.Parts {
-			if tc, ok := part.(message.TextContent); ok {
-				fmt.Fprintf(w, "%s\n", tc.Text)
+			switch p := part.(type) {
+			case message.TextContent:
+				fmt.Fprintf(w, "%s\n", p.Text)
+			case message.ToolCall:
+				fmt.Fprintf(w, "[tool: %s]\n", p.Name)
+			case message.ToolResult:
+				name := p.Name
+				if name == "" {
+					name = p.ToolCallID
+				}
+				if p.IsError {
+					fmt.Fprintf(w, "[tool-result: %s] ERROR\n", name)
+				} else {
+					fmt.Fprintf(w, "[tool-result: %s]\n", name)
+				}
 			}
 		}
 		if f := msg.FinishPart(); f != nil && f.Reason != "" {
