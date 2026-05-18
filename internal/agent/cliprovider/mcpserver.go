@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"time"
@@ -366,12 +367,41 @@ func registerViewTool(srv *mcp.Server, perms permission.Service, workingDir stri
 		}
 
 		content := string(data)
+		// Fork patch: batch 15 — when a sub-agent (called via this MCP)
+		// reads CLAUDE.md it gets the OPERATOR-facing delegation guidance
+		// inserted by `crush claude-init`. That guidance tells the reader
+		// to "delegate work to crush sub-agents" — which causes a
+		// sub-agent that just read this to spawn a NEW crush sub-agent,
+		// recursing until timeout. Strip the block before returning so
+		// the sub-agent never sees the instruction it would loop on.
+		// Filesystem file is untouched; only THIS read sees the filtered
+		// content. Operator reading via shell or external tools still
+		// sees the original.
+		if isClaudeMdPath(path) {
+			content = stripCrushClaudeInitBlock(content)
+		}
 		if input.StartLine > 0 || input.EndLine > 0 {
 			content = sliceLines(content, input.StartLine, input.EndLine)
 		}
 		slog.Debug("cliprovider: MCP Read ok", "path", path, "bytes", len(data))
 		return toolText(content), nil, nil
 	})
+}
+
+// crushClaudeInitBlockPattern is the same regex `internal/cmd/claude_init.go`
+// uses to identify our injected block. Duplicated here to avoid a cmd→
+// cliprovider import (cmd already imports a lot from the agent layer).
+// If the marker scheme ever changes, update both sites.
+var crushClaudeInitBlockPattern = regexp.MustCompile(`(?s)<!-- crush-claude-init:v\d+ -->.*?<!-- /crush-claude-init -->\s*`)
+
+func isClaudeMdPath(path string) bool {
+	base := filepath.Base(path)
+	// Case-insensitive — Windows users sometimes write "Claude.md".
+	return strings.EqualFold(base, "CLAUDE.md")
+}
+
+func stripCrushClaudeInitBlock(content string) string {
+	return crushClaudeInitBlockPattern.ReplaceAllString(content, "")
 }
 
 // ── write ─────────────────────────────────────────────────────────────────────

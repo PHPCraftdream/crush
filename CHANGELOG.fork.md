@@ -1122,3 +1122,34 @@ internal/cmd/providers.go              extended: enable/disable/add/remove/updat
 internal/cmd/providers_test.go         new — test stubs + helper function tests (maskKey, dash, matchesGrep, providerListItem)
 CHANGELOG.fork.md                      this entry
 ```
+
+### Batch 15 — strip our delegation block from CLAUDE.md in sub-agent Read (2026-05-18)
+
+Closes the silent infinite-recursion bug where a sub-agent invoked via
+`crush run` would read the workspace `CLAUDE.md`, see the "delegate work
+to `crush run`" guidance that `crush claude-init` injected, and faithfully
+spawn ANOTHER `crush run` — recursing until the timeout fired with no
+real output.
+
+Mechanism: the MCP `Read` tool exposed by `cliprovider` (which is the
+only file-read interface a CLI sub-agent has when running through us)
+checks if the requested path's basename is `CLAUDE.md` (case-insensitive).
+If yes, it runs the file content through the same regex
+`<!-- crush-claude-init:vN -->...<!-- /crush-claude-init -->` that
+`internal/cmd/claude_init.go` uses to identify the block, and strips it
+before returning to the sub-agent. The file on disk is never touched —
+operators and external tools see the original CLAUDE.md unchanged. Only
+the in-flight Read result is filtered.
+
+Safe-failure mode: a malformed CLAUDE.md with an opening marker but no
+closing marker is returned unchanged (the regex requires both halves),
+so a sub-agent gets a corrupted file's contents visibly rather than
+having half the file silently disappear.
+
+Files touched:
+
+```
+internal/agent/cliprovider/mcpserver.go               filter wired into Read handler + helpers
+internal/agent/cliprovider/mcpserver_claudemd_test.go 11 tests: path detection + 5 strip scenarios
+CHANGELOG.fork.md                                     this entry
+```
