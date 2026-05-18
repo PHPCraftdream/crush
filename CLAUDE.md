@@ -100,8 +100,10 @@ both readability and parseability.
 Anything bigger than one sentence belongs in a file (use `Write`),
 then `< /tmp/task.md` to feed it in. Avoids quoting hell, lost
 newlines, and `$VAR`/backtick expansion. The file is also a handle
-for re-runs against the same `--session` id. See the canonical
-invocation below for the full pattern.
+for re-runs against the same `--session` id. Store them under
+`./.crush/stdin/<task-slug>.prompt` for consistency with workspace data
+and git-ignored cleanup. See the canonical invocation below for the full
+pattern.
 
 ### Conventions
 

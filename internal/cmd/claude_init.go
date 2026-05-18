@@ -17,7 +17,7 @@ import (
 var claudeInitBlockPattern = regexp.MustCompile(`(?s)<!-- crush-claude-init:v\d+ -->.*?<!-- /crush-claude-init -->\s*`)
 
 const (
-	claudeInitMarkerStart      = "<!-- crush-claude-init:v9 -->"
+	claudeInitMarkerStart      = "<!-- crush-claude-init:v10 -->"
 	claudeInitMarkerEnd        = "<!-- /crush-claude-init -->"
 	claudeMdFile               = "CLAUDE.md"
 	claudeSlashCommandPath     = ".claude/commands/crush.md"
@@ -267,6 +267,14 @@ then ` + "`< /tmp/task.md`" + ` to feed it in. Avoids quoting hell, lost
 newlines, and ` + "`$VAR`" + `/backtick expansion. The file is also a handle
 for re-runs against the same ` + "`--session`" + ` id. See the canonical
 invocation below for the full pattern.
+
+**Store stdin prompts under ` + "`./.crush/stdin/<task-slug>.prompt`" + `** — co-locate
+them with the crush workspace data directory (` + "`.crush/`" + `) rather than
+scattering them in ` + "`/tmp`" + ` or random places. The directory is
+gitignored as a side-effect of the existing ` + "`.crush/`" + ` rule, so no
+risk of accidentally committing. When iterating on a prompt with the same
+` + "`--session`" + ` id, reuse the same file path for convenience: run once,
+edit the prompt file, re-invoke with the same ` + "`crush run`" + ` command.
 
 ### Conventions
 

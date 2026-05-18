@@ -1207,3 +1207,86 @@ internal/agent/tools/bash.go                    early Check; deny via NewTextErr
 internal/agent/cliprovider/mcpserver.go         early Check in registerBashTool; deny via toolError
 CHANGELOG.fork.md                                this entry
 ```
+
+### Batch 17 — standardize stdin prompt file location to `.crush/stdin/` (2026-05-18)
+
+Documentation-only change. Formalizes a convention: when an orchestrator
+(Claude Code, crush wrapper harness, CI job) needs to pass a multi-line prompt
+to `crush run` via stdin (e.g. `< ./.crush/stdin/task.prompt`), it should write
+to a file under `./.crush/stdin/` (co-located with workspace data) rather than
+scattering files into `/tmp`. No new directories are created at runtime — the
+operator's harness creates them on first write. The directory is covered by the
+existing `.crush/` gitignore rule, so cleanup is automatic.
+
+Files touched:
+
+```
+internal/cmd/claude_init.go               v9 → v10 marker; new paragraph on `.crush/stdin/` location + reuse pattern
+CLAUDE.md                                 one-liner in "Long prompts" section mentioning `.crush/stdin/`
+CHANGELOG.fork.md                         this entry
+```
+
+### Batch 18 — `crush sessions` subcommands for orchestrator observability (2026-05-18)
+
+Three new `crush sessions` subcommands for monitoring and debugging session state
+at the CLI. Designed for orchestrator visibility into running or completed
+sessions — allowing scripts and CI jobs to inspect session metadata, monitor
+lock files, and stream messages as they complete.
+
+Subcommands:
+
+- `crush sessions show <id> [--json] [--with-messages] [--full]` — inspect single
+  session with optional message thread; default: text output with truncated
+  system prompt and message previews; --json for structured format
+- `crush sessions locks [--json] [--stale-only]` — scan `.crush/locks/` for
+  active lock files (one per running session); report session id, PID, acquisition
+  time, duration, stale status (process dead OR lock older than 10 minutes);
+  default: tabwriter table; --json for NDJSON
+- `crush sessions tail <id> [--follow] [--from-message <id>] [--format text|ndjson]`
+  — stream messages from a session; default: print all existing messages and exit;
+  --follow: poll and print new messages until session finishes or Ctrl+C;
+  --from-message: resume after a specific message ID (skip earlier); default:
+  human-readable blocks per message; --format ndjson: JSON per line for piping
+
+All three commands use simple polling against the SQLite message store (no
+streaming DB connections required). Error codes are predictable (0 = success,
+1 = session/file not found, 2 = database error mid-stream).
+
+Files touched:
+
+```
+internal/cmd/sessions.go                  add 3 commands + init() registration + implementation
+internal/cmd/sessions_show_test.go        new — 4 tests (TextOutput, JSON, WithMessages, NotFound)
+internal/cmd/sessions_locks_test.go       new — 3 tests (CreateLockFile, MultipleFiles, ParseFilename)
+internal/cmd/sessions_tail_test.go        new — 3 tests (StreamsMessages, MultipleMessages, EmptySession)
+CHANGELOG.fork.md                         this entry
+```
+
+### Batch 19 — `crush mcp` command family for MCP server management (2026-05-18)
+
+Add new CLI command family `crush mcp <subcommand>` to manage Model Context
+Protocol servers configured in crush.json. Follows the `crush providers`
+pattern exactly with list, show, enable, disable, restart, test, add, remove,
+and set subcommands. Enables lifecycle management of MCP servers without
+editing config files by hand.
+
+Subcommands:
+
+- `crush mcp list [--json] [--grep <pattern>]` — table or JSON list, optionally filtered
+- `crush mcp show <id> [--json]` — full config for one server
+- `crush mcp enable <id> [--global|--local]` — set disabled=false
+- `crush mcp disable <id> [--global|--local]` — set disabled=true
+- `crush mcp restart <id>` — placeholder (requires session restart)
+- `crush mcp test <id>` — connectivity test (placeholder)
+- `crush mcp add <id> --type <stdio|sse|http> [--command ...] [--url ...] [--arg ...] [--env ...] [--header ...]` — create new server
+- `crush mcp remove <id> [--global|--local]` (alias: `rm`) — delete from config
+- `crush mcp set <id> [--command ...] [--type ...] [--disabled ...]` — update fields in-place
+
+Files touched:
+
+```
+internal/cmd/mcp.go              new — 9 subcommands + helper types + flag registration
+internal/cmd/mcp_test.go         new — 8 tests covering command structure + helper functions
+internal/cmd/sessions_show_test.go removed unused config import (no-op fix)
+CHANGELOG.fork.md                this entry
+```
