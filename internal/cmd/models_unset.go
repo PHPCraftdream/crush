@@ -31,9 +31,20 @@ Missing keys are a no-op (exit 0). After the deletion, an empty
 	Args:      cobra.MaximumNArgs(1),
 	ValidArgs: []string{"large", "small", "both"},
 	Example: `
-crush models unset --local            # clear both slots in workspace scope
-crush models unset large --local      # clear only the large override
-crush models unset small --global     # clear the global small slot
+# Clear the entire workspace override so the global config takes effect again.
+crush models unset --local
+
+# Same but globally — wipes both slots from ~/.local/share/crush/crush.json.
+crush models unset --global
+
+# Drop just the large slot in the workspace; keep the small one.
+crush models unset large --local
+
+# Drop just the small slot globally.
+crush models unset small --global
+
+# Confirm what survived:
+crush models state
   `,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		which := "both"

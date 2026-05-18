@@ -26,6 +26,19 @@ var modelsStateCmd = &cobra.Command{
   3. The atom name in parens when the effective model matches a known atom.
 
 ` + "`--json`" + ` emits a structured object for orchestrators.`,
+	Example: `
+# Plain text: effective pair + scope breakdown.
+crush models state
+
+# Machine-readable for orchestrators (jq-friendly):
+crush models state --json | jq '.effective'
+
+# After changing the workspace override, see what's now effective:
+crush models use --local opus-high glm5_turbo && crush models state
+
+# Backwards-compat alias of the same command:
+crush models show
+  `,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		asJSON, _ := cmd.Flags().GetBool("json")
 		a, err := setupApp(cmd)

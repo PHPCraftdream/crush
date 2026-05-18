@@ -21,6 +21,19 @@ var runCmd = &cobra.Command{
 	Short:   "Run a single non-interactive prompt",
 	Long: `Run a single prompt in non-interactive mode and exit.
 
+  WARNING — auto-bypass of inner CLI permissions:
+  `+"`crush run`"+` is non-interactive by design (no human at the keyboard),
+  so any inner CLI sub-process it spawns (claude / codex / gemini) is
+  launched with its own bypass-permissions flag (claude
+  --dangerously-skip-permissions, codex --approval-mode yolo, gemini
+  --yolo). The sub-process can read, write, and execute anywhere the
+  invoking user has permission. There is no per-tool confirmation. Use
+  `+"`crush run`"+` only in workspaces you can afford to lose; if you need
+  real isolation, wrap the invocation in an OS-level sandbox (Sandboxie
+  Plus, Windows Sandbox, WSL2 + landlock, Docker, etc.). Interactive
+  sessions (TUI / web) keep the normal permission flow — this WARNING
+  applies only to `+"`crush run`"+`.
+
 --role is REQUIRED: every invocation must declare whether it wants the
 strong/slow model ("--role smart" or "--role large") or the cheap/fast
 one ("--role fast" or "--role small"). The actual model id behind each

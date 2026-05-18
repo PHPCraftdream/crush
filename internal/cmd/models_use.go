@@ -27,11 +27,35 @@ remains "local if set, else global".
 See ` + "`crush models list`" + ` for the full atom table.`,
 	Args: cobra.ExactArgs(2),
 	Example: `
-crush models use opus-high sonnet-low                # both Anthropic
-crush models use glm5_1 glm5_turbo                   # both Z.AI
-crush models use opus-max glm5_turbo                 # mixed providers
-crush models use --local haiku-xhigh haiku-low       # workspace-only
-crush models use openai/gpt-5@high zai/glm-5-turbo   # raw provider/model fallback
+# Default Anthropic stack — strong reasoning on the large slot, cheap small.
+crush models use opus-high sonnet-low
+
+# Same intent but Sonnet as the strong slot (cheaper than Opus, still smart).
+crush models use sonnet-high haiku-low
+
+# Cheapest viable Anthropic — Haiku on both, with thinking on the large slot.
+crush models use haiku-high haiku-low
+
+# Default Z.AI stack (no reasoning effort — GLM via openai-compat ignores it).
+crush models use glm5_1 glm5_turbo
+
+# Cheapest Z.AI — both slots on turbo.
+crush models use glm5_turbo glm5_turbo
+
+# Mixed: Anthropic Opus for hard reasoning, Z.AI turbo for cheap fast slot.
+crush models use opus-max glm5_turbo
+
+# Workspace-only override (writes ./.crush/crush.json, leaves global untouched).
+crush models use --local haiku-xhigh haiku-low
+
+# Override only the global config (default scope; flag shown for clarity).
+crush models use --global sonnet-high haiku-low
+
+# Raw "provider/model[@level]" syntax for anything not in the atom registry.
+crush models use openai/gpt-5@high zai/glm-5-turbo
+
+# After running, verify with:
+crush models state
   `,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		scope, err := scopeFromFlags(cmd, config.ScopeGlobal)

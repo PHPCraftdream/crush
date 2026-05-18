@@ -31,6 +31,19 @@ accepted by ` + "`crush models use`" + ` as a fallback when a model is not in
 the atom registry.
 
 ` + "`--json`" + ` emits a structured object: { "atoms": [...], "other_models": [...] }.`,
+	Example: `
+# Human-readable atom table + raw provider/model listing for enabled providers.
+crush models list
+
+# Just the atoms (skip the OTHER MODELS section visually via head/sed):
+crush models list | sed '/^OTHER MODELS/,$d'
+
+# JSON for orchestrators — enumerate every atom and its valid effort levels:
+crush models list --json | jq '.atoms[] | {name, levels}'
+
+# Find every glm-* model the active Z.AI provider exposes:
+crush models list --json | jq '.other_models[] | select(.provider=="zai")'
+  `,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		asJSON, _ := cmd.Flags().GetBool("json")
 		a, err := setupApp(cmd)
