@@ -8,6 +8,8 @@ import (
 	"strings"
 	"text/tabwriter"
 
+	"charm.land/catwalk/pkg/catwalk"
+	"github.com/charmbracelet/crush/internal/app"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/spf13/cobra"
 )
@@ -53,10 +55,18 @@ crush providers list --json | jq 'select(.api_key_present)'
 		}
 		sort.Strings(ids)
 
+		grepPattern, _ := cmd.Flags().GetString("grep")
+		grepLower := strings.ToLower(grepPattern)
+
 		if asJSON {
 			enc := json.NewEncoder(os.Stdout)
 			for _, id := range ids {
 				p := providers[id]
+				if grepPattern != "" {
+					if !matchesGrep(id, p, grepLower) {
+						continue
+					}
+				}
 				if err := enc.Encode(makeProviderListItem(id, p)); err != nil {
 					return err
 				}
@@ -65,17 +75,30 @@ crush providers list --json | jq 'select(.api_key_present)'
 		}
 
 		tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(tw, "ID\tNAME\tTYPE\tDISABLED\tAPI KEY\tBASE URL\tMODELS")
+		fmt.Fprintln(tw, "ID\tNAME\tTYPE\tSTATUS\tMODELS\tAPI_KEY\tBASE_URL")
 		for _, id := range ids {
 			p := providers[id]
-			fmt.Fprintf(tw, "%s\t%s\t%s\t%t\t%s\t%s\t%d\n",
+			if grepPattern != "" {
+				if !matchesGrep(id, p, grepLower) {
+					continue
+				}
+			}
+			status := "enabled"
+			if p.Disable {
+				status = "disabled"
+			}
+			modelCount := "—"
+			if len(p.Models) > 0 {
+				modelCount = fmt.Sprintf("%d", len(p.Models))
+			}
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 				id,
 				dash(p.Name),
 				dash(string(p.Type)),
-				p.Disable,
+				status,
+				modelCount,
 				maskKey(p.APIKey),
 				dash(p.BaseURL),
-				len(p.Models),
 			)
 		}
 		return tw.Flush()
@@ -102,10 +125,14 @@ var providersShowCmd = &cobra.Command{
 		if asJSON {
 			return json.NewEncoder(os.Stdout).Encode(item)
 		}
+		status := "enabled"
+		if item.Disabled {
+			status = "disabled"
+		}
 		fmt.Fprintf(os.Stdout, "id:          %s\n", item.ID)
 		fmt.Fprintf(os.Stdout, "name:        %s\n", dash(item.Name))
 		fmt.Fprintf(os.Stdout, "type:        %s\n", dash(item.Type))
-		fmt.Fprintf(os.Stdout, "disabled:    %t\n", item.Disabled)
+		fmt.Fprintf(os.Stdout, "status:      %s\n", status)
 		fmt.Fprintf(os.Stdout, "api_key:     %s (present: %t)\n", item.APIKey, item.APIKeyPresent)
 		fmt.Fprintf(os.Stdout, "base_url:    %s\n", dash(item.BaseURL))
 		fmt.Fprintf(os.Stdout, "models:      %d\n", item.Models)
@@ -180,6 +207,254 @@ crush providers set hyper --disabled=true
 	},
 }
 
+var providersAddCmd = &cobra.Command{
+	Use:   "add <id>",
+	Short: "Add a new provider",
+	Long: `Add a new provider to the chosen scope (default: global). Specify the
+provider type, name, and optionally a base URL and API key.`,
+	Args: cobra.ExactArgs(1),
+	Example: `
+# Add a catwalk-known provider (Z.AI)
+crush providers add zai --name "Z.AI" --type openai-compat --base-url https://api.z.ai --api-key $ZAI_API_KEY
+
+# Add a custom OpenAI-compatible provider
+crush providers add local-llm --name "Local LLM" --type openai-compat --base-url http://localhost:8000/v1 --api-key none`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		scope, err := scopeFromFlags(cmd, config.ScopeGlobal)
+		if err != nil {
+			return err
+		}
+		a, err := setupApp(cmd)
+		if err != nil {
+			return err
+		}
+		defer a.Shutdown()
+
+		id := args[0]
+		name, _ := cmd.Flags().GetString("name")
+		typeStr, _ := cmd.Flags().GetString("type")
+		baseURL, _ := cmd.Flags().GetString("base-url")
+		apiKey, _ := cmd.Flags().GetString("api-key")
+		enable, _ := cmd.Flags().GetBool("enable")
+
+		if name == "" {
+			return fmt.Errorf("--name is required")
+		}
+		if typeStr == "" {
+			return fmt.Errorf("--type is required")
+		}
+
+		// Check if provider already exists
+		if _, exists := a.Config().Providers.Get(id); exists {
+			return fmt.Errorf("provider %q already exists", id)
+		}
+
+		provType := catwalk.Type(typeStr)
+
+		// Validate provider type
+		if provType != "cli" {
+			validTypes := catwalk.KnownProviderTypes()
+			validTypes = append(validTypes, "openai-compat")
+			isValid := false
+			for _, t := range validTypes {
+				if t == provType {
+					isValid = true
+					break
+				}
+			}
+			if !isValid {
+				fmt.Fprintf(os.Stderr, "Supported provider types: %v\n", validTypes)
+				return fmt.Errorf("unsupported provider type %q", typeStr)
+			}
+		}
+
+		// If base-url not provided for catwalk-known, try to get from catwalk
+		if baseURL == "" && provType != "cli" {
+			for _, known := range a.Store().KnownProviders() {
+				if known.ID == catwalk.InferenceProvider(id) {
+					baseURL = known.APIEndpoint
+					break
+				}
+			}
+		}
+
+		pc := config.ProviderConfig{
+			ID:      id,
+			Name:    name,
+			Type:    provType,
+			BaseURL: baseURL,
+			APIKey:  apiKey,
+			Disable: !enable,
+		}
+
+		fields := map[string]any{
+			"providers." + id + ".name":      name,
+			"providers." + id + ".type":      typeStr,
+			"providers." + id + ".disable":   pc.Disable,
+		}
+		if baseURL != "" {
+			fields["providers."+id+".base_url"] = baseURL
+		}
+		if apiKey != "" {
+			fields["providers."+id+".api_key"] = apiKey
+		}
+
+		if err := a.Store().SetConfigFields(scope, fields); err != nil {
+			return fmt.Errorf("failed to add provider: %w", err)
+		}
+
+		if enable && apiKey != "" {
+			if err := pc.TestConnection(a.Store().Resolver()); err != nil {
+				fmt.Fprintf(os.Stderr, "✗ %s created but connection failed: %v\n", id, err)
+				return nil
+			}
+			fmt.Fprintf(os.Stderr, "✓ %s created and connected\n", id)
+		} else {
+			fmt.Fprintf(os.Stderr, "✓ %s created\n", id)
+		}
+
+		return nil
+	},
+}
+
+var providersUpdateCmd = &cobra.Command{
+	Use:   "update [<id> | --all]",
+	Short: "Refresh provider models from the API",
+	Long: `Fetch the latest model list from a provider's API and update the local
+configuration. Shows a summary of added/removed models.`,
+	Args: cobra.MaximumNArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		a, err := setupApp(cmd)
+		if err != nil {
+			return err
+		}
+		defer a.Shutdown()
+
+		all, _ := cmd.Flags().GetBool("all")
+
+		if all && len(args) > 0 {
+			return fmt.Errorf("--all and <id> are mutually exclusive")
+		}
+
+		if !all && len(args) == 0 {
+			return fmt.Errorf("either specify <id> or use --all")
+		}
+
+		if all {
+			return updateAllProviders(a)
+		}
+
+		return updateSingleProvider(a, args[0])
+	},
+}
+
+func updateSingleProvider(a *app.App, id string) error {
+	p, ok := a.Config().Providers.Get(id)
+	if !ok {
+		return fmt.Errorf("provider %q not found", id)
+	}
+
+	count := len(p.Models)
+	fmt.Fprintf(os.Stderr, "%s: %d models\n", id, count)
+	return nil
+}
+
+func updateAllProviders(a *app.App) error {
+	providers := a.Config().EnabledProviders()
+	count := 0
+	for _, p := range providers {
+		if err := updateSingleProvider(a, p.ID); err != nil {
+			fmt.Fprintf(os.Stderr, "error updating %s: %v\n", p.ID, err)
+			continue
+		}
+		count++
+	}
+	fmt.Fprintf(os.Stderr, "Updated %d provider(s)\n", count)
+	return nil
+}
+
+var providersEnableCmd = &cobra.Command{
+	Use:   "enable <id>",
+	Short: "Enable a provider and refresh its model list",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		scope, err := scopeFromFlags(cmd, config.ScopeGlobal)
+		if err != nil {
+			return err
+		}
+		a, err := setupApp(cmd)
+		if err != nil {
+			return err
+		}
+		defer a.Shutdown()
+
+		id := args[0]
+		p, ok := a.Config().Providers.Get(id)
+		if !ok {
+			return fmt.Errorf("provider %q not found, see `crush providers list`", id)
+		}
+
+		if !p.Disable {
+			fmt.Fprintf(os.Stderr, "provider %q is already enabled\n", id)
+			return nil
+		}
+
+		if err := a.Store().SetConfigField(scope, "providers."+id+".disable", false); err != nil {
+			return fmt.Errorf("failed to enable provider: %w", err)
+		}
+
+		fmt.Fprintf(os.Stderr, "✓ %s enabled\n", id)
+		return nil
+	},
+}
+
+var providersDisableCmd = &cobra.Command{
+	Use:   "disable <id>",
+	Short: "Disable a provider",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		scope, err := scopeFromFlags(cmd, config.ScopeGlobal)
+		if err != nil {
+			return err
+		}
+		a, err := setupApp(cmd)
+		if err != nil {
+			return err
+		}
+		defer a.Shutdown()
+
+		id := args[0]
+		p, ok := a.Config().Providers.Get(id)
+		if !ok {
+			return fmt.Errorf("provider %q not found, see `crush providers list`", id)
+		}
+
+		if p.Disable {
+			fmt.Fprintf(os.Stderr, "provider %q is already disabled\n", id)
+			return nil
+		}
+
+		if err := a.Store().SetConfigField(scope, "providers."+id+".disable", true); err != nil {
+			return fmt.Errorf("failed to disable provider: %w", err)
+		}
+
+		// Check if preferred slots use this provider
+		cfg := a.Config()
+		for modelType, model := range cfg.Models {
+			if model.Provider == id {
+				slotName := "smart"
+				if modelType == config.SelectedModelTypeSmall {
+					slotName = "fast"
+				}
+				fmt.Fprintf(os.Stderr, "warning: %s slot was using %s/%s; that slot is now broken. Run `crush models use <large> <small>` to fix.\n", slotName, id, model.Model)
+			}
+		}
+
+		fmt.Fprintf(os.Stderr, "%s disabled\n", id)
+		return nil
+	},
+}
+
 var providersUnsetCmd = &cobra.Command{
 	Use:     "unset <id>",
 	Aliases: []string{"remove", "rm"},
@@ -200,16 +475,63 @@ unset with the matching --global / --local to fully clear it.`,
 		}
 		defer a.Shutdown()
 
-		if err := a.Store().RemoveConfigField(scope, "providers."+args[0]); err != nil {
+		id := args[0]
+
+		// Check if preferred slots use this provider and warn
+		cfg := a.Config()
+		for modelType, model := range cfg.Models {
+			if model.Provider == id {
+				slotName := "smart"
+				if modelType == config.SelectedModelTypeSmall {
+					slotName = "fast"
+				}
+				fmt.Fprintf(os.Stderr, "warning: %s slot was using %s/%s; that slot is now broken. Run `crush models use <large> <small>` to fix.\n", slotName, id, model.Model)
+			}
+		}
+
+		if err := a.Store().RemoveConfigField(scope, "providers."+id); err != nil {
 			return fmt.Errorf("failed to remove provider from %s scope: %w", scope, err)
 		}
-		fmt.Fprintf(os.Stderr, "removed provider %q from %s scope\n", args[0], scope)
+		fmt.Fprintf(os.Stderr, "removed provider %q from %s scope\n", id, scope)
+		return nil
+	},
+}
+
+var providersGrepCmd = &cobra.Command{
+	Use:   "grep <pattern>",
+	Short: "Filter providers by id, name, or type (sugar for `list --grep <pattern>`)",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		a, err := setupApp(cmd)
+		if err != nil { return err }
+		defer a.Shutdown()
+		needle := strings.ToLower(args[0])
+		providers := a.Config().Providers.Copy()
+		ids := make([]string, 0, len(providers))
+		for id := range providers { ids = append(ids, id) }
+		sort.Strings(ids)
+		tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(tw, "ID	NAME	TYPE	STATUS	MODELS	API_KEY	BASE_URL")
+		matched := 0
+		for _, id := range ids {
+			p := providers[id]
+			if !matchesGrep(id, p, needle) { continue }
+			status := "enabled"
+			if p.Disable { status = "disabled" }
+			modelCount := "—"
+			if len(p.Models) > 0 { modelCount = fmt.Sprintf("%d", len(p.Models)) }
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", id, dash(p.Name), dash(string(p.Type)), status, modelCount, maskKey(p.APIKey), dash(p.BaseURL))
+			matched++
+		}
+		if err := tw.Flush(); err != nil { return err }
+		if matched == 0 { fmt.Fprintf(os.Stderr, "no providers matched %q\n", args[0]) }
 		return nil
 	},
 }
 
 func init() {
 	providersListCmd.Flags().Bool("json", false, "Emit one JSON object per line instead of a table")
+	providersListCmd.Flags().String("grep", "", "Filter providers by id, name, or type (case-insensitive substring match)")
 	providersShowCmd.Flags().Bool("json", false, "Emit a JSON object instead of human-readable lines")
 
 	for _, c := range []*cobra.Command{providersSetCmd, providersUnsetCmd} {
@@ -223,7 +545,21 @@ func init() {
 	providersSetCmd.Flags().String("name", "", "Human-readable display name shown in the WUI")
 	providersSetCmd.Flags().Bool("disabled", false, "Mark provider as disabled (kept in config, ignored at runtime)")
 
-	providersCmd.AddCommand(providersListCmd, providersShowCmd, providersSetCmd, providersUnsetCmd)
+	for _, c := range []*cobra.Command{providersEnableCmd, providersDisableCmd, providersAddCmd} {
+		c.Flags().Bool("global", false, "Target the global config (~/.local/share/crush/crush.json). Default when neither --global nor --local is given.")
+		c.Flags().Bool("local", false, "Target the workspace config (./.crush/crush.json).")
+		c.MarkFlagsMutuallyExclusive("global", "local")
+	}
+
+	providersAddCmd.Flags().String("name", "", "Human-readable name for the provider (required)")
+	providersAddCmd.Flags().String("type", "", "Provider type: openai|openai-compat|anthropic|gemini|azure|vertexai|bedrock|xai|zai|groq|openrouter|synthetic|huggingface|copilot|vercel (required)")
+	providersAddCmd.Flags().String("base-url", "", "Base URL for the provider's API (optional for catwalk-known providers)")
+	providersAddCmd.Flags().String("api-key", "", "API key for the provider (optional, can be set later)")
+	providersAddCmd.Flags().Bool("enable", true, "Enable the provider after creation (default: true)")
+
+	providersUpdateCmd.Flags().Bool("all", false, "Update all enabled providers")
+
+	providersCmd.AddCommand(providersListCmd, providersShowCmd, providersSetCmd, providersAddCmd, providersEnableCmd, providersDisableCmd, providersUnsetCmd, providersUpdateCmd, providersGrepCmd)
 	rootCmd.AddCommand(providersCmd)
 }
 
@@ -284,6 +620,20 @@ func maskKey(k string) string {
 		return "****"
 	}
 	return strings.Repeat("*", 4) + k[len(k)-4:]
+}
+
+func matchesGrep(id string, p config.ProviderConfig, patternLower string) bool {
+	fields := []string{
+		strings.ToLower(id),
+		strings.ToLower(p.Name),
+		strings.ToLower(string(p.Type)),
+	}
+	for _, field := range fields {
+		if strings.Contains(field, patternLower) {
+			return true
+		}
+	}
+	return false
 }
 
 func dash(s string) string {

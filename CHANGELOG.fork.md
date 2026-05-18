@@ -1083,3 +1083,42 @@ internal/agent/cliprovider/provider.go   new NonInteractiveContextKey + override
 internal/app/app.go                       seed context with NonInteractiveContextKey in RunNonInteractive
 CHANGELOG.fork.md                         this entry
 ```
+
+### Batch 12 — provider management commands (2026-05-18)
+
+Extends the `crush providers` command family with full CRUD + model lifecycle
+management, enabling operators to add custom providers, refresh model lists,
+and track provider state transitions.
+
+New commands:
+- `crush providers list` — extended with `STATUS` column, `--grep` filtering
+- `crush providers enable <id>` — re-enable a disabled provider
+- `crush providers disable <id>` — disable with orphaned-slot warnings
+- `crush providers add <id>` — new provider with model auto-fetch
+- `crush providers remove <id>` — delete provider with `--yes` confirmation
+- `crush providers update [<id> | --all]` — refresh model lists, show diffs
+- `crush providers grep <pattern>` — sugar for `list --grep`
+
+Model-source strategies:
+- **Catwalk-known providers** (openai, anthropic, gemini, etc.) — pull cached
+  model list from internal/config catwalk JSON; no HTTP call.
+- **OpenAI-compatible (`openai-compat`)** — GET `<base_url>/models`, parse
+  `{data: [{id, ...}]}`, map to catwalk.Model. Context window unknown; warns
+  user to correct via future `providers update --set-ctx` flag.
+- **Anthropic with custom base** — GET `<base_url>/v1/models` with
+  x-api-key + anthropic-version headers; extracts id, display_name,
+  context_tokens.
+- **CLI providers** — model list from hardcoded cliprovider.go slice; no-op
+  for update.
+
+Orphan detection: when a provider's models change, warns if currently-preferred
+`large`/`small` model is removed (`WARN: preferred <slot> = <id>/<model> no
+longer exists — your '<slot>' slot is broken`).
+
+Files touched:
+
+```
+internal/cmd/providers.go              extended: enable/disable/add/remove/update/grep + list STATUS column + --grep flag
+internal/cmd/providers_test.go         new — test stubs + helper function tests (maskKey, dash, matchesGrep, providerListItem)
+CHANGELOG.fork.md                      this entry
+```

@@ -1110,6 +1110,89 @@ Or set the `CRUSH_DISABLE_PROVIDER_AUTO_UPDATE` environment variable:
 export CRUSH_DISABLE_PROVIDER_AUTO_UPDATE=1
 ```
 
+## Provider management
+
+Crush provides a suite of commands to inspect and manage LLM providers:
+
+### List providers
+
+```bash
+# List all configured providers across global and workspace scopes
+crush providers list
+
+# Filter by id, name, or type (case-insensitive substring match)
+crush providers list --grep zai
+
+# Emit JSON for further processing
+crush providers list --json | jq '.[] | select(.type=="openai")'
+```
+
+Output shows ID, name, type, status (enabled/disabled), model count, and (masked) API key.
+
+### Show provider details
+
+```bash
+# Show full details for a provider
+crush providers show openai
+
+# Emit JSON
+crush providers show openai --json
+```
+
+### Enable/disable a provider
+
+```bash
+# Enable a disabled provider (re-enables it and refreshes models)
+crush providers enable zai
+
+# Disable a provider (keeps credentials, sets disabled flag)
+crush providers disable openai
+```
+
+### Add a new provider
+
+```bash
+# Add a catwalk-known provider (uses default base URL from catwalk)
+crush providers add zai --name "Z.AI" --type openai-compat --api-key $ZAI_API_KEY
+
+# Add with a custom base URL
+crush providers add local-llm --name "Local LLM" --type openai-compat \
+  --base-url http://localhost:8000/v1 --api-key none
+
+# Add but don't enable
+crush providers add myProvider --name "My Provider" --type openai \
+  --api-key $KEY --no-enable
+```
+
+### Remove a provider
+
+```bash
+# Remove a provider with confirmation
+crush providers remove openai
+
+# Remove without prompting (required in non-interactive mode)
+crush providers remove openai --yes
+```
+
+### Update provider models
+
+```bash
+# Refresh models for a single provider
+crush providers update zai
+
+# Refresh models for all enabled providers
+crush providers update --all
+```
+
+Shows a diff of added/removed models. Warns if any currently-preferred model is orphaned.
+
+### Filter providers (grep sugar)
+
+```bash
+# Equivalent to `providers list --grep pattern`
+crush providers grep openai-compat
+```
+
 ### Manually updating providers
 
 Manually updating providers is possible with the `crush update-providers`
