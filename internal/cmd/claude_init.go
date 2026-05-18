@@ -79,28 +79,46 @@ var allModelCommands = []modelCmd{
 
 var claudeInitCmd = &cobra.Command{
 	Use:   "claude-init",
-	Short: "Install the `/crush` slash-command and strip any legacy delegation block from CLAUDE.md",
-	Long: `Set up the workspace so an operator can delegate a task to crush via the
-` + "`/crush`" + ` slash command in Claude Code. Concretely:
+	Short: "Install /crush and per-model slash-commands locally; strip legacy CLAUDE.md block",
+	Long: `Set up the current workspace (project-local) so an operator can delegate
+tasks to crush or invoke a specific model directly from Claude Code.
 
-  1. Write ` + "`.claude/commands/crush.md`" + ` (the slash-command body). If a file
-     with that path already exists WITHOUT our sentinel, leave it alone and
-     print a warning — someone else owns it.
+All files are written to ` + "`.claude/commands/`" + ` inside the project directory
+(or --cwd). This is the LOCAL scope — Claude Code also supports a global
+scope at ` + "`~/.claude/commands/`" + `, which this command does NOT touch.
 
-  2. Strip any pre-existing crush-claude-init block from ` + "`CLAUDE.md`" + `
-     (matches any version, v1..vN). This cleans up workspaces where an
-     older crush installed an always-on delegation instruction; that block
-     turned out to be a recursive-delegation footgun (see CHANGELOG.fork.md
-     batch 22). If stripping leaves CLAUDE.md empty, the file is removed.
+Concretely:
+
+  1. Write ` + "`.claude/commands/crush.md`" + ` — the ` + "`/crush`" + ` delegation command.
+     Skipped (with a warning) if the file exists without our sentinel.
+
+  2. Write 19 per-model slash commands (` + "`/o47-0`" + `..` + "`/h45-2`" + `):
+
+       o47-0..o47-4  claude-opus-4-7    effort low→max  (0=low 4=max)
+       o46-0..o46-3  claude-opus-4-6    effort low→max
+       s46-0..s46-3  claude-sonnet-4-6  effort low→max
+       s45-0..s45-2  claude-sonnet-4-5  effort low→high
+       h45-0..h45-2  claude-haiku-4-5   effort low→high
+
+     Each passes ` + "`$ARGUMENTS`" + ` straight to the chosen model/effort.
+     Existing files without our sentinel are left alone.
+
+  3. Strip any pre-existing crush-claude-init block from ` + "`CLAUDE.md`" + `
+     (any version v1..vN). If the file becomes empty it is removed.
 
 ` + "`claude-init`" + ` no longer writes anything into ` + "`CLAUDE.md`" + `. Delegation is
-explicit-only — the operator invokes ` + "`/crush <task>`" + ` when they want it.`,
+explicit-only — invoke ` + "`/crush <task>`" + ` or ` + "`/o47-3 <task>`" + ` when you want it.`,
 	Example: `
-# Install / refresh the slash-command in the current workspace
+# Install / refresh all slash-commands in the current workspace (local)
 crush claude-init
 
 # Scope to another project
 crush claude-init --cwd /path/to/project
+
+# After init, in Claude Code you can type:
+#   /o47-3 explain this function   → Opus 4.7 xhigh
+#   /s46-1 fix the lint warnings   → Sonnet 4.6 medium
+#   /h45-0 summarise this file     → Haiku 4.5 low
 `,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cwd, err := ResolveCwd(cmd)
