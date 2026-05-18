@@ -295,11 +295,10 @@ func writeModelCommandsToDir(dir string) error {
 			return fmt.Errorf("read %s: %w", path, err)
 		}
 		content := "---\n" +
-			"description: " + mc.model + " effort=" + mc.effort + "\n" +
+			"description: " + claudeModelCmdSentinel + " " + mc.model + " effort=" + mc.effort + "\n" +
 			"model: " + mc.model + "\n" +
 			"effort: " + mc.effort + "\n" +
 			"---\n\n" +
-			claudeModelCmdSentinel + "\n\n" +
 			"$ARGUMENTS\n"
 		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 			return fmt.Errorf("write %s: %w", path, err)
