@@ -11,52 +11,103 @@ import (
 
 var claudeDelCmd = &cobra.Command{
 	Use:   "claude-del",
-	Short: "Remove the crush delegation block from CLAUDE.md",
-	Long: `Undo ` + "`crush claude-init`" + `: strip every crush-claude-init
-block (any version) from CLAUDE.md and remove the
-.claude/commands/crush.md slash command (if it carries our sentinel).
+	Short: "Remove crush slash-commands and legacy CLAUDE.md block",
+	Long: `Undo ` + "`crush claude-init`" + `: remove the /crush slash-command, all
+per-model slash-commands (o47-*, s46-*, h45-*, …), and strip any
+crush-claude-init block from CLAUDE.md.
+
+Only files that carry our sentinel are removed — foreign files with the
+same names are left alone with a warning.
+
+Use --global to remove from ~/.claude/commands/ instead of the local
+.claude/commands/ directory. --global and --cwd are mutually exclusive.
 
 Idempotent: running this twice is a no-op the second time.`,
 	Example: `
 # Remove from the current workspace
 crush claude-del
 
+# Remove globally (from ~/.claude/commands/)
+crush claude-del --global
+
 # Scope to another project
 crush claude-del --cwd /path/to/project
 `,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		cwd, err := ResolveCwd(cmd)
-		if err != nil {
+		global, _ := cmd.Flags().GetBool("global")
+
+		var cmdDir string
+		if global {
+			if cmd.Flags().Changed("cwd") {
+				return fmt.Errorf("--global and --cwd are mutually exclusive")
+			}
+			var err error
+			cmdDir, err = resolveCommandsDir("", true)
+			if err != nil {
+				return err
+			}
+		} else {
+			cwd, err := ResolveCwd(cmd)
+			if err != nil {
+				return err
+			}
+			// Strip CLAUDE.md blocks only in local mode.
+			claudeMdPath := filepath.Join(cwd, claudeMdFile)
+			if _, err := stripClaudeMdBlocks(claudeMdPath); err != nil {
+				return err
+			}
+			cmdDir = filepath.Join(cwd, claudeCommandsDir)
+		}
+
+		if err := removeSlashCommandFromDir(cmdDir); err != nil {
 			return err
 		}
-		return runClaudeDel(cwd)
+		return removeModelCommandsFromDir(cmdDir)
 	},
 }
 
+// runClaudeDel is kept for tests that call it directly (local mode only).
 func runClaudeDel(cwd string) error {
-	// 1. Strip blocks from CLAUDE.md.
 	claudeMdPath := filepath.Join(cwd, claudeMdFile)
-	removed, err := stripClaudeMdBlocks(claudeMdPath)
+	if _, err := stripClaudeMdBlocks(claudeMdPath); err != nil {
+		return err
+	}
+	dir := filepath.Join(cwd, claudeCommandsDir)
+	if err := removeSlashCommandFromDir(dir); err != nil {
+		return err
+	}
+	return removeModelCommandsFromDir(dir)
+}
+
+func removeSlashCommand(cwd string) error {
+	return removeSlashCommandFromDir(filepath.Join(cwd, claudeCommandsDir))
+}
+
+func removeSlashCommandFromDir(dir string) error {
+	path := filepath.Join(dir, "crush.md")
+	data, err := os.ReadFile(path)
 	if err != nil {
-		return err
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read %s: %w", path, err)
 	}
-
-	// 2. Remove /crush slash command if ours.
-	if err := removeSlashCommand(cwd); err != nil {
-		return err
+	if !strings.Contains(string(data), claudeSlashCommandSentinel) {
+		fmt.Fprintf(os.Stderr, "refusing to delete %s — does not look like ours (missing sentinel)\n", path)
+		return nil
 	}
-
-	// 3. Remove per-model slash commands if ours.
-	if err := removeModelCommands(cwd); err != nil {
-		return err
+	if err := os.Remove(path); err != nil {
+		return fmt.Errorf("failed to remove %s: %w", path, err)
 	}
-
-	_ = removed
+	fmt.Fprintf(os.Stderr, "removed %s\n", path)
 	return nil
 }
 
 func removeModelCommands(cwd string) error {
-	dir := filepath.Join(cwd, claudeCommandsDir)
+	return removeModelCommandsFromDir(filepath.Join(cwd, claudeCommandsDir))
+}
+
+func removeModelCommandsFromDir(dir string) error {
 	removed := 0
 	for _, mc := range allModelCommands {
 		path := filepath.Join(dir, mc.name+".md")
@@ -77,7 +128,7 @@ func removeModelCommands(cwd string) error {
 		removed++
 	}
 	if removed > 0 {
-		fmt.Fprintf(os.Stderr, "removed %d model commands\n", removed)
+		fmt.Fprintf(os.Stderr, "removed %d model commands from %s\n", removed, dir)
 	}
 	return nil
 }
@@ -110,7 +161,6 @@ func stripClaudeMdBlocks(path string) (int, error) {
 		return len(matches), nil
 	}
 
-	// Write back with a single trailing newline.
 	if err := os.WriteFile(path, []byte(cleaned+"\n"), 0o644); err != nil {
 		return 0, fmt.Errorf("failed to write %s: %w", path, err)
 	}
@@ -118,28 +168,7 @@ func stripClaudeMdBlocks(path string) (int, error) {
 	return len(matches), nil
 }
 
-func removeSlashCommand(cwd string) error {
-	path := filepath.Join(cwd, claudeSlashCommandPath)
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return fmt.Errorf("read %s: %w", path, err)
-	}
-
-	if !strings.Contains(string(data), claudeSlashCommandSentinel) {
-		fmt.Fprintf(os.Stderr, "refusing to delete %s — does not look like ours (missing sentinel)\n", path)
-		return nil
-	}
-
-	if err := os.Remove(path); err != nil {
-		return fmt.Errorf("failed to remove %s: %w", path, err)
-	}
-	fmt.Fprintf(os.Stderr, "removed %s\n", path)
-	return nil
-}
-
 func init() {
+	claudeDelCmd.Flags().Bool("global", false, "Remove from ~/.claude/commands/ instead of the local .claude/commands/")
 	rootCmd.AddCommand(claudeDelCmd)
 }

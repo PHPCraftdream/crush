@@ -39,7 +39,22 @@ const (
 	claudeSlashCommandSentinel = "<!-- crush-slash-command:v1 -->"
 	claudeModelCmdSentinel     = "<!-- crush-model-command:v1 -->"
 	claudeCommandsDir          = ".claude/commands"
+	claudeGlobalCommandsDir    = ".claude/commands" // relative to $HOME
 )
+
+// resolveCommandsDir returns the directory where slash commands should be
+// written. When global is true it returns ~/.claude/commands; otherwise it
+// returns <cwd>/.claude/commands.
+func resolveCommandsDir(cwd string, global bool) (string, error) {
+	if global {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("cannot determine home directory: %w", err)
+		}
+		return filepath.Join(home, claudeGlobalCommandsDir), nil
+	}
+	return filepath.Join(cwd, claudeCommandsDir), nil
+}
 
 // modelCmd describes one per-model slash command.
 type modelCmd struct {
@@ -112,6 +127,9 @@ explicit-only — invoke ` + "`/crush <task>`" + ` or ` + "`/o47-3 <task>`" + ` 
 # Install / refresh all slash-commands in the current workspace (local)
 crush claude-init
 
+# Install globally for every project (~/.claude/commands/)
+crush claude-init --global
+
 # Scope to another project
 crush claude-init --cwd /path/to/project
 
@@ -121,23 +139,37 @@ crush claude-init --cwd /path/to/project
 #   /h45-0 summarise this file     → Haiku 4.5 low
 `,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		cwd, err := ResolveCwd(cmd)
-		if err != nil {
-			return err
-		}
+		global, _ := cmd.Flags().GetBool("global")
 
-		// 1. Strip any legacy crush-claude-init block from CLAUDE.md.
-		if err := stripLegacyBlockFromCLAUDEMd(cwd); err != nil {
-			return err
+		var cmdDir string
+		if global {
+			if cmd.Flags().Changed("cwd") {
+				return fmt.Errorf("--global and --cwd are mutually exclusive")
+			}
+			var err error
+			cmdDir, err = resolveCommandsDir("", true)
+			if err != nil {
+				return err
+			}
+		} else {
+			cwd, err := ResolveCwd(cmd)
+			if err != nil {
+				return err
+			}
+			// 1. Strip any legacy crush-claude-init block from CLAUDE.md (local only).
+			if err := stripLegacyBlockFromCLAUDEMd(cwd); err != nil {
+				return err
+			}
+			cmdDir = filepath.Join(cwd, claudeCommandsDir)
 		}
 
 		// 2. Install / refresh the /crush slash-command.
-		if err := writeSlashCommand(cwd); err != nil {
+		if err := writeSlashCommandToDir(cmdDir); err != nil {
 			return fmt.Errorf("slash command: %w", err)
 		}
 
 		// 3. Install / refresh per-model slash commands.
-		if err := writeModelCommands(cwd); err != nil {
+		if err := writeModelCommandsToDir(cmdDir); err != nil {
 			return fmt.Errorf("model commands: %w", err)
 		}
 		return nil
@@ -177,7 +209,11 @@ func stripLegacyBlockFromCLAUDEMd(cwd string) error {
 }
 
 func writeSlashCommand(cwd string) error {
-	path := filepath.Join(cwd, claudeSlashCommandPath)
+	return writeSlashCommandToDir(filepath.Join(cwd, claudeCommandsDir))
+}
+
+func writeSlashCommandToDir(dir string) error {
+	path := filepath.Join(dir, "crush.md")
 	if data, err := os.ReadFile(path); err == nil {
 		if !strings.Contains(string(data), claudeSlashCommandSentinel) {
 			fmt.Fprintf(os.Stderr, "warning: %s exists but does not contain our sentinel — skipping (someone else owns that file)\n", path)
@@ -186,8 +222,8 @@ func writeSlashCommand(cwd string) error {
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("read %s: %w", path, err)
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return fmt.Errorf("mkdir %s: %w", filepath.Dir(path), err)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", dir, err)
 	}
 	if err := os.WriteFile(path, []byte(claudeSlashCommandContent()), 0o644); err != nil {
 		return fmt.Errorf("write %s: %w", path, err)
@@ -238,12 +274,13 @@ $ARGUMENTS
 `
 }
 
-// writeModelCommands installs one .claude/commands/<name>.md per entry in
-// allModelCommands. Each file contains a frontmatter model+effort directive
-// and passes $ARGUMENTS straight through. Files we don't own (missing
-// sentinel) are left alone with a warning.
 func writeModelCommands(cwd string) error {
-	dir := filepath.Join(cwd, claudeCommandsDir)
+	return writeModelCommandsToDir(filepath.Join(cwd, claudeCommandsDir))
+}
+
+// writeModelCommandsToDir installs one <name>.md per entry in allModelCommands
+// into dir. Files we don't own (missing sentinel) are left alone with a warning.
+func writeModelCommandsToDir(dir string) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("mkdir %s: %w", dir, err)
 	}
@@ -273,5 +310,6 @@ func writeModelCommands(cwd string) error {
 }
 
 func init() {
+	claudeInitCmd.Flags().Bool("global", false, "Install into ~/.claude/commands/ (available in every project)")
 	rootCmd.AddCommand(claudeInitCmd)
 }
