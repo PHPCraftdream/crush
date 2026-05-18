@@ -30,7 +30,7 @@ companion. Every divergence below follows from that single repositioning:
   invalid JSON, runs out of context, stalls the stream) the envelope
   says so — there is no silent success because the agent on top
   cannot read the operator's mind.
-- Bootstrap helpers (`crush claude-init`) drop a delegation guide into
+- Bootstrap helper (`crush claude-init`) installs a `/crush` slash command into
   the workspace so the upper LLM knows when and how to delegate to
   `crush run` instead of grepping the codebase itself.
 
@@ -219,21 +219,26 @@ processes still spawn N stdio children of every configured MCP server
 If you drive Crush from another LLM (e.g. Claude Code), run once:
 
 ```bash
-crush claude-init                 # install or refresh the delegation guide in ./CLAUDE.md
+crush claude-init                 # install the /crush slash-command
 ```
 
-This drops two things into the workspace:
-- A versioned block in `CLAUDE.md` teaching the upper LLM when and how
-  to delegate work to `crush run` (channels, `--role`, `--session`
-  conventions, backgrounding rules, the `CRUSH_FORBID_WRITES`
-  pattern, when to use `--format json` and `--agents single`).
-- A `.claude/commands/crush.md` slash command that says "for this task,
-  delegate via `crush run` per the rules in CLAUDE.md".
+This installs **only** the `.claude/commands/crush.md` slash-command — an
+operator-triggered `/crush <task>` that builds a `crush run` invocation
+with sensible defaults and launches it. Triggered explicitly by the
+operator; never auto-discovered.
 
-The block is versioned (`<!-- crush-claude-init:vN -->`). Re-run
-`crush claude-init` at any time to refresh it — every invocation strips
-all prior versions and writes a fresh one. To undo, `crush claude-del`
-removes the block and the slash command cleanly.
+Earlier versions of this fork also wrote a long "delegate everything to
+crush" block into `CLAUDE.md`. That block turned out to be a recursive-
+delegation footgun: a sub-agent reading it on startup would try to
+delegate every task back into `crush run`, spawning another sub-agent
+which read the same block, and so on (see CHANGELOG.fork.md batch 22 for
+the postmortem). `claude-init` now strips that legacy block on every
+invocation (matching any version, v1..vN) and removes `CLAUDE.md`
+entirely if stripping leaves it empty. Re-run `claude-init` at any time
+— it's idempotent.
+
+To uninstall completely: `crush claude-del` removes the slash-command
+file and strips any remaining legacy `CLAUDE.md` block.
 
 ### 5. `crush models` — picking and inspecting models
 

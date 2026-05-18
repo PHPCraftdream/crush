@@ -1397,11 +1397,36 @@ underlying binary directly (e.g. `claude --model haiku -p ping`) with
 a short timeout instead of going through the agent stream loop.
 Deferred to a follow-up batch.
 
+**Completion (2026-05-18):**
+
+All implementation gaps closed:
+1. Fixed `fantasy.AgentStreamCall` usage: removed message history, pass
+   only `Prompt` field for stateless ping request.
+2. Cost calculation implemented: looks up model pricing from
+   `ProviderConfig.Models` and applies formula `(in_price/1M * prompt_tokens)
+   + (out_price/1M * completion_tokens)`. Returns 0.0 if model not in
+   pricing table.
+3. Comprehensive test suite with 14+ functional tests:
+   - `TestPingLargeModelSucceeds` / `TestPingSmallModelSucceeds` — verify
+     "OK" response triggers status=ok, exit code 0
+   - `TestPingErrorPropagates` — auth errors trigger status=error, exit
+     code 1
+   - `TestPingTimeoutDetected` — deadline exceeded triggers status=timeout,
+     exit code 2
+   - `TestPingDegradedResponse` — non-"OK" response triggers status=degraded,
+     exit code 3
+   - `TestCalculatePingCost_*` — cost calculation with various pricing
+     scenarios (with pricing, no models, model not found, zero pricing)
+   - `TestLookupAtomForModel_KnownModels` — atom label mapping verified
+   - `TestPingResult_JSONMarshal` / `TestPingResult_WithError` — JSON
+     serialization
+   - Command metadata and flag registration tests
+
 Files touched:
 
 ```
-internal/cmd/ping.go         new — 466 LoC, cobra commands + provider dispatch
-internal/cmd/ping_test.go    new — 159 LoC, four test scenarios
+internal/cmd/ping.go         — 499 LoC, fully implemented with all provider types
+internal/cmd/ping_test.go    — 582 LoC, 14 comprehensive test scenarios
 CHANGELOG.fork.md            this entry
 ```
 
@@ -1412,3 +1437,64 @@ polishing after the initial batch-19 commit landed):
   better tools-list probe error handling)
 - internal/cmd/mcp_test.go: +315/-69 (expanded coverage of enable/
   disable/restart edge cases, JSON output shape assertions)
+
+### Batch 22 — remove CLAUDE.md delegation block (recursion-prone footgun) (2026-05-18)
+
+**Postmortem.** Over the course of one day this fork accumulated 470+
+orphan processes (95 claude.exe, 290 bash.exe, 80 go.exe, 3 crush.exe)
+on the operator's Windows machine. Root cause: the always-on
+delegation block that `claude-init` installed into the workspace's
+CLAUDE.md ("you are the strategist, crush is the worker — delegate
+everything"). Every Claude Code session opening the workspace read it
+on startup and tried to delegate ANY task back into `crush run`, which
+spawned another Claude Code via cliprovider, which read the same block,
+and so on. Watchdogs killed outer parents but on Windows the child
+processes became OS-level orphans (no Job Object kill-on-close).
+
+The cycle was already partially closed at the tool-call layer:
+- batch 16 (agentguard) denies `crush`/`claude`/`codex`/etc in our MCP
+  Bash tool.
+- batch 20 force-keeps the MCP bridge active in yolo mode so inner
+  claude is locked to mcp__crush__* and agentguard actually fires.
+
+But the cleanest fix is to remove the trigger entirely: stop telling
+sub-agents to delegate.
+
+**Change.** `claude-init` now:
+- Writes NOTHING into CLAUDE.md.
+- STRIPS any pre-existing crush-claude-init block (any version, v1..v10)
+  from CLAUDE.md when invoked, so users upgrading from an older crush
+  get a clean workspace.
+- Removes CLAUDE.md entirely if stripping leaves it empty (mirrors
+  `claude-del`'s behaviour).
+- Continues to install / refresh the `.claude/commands/crush.md`
+  slash-command — that file is now self-contained (full delegation
+  guidance inline) and triggered ONLY by an explicit `/crush <task>`
+  from the operator. Never auto-discovered.
+
+Also removed:
+- `crush claude-print` — there's no longer a block to print to stdout.
+- The whole `claudeInitBlock()` template function in claude_init.go
+  (lines 165..532, ~370 LoC of long-form prose), the
+  `claudeInitMarkerStart`/`End` constants, and the related "v8"/"v9"/
+  "v10" marker bump apparatus.
+
+Test coverage rewritten for the new behaviour: 8 new claude-init tests
+covering strip-only mode, empty-file deletion, multi-version stripping,
+slash-command install/skip/overwrite. claude-del tests unchanged.
+
+Defence-in-depth still in place: agentguard (batch 16) + MCP-bridge
+re-activation (batch 20) keep blocking nested AI-agent invocations
+even if some operator manually puts a delegation hint back. The
+removed block was only the *trigger* — the agent containment layer
+stays.
+
+Files touched:
+
+```
+internal/cmd/claude_init.go        rewrite — 534 → 184 LoC
+internal/cmd/claude_init_test.go   rewrite — new tests for the new behaviour
+internal/cmd/claude_print.go       deleted — nothing left to print
+README.md                          rewrite of the claude-init section
+CHANGELOG.fork.md                  this entry
+```
