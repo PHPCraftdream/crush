@@ -150,6 +150,9 @@ type Coordinator interface {
 	// extension on the current agent. Called from RunNonInteractive when
 	// --timeout-extends-on-progress is set. Fork patch: batch 8.
 	SetAgentTimeoutOptions(extendsOnProgress bool, hardCap time.Duration)
+	// SetRunLimits sets cost and token caps for the next Run call.
+	// Fork patch: batch 30.
+	SetRunLimits(maxCost float64, maxTokens int64)
 }
 
 type coordinator struct {
@@ -172,6 +175,11 @@ type coordinator struct {
 	skillTracker *skills.Tracker
 
 	readyWg errgroup.Group
+
+	// Per-run limits. Set via SetRunLimits before Run(). Reset after use.
+	// Fork patch: batch 30.
+	maxCost   float64
+	maxTokens int64
 }
 
 func NewCoordinator(
@@ -248,6 +256,13 @@ func (c *coordinator) Run(ctx context.Context, sessionID string, prompt string, 
 	}
 
 	return c.runInternal(ctx, sessionID, prompt, attachments...)
+}
+
+// SetRunLimits stores cost and token caps for the next Run call.
+// Fork patch: batch 30.
+func (c *coordinator) SetRunLimits(maxCost float64, maxTokens int64) {
+	c.maxCost = maxCost
+	c.maxTokens = maxTokens
 }
 
 // applyModelOverrides sets up the agent with the given model overrides (modifies currentAgent in place).
@@ -372,9 +387,9 @@ func (c *coordinator) runInternal(ctx context.Context, sessionID string, prompt 
 	model := c.currentAgent.Model()
 	slog.Debug("Coordinator: running with model", "sessionID", sessionID, "model", model.ModelCfg.Model)
 
-	maxTokens := model.CatwalkCfg.DefaultMaxTokens
+	maxOutputTokens := model.CatwalkCfg.DefaultMaxTokens
 	if model.ModelCfg.MaxTokens != 0 {
-		maxTokens = model.ModelCfg.MaxTokens
+		maxOutputTokens = model.ModelCfg.MaxTokens
 	}
 
 	if !model.CatwalkCfg.SupportsImages && attachments != nil {
@@ -402,12 +417,18 @@ func (c *coordinator) runInternal(ctx context.Context, sessionID string, prompt 
 
 	sessionSystemPrompt := c.resolveSessionSystemPrompt(ctx, sessionID)
 
+	// Fork patch: batch 30 — per-run limits, pass through to the agent.
+	maxCost := c.maxCost
+	c.maxCost = 0
+	maxTokensRunLimit := c.maxTokens
+	c.maxTokens = 0
+
 	run := func() (*fantasy.AgentResult, error) {
 		return c.currentAgent.Run(ctx, SessionAgentCall{
 			SessionID:            sessionID,
 			Prompt:               prompt,
 			Attachments:          attachments,
-			MaxOutputTokens:      maxTokens,
+			MaxOutputTokens:      maxOutputTokens,
 			ProviderOptions:      mergedOptions,
 			Temperature:          temp,
 			TopP:                 topP,
@@ -415,6 +436,8 @@ func (c *coordinator) runInternal(ctx context.Context, sessionID string, prompt 
 			FrequencyPenalty:     freqPenalty,
 			PresencePenalty:      presPenalty,
 			SystemPromptOverride: sessionSystemPrompt,
+			MaxCost:              maxCost,
+			MaxTokens:            maxTokensRunLimit,
 		})
 	}
 	beforeLoaded := c.skillTracker.LoadedNames()

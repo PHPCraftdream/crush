@@ -119,6 +119,11 @@ type SessionAgentCall struct {
 	// SystemPromptOverride, if non-empty, replaces the agent's global system prompt
 	// for this single call. Used to apply per-session system prompts from the DB.
 	SystemPromptOverride string
+	// MaxCost aborts the run if total session cost exceeds this value (0 = no cap).
+	MaxCost float64
+	// MaxTokens aborts the run if total prompt+completion tokens exceed this value
+	// (0 = no cap).
+	MaxTokens int64
 }
 
 type SessionAgent interface {
@@ -900,6 +905,41 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 				return sessionErr
 			}
 			currentSession = updatedSession
+
+			// Fork patch: batch 30 — cancel + runaway protection.
+			// Check DB cancel flag (cross-process signal) and cost/token caps.
+			if canc, cancErr := a.sessions.IsCancelRequested(ctx, call.SessionID); cancErr == nil && canc {
+				if cancelFn, ok := a.activeRequests.Get(call.SessionID); ok {
+					cancelFn()
+				}
+				return fmt.Errorf("session %s cancelled by user", call.SessionID)
+			}
+			if call.MaxCost > 0 && updatedSession.Cost > call.MaxCost {
+				slog.Warn("agent: aborting — max-cost exceeded",
+					"session_id", call.SessionID,
+					"cost", updatedSession.Cost,
+					"max", call.MaxCost,
+				)
+				if cancelFn, ok := a.activeRequests.Get(call.SessionID); ok {
+					cancelFn()
+				}
+				return fmt.Errorf("session %s aborted: cost $%.4f exceeds max $%.4f",
+					call.SessionID, updatedSession.Cost, call.MaxCost)
+			}
+			totalTokens := updatedSession.PromptTokens + updatedSession.CompletionTokens
+			if call.MaxTokens > 0 && totalTokens > call.MaxTokens {
+				slog.Warn("agent: aborting — max-tokens exceeded",
+					"session_id", call.SessionID,
+					"tokens", totalTokens,
+					"max", call.MaxTokens,
+				)
+				if cancelFn, ok := a.activeRequests.Get(call.SessionID); ok {
+					cancelFn()
+				}
+				return fmt.Errorf("session %s aborted: %d tokens exceeds max %d",
+					call.SessionID, totalTokens, call.MaxTokens)
+			}
+
 			return a.messages.Update(genCtx, *currentAssistant)
 		},
 		StopWhen: []fantasy.StopCondition{

@@ -69,10 +69,17 @@ is busy, and interrupt the running turn (yellow Interrupt button) to fold
 a correction into the next step while keeping everything produced so far.
 
 Companion CLI subcommands for scripting and CI:
-  - ` + "`crush run`" + `             one-shot prompt; supports --session id (get-or-create),
-                          --system-prompt[-file], --json output, --timeout.
-  - ` + "`crush sessions`" + `        list / delete / reset stored sessions.
-  - ` + "`crush system-prompt`" + `   print the system prompt that would be sent.`,
+  - ` + "`crush run`" + `             one-shot prompt; --session, --timeout, --max-cost,
+                          --max-tokens, --on-finish, --json.
+  - ` + "`crush sessions`" + `        list / show / delete / last / tail / locks / watch /
+                          pick / grep / cost / diff / tree / fork / cancel / gc.
+  - ` + "`crush queue`" + `           batch task queue — add / list / run / rm / clear / show.
+  - ` + "`crush models`" + `          use / list / set / unset — atom-based model selection
+                          with short codes (o47x, s46h, hl, etc.).
+  - ` + "`crush claude-init`" + `     install 31 slash-commands + 31 sub-agents into
+                          .claude/commands/ and .claude/agents/.
+  - ` + "`crush system-prompt`" + `   print the system prompt that would be sent.
+  - ` + "`crush ping`" + `            health-check (verify API connectivity).`,
 	Example: `
 # Start the web UI on a random free port and open the browser
 crush
@@ -98,12 +105,33 @@ crush run "Summarise the changes on this branch"
 # Pipe stdin into a one-shot prompt
 cat README.md | crush run "Make this more glamorous" > GLAMOROUS_README.md
 
+# With cost cap and timeout (900 = 900 seconds)
+crush run --max-cost 0.50 --max-tokens 100k --timeout 900 "refactor storage"
+
 # Idempotent CI invocation with structured output
 crush run --session "pr-42" --json "Review the diff" | jq .final_text
 
-# Inspect / clean up stored sessions
-crush sessions list
-crush sessions delete pr-42
+# Session management
+crush sessions list                    # list all sessions
+crush sessions last pr-42 --n 5       # last 5 messages with timestamps
+crush sessions tree                    # parent-child hierarchy
+crush sessions cancel pr-42            # graceful cancel via DB flag
+crush sessions fork pr-42 --at 10     # branch from message 10
+crush sessions grep "import error"    # search message text
+crush sessions cost --by model        # cost breakdown by model
+crush sessions diff pr-42             # files touched (from ToolCalls)
+crush sessions pick                   # interactive TUI picker
+
+# Task queue
+crush queue add --role smart --max-cost 0.20 < task.prompt
+crush queue run --concurrent 2 --stop-on-fail
+
+# Model selection with short codes
+crush models use o47x h45l            # Opus 4.7 xhigh + Haiku low
+crush models use oh sl                # top Opus high + top Sonnet low
+
+# Install slash-commands & sub-agents for Claude Code
+crush claude-init --global
   `,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return runWebMode(cmd)

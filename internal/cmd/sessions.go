@@ -19,11 +19,18 @@ import (
 
 var sessionsCmd = &cobra.Command{
 	Use:   "sessions",
-	Short: "List and manage sessions stored in this workspace",
+	Short: "List, observe, and manage sessions — the full orchestration toolkit",
 	Long: `Sessions are the unit of conversation context. The web UI and
-"crush run" both create / continue them; this subcommand exposes the same
-store from the CLI so scripts can enumerate, delete, or reset them
-without poking at the SQLite file directly.`,
+"crush run" both create / continue them. This subcommand gives full
+CLI access to the session store for scripting, orchestration, and debugging.
+
+Core:        list, show, delete, reset
+Observe:     last (with timestamps), tail --follow, locks (heartbeat pulse),
+             watch (live dashboard), pick (interactive TUI)
+Search:      grep <pattern> (message text), diff <id> (files touched),
+             cost [--by model|day|session] (spend breakdown)
+Orchestrate: cancel <id> (graceful DB-flag stop), fork <id> [--at N],
+             tree (parent-child hierarchy), gc (garbage-collect stale)`,
 }
 
 var sessionsListCmd = &cobra.Command{
@@ -331,7 +338,7 @@ func init() {
 	sessionsLastCmd.Flags().IntP("n", "n", 10, "Number of messages to show")
 	sessionsLastCmd.Flags().String("format", "text", "Output format: text or ndjson")
 
-	sessionsCmd.AddCommand(sessionsListCmd, sessionsDeleteCmd, sessionsResetCmd, sessionsShowCmd, sessionsLocksCmd, sessionsTailCmd, sessionsLastCmd, sessionsGcCmd, sessionsWatchCmd, sessionsPickCmd, sessionsGrepCmd, sessionsCostCmd, sessionsDiffCmd)
+	sessionsCmd.AddCommand(sessionsListCmd, sessionsDeleteCmd, sessionsResetCmd, sessionsShowCmd, sessionsLocksCmd, sessionsTailCmd, sessionsLastCmd, sessionsGcCmd, sessionsWatchCmd, sessionsPickCmd, sessionsGrepCmd, sessionsCostCmd, sessionsDiffCmd, sessionsCancelCmd, sessionsForkCmd, sessionsTreeCmd)
 	rootCmd.AddCommand(sessionsCmd)
 }
 

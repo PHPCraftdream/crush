@@ -65,8 +65,9 @@ type Session struct {
 	SmallModelID               string
 	SmallModelReasoningEffort  string // "low", "medium", "high", or "max"
 
-	SystemPrompt string
-	YoloEnabled  bool
+	SystemPrompt    string
+	YoloEnabled     bool
+	CancelRequested bool
 }
 
 type Service interface {
@@ -114,6 +115,11 @@ type Service interface {
 	SetYolo(ctx context.Context, sessionID string, enabled bool) error
 	Rename(ctx context.Context, id string, title string) error
 	Delete(ctx context.Context, id string) error
+
+	// CancelRequested flag: cross-process cancel signal.
+	RequestCancel(ctx context.Context, sessionID string) error
+	IsCancelRequested(ctx context.Context, sessionID string) (bool, error)
+	ClearCancelRequest(ctx context.Context, sessionID string) error
 
 	// Agent tool session management
 	CreateAgentToolSessionID(messageID, toolCallID string) string
@@ -433,7 +439,7 @@ func (s *service) List(ctx context.Context) ([]Session, error) {
 }
 
 func (s *service) ListAll(ctx context.Context) ([]Session, error) {
-	rows, err := s.db.QueryContext(ctx, "SELECT id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id, system_prompt, yolo_enabled, large_model_reasoning_effort, small_model_reasoning_effort FROM sessions ORDER BY updated_at DESC")
+	rows, err := s.db.QueryContext(ctx, "SELECT id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id, system_prompt, yolo_enabled, large_model_reasoning_effort, small_model_reasoning_effort, cancel_requested FROM sessions ORDER BY updated_at DESC")
 	if err != nil {
 		return nil, err
 	}
@@ -441,6 +447,7 @@ func (s *service) ListAll(ctx context.Context) ([]Session, error) {
 	var sessions []Session
 	for rows.Next() {
 		var item db.Session
+		var cancelRequested int64
 		if err := rows.Scan(
 			&item.ID, &item.ParentSessionID, &item.Title, &item.MessageCount,
 			&item.PromptTokens, &item.CompletionTokens, &item.Cost,
@@ -449,10 +456,13 @@ func (s *service) ListAll(ctx context.Context) ([]Session, error) {
 			&item.SmallModelProvider, &item.SmallModelID,
 			&item.SystemPrompt, &item.YoloEnabled,
 			&item.LargeModelReasoningEffort, &item.SmallModelReasoningEffort,
+			&cancelRequested,
 		); err != nil {
 			return nil, err
 		}
-		sessions = append(sessions, s.fromDBItem(item))
+		sess := s.fromDBItem(item)
+		sess.CancelRequested = cancelRequested != 0
+		sessions = append(sessions, sess)
 	}
 	return sessions, rows.Err()
 }
@@ -485,6 +495,39 @@ func (s service) fromDBItem(item db.Session) Session {
 		SystemPrompt: item.SystemPrompt,
 		YoloEnabled:  item.YoloEnabled != 0,
 	}
+}
+
+// RequestCancel sets the cancel_requested flag for a session so a
+// running agent (possibly in a different process) stops gracefully.
+func (s *service) RequestCancel(ctx context.Context, sessionID string) error {
+	_, err := s.db.ExecContext(ctx,
+		"UPDATE sessions SET cancel_requested = 1 WHERE id = ?",
+		sessionID,
+	)
+	return err
+}
+
+// IsCancelRequested checks whether a cancel signal is set on the session.
+func (s *service) IsCancelRequested(ctx context.Context, sessionID string) (bool, error) {
+	var v int64
+	err := s.db.QueryRowContext(ctx,
+		"SELECT cancel_requested FROM sessions WHERE id = ?",
+		sessionID,
+	).Scan(&v)
+	if err != nil {
+		return false, err
+	}
+	return v != 0, nil
+}
+
+// ClearCancelRequest resets the cancel_requested flag. Called when a
+// new run starts so a stale flag from a previous run does not kill it.
+func (s *service) ClearCancelRequest(ctx context.Context, sessionID string) error {
+	_, err := s.db.ExecContext(ctx,
+		"UPDATE sessions SET cancel_requested = 0 WHERE id = ?",
+		sessionID,
+	)
+	return err
 }
 
 func marshalTodos(todos []Todo) (string, error) {

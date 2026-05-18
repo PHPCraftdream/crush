@@ -53,6 +53,10 @@ type App struct {
 
 	config *config.ConfigStore
 
+	// DB is the underlying SQLite connection. Exposed for queue and other
+	// raw-SQL features that don't have their own sqlc-generated package.
+	DB func() *sql.DB
+
 	// global context and cleanup functions
 	globalCtx          context.Context
 	cleanupFuncs       []func(context.Context) error
@@ -86,6 +90,8 @@ func New(ctx context.Context, conn *sql.DB, store *config.ConfigStore) (*App, er
 		Permissions: permission.NewPermissionService(ctx, store.WorkingDir(), skipPermissionsRequests, allowedTools, q),
 		FileTracker: filetracker.NewService(q),
 		LSPManager:  lsp.NewManager(store),
+
+		DB: func() *sql.DB { return conn },
 
 		globalCtx: ctx,
 
@@ -540,6 +546,12 @@ type RunOverrides struct {
 	// Errors from the hook are printed to stderr but don't affect exit code.
 	// Fork patch: batch 24.
 	OnFinishHook string
+	// MaxCost aborts the run if total session cost (USD) exceeds this value.
+	// 0 = no cap. Fork patch: batch 30.
+	MaxCost float64
+	// MaxTokens aborts the run if total prompt+completion tokens exceed this
+	// value. 0 = no cap. Fork patch: batch 30.
+	MaxTokens int64
 }
 
 // RunNonInteractive runs a single agent turn and writes its result to
@@ -656,6 +668,14 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt 
 			overrides.TimeoutExtendsOnProgress,
 			overrides.TimeoutHardCap,
 		)
+	}
+
+	// Fork patch: batch 30 — clear stale cancel flag and set run limits.
+	if err := app.Sessions.ClearCancelRequest(ctx, sess.ID); err != nil {
+		slog.Warn("Failed to clear cancel request flag", "session_id", sess.ID, "err", err)
+	}
+	if overrides.MaxCost > 0 || overrides.MaxTokens > 0 {
+		app.AgentCoordinator.SetRunLimits(overrides.MaxCost, overrides.MaxTokens)
 	}
 
 	// Fork patch: batch 24 — on-finish hook support. Captures run

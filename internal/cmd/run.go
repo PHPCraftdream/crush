@@ -121,7 +121,24 @@ Sub-agent aggregation (only matters when --agents permits fan-out):
 
 Use --timeout to bound the run from outside (the agent gets a clean
 cancel + the partial answer is preserved in the session and is included
-in --json output).
+in --json output). Plain numbers are treated as seconds: --timeout 900
+is the same as --timeout 900s or --timeout 15m.
+
+Runaway protection:
+  --max-cost 0.50     abort when session cost (USD) crosses the threshold
+  --max-tokens 100k   abort when prompt+completion tokens cross the limit
+                      (supports k/M suffixes: 100k = 100000, 1M = 1000000)
+  Both checks fire after each agent step. The session is saved with its
+  partial work so you can inspect or fork from it.
+
+Lifecycle hooks:
+  --on-finish "cmd"   run a shell command after the agent finishes.
+                      Env vars set: CRUSH_SESSION_ID, CRUSH_EXIT_REASON,
+                      CRUSH_COST_USD, CRUSH_TOKENS, CRUSH_DURATION_SEC.
+
+External cancellation: use "crush sessions cancel <id>" from another
+terminal to set a DB flag; the running agent checks it after each step
+and stops gracefully.
 
 Permissions: non-interactive runs auto-approve every permission request
 (no one is on the keyboard to confirm). The agent gets the full tool
@@ -196,6 +213,15 @@ crush run --role fast "tldr this readme" < README.md
 # Watch the agent think token-by-token (legacy output mode)
 crush run --role smart --stream "explain this codebase"
 
+# Runaway protection: cap cost and tokens
+crush run --role smart --max-cost 0.50 --max-tokens 100k "refactor storage"
+
+# Flexible timeout: plain number = seconds
+crush run --role smart --timeout 900 --session "long-task" "refactor the storage layer"
+
+# On-finish hook (env: CRUSH_SESSION_ID, CRUSH_EXIT_REASON, CRUSH_COST_USD, ...)
+crush run --role smart --on-finish "echo done >> /tmp/log" "analyze codebase"
+
 # Machine-readable summary for wrapper scripts
 crush run --json --session "pr-42" "review the diff" | jq .final_text
 
@@ -260,6 +286,9 @@ crush run --timeout 5m --session "long-task" "refactor the storage layer"
 			timeoutHardCap, _           = cmd.Flags().GetString("timeout-hard-cap")
 			// Fork patch: batch 24 — on-finish hook.
 			onFinishHook, _ = cmd.Flags().GetString("on-finish")
+			// Fork patch: batch 30 — runaway protection.
+			maxCostStr, _     = cmd.Flags().GetString("max-cost")
+			maxTokensStr, _   = cmd.Flags().GetString("max-tokens")
 		)
 
 		if effort != "" {
@@ -343,6 +372,22 @@ crush run --timeout 5m --session "long-task" "refactor the storage layer"
 		hardCapDur, err := parseDurationFlexible(timeoutHardCap)
 		if err != nil {
 			return fmt.Errorf("--timeout-hard-cap: %w", err)
+		}
+
+		// Fork patch: batch 30 — parse --max-cost and --max-tokens.
+		var maxCost float64
+		if maxCostStr != "" {
+			maxCost, err = strconv.ParseFloat(maxCostStr, 64)
+			if err != nil || maxCost <= 0 {
+				return fmt.Errorf("--max-cost: invalid value %q (must be a positive number like 0.50 or 2.00)", maxCostStr)
+			}
+		}
+		var maxTokens int64
+		if maxTokensStr != "" {
+			maxTokens, err = parseTokenCount(maxTokensStr)
+			if err != nil || maxTokens <= 0 {
+				return fmt.Errorf("--max-tokens: %w", err)
+			}
 		}
 
 		// Cancel on SIGINT or SIGTERM.
@@ -439,6 +484,8 @@ crush run --timeout 5m --session "long-task" "refactor the storage layer"
 			TimeoutExtendsOnProgress: timeoutExtendsOnProgress, // Fork patch: batch 8
 			TimeoutHardCap:           hardCapDur,               // Fork patch: batch 8
 			OnFinishHook:             onFinishHook,             // Fork patch: batch 24
+			MaxCost:                  maxCost,                  // Fork patch: batch 30
+			MaxTokens:                maxTokens,                // Fork patch: batch 30
 		}
 		return a.RunNonInteractive(ctx, os.Stdout, prompt, overrides, hideSpinner, mode, sessionID, useLast)
 	},
@@ -468,6 +515,9 @@ func init() {
 	runCmd.Flags().String("timeout-hard-cap", "0", "Maximum wall-clock time the watchdog allows even with --timeout-extends-on-progress (e.g. 30s, 5m, 900 — plain number = seconds). Default: 0 (no cap).")
 	// Fork patch: batch 24 — on-finish hook.
 	runCmd.Flags().String("on-finish", "", "Shell command to execute after the run completes. Environment variables: CRUSH_SESSION_ID, CRUSH_EXIT_REASON, CRUSH_COST_USD, CRUSH_TOKENS, CRUSH_DURATION_SEC. Hook errors are printed to stderr but don't affect exit code.")
+	// Fork patch: batch 30 — runaway protection.
+	runCmd.Flags().String("max-cost", "", "Abort the run if total cost (USD) exceeds this value. e.g. 0.50, 2.00")
+	runCmd.Flags().String("max-tokens", "", "Abort the run if total prompt+completion tokens exceed this value. e.g. 100k, 1M, 500000")
 	runCmd.MarkFlagsMutuallyExclusive("session", "continue")
 	runCmd.MarkFlagsMutuallyExclusive("system-prompt", "system-prompt-file")
 	runCmd.MarkFlagsMutuallyExclusive("stream", "json")
@@ -517,4 +567,27 @@ func parseDurationFlexible(s string) (time.Duration, error) {
 		return time.Duration(n) * time.Second, nil
 	}
 	return time.ParseDuration(s)
+}
+
+// parseTokenCount parses a token count string with optional k/M suffix.
+// e.g. "500000", "100k", "1M" → int64.
+func parseTokenCount(s string) (int64, error) {
+	if s == "" {
+		return 0, nil
+	}
+	s = strings.TrimSpace(s)
+	multiplier := int64(1)
+	switch {
+	case strings.HasSuffix(s, "M") || strings.HasSuffix(s, "m"):
+		multiplier = 1_000_000
+		s = s[:len(s)-1]
+	case strings.HasSuffix(s, "K") || strings.HasSuffix(s, "k"):
+		multiplier = 1_000
+		s = s[:len(s)-1]
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid token count %q", s)
+	}
+	return n * multiplier, nil
 }
