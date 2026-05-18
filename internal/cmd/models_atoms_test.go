@@ -118,3 +118,46 @@ func TestLookupAtomForModel(t *testing.T) {
 }
 
 // (splitModelEffort is covered by helpers_test.go — don't duplicate.)
+
+func TestParseShortCode_Valid(t *testing.T) {
+	cases := []struct {
+		code   string
+		model  string
+		effort string
+	}{
+		{"o47-0", "cli-claude-opus", "low"},
+		{"o47-3", "cli-claude-opus", "xhigh"},
+		{"o47-4", "cli-claude-opus", "max"},
+		{"o46-2", "cli-claude-opus", "high"},
+		{"s46-1", "cli-claude-sonnet", "medium"},
+		{"s45-2", "cli-claude-sonnet", "high"},
+		{"h45-0", "cli-claude-haiku", "low"},
+		{"h45-2", "cli-claude-haiku", "high"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.code, func(t *testing.T) {
+			sm, ok := parseShortCode(tc.code)
+			require.True(t, ok, "expected ok for %s", tc.code)
+			assert.Equal(t, "local-cli", sm.Provider)
+			assert.Equal(t, tc.model, sm.Model)
+			assert.Equal(t, tc.effort, sm.ReasoningEffort)
+		})
+	}
+}
+
+func TestParseShortCode_Invalid(t *testing.T) {
+	invalid := []string{"o47", "o47-5", "x47-0", "o99-0", "o47-a", "", "opus-high"}
+	for _, code := range invalid {
+		_, ok := parseShortCode(code)
+		assert.False(t, ok, "expected not-ok for %q", code)
+	}
+}
+
+func TestParseAtom_ShortCodeRoundtrip(t *testing.T) {
+	defer setMockEffortLevels([]string{"low", "medium", "high", "xhigh", "max"})()
+	sm, err := parseAtom("o47-3")
+	require.NoError(t, err)
+	assert.Equal(t, "local-cli", sm.Provider)
+	assert.Equal(t, "cli-claude-opus", sm.Model)
+	assert.Equal(t, "xhigh", sm.ReasoningEffort)
+}

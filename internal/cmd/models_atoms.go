@@ -171,7 +171,13 @@ func renderAtomsBlock(cfg *config.Config) string {
 		tw.Flush()
 		b.WriteString("\n")
 	}
-	b.WriteString("EXAMPLES:\n  crush models use opus-high sonnet-low\n  crush models use glm5_1 glm5_turbo\n  crush models use opus-max glm5_turbo\n")
+	b.WriteString(renderShortCodesBlock())
+	b.WriteString("EXAMPLES:\n")
+	b.WriteString("  crush models use o47-3 h45-0     # Opus 4.7 xhigh + Haiku 4.5 low\n")
+	b.WriteString("  crush models use s46-2 h45-0     # Sonnet 4.6 high + Haiku 4.5 low\n")
+	b.WriteString("  crush models use opus-high sonnet-low\n")
+	b.WriteString("  crush models use glm5_1 glm5_turbo\n")
+	b.WriteString("  crush models use o47-4 glm5_turbo  # mixed\n")
 	return b.String()
 }
 
@@ -203,14 +209,107 @@ func renderAtomsBlockFallback() string {
 		tw.Flush()
 		b.WriteString("\n")
 	}
-	b.WriteString("EXAMPLES:\n  crush models use opus-high sonnet-low\n  crush models use glm5_1 glm5_turbo\n  crush models use opus-max glm5_turbo\n")
+	b.WriteString(renderShortCodesBlock())
+	b.WriteString("EXAMPLES:\n")
+	b.WriteString("  crush models use o47-3 h45-0\n")
+	b.WriteString("  crush models use s46-2 h45-0\n")
+	b.WriteString("  crush models use glm5_1 glm5_turbo\n")
 	return b.String()
 }
 
-// parseAtom takes a string like "opus-high" or "glm5_turbo" or, as fallback,
-// "openai/gpt-5@high" / "zai/glm-5.1". Returns a SelectedModel ready for
-// UpdatePreferredModel.
+// renderShortCodesBlock returns a formatted table of the short-code aliases.
+func renderShortCodesBlock() string {
+	var b strings.Builder
+	b.WriteString("SHORT CODES (alias for atom+effort, e.g. `crush models use o47-3 h45-0`):\n\n")
+	b.WriteString("  Code     Model              Effort\n")
+	b.WriteString("  -------  -----------------  ------\n")
+	rows := []struct{ code, model, effort string }{
+		{"o47-0", "claude-opus-4-7", "low"},
+		{"o47-1", "claude-opus-4-7", "medium"},
+		{"o47-2", "claude-opus-4-7", "high"},
+		{"o47-3", "claude-opus-4-7", "xhigh"},
+		{"o47-4", "claude-opus-4-7", "max"},
+		{"o46-0", "claude-opus-4-6", "low"},
+		{"o46-1", "claude-opus-4-6", "medium"},
+		{"o46-2", "claude-opus-4-6", "high"},
+		{"o46-3", "claude-opus-4-6", "max"},
+		{"s46-0", "claude-sonnet-4-6", "low"},
+		{"s46-1", "claude-sonnet-4-6", "medium"},
+		{"s46-2", "claude-sonnet-4-6", "high"},
+		{"s46-3", "claude-sonnet-4-6", "max"},
+		{"s45-0", "claude-sonnet-4-5", "low"},
+		{"s45-1", "claude-sonnet-4-5", "medium"},
+		{"s45-2", "claude-sonnet-4-5", "high"},
+		{"h45-0", "claude-haiku-4-5", "low"},
+		{"h45-1", "claude-haiku-4-5", "medium"},
+		{"h45-2", "claude-haiku-4-5", "high"},
+	}
+	tw := tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
+	for _, r := range rows {
+		fmt.Fprintf(tw, "  %s\t%s\t%s\n", r.code, r.model, r.effort)
+	}
+	tw.Flush()
+	b.WriteString("\n")
+	return b.String()
+}
+
+// shortCodeEffort maps the numeric suffix (0–4) to an effort level name.
+var shortCodeEffort = map[byte]string{
+	'0': "low",
+	'1': "medium",
+	'2': "high",
+	'3': "xhigh",
+	'4': "max",
+}
+
+// shortCodeBase maps the model prefix part of a short code to the
+// corresponding atom key in atomRegistry.
+var shortCodeBase = map[string]string{
+	"o47": "opus",
+	"o46": "opus",
+	"s46": "sonnet",
+	"s45": "sonnet",
+	"h45": "haiku",
+}
+
+// parseShortCode tries to parse a short-code atom like "o47-3" or "h45-0".
+// Returns ok=false if the input doesn't match the pattern.
+func parseShortCode(name string) (config.SelectedModel, bool) {
+	// Expected format: "<base>-<digit>", e.g. "o47-3"
+	if len(name) != 5 || name[3] != '-' {
+		return config.SelectedModel{}, false
+	}
+	base := name[:3]
+	digit := name[4]
+
+	atomKey, ok := shortCodeBase[base]
+	if !ok {
+		return config.SelectedModel{}, false
+	}
+	effort, ok := shortCodeEffort[digit]
+	if !ok {
+		return config.SelectedModel{}, false
+	}
+
+	a, ok := atomRegistry[atomKey]
+	if !ok {
+		return config.SelectedModel{}, false
+	}
+	return config.SelectedModel{
+		Provider:        a.Provider,
+		Model:           a.Model,
+		ReasoningEffort: effort,
+	}, true
+}
+
+// parseAtom takes a string like "o47-3", "opus-high", "glm5_turbo", or, as
+// fallback, "openai/gpt-5@high" / "zai/glm-5.1". Returns a SelectedModel
+// ready for UpdatePreferredModel.
 func parseAtom(name string) (config.SelectedModel, error) {
+	// Try short-code notation first (o47-3, s46-1, h45-0, …).
+	if sm, ok := parseShortCode(name); ok {
+		return sm, nil
+	}
 	if strings.Contains(name, "/") {
 		modelPart, effort := splitModelEffort(name)
 		return config.SelectedModel{Provider: "", Model: modelPart, ReasoningEffort: effort}, fmt.Errorf("raw provider/model not yet resolved: %s", name)
