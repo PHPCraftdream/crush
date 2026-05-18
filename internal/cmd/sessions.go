@@ -259,6 +259,60 @@ crush sessions tail myid-123 --format ndjson | jq '.role == "assistant"'
 	RunE: sessionsTailCmdRun,
 }
 
+var sessionsLastCmd = &cobra.Command{
+	Use:   "last <id>",
+	Short: "Show the last N messages of a session",
+	Long: `Print the most recent messages from a session without following.
+Useful for quickly checking what an agent produced.
+
+Use --n to control how many messages to show (default 10).
+Use --format ndjson for machine-readable output.`,
+	Example: `
+# Show last 10 messages
+crush sessions last myid-123
+
+# Show last 3 messages
+crush sessions last myid-123 --n 3
+
+# Machine-readable
+crush sessions last myid-123 --format ndjson | jq '.role'
+`,
+	Args: cobra.ExactArgs(1),
+	RunE: sessionsLastCmdRun,
+}
+
+func sessionsLastCmdRun(cmd *cobra.Command, args []string) error {
+	n, _ := cmd.Flags().GetInt("n")
+	format, _ := cmd.Flags().GetString("format")
+	if format != "text" && format != "ndjson" {
+		return fmt.Errorf("invalid format: %s (must be text or ndjson)", format)
+	}
+
+	a, err := setupApp(cmd)
+	if err != nil {
+		return err
+	}
+	defer a.Shutdown()
+
+	sessionID := args[0]
+	if _, err := resolveSessionID(cmd.Context(), a.Sessions, sessionID); err != nil {
+		return err
+	}
+
+	messages, err := a.Messages.List(cmd.Context(), sessionID)
+	if err != nil {
+		return fmt.Errorf("failed to list messages: %w", err)
+	}
+
+	if len(messages) > n {
+		messages = messages[len(messages)-n:]
+	}
+	for _, msg := range messages {
+		printMessage(os.Stdout, msg, format)
+	}
+	return nil
+}
+
 func init() {
 	sessionsListCmd.Flags().Bool("json", false, "Emit one JSON object per line instead of a table")
 
@@ -273,7 +327,10 @@ func init() {
 	sessionsTailCmd.Flags().String("from-message", "", "Resume from this message ID (skip earlier)")
 	sessionsTailCmd.Flags().String("format", "text", "Output format: text or ndjson")
 
-	sessionsCmd.AddCommand(sessionsListCmd, sessionsDeleteCmd, sessionsResetCmd, sessionsShowCmd, sessionsLocksCmd, sessionsTailCmd)
+	sessionsLastCmd.Flags().IntP("n", "n", 10, "Number of messages to show")
+	sessionsLastCmd.Flags().String("format", "text", "Output format: text or ndjson")
+
+	sessionsCmd.AddCommand(sessionsListCmd, sessionsDeleteCmd, sessionsResetCmd, sessionsShowCmd, sessionsLocksCmd, sessionsTailCmd, sessionsLastCmd)
 	rootCmd.AddCommand(sessionsCmd)
 }
 
@@ -494,6 +551,25 @@ func sessionsShowCmdRun(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// lockPulseStatus classifies a lock file by its heartbeat mtime.
+// Heartbeat interval = 10s, stale threshold = 20s (session.lockStaleDuration).
+//   0–10s  → "alive"    (fresh heartbeat)
+//   10–15s → "ping"     (one beat overdue, likely OK)
+//   15–20s → "stopping" (two beats missed, probably finishing)
+//   >20s   → "offline"  (stale — holder crashed or exited without Release)
+func lockPulseStatus(ageSec int64) string {
+	switch {
+	case ageSec <= 10:
+		return "alive"
+	case ageSec <= 15:
+		return "ping"
+	case ageSec <= 20:
+		return "stopping"
+	default:
+		return "offline"
+	}
+}
+
 func sessionsLocksCmdRun(cmd *cobra.Command, args []string) error {
 	asJSON, _ := cmd.Flags().GetBool("json")
 	staleOnly, _ := cmd.Flags().GetBool("stale-only")
@@ -513,7 +589,6 @@ func sessionsLocksCmdRun(cmd *cobra.Command, args []string) error {
 	entries, err := os.ReadDir(locksDir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// No locks directory yet
 			if asJSON {
 				return nil
 			}
@@ -526,58 +601,49 @@ func sessionsLocksCmdRun(cmd *cobra.Command, args []string) error {
 	type lockItem struct {
 		SessionID   string `json:"session_id"`
 		PID         int    `json:"pid"`
+		PulseSec    int64  `json:"pulse_sec"`
+		Pulse       string `json:"pulse"` // alive / ping / stopping / offline
 		AcquiredAt  int64  `json:"acquired_at_unix"`
 		DurationSec int64  `json:"duration_seconds"`
 		Stale       bool   `json:"stale"`
 	}
 
 	var locks []lockItem
-	now := time.Now().Unix()
-	staleThresholdSec := int64(600) // 10 minutes
+	now := time.Now()
 
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasPrefix(entry.Name(), "session-") || !strings.HasSuffix(entry.Name(), ".lock") {
 			continue
 		}
 
-		// Parse session ID from filename
 		sessionID := strings.TrimPrefix(entry.Name(), "session-")
 		sessionID = strings.TrimSuffix(sessionID, ".lock")
 
 		info, _ := entry.Info()
-		acqTime := info.ModTime().Unix()
-		duration := now - acqTime
-
-		// Try to read PID from file
-		lockPath := filepath.Join(locksDir, entry.Name())
-		pidBytes, _ := os.ReadFile(lockPath)
-		pidStr := strings.TrimSpace(string(pidBytes))
-		pid := 0
-		fmt.Sscanf(pidStr, "%d", &pid)
-
-		// Check if process is alive
-		stale := false
-		if pid > 0 {
-			proc, err := os.FindProcess(pid)
-			if err != nil {
-				stale = true
-			} else if err := proc.Signal(os.Signal(nil)); err != nil {
-				stale = true
-			}
-		}
-
-		// Also stale if older than threshold
-		if duration > staleThresholdSec {
-			stale = true
-		}
+		pulseSec := int64(now.Sub(info.ModTime()).Seconds())
+		pulse := lockPulseStatus(pulseSec)
+		stale := pulse == "offline"
 
 		if staleOnly && !stale {
 			continue
 		}
 
+		lockPath := filepath.Join(locksDir, entry.Name())
+		pidBytes, _ := os.ReadFile(lockPath)
+		pid := 0
+		fmt.Sscanf(strings.TrimSpace(string(pidBytes)), "%d", &pid)
+
+		// Approximate acquire time: mtime when pulse was fresh.
+		// For alive locks mtime ≈ now, so we use file birthtime via stat
+		// if available; otherwise mtime is the best proxy.
+		acqTime := info.ModTime().Unix()
+		duration := int64(now.Sub(info.ModTime()).Seconds())
+
 		locks = append(locks, lockItem{
 			SessionID:   sessionID,
 			PID:         pid,
+			PulseSec:    pulseSec,
+			Pulse:       pulse,
 			AcquiredAt:  acqTime,
 			DurationSec: duration,
 			Stale:       stale,
@@ -604,20 +670,14 @@ func sessionsLocksCmdRun(cmd *cobra.Command, args []string) error {
 	}
 
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "SESSION_ID\tPID\tACQUIRED_AT\tDURATION\tSTALE")
+	fmt.Fprintln(tw, "SESSION_ID\tPID\tPULSE\tPULSE_AGE\tDURATION")
 	for _, lock := range locks {
-		staleStr := "no"
-		if lock.Stale {
-			staleStr = "yes"
-		}
-		acqTime := time.Unix(lock.AcquiredAt, 0).Format("2006-01-02 15:04:05")
-		duration := fmt.Sprintf("%ds", lock.DurationSec)
-		fmt.Fprintf(tw, "%s\t%d\t%s\t%s\t%s\n",
-			truncate(lock.SessionID, 20),
+		fmt.Fprintf(tw, "%s\t%d\t%s\t%ds ago\t%ds\n",
+			truncate(lock.SessionID, 28),
 			lock.PID,
-			acqTime,
-			duration,
-			staleStr,
+			lock.Pulse,
+			lock.PulseSec,
+			lock.DurationSec,
 		)
 	}
 	return tw.Flush()

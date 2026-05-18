@@ -245,6 +245,8 @@ description: Delegate this task to a crush sub-agent instead of doing it yoursel
 Do not implement the following task yourself. Build a ` + "`crush run`" + ` invocation
 and launch it.
 
+## Launching
+
 Defaults to apply unless the user said otherwise:
 
 - ` + "`--role smart`" + ` for non-trivial work; ` + "`--role fast`" + ` for one-liners.
@@ -260,15 +262,49 @@ Defaults to apply unless the user said otherwise:
 - Permissions inside ` + "`crush run`" + ` are auto-approved (no human at the keyboard).
   Run only in workspaces you can afford to lose.
 
-Once the run finishes:
+## Monitoring a running session
 
-1. ` + "`Read`" + ` the result file.
+Check whether a session is still alive via its lock heartbeat:
+
+` + "```" + `
+crush sessions locks
+` + "```" + `
+
+PULSE column meaning (heartbeat every 10 s, stale after 20 s):
+- ` + "`alive`" + `    — last heartbeat ≤ 10 s ago, agent is running
+- ` + "`ping`" + `     — 10–15 s ago, likely still running
+- ` + "`stopping`" + ` — 15–20 s ago, agent is finishing or slow
+- ` + "`offline`" + `  — >20 s ago, lock is stale (agent crashed or exited)
+
+Show the last messages of a session to see what it produced:
+
+` + "```" + `
+crush sessions last <session-id>          # last 10 messages
+crush sessions last <session-id> --n 3   # last 3 messages
+` + "```" + `
+
+Live-follow a running session:
+
+` + "```" + `
+crush sessions tail <session-id> --follow
+` + "```" + `
+
+List all sessions:
+
+` + "```" + `
+crush sessions list
+crush sessions show <session-id> --with-messages
+` + "```" + `
+
+## After the run finishes
+
+1. ` + "`Read`" + ` the result file (` + "`.crush/stdin/<task>.out`" + `).
 2. Sanity-check the diff/output against the user's intent.
 3. Apply any small tactical fixes yourself (typos, missed imports);
    re-delegate to the same ` + "`--session`" + ` for anything bigger.
 4. Report back to the user with the summary + cost + what changed.
 
-Task:
+## Task
 
 $ARGUMENTS
 `
