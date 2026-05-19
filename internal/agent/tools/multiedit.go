@@ -120,7 +120,8 @@ func NewMultiEditTool(
 			text += getDiagnostics(params.FilePath, lspManager)
 			response.Content = text
 			return response, nil
-		})
+		},
+	)
 }
 
 func validateEdits(edits []MultiEditOperation) error {
@@ -275,7 +276,7 @@ func processMultiEditExistingFile(edit editContext, params MultiEditParams, call
 	// Check if file was modified since last read.
 	modTime := fileInfo.ModTime().Truncate(time.Second)
 	if modTime.After(lastRead) {
-		// File was modified externally since last read, update the read time to allow the edit
+		// Fork merge note: same as Edit tool — orchestrators tolerate external edits.
 		slog.Warn("File was modified externally since last read, proceeding with edit", "file", params.FilePath, "mod_time", modTime.Format(time.RFC3339), "last_read", lastRead.Format(time.RFC3339))
 		edit.filetracker.RecordRead(edit.ctx, sessionID, params.FilePath)
 	}

@@ -18,6 +18,11 @@ import (
 
 const batchInterval = 16 * time.Millisecond
 
+// Fork merge note: upstream rewrote events.go as REST /v1/... protocol
+// conversions (sessionToProto, messageToProto, etc.). Our events.go is a
+// WebSocket subscriber that forwards pubsub events to our Hub. Different
+// architectures — keep ours. CHANGELOG.fork.md section 4.A.
+
 // subscribeAndBroadcast subscribes to all app event sources and forwards them
 // to the hub, batching high-frequency message updates the same way the TUI does.
 func subscribeAndBroadcast(ctx context.Context, a *appPkg.App, h *Hub) {

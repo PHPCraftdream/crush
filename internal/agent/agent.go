@@ -1227,7 +1227,8 @@ func (a *sessionAgent) runSummarize(ctx context.Context, sessionID string, opts 
 	// Fork merge note: FlushAll deleted with the debounced layer — see the
 	// Run() entry point above for context.
 
-	agent := fantasy.NewAgent(largeModel.Model,
+	agent := fantasy.NewAgent(
+		largeModel.Model,
 		fantasy.WithSystemPrompt(string(summaryPrompt)),
 		fantasy.WithUserAgent(userAgent),
 	)
@@ -1531,6 +1532,9 @@ func (a *sessionAgent) createUserMessage(ctx context.Context, call SessionAgentC
 func (a *sessionAgent) preparePrompt(msgs []message.Message, todos []session.Todo, attachments ...message.Attachment) ([]fantasy.Message, []fantasy.FilePart) {
 	var history []fantasy.Message
 	if !a.isSubAgent {
+		// Fork merge note: we already extended this block to also surface the
+		// CURRENT todo list when non-empty (originally only handled empty).
+		// Upstream's small reword to the empty-case text is not worth the churn.
 		var reminderText string
 		if len(todos) == 0 {
 			reminderText = `This is a reminder that your todo list is currently empty — all previous tasks have been completed or deleted. DO NOT recreate any old tasks from memory. DO NOT mention this to the user explicitly because they are already aware.
@@ -1647,7 +1651,8 @@ func filterOrphanedToolResults(m message.Message, knownToolCallIDs map[string]st
 		if _, known := knownToolCallIDs[tr.ToolCallID]; known {
 			validParts = append(validParts, part)
 		} else {
-			slog.Warn("Dropping orphaned tool result with no matching tool call",
+			slog.Warn(
+				"Dropping orphaned tool result with no matching tool call",
 				"tool_call_id", tr.ToolCallID,
 			)
 		}
@@ -1673,7 +1678,8 @@ func syntheticToolResultsForOrphanedCalls(m message.Message, knownToolResultIDs 
 		if _, hasResult := knownToolResultIDs[tc.ID]; hasResult {
 			continue
 		}
-		slog.Warn("Injecting synthetic tool result for orphaned tool call",
+		slog.Warn(
+			"Injecting synthetic tool result for orphaned tool call",
 			"tool_call_id", tc.ID,
 			"tool_name", tc.Name,
 		)
@@ -1741,7 +1747,8 @@ func (a *sessionAgent) generateTitle(ctx context.Context, sessionID string, user
 	}
 
 	newAgent := func(m fantasy.LanguageModel, p []byte, tok int64) fantasy.Agent {
-		return fantasy.NewAgent(m,
+		return fantasy.NewAgent(
+			m,
 			fantasy.WithSystemPrompt(string(p)+"\n /no_think"),
 			fantasy.WithMaxOutputTokens(tok),
 			fantasy.WithUserAgent(userAgent),
@@ -2032,7 +2039,8 @@ func (a *sessionAgent) convertToToolResult(result fantasy.ToolResultContent) mes
 	case fantasy.ToolResultContentTypeMedia:
 		if r, ok := fantasy.AsToolResultOutputType[fantasy.ToolResultOutputContentMedia](result.Result); ok {
 			if !stringext.IsValidBase64(r.Data) {
-				slog.Warn("Tool returned media with invalid base64 data, discarding image",
+				slog.Warn(
+					"Tool returned media with invalid base64 data, discarding image",
 					"tool", result.ToolName,
 					"tool_call_id", result.ToolCallID,
 				)

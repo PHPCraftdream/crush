@@ -136,6 +136,10 @@ func (s *Server) readPump(ctx context.Context, c *Client) {
 		return nil
 	})
 
+	// Fork merge note (origin/main 9c35ee01 "fix(server): recover from handler panics"):
+	// upstream wraps the REST mux with recoverHandler; our WebSocket loop reads
+	// frames directly. The equivalent in our architecture would be a recover()
+	// inside handleIncoming or this for-loop — see CHANGELOG.fork.md section 4.A.
 	for {
 		_, raw, err := c.conn.ReadMessage()
 		if err != nil {

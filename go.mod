@@ -4,9 +4,9 @@ go 1.26.3
 
 require (
 	charm.land/bubbletea/v2 v2.0.6
-	charm.land/catwalk v0.40.0
+	charm.land/catwalk v0.41.0
 	charm.land/fang/v2 v2.0.1
-	charm.land/fantasy v0.24.0
+	charm.land/fantasy v0.25.0
 	charm.land/lipgloss/v2 v2.0.3
 	charm.land/log/v2 v2.0.0
 	charm.land/x/vcr v0.1.1
@@ -154,7 +154,6 @@ require (
 	github.com/sergeymakinen/go-ico v1.0.0-beta.0 // indirect
 	github.com/sethvargo/go-retry v0.3.0 // indirect
 	github.com/spf13/pflag v1.0.9 // indirect
-	github.com/stretchr/objx v0.5.2 // indirect
 	github.com/tadvi/systray v0.0.0-20190226123456-11a2b8fa57af // indirect
 	github.com/tidwall/match v1.1.1 // indirect
 	github.com/tidwall/pretty v1.2.1 // indirect

@@ -145,6 +145,15 @@ func (m *mockSessionService) UpdateSystemPrompt(context.Context, string, string)
 	return nil
 }
 
+func (m *mockSessionService) RequestCancel(context.Context, string) error        { return nil }
+func (m *mockSessionService) IsCancelRequested(context.Context, string) (bool, error) {
+	return false, nil
+}
+func (m *mockSessionService) ClearCancelRequest(context.Context, string) error { return nil }
+func (m *mockSessionService) ListAll(context.Context) ([]session.Session, error) {
+	return m.sessions, nil
+}
+
 func newTestApp(sessions session.Service) *App {
 	return &App{Sessions: sessions}
 }

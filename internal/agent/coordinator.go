@@ -714,6 +714,10 @@ func getProviderOptions(model Model, providerCfg config.ProviderConfig) fantasy.
 					"type": "disabled",
 				}
 			}
+		case string(catwalk.InferenceProviderAlibabaSingapore):
+			if model.CatwalkCfg.CanReason {
+				extraBody["enable_thinking"] = model.ModelCfg.Think
+			}
 		}
 
 		mergedOptions["extra_body"] = extraBody
@@ -833,7 +837,8 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubA
 		hookRunner = hooks.NewRunner(preToolHooks, c.cfg.WorkingDir(), c.cfg.WorkingDir())
 	}
 
-	allTools = append(allTools,
+	allTools = append(
+		allTools,
 		tools.NewBashTool(c.permissions, c.cfg.WorkingDir(), c.cfg.Config().Options.Attribution, modelID),
 		tools.NewCrushInfoTool(c.cfg, c.lspManager, c.allSkills, c.activeSkills, c.skillTracker),
 		tools.NewCrushLogsTool(logFile),
@@ -1086,7 +1091,8 @@ func (c *coordinator) buildOpenaiCompatProvider(baseURL, apiKey string, headers 
 	// Set HTTP client based on provider and debug mode.
 	var httpClient *http.Client
 	if providerID == string(catwalk.InferenceProviderCopilot) {
-		opts = append(opts,
+		opts = append(
+			opts,
 			openaicompat.WithUseResponsesAPI(),
 			openaicompat.WithResponsesAPIFunc(func(modelID string) bool {
 				return copilotResponsesModels[modelID]
@@ -1656,7 +1662,8 @@ func logTurnSkillUsage(
 		}
 	}
 
-	slog.Info("Skill turn summary",
+	slog.Info(
+		"Skill turn summary",
 		"component", "skills",
 		"session_id", sessionID,
 		"prompt_len", len(prompt),
@@ -1700,7 +1707,8 @@ func logDiscoveryStats(
 
 	xml := skills.ToPromptXML(activeSkills)
 
-	slog.Info("Skill discovery complete",
+	slog.Info(
+		"Skill discovery complete",
 		"component", "skills",
 		"builtin_ok", len(builtin),
 		"builtin_errors", countErrors(builtinStates),

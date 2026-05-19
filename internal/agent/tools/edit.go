@@ -114,7 +114,8 @@ func NewEditTool(
 			text += getDiagnostics(params.FilePath, lspManager)
 			response.Content = text
 			return response, nil
-		})
+		},
+	)
 }
 
 func createNewFile(edit editContext, filePath, content string, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
@@ -143,7 +144,8 @@ func createNewFile(edit editContext, filePath, content string, call fantasy.Tool
 		content,
 		strings.TrimPrefix(filePath, edit.workingDir),
 	)
-	p, err := edit.permissions.Request(edit.ctx,
+	p, err := edit.permissions.Request(
+		edit.ctx,
 		permission.CreatePermissionRequest{
 			SessionID:   sessionID,
 			Path:        fsext.PathOrPrefix(filePath, edit.workingDir),
@@ -222,7 +224,9 @@ func deleteContent(edit editContext, filePath, oldString string, replaceAll bool
 
 	modTime := fileInfo.ModTime().Truncate(time.Second)
 	if modTime.After(lastRead) {
-		// File was modified externally since last read, update the read time to allow the edit
+		// Fork merge note: upstream blocks the edit and requires re-read; in
+		// orchestrator mode external modifications are normal (other tools, CI
+		// regenerators) so we warn-and-refresh-tracker instead of bailing.
 		slog.Warn("File was modified externally since last read, proceeding with edit", "file", filePath, "mod_time", modTime.Format(time.RFC3339), "last_read", lastRead.Format(time.RFC3339))
 		edit.filetracker.RecordRead(edit.ctx, sessionID, filePath)
 	}
@@ -261,7 +265,8 @@ func deleteContent(edit editContext, filePath, oldString string, replaceAll bool
 		strings.TrimPrefix(filePath, edit.workingDir),
 	)
 
-	p, err := edit.permissions.Request(edit.ctx,
+	p, err := edit.permissions.Request(
+		edit.ctx,
 		permission.CreatePermissionRequest{
 			SessionID:   sessionID,
 			Path:        fsext.PathOrPrefix(filePath, edit.workingDir),
@@ -352,7 +357,9 @@ func replaceContent(edit editContext, filePath, oldString, newString string, rep
 
 	modTime := fileInfo.ModTime().Truncate(time.Second)
 	if modTime.After(lastRead) {
-		// File was modified externally since last read, update the read time to allow the edit
+		// Fork merge note: same rationale as the Edit tool above — refresh
+		// tracker instead of blocking, since orchestrators tolerate external
+		// edits.
 		edit.filetracker.RecordRead(edit.ctx, sessionID, filePath)
 	}
 
@@ -390,7 +397,8 @@ func replaceContent(edit editContext, filePath, oldString, newString string, rep
 		strings.TrimPrefix(filePath, edit.workingDir),
 	)
 
-	p, err := edit.permissions.Request(edit.ctx,
+	p, err := edit.permissions.Request(
+		edit.ctx,
 		permission.CreatePermissionRequest{
 			SessionID:   sessionID,
 			Path:        fsext.PathOrPrefix(filePath, edit.workingDir),
@@ -452,5 +460,6 @@ func replaceContent(edit editContext, filePath, oldString, newString string, rep
 			NewContent: newContent,
 			Additions:  additions,
 			Removals:   removals,
-		}), nil
+		},
+	), nil
 }

@@ -115,7 +115,8 @@ func NewWriteTool(
 				strings.TrimPrefix(filePath, workingDir),
 			)
 
-			p, err := permissions.Request(ctx,
+			p, err := permissions.Request(
+				ctx,
 				permission.CreatePermissionRequest{
 					SessionID:   sessionID,
 					Path:        fsext.PathOrPrefix(filePath, workingDir),
@@ -171,12 +172,14 @@ func NewWriteTool(
 			result := fmt.Sprintf("File successfully written: %s", filePath)
 			result = fmt.Sprintf("<result>\n%s\n</result>", result)
 			result += getDiagnostics(filePath, lspManager)
-			return fantasy.WithResponseMetadata(fantasy.NewTextResponse(result),
+			return fantasy.WithResponseMetadata(
+				fantasy.NewTextResponse(result),
 				WriteResponseMetadata{
 					Diff:      diff,
 					Additions: additions,
 					Removals:  removals,
 				},
 			), nil
-		})
+		},
+	)
 }
