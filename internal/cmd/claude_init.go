@@ -378,6 +378,37 @@ crush sessions list
 crush sessions show <session-id> --with-messages
 ` + "```" + `
 
+## Repo-wide default system prompt
+
+If ` + "`./.crush/system-prompts/default.md`" + ` exists, ` + "`crush run`" + `
+auto-loads it as the system prompt when neither ` + "`--system-prompt`" + `
+nor ` + "`--system-prompt-file`" + ` was passed. Use this to commit one set
+of "always apply" rules to the repo (scope-control, summary-required,
+no-commits) instead of repeating them in every prompt.
+
+Recommended starter template — write to ` + "`./.crush/system-prompts/default.md`" + `:
+
+` + "```markdown" + `
+You are a sub-agent invoked by an orchestrator. Apply these rules to
+every task in this repo, in addition to anything in the user prompt:
+
+1. **Stay strictly in scope.** Edit ONLY the files the prompt names.
+   Do not refactor unrelated code, generalise patterns, expand
+   .gitignore beyond what's asked, or "tidy up" while you're nearby.
+   If you notice unrelated mess, list it in your final summary and
+   leave it untouched.
+2. **End every turn with a final assistant message** that names:
+   files you changed, tests you ran, and any noteworthy observation.
+   Wrappers parse the final_text — leaving it empty silently is a bug.
+3. **Never commit, never push** unless the prompt explicitly says so.
+4. **Run the tests** that cover what you touched before declaring done.
+5. If you hit an ambiguity that needs a real product decision, stop
+   and surface it — don't guess and ship.
+` + "```" + `
+
+Explicit ` + "`--system-prompt-file`" + ` always wins over the auto-loaded
+default.
+
 ## When the lock is stuck
 
 If a session reports "session is already in use" but you know the holder

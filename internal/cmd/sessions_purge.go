@@ -3,6 +3,7 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 	"unicode"
@@ -31,6 +32,7 @@ Supported age suffixes:
 crush sessions purge 1m --dry-run
 crush sessions purge 3d
 crush sessions purge 15min --yes
+crush sessions purge 7d --matching 'garnet-sql-*' --yes
   `,
 	Args: cobra.ExactArgs(1),
 	RunE: sessionsPurgeCmdRun,
@@ -39,10 +41,18 @@ crush sessions purge 15min --yes
 func sessionsPurgeCmdRun(cmd *cobra.Command, args []string) error {
 	dryRun, _ := cmd.Flags().GetBool("dry-run")
 	yes, _ := cmd.Flags().GetBool("yes")
+	matching, _ := cmd.Flags().GetString("matching")
 
 	age, err := parseAge(args[0])
 	if err != nil {
 		return err
+	}
+
+	// Validate the glob early so a typo doesn't cost a whole pass.
+	if matching != "" {
+		if _, err := filepath.Match(matching, "probe"); err != nil {
+			return fmt.Errorf("--matching: invalid glob %q: %w", matching, err)
+		}
 	}
 
 	a, err := setupApp(cmd)
@@ -59,9 +69,16 @@ func sessionsPurgeCmdRun(cmd *cobra.Command, args []string) error {
 	cutoff := time.Now().Add(-age)
 	var victims []session.Session
 	for _, s := range sessions {
-		if time.Unix(s.CreatedAt, 0).Before(cutoff) {
-			victims = append(victims, s)
+		if !time.Unix(s.CreatedAt, 0).Before(cutoff) {
+			continue
 		}
+		if matching != "" {
+			ok, _ := filepath.Match(matching, s.ID)
+			if !ok {
+				continue
+			}
+		}
+		victims = append(victims, s)
 	}
 
 	if len(victims) == 0 {
@@ -154,4 +171,5 @@ func parseAge(s string) (time.Duration, error) {
 func init() {
 	sessionsPurgeCmd.Flags().Bool("dry-run", false, "Print what would be deleted without deleting")
 	sessionsPurgeCmd.Flags().Bool("yes", false, "Skip the confirmation prompt")
+	sessionsPurgeCmd.Flags().String("matching", "", "Only delete sessions whose ID matches this glob (e.g. 'garnet-sql-*')")
 }

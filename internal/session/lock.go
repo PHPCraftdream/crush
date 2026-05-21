@@ -138,8 +138,21 @@ func heartbeat(path string, done <-chan struct{}) {
 	}
 }
 
-// removeIfStale deletes the lock file if it exists and has not been
-// touched for lockStaleDuration. A missing file is not an error.
+// removeIfStale deletes the lock file if it exists and is unambiguously
+// stale. A missing file is not an error.
+//
+// Two staleness signals (either is sufficient):
+//  1. mtime older than lockStaleDuration — heartbeat would have touched
+//     the file every 10s if the holder were alive.
+//  2. holder PID is no longer a running process — covers the orphan case
+//     where the wrapper that started crush was killed but crush itself
+//     also died at the same time, so within the 20s mtime window we'd
+//     otherwise refuse a clean re-entry. See feedback round 2, #12.
+//
+// We only check the PID branch when the file is older than one
+// heartbeat tick (10s). Inside the first 10s the file may exist but PID
+// hasn't been written yet (acquirer is still in the open→lock→write
+// dance), so a PID-not-alive check would race the acquirer.
 func removeIfStale(path string) error {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -148,9 +161,22 @@ func removeIfStale(path string) error {
 		}
 		return fmt.Errorf("removeIfStale: stat %s: %w", path, err)
 	}
-	if time.Since(info.ModTime()) > lockStaleDuration {
+	age := time.Since(info.ModTime())
+	if age > lockStaleDuration {
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("removeIfStale: remove stale lock %s: %w", path, err)
+		}
+		return nil
+	}
+	// Fork patch (orchestrator UX, round 2 #12): PID-based fast-path. If
+	// the holder PID is dead, snap the lock immediately instead of making
+	// the operator wait 20s. Skip the check for very young locks to avoid
+	// racing the acquirer's "open → lock → write PID" sequence.
+	if age > lockHeartbeatInterval {
+		if pid := readLockHolderPID(path); pid > 0 && !isProcessAlive(pid) {
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("removeIfStale: remove orphan lock %s (PID %d dead): %w", path, pid, err)
+			}
 		}
 	}
 	return nil

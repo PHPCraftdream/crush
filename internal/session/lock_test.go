@@ -2,10 +2,11 @@ package session
 
 import (
 	"errors"
+	"fmt"
 	"os"
-	"sync"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -164,6 +165,52 @@ func TestTryAcquireSessionLock_StaleLockIsCleared(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, lk)
 	require.NoError(t, lk.Release())
+}
+
+// TestTryAcquireSessionLock_OrphanPIDIsCleared covers the round-2 #12
+// orphan-PID fast path: a lock whose holder PID is no longer alive
+// must be reclaimable without waiting the full 20s stale window. We
+// fake an orphan by writing a guaranteed-dead PID (a very high number)
+// and back-dating mtime past the heartbeat tick.
+func TestTryAcquireSessionLock_OrphanPIDIsCleared(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "locks", "session-orphan.lock")
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+
+	// PID 0x7FFFFFFE is virtually guaranteed not to be a running process.
+	require.NoError(t, os.WriteFile(path, []byte("2147483646\n"), 0o644))
+
+	// mtime older than one heartbeat tick (so the PID-check branch fires)
+	// but YOUNGER than lockStaleDuration (so the existing mtime branch does
+	// NOT cover it — the orphan-PID branch is the only thing that can
+	// reclaim it).
+	mtime := time.Now().Add(-(lockHeartbeatInterval + time.Second))
+	require.NoError(t, os.Chtimes(path, mtime, mtime))
+
+	lk, err := TryAcquireSessionLock(dir, "orphan")
+	require.NoError(t, err, "orphan lock with dead PID should be reclaimed without waiting for the 20s stale window")
+	require.NotNil(t, lk)
+	require.NoError(t, lk.Release())
+}
+
+// TestTryAcquireSessionLock_LiveOrphanPIDStillBusy is the negative
+// counterpart: the lock file lists the CURRENT process's PID (definitely
+// alive), so the PID branch must NOT remove it. This prevents an "I see
+// no heartbeat in 11s, but the process is fine" false positive.
+func TestTryAcquireSessionLock_LiveOrphanPIDStillBusy(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "locks", "session-live.lock")
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+
+	require.NoError(t, os.WriteFile(path, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0o644))
+	// Past the PID-check threshold but well before the 20s mtime threshold.
+	mtime := time.Now().Add(-(lockHeartbeatInterval + time.Second))
+	require.NoError(t, os.Chtimes(path, mtime, mtime))
+
+	// removeIfStale must NOT remove a lock whose PID is alive.
+	require.NoError(t, removeIfStale(path))
+	_, statErr := os.Stat(path)
+	assert.NoError(t, statErr, "lock for a live PID must survive removeIfStale")
 }
 
 func TestTryAcquireSessionLock_FreshLockIsRespected(t *testing.T) {

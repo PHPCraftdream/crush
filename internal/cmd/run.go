@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -324,6 +325,23 @@ crush run --timeout 5m --session "long-task" "refactor the storage layer"
 				return fmt.Errorf("failed to read --system-prompt-file: %w", err)
 			}
 			systemPrompt = string(bts)
+		}
+		// Fork patch (orchestrator UX, round 2 #13): auto-load a repo-local
+		// default system prompt from .crush/system-prompts/default.md if it
+		// exists AND neither --system-prompt nor --system-prompt-file was
+		// supplied. Lets a team commit one set of "always apply these
+		// rules" instructions (scope-control, summary-required, no-commits)
+		// to git instead of every operator passing --system-prompt-file by
+		// hand on every invocation. Explicit flags always win — silent
+		// auto-load only fills the gap when nothing was passed.
+		if systemPrompt == "" {
+			if cwd, cwdErr := ResolveCwd(cmd); cwdErr == nil {
+				autoPath := filepath.Join(cwd, ".crush", "system-prompts", "default.md")
+				if bts, err := os.ReadFile(autoPath); err == nil && len(bts) > 0 {
+					systemPrompt = string(bts)
+					fmt.Fprintf(os.Stderr, "auto-loaded system prompt from %s (%d bytes)\n", autoPath, len(bts))
+				}
+			}
 		}
 
 		// Fork patch (orchestrator UX): validate --agents up-front so a
