@@ -1137,7 +1137,19 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 			ptycmd := p.CommandContext(ctx, binaryPath, args...)
 			ptycmd.Dir = m.workingDir
 			if startErr := ptycmd.Start(); startErr == nil {
-				slog.Info("cliprovider: using PTY", "binary", binaryPath)
+				// Fork patch (operator UX, debug): log the full command-line
+				// + prompt length + first/last 200 chars of the prompt so
+				// silent-claude-exit cases ("claude died in 68ms with empty
+				// stderr") can be reproduced post-mortem from the log.
+				slog.Info("cliprovider: using PTY",
+					"binary", binaryPath,
+					"args", strings.Join(args, " "),
+					"argsCount", len(args),
+					"argsByteLen", argsByteLen(args),
+					"promptLen", len(prompt),
+					"promptHead", clipString(prompt, 200),
+					"promptTail", tailString(prompt, 200),
+				)
 				waitCh := make(chan error, 1)
 				go func() {
 					waitCh <- ptycmd.Wait()
@@ -1179,8 +1191,12 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 		slog.Info("cliprovider: launching pipe mode",
 			"binary", m.spec.Binary,
 			"args", strings.Join(args, " "),
+			"argsCount", len(args),
+			"argsByteLen", argsByteLen(args),
 			"useStdin", useStdin,
 			"promptLen", len(prompt),
+			"promptHead", clipString(prompt, 200),
+			"promptTail", tailString(prompt, 200),
 			"noPTY", m.spec.NoPTY,
 		)
 
@@ -1320,6 +1336,7 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 		var finalUsage fantasy.Usage
 		scanDone := false
 		var scanErr error
+		var linesSeen int
 		for !scanDone {
 			select {
 			case <-ctx.Done():
@@ -1356,6 +1373,7 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 					scanErr = res.err
 					break
 				}
+				linesSeen++
 
 				// Strip ANSI/VT sequences that PTY drivers (especially Windows ConPTY)
 				// inject into the output stream. JSON parsers need clean bytes.
@@ -1415,7 +1433,18 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 		}
 
 		stderr, waitErr := proc.wait()
-		slog.Info("cliprovider: process finished", "binary", m.spec.Binary, "err", waitErr, "stderrLen", len(stderr))
+		// Fork patch (operator UX): also log stderr content (clipped) and
+		// total lines seen on stdout. The original log said "err=null
+		// stderrLen=0" for the silent-claude-exit bug which gave the
+		// operator nothing actionable. Now they see if anything was
+		// emitted at all and what the stderr tail looked like.
+		slog.Info("cliprovider: process finished",
+			"binary", m.spec.Binary,
+			"err", waitErr,
+			"stderrLen", len(stderr),
+			"stderrTail", tailString(stderr, 500),
+			"linesSeen", linesSeen,
+		)
 		// If resume failed, clear the stale CLI session mapping so next call starts fresh.
 		if waitErr != nil && resuming && cliSessionKey != "" {
 			m.cliSessions.Del(cliSessionKey)
@@ -1592,4 +1621,33 @@ func extractText(msg fantasy.Message) string {
 		}
 	}
 	return sb.String()
+}
+
+// argsByteLen totals the bytes of all args — useful when diagnosing
+// command-line-length issues on Windows (CreateProcessW has a 32K limit).
+func argsByteLen(args []string) int {
+	n := 0
+	for _, a := range args {
+		n += len(a) + 1 // +1 for the separator
+	}
+	return n
+}
+
+// clipString returns the first n chars of s with a "(+K more)" suffix when
+// truncated. Used in slog fields to keep a sample of long prompts without
+// blowing up the log file.
+func clipString(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + fmt.Sprintf("…(+%d more)", len(s)-n)
+}
+
+// tailString returns the last n chars of s with a "(+K skipped)" prefix when
+// truncated. Pair with clipString to see prompt boundaries.
+func tailString(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return fmt.Sprintf("(+%d skipped)…", len(s)-n) + s[len(s)-n:]
 }
