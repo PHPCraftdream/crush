@@ -68,6 +68,13 @@ type Session struct {
 	SystemPrompt    string
 	YoloEnabled     bool
 	CancelRequested bool // Only populated by ListAll; use IsCancelRequested() for live checks.
+
+	// Fork patch (operator UX): persisted from --max-cost / --max-tokens /
+	// --timeout at run start so sessions show/locks can display budget.
+	EndedReason      string  // "done","canceled","timeout","max_cost","max_tokens","error","crash",""
+	BudgetMaxCost    float64 // --max-cost value, 0 if unlimited
+	BudgetMaxTokens  int64   // --max-tokens value, 0 if unlimited
+	BudgetTimeoutSec int64   // --timeout in seconds, 0 if unlimited
 }
 
 type Service interface {
@@ -120,6 +127,10 @@ type Service interface {
 	RequestCancel(ctx context.Context, sessionID string) error
 	IsCancelRequested(ctx context.Context, sessionID string) (bool, error)
 	ClearCancelRequest(ctx context.Context, sessionID string) error
+
+	// Fork patch: ended_reason + budget persistence for operator UX.
+	SetEndedReason(ctx context.Context, sessionID, reason string) error
+	SetBudget(ctx context.Context, sessionID string, maxCost float64, maxTokens, timeoutSec int64) error
 
 	// Agent tool session management
 	CreateAgentToolSessionID(messageID, toolCallID string) string
@@ -439,7 +450,17 @@ func (s *service) List(ctx context.Context) ([]Session, error) {
 }
 
 func (s *service) ListAll(ctx context.Context) ([]Session, error) {
-	rows, err := s.db.QueryContext(ctx, "SELECT id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id, system_prompt, yolo_enabled, large_model_reasoning_effort, small_model_reasoning_effort, cancel_requested FROM sessions ORDER BY updated_at DESC")
+	rows, err := s.db.QueryContext(ctx, `SELECT id, parent_session_id, title, message_count,
+		prompt_tokens, completion_tokens, cost, updated_at, created_at,
+		summary_message_id, todos,
+		large_model_provider, large_model_id,
+		small_model_provider, small_model_id,
+		system_prompt, yolo_enabled,
+		large_model_reasoning_effort, small_model_reasoning_effort,
+		cancel_requested,
+		COALESCE(ended_reason, ''), COALESCE(budget_max_cost, 0),
+		COALESCE(budget_max_tokens, 0), COALESCE(budget_timeout_sec, 0)
+		FROM sessions ORDER BY updated_at DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -448,6 +469,9 @@ func (s *service) ListAll(ctx context.Context) ([]Session, error) {
 	for rows.Next() {
 		var item db.Session
 		var cancelRequested int64
+		var endedReason string
+		var budgetMaxCost float64
+		var budgetMaxTokens, budgetTimeoutSec int64
 		if err := rows.Scan(
 			&item.ID, &item.ParentSessionID, &item.Title, &item.MessageCount,
 			&item.PromptTokens, &item.CompletionTokens, &item.Cost,
@@ -457,11 +481,16 @@ func (s *service) ListAll(ctx context.Context) ([]Session, error) {
 			&item.SystemPrompt, &item.YoloEnabled,
 			&item.LargeModelReasoningEffort, &item.SmallModelReasoningEffort,
 			&cancelRequested,
+			&endedReason, &budgetMaxCost, &budgetMaxTokens, &budgetTimeoutSec,
 		); err != nil {
 			return nil, err
 		}
 		sess := s.fromDBItem(item)
 		sess.CancelRequested = cancelRequested != 0
+		sess.EndedReason = endedReason
+		sess.BudgetMaxCost = budgetMaxCost
+		sess.BudgetMaxTokens = budgetMaxTokens
+		sess.BudgetTimeoutSec = budgetTimeoutSec
 		sessions = append(sessions, sess)
 	}
 	return sessions, rows.Err()
@@ -526,6 +555,23 @@ func (s *service) ClearCancelRequest(ctx context.Context, sessionID string) erro
 	_, err := s.db.ExecContext(ctx,
 		"UPDATE sessions SET cancel_requested = 0 WHERE id = ?",
 		sessionID,
+	)
+	return err
+}
+
+func (s *service) SetEndedReason(ctx context.Context, sessionID, reason string) error {
+	_, err := s.db.ExecContext(ctx,
+		"UPDATE sessions SET ended_reason = ?, updated_at = strftime('%s', 'now') WHERE id = ?",
+		reason, sessionID,
+	)
+	return err
+}
+
+func (s *service) SetBudget(ctx context.Context, sessionID string, maxCost float64, maxTokens, timeoutSec int64) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE sessions SET budget_max_cost = ?, budget_max_tokens = ?, budget_timeout_sec = ?,
+		 updated_at = strftime('%s', 'now') WHERE id = ?`,
+		maxCost, maxTokens, timeoutSec, sessionID,
 	)
 	return err
 }

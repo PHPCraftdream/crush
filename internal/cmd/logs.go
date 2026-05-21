@@ -73,6 +73,7 @@ var logsCmd = &cobra.Command{
 func init() {
 	logsCmd.Flags().BoolP("follow", "f", false, "Follow log output")
 	logsCmd.Flags().IntP("tail", "t", defaultTailLines, "Show only the last N lines default: 1000 for performance")
+	logsCmd.AddCommand(logsPathCmd, logsPruneCmd)
 }
 
 func followLogs(ctx context.Context, logsFile string, tailLines int) error {

@@ -54,6 +54,18 @@ exact id — handy for CI where the build matrix maps to a stable key.
 
 System prompt: --system-prompt / --system-prompt-file persists the prompt
 on the session so subsequent runs with the same --session pick it up.
+If neither is passed and .crush/system-prompts/default.md exists, it is
+loaded automatically (see "crush claude-init" for a starter template).
+
+Session title: if the session title is empty or "Untitled Session", the
+first 60 characters of the user prompt are used as the title. This makes
+"sessions list" immediately useful without a --title flag.
+
+Budget persistence: --max-cost, --max-tokens, and --timeout values are
+saved on the session row. "sessions show" displays cost vs budget, and
+"sessions locks" shows an ELAPSED / BUDGET column. ended_reason is set
+when the run finishes (done, canceled, timeout, max_cost, max_tokens,
+error) and appears in "sessions show" and "sessions list --json".
 
 Output modes (mutually exclusive --stream / --json):
   - default (terse): tool-call names on stderr as "▶ <toolName>"; only
@@ -214,14 +226,20 @@ crush run --role fast "tldr this readme" < README.md
 # Watch the agent think token-by-token (legacy output mode)
 crush run --role smart --stream "explain this codebase"
 
-# Runaway protection: cap cost and tokens
+# Runaway protection: cap cost and tokens (persisted to session budget)
 crush run --role smart --max-cost 0.50 --max-tokens 100k "refactor storage"
+# After run: crush sessions show <id> → "Cost: $0.32 / $0.50 budget (64%)"
 
-# Flexible timeout: plain number = seconds
+# Flexible timeout: plain number = seconds (saved to session budget)
 crush run --role smart --timeout 900 --session "long-task" "refactor the storage layer"
+# During run: crush sessions locks → "ELAPSED 3m0s  BUDGET 15m0s"
 
 # On-finish hook (env: CRUSH_SESSION_ID, CRUSH_EXIT_REASON, CRUSH_COST_USD, ...)
 crush run --role smart --on-finish "echo done >> /tmp/log" "analyze codebase"
+
+# Auto-loaded repo-default system prompt (from .crush/system-prompts/default.md)
+crush run --role smart --session "pr-42" "review this PR"
+# → auto-loads scope-control / summary-required rules without --system-prompt-file
 
 # Machine-readable summary for wrapper scripts
 crush run --json --session "pr-42" "review the diff" | jq .final_text
@@ -504,6 +522,7 @@ crush run --timeout 5m --session "long-task" "refactor the storage layer"
 			OnFinishHook:             onFinishHook,             // Fork patch: batch 24
 			MaxCost:                  maxCost,                  // Fork patch: batch 30
 			MaxTokens:                maxTokens,                // Fork patch: batch 30
+			Timeout:                  timeoutDur,               // Fork patch: operator UX (budget display)
 		}
 		return a.RunNonInteractive(ctx, os.Stdout, prompt, overrides, hideSpinner, mode, sessionID, useLast)
 	},

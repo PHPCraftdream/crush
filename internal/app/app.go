@@ -618,6 +618,11 @@ type RunOverrides struct {
 	// MaxTokens aborts the run if total prompt+completion tokens exceed this
 	// value. 0 = no cap. Fork patch: batch 30.
 	MaxTokens int64
+	// Timeout is the original --timeout duration, carried for budget
+	// persistence so `sessions show` / `sessions locks` can display it.
+	// The context-level deadline is applied separately by the caller.
+	// Fork patch (operator UX).
+	Timeout time.Duration
 }
 
 // RunNonInteractive runs a single agent turn and writes its result to
@@ -744,6 +749,37 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt 
 		app.AgentCoordinator.SetRunLimits(overrides.MaxCost, overrides.MaxTokens)
 	}
 
+	// Fork patch (operator UX): persist budget at run start so
+	// `sessions show` / `sessions locks` can display "cost vs limit".
+	// Also clear ended_reason since the session is being (re)started.
+	if err := app.Sessions.SetBudget(ctx, sess.ID, overrides.MaxCost, overrides.MaxTokens, int64(overrides.Timeout.Seconds())); err != nil {
+		slog.Warn("Failed to persist budget", "session_id", sess.ID, "err", err)
+	}
+	if err := app.Sessions.SetEndedReason(ctx, sess.ID, ""); err != nil {
+		slog.Warn("Failed to clear ended_reason", "session_id", sess.ID, "err", err)
+	}
+
+	// Fork patch (operator UX): auto-title from first user prompt. If the
+	// session title is empty or "Untitled Session", set it to the first 60
+	// chars of the user prompt. Makes `sessions list` immediately useful
+	// without requiring the orchestrator to pass a title.
+	if prompt != "" && (sess.Title == "" || sess.Title == "Untitled Session" || sess.Title == sess.ID) {
+		autoTitle := prompt
+		if len(autoTitle) > 60 {
+			autoTitle = autoTitle[:60] + "…"
+		}
+		// Strip newlines so it fits in one line in `sessions list`.
+		autoTitle = strings.Map(func(r rune) rune {
+			if r == '\n' || r == '\r' {
+				return ' '
+			}
+			return r
+		}, autoTitle)
+		if err := app.Sessions.Rename(ctx, sess.ID, autoTitle); err != nil {
+			slog.Warn("Failed to auto-title session", "session_id", sess.ID, "err", err)
+		}
+	}
+
 	// Fork patch: batch 24 — on-finish hook support. Captures run
 	// metadata as it becomes available and executes the hook on return.
 	var (
@@ -754,6 +790,18 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt 
 	runStart := time.Now()
 	tokensBefore := sess.PromptTokens + sess.CompletionTokens
 	costBefore := sess.Cost
+
+	// Fork patch (operator UX): persist ended_reason when the run finishes.
+	// hookExitReason is always set before return, so this defer fires after it.
+	defer func() {
+		reason := hookExitReason
+		if reason == "" {
+			reason = "done"
+		}
+		if setErr := app.Sessions.SetEndedReason(context.Background(), sess.ID, reason); setErr != nil {
+			slog.Warn("Failed to persist ended_reason", "session_id", sess.ID, "reason", reason, "err", setErr)
+		}
+	}()
 	if overrides.OnFinishHook != "" {
 		defer func() {
 			if freshSess, err := app.Sessions.Get(context.Background(), sess.ID); err == nil {

@@ -55,6 +55,22 @@ func (e *SessionLockBusyError) Error() string {
 // given sessionID under <dataDir>/locks/. Returns a *SessionLock on
 // success (caller MUST Release()). Returns *SessionLockBusyError if
 // another live process holds the lock. Other errors returned as-is.
+// TryAcquireSessionLockWithTimeout is like TryAcquireSessionLock but also
+// writes the run's --timeout (in seconds) as a second line in the lock file.
+// `sessions locks` reads this to display ELAPSED / BUDGET.
+func TryAcquireSessionLockWithTimeout(dataDir, sessionID string, timeoutSec int64) (*SessionLock, error) {
+	lk, err := TryAcquireSessionLock(dataDir, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	if timeoutSec > 0 && lk.f != nil {
+		// Append the timeout on the second line; reader handles missing line gracefully.
+		_, _ = fmt.Fprintf(lk.f, "%d\n", timeoutSec)
+		_ = lk.f.Sync()
+	}
+	return lk, nil
+}
+
 func TryAcquireSessionLock(dataDir, sessionID string) (*SessionLock, error) {
 	if dataDir == "" {
 		return nil, fmt.Errorf("TryAcquireSessionLock: dataDir is empty")
@@ -209,13 +225,33 @@ func sanitiseSessionID(id string) string {
 }
 
 func readLockHolderPID(path string) int {
+	pid, _ := readLockFile(path)
+	return pid
+}
+
+// ReadLockTimeoutSec returns the timeout-in-seconds stored on the second line
+// of a lock file (written by TryAcquireSessionLockWithTimeout). Returns 0 if
+// not present or unreadable — backward compatible.
+func ReadLockTimeoutSec(path string) int64 {
+	_, t := readLockFile(path)
+	return t
+}
+
+// readLockFile returns (PID, timeoutSec) from a lock file. Both default to 0
+// on any parse error — backward compatible with old one-line files.
+func readLockFile(path string) (int, int64) {
 	bts, err := os.ReadFile(path)
 	if err != nil {
-		return 0
+		return 0, 0
 	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(bts)))
-	if err != nil {
-		return 0
+	lines := strings.Split(strings.TrimSpace(string(bts)), "\n")
+	pid := 0
+	var timeoutSec int64
+	if len(lines) >= 1 {
+		pid, _ = strconv.Atoi(strings.TrimSpace(lines[0]))
 	}
-	return pid
+	if len(lines) >= 2 {
+		timeoutSec, _ = strconv.ParseInt(strings.TrimSpace(lines[1]), 10, 64)
+	}
+	return pid, timeoutSec
 }

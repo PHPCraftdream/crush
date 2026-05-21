@@ -24,13 +24,15 @@ var sessionsCmd = &cobra.Command{
 "crush run" both create / continue them. This subcommand gives full
 CLI access to the session store for scripting, orchestration, and debugging.
 
-Core:        list, show, delete, reset
-Observe:     last (with timestamps), tail --follow, locks (heartbeat pulse),
+Core:        list (with STATUS column), show (with purpose + budget), delete, reset (--force)
+Observe:     last (with timestamps), tail --follow, locks (heartbeat + budget),
              watch (live dashboard), pick (interactive TUI)
 Search:      grep <pattern> (message text), diff <id> (files touched),
              cost [--by model|day|session] (spend breakdown)
 Orchestrate: cancel <id> (graceful DB-flag stop), fork <id> [--at N],
-             tree (parent-child hierarchy), gc (garbage-collect stale)`,
+             tree (parent-child hierarchy), gc (garbage-collect stale)
+Cleanup:     purge <age> [--matching <glob>], kill <id> (force-unlock),
+             reap (remove all orphan locks)`,
 }
 
 var sessionsListCmd = &cobra.Command{
@@ -521,6 +523,7 @@ func sessionsShowCmdRun(cmd *cobra.Command, args []string) error {
 		ID               string    `json:"id"`
 		Hash             string    `json:"hash"`
 		Title            string    `json:"title"`
+		Purpose          string    `json:"purpose,omitempty"` // first user prompt excerpt
 		ParentID         string    `json:"parent_id,omitempty"`
 		Provider         string    `json:"provider,omitempty"`
 		Model            string    `json:"model,omitempty"`
@@ -531,14 +534,39 @@ func sessionsShowCmdRun(cmd *cobra.Command, args []string) error {
 		PromptTokens     int64     `json:"prompt_tokens"`
 		CompletionTokens int64     `json:"completion_tokens"`
 		CostUSD          float64   `json:"cost_usd"`
+		EndedReason      string    `json:"ended_reason,omitempty"`
+		BudgetMaxCost    float64   `json:"budget_max_cost,omitempty"`
+		BudgetMaxTokens  int64     `json:"budget_max_tokens,omitempty"`
+		BudgetTimeoutSec int64     `json:"budget_timeout_sec,omitempty"`
 		SystemPrompt     string    `json:"system_prompt,omitempty"`
 		Messages         []msgItem `json:"messages,omitempty"`
+	}
+
+	// Fetch the first user message as "purpose".
+	var purpose string
+	messages, msgErr := a.Messages.List(cmd.Context(), sess.ID)
+	if msgErr == nil {
+		for _, msg := range messages {
+			if msg.Role == message.User {
+				for _, part := range msg.Parts {
+					if tc, ok := part.(message.TextContent); ok && tc.Text != "" {
+						purpose = tc.Text
+						if len(purpose) > 120 {
+							purpose = purpose[:120] + "…"
+						}
+						break
+					}
+				}
+				break
+			}
+		}
 	}
 
 	output := sessionShowOutput{
 		ID:               sess.ID,
 		Hash:             session.HashID(sess.ID),
 		Title:            sess.Title,
+		Purpose:          purpose,
 		ParentID:         sess.ParentSessionID,
 		Provider:         sess.LargeModelProvider,
 		Model:            sess.LargeModelID,
@@ -549,13 +577,16 @@ func sessionsShowCmdRun(cmd *cobra.Command, args []string) error {
 		PromptTokens:     sess.PromptTokens,
 		CompletionTokens: sess.CompletionTokens,
 		CostUSD:          sess.Cost,
+		EndedReason:      sess.EndedReason,
+		BudgetMaxCost:    sess.BudgetMaxCost,
+		BudgetMaxTokens:  sess.BudgetMaxTokens,
+		BudgetTimeoutSec: sess.BudgetTimeoutSec,
 		SystemPrompt:     sess.SystemPrompt,
 	}
 
 	if withMessages {
-		messages, err := a.Messages.List(cmd.Context(), sess.ID)
-		if err != nil {
-			return fmt.Errorf("failed to list messages: %w", err)
+		if msgErr != nil {
+			return fmt.Errorf("failed to list messages: %w", msgErr)
 		}
 
 		output.Messages = make([]msgItem, len(messages))
@@ -614,7 +645,26 @@ func sessionsShowCmdRun(cmd *cobra.Command, args []string) error {
 	fmt.Printf("Updated:      %s\n", time.Unix(output.UpdatedAt, 0).Format(time.RFC3339))
 	fmt.Printf("Messages:     %d\n", output.MessageCount)
 	fmt.Printf("Tokens:       %d prompt, %d completion\n", output.PromptTokens, output.CompletionTokens)
-	fmt.Printf("Cost:         $%.6f USD\n", output.CostUSD)
+	costLine := fmt.Sprintf("$%.6f USD", output.CostUSD)
+	if output.BudgetMaxCost > 0 {
+		pct := output.CostUSD / output.BudgetMaxCost * 100
+		costLine += fmt.Sprintf(" / $%.2f budget (%.0f%%)", output.BudgetMaxCost, pct)
+	}
+	fmt.Printf("Cost:         %s\n", costLine)
+	if output.BudgetMaxTokens > 0 {
+		totalTokens := output.PromptTokens + output.CompletionTokens
+		pct := float64(totalTokens) / float64(output.BudgetMaxTokens) * 100
+		fmt.Printf("Token budget: %d / %d (%.0f%%)\n", totalTokens, output.BudgetMaxTokens, pct)
+	}
+	if output.BudgetTimeoutSec > 0 {
+		fmt.Printf("Timeout:      %s\n", formatDurationShort(time.Duration(output.BudgetTimeoutSec)*time.Second))
+	}
+	if output.EndedReason != "" {
+		fmt.Printf("Ended:        %s\n", output.EndedReason)
+	}
+	if output.Purpose != "" {
+		fmt.Printf("Purpose:      %s\n", output.Purpose)
+	}
 	fmt.Println()
 	fmt.Println("System prompt:")
 	if output.SystemPrompt == "" {
@@ -696,13 +746,14 @@ func sessionsLocksCmdRun(cmd *cobra.Command, args []string) error {
 	}
 
 	type lockItem struct {
-		SessionID   string `json:"session_id"`
-		PID         int    `json:"pid"`
-		PulseSec    int64  `json:"pulse_sec"`
-		Pulse       string `json:"pulse"` // alive / ping / stopping / offline
-		AcquiredAt  int64  `json:"acquired_at_unix"`
-		DurationSec int64  `json:"duration_seconds"`
-		Stale       bool   `json:"stale"`
+		SessionID    string `json:"session_id"`
+		PID          int    `json:"pid"`
+		PulseSec     int64  `json:"pulse_sec"`
+		Pulse        string `json:"pulse"` // alive / ping / stopping / offline
+		AcquiredAt   int64  `json:"acquired_at_unix"`
+		DurationSec  int64  `json:"duration_seconds"`
+		Stale        bool   `json:"stale"`
+		BudgetSec    int64  `json:"budget_sec,omitempty"` // --timeout seconds, 0 if not set
 	}
 
 	var locks []lockItem
@@ -742,6 +793,7 @@ func sessionsLocksCmdRun(cmd *cobra.Command, args []string) error {
 		pidBytes, _ := os.ReadFile(lockPath)
 		pid := 0
 		fmt.Sscanf(strings.TrimSpace(string(pidBytes)), "%d", &pid)
+		budgetSec := session.ReadLockTimeoutSec(lockPath)
 
 		// Approximate acquire time: mtime when pulse was fresh.
 		// For alive locks mtime ≈ now, so we use file birthtime via stat
@@ -750,13 +802,14 @@ func sessionsLocksCmdRun(cmd *cobra.Command, args []string) error {
 		duration := int64(now.Sub(info.ModTime()).Seconds())
 
 		locks = append(locks, lockItem{
-			SessionID:   sessionID,
-			PID:         pid,
-			PulseSec:    pulseSec,
-			Pulse:       pulse,
-			AcquiredAt:  acqTime,
-			DurationSec: duration,
-			Stale:       stale,
+			SessionID:    sessionID,
+			PID:          pid,
+			PulseSec:     pulseSec,
+			Pulse:        pulse,
+			AcquiredAt:   acqTime,
+			DurationSec:  duration,
+			Stale:        stale,
+			BudgetSec:    budgetSec,
 		})
 	}
 
@@ -780,14 +833,19 @@ func sessionsLocksCmdRun(cmd *cobra.Command, args []string) error {
 	}
 
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "SESSION_ID\tPID\tPULSE\tPULSE_AGE\tDURATION")
+	fmt.Fprintln(tw, "SESSION_ID\tPID\tPULSE\tPULSE_AGE\tELAPSED\tBUDGET")
 	for _, lock := range locks {
-		fmt.Fprintf(tw, "%s\t%d\t%s\t%ds ago\t%ds\n",
+		budget := "∞"
+		if lock.BudgetSec > 0 {
+			budget = formatDurationShort(time.Duration(lock.BudgetSec) * time.Second)
+		}
+		fmt.Fprintf(tw, "%s\t%d\t%s\t%ds ago\t%s\t%s\n",
 			truncate(lock.SessionID, 28),
 			lock.PID,
 			lock.Pulse,
 			lock.PulseSec,
-			lock.DurationSec,
+			formatDurationShort(time.Duration(lock.DurationSec)*time.Second),
+			budget,
 		)
 	}
 	return tw.Flush()
@@ -920,6 +978,18 @@ func formatAgo(d time.Duration) string {
 		days := int(d.Hours()) / 24
 		hours := int(d.Hours()) % 24
 		return fmt.Sprintf("%dd %dh ago", days, hours)
+	}
+}
+
+// formatDurationShort returns a compact "Xm Ys" or "Xh Ym" string.
+func formatDurationShort(d time.Duration) string {
+	switch {
+	case d < time.Minute:
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm%ds", int(d.Minutes()), int(d.Seconds())%60)
+	default:
+		return fmt.Sprintf("%dh%dm", int(d.Hours()), int(d.Minutes())%60)
 	}
 }
 
