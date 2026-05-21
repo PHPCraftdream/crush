@@ -70,10 +70,23 @@ crush sessions list --json | jq 'select(.message_count > 0)'
 		}
 		sessions = visible
 
+		// Fork patch (orchestrator UX, round 2 #1): compute STATUS by
+		// reading the locks directory once. running = lock exists and
+		// holder PID is alive; crashed = lock exists but PID is dead
+		// (will be auto-reclaimed on next acquire); blank = no lock,
+		// session is at rest. The lock dir read is one syscall + N
+		// directory entries; the PID liveness check is the same cheap
+		// per-PID probe `sessions reap` uses.
+		statusByID := computeSessionStatuses(cmd)
+
 		if asJSON {
 			enc := json.NewEncoder(os.Stdout)
 			for _, s := range sessions {
-				if err := enc.Encode(makeSessionListItem(s)); err != nil {
+				item := makeSessionListItem(s)
+				if st := statusByID[s.ID]; st != "" {
+					item.Status = st
+				}
+				if err := enc.Encode(item); err != nil {
 					return err
 				}
 			}
@@ -81,13 +94,14 @@ crush sessions list --json | jq 'select(.message_count > 0)'
 		}
 
 		tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(tw, "HASH\tID\tTITLE\tMSGS\tUPDATED\tTOKENS\tCOST")
+		fmt.Fprintln(tw, "HASH\tID\tTITLE\tMSGS\tSTATUS\tUPDATED\tTOKENS\tCOST")
 		for _, s := range sessions {
-			fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%s\t%d\t$%.4f\n",
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%s\t%s\t%d\t$%.4f\n",
 				short(session.HashID(s.ID)),
 				s.ID,
 				truncate(s.Title, 40),
 				s.MessageCount,
+				statusOrDash(statusByID[s.ID]),
 				time.Unix(s.UpdatedAt, 0).Format("2006-01-02 15:04"),
 				s.PromptTokens+s.CompletionTokens,
 				s.Cost,
@@ -95,6 +109,44 @@ crush sessions list --json | jq 'select(.message_count > 0)'
 		}
 		return tw.Flush()
 	},
+}
+
+// computeSessionStatuses returns sessionID → status ("running" | "crashed").
+// Sessions not in the map are at rest (no lock). Cheap: one directory read +
+// one PID probe per lock file.
+func computeSessionStatuses(cmd *cobra.Command) map[string]string {
+	cwd, err := ResolveCwd(cmd)
+	if err != nil {
+		return nil
+	}
+	locksDir := filepath.Join(cwd, ".crush", "locks")
+	entries, err := os.ReadDir(locksDir)
+	if err != nil {
+		return nil
+	}
+	out := map[string]string{}
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasPrefix(name, "session-") || !strings.HasSuffix(name, ".lock") {
+			continue
+		}
+		sessionID := strings.TrimSuffix(strings.TrimPrefix(name, "session-"), ".lock")
+		path := filepath.Join(locksDir, name)
+		pid, _ := readPIDFromLock(path)
+		if pid > 0 && session.IsProcessAlive(pid) {
+			out[sessionID] = "running"
+		} else {
+			out[sessionID] = "crashed"
+		}
+	}
+	return out
+}
+
+func statusOrDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
 }
 
 var sessionsDeleteCmd = &cobra.Command{
@@ -368,7 +420,7 @@ func init() {
 	sessionsLastCmd.Flags().IntP("n", "n", 10, "Number of messages to show")
 	sessionsLastCmd.Flags().String("format", "text", "Output format: text or ndjson")
 
-	sessionsCmd.AddCommand(sessionsListCmd, sessionsDeleteCmd, sessionsResetCmd, sessionsShowCmd, sessionsLocksCmd, sessionsTailCmd, sessionsLastCmd, sessionsGcCmd, sessionsPurgeCmd, sessionsKillCmd, sessionsWatchCmd, sessionsPickCmd, sessionsGrepCmd, sessionsCostCmd, sessionsDiffCmd, sessionsCancelCmd, sessionsForkCmd, sessionsTreeCmd)
+	sessionsCmd.AddCommand(sessionsListCmd, sessionsDeleteCmd, sessionsResetCmd, sessionsShowCmd, sessionsLocksCmd, sessionsTailCmd, sessionsLastCmd, sessionsGcCmd, sessionsPurgeCmd, sessionsKillCmd, sessionsReapCmd, sessionsWatchCmd, sessionsPickCmd, sessionsGrepCmd, sessionsCostCmd, sessionsDiffCmd, sessionsCancelCmd, sessionsForkCmd, sessionsTreeCmd)
 	rootCmd.AddCommand(sessionsCmd)
 }
 
@@ -386,6 +438,12 @@ type sessionListItem struct {
 	Tokens       int64   `json:"tokens"`
 	CostUSD      float64 `json:"cost_usd"`
 	YoloEnabled  bool    `json:"yolo_enabled"`
+	// Status is "running" (lock exists, holder PID alive), "crashed"
+	// (lock exists but PID dead — will be auto-reclaimed) or "" (at rest).
+	// Computed live from the locks directory at list time. omitempty so
+	// the field is absent for at-rest sessions, keeping the wire shape
+	// minimal for the common case.
+	Status string `json:"status,omitempty"`
 }
 
 // makeSessionListItem projects a session.Session into the wire-stable

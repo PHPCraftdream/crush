@@ -2,6 +2,7 @@ package session
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -166,6 +167,10 @@ func removeIfStale(path string) error {
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("removeIfStale: remove stale lock %s: %w", path, err)
 		}
+		slog.Info("reclaimed stale session lock",
+			"reason", "mtime_expired",
+			"path", path,
+			"age_seconds", int(age.Seconds()))
 		return nil
 	}
 	// Fork patch (orchestrator UX, round 2 #12): PID-based fast-path. If
@@ -177,6 +182,11 @@ func removeIfStale(path string) error {
 			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 				return fmt.Errorf("removeIfStale: remove orphan lock %s (PID %d dead): %w", path, pid, err)
 			}
+			slog.Info("reclaimed orphan session lock",
+				"reason", "holder_pid_dead",
+				"path", path,
+				"holder_pid", pid,
+				"age_seconds", int(age.Seconds()))
 		}
 	}
 	return nil
