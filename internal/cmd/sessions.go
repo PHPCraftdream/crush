@@ -137,8 +137,13 @@ clean slate without picking a new id and losing the side-channel state
 # Wipe history, keep system prompt, continue with same id
 crush sessions reset pr-42
 crush run --session pr-42 "try again with the fresh context"
+
+# Reset even if a stale lock from a crashed process is in the way
+crush sessions reset pr-42 --force
   `,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		force, _ := cmd.Flags().GetBool("force")
+
 		a, err := setupApp(cmd)
 		if err != nil {
 			return err
@@ -149,6 +154,29 @@ crush run --session pr-42 "try again with the fresh context"
 		if err != nil {
 			return err
 		}
+
+		// Fork patch (orchestrator UX): --force kills any process still
+		// holding the session's lock and removes the lock file. Without
+		// this, a reset can succeed at the DB level but a subsequent
+		// `crush run --session <same>` still fails with "session is
+		// already in use" because the previous holder crashed without
+		// releasing.
+		if force {
+			cwd, err := ResolveCwd(cmd)
+			if err == nil {
+				lockPath := filepath.Join(cwd, ".crush", "locks", "session-"+sanitiseSessionIDForFilename(sess.ID)+".lock")
+				if pid, err := readPIDFromLock(lockPath); err == nil && pid > 0 {
+					if proc, perr := os.FindProcess(pid); perr == nil {
+						_ = proc.Kill()
+						fmt.Fprintf(os.Stderr, "killed PID %d holding session %s\n", pid, short(session.HashID(sess.ID)))
+					}
+				}
+				if err := os.Remove(lockPath); err == nil {
+					fmt.Fprintf(os.Stderr, "removed lock %s\n", lockPath)
+				}
+			}
+		}
+
 		if err := a.Messages.DeleteSessionMessages(cmd.Context(), sess.ID); err != nil {
 			return fmt.Errorf("failed to reset session %s: %w", sess.ID, err)
 		}
@@ -324,6 +352,8 @@ func sessionsLastCmdRun(cmd *cobra.Command, args []string) error {
 func init() {
 	sessionsListCmd.Flags().Bool("json", false, "Emit one JSON object per line instead of a table")
 
+	sessionsResetCmd.Flags().Bool("force", false, "Also kill any process holding the session lock and remove the lock file")
+
 	sessionsShowCmd.Flags().Bool("json", false, "Emit structured JSON instead of text")
 	sessionsShowCmd.Flags().Bool("with-messages", false, "Include all messages in the output")
 	sessionsShowCmd.Flags().Bool("full", false, "Show full message content (implies --with-messages)")
@@ -338,7 +368,7 @@ func init() {
 	sessionsLastCmd.Flags().IntP("n", "n", 10, "Number of messages to show")
 	sessionsLastCmd.Flags().String("format", "text", "Output format: text or ndjson")
 
-	sessionsCmd.AddCommand(sessionsListCmd, sessionsDeleteCmd, sessionsResetCmd, sessionsShowCmd, sessionsLocksCmd, sessionsTailCmd, sessionsLastCmd, sessionsGcCmd, sessionsPurgeCmd, sessionsWatchCmd, sessionsPickCmd, sessionsGrepCmd, sessionsCostCmd, sessionsDiffCmd, sessionsCancelCmd, sessionsForkCmd, sessionsTreeCmd)
+	sessionsCmd.AddCommand(sessionsListCmd, sessionsDeleteCmd, sessionsResetCmd, sessionsShowCmd, sessionsLocksCmd, sessionsTailCmd, sessionsLastCmd, sessionsGcCmd, sessionsPurgeCmd, sessionsKillCmd, sessionsWatchCmd, sessionsPickCmd, sessionsGrepCmd, sessionsCostCmd, sessionsDiffCmd, sessionsCancelCmd, sessionsForkCmd, sessionsTreeCmd)
 	rootCmd.AddCommand(sessionsCmd)
 }
 

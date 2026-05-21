@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -151,4 +152,78 @@ func TestBuildRunResult_NoSubAgentOutputsByDefault(t *testing.T) {
 		nil, "",
 	)
 	assert.Nil(t, r.SubAgentOutputs, "default (summary) must yield nil so omitempty drops the JSON key")
+}
+
+// TestBuildRunResult_EmptyFinalText_NoFanout verifies the generic
+// empty-final_text warning that fires when the model ended the turn on a
+// tool_call (no assistant text composed), regardless of fan-out. Without
+// this warning the orchestrator gets `final_text: ""` and a silent
+// success — they have no way to know "this run did things but never told
+// me what". The warning enumerates what tools were called so the
+// operator can decide whether to re-prompt or to inspect git directly.
+func TestBuildRunResult_EmptyFinalText_NoFanout(t *testing.T) {
+	r := buildRunResult(
+		"s", "", "", "stop", nil, false,
+		map[string]int{"edit": 2, "bash": 1, "view": 4},
+		0, 0, 0, "", "",
+		0, "", "",
+		nil, "",
+	)
+	require.NotEmpty(t, r.Warnings, "empty final_text without fan-out must still emit a warning")
+	found := false
+	for _, w := range r.Warnings {
+		if assertContainsAll(w, "final_text is empty", "2 file edit(s)", "1 bash call(s)", "4 other tool call(s)") {
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "warning should name the file-edit / bash / other tool counts; got: %v", r.Warnings)
+}
+
+func TestBuildRunResult_EmptyFinalText_NoTools(t *testing.T) {
+	r := buildRunResult("s", "", "", "stop", nil, false, nil, 0, 0, 0, "", "", 0, "", "", nil, "")
+	require.NotEmpty(t, r.Warnings)
+	assert.Contains(t, r.Warnings[0], "no tools were called", "no tools + empty final_text should produce its own warning")
+}
+
+func TestBuildRunResult_EmptyFinalText_FanoutWarningTakesPriority(t *testing.T) {
+	// fan-out warning is the original path and must keep firing — the new
+	// generic path only triggers when fanoutCalls == 0.
+	r := buildRunResult(
+		"s", "", "", "stop", nil, false,
+		map[string]int{"agent": 2, "edit": 1},
+		0, 0, 0, "", "",
+		0, "", "",
+		nil, "",
+	)
+	require.NotEmpty(t, r.Warnings)
+	assert.Contains(t, r.Warnings[0], "sub-agent fan-out call(s)")
+	for _, w := range r.Warnings {
+		assert.NotContains(t, w, "model ended on a tool_call without composing", "should not double-emit the generic warning on top of the fan-out one")
+	}
+}
+
+func TestBuildRunResult_NonEmptyFinalText_NoEmptyWarning(t *testing.T) {
+	r := buildRunResult(
+		"s", "I edited foo.go", "", "stop", nil, false,
+		map[string]int{"edit": 1},
+		0, 0, 0, "", "",
+		0, "", "",
+		nil, "",
+	)
+	for _, w := range r.Warnings {
+		assert.NotContains(t, w, "final_text is empty")
+	}
+}
+
+// assertContainsAll returns true if every part appears in s. testify has
+// `assert.Contains` for a single substring; we use this when we need to
+// verify a warning string carries multiple expected fragments at once.
+func assertContainsAll(s string, parts ...string) bool {
+	for _, p := range parts {
+		if !strings.Contains(s, p) {
+			return false
+		}
+	}
+	return true
 }

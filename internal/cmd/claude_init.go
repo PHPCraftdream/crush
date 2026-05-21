@@ -320,15 +320,29 @@ Defaults to apply unless the user said otherwise:
 - ` + "`--role smart`" + ` for non-trivial work; ` + "`--role fast`" + ` for one-liners.
 - A stable, task-meaningful ` + "`--session`" + ` id (issue / branch / topic slug).
   Same id continues across runs.
-- ` + "`--timeout`" + ` proportional to the scope (5–15 min typical).
+- ` + "`--timeout`" + ` proportional to the scope. Rough rule of thumb:
+  one-line tweak / single small file → ` + "`--timeout 5m`" + `; new file
+  under ~300 lines → ` + "`10m`" + `; refactor across 2–4 files or any
+  file over ~500 lines → ` + "`20m`" + `; deep bug-hunt or multi-package
+  → ` + "`30m`" + `. When in doubt, over-provision — a 30m timeout costs
+  nothing if the task finishes in 3m, but a 5m timeout that fires mid-edit
+  leaves you with partial state.
 - Launch in the background (` + "`Bash`" + ` with ` + "`run_in_background: true`" + `),
   redirect ` + "`> .crush/stdin/<task>.out 2>.crush/stdin/<task>.err`" + `, and react
   when the harness fires the completion notification. Do NOT poll with sleep.
+  (Yes, the folder is called ` + "`stdin/`" + ` even though it also holds
+  ` + "`.out`" + ` and ` + "`.err`" + ` outputs — it's a single per-task working
+  directory. Don't let the name confuse you.)
 - For multi-line prompts, ` + "`Write`" + ` them to a file under
   ` + "`./.crush/stdin/<task-slug>.prompt`" + ` and feed via stdin (` + "`< file`" + `).
   Avoid positional ` + "`\"…\"`" + ` for anything past one line.
 - Permissions inside ` + "`crush run`" + ` are auto-approved (no human at the keyboard).
   Run only in workspaces you can afford to lose.
+- **Parallel runs**: when fan-out is more than one ` + "`crush run`" + `, every
+  prompt MUST explicitly name the file-set it is allowed to touch
+  (e.g. "only edit ` + "`internal/foo/`" + ` and ` + "`docs/foo.md`" + `; do
+  not touch root configs"). Two concurrent runs writing the same file
+  race each other's edits and produce silent corruption.
 
 ## Monitoring a running session
 
@@ -364,13 +378,45 @@ crush sessions list
 crush sessions show <session-id> --with-messages
 ` + "```" + `
 
+## When the lock is stuck
+
+If a session reports "session is already in use" but you know the holder
+is dead (TaskStop killed only the shell wrapper, not the underlying crush
+process; the box rebooted; previous run was force-killed), do not try to
+` + "`rm`" + ` the lock file manually — on Windows the OS still considers
+it open and refuses. Use:
+
+` + "```" + `
+crush sessions kill <id>            # kills the holder PID + removes the lock
+crush sessions reset <id> --force   # same, then also wipes message history
+` + "```" + `
+
+After either, ` + "`crush run --session <id>`" + ` can re-enter cleanly.
+
 ## After the run finishes
 
 1. ` + "`Read`" + ` the result file (` + "`.crush/stdin/<task>.out`" + `).
-2. Sanity-check the diff/output against the user's intent.
-3. Apply any small tactical fixes yourself (typos, missed imports);
+   With ` + "`--json`" + ` it is the wire envelope; with default mode it
+   is the model's final text.
+2. **Always sanity-check with ` + "`git status --short`" + `** — the
+   envelope's ` + "`final_text`" + ` is what the MODEL claims it did,
+   not what it actually wrote to disk. Models occasionally edit files
+   outside the asked scope (e.g. "tidying up" ` + "`.gitignore`" + ` when
+   you only asked for one new line). If ` + "`git status`" + ` shows
+   files outside the task's declared scope, ` + "`git checkout HEAD --`" + `
+   them and re-prompt with tighter constraints.
+3. Check ` + "`.warnings[]`" + ` in the JSON envelope. Specifically:
+   ` + "`final_text is empty`" + ` means the model ended on a tool_call
+   without composing a reply — fall back to ` + "`git status`" + ` plus
+   ` + "`crush sessions last <id>`" + ` for context.
+4. Apply any small tactical fixes yourself (typos, missed imports);
    re-delegate to the same ` + "`--session`" + ` for anything bigger.
-4. Report back to the user with the summary + cost + what changed.
+5. Report back to the user with the summary + cost + what changed.
+
+(` + "`crush sessions last <id>`" + ` is only needed when the ` + "`.out`" + `
+file is missing or you are doing post-mortem audit of an old session.
+For the just-finished run, the ` + "`.out`" + ` file already has the
+envelope — read that.)
 
 ## Task
 

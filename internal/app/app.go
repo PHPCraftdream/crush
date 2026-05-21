@@ -382,6 +382,18 @@ func buildRunResult(sessionID, finalText, assistantNotes, finalReason string, er
 				"final_text is empty after %d sub-agent fan-out call(s). The model dispatched sub-agents but did not compose a top-level reply — query the sub-session DB rows directly, or prompt the model to summarise into final_text.",
 				fanoutCalls,
 			))
+		} else {
+			// Fork patch (orchestrator UX): the model ended the turn on a
+			// tool_call without composing a final assistant text. The
+			// orchestrator now has no human-readable summary. Synthesise a
+			// one-liner from the tool counts so they can at least decide
+			// whether to look at `git status --short` or re-prompt for a
+			// proper summary.
+			if synth := synthesiseEmptyFinalSummary(toolCounts); synth != "" {
+				warnings = append(warnings, "final_text is empty (model ended on a tool_call without composing a reply). "+synth+" Inspect `git status --short` or `crush sessions last <id>` for context, or re-prompt asking for a summary.")
+			} else {
+				warnings = append(warnings, "final_text is empty and no tools were called this turn. The model produced nothing actionable.")
+			}
 		}
 	}
 	errMsg := ""
@@ -473,6 +485,60 @@ func tailN(s string, n int) string {
 		return s
 	}
 	return "..." + s[len(s)-n:]
+}
+
+// synthesiseEmptyFinalSummary builds a one-line summary of what tools were
+// used this turn so the empty-final_text warning gives the orchestrator
+// SOMETHING to act on. Returns "" if no tools were called.
+//
+// Fork patch (orchestrator UX): a model that finishes on a tool_call
+// without composing assistant text leaves final_text="". Wrappers
+// reading just final_text get a silent success and have to fall back to
+// `git status` or `sessions last`. The synthesised summary names the
+// most-likely meaningful tools (edit/write/multiedit/bash) and counts
+// the rest as "other tools".
+func synthesiseEmptyFinalSummary(toolCounts map[string]int) string {
+	if len(toolCounts) == 0 {
+		return ""
+	}
+	// Group writes (edit / write / multiedit count as "files changed").
+	writeTools := []string{"edit", "write", "multiedit"}
+	writes := 0
+	for _, t := range writeTools {
+		writes += toolCounts[t]
+	}
+	bashes := toolCounts["bash"]
+	others := 0
+	for name, n := range toolCounts {
+		if name == "bash" {
+			continue
+		}
+		isWrite := false
+		for _, w := range writeTools {
+			if w == name {
+				isWrite = true
+				break
+			}
+		}
+		if !isWrite {
+			others += n
+		}
+	}
+
+	parts := []string{}
+	if writes > 0 {
+		parts = append(parts, fmt.Sprintf("%d file edit(s)", writes))
+	}
+	if bashes > 0 {
+		parts = append(parts, fmt.Sprintf("%d bash call(s)", bashes))
+	}
+	if others > 0 {
+		parts = append(parts, fmt.Sprintf("%d other tool call(s)", others))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "Tools used: " + strings.Join(parts, ", ") + "."
 }
 
 // RunMode picks the output format for RunNonInteractive.
