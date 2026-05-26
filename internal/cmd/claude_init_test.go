@@ -181,6 +181,66 @@ func TestClaudeInit_CreatesSlashCommand(t *testing.T) {
 	assert.Contains(t, got, "--role smart")
 }
 
+// TestClaudeInit_SlashCommandContainsOptInRules pins the load-bearing
+// safety rules into the installed /crush slash-command. These instructions
+// are what prevent Claude Code from auto-delegating tasks the user never
+// asked to delegate, and from delegating cases that require interactive
+// stop-and-ask (merges, debugging, follow-up clarifications). If a future
+// edit silently drops one of these guards, this test fails and forces a
+// reconsider.
+func TestClaudeInit_SlashCommandContainsOptInRules(t *testing.T) {
+	dir := t.TempDir()
+	runClaudeInitInDir(t, dir)
+
+	slashPath := filepath.Join(dir, ".claude", "commands", "crush.md")
+	bts, err := os.ReadFile(slashPath)
+	require.NoError(t, err)
+	got := string(bts)
+
+	// Top-level "opt-in only" rule.
+	assert.Contains(t, got, "opt-in only",
+		"slash command must declare itself opt-in (no auto-invocation)")
+	assert.Contains(t, got, "Do NOT auto-invoke this skill on later turns",
+		"slash command must forbid auto-delegating subsequent tasks in the same chat")
+
+	// "When NOT to delegate" guardrails.
+	assert.Contains(t, got, "When NOT to delegate",
+		"slash command must have an explicit section listing refusal cases")
+	assert.Contains(t, got, "interactive by nature",
+		"interactive tasks (merges, debugging) must be a documented refusal case")
+	assert.Contains(t, got, "depends on this conversation's context",
+		"context-dependent tasks must be a documented refusal case")
+}
+
+// TestClaudeInit_SlashCommandReferencesCurrentMonitoringCommands keeps the
+// monitoring section in sync with the actual sessions commands the fork
+// ships. If `sessions watch` is renamed or removed, or the live-tail tool
+// preview rendering goes away, this test fails so the slash-command help
+// gets updated in lockstep.
+func TestClaudeInit_SlashCommandReferencesCurrentMonitoringCommands(t *testing.T) {
+	dir := t.TempDir()
+	runClaudeInitInDir(t, dir)
+
+	slashPath := filepath.Join(dir, ".claude", "commands", "crush.md")
+	bts, err := os.ReadFile(slashPath)
+	require.NoError(t, err)
+	got := string(bts)
+
+	// Primary monitoring command.
+	assert.Contains(t, got, "crush sessions watch",
+		"sessions watch is the primary monitoring command — must be documented")
+
+	// Tool-call preview rendering (batch 24).
+	assert.Contains(t, got, "[tool: bash]",
+		"tool-call preview rendering must be documented so operators know what to expect")
+
+	// Lock-recovery commands (sessions kill / reset / reap).
+	assert.Contains(t, got, "crush sessions kill",
+		"sessions kill must be documented for stuck-lock recovery")
+	assert.Contains(t, got, "crush sessions reap",
+		"sessions reap must be documented for bulk orphan-lock cleanup")
+}
+
 func TestClaudeInit_SlashCommandOverwritesWithSentinel(t *testing.T) {
 	dir := t.TempDir()
 	runClaudeInitInDir(t, dir)

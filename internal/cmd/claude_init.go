@@ -23,6 +23,7 @@
 package cmd
 
 import (
+	_ "embed"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -31,6 +32,15 @@ import (
 
 	"github.com/spf13/cobra"
 )
+
+// claudeSlashCommandTemplate is the canonical /crush slash-command body
+// minus the sentinel marker (which is prepended at write time so
+// `claude-del` can recognise files we own without depending on file
+// content semantics). Kept in a sibling .md file rather than a Go raw
+// string so future edits don't need backtick / dollar-sign escaping.
+//
+//go:embed claude_slash_command.md
+var claudeSlashCommandTemplate string
 
 // claudeInitBlockPattern matches any version of the legacy inserted block —
 // `<!-- crush-claude-init:v1 --> … <!-- /crush-claude-init -->`.
@@ -301,167 +311,13 @@ func writeSlashCommandToDir(dir string) error {
 }
 
 // claudeSlashCommandContent returns the body of `.claude/commands/crush.md`.
-// Self-contained: holds the full delegation guidance inline, because there
-// is no longer a long block in CLAUDE.md to refer the operator to.
-// Triggered ONLY by an explicit `/crush <task>` from the operator.
+// Sentinel marker is prepended so claude-del can recognise files we own
+// without parsing content. Self-contained: holds the full delegation
+// guidance inline, because there is no longer a long block in CLAUDE.md
+// to refer the operator to. Triggered ONLY by an explicit `/crush <task>`
+// from the operator.
 func claudeSlashCommandContent() string {
-	return claudeSlashCommandSentinel + `
----
-description: Delegate this task to a crush sub-agent instead of doing it yourself
----
-
-Do not implement the following task yourself. Build a ` + "`crush run`" + ` invocation
-and launch it.
-
-## Launching
-
-Defaults to apply unless the user said otherwise:
-
-- ` + "`--role smart`" + ` for non-trivial work; ` + "`--role fast`" + ` for one-liners.
-- A stable, task-meaningful ` + "`--session`" + ` id (issue / branch / topic slug).
-  Same id continues across runs.
-- ` + "`--timeout`" + ` proportional to the scope. Rough rule of thumb:
-  one-line tweak / single small file → ` + "`--timeout 5m`" + `; new file
-  under ~300 lines → ` + "`10m`" + `; refactor across 2–4 files or any
-  file over ~500 lines → ` + "`20m`" + `; deep bug-hunt or multi-package
-  → ` + "`30m`" + `. When in doubt, over-provision — a 30m timeout costs
-  nothing if the task finishes in 3m, but a 5m timeout that fires mid-edit
-  leaves you with partial state.
-- Launch in the background (` + "`Bash`" + ` with ` + "`run_in_background: true`" + `),
-  redirect ` + "`> .crush/stdin/<task>.out 2>.crush/stdin/<task>.err`" + `, and react
-  when the harness fires the completion notification. Do NOT poll with sleep.
-  (Yes, the folder is called ` + "`stdin/`" + ` even though it also holds
-  ` + "`.out`" + ` and ` + "`.err`" + ` outputs — it's a single per-task working
-  directory. Don't let the name confuse you.)
-- For multi-line prompts, ` + "`Write`" + ` them to a file under
-  ` + "`./.crush/stdin/<task-slug>.prompt`" + ` and feed via stdin (` + "`< file`" + `).
-  Avoid positional ` + "`\"…\"`" + ` for anything past one line.
-- Permissions inside ` + "`crush run`" + ` are auto-approved (no human at the keyboard).
-  Run only in workspaces you can afford to lose.
-- **Parallel runs**: when fan-out is more than one ` + "`crush run`" + `, every
-  prompt MUST explicitly name the file-set it is allowed to touch
-  (e.g. "only edit ` + "`internal/foo/`" + ` and ` + "`docs/foo.md`" + `; do
-  not touch root configs"). Two concurrent runs writing the same file
-  race each other's edits and produce silent corruption.
-
-## Monitoring a running session
-
-Check whether a session is still alive via its lock heartbeat:
-
-` + "```" + `
-crush sessions locks
-` + "```" + `
-
-PULSE column meaning (heartbeat every 10 s, stale after 20 s):
-- ` + "`alive`" + `    — last heartbeat ≤ 10 s ago, agent is running
-- ` + "`ping`" + `     — 10–15 s ago, likely still running
-- ` + "`stopping`" + ` — 15–20 s ago, agent is finishing or slow
-- ` + "`offline`" + `  — >20 s ago, lock is stale (agent crashed or exited)
-
-Show the last messages of a session to see what it produced:
-
-` + "```" + `
-crush sessions last <session-id>          # last 10 messages
-crush sessions last <session-id> --n 3   # last 3 messages
-` + "```" + `
-
-Live-follow a running session:
-
-` + "```" + `
-crush sessions tail <session-id> --follow
-` + "```" + `
-
-List all sessions:
-
-` + "```" + `
-crush sessions list
-crush sessions show <session-id> --with-messages
-` + "```" + `
-
-## Repo-wide default system prompt
-
-If ` + "`./.crush/system-prompts/default.md`" + ` exists, ` + "`crush run`" + `
-auto-loads it as the system prompt when neither ` + "`--system-prompt`" + `
-nor ` + "`--system-prompt-file`" + ` was passed. Use this to commit one set
-of "always apply" rules to the repo (scope-control, summary-required,
-no-commits) instead of repeating them in every prompt.
-
-Recommended starter template — write to ` + "`./.crush/system-prompts/default.md`" + `:
-
-` + "```markdown" + `
-You are a sub-agent invoked by an orchestrator. Apply these rules to
-every task in this repo, in addition to anything in the user prompt:
-
-1. **Stay strictly in scope.** Edit ONLY the files the prompt names.
-   Do not refactor unrelated code, generalise patterns, expand
-   .gitignore beyond what's asked, or "tidy up" while you're nearby.
-   If you notice unrelated mess, list it in your final summary and
-   leave it untouched.
-2. **End every turn with a final assistant message** that names:
-   files you changed, tests you ran, and any noteworthy observation.
-   Wrappers parse the final_text — leaving it empty silently is a bug.
-3. **Never commit, never push** unless the prompt explicitly says so.
-4. **Run the tests** that cover what you touched before declaring done.
-5. If you hit an ambiguity that needs a real product decision, stop
-   and surface it — don't guess and ship.
-` + "```" + `
-
-Explicit ` + "`--system-prompt-file`" + ` always wins over the auto-loaded
-default.
-
-## When the lock is stuck
-
-If a session reports "session is already in use" but you know the holder
-is dead or stuck (TaskStop killed only the shell wrapper, not the
-underlying crush process; the box rebooted; previous run was
-force-killed), do not try to ` + "`rm`" + ` the lock file manually — on
-Windows the OS still considers it open and refuses with
-"the process cannot access the file because it is being used". Use:
-
-` + "```" + `
-crush sessions kill <id>            # kills the holder PID + removes the lock
-crush sessions kill <id> --wait 10s # give a slow holder more time to die
-crush sessions reset <id> --force   # same, then also wipes message history
-` + "```" + `
-
-On Windows the kill goes through ` + "`taskkill /F /T /PID`" + ` so the
-entire child tree dies (typically ` + "`crush.exe`" + ` →
-` + "`claude.cmd`" + ` → ` + "`node.exe`" + `). The command then polls
-until the PID actually exits and retries the lock removal until the OS
-releases the file handle — no more "process still using the file"
-loops, no need to fall back to ` + "`taskkill`" + ` by hand.
-
-After either, ` + "`crush run --session <id>`" + ` can re-enter cleanly.
-
-## After the run finishes
-
-1. ` + "`Read`" + ` the result file (` + "`.crush/stdin/<task>.out`" + `).
-   With ` + "`--json`" + ` it is the wire envelope; with default mode it
-   is the model's final text.
-2. **Always sanity-check with ` + "`git status --short`" + `** — the
-   envelope's ` + "`final_text`" + ` is what the MODEL claims it did,
-   not what it actually wrote to disk. Models occasionally edit files
-   outside the asked scope (e.g. "tidying up" ` + "`.gitignore`" + ` when
-   you only asked for one new line). If ` + "`git status`" + ` shows
-   files outside the task's declared scope, ` + "`git checkout HEAD --`" + `
-   them and re-prompt with tighter constraints.
-3. Check ` + "`.warnings[]`" + ` in the JSON envelope. Specifically:
-   ` + "`final_text is empty`" + ` means the model ended on a tool_call
-   without composing a reply — fall back to ` + "`git status`" + ` plus
-   ` + "`crush sessions last <id>`" + ` for context.
-4. Apply any small tactical fixes yourself (typos, missed imports);
-   re-delegate to the same ` + "`--session`" + ` for anything bigger.
-5. Report back to the user with the summary + cost + what changed.
-
-(` + "`crush sessions last <id>`" + ` is only needed when the ` + "`.out`" + `
-file is missing or you are doing post-mortem audit of an old session.
-For the just-finished run, the ` + "`.out`" + ` file already has the
-envelope — read that.)
-
-## Task
-
-$ARGUMENTS
-`
+	return claudeSlashCommandSentinel + "\n" + claudeSlashCommandTemplate
 }
 
 func writeModelCommands(cwd string) error {
