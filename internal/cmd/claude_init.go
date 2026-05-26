@@ -412,15 +412,24 @@ default.
 ## When the lock is stuck
 
 If a session reports "session is already in use" but you know the holder
-is dead (TaskStop killed only the shell wrapper, not the underlying crush
-process; the box rebooted; previous run was force-killed), do not try to
-` + "`rm`" + ` the lock file manually — on Windows the OS still considers
-it open and refuses. Use:
+is dead or stuck (TaskStop killed only the shell wrapper, not the
+underlying crush process; the box rebooted; previous run was
+force-killed), do not try to ` + "`rm`" + ` the lock file manually — on
+Windows the OS still considers it open and refuses with
+"the process cannot access the file because it is being used". Use:
 
 ` + "```" + `
 crush sessions kill <id>            # kills the holder PID + removes the lock
+crush sessions kill <id> --wait 10s # give a slow holder more time to die
 crush sessions reset <id> --force   # same, then also wipes message history
 ` + "```" + `
+
+On Windows the kill goes through ` + "`taskkill /F /T /PID`" + ` so the
+entire child tree dies (typically ` + "`crush.exe`" + ` →
+` + "`claude.cmd`" + ` → ` + "`node.exe`" + `). The command then polls
+until the PID actually exits and retries the lock removal until the OS
+releases the file handle — no more "process still using the file"
+loops, no need to fall back to ` + "`taskkill`" + ` by hand.
 
 After either, ` + "`crush run --session <id>`" + ` can re-enter cleanly.
 

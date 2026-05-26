@@ -229,6 +229,14 @@ func readLockHolderPID(path string) int {
 	return pid
 }
 
+// ReadLockPID is the exported variant of readLockHolderPID, used by
+// `crush sessions kill` / `reset --force` to read the PID off a lock
+// file without having to re-implement the multi-line parse (the file
+// stores PID on line 1, optional timeout in seconds on line 2).
+func ReadLockPID(path string) int {
+	return readLockHolderPID(path)
+}
+
 // ReadLockTimeoutSec returns the timeout-in-seconds stored on the second line
 // of a lock file (written by TryAcquireSessionLockWithTimeout). Returns 0 if
 // not present or unreadable — backward compatible.

@@ -83,11 +83,11 @@ func sessionsReapCmdRun(cmd *cobra.Command, args []string) error {
 			continue
 		}
 
-		pid, perr := readPIDFromLock(path)
+		pid := session.ReadLockPID(path)
 		item.PID = pid
 
 		switch {
-		case perr != nil || pid <= 0:
+		case pid <= 0:
 			if all {
 				item.Action = "remove-unreadable"
 			} else {

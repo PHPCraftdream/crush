@@ -134,7 +134,7 @@ func computeSessionStatuses(cmd *cobra.Command) map[string]string {
 		}
 		sessionID := strings.TrimSuffix(strings.TrimPrefix(name, "session-"), ".lock")
 		path := filepath.Join(locksDir, name)
-		pid, _ := readPIDFromLock(path)
+		pid := session.ReadLockPID(path)
 		if pid > 0 && session.IsProcessAlive(pid) {
 			out[sessionID] = "running"
 		} else {
@@ -215,18 +215,24 @@ crush sessions reset pr-42 --force
 		// `crush run --session <same>` still fails with "session is
 		// already in use" because the previous holder crashed without
 		// releasing.
+		//
+		// Uses the shared forceKillHolder + removeLockWithRetry helpers
+		// (defined in sessions_kill.go) so kill / wait-for-death /
+		// retry-remove behaves identically here and in `sessions kill`.
+		// On Windows the kill goes through taskkill /F /T which also
+		// terminates the spawned CLI subprocess tree.
 		if force {
 			cwd, err := ResolveCwd(cmd)
 			if err == nil {
 				lockPath := filepath.Join(cwd, ".crush", "locks", "session-"+sanitiseSessionIDForFilename(sess.ID)+".lock")
-				if pid, err := readPIDFromLock(lockPath); err == nil && pid > 0 {
-					if proc, perr := os.FindProcess(pid); perr == nil {
-						_ = proc.Kill()
-						fmt.Fprintf(os.Stderr, "killed PID %d holding session %s\n", pid, short(session.HashID(sess.ID)))
+				if _, statErr := os.Stat(lockPath); statErr == nil {
+					pid := session.ReadLockPID(lockPath)
+					fmt.Fprint(os.Stderr, forceKillHolder(pid, 5*time.Second))
+					if err := removeLockWithRetry(lockPath, 5*time.Second); err != nil {
+						fmt.Fprintf(os.Stderr, "warning: could not remove lock %s: %v\n", lockPath, err)
+					} else {
+						fmt.Fprintf(os.Stderr, "removed lock %s\n", lockPath)
 					}
-				}
-				if err := os.Remove(lockPath); err == nil {
-					fmt.Fprintf(os.Stderr, "removed lock %s\n", lockPath)
 				}
 			}
 		}
