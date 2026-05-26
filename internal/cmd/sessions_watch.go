@@ -121,10 +121,15 @@ func liveTailSession(ctx context.Context, a *app.App, sessionID, locksDir string
 		return fmt.Errorf("failed to list messages: %w", err)
 	}
 
+	// Origin context lets ToolResult renderings show the file_path /
+	// url / pattern the call was about. Rebuilt every tick because new
+	// ToolCalls arrive over the polling loop.
+	callCtx := buildToolCallContext(messages)
+
 	now := time.Now()
 	lastPrinted := ""
 	for _, msg := range messages {
-		printMessageWithTime(os.Stdout, msg, "text", now)
+		printMessageWithTime(os.Stdout, msg, "text", now, callCtx)
 		lastPrinted = msg.ID
 	}
 
@@ -150,6 +155,7 @@ func liveTailSession(ctx context.Context, a *app.App, sessionID, locksDir string
 		if err != nil {
 			return fmt.Errorf("database error: %w", err)
 		}
+		callCtx = buildToolCallContext(msgs)
 		tickNow := time.Now()
 		var anchor *message.Message
 		if lastPrinted != "" {
@@ -160,12 +166,18 @@ func liveTailSession(ctx context.Context, a *app.App, sessionID, locksDir string
 				continue
 			}
 			if lastPrinted == "" || isAfter(&msgs[i], anchor) {
-				printMessageWithTime(os.Stdout, msgs[i], "text", tickNow)
+				printMessageWithTime(os.Stdout, msgs[i], "text", tickNow, callCtx)
 				lastPrinted = msgs[i].ID
 			}
 		}
 	}
 }
+
+// liveLockMaxAge is the threshold for considering a lock file "alive".
+// The session heartbeat touches the lock every 10s; we add a 10s grace
+// window so a missed tick during a slow GC pause / disk sync does not
+// look like a dead process. Matches session.lockStaleDuration in spirit.
+const liveLockMaxAge = 20 * time.Second
 
 // isSessionFinished reports whether a live-tail loop should exit. Returns
 // the end reason as a short human label so the summary block can show
@@ -176,19 +188,40 @@ func isSessionFinished(ctx context.Context, a *app.App, sessionID, locksDir stri
 	sess, sessErr := a.Sessions.Get(ctx, sessionID)
 	msgs, msgsErr := a.Messages.List(ctx, sessionID)
 	lockPath := filepath.Join(locksDir, "session-"+sanitiseSessionIDForFilename(sessionID)+".lock")
-	_, statErr := os.Stat(lockPath)
-	lockExists := statErr == nil
-	return isSessionFinishedFromState(sess, sessErr, msgs, msgsErr, lockExists)
+
+	// Distinguish "alive" (file exists and was touched recently — process
+	// is still heartbeating) from "stale or missing" (file gone, or file
+	// present but mtime older than the heartbeat window — holder crashed
+	// or detached). Only "alive" should block the end signals.
+	var lockAlive bool
+	if info, err := os.Stat(lockPath); err == nil {
+		lockAlive = time.Since(info.ModTime()) < liveLockMaxAge
+	}
+	return isSessionFinishedFromState(sess, sessErr, msgs, msgsErr, lockAlive)
 }
 
 // isSessionFinishedFromState is the pure decision used by isSessionFinished.
-// Signals (any one of which means "done"):
+//
+// The lock heartbeat is the AUTHORITATIVE signal: while the holding
+// process is alive (lock mtime < liveLockMaxAge) we never terminate the
+// watch, regardless of what the DB rows say. This guards against the
+// real-world failure mode where a tool-result message carries a Finish
+// part with reason="stop" (the tool finished — not the session), or
+// where an assistant message has Finish reason="tool_use" (it ran a
+// tool and is about to consume the result, not done).
+//
+// Only when the lock is no longer alive do we trust the DB-derived
+// signals:
 //
 //	(a) session row has a non-empty EndedReason
-//	(b) the lock file is gone AND the session has at least one message
-//	    (the "at least one message" guard avoids racing the acquirer that
-//	    has opened the file but not yet touched / written the lock)
-//	(c) the latest assistant message has a non-partial Finish.Reason
+//	(b) lock disappeared / went stale AND the session has at least one
+//	    message (the "at least one message" guard avoids racing the
+//	    acquirer that has opened the file but not yet touched / written
+//	    the lock)
+//	(c) the latest ASSISTANT message has a non-partial Finish whose
+//	    Reason is a terminal FinishReason (end_turn / max_tokens /
+//	    canceled / error). tool_use, unknown, and any unrecognised
+//	    string are treated as "not yet done" — the agent is mid-loop.
 //
 // Errors on the session lookup are treated as "no signal (a)", and
 // errors on the message lookup as "no signal (b)/(c)" — neither is
@@ -198,21 +231,57 @@ func isSessionFinishedFromState(
 	sessErr error,
 	msgs []message.Message,
 	msgsErr error,
-	lockExists bool,
+	lockAlive bool,
 ) (bool, string) {
+	if lockAlive {
+		return false, ""
+	}
 	if sessErr == nil && sess.EndedReason != "" {
 		return true, sess.EndedReason
 	}
-	if !lockExists && msgsErr == nil && len(msgs) > 0 {
+	if msgsErr == nil && len(msgs) > 0 {
+		// Walk back to the latest assistant message — tool result rows
+		// carry their own Finish parts (e.g. reason="stop" when the
+		// tool subprocess exits) that have nothing to do with end of
+		// session. Only the assistant author's own finish counts.
+		for i := len(msgs) - 1; i >= 0; i-- {
+			m := msgs[i]
+			if m.Role != message.Assistant {
+				continue
+			}
+			f := m.FinishPart()
+			if f == nil || f.Partial {
+				break
+			}
+			if isTerminalFinishReason(f.Reason) {
+				return true, string(f.Reason)
+			}
+			// Latest assistant has Finish but it's tool_use / unknown /
+			// some unrecognised reason — the loop is mid-step, not done.
+			break
+		}
+		// Lock is not alive AND we have at least one message — the
+		// holder process is gone but the session never wrote an
+		// EndedReason or a terminal assistant Finish. Treat as ended.
 		return true, "lock_released"
 	}
-	if msgsErr == nil && len(msgs) > 0 {
-		last := msgs[len(msgs)-1]
-		if f := last.FinishPart(); f != nil && !f.Partial && f.Reason != "" {
-			return true, string(f.Reason)
-		}
-	}
 	return false, ""
+}
+
+// isTerminalFinishReason reports whether a FinishReason indicates the
+// agent has finished its work for this turn AND has nothing queued
+// (i.e. it is safe to consider the session done). tool_use means the
+// agent ran a tool and will continue after the result; unknown means
+// we cannot tell; everything else recognised is a real end.
+func isTerminalFinishReason(r message.FinishReason) bool {
+	switch r {
+	case message.FinishReasonEndTurn,
+		message.FinishReasonMaxTokens,
+		message.FinishReasonCanceled,
+		message.FinishReasonError:
+		return true
+	}
+	return false
 }
 
 // printWatchSummary emits the final block shown when a watched session

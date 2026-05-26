@@ -4,7 +4,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/charmbracelet/crush/internal/message"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestFormatToolCallPreview(t *testing.T) {
@@ -65,10 +67,241 @@ func TestFormatToolResultPreview(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := formatToolResultPreview(c.content)
+			// Backward-compat path: no origin info → content-only preview.
+			got := formatToolResultPreview(c.content, "", "")
 			assert.Equal(t, c.want, got, "content=%q", c.content)
 		})
 	}
+}
+
+func TestFormatToolResultPreview_WithOriginHint(t *testing.T) {
+	cases := []struct {
+		name        string
+		content     string
+		originName  string
+		originInput string
+		want        string
+	}{
+		// view / edit / multiedit / write → file_path as hint.
+		{
+			"view shows file_path before content",
+			"package cmd\n\nimport (\n",
+			"view", `{"file_path":"internal/cmd/sessions.go","limit":50}`,
+			"internal/cmd/sessions.go: package cmd (+2 lines)",
+		},
+		{
+			"view with empty content shows file_path alone",
+			"",
+			"view", `{"file_path":"internal/cmd/sessions.go"}`,
+			"internal/cmd/sessions.go",
+		},
+		{
+			"edit shows file_path with <result> body",
+			"<result>\nedited\nfoo\nbar\n",
+			"edit", `{"file_path":"a.go","old_string":"x","new_string":"y"}`,
+			"a.go: <result> (+3 lines)",
+		},
+		{
+			"multiedit shows file_path",
+			"<result>",
+			"multiedit", `{"file_path":"b.go","edits":[{}]}`,
+			"b.go: <result>",
+		},
+		{
+			"write shows file_path",
+			"<wrote 42 bytes>",
+			"write", `{"file_path":"c.go","content":"package main"}`,
+			"c.go: <wrote 42 bytes>",
+		},
+
+		// grep / glob / ls → pattern / path.
+		{
+			"grep with both pattern+path",
+			"main.go:42:TODO\nmain.go:88:TODO\n",
+			"grep", `{"pattern":"TODO","path":"internal/"}`,
+			`"TODO" in internal/: main.go:42:TODO (+1 lines)`,
+		},
+		{
+			"grep pattern only",
+			"a.go:1:func main",
+			"grep", `{"pattern":"func main"}`,
+			`"func main": a.go:1:func main`,
+		},
+		{
+			"glob pattern",
+			"a.go\nb.go\nc.go\n",
+			"glob", `{"pattern":"**/*.go"}`,
+			"**/*.go: a.go (+2 lines)",
+		},
+		{
+			"ls path",
+			"foo.txt\nbar.txt",
+			"ls", `{"path":"/tmp"}`,
+			"/tmp: foo.txt (+1 lines)",
+		},
+
+		// fetch / download → url.
+		{
+			"fetch shows url",
+			"<html><body>...",
+			"fetch", `{"url":"https://example.com"}`,
+			"https://example.com: <html><body>...",
+		},
+		{
+			"download shows destination over url",
+			"",
+			"download", `{"url":"https://x.com/y","file_path":"/tmp/y"}`,
+			"/tmp/y",
+		},
+		{
+			"download falls back to url when no file_path",
+			"saved",
+			"download", `{"url":"https://x.com/y"}`,
+			"https://x.com/y: saved",
+		},
+
+		// bash / sourcegraph / todowrite / unknown → content-only (no hint).
+		{
+			"bash keeps content-only behaviour",
+			"hello world",
+			"bash", `{"command":"echo hello world"}`,
+			"hello world",
+		},
+		{
+			"sourcegraph keeps content-only behaviour",
+			"match 1\nmatch 2",
+			"sourcegraph", `{"query":"repo:foo lang:go"}`,
+			"match 1 (+1 lines)",
+		},
+		{
+			"unknown tool falls back to content-only",
+			"some content",
+			"weirdtool", `{"alpha":"hello"}`,
+			"some content",
+		},
+
+		// Robustness: bad JSON, missing fields, empty origin.
+		{
+			"unparseable origin input → content-only",
+			"some content",
+			"view", "not-json{",
+			"some content",
+		},
+		{
+			"empty origin input → content-only",
+			"some content",
+			"view", "",
+			"some content",
+		},
+		{
+			"view without file_path in input → content-only",
+			"some content",
+			"view", `{"offset":10}`,
+			"some content",
+		},
+		{
+			"both empty → empty string",
+			"",
+			"view", `{"file_path":""}`,
+			"",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := formatToolResultPreview(c.content, c.originName, c.originInput)
+			assert.Equal(t, c.want, got, "content=%q origin=%s/%s", c.content, c.originName, c.originInput)
+		})
+	}
+}
+
+func TestToolResultOriginHint(t *testing.T) {
+	// Direct unit test of the origin-hint helper so the per-tool branch
+	// table stays covered even if formatToolResultPreview changes shape.
+	cases := []struct {
+		name  string
+		tool  string
+		input string
+		want  string
+	}{
+		{"view", "view", `{"file_path":"a.go"}`, "a.go"},
+		{"edit", "edit", `{"file_path":"a.go"}`, "a.go"},
+		{"multiedit", "multiedit", `{"file_path":"a.go"}`, "a.go"},
+		{"write", "write", `{"file_path":"a.go"}`, "a.go"},
+		{"grep both", "grep", `{"pattern":"x","path":"src/"}`, `"x" in src/`},
+		{"grep pat only", "grep", `{"pattern":"x"}`, `"x"`},
+		{"grep path only", "grep", `{"path":"src/"}`, "src/"},
+		{"glob", "glob", `{"pattern":"*.go"}`, "*.go"},
+		{"ls", "ls", `{"path":"/tmp"}`, "/tmp"},
+		{"fetch", "fetch", `{"url":"https://x.com"}`, "https://x.com"},
+		{"web_fetch", "web_fetch", `{"url":"https://x.com"}`, "https://x.com"},
+		{"agentic_fetch", "agentic_fetch", `{"url":"https://x.com"}`, "https://x.com"},
+		{"download with file_path", "download", `{"url":"https://x.com","file_path":"/tmp/y"}`, "/tmp/y"},
+		{"download without file_path", "download", `{"url":"https://x.com"}`, "https://x.com"},
+		{"bash → no hint", "bash", `{"command":"echo"}`, ""},
+		{"sourcegraph → no hint", "sourcegraph", `{"query":"x"}`, ""},
+		{"empty input → no hint", "view", "", ""},
+		{"unparseable → no hint", "view", "{not-json", ""},
+		{"case insensitive", "VIEW", `{"file_path":"a.go"}`, "a.go"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := toolResultOriginHint(c.tool, c.input)
+			assert.Equal(t, c.want, got, "tool=%s", c.tool)
+		})
+	}
+}
+
+func TestBuildToolCallContext(t *testing.T) {
+	// The context map must (a) index every ToolCall in the slice by ID,
+	// (b) preserve later overwrites if the same ID appears twice
+	// (defensive — the agent should never emit duplicates, but the index
+	// must not panic or pick arbitrarily), and (c) skip ToolCall parts
+	// with empty IDs (we have nothing to key on).
+	tc1 := someToolCall("id-1", "bash", `{"command":"ls"}`)
+	tc2 := someToolCall("id-2", "view", `{"file_path":"a.go"}`)
+	tcEmpty := someToolCall("", "edit", `{"file_path":"b.go"}`)
+	tcDup := someToolCall("id-1", "bash", `{"command":"pwd"}`)
+
+	msgs := []message.Message{
+		{ID: "m1", Role: message.Assistant, Parts: []message.ContentPart{tc1, tc2}},
+		{ID: "m2", Role: message.Assistant, Parts: []message.ContentPart{tcEmpty, tcDup}},
+		{ID: "m3", Role: message.Tool, Parts: []message.ContentPart{
+			message.ToolResult{ToolCallID: "id-1", Content: "x"},
+		}},
+	}
+	ctx := buildToolCallContext(msgs)
+
+	require.Len(t, ctx, 2, "empty-ID ToolCall must be skipped, no Tool-role indexing")
+	assert.Equal(t, "bash", ctx["id-1"].name)
+	assert.Equal(t, `{"command":"pwd"}`, ctx["id-1"].input, "later duplicate overwrites earlier")
+	assert.Equal(t, "view", ctx["id-2"].name)
+	assert.Equal(t, `{"file_path":"a.go"}`, ctx["id-2"].input)
+	_, exists := ctx[""]
+	assert.False(t, exists, "empty-ID entry must not be in the map")
+}
+
+func TestLookupToolCallOrigin(t *testing.T) {
+	ctx := map[string]toolCallOrigin{
+		"id-1": {name: "bash", input: `{"command":"ls"}`},
+	}
+	name, input := lookupToolCallOrigin(ctx, "id-1")
+	assert.Equal(t, "bash", name)
+	assert.Equal(t, `{"command":"ls"}`, input)
+
+	name, input = lookupToolCallOrigin(ctx, "missing")
+	assert.Equal(t, "", name)
+	assert.Equal(t, "", input)
+
+	// Nil map is a valid input (legacy callsites that don't build a context).
+	name, input = lookupToolCallOrigin(nil, "id-1")
+	assert.Equal(t, "", name)
+	assert.Equal(t, "", input)
+}
+
+// someToolCall is a tiny test helper so the buildToolCallContext test
+// reads cleanly without literal struct noise.
+func someToolCall(id, name, input string) message.ToolCall {
+	return message.ToolCall{ID: id, Name: name, Input: input}
 }
 
 func TestTruncatePreview(t *testing.T) {

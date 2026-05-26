@@ -125,11 +125,46 @@ func formatToolCallPreview(name, input string) string {
 }
 
 // formatToolResultPreview returns a one-line summary of a tool result's
-// content. If the content fits in toolResultPreviewMaxLen the whole
-// (single-line-collapsed) string is returned; otherwise the first line is
-// returned with a "(N more lines)" suffix when the content is multiline.
-// Returns "" for empty or whitespace-only content.
-func formatToolResultPreview(content string) string {
+// content. The optional originName / originInput are the name and raw
+// JSON Input of the assistant's matching ToolCall (looked up by
+// ToolCallID by the caller). When supplied AND the tool is one whose
+// result-content alone is uninformative (view dumps a whole file, edit
+// returns "<result>", grep returns match lines without restating the
+// pattern, etc.) the preview is prefixed with the most useful argument
+// from the call — so operators reading `[tool-result: view]` actually
+// see which file was viewed:
+//
+//	[tool-result: view] internal/cmd/sessions.go: package cmd  (+412 lines)
+//	[tool-result: edit] internal/cmd/sessions.go (+3 lines)
+//	[tool-result: grep] "TODO" in internal/: internal/cmd/run.go:142:…  (+8 lines)
+//
+// For tools whose content IS the interesting output (bash command
+// output, fetch result body, sourcegraph match list) we keep the
+// content-first behaviour. Empty / whitespace-only content with no
+// origin returns "".
+func formatToolResultPreview(content, originName, originInput string) string {
+	hint := toolResultOriginHint(originName, originInput)
+	body := summariseResultContent(content)
+
+	switch {
+	case hint != "" && body != "":
+		// "<file-path>: <first content line>... (+N lines)"
+		full := hint + ": " + body
+		return truncatePreview(full, toolResultPreviewMaxLen)
+	case hint != "" && body == "":
+		return truncatePreview(hint, toolResultPreviewMaxLen)
+	case hint == "" && body != "":
+		return body
+	default:
+		return ""
+	}
+}
+
+// summariseResultContent collapses a tool result's content into a single
+// line of preview. Empty / whitespace-only → "". Single-line short →
+// as-is. Single-line long → ellipsised. Multiline → first line + "(+N
+// lines)" suffix.
+func summariseResultContent(content string) string {
 	trimmed := strings.TrimSpace(content)
 	if trimmed == "" {
 		return ""
@@ -145,6 +180,52 @@ func formatToolResultPreview(content string) string {
 		available = 20
 	}
 	return truncatePreview(first, available) + suffix
+}
+
+// toolResultOriginHint extracts the most useful argument from the
+// originating ToolCall's JSON input — typically a file path, URL or
+// pattern — to be shown alongside the tool result. Returns "" when the
+// origin info is missing, unparseable, or for tools whose result
+// content is the interesting payload by itself (bash, sourcegraph
+// matches, todo updates).
+func toolResultOriginHint(name, input string) string {
+	if strings.TrimSpace(input) == "" {
+		return ""
+	}
+	var params map[string]any
+	if err := json.Unmarshal([]byte(input), &params); err != nil {
+		return ""
+	}
+	switch strings.ToLower(name) {
+	case "view", "edit", "multiedit", "write":
+		return stringField(params, "file_path")
+	case "grep":
+		pat := stringField(params, "pattern")
+		path := stringField(params, "path")
+		switch {
+		case pat != "" && path != "":
+			return fmt.Sprintf("%q in %s", pat, path)
+		case pat != "":
+			return fmt.Sprintf("%q", pat)
+		case path != "":
+			return path
+		}
+	case "glob":
+		return stringField(params, "pattern")
+	case "ls":
+		return stringField(params, "path")
+	case "fetch", "web_fetch", "agentic_fetch":
+		return stringField(params, "url")
+	case "download":
+		dst := stringField(params, "file_path")
+		if dst != "" {
+			return dst
+		}
+		return stringField(params, "url")
+	}
+	// bash / sourcegraph / agent / task / todowrite / unknown — fall through
+	// to content-only preview.
+	return ""
 }
 
 // truncatePreview shortens s to max runes, appending an ellipsis when

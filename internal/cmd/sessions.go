@@ -406,9 +406,13 @@ func sessionsLastCmdRun(cmd *cobra.Command, args []string) error {
 	if len(messages) > n {
 		messages = messages[len(messages)-n:]
 	}
+	// Build the tool-call context from the FULL message list (not just
+	// the trimmed window) so a ToolResult inside the window can still
+	// look up its matching ToolCall that may have been emitted earlier.
+	callCtx := buildToolCallContext(messages)
 	now := time.Now()
 	for _, msg := range messages {
-		printMessageWithTime(os.Stdout, msg, format, now)
+		printMessageWithTime(os.Stdout, msg, format, now, callCtx)
 	}
 	return nil
 }
@@ -907,10 +911,14 @@ func sessionsTailCmdRun(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Build origin context from the snapshot we have right now; the
+	// follow loop below extends it as new ToolCall parts arrive.
+	callCtx := buildToolCallContext(messages)
+
 	// Print messages
 	now := time.Now()
 	for _, msg := range messages {
-		printMessageWithTime(os.Stdout, msg, format, now)
+		printMessageWithTime(os.Stdout, msg, format, now, callCtx)
 		lastPrinted = msg.ID
 	}
 
@@ -941,11 +949,15 @@ func sessionsTailCmdRun(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("database error: %w", err)
 		}
 
+		// Rebuild origin context — new ToolCall parts may have arrived
+		// this tick, and the next ToolResult render needs them.
+		callCtx = buildToolCallContext(messages)
+
 		// Print any new messages
 		now := time.Now()
 		for i := range messages {
 			if messages[i].ID != lastPrinted && (lastPrinted == "" || isAfter(&messages[i], findByID(messages, lastPrinted))) {
-				printMessageWithTime(os.Stdout, messages[i], format, now)
+				printMessageWithTime(os.Stdout, messages[i], format, now, callCtx)
 				lastPrinted = messages[i].ID
 			}
 		}
@@ -1003,19 +1015,68 @@ func formatDurationShort(d time.Duration) string {
 	}
 }
 
+// toolCallOrigin captures the (name, raw JSON input) of an assistant
+// ToolCall, indexed by its ToolCallID so that the subsequent
+// ToolResult render can pull out the call's most useful argument
+// (file_path, url, pattern, etc.) and show it next to the result.
+// Populated by buildToolCallContext before a batch render.
+type toolCallOrigin struct {
+	name  string
+	input string
+}
+
+// buildToolCallContext walks every message in a session and indexes every
+// ToolCall by its ID. The map is then handed to printMessageWithTime so
+// renderings of ToolResult parts can look up "what was the call about"
+// and prefix the result preview with the argument (e.g. file_path for
+// view, url for fetch). Walking is O(N+M) over messages and parts;
+// caller pays this once per render batch.
+func buildToolCallContext(msgs []message.Message) map[string]toolCallOrigin {
+	out := make(map[string]toolCallOrigin, len(msgs))
+	for _, m := range msgs {
+		for _, part := range m.Parts {
+			tc, ok := part.(message.ToolCall)
+			if !ok || tc.ID == "" {
+				continue
+			}
+			out[tc.ID] = toolCallOrigin{name: tc.Name, input: tc.Input}
+		}
+	}
+	return out
+}
+
+// lookupToolCallOrigin returns the (name, input) recorded for toolCallID,
+// or ("", "") when the context is nil or the id is unknown. Safe to call
+// with a nil map — callers that don't need origin enrichment (legacy
+// paths) can pass nil and get the old behaviour from
+// formatToolResultPreview.
+func lookupToolCallOrigin(ctx map[string]toolCallOrigin, toolCallID string) (string, string) {
+	if ctx == nil {
+		return "", ""
+	}
+	o, ok := ctx[toolCallID]
+	if !ok {
+		return "", ""
+	}
+	return o.name, o.input
+}
+
 // printMessageWithTime prints a timestamp header followed by the message
 // content. Only adds the header in text format when CreatedAt != 0.
-// A blank line is printed between messages for readability.
-func printMessageWithTime(w io.Writer, msg message.Message, format string, now time.Time) {
+// A blank line is printed between messages for readability. callCtx
+// (optional, may be nil) maps ToolCallID to the originating ToolCall's
+// name and JSON input — when present, ToolResult rendering uses it to
+// show the call's most useful argument next to the result.
+func printMessageWithTime(w io.Writer, msg message.Message, format string, now time.Time, callCtx map[string]toolCallOrigin) {
 	if format == "text" && msg.CreatedAt != 0 {
 		ts := time.Unix(msg.CreatedAt, 0)
 		ago := now.Sub(ts)
 		fmt.Fprintf(w, "[%s] (%s)\n", ts.Format("2006-01-02 15:04:05"), formatAgo(ago))
 	}
-	printMessage(w, msg, format)
+	printMessage(w, msg, format, callCtx)
 }
 
-func printMessage(w io.Writer, msg message.Message, format string) {
+func printMessage(w io.Writer, msg message.Message, format string, callCtx map[string]toolCallOrigin) {
 	if format == "ndjson" {
 		type msgJSON struct {
 			ID           string `json:"id"`
@@ -1059,7 +1120,8 @@ func printMessage(w io.Writer, msg message.Message, format string) {
 				if name == "" {
 					name = p.ToolCallID
 				}
-				preview := formatToolResultPreview(p.Content)
+				originName, originInput := lookupToolCallOrigin(callCtx, p.ToolCallID)
+				preview := formatToolResultPreview(p.Content, originName, originInput)
 				prefix := "[tool-result: " + name + "]"
 				if p.IsError {
 					prefix += " ERROR"
