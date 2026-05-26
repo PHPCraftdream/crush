@@ -3,8 +3,10 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
@@ -167,29 +169,44 @@ func liveTailSession(ctx context.Context, a *app.App, sessionID, locksDir string
 
 // isSessionFinished reports whether a live-tail loop should exit. Returns
 // the end reason as a short human label so the summary block can show
-// it next to "reason:".
+// it next to "reason:". I/O-doing wrapper; the pure decision lives in
+// isSessionFinishedFromState so it is unit-testable without an app /
+// filesystem.
 func isSessionFinished(ctx context.Context, a *app.App, sessionID, locksDir string) (bool, string) {
-	// (a) session row has an ended_reason.
-	sess, err := a.Sessions.Get(ctx, sessionID)
-	if err == nil && sess.EndedReason != "" {
+	sess, sessErr := a.Sessions.Get(ctx, sessionID)
+	msgs, msgsErr := a.Messages.List(ctx, sessionID)
+	lockPath := filepath.Join(locksDir, "session-"+sanitiseSessionIDForFilename(sessionID)+".lock")
+	_, statErr := os.Stat(lockPath)
+	lockExists := statErr == nil
+	return isSessionFinishedFromState(sess, sessErr, msgs, msgsErr, lockExists)
+}
+
+// isSessionFinishedFromState is the pure decision used by isSessionFinished.
+// Signals (any one of which means "done"):
+//
+//	(a) session row has a non-empty EndedReason
+//	(b) the lock file is gone AND the session has at least one message
+//	    (the "at least one message" guard avoids racing the acquirer that
+//	    has opened the file but not yet touched / written the lock)
+//	(c) the latest assistant message has a non-partial Finish.Reason
+//
+// Errors on the session lookup are treated as "no signal (a)", and
+// errors on the message lookup as "no signal (b)/(c)" — neither is
+// treated as termination, so a transient DB hiccup does not end the tail.
+func isSessionFinishedFromState(
+	sess session.Session,
+	sessErr error,
+	msgs []message.Message,
+	msgsErr error,
+	lockExists bool,
+) (bool, string) {
+	if sessErr == nil && sess.EndedReason != "" {
 		return true, sess.EndedReason
 	}
-
-	// (b) the lock file is gone — process exited or was killed. Only
-	// trust this signal when the session actually has at least one
-	// message (otherwise we might race the acquirer that has not yet
-	// touched the lock or written its first message).
-	lockPath := filepath.Join(locksDir, "session-"+sanitiseSessionIDForFilename(sessionID)+".lock")
-	if _, statErr := os.Stat(lockPath); os.IsNotExist(statErr) {
-		msgs, mErr := a.Messages.List(ctx, sessionID)
-		if mErr == nil && len(msgs) > 0 {
-			return true, "lock_released"
-		}
+	if !lockExists && msgsErr == nil && len(msgs) > 0 {
+		return true, "lock_released"
 	}
-
-	// (c) latest assistant message has a non-partial Finish part.
-	msgs, err := a.Messages.List(ctx, sessionID)
-	if err == nil && len(msgs) > 0 {
+	if msgsErr == nil && len(msgs) > 0 {
 		last := msgs[len(msgs)-1]
 		if f := last.FinishPart(); f != nil && !f.Partial && f.Reason != "" {
 			return true, string(f.Reason)
@@ -200,33 +217,52 @@ func isSessionFinished(ctx context.Context, a *app.App, sessionID, locksDir stri
 
 // printWatchSummary emits the final block shown when a watched session
 // finishes. Pulls fresh totals from the session row so any in-flight
-// IncrementCost from the agent's last step is reflected.
-func printWatchSummary(w *os.File, ctx context.Context, a *app.App, sessionID, reason string) {
+// IncrementCost from the agent's last step is reflected. Thin wrapper;
+// the formatting lives in formatWatchSummary so it can be unit-tested
+// without a live app.
+func printWatchSummary(w io.Writer, ctx context.Context, a *app.App, sessionID, reason string) {
 	sess, err := a.Sessions.Get(ctx, sessionID)
 	if err != nil {
 		fmt.Fprintf(w, "\n--- session ended (could not load summary: %v) ---\n", err)
 		return
 	}
+	fmt.Fprint(w, formatWatchSummary(sess, reason, time.Now()))
+}
+
+// formatWatchSummary renders the human-readable end-of-watch block.
+// "now" is taken as an argument so tests can pin duration to a known
+// value without sleeping. Layout (one blank line above for separation
+// from the live message stream):
+//
+//	--- session ended ---
+//	id:       <session-id>
+//	title:    <title>           (omitted when empty)
+//	reason:   <reason>
+//	duration: <X>h<Y>m / <Y>m<Z>s / <Z>s  (compact form)
+//	tokens:   <total> (prompt <p> + completion <c>)
+//	cost:     $0.0000 [ / $X.XXXX budget ]
+func formatWatchSummary(sess session.Session, reason string, now time.Time) string {
 	duration := time.Duration(0)
 	if sess.CreatedAt > 0 {
-		duration = time.Since(time.Unix(sess.CreatedAt, 0))
+		duration = now.Sub(time.Unix(sess.CreatedAt, 0))
 	}
 	tokens := sess.PromptTokens + sess.CompletionTokens
-	fmt.Fprintln(w)
-	fmt.Fprintln(w, "--- session ended ---")
-	fmt.Fprintf(w, "id:       %s\n", sess.ID)
+	var b strings.Builder
+	b.WriteString("\n--- session ended ---\n")
+	fmt.Fprintf(&b, "id:       %s\n", sess.ID)
 	if sess.Title != "" {
-		fmt.Fprintf(w, "title:    %s\n", sess.Title)
+		fmt.Fprintf(&b, "title:    %s\n", sess.Title)
 	}
-	fmt.Fprintf(w, "reason:   %s\n", reason)
-	fmt.Fprintf(w, "duration: %s\n", formatDurationShort(duration))
-	fmt.Fprintf(w, "tokens:   %s (prompt %s + completion %s)\n",
+	fmt.Fprintf(&b, "reason:   %s\n", reason)
+	fmt.Fprintf(&b, "duration: %s\n", formatDurationShort(duration))
+	fmt.Fprintf(&b, "tokens:   %s (prompt %s + completion %s)\n",
 		formatWatchInt(tokens), formatWatchInt(sess.PromptTokens), formatWatchInt(sess.CompletionTokens))
-	fmt.Fprintf(w, "cost:     $%.4f", sess.Cost)
+	fmt.Fprintf(&b, "cost:     $%.4f", sess.Cost)
 	if sess.BudgetMaxCost > 0 {
-		fmt.Fprintf(w, " / $%.4f budget", sess.BudgetMaxCost)
+		fmt.Fprintf(&b, " / $%.4f budget", sess.BudgetMaxCost)
 	}
-	fmt.Fprintln(w)
+	b.WriteString("\n")
+	return b.String()
 }
 
 // pickSessionForWatch runs the interactive picker used by both

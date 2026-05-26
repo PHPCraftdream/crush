@@ -1655,3 +1655,125 @@ internal/workspace/ (4 files)
 internal/cmd/server*.go — already deleted, just kept it that way
 .github/cla-signatures.json
 ```
+
+### Batch 24 — sessions monitoring UX: tool-call previews + watch live-tail (2026-05-26)
+
+Two changes that make watching agent runs actually pleasant. Until now,
+following a `crush run` session looked like a wall of `[tool: bash]` /
+`[tool-result: bash]` lines — you knew the agent was *doing things*
+but not *which things*. And `crush sessions watch` printed a dashboard
+of active sessions, which duplicates `sessions list` + `sessions locks`
+and is not what an operator usually wants.
+
+**Tool-call argument previews in the message renderer.**
+
+`printMessageWithTime` (text mode) now renders the most informative
+argument from each tool call's JSON input next to the tool name. New
+helpers `formatToolCallPreview` and `formatToolResultPreview` in
+`internal/cmd/sessions_render.go`. Per-tool field priority hand-curated
+for the common cases (`bash`→command, `view`→file_path[:offset+limit],
+`edit`/`multiedit`/`write`→file_path, `grep`→pattern[+path],
+`glob`→pattern, `ls`→path, `fetch`/`web_fetch`/`agentic_fetch`→url,
+`download`→url→file_path, `sourcegraph`→query, `agent`/`sub_agent`/`task`
+→description (then prompt), `todo`/`todowrite`→item count). Generic
+fallback for unknown tools picks the first non-empty string field in
+alphabetical order. Rune-truncated to 80 chars (tool calls) / 200 chars
+(tool results). Multibyte-safe. Affects `sessions last`, `sessions tail`,
+`sessions pick`, `sessions watch <id>` — every text-mode message render
+in the project.
+
+Before:
+
+    [tool: bash]
+    [tool-result: bash]
+    [tool: edit]
+    [tool-result: edit]
+
+After:
+
+    [tool: bash] cd D:/dev/go/crush && go build ./... 2>&1 | head -30
+    [tool-result: bash] no output
+    [tool: edit] D:/dev/go/crush/internal/cmd/queue.go
+    [tool-result: edit] <result> (+21 lines)
+
+**`sessions watch` reshaped: drop dashboard, default to picker → live-tail.**
+
+The old dashboard mode (auto-refreshed table of active sessions with
+PULSE / AGE / LAST_TOOL / TOKENS / COST columns) was removed — it
+duplicated `sessions list` + `sessions locks` and crowded the command
+with three modes (no-args / `--pick` / `<id>`) that obscured the actual
+job. `watch -n 3 'crush sessions list'` in the shell trivially
+reproduces what the dashboard did. Final shape:
+
+    crush sessions watch          → interactive picker, then live-tail
+    crush sessions watch <id>     → live-tail directly (short hash OK)
+
+Live-tail prints existing messages, polls every `--interval` (default
+1s) for new ones, and exits cleanly when the session ends. End
+detection has three independent signals, any of which terminates:
+
+    (a) the session row has a non-empty EndedReason
+    (b) the lock file disappeared AND ≥1 message exists (the "≥1
+        message" guard avoids racing the acquirer that has opened the
+        lock but not yet written its first message)
+    (c) the latest assistant message has a non-partial Finish.Reason
+
+The decision lives in the pure helper `isSessionFinishedFromState`
+so it is unit-testable without an app / DB / filesystem.
+
+On exit, `formatWatchSummary` renders the end-of-watch block:
+
+    --- session ended ---
+    id:       batch30-runaway-fork-tree-queue
+    title:    Batch 30: Sessions cancel, fork, tree, queue
+    reason:   stop
+    duration: 185h30m
+    tokens:   183,706 (prompt 183,669 + completion 37)
+    cost:     $0.5100
+
+`Ctrl+C` interrupts and prints `(interrupted — session still running)`
+*without* a summary — keeps the "I stopped watching" / "the session
+ended" distinction obvious. Title line is omitted when empty; budget
+suffix appended only when `BudgetMaxCost > 0`.
+
+Drive-by fix in `sessionsLastCmdRun`: the function called
+`resolveSessionID` to map a short hash to a full ID and then *ignored*
+the result, passing `args[0]` (the hash) directly into
+`Messages.List`. Short-hash invocations returned empty output. Now
+uses `sess.ID`. Same fix `sessions tail` already had.
+
+Tests (`internal/cmd/sessions_render_test.go` + `sessions_watch_test.go`):
+
+- `formatToolCallPreview` — 24 table cases (every per-tool branch +
+  invalid-JSON fallback + unknown-tool fallback + case-insensitive
+  matching + multibyte truncation + empty/whitespace input)
+- `formatToolResultPreview` — 7 cases (empty, single-line short / at-200 /
+  long, multiline with leading whitespace)
+- `truncatePreview` / `stringField` / `intField` — basic invariants
+- `isSessionFinishedFromState` — 8 cases (each of the three signals
+  individually, the "lock gone but no messages yet" race guard, the
+  no-signal live-session case, transient DB errors must NOT terminate,
+  Partial=true Finish must NOT terminate, EndedReason wins over
+  FinishPart when both are set)
+- `formatWatchSummary` — full layout / with budget / no title / no
+  CreatedAt (no panic, "0s" duration)
+- `formatWatchInt` — thousands separator at every order-of-magnitude
+  boundary
+- `formatAge` — boundary cases at 60s / 3600s
+
+Build clean, vet clean (modulo the pre-existing `csync.Map` lock-by-
+value warning), full `./internal/cmd/...` test suite green.
+
+Files:
+
+```
+internal/cmd/sessions_render.go         new — preview helpers
+internal/cmd/sessions_render_test.go    new — table-driven preview tests
+internal/cmd/sessions_watch.go          rewrite — dashboard mode dropped,
+                                        picker→live-tail is the default,
+                                        pure helpers isSessionFinishedFromState
+                                        and formatWatchSummary extracted
+internal/cmd/sessions_watch_test.go     new — finished/summary/age/int tests
+internal/cmd/sessions.go                renderer hooks + sessions-last hash fix
+CHANGELOG.fork.md                       this entry
+```
