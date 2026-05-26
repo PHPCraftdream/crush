@@ -449,6 +449,14 @@ func (s *service) List(ctx context.Context) ([]Session, error) {
 	return sessions, nil
 }
 
+// Fork merge note (origin/main 2736e487 "fix(ui): mark estimated context
+// usage" + 9595d1f0 "fix(session): preserve estimated usage marker"):
+// upstream added applyEstimatedUsageState / setEstimatedUsageState /
+// clearEstimatedUsageState as backend infrastructure for their TUI's
+// "estimated context usage" marker. Rejected — the whole feature drives
+// a TUI widget we do not ship; our WebUI handles usage display via the
+// WebSocket events stream (internal/server/events.go) without per-session
+// estimated-state tracking. See CHANGELOG.fork.md Section 2.
 func (s *service) ListAll(ctx context.Context) ([]Session, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id, parent_session_id, title, message_count,
 		prompt_tokens, completion_tokens, cost, updated_at, created_at,

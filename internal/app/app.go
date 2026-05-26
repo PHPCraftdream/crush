@@ -1154,6 +1154,11 @@ func (app *App) GetDefaultSmallModel(providerID string) config.SelectedModel {
 	}
 }
 
+// Fork merge note (origin/main 6716ef09 "feat(skills): user invocable skills"):
+// upstream added setupEvents/setupSubscriber to forward service events into a
+// bubbletea pubsub broker. We rejected this — our WebSocket hub
+// (internal/server/hub.go) handles event fan-out to browser clients directly
+// without going through tea.Msg. See CHANGELOG.fork.md Section 2.
 func (app *App) InitCoderAgent(ctx context.Context) error {
 	coderAgentCfg := app.config.Config().Agents[config.AgentCoder]
 	if coderAgentCfg.ID == "" {

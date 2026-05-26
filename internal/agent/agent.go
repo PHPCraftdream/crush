@@ -458,6 +458,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	history, files := a.preparePrompt(msgs, currentSession.Todos, call.Attachments...)
 
 	var currentAssistant *message.Message
+	var stepMessages []fantasy.Message
 	var shouldSummarize bool
 
 	// bgSummarizeLaunched ensures we launch at most one background
@@ -692,6 +693,10 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 				prepared.Messages = append([]fantasy.Message{fantasy.NewSystemMessage(promptPrefix)}, prepared.Messages...)
 			}
 
+			sessionLock.Lock()
+			stepMessages = cloneFantasyMessages(prepared.Messages)
+			sessionLock.Unlock()
+
 			var assistantMsg message.Message
 			assistantMsg, err = a.messages.Create(callContext, call.SessionID, message.CreateMessageParams{
 				Role:            message.Assistant,
@@ -894,7 +899,13 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			if getSessionErr != nil {
 				return getSessionErr
 			}
-			costDelta := a.updateSessionUsage(largeModel, &updatedSession, stepResult.Usage, a.openrouterCost(stepResult.ProviderMetadata))
+			// Fork merge note (origin/main 6ed8852b "fix(agent): estimate
+			// missing streamed usage"): if the provider omits the final
+			// usage chunk, use upstream's token estimator so our sliding
+			// context window stays accurate. We drop the "estimated" flag
+			// (TUI marker — see CHANGELOG.fork.md Section 2).
+			usage, _ := fallbackStepUsage(stepMessages, stepResult)
+			costDelta := a.updateSessionUsage(largeModel, &updatedSession, usage, a.openrouterCost(stepResult.ProviderMetadata))
 			if costDelta != 0 {
 				if _, costErr := a.sessions.IncrementCost(ctx, updatedSession.ID, costDelta); costErr != nil {
 					return costErr
@@ -1322,10 +1333,13 @@ func (a *sessionAgent) runSummarize(ctx context.Context, sessionID string, opts 
 		}
 	}
 
-	// Just in case, get just the last usage info.
+	// Just in case, get just the last usage info. Use upstream's
+	// summaryCompletionTokens helper (origin/main 6ed8852b) so we fall back
+	// to an approximate count when the provider omits OutputTokens on the
+	// summary stream's final usage chunk.
 	usage := resp.Response.Usage
 	freshSession.SummaryMessageID = summaryMessage.ID
-	freshSession.CompletionTokens = usage.OutputTokens
+	freshSession.CompletionTokens = summaryCompletionTokens(usage, summaryMessage)
 	freshSession.PromptTokens = 0
 	if _, err = a.sessions.Save(genCtx, freshSession); err != nil {
 		return err
@@ -1881,6 +1895,14 @@ func (a *sessionAgent) openrouterCost(metadata fantasy.ProviderMetadata) *float6
 // Fork patch (concurrency): upstream version was void; we now return
 // the delta and rely on the caller to drive IncrementCost. See
 // CHANGELOG.fork.md (Section 4.I).
+//
+// Fork merge note (origin/main 6ed8852b / 2e9c6505 / 74e6e378 "fix(agent):
+// estimate/harden fallback usage accounting"): adopted upstream's
+// updateSessionTokenCounters helper so partial-zero usage chunks no longer
+// overwrite accumulated counters with zero. Rejected their `estimated bool`
+// parameter (drives session.EstimatedUsage marker — a TUI widget we do not
+// ship, see CHANGELOG.fork.md Section 2) and their eventTokensUsed publish
+// (no consumer in our WebSocket fan-out).
 func (a *sessionAgent) updateSessionUsage(model Model, session *session.Session, usage fantasy.Usage, overrideCost *float64) float64 {
 	modelConfig := model.CatwalkCfg
 	cost := modelConfig.CostPer1MInCached/1e6*float64(usage.CacheCreationTokens) +
@@ -1899,9 +1921,32 @@ func (a *sessionAgent) updateSessionUsage(model Model, session *session.Session,
 	}
 
 	session.Cost += cost
-	session.CompletionTokens = usage.OutputTokens
-	session.PromptTokens = usage.InputTokens + usage.CacheReadTokens
+	updateSessionTokenCounters(session, usage)
 	return cost
+}
+
+// updateSessionTokenCounters writes a new usage snapshot into the session
+// without overwriting accumulated counters with zero. Fork merge note: from
+// origin/main 74e6e378 "fix(agent): harden fallback usage accounting".
+func updateSessionTokenCounters(session *session.Session, usage fantasy.Usage) {
+	if usage.OutputTokens != 0 {
+		session.CompletionTokens = usage.OutputTokens
+	}
+	if promptTokens := usage.InputTokens + usage.CacheReadTokens; promptTokens != 0 {
+		session.PromptTokens = promptTokens
+	}
+}
+
+// summaryCompletionTokens returns OutputTokens when the provider reported
+// them, otherwise falls back to an approximate count from the rendered
+// summary message. Fork merge note: from origin/main 6ed8852b
+// "fix(agent): estimate missing streamed usage" — used in Summarize when
+// the provider omits final usage on the summary stream.
+func summaryCompletionTokens(usage fantasy.Usage, summaryMessage message.Message) int64 {
+	if usage.OutputTokens != 0 {
+		return usage.OutputTokens
+	}
+	return approxTokenCount(summaryMessage.Content().Text) + approxTokenCount(summaryMessage.ReasoningContent().String())
 }
 
 func (a *sessionAgent) Cancel(sessionID string) {

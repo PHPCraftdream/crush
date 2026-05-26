@@ -4,16 +4,16 @@ go 1.26.3
 
 require (
 	charm.land/bubbletea/v2 v2.0.6
-	charm.land/catwalk v0.41.0
+	charm.land/catwalk v0.41.8
 	charm.land/fang/v2 v2.0.1
-	charm.land/fantasy v0.25.0
+	charm.land/fantasy v0.25.2
 	charm.land/lipgloss/v2 v2.0.3
 	charm.land/log/v2 v2.0.0
 	charm.land/x/vcr v0.1.1
 	github.com/JohannesKaufmann/html-to-markdown v1.6.0
 	github.com/PuerkitoBio/goquery v1.12.0
 	github.com/atotto/clipboard v0.1.4
-	github.com/aymanbagabas/go-pty v0.2.2
+	github.com/aymanbagabas/go-pty v0.2.3
 	github.com/aymanbagabas/go-udiff v0.4.1
 	github.com/bmatcuk/doublestar/v4 v4.10.0
 	github.com/charlievieth/fastwalk v1.0.14
@@ -28,18 +28,18 @@ require (
 	github.com/charmbracelet/x/term v0.2.2
 	github.com/denisbrodbeck/machineid v1.0.1
 	github.com/gen2brain/beeep v0.11.2
-	github.com/go-git/go-git/v5 v5.19.0
+	github.com/go-git/go-git/v5 v5.19.1
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.3
 	github.com/invopop/jsonschema v0.14.0
 	github.com/itchyny/gojq v0.12.19
 	github.com/joho/godotenv v1.5.1
 	github.com/mattn/go-isatty v0.0.22
-	github.com/modelcontextprotocol/go-sdk v1.6.0
-	github.com/ncruces/go-sqlite3 v0.34.1
+	github.com/modelcontextprotocol/go-sdk v1.6.1
+	github.com/ncruces/go-sqlite3 v0.34.2
 	github.com/nxadm/tail v1.4.11
 	github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c
-	github.com/posthog/posthog-go v1.12.5
+	github.com/posthog/posthog-go v1.12.6
 	github.com/pressly/goose/v3 v3.27.1
 	github.com/qjebbs/go-jsons v1.0.0-alpha.5
 	github.com/sourcegraph/jsonrpc2 v0.2.1
@@ -49,9 +49,9 @@ require (
 	github.com/tidwall/sjson v1.2.5
 	github.com/zeebo/xxh3 v1.1.0
 	go.uber.org/goleak v1.3.0
-	golang.org/x/net v0.54.0
+	golang.org/x/net v0.55.0
 	golang.org/x/sync v0.20.0
-	golang.org/x/sys v0.44.0
+	golang.org/x/sys v0.45.0
 	golang.org/x/text v0.37.0
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 	gopkg.in/yaml.v3 v3.0.1
@@ -103,7 +103,7 @@ require (
 	github.com/fsnotify/fsnotify v1.9.0 // indirect
 	github.com/go-git/gcfg v1.5.1-0.20230307220236-3a3c6141e376 // indirect
 	github.com/go-git/go-billy/v5 v5.9.0 // indirect
-	github.com/go-json-experiment/json v0.0.0-20260430182902-b6187a392ed4 // indirect
+	github.com/go-json-experiment/json v0.0.0-20260505212615-e40f80bf6836 // indirect
 	github.com/go-logfmt/logfmt v0.6.0 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
@@ -122,10 +122,10 @@ require (
 	github.com/itchyny/timefmt-go v0.1.8 // indirect
 	github.com/jackmordaunt/icns/v3 v3.0.1 // indirect
 	github.com/jbenet/go-context v0.0.0-20150711004518-d14ea06fba99 // indirect
-	github.com/kaptinlin/go-i18n v0.4.5 // indirect
-	github.com/kaptinlin/jsonpointer v0.4.20 // indirect
-	github.com/kaptinlin/jsonschema v0.7.13 // indirect
-	github.com/kaptinlin/messageformat-go v0.6.0 // indirect
+	github.com/kaptinlin/go-i18n v0.4.8 // indirect
+	github.com/kaptinlin/jsonpointer v0.4.23 // indirect
+	github.com/kaptinlin/jsonschema v0.7.14 // indirect
+	github.com/kaptinlin/messageformat-go v0.6.4 // indirect
 	github.com/klauspost/compress v1.18.6 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/klauspost/pgzip v1.2.6 // indirect
@@ -138,7 +138,7 @@ require (
 	github.com/muesli/mango-cobra v1.2.0 // indirect
 	github.com/muesli/mango-pflag v0.1.0 // indirect
 	github.com/muesli/roff v0.1.0 // indirect
-	github.com/ncruces/go-sqlite3-wasm/v2 v2.2.35301 // indirect
+	github.com/ncruces/go-sqlite3-wasm/v2 v2.4.35301 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
 	github.com/ncruces/julianday v1.0.0 // indirect
 	github.com/nfnt/resize v0.0.0-20180221191011-83c6a9932646 // indirect
@@ -157,7 +157,7 @@ require (
 	github.com/tadvi/systray v0.0.0-20190226123456-11a2b8fa57af // indirect
 	github.com/tidwall/match v1.1.1 // indirect
 	github.com/tidwall/pretty v1.2.1 // indirect
-	github.com/u-root/u-root v0.14.1-0.20250807200646-5e7721023dc7 // indirect
+	github.com/u-root/u-root v0.16.0 // indirect
 	github.com/u-root/uio v0.0.0-20240224005618-d2acac8f3701 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
@@ -175,10 +175,10 @@ require (
 	golang.org/x/oauth2 v0.36.0 // indirect
 	golang.org/x/term v0.43.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
-	google.golang.org/api v0.278.0 // indirect
-	google.golang.org/genai v1.56.0 // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20260504160031-60b97b32f348 // indirect
-	google.golang.org/grpc v1.81.0 // indirect
+	google.golang.org/api v0.279.0 // indirect
+	google.golang.org/genai v1.57.0 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20260511170946-3700d4141b60 // indirect
+	google.golang.org/grpc v1.81.1 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/dnaeon/go-vcr.v4 v4.0.6-0.20251110073552-01de4eb40290 // indirect
 	gopkg.in/tomb.v1 v1.0.0-20141024135613-dd632973f1e7 // indirect
@@ -187,3 +187,5 @@ require (
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
 )
+
+replace github.com/u-root/u-root => github.com/u-root/u-root v0.14.1-0.20250807200646-5e7721023dc7

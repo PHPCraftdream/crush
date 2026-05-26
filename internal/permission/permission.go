@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
+	"sync/atomic"
 
 	"github.com/charmbracelet/crush/internal/csync"
 	"github.com/charmbracelet/crush/internal/db"
@@ -106,7 +107,7 @@ type permissionService struct {
 	pendingRequests       *csync.Map[string, chan bool]
 	autoApproveSessions   map[string]bool
 	autoApproveSessionsMu sync.RWMutex
-	skip                  bool
+	skip                  atomic.Bool
 	allowedTools          []string
 	q                     *db.Queries
 
@@ -199,7 +200,7 @@ func (s *permissionService) Deny(permission PermissionRequest) {
 }
 
 func (s *permissionService) Request(ctx context.Context, opts CreatePermissionRequest) (bool, error) {
-	if s.skip {
+	if s.skip.Load() {
 		return true, nil
 	}
 
@@ -338,11 +339,11 @@ func (s *permissionService) SubscribeNotifications(ctx context.Context) <-chan p
 }
 
 func (s *permissionService) SetSkipRequests(skip bool) {
-	s.skip = skip
+	s.skip.Store(skip)
 }
 
 func (s *permissionService) SkipRequests() bool {
-	return s.skip
+	return s.skip.Load()
 }
 
 func NewPermissionService(ctx context.Context, workingDir string, skip bool, allowedTools []string, q *db.Queries) Service {
@@ -351,11 +352,14 @@ func NewPermissionService(ctx context.Context, workingDir string, skip bool, all
 		notificationBroker:  pubsub.NewBroker[PermissionNotification](),
 		workingDir:          workingDir,
 		autoApproveSessions: make(map[string]bool),
-		skip:                skip,
 		allowedTools:        allowedTools,
 		pendingRequests:     csync.NewMap[string, chan bool](),
 		q:                   q,
 	}
+	// Fork merge note (origin/main 6b312bee "fix: potential data race on
+	// permissionService"): upstream made skip atomic.Bool and initialises it
+	// after struct construction. Their pattern preserved.
+	svc.skip.Store(skip)
 
 	// Fork patch (concurrency): startup pre-load into an in-memory cache
 	// was removed. Request now queries the DB directly on every call so

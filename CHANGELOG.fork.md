@@ -78,6 +78,52 @@ top".
 
 ## 2. Merge guidance — how to resolve conflicts from upstream
 
+### Default rule — auto-reject all upstream TUI / client-server features
+
+**Anything upstream adds that exists to serve their TUI or their
+client-server REST architecture is rejected without discussion.** This
+is the fork's core posture, not a per-merge judgement call. Do not stop
+to ask the user about TUI/CS additions — they have made this decision
+once and it is permanent. Concrete patterns:
+
+- New `internal/ui/*` files (pills, picker, scrollbar, sidebar,
+  notifications widget, mark/marker UI markers, etc.) — `git rm`.
+- New `internal/backend/*`, `internal/client/*`, `internal/workspace/*`,
+  `internal/cmd/server*.go`, `internal/cmd/session.go`,
+  `internal/cmd/logout.go` — `git rm`.
+- New REST proto types in `internal/server/proto.go` or new
+  `internal/proto/*.go` files specifically wired to client-server
+  (e.g. `proto/skills.go` shipping `SkillsEvent`) — `git rm`.
+- New backend abstractions like `skills.Manager`, `skills.Catalog`,
+  `workspace.AppWorkspace`, anything with `WithGlobalMirror` /
+  cross-client RPC plumbing — `git rm` (the entire file/type).
+- Auto-merged callsites of such removed types (e.g. `app.Skills` field,
+  `skillsMgr` parameter, `s.applyEstimatedUsageState(...)`) — surgically
+  removed from our existing files. Auto-merge will silently leave these
+  in: search with `grep -rn '<removed-type-or-method>' internal/` after
+  every merge and clean them up.
+- New `setupEvents()` / `setupSubscriber()` style helpers that bridge
+  service brokers into a `tea.Msg` pubsub for bubbletea — drop the whole
+  block. Our WebSocket hub (`internal/server/hub.go`) handles fan-out
+  directly without going through tea.Msg.
+- TUI-driven backend fields like `Session.EstimatedUsage`,
+  `service.estimatedUsageMu`/`estimatedUsage` map and their setter
+  methods — drop entirely. The marker feature serves a TUI widget we do
+  not ship; the WebUI computes usage display from the event stream.
+
+If a *behavioural fix* arrives that happens to be packaged with TUI
+code (e.g. a `fix(ui): ...` commit that incidentally touches a session
+service), extract only the non-UI part and apply it manually — do not
+take the wrapper. The upstream UI infrastructure has zero callers in
+our fork's WebSocket+React surface, so any of it linked in becomes
+dead-but-compiled code that drags in bubbletea/lipgloss/fang.
+
+The narrow exception is `internal/ui/notification/` — OS-native
+notifications (Windows toast, macOS NotificationCenter, Linux libnotify)
+that the web server reuses to surface re-auth / out-of-credits events.
+
+### Per-file conflict table
+
 When you run `git merge origin/main` and get conflicts, the table below
 tells you which side is authoritative for each common conflict class.
 
@@ -1497,4 +1543,115 @@ internal/cmd/claude_init_test.go   rewrite — new tests for the new behaviour
 internal/cmd/claude_print.go       deleted — nothing left to print
 README.md                          rewrite of the claude-init section
 CHANGELOG.fork.md                  this entry
+```
+
+### Batch 23 — upstream merge v0.72.0 + system-prompt compression (2026-05-26)
+
+This batch covers two unrelated chunks landed back-to-back: a compression
+of the system prompt that ships with every `crush run`, and the
+upstream-merge of 42 commits (v0.71.0 + v0.72.0).
+
+**System-prompt compression (commit `882ffccd`)**
+
+`internal/agent/templates/coder.md.tpl` was 4922 bytes / 96 lines —
+fourteen dispersed rules plus four prose blocks (`<workflow>`,
+`<editing>`, `<coding>`, `<skills_usage>`) that mostly restated the
+rules in different words. Restructured into 5 thematic blocks (editing
+discipline, execution, I/O contract, safety boundary, project context)
+totalling 2772 bytes / 41 lines. Every behavioural hook preserved:
+the will-to-finish (autonomous + finish-every-part + only-stop-for-real-
+blocks + try-different-approach), the code-caution (read-before-edit +
+exact-whitespace + 3–5-lines-context + strict-scope + never-commit/push/
+amend/--no-verify), and the output contract (under 4 lines, no emojis,
+user's language, `crush run --json` needs `final_text`). ~44 % size
+reduction per invocation; saves ~600 input tokens on every native API
+call and every cliprovider subprocess invocation (both render this
+template).
+
+**Upstream merge — `origin/main` 42 commits → fork main**
+
+Backup branch: `backup/before-merge-20260526-124533`.
+
+Per-file decisions (anything not listed below was a clean auto-merge):
+
+| File / area | Decision | Reasoning |
+| ----------- | -------- | --------- |
+| All `internal/ui/*` modifications (~12 commits) | `git rm` | TUI removed in fork, see Section 2 default rule |
+| `internal/server/proto.go`, `config.go`, `cmd/server*.go`, `client/`, `backend/`, `workspace/`, `cla-signatures.json`, new upstream `backend_test.go` / `ui/*_test.go` | `git rm` | client-server REST architecture not used |
+| `go.mod` / `go.sum` (UU) | `--theirs` + `go mod tidy` + explicit `go get charm.land/fang/v2` + `replace github.com/u-root/u-root => v0.14.1-...` | upstream fantasy bump pulled u-root v0.16.0 which broke `mvdan.cc/sh/moreinterp/coreutils` (`gzip.New()` signature mismatch); pinned v0.14.1 to match what works with sh/moreinterp |
+| `internal/agent/templates/coder.md.tpl` (UU vs upstream `1811bec2`) | combine | kept our compressed 5-block version (from `882ffccd`), wove their "use `offset`/`limit` for large files" guidance into block 1 |
+| `internal/agent/tools/view.go` `DefaultReadLimit` (auto-merged to upstream 200) | manual override to **500** | upstream `1811bec2` cut 2000→200 to push agents toward offset/limit. We picked 500 as a compromise — small enough to discourage "read everything", large enough to cover most of our `.go` files in one pass so cliprovider subprocess agents (claude/codex/gemini) don't round-trip per read. `// Fork merge note` left in `view.go` |
+| `internal/agent/tools/bash.go` + `safe.go` + `safe_test.go` + new `recordingPermissionService` tests (`96728b15`) | upstream verbatim | clean security fix: `containsCommandChaining()` blocks the allowlist bypass `ls && rm -rf /`. Stubbed three extra DB-backed methods on the test mock to satisfy our extended `permission.Service` interface |
+| `internal/permission/permission.go` (UU + `6b312bee`) | combine | kept our DB-persistence (`ListSessionPermissions` / `UpdatePermissionEnabled` / `DeletePermission` + per-session yolo + cross-process direct-DB lookup) + adopted upstream's `skip atomic.Bool` race fix (`SetSkipRequests`/`SkipRequests` Load/Store, init via `svc.skip.Store(skip)` after struct ctor) |
+| `internal/permission/permission_test.go` `TestSkipRace` | adapted | rewrote the `NewPermissionService(...)` call to our extended signature (ctx, workingDir, skip, allowedTools, q) using the existing `newTestService` helper |
+| `internal/agent/agent.go` (5 UU clusters) | combine | kept our `updateSessionUsage(...) float64` signature — critical for our `sessions.IncrementCost(delta)` race-safe additive UPDATE under parallel `crush run` processes. Inside, replaced our direct token-counter assignment with upstream's `updateSessionTokenCounters` helper (doesn't overwrite accumulated counters with zero — `74e6e378`). In the streaming loop, prepended `usage, _ := fallbackStepUsage(stepMessages, stepResult)` so the new estimator (`6ed8852b`) corrects providers that omit final usage chunks. In `Summarize`, kept our `re-fetch session before save` (preserves user todo edits during summary stream) + `IncrementCost` pattern + adopted upstream's `summaryCompletionTokens(usage, summaryMessage)` helper. Took the two new helper functions verbatim. **Rejected**: their `estimated bool` parameter on `updateSessionUsage` (drives the TUI `EstimatedUsage` marker — Section 2 default rule); their `a.eventTokensUsed(...)` publish (no consumer in our WebSocket fan-out) |
+| `internal/agent/coordinator.go` (UU + `2faa467a`) | restored ours | upstream `6716ef09` threaded a `skillsMgr *skills.Manager` parameter through `NewCoordinator`; auto-merge left both that param and `skills.DiscoverFromConfig` call in. Stripped the parameter and restored our pre-merge `discoverSkills` body (uses `skills.DiscoverBuiltinWithStates` + `skills.DiscoverWithStates` directly) and its 7-arg `logDiscoveryStats` helper. `2faa467a`'s reasoning-effort guard (`if !model.SupportsReasoningEffort { …only thinking }`) auto-merged cleanly |
+| `internal/skills/skills.go` (UU) | combine struct only | kept our `Source` field (drives `DiscoverCommands` scrape of `~/.{claude,gemini,qwen,cursor,zed,windsurf,crush}/commands/` that the WebUI surfaces as slash-commands — fork-only feature), added their two new boolean flags (`UserInvocable`, `DisableModelInvocation`) so SKILL.md files using them parse without error. **Rejected** the rest of their skills-architecture rewrite |
+| `internal/skills/{catalog,manager,manager_test}.go` (upstream-added, ~600 LoC) | `git rm` | Manager/Catalog wraps per-workspace state for their multi-client backend (one Manager per workspace + `WithGlobalMirror` fallback for local TUI). We have a single embedded `App` per process and a WebSocket hub for fan-out — there is nothing to manage |
+| `internal/proto/skills.go` (upstream-added) | `git rm` | wire types for their REST client-server skills events — no consumer |
+| `internal/proto/proto.go` `Workspace.Skills []SkillState` field | dropped | dangling reference to removed `SkillState` |
+| `internal/app/app.go` (UU + auto-merged callsites) | keep ours | dropped their `setupEvents() / setupSubscriber[T any](...)` block (forwards service brokers into a bubbletea `tea.Msg` pubsub — TUI infrastructure). Stripped `Skills *skills.Manager` field, `skillsMgr` parameter on `New(...)`, and `app.Skills` argument to `NewCoordinator(...)` — all came in via auto-merge from their multi-client rewrite |
+| `internal/cmd/root.go` (UU 3 clusters) | `git checkout --ours` | upstream injected 418 lines of client-server bootstrap (`setupClientServerWorkspace`, `connectToServer`, `ensureServer`, `spawnAndWaitReady`, `localSkillsDiscoveryConfig`) into `setupApp()`. Our HEAD `setupApp()` is the simple embedded path — `appInstance, err := app.New(ctx, conn, store); return appInstance, nil`. Also stripped their imports of `internal/session` / `internal/skills` / `internal/ui/common` / `internal/ui/model` |
+| `internal/session/session.go` (UU + 5 auto-merged callsites) | keep ours + cleanup | restored our `ListAll` + value-receiver `fromDBItem`. Stripped the auto-merged `EstimatedUsage` infrastructure that came in as TUI-marker plumbing for upstream `2736e487 fix(ui): mark estimated context usage` + `9595d1f0 fix(session): preserve estimated usage marker`: removed `Session.EstimatedUsage` field, `service.estimatedUsageMu` mutex + `estimatedUsage` map, the three setter methods (`apply` / `set` / `clear`), and the 5 callsites that auto-merge had sprinkled through `Delete` / `Get` / `GetLast` / `Save` / `ListAll`. Section 2 default rule |
+| `internal/session/session_test.go` (AA) | `git checkout --ours` | our 242-line in-memory-SQLite test vs their 81-line stub — ours covers more behaviour |
+| `internal/server/events.go` + `server.go` (UU) | `git checkout --ours` | upstream rewrote both as REST `/v1/...` proto-conversion helpers (`messageToProto`, `sessionToProto`, `wrapEvent`, `recoverHandler` mux wrapper). Ours are the WebSocket subscriber + handler dispatch. Different architectures. `// Fork merge note` already in place from prior merges |
+| `internal/server/events_test.go` + `recover_test.go` | deleted | upstream-added tests for `messageToProto` / `recoverHandler` — both reference functions we never adopted |
+| `internal/client/config_test.go` | deleted | orphan test from the deleted `internal/client/` package |
+
+**New rules added to `CHANGELOG.fork.md` Section 2 — "Auto-reject all
+upstream TUI / client-server features".** Explicit, named patterns to
+catch on future merges (UI files, server/REST stack, Manager/Catalog
+abstractions, `setupEvents` + `tea.Msg` bridges, EstimatedUsage-style
+TUI marker plumbing, auto-merged callsites of removed types). The
+intent is to stop asking the user about TUI/CS additions — the decision
+is permanent.
+
+Verification:
+
+- `go build ./...` — clean
+- `go vet ./...` — clean (modulo the pre-existing `csync.Map` lock-by-
+  value warning unrelated to this merge)
+- `go test -count=1 -timeout=300s ./...` — zero regressions vs pre-merge
+  snapshot. All post-merge failures (`TestConfig_configureProviders*`,
+  `TestGlobWithDoubleStar/*`, `TestListDirectory/*`, `TestStreamExitError`)
+  were already failing pre-merge on Windows (Windows path-slash + cred
+  resolution flakes). New failures: 0.
+- Smoke: built `crush.exe`, ran `crush sessions list` / `sessions locks`
+  / `--help` — all clean
+- All 42 upstream commits absorbed or explicitly rejected (every
+  rejection logged in this batch entry or via `// Fork merge note`
+  in the touched file)
+
+Files touched (~25 modified, ~40 deleted, 0 added beyond what upstream
+shipped that we kept):
+
+```
+internal/agent/agent.go               — 5 conflict clusters resolved (usage accounting)
+internal/agent/coordinator.go         — skillsMgr stripped, discoverSkills restored
+internal/agent/templates/coder.md.tpl — kept compressed + offset/limit guidance
+internal/agent/tools/view.go          — DefaultReadLimit 2000→500
+internal/agent/tools/bash.go +safe.go +safe_test.go +bash_test.go — chained-perms fix
+internal/agent/usage_fallback.go +_test.go — taken; tests adapted to our 4-arg sig
+internal/app/app.go                   — Skills field + setupEvents block removed
+internal/cmd/root.go                  — kept ours (CS stack rejected)
+internal/permission/permission.go     — atomic.Bool skip + our extra methods
+internal/permission/permission_test.go — TestSkipRace adapted to our ctor sig
+internal/proto/proto.go               — Workspace.Skills field dropped
+internal/server/{events,server}.go    — kept ours (WebSocket)
+internal/session/session.go           — EstimatedUsage infra removed
+internal/session/session_test.go      — kept ours
+internal/skills/skills.go             — Skill struct combined
+go.mod / go.sum                       — upstream + fang/v2 + u-root pin
+CHANGELOG.fork.md                     — Section 2 auto-reject rule + this batch entry
+
+DELETED:
+internal/backend/ (3 files)
+internal/client/ (3 files including orphan test)
+internal/server/config.go +events_test.go +recover_test.go
+internal/skills/{catalog,manager,manager_test}.go
+internal/proto/skills.go
+internal/ui/ ~22 files across attachments/chat/common/dialog/list/model/styles + 2 new upstream test files
+internal/workspace/ (4 files)
+internal/cmd/server*.go — already deleted, just kept it that way
+.github/cla-signatures.json
 ```

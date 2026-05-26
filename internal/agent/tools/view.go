@@ -48,7 +48,7 @@ func viewDescription() string {
 type ViewParams struct {
 	FilePath string `json:"file_path" description:"The path to the file to read"`
 	Offset   int    `json:"offset,omitempty" description:"The line number to start reading from (0-based)"`
-	Limit    int    `json:"limit,omitempty" description:"The number of lines to read (defaults to 2000)"`
+	Limit    int    `json:"limit,omitempty" description:"The number of lines to read (defaults to 500)"`
 }
 
 type ViewPermissionsParams struct {
@@ -75,7 +75,14 @@ type ViewResponseMetadata struct {
 const (
 	ViewToolName     = "view"
 	MaxViewSize      = 200 * 1024 // 200KB
-	DefaultReadLimit = 2000
+	// Fork merge note (origin/main 1811bec2 "fix(prompts): tweak file reads
+	// to encourage more targeted reads"): upstream cut the default from
+	// 2000 to 200 to push the model toward offset/limit usage. We picked
+	// 500 as a compromise — small enough to discourage "read everything",
+	// large enough to cover most of our .go files in one pass so
+	// cliprovider subprocess agents (claude/codex/gemini) don't have to
+	// round-trip for every read.
+	DefaultReadLimit = 500
 	MaxLineLength    = 2000
 )
 

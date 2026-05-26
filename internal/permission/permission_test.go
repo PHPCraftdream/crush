@@ -25,6 +25,24 @@ func newTestService(t *testing.T, skip bool, allowedTools []string) Service {
 	return NewPermissionService(t.Context(), "/tmp", skip, allowedTools, db.New(conn))
 }
 
+func TestSkipRace(t *testing.T) {
+	// Fork merge note (origin/main 6b312bee "fix: potential data race on
+	// permissionService"): kept the test, adapted the call site to our
+	// extended NewPermissionService signature (ctx + Queries).
+	svc := newTestService(t, false, nil)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		svc.SetSkipRequests(true)
+	}()
+	go func() {
+		defer wg.Done()
+		svc.SkipRequests()
+	}()
+	wg.Wait()
+}
+
 func TestPermissionService_SkipMode(t *testing.T) {
 	svc := newTestService(t, true, nil)
 	result, err := svc.Request(t.Context(), CreatePermissionRequest{
