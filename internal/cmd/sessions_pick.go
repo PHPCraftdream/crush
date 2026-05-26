@@ -167,15 +167,23 @@ func (m *pickerModel) View() tea.View {
 
 	fmt.Fprintf(&b, "  Sessions (↑/↓ navigate, Enter select, q quit)\n\n")
 
+	// Column header. Two leading spaces match the cursor column width so
+	// columns align under their headers regardless of which row is
+	// selected. ID column is 32 chars wide — covers UUIDs (36 chars,
+	// truncated with ellipsis) and slug-style ids set via `--session <slug>`.
+	fmt.Fprintf(&b, "   %-8s  %-32s  %-30s  %-16s  %-7s  %s\n",
+		"HASH", "ID", "TITLE", "UPDATED", "COST", "AGE")
+
 	for i, item := range m.items {
 		cursor := "  "
 		if i == m.cursor {
 			cursor = "> "
 		}
-		fmt.Fprintf(&b, "%s %-8s %-41s %s  $%.4f  %s\n",
+		fmt.Fprintf(&b, "%s %-8s  %-32s  %-30s  %-16s  $%-6.4f  %s\n",
 			cursor,
 			item.hash,
-			item.title,
+			truncate(item.id, 32),
+			truncate(item.title, 30),
 			item.updated,
 			item.cost,
 			item.ago,
