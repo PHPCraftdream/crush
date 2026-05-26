@@ -389,12 +389,16 @@ func sessionsLastCmdRun(cmd *cobra.Command, args []string) error {
 	}
 	defer a.Shutdown()
 
-	sessionID := args[0]
-	if _, err := resolveSessionID(cmd.Context(), a.Sessions, sessionID); err != nil {
+	// Fix (pre-existing): resolveSessionID returned the full session but
+	// the next call passed args[0] (which may be a short hash). On a
+	// short-hash invocation that meant Messages.List got the hash, no
+	// match, empty output. Use the resolved ID.
+	sess, err := resolveSessionID(cmd.Context(), a.Sessions, args[0])
+	if err != nil {
 		return err
 	}
 
-	messages, err := a.Messages.List(cmd.Context(), sessionID)
+	messages, err := a.Messages.List(cmd.Context(), sess.ID)
 	if err != nil {
 		return fmt.Errorf("failed to list messages: %w", err)
 	}
@@ -1045,16 +1049,25 @@ func printMessage(w io.Writer, msg message.Message, format string) {
 			case message.TextContent:
 				fmt.Fprintf(w, "%s\n", p.Text)
 			case message.ToolCall:
-				fmt.Fprintf(w, "[tool: %s]\n", p.Name)
+				if preview := formatToolCallPreview(p.Name, p.Input); preview != "" {
+					fmt.Fprintf(w, "[tool: %s] %s\n", p.Name, preview)
+				} else {
+					fmt.Fprintf(w, "[tool: %s]\n", p.Name)
+				}
 			case message.ToolResult:
 				name := p.Name
 				if name == "" {
 					name = p.ToolCallID
 				}
+				preview := formatToolResultPreview(p.Content)
+				prefix := "[tool-result: " + name + "]"
 				if p.IsError {
-					fmt.Fprintf(w, "[tool-result: %s] ERROR\n", name)
+					prefix += " ERROR"
+				}
+				if preview != "" {
+					fmt.Fprintf(w, "%s %s\n", prefix, preview)
 				} else {
-					fmt.Fprintf(w, "[tool-result: %s]\n", name)
+					fmt.Fprintf(w, "%s\n", prefix)
 				}
 			}
 		}
