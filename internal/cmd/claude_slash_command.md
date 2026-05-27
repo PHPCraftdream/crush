@@ -22,6 +22,21 @@ Refuse, say so in one sentence, and offer to do it directly:
 - **One- or two-line work** — delegation overhead > the change.
 - **Mid-plan with the user** — keep the plan coherent in one head.
 
+## Fallback when `crush` hits rate limits
+
+If `crush run` fails with a rate-limit / quota error (or the provider
+itself is down), do **not** drop the task back on the user and do
+**not** ask for confirmation — just re-route immediately to an
+in-process sub-agent via the `Agent` tool:
+
+- Complex / non-trivial work → `@ao46l` (agent) — Opus, heavier model.
+- Simple / one-liner / mechanical task → `@ash` (agent) — Sonnet, faster.
+
+Brief the sub-agent the same way you would have briefed `crush`: state
+the goal, the file-set it may touch, and what "done" looks like. The
+zero-trust verification rule below still applies — verify the diff and
+re-run the tests yourself.
+
 ## Launching
 
 - `--role smart` for non-trivial, `--role fast` for one-liners.
