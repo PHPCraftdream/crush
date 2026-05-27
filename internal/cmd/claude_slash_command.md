@@ -176,31 +176,136 @@ hand.
 
 After any of these, `crush run --session <id>` can re-enter cleanly.
 
-## After the run finishes
+## After the run finishes — review with zero trust
 
-1. `Read` the result file (`.crush/stdin/<task>.out`). With `--json`
-   it is the wire envelope; with default mode it is the model's final
-   text.
-2. **Always sanity-check with `git status --short`** — the envelope's
-   `final_text` is what the MODEL claims it did, not what it actually
-   wrote to disk. Models occasionally edit files outside the asked
-   scope (e.g. "tidying up" `.gitignore` when you only asked for one
-   new line). If `git status` shows files outside the task's declared
-   scope, `git checkout HEAD --` them and re-prompt with tighter
-   constraints.
-3. Check `.warnings[]` in the JSON envelope. Specifically:
-   `final_text is empty` means the model ended on a tool_call without
-   composing a reply — fall back to `git status` plus `crush sessions
-   last <id>` (or `crush sessions watch <id>` to confirm it really did
-   stop) for context.
-4. Apply any small tactical fixes yourself (typos, missed imports);
-   re-delegate to the same `--session` for anything bigger.
-5. Report back to the user with the summary + cost + what changed.
+The sub-agent's `final_text` and the JSON envelope's claims are NOT
+evidence of what actually happened. Models routinely:
+
+- claim a fix that doesn't exist in the diff
+- add a test that asserts trivial truths or tautologies and would
+  pass against the bug (e.g. `assert.NoError(t, err)` without any
+  actual exercise of the failing path)
+- leave `TODO` / `XXX` / placeholder comments where they couldn't
+  finish a piece
+- edit files outside the asked scope ("tidying up" while nearby)
+- mark a feature "done" with a half-implementation that compiles
+  but doesn't wire end-to-end
+- report tests as "green" without running them, or run only a
+  subset and skip the slow integration ones
+
+Run the steps below in order after EVERY `crush run`. Stop at the
+first red flag and re-delegate (same `--session`) with a tighter
+prompt — don't paper over the gap yourself unless it's a typo / one
+import.
+
+### Step 1 — `git diff` is the source of truth
+
+```
+git status --short                  # what files changed?
+git diff <each-touched-file>        # read every hunk yourself
+```
+
+For each file IN scope of the task, confirm the change actually does
+what was asked. For each file OUT of scope, decide: keep, or
+`git checkout HEAD -- <file>` and re-prompt with tighter constraints.
+
+Don't skim. Read the diff like a code review — if you cannot explain
+in one sentence what each hunk does and why, re-delegate that part.
+
+### Step 2 — read the new tests, not the test count
+
+If the sub-agent added tests, OPEN them and read what they assert.
+Watch for these failure modes:
+
+- assertions that pass against the bug (asserting `err == nil` when
+  the bug also returns `nil`; asserting a slice is non-empty without
+  checking contents)
+- `t.Skip` with stale or always-true conditions
+- the test calls the function under test but never asserts its
+  output — only that it didn't panic
+- mocks that return exactly the value the test then checks for
+  ("tautology tests")
+- the test exercises a side effect (file written, DB row created)
+  but never reads it back to verify
+- the test is a syntactic copy of an existing one with a renamed
+  function — same assertions, no new coverage
+
+If a "new" test wouldn't fail against the pre-fix code, it has zero
+regression value. Re-delegate with: "the tests you added do not
+exercise the bug — write a test that fails against the previous
+commit, then make it pass."
+
+### Step 3 — run the tests yourself
+
+```
+go test -count=1 -timeout=180s ./<changed-package>/...
+cargo test -p <changed-crate> --no-fail-fast
+npm test --workspace=<changed-package>
+pytest <changed-dir>
+```
+
+`-count=1` defeats Go's test cache so you actually run the new tests
+rather than read a cached "PASS" from a previous run. Even if the
+sub-agent reports the tests were green, run them ONCE MORE — the
+sub-agent's run may have been optimistic, the cache may be lying,
+or unrelated code may have shifted under the test since.
+
+If a test fails, do NOT accept "must be a flake" without proof.
+Re-run it three times. If still flaky, treat as broken and
+re-delegate.
+
+### Step 4 — sanity-check build / vet / lint / typecheck
+
+```
+go build ./...     &&  go vet ./...
+cargo check        &&  cargo clippy -- -D warnings
+tsc --noEmit       &&  eslint .
+```
+
+The sub-agent may have introduced an import or signature change that
+compiles in the file it edited but breaks a downstream caller it
+didn't touch.
+
+### Step 5 — grep for surrender markers
+
+```
+git diff --no-color | grep -E "TODO|FIXME|XXX|unimplemented|placeholder|panic\\!"
+```
+
+These usually mean "I couldn't finish this part". If they appeared
+in the sub-agent's diff (not pre-existing — compare with `git log
+-1 -p` before the run), re-delegate the unfinished piece.
+
+### Step 6 — only NOW report back to the user
+
+Report:
+- what the sub-agent ACTUALLY did, per your diff review (not per
+  its envelope)
+- what tests you ran yourself, with the exact command, and what
+  passed / failed
+- any compromises or out-of-scope edits you accepted, or that you
+  reverted
+- if you re-delegated mid-review, also report what the second pass
+  changed
+
+Never echo the sub-agent's claim verbatim — your authority comes
+from the diff and the test run, not the envelope.
+
+### Where to look up envelope details
+
+- `.crush/stdin/<task>.out` — the wire envelope (with `--json`) or
+  the model's final text (default mode). Always read this first.
+- `.warnings[]` in the envelope — specifically
+  `final_text is empty` means the model ended on a `tool_call`
+  without composing a reply; fall back to `git status` and
+  `crush sessions last <id>` for context.
+- `crush sessions watch <id>` — to confirm the process really did
+  exit (not still running). Lock-alive heartbeat is the truth.
 
 (`crush sessions last <id>` and `crush sessions watch <id>` are only
-needed when the `.out` file is missing or you are doing post-mortem
-audit of an old session. For the just-finished run, the `.out` file
-already has the envelope — read that.)
+needed when the `.out` file is missing, or for post-mortem audit of
+an old session. For the just-finished run, the `.out` file already
+has the envelope — read that.)
 
 ## Task
 

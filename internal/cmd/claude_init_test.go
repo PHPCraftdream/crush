@@ -241,6 +241,60 @@ func TestClaudeInit_SlashCommandReferencesCurrentMonitoringCommands(t *testing.T
 		"sessions reap must be documented for bulk orphan-lock cleanup")
 }
 
+// TestClaudeInit_SlashCommandEnforcesZeroTrustReview pins the load-bearing
+// post-run review rules into the installed /crush slash-command. These
+// instructions are what prevent the orchestrator from rubber-stamping a
+// sub-agent's final_text without verifying the diff, reading the added
+// tests, and re-running them. If a future edit silently drops one of
+// these guards, this test fails and forces a reconsider.
+func TestClaudeInit_SlashCommandEnforcesZeroTrustReview(t *testing.T) {
+	dir := t.TempDir()
+	runClaudeInitInDir(t, dir)
+
+	slashPath := filepath.Join(dir, ".claude", "commands", "crush.md")
+	bts, err := os.ReadFile(slashPath)
+	require.NoError(t, err)
+	got := string(bts)
+
+	// Top-level posture.
+	assert.Contains(t, got, "review with zero trust",
+		"post-run review section must state the zero-trust posture")
+	assert.Contains(t, got, "evidence of what actually happened",
+		"must say final_text is NOT evidence of what happened (markdown wraps NOT and evidence onto separate lines)")
+
+	// Diff-as-truth (Step 1).
+	assert.Contains(t, got, "git diff",
+		"must instruct to read the diff hunk-by-hunk")
+	assert.Contains(t, got, "source of truth",
+		"git diff must be framed as the source of truth")
+
+	// Read added tests (Step 2).
+	assert.Contains(t, got, "read the new tests",
+		"must instruct to open and read tests the sub-agent added")
+	assert.Contains(t, got, "tautology",
+		"must warn against tautology tests (mocks that return the asserted value)")
+	assert.Contains(t, got, "wouldn't fail against the pre-fix code",
+		"must explain the regression-value criterion")
+
+	// Re-run the tests yourself (Step 3).
+	assert.Contains(t, got, "run the tests yourself",
+		"must instruct to re-run tests, not trust the sub-agent's claim")
+	assert.Contains(t, got, "-count=1",
+		"must mention -count=1 to defeat Go's test cache")
+
+	// Build/vet/lint sanity (Step 4).
+	assert.Contains(t, got, "go build ./...",
+		"must include go build in the post-run sanity check")
+
+	// Surrender markers (Step 5).
+	assert.Contains(t, got, "TODO",
+		"must mention searching for TODO / FIXME / placeholder markers")
+
+	// Report-back contract (Step 6).
+	assert.Contains(t, got, "Never echo the sub-agent's claim verbatim",
+		"must forbid echoing the envelope verbatim to the user")
+}
+
 func TestClaudeInit_SlashCommandOverwritesWithSentinel(t *testing.T) {
 	dir := t.TempDir()
 	runClaudeInitInDir(t, dir)
