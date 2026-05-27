@@ -24,10 +24,13 @@ Refuse, say so in one sentence, and offer to do it directly:
 
 ## Fallback when `crush` hits rate limits
 
-If `crush run` fails with a rate-limit / quota error (or the provider
-itself is down), do **not** drop the task back on the user and do
-**not** ask for confirmation — just re-route immediately to an
-in-process sub-agent via the `Agent` tool:
+Fall back to a local `Agent` sub-agent **only** when `crush` has hit a
+hard window / quota limit that won't recover by retrying — the user's
+weekly / monthly token budget is gone, the account is suspended, or the
+provider says "context window exceeded" / "quota exceeded" with no
+retry-after that would land inside this session.
+
+Re-route immediately in those cases, without asking for confirmation:
 
 - Complex / non-trivial work → `@ao46l` (agent) — Opus, heavier model.
 - Simple / one-liner / mechanical task → `@ash` (agent) — Sonnet, faster.
@@ -36,6 +39,19 @@ Brief the sub-agent the same way you would have briefed `crush`: state
 the goal, the file-set it may touch, and what "done" looks like. The
 zero-trust verification rule below still applies — verify the diff and
 re-run the tests yourself.
+
+**Do NOT fall back** for transient or recoverable failures:
+
+- a `--timeout` you yourself set fired — re-run `crush run` against the
+  **same `--session` id** with a larger `--timeout`.
+- a situational HTTP 429 with short retry-after (per-minute / per-second
+  throttle, concurrent-request cap) — wait the retry-after and re-run.
+- 5xx / network blip — re-run; if it persists, escalate to the user.
+- operator-side errors (bad flag, missing workspace, malformed prompt)
+  — fix the invocation and retry `crush`.
+
+The local-agent fallback is the **last resort**, not a shortcut around
+transient failures.
 
 ## Launching
 
