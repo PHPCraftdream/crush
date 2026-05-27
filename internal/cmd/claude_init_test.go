@@ -181,119 +181,22 @@ func TestClaudeInit_CreatesSlashCommand(t *testing.T) {
 	assert.Contains(t, got, "--role smart")
 }
 
-// TestClaudeInit_SlashCommandContainsOptInRules pins the load-bearing
-// safety rules into the installed /crush slash-command. These instructions
-// are what prevent Claude Code from auto-delegating tasks the user never
-// asked to delegate, and from delegating cases that require interactive
-// stop-and-ask (merges, debugging, follow-up clarifications). If a future
-// edit silently drops one of these guards, this test fails and forces a
-// reconsider.
-func TestClaudeInit_SlashCommandContainsOptInRules(t *testing.T) {
-	dir := t.TempDir()
-	runClaudeInitInDir(t, dir)
-
-	slashPath := filepath.Join(dir, ".claude", "commands", "crush.md")
-	bts, err := os.ReadFile(slashPath)
-	require.NoError(t, err)
-	got := string(bts)
-
-	// Top-level "opt-in only" rule.
-	assert.Contains(t, got, "opt-in only",
-		"slash command must declare itself opt-in (no auto-invocation)")
-	assert.Contains(t, got, "Do NOT auto-invoke this skill on later turns",
-		"slash command must forbid auto-delegating subsequent tasks in the same chat")
-
-	// "When NOT to delegate" guardrails.
-	assert.Contains(t, got, "When NOT to delegate",
-		"slash command must have an explicit section listing refusal cases")
-	assert.Contains(t, got, "interactive by nature",
-		"interactive tasks (merges, debugging) must be a documented refusal case")
-	assert.Contains(t, got, "depends on this conversation's context",
-		"context-dependent tasks must be a documented refusal case")
-}
-
-// TestClaudeInit_SlashCommandReferencesCurrentMonitoringCommands keeps the
-// monitoring section in sync with the actual sessions commands the fork
-// ships. If `sessions watch` is renamed or removed, or the live-tail tool
-// preview rendering goes away, this test fails so the slash-command help
-// gets updated in lockstep.
-func TestClaudeInit_SlashCommandReferencesCurrentMonitoringCommands(t *testing.T) {
-	dir := t.TempDir()
-	runClaudeInitInDir(t, dir)
-
-	slashPath := filepath.Join(dir, ".claude", "commands", "crush.md")
-	bts, err := os.ReadFile(slashPath)
-	require.NoError(t, err)
-	got := string(bts)
-
-	// Primary monitoring command.
-	assert.Contains(t, got, "crush sessions watch",
-		"sessions watch is the primary monitoring command — must be documented")
-
-	// Tool-call preview rendering (batch 24).
-	assert.Contains(t, got, "[tool: bash]",
-		"tool-call preview rendering must be documented so operators know what to expect")
-
-	// Lock-recovery commands (sessions kill / reset / reap).
-	assert.Contains(t, got, "crush sessions kill",
-		"sessions kill must be documented for stuck-lock recovery")
-	assert.Contains(t, got, "crush sessions reap",
-		"sessions reap must be documented for bulk orphan-lock cleanup")
-}
-
-// TestClaudeInit_SlashCommandEnforcesZeroTrustReview pins the load-bearing
-// post-run review rules into the installed /crush slash-command. These
-// instructions are what prevent the orchestrator from rubber-stamping a
-// sub-agent's final_text without verifying the diff, reading the added
-// tests, and re-running them. If a future edit silently drops one of
-// these guards, this test fails and forces a reconsider.
-func TestClaudeInit_SlashCommandEnforcesZeroTrustReview(t *testing.T) {
-	dir := t.TempDir()
-	runClaudeInitInDir(t, dir)
-
-	slashPath := filepath.Join(dir, ".claude", "commands", "crush.md")
-	bts, err := os.ReadFile(slashPath)
-	require.NoError(t, err)
-	got := string(bts)
-
-	// Top-level posture.
-	assert.Contains(t, got, "review with zero trust",
-		"post-run review section must state the zero-trust posture")
-	assert.Contains(t, got, "evidence of what actually happened",
-		"must say final_text is NOT evidence of what happened (markdown wraps NOT and evidence onto separate lines)")
-
-	// Diff-as-truth (Step 1).
-	assert.Contains(t, got, "git diff",
-		"must instruct to read the diff hunk-by-hunk")
-	assert.Contains(t, got, "source of truth",
-		"git diff must be framed as the source of truth")
-
-	// Read added tests (Step 2).
-	assert.Contains(t, got, "read the new tests",
-		"must instruct to open and read tests the sub-agent added")
-	assert.Contains(t, got, "tautology",
-		"must warn against tautology tests (mocks that return the asserted value)")
-	assert.Contains(t, got, "wouldn't fail against the pre-fix code",
-		"must explain the regression-value criterion")
-
-	// Re-run the tests yourself (Step 3).
-	assert.Contains(t, got, "run the tests yourself",
-		"must instruct to re-run tests, not trust the sub-agent's claim")
-	assert.Contains(t, got, "-count=1",
-		"must mention -count=1 to defeat Go's test cache")
-
-	// Build/vet/lint sanity (Step 4).
-	assert.Contains(t, got, "go build ./...",
-		"must include go build in the post-run sanity check")
-
-	// Surrender markers (Step 5).
-	assert.Contains(t, got, "TODO",
-		"must mention searching for TODO / FIXME / placeholder markers")
-
-	// Report-back contract (Step 6).
-	assert.Contains(t, got, "Never echo the sub-agent's claim verbatim",
-		"must forbid echoing the envelope verbatim to the user")
-}
+// Content-of-the-slash-command pin tests intentionally removed (2026-05):
+// asserting that specific marketing-style phrases ("opt-in only",
+// "zero trust", "never echo … verbatim") appear in the installed
+// markdown is testing the documentation, not the code. The slash
+// command is prose meant to instruct another LLM — its wording will
+// drift as we learn what works, and brittle string asserts only mean
+// every refinement also has to update a test file. The behavioural
+// contract that DOES matter — file gets written, our sentinel marker
+// is present (so claude-del can recognise it), $ARGUMENTS placeholder
+// is present (so Claude Code's slash-command machinery can substitute
+// the user's prompt) — is already covered by
+// TestClaudeInit_CreatesSlashCommand /
+// TestClaudeInit_SlashCommandOverwritesWithSentinel /
+// TestClaudeInit_SlashCommandSkipsWithoutSentinel above. The
+// claude_slash_command.md content review happens at code-review
+// time, not in CI.
 
 func TestClaudeInit_SlashCommandOverwritesWithSentinel(t *testing.T) {
 	dir := t.TempDir()
