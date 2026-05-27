@@ -330,6 +330,18 @@ func TestStringField(t *testing.T) {
 	assert.Equal(t, "", stringField(m, "missing"))
 }
 
+func TestFirstLine(t *testing.T) {
+	assert.Equal(t, "", firstLine(""))
+	assert.Equal(t, "", firstLine("   \n\t  "))
+	assert.Equal(t, "hello", firstLine("hello"))
+	assert.Equal(t, "hello", firstLine("  hello  "))
+	assert.Equal(t, "first", firstLine("first\nsecond\nthird"))
+	// Skips leading blank lines.
+	assert.Equal(t, "real", firstLine("\n\n  \n  real\nmore"))
+	// Carriage returns get trimmed off as whitespace.
+	assert.Equal(t, "abc", firstLine("abc\r\ndef"))
+}
+
 func TestIntField(t *testing.T) {
 	m := map[string]any{
 		"a": float64(42),

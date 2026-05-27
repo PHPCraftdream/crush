@@ -160,6 +160,22 @@ func formatToolResultPreview(content, originName, originInput string) string {
 	}
 }
 
+// firstLine returns the first non-empty line of s, trimmed. Empty input
+// (after trim) returns "". Used by message renderers to collapse a
+// multi-line reasoning / thinking block into a one-line preview.
+func firstLine(s string) string {
+	trimmed := strings.TrimSpace(s)
+	if trimmed == "" {
+		return ""
+	}
+	for _, line := range strings.Split(trimmed, "\n") {
+		if l := strings.TrimSpace(line); l != "" {
+			return l
+		}
+	}
+	return ""
+}
+
 // summariseResultContent collapses a tool result's content into a single
 // line of preview. Empty / whitespace-only → "". Single-line short →
 // as-is. Single-line long → ellipsised. Multiline → first line + "(+N

@@ -1105,16 +1105,28 @@ func printMessage(w io.Writer, msg message.Message, format string, callCtx map[s
 	} else {
 		// text format
 		fmt.Fprintf(w, "[%s]\n", msg.Role)
+		rendered := 0
 		for _, part := range msg.Parts {
 			switch p := part.(type) {
 			case message.TextContent:
+				if p.Text == "" {
+					continue
+				}
 				fmt.Fprintf(w, "%s\n", p.Text)
+				rendered++
+			case message.ReasoningContent:
+				if p.Thinking == "" {
+					continue
+				}
+				fmt.Fprintf(w, "[thinking] %s\n", truncatePreview(firstLine(p.Thinking), 200))
+				rendered++
 			case message.ToolCall:
 				if preview := formatToolCallPreview(p.Name, p.Input); preview != "" {
 					fmt.Fprintf(w, "[tool: %s] %s\n", p.Name, preview)
 				} else {
 					fmt.Fprintf(w, "[tool: %s]\n", p.Name)
 				}
+				rendered++
 			case message.ToolResult:
 				name := p.Name
 				if name == "" {
@@ -1131,7 +1143,15 @@ func printMessage(w io.Writer, msg message.Message, format string, callCtx map[s
 				} else {
 					fmt.Fprintf(w, "%s\n", prefix)
 				}
+				rendered++
 			}
+		}
+		if rendered == 0 {
+			// No renderable parts yet — most often a streaming row that
+			// hasn't flushed text, or an auto-checkpoint placeholder with
+			// only a partial Finish. Saying so explicitly is friendlier
+			// than leaving a bare role header.
+			fmt.Fprintf(w, "(no content yet)\n")
 		}
 		if f := msg.FinishPart(); f != nil && f.Reason != "" {
 			fmt.Fprintf(w, "(finished: %s)\n", f.Reason)
