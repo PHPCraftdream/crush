@@ -22,7 +22,10 @@ var sessionsWatchCmd = &cobra.Command{
 	Long: `One-stop "open a live view of a session" command.
 
 Without arguments: shows an interactive picker (arrow keys, Enter to
-select) and then drops into live-tail of the chosen session.
+select) and then drops into live-tail of the chosen session. The picker
+shows the 15 most recently active sessions and a "(+N not shown)"
+footer when there are older ones — use "crush sessions list" to see
+every session.
 
 With a <session-id> argument: skips the picker and live-tails that
 session directly. Short hashes (the HASH column of "sessions list")
@@ -367,9 +370,11 @@ func pickSessionForWatch(ctx context.Context, a *app.App) (string, error) {
 			ago:     formatAge(now.Sub(time.Unix(s.UpdatedAt, 0))),
 		}
 	}
+	items, hidden := trimSessionItems(items, pickerMaxItems)
 
 	m := pickerModel{
 		items:  items,
+		hidden: hidden,
 		cursor: 0,
 		binary: os.Args[0],
 	}

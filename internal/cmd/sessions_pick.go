@@ -20,7 +20,11 @@ var sessionsPickCmd = &cobra.Command{
 Arrow keys navigate, Enter selects, q or Ctrl+C exits without selection.
 
 By default, runs "crush sessions last <id>" on the selected session.
-Use --tail to run "crush sessions tail <id> --follow" instead.`,
+Use --tail to run "crush sessions tail <id> --follow" instead.
+
+Only the 15 most recently active sessions are shown in the picker —
+older ones are hidden and a "(+N not shown)" footer reports how many.
+Run "crush sessions list" to see every session.`,
 	Example: `
 # Pick a session and show last 10 messages
 crush sessions pick
@@ -72,9 +76,11 @@ func sessionsPickCmdRun(cmd *cobra.Command, args []string) error {
 			ago:     formatAge(now.Sub(time.Unix(s.UpdatedAt, 0))),
 		}
 	}
+	items, hidden := trimSessionItems(items, pickerMaxItems)
 
 	m := pickerModel{
 		items:   items,
+		hidden:  hidden,
 		cursor:  0,
 		tail:    tail,
 		binary:  os.Args[0],
@@ -107,6 +113,24 @@ func sessionsPickCmdRun(cmd *cobra.Command, args []string) error {
 	return subCmd.Run()
 }
 
+// pickerMaxItems caps how many session rows the interactive picker
+// shows. Sessions come back from the DB ordered by updated_at DESC,
+// so this is the N most-recently-active sessions. Older ones are
+// reachable by id via `sessions list` / `sessions show`. The cap keeps
+// the picker fit-on-screen on small terminals and avoids a wall of
+// rows when the DB has hundreds of entries.
+const pickerMaxItems = 15
+
+// trimSessionItems caps items to the first max entries and returns how
+// many were dropped, so the picker view can show "(+N more not shown)".
+// max <= 0 disables the cap. A nil / empty input is returned as-is.
+func trimSessionItems(items []sessionItem, max int) ([]sessionItem, int) {
+	if max <= 0 || len(items) <= max {
+		return items, 0
+	}
+	return items[:max], len(items) - max
+}
+
 type sessionItem struct {
 	id      string
 	hash    string
@@ -118,6 +142,7 @@ type sessionItem struct {
 
 type pickerModel struct {
 	items    []sessionItem
+	hidden   int // sessions excluded by pickerMaxItems; shown as a footer
 	cursor   int
 	selected string
 	tail     bool
@@ -188,6 +213,9 @@ func (m *pickerModel) View() tea.View {
 			item.cost,
 			item.ago,
 		)
+	}
+	if m.hidden > 0 {
+		fmt.Fprintf(&b, "\n  (+%d older sessions not shown — use `sessions list` to see all)\n", m.hidden)
 	}
 
 	return tea.NewView(b.String())
