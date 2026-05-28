@@ -1777,3 +1777,61 @@ internal/cmd/sessions_watch_test.go     new — finished/summary/age/int tests
 internal/cmd/sessions.go                renderer hooks + sessions-last hash fix
 CHANGELOG.fork.md                       this entry
 ```
+
+### Batch 31 — model aliases: top opus → Opus 4.8; ownership markers out of `description` (2026-05-29)
+
+Opus 4.8 shipped. Two related changes across the two model-alias
+subsystems: the `claude-init` slash-commands / sub-agents and the
+`crush models use` short-code table.
+
+**Top opus shortcuts now resolve to `claude-opus-4-8`.** In
+`allModelCommands` (`internal/cmd/claude_init.go`) the top-of-family
+opus aliases `ol/om/oh/ox/oxx` — and their agent twins
+`aol/aom/aoh/aox/aoxx` — were bumped from `claude-opus-4-7` to
+`claude-opus-4-8`. The versioned `o47*` / `ao47*` family stays pinned to
+`claude-opus-4-7`, so 4.7 remains reachable by its own prefix now that it
+is no longer the top. No `o48*` family was added — 4.8 is reached via the
+top aliases, matching the prior arrangement where the top mirrored the
+newest version. The display labels in `renderShortCodesBlock`
+(`internal/cmd/models_atoms.go`) were updated to match.
+
+**Ownership sentinels moved out of the visible `description`.** The
+`<!-- crush-model-command:v1 -->` / `<!-- crush-model-agent:v1 -->`
+markers used to sit inside the YAML `description:` field, so they leaked
+into the Claude Code command list and the agent picker / tool listing
+(e.g. `aoh: <!-- crush-model-agent:v1 --> claude-opus-…`). They are
+load-bearing — `claude-init` and `claude-del` both use a whole-file
+`strings.Contains(data, sentinel)` to tell our files from foreign ones
+before overwriting / deleting — so they can't simply be removed. The
+frontmatter must stay on line 1 (a leading comment makes Claude Code fail
+to parse the YAML and render that first line as the description — which is
+also why `crush.md`'s own leading sentinel shows up as its listed
+description), so the marker is now an HTML comment in the body:
+
+- commands have a tiny body (`$ARGUMENTS`), so the marker is buried ~50
+  blank lines down (`sentinelBodyGap`) to stay out of the command-body
+  preview as well as the description;
+- agents already have a long body, so the marker sits at the very end.
+
+The `Contains` ownership check is unchanged (it scans the whole file), so
+overwrite-protection and old-format GC still work — only the UI is
+cleaner.
+
+Drive-by: fixed a pre-existing gofmt misalignment in the `atom` struct in
+`models_atoms.go` (whitespace only).
+
+Build / vet / gofmt clean; `./internal/cmd/...` and `./internal/agent/`
+test suites green. The generated `.claude/**` files are gitignored — the
+source of truth is the Go generator; run `crush claude-init` (`--global`
+for `~/.claude/`) to refresh a workspace.
+
+Files:
+
+```
+internal/cmd/claude_init.go     top opus aliases (ol..oxx / aol..aoxx) → 4.8;
+                                sentinels moved out of description (end of
+                                command + agent body); batch-31 header note
+internal/cmd/models_atoms.go    short-code table top opus → 4.8; atom struct
+                                gofmt realign
+CHANGELOG.fork.md               this entry
+```

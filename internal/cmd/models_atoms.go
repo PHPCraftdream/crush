@@ -12,13 +12,13 @@ import (
 )
 
 type atom struct {
-	Provider    string
-	Model       string
-	DisplayName string
-	CtxLabel    string
-	Group       string
-	GroupNote   string
-	Vision      bool
+	Provider     string
+	Model        string
+	DisplayName  string
+	CtxLabel     string
+	Group        string
+	GroupNote    string
+	Vision       bool
 	EffortSource *cliEffortSource
 }
 
@@ -254,11 +254,11 @@ func renderShortCodesBlock() string {
 		{"h45m", "claude-haiku-4-5", "200k", "medium"},
 		{"h45h", "claude-haiku-4-5", "200k", "high"},
 		// Top-model shortcuts
-		{"ol", "claude-opus-4-7", "1M", "low"},
-		{"om", "claude-opus-4-7", "1M", "medium"},
-		{"oh", "claude-opus-4-7", "1M", "high"},
-		{"ox", "claude-opus-4-7", "1M", "xhigh"},
-		{"oxx", "claude-opus-4-7", "1M", "max"},
+		{"ol", "claude-opus-4-8", "1M", "low"},
+		{"om", "claude-opus-4-8", "1M", "medium"},
+		{"oh", "claude-opus-4-8", "1M", "high"},
+		{"ox", "claude-opus-4-8", "1M", "xhigh"},
+		{"oxx", "claude-opus-4-8", "1M", "max"},
 		{"sl", "claude-sonnet-4-6", "200k", "low"},
 		{"sm", "claude-sonnet-4-6", "200k", "medium"},
 		{"sh", "claude-sonnet-4-6", "200k", "high"},

@@ -1,3 +1,16 @@
+// Fork patch: batch 31 — Opus 4.8 shipped. Top-of-family opus shortcuts
+// (ol/om/oh/ox/oxx and agents aol..aoxx) now point at `claude-opus-4-8`;
+// the versioned o47*/ao47* family stays on `claude-opus-4-7` so 4.7 is
+// still reachable by its own prefix. Also: the crush-model-{command,agent}
+// sentinels moved OUT of the visible `description` (command → leading
+// comment line; agent → comment at end of body) so they stop leaking into
+// the Claude Code command list / agent picker. Frontmatter stays on line 1
+// (else Claude Code renders the leading line as the description); the
+// command marker is buried far below the body so it stays out of the
+// command-body preview too, and the agent marker sits at the end of its
+// (already long) body. The whole-file Contains() ownership check is
+// unchanged, so overwrite-protection + GC still work.
+//
 // Fork patch: batch 25 — rename model slash-commands from `<model>-<digit>`
 // (o47-0..o47-4) to letter-suffix notation (o47l..o47xx) and add top-model
 // shortcuts (ol, om, oh, ox, oxx, sl, sm, sh, sx, hl, hm, hh).
@@ -59,6 +72,15 @@ const (
 	claudeAgentsDir            = ".claude/agents"
 	claudeGlobalAgentsDir      = ".claude/agents" // relative to $HOME
 )
+
+// sentinelBodyGap is how many blank lines separate `$ARGUMENTS` from the
+// ownership sentinel at the bottom of a model-command body. The sentinel
+// has to live in the file (the whole-file Contains() check is how
+// claude-init / claude-del recognise files they own), but it must not show
+// up in Claude Code's command-body preview — so it is buried well below the
+// visible region. The exact count is not load-bearing; "comfortably off
+// screen" is the only requirement.
+const sentinelBodyGap = 50
 
 // resolveCommandsDir returns the directory where slash commands should be
 // written. When global is true it returns ~/.claude/commands; otherwise it
@@ -123,11 +145,11 @@ var allModelCommands = []modelCmd{
 	{"h45m", "claude-haiku-4-5", "medium", "Haiku 4.5 (200k) – medium"},
 	{"h45h", "claude-haiku-4-5", "high", "Haiku 4.5 (200k) – high"},
 	// Top-model shortcuts (point to top version of each family)
-	{"ol", "claude-opus-4-7", "low", "Opus (top, 1M) – low"},
-	{"om", "claude-opus-4-7", "medium", "Opus (top, 1M) – medium"},
-	{"oh", "claude-opus-4-7", "high", "Opus (top, 1M) – high"},
-	{"ox", "claude-opus-4-7", "xhigh", "Opus (top, 1M) – xhigh"},
-	{"oxx", "claude-opus-4-7", "max", "Opus (top, 1M) – max"},
+	{"ol", "claude-opus-4-8", "low", "Opus (top, 1M) – low"},
+	{"om", "claude-opus-4-8", "medium", "Opus (top, 1M) – medium"},
+	{"oh", "claude-opus-4-8", "high", "Opus (top, 1M) – high"},
+	{"ox", "claude-opus-4-8", "xhigh", "Opus (top, 1M) – xhigh"},
+	{"oxx", "claude-opus-4-8", "max", "Opus (top, 1M) – max"},
 	{"sl", "claude-sonnet-4-6", "low", "Sonnet (top, 200k) – low"},
 	{"sm", "claude-sonnet-4-6", "medium", "Sonnet (top, 200k) – medium"},
 	{"sh", "claude-sonnet-4-6", "high", "Sonnet (top, 200k) – high"},
@@ -159,7 +181,7 @@ Concretely:
        s46l..s46xx  claude-sonnet-4-6  200k ctx effort low→max (no xhigh)
        s45l..s45h   claude-sonnet-4-5  200k ctx effort low→high
        h45l..h45h   claude-haiku-4-5   200k ctx effort low→high
-       ol,om,oh,ox,oxx  claude-opus-4-7    1M ctx   (top opus shortcuts)
+       ol,om,oh,ox,oxx  claude-opus-4-8    1M ctx   (top opus shortcuts)
        sl,sm,sh,sx      claude-sonnet-4-6  200k ctx (top sonnet shortcuts)
        hl,hm,hh         claude-haiku-4-5   200k ctx (top haiku shortcuts)
 
@@ -376,12 +398,20 @@ func writeModelCommandsToDir(dir string) error {
 		} else if !os.IsNotExist(err) {
 			return fmt.Errorf("read %s: %w", path, err)
 		}
+		// Frontmatter MUST start on line 1 — a leading comment makes Claude
+		// Code fail to parse it and show that first line as the description.
+		// The visible `description` is kept clean (model + effort). The
+		// ownership sentinel is an HTML comment (inert in the prompt) pushed
+		// FAR below the body so it never surfaces in the command-body preview,
+		// yet is still found by our whole-file Contains() check.
 		content := "---\n" +
-			"description: " + claudeModelCmdSentinel + " " + mc.model + " effort=" + mc.effort + "\n" +
+			"description: " + mc.model + " effort=" + mc.effort + "\n" +
 			"model: " + mc.model + "\n" +
 			"effort: " + mc.effort + "\n" +
 			"---\n\n" +
-			"$ARGUMENTS\n"
+			"$ARGUMENTS\n" +
+			strings.Repeat("\n", sentinelBodyGap) +
+			claudeModelCmdSentinel + "\n"
 		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 			return fmt.Errorf("write %s: %w", path, err)
 		}
@@ -391,17 +421,23 @@ func writeModelCommandsToDir(dir string) error {
 }
 
 // buildAgentContent returns the body of `.claude/agents/a<name>.md`.
+//
+// The ownership sentinel lives as an HTML comment at the END of the body
+// (not in `description`) so it stays out of the user-visible agent picker /
+// tool listing but is still found by our whole-file Contains() check. An
+// HTML comment is inert in the system prompt itself.
 func buildAgentContent(mc modelCmd) string {
 	return "---\n" +
 		"name: a" + mc.name + "\n" +
-		"description: " + claudeModelAgentSentinel + " " + mc.model + " effort=" + mc.effort + " (" + mc.display + ") — delegate task in isolated context\n" +
+		"description: " + mc.model + " effort=" + mc.effort + " (" + mc.display + ") — delegate task in isolated context\n" +
 		"model: " + mc.model + "\n" +
 		"---\n\n" +
 		"You are a delegated worker invoked with reasoning effort: " + mc.effort + ".\n\n" +
 		"The user passed:\n\n" +
 		"$ARGUMENTS\n\n" +
 		"Do the task autonomously. Return only the final result — no preamble, no recap of steps. If the task is a question, answer it directly. If it's an action, do it and report what changed.\n\n" +
-		agentGitSafetyClause
+		agentGitSafetyClause +
+		"\n" + claudeModelAgentSentinel + "\n"
 }
 
 // agentGitSafetyClause is the shared "do not touch shared git state"
