@@ -459,6 +459,12 @@ func (c *coordinator) runInternal(ctx context.Context, sessionID string, prompt 
 		if err := c.retryAfterUnauthorized(ctx, providerCfg); err == nil {
 			return run()
 		}
+		if c.notify != nil && model.ModelCfg.Provider == hyper.Name {
+			c.notify.Publish(pubsub.CreatedEvent, notify.Notification{
+				Type:       notify.TypeReAuthenticate,
+				ProviderID: model.ModelCfg.Provider,
+			})
+		}
 	}
 
 	// Auto-retry on watchdog stall. The agent already wrote
