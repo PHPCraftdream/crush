@@ -400,8 +400,28 @@ func buildAgentContent(mc modelCmd) string {
 		"You are a delegated worker invoked with reasoning effort: " + mc.effort + ".\n\n" +
 		"The user passed:\n\n" +
 		"$ARGUMENTS\n\n" +
-		"Do the task autonomously. Return only the final result — no preamble, no recap of steps. If the task is a question, answer it directly. If it's an action, do it and report what changed.\n"
+		"Do the task autonomously. Return only the final result — no preamble, no recap of steps. If the task is a question, answer it directly. If it's an action, do it and report what changed.\n\n" +
+		agentGitSafetyClause
 }
+
+// agentGitSafetyClause is the shared "do not touch shared git state"
+// instruction injected into every delegated-worker agent. Many agents
+// can be active in the same repo at the same time (parallel crush runs,
+// concurrent /agent invocations); a single `git checkout` / `git reset`
+// / `git stash` / `git pull` from one of them silently corrupts the
+// in-progress work of the others. The clause is in English because the
+// agent prompts themselves are in English.
+const agentGitSafetyClause = "**Git safety — shared workspace.** You are one of several agents that " +
+	"may be working in this repository at the same time. Do NOT run any " +
+	"git command that mutates the working tree, index, refs or remotes — " +
+	"specifically `git checkout`, `git switch`, `git reset`, `git restore`, " +
+	"`git stash`, `git clean`, `git pull`, `git rebase`, `git merge`, " +
+	"`git branch -D/--delete`, `git commit`, `git push`, `git fetch --prune`, " +
+	"`git reflog expire`. Those operations can clobber another agent's " +
+	"in-flight edits or unstaged changes. Read-only inspection is fine " +
+	"(`git status`, `git log`, `git diff`, `git show`, `git branch -v`, " +
+	"`git rev-parse`, `git ls-files`). Only run a mutating git command " +
+	"when the task prompt you were given **explicitly tells you to**.\n"
 
 // writeModelAgentsToDir installs one a<name>.md per entry in allModelCommands
 // into dir. Files we don't own (missing sentinel) are left alone with a warning.

@@ -373,6 +373,10 @@ func TestClaudeInit_AgentFrontmatter(t *testing.T) {
 	assert.Contains(t, content, "model: claude-opus-4-7")
 	assert.Contains(t, content, "effort=high")
 	assert.Contains(t, content, "You are a delegated worker invoked with reasoning effort: high")
+	// Git-safety clause is part of the agent body for every model — pin
+	// just the anchor phrase so future tweaks to the wording don't break
+	// the test, but a missing clause does.
+	assert.Contains(t, content, "Git safety", "agent should carry the shared-workspace git-safety clause")
 }
 
 func TestClaudeInit_AgentSkipsWithoutSentinel(t *testing.T) {
