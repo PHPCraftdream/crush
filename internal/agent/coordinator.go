@@ -102,6 +102,12 @@ var copilotResponsesModels = map[string]bool{
 	"gpt-5-mini":    true,
 }
 
+// OpenCode models that use Anthropic Messages API instead of Chat Completions.
+// Ported from upstream b7f4ad6c (#3040).
+var opencodeMessagesModels = map[string]bool{
+	"qwen3.7-max": true,
+}
+
 const (
 	// streamStallRetriesDefault is the default Options.StreamStallRetries
 	// when the config key is absent or zero. We default to 2 (3 total
@@ -1111,7 +1117,8 @@ func (c *coordinator) buildOpenaiCompatProvider(baseURL, apiKey string, headers 
 
 	// Set HTTP client based on provider and debug mode.
 	var httpClient *http.Client
-	if providerID == string(catwalk.InferenceProviderCopilot) {
+	switch providerID {
+	case string(catwalk.InferenceProviderCopilot):
 		opts = append(
 			opts,
 			openaicompat.WithUseResponsesAPI(),
@@ -1120,7 +1127,8 @@ func (c *coordinator) buildOpenaiCompatProvider(baseURL, apiKey string, headers 
 			}),
 		)
 		httpClient = copilot.NewClient(isSubAgent, c.cfg.Config().Options.Debug)
-	} else if c.cfg.Config().Options.Debug {
+	}
+	if httpClient == nil && c.cfg.Config().Options.Debug {
 		httpClient = log.NewHTTPClient()
 	}
 	if httpClient != nil {
@@ -1239,6 +1247,14 @@ func (c *coordinator) buildProvider(providerCfg config.ProviderConfig, model con
 
 	apiKey, _ := c.cfg.Resolve(providerCfg.APIKey)
 	baseURL, _ := c.cfg.Resolve(providerCfg.BaseURL)
+
+	switch providerCfg.ID {
+	case string(catwalk.InferenceProviderOpenCodeGo), string(catwalk.InferenceProviderOpenCodeZen):
+		if opencodeMessagesModels[model.Model] {
+			baseURL = strings.TrimSuffix(baseURL, "/v1")
+			return c.buildAnthropicProvider(baseURL, apiKey, headers, providerCfg.ID)
+		}
+	}
 
 	switch providerCfg.Type {
 	case openai.Name:
