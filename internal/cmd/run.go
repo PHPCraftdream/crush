@@ -306,8 +306,8 @@ crush run --timeout 5m --session "long-task" "refactor the storage layer"
 			// Fork patch: batch 24 — on-finish hook.
 			onFinishHook, _ = cmd.Flags().GetString("on-finish")
 			// Fork patch: batch 30 — runaway protection.
-			maxCostStr, _     = cmd.Flags().GetString("max-cost")
-			maxTokensStr, _   = cmd.Flags().GetString("max-tokens")
+			maxCostStr, _   = cmd.Flags().GetString("max-cost")
+			maxTokensStr, _ = cmd.Flags().GetString("max-tokens")
 		)
 
 		if effort != "" {

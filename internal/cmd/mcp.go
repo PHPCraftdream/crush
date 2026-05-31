@@ -9,8 +9,8 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/charmbracelet/crush/internal/config"
 	mcpmanager "github.com/charmbracelet/crush/internal/agent/tools/mcp"
+	"github.com/charmbracelet/crush/internal/config"
 	"github.com/spf13/cobra"
 )
 
@@ -607,7 +607,7 @@ func makeMCPListItem(id string, m config.MCPConfig) mcpListItem {
 		DisabledTools: m.DisabledTools,
 		EnabledTools:  m.EnabledTools,
 		Timeout:       m.Timeout,
-		Source:         string(m.Source),
+		Source:        string(m.Source),
 	}
 }
 

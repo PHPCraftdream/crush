@@ -16,29 +16,29 @@ import (
 type TaskStatus string
 
 const (
-	StatusPending    TaskStatus = "pending"
-	StatusRunning    TaskStatus = "running"
-	StatusDone       TaskStatus = "done"
-	StatusFailed     TaskStatus = "failed"
-	StatusCancelled  TaskStatus = "cancelled"
+	StatusPending   TaskStatus = "pending"
+	StatusRunning   TaskStatus = "running"
+	StatusDone      TaskStatus = "done"
+	StatusFailed    TaskStatus = "failed"
+	StatusCancelled TaskStatus = "cancelled"
 )
 
 // Task is a row from the queue_tasks table.
 type Task struct {
-	ID          string
-	SessionID   string
-	Prompt      string
-	Role        string
-	MaxCost     float64
-	MaxTokens   int64
-	TimeoutSec  int64
-	Status      TaskStatus
-	Cost        float64
-	Tokens      int64
-	ExitReason  string
-	CreatedAt   int64
-	StartedAt   sql.NullInt64
-	FinishedAt  sql.NullInt64
+	ID         string
+	SessionID  string
+	Prompt     string
+	Role       string
+	MaxCost    float64
+	MaxTokens  int64
+	TimeoutSec int64
+	Status     TaskStatus
+	Cost       float64
+	Tokens     int64
+	ExitReason string
+	CreatedAt  int64
+	StartedAt  sql.NullInt64
+	FinishedAt sql.NullInt64
 }
 
 // Service provides CRUD for the queue_tasks table.

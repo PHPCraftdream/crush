@@ -57,7 +57,7 @@ func findAllBalancedJSONValues(text string) []string {
 func stripAndExtractJSON(text string) (cleaned, notes string, err error) {
 	// Fork patch: run fence-strip first (same as before).
 	inner := text
-	var fenceOpenEnd, fenceCloseStart = -1, -1
+	fenceOpenEnd, fenceCloseStart := -1, -1
 	if openEnd, closeStart, ok := findJSONFenceBounds(text); ok {
 		fenceOpenEnd = openEnd
 		fenceCloseStart = closeStart
@@ -216,7 +216,7 @@ func stripJSONEnvelope(text string) (cleaned, notes string) {
 	// Track fence boundaries separately so when the model wrapped the
 	// JSON in ```json … ``` with nothing else, the fence markers
 	// themselves do not get surfaced as "notes".
-	var fenceOpenEnd, fenceCloseStart = -1, -1
+	fenceOpenEnd, fenceCloseStart := -1, -1
 	if openEnd, closeStart, ok := findJSONFenceBounds(text); ok {
 		fenceOpenEnd = openEnd
 		fenceCloseStart = closeStart

@@ -4,8 +4,8 @@ import (
 	"testing"
 
 	"charm.land/catwalk/pkg/catwalk"
-	"github.com/charmbracelet/crush/internal/csync"
 	"github.com/charmbracelet/crush/internal/config"
+	"github.com/charmbracelet/crush/internal/csync"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -27,8 +27,8 @@ func makeAppForResolve(t *testing.T, providers map[string]config.ProviderConfig)
 
 func TestResolveModel_ExactProviderSlashModel(t *testing.T) {
 	a := makeAppForResolve(t, map[string]config.ProviderConfig{
-		"openai":   {ID: "openai", Models: []catwalk.Model{{ID: "gpt-5"}}},
-		"alt":      {ID: "alt", Models: []catwalk.Model{{ID: "gpt-5"}}}, // dup name
+		"openai": {ID: "openai", Models: []catwalk.Model{{ID: "gpt-5"}}},
+		"alt":    {ID: "alt", Models: []catwalk.Model{{ID: "gpt-5"}}}, // dup name
 	})
 	p, m, err := a.ResolveModel("openai/gpt-5")
 	require.NoError(t, err)

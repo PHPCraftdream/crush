@@ -1,4 +1,4 @@
-﻿// Package server implements the HTTP + WebSocket server for crush's web mode.
+// Package server implements the HTTP + WebSocket server for crush's web mode.
 // It serves the embedded React application and bridges the app's pubsub
 // event system to connected browsers over WebSocket.
 package server

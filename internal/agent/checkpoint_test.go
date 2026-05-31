@@ -31,6 +31,7 @@ func newMockCheckpointMsgSvc() *mockCheckpointMsgSvc {
 func (m *mockCheckpointMsgSvc) Create(_ context.Context, _ string, _ message.CreateMessageParams) (message.Message, error) {
 	return message.Message{}, nil
 }
+
 func (m *mockCheckpointMsgSvc) Update(_ context.Context, msg message.Message) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -39,25 +40,31 @@ func (m *mockCheckpointMsgSvc) Update(_ context.Context, msg message.Message) er
 	m.lastUpdated = &cp
 	return nil
 }
+
 func (m *mockCheckpointMsgSvc) Notify(msg message.Message) {
 	m.Publish(pubsub.UpdatedEvent, msg.Clone())
 }
+
 func (m *mockCheckpointMsgSvc) Get(_ context.Context, _ string) (message.Message, error) {
 	return message.Message{}, nil
 }
+
 func (m *mockCheckpointMsgSvc) List(_ context.Context, _ string) ([]message.Message, error) {
 	return nil, nil
 }
+
 func (m *mockCheckpointMsgSvc) ListUserMessages(_ context.Context, _ string) ([]message.Message, error) {
 	return nil, nil
 }
+
 func (m *mockCheckpointMsgSvc) ListAllUserMessages(_ context.Context) ([]message.Message, error) {
 	return nil, nil
 }
-func (m *mockCheckpointMsgSvc) Delete(_ context.Context, _ string) error  { return nil }
+func (m *mockCheckpointMsgSvc) Delete(_ context.Context, _ string) error { return nil }
 func (m *mockCheckpointMsgSvc) DeleteSessionMessages(_ context.Context, _ string) error {
 	return nil
 }
+
 func (m *mockCheckpointMsgSvc) SetPinned(_ context.Context, _ string, _ bool) error {
 	return nil
 }

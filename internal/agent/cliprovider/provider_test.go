@@ -967,12 +967,12 @@ func TestStreamWithCodexParser(t *testing.T) {
 
 	readCmd := "cat " + strings.ReplaceAll(tmpFile, "\\", "/")
 	spec := CLISpec{
-		ModelID:       "test-codex",
-		ModelName:     "Test Codex",
-		Binary:        "bash",
-		PromptFlag:    "-p",
-		BuildArgs:     func(bool) []string { return []string{"-c", readCmd} },
-		NewPartParser: codexPartParser,
+		ModelID:        "test-codex",
+		ModelName:      "Test Codex",
+		Binary:         "bash",
+		PromptFlag:     "-p",
+		BuildArgs:      func(bool) []string { return []string{"-c", readCmd} },
+		NewPartParser:  codexPartParser,
 		ParseUsageLine: codexParseUsageLine,
 	}
 	m := &cliModel{spec: spec, workingDir: tmpDir}

@@ -58,12 +58,12 @@ type Session struct {
 	CreatedAt        int64
 	UpdatedAt        int64
 
-	LargeModelProvider         string
-	LargeModelID               string
-	LargeModelReasoningEffort  string // "low", "medium", "high", or "max"
-	SmallModelProvider         string
-	SmallModelID               string
-	SmallModelReasoningEffort  string // "low", "medium", "high", or "max"
+	LargeModelProvider        string
+	LargeModelID              string
+	LargeModelReasoningEffort string // "low", "medium", "high", or "max"
+	SmallModelProvider        string
+	SmallModelID              string
+	SmallModelReasoningEffort string // "low", "medium", "high", or "max"
 
 	SystemPrompt    string
 	YoloEnabled     bool

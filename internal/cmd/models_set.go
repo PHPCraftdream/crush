@@ -1,8 +1,8 @@
 // Fork patch: batch 11 — `crush models set` removed in favour of
 // `crush models use <large> <small>`. This file keeps only:
-//   1. A hidden cobra command that prints a redirect notice + exits 2.
-//   2. `splitModelEffort`, the @level-suffix helper still used by atom parsing
-//      and a couple of tests.
+//  1. A hidden cobra command that prints a redirect notice + exits 2.
+//  2. `splitModelEffort`, the @level-suffix helper still used by atom parsing
+//     and a couple of tests.
 package cmd
 
 import (

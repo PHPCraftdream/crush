@@ -614,7 +614,6 @@ func mcpStatusLevel(s session.TodoStatus) int {
 	}
 }
 
-
 type mcpTodoItem struct {
 	Content    string `json:"content"     description:"What needs to be done (imperative form)"`
 	Status     string `json:"status"      description:"Task status: pending, in_progress, or completed"`
@@ -670,7 +669,7 @@ func registerTodosTool(srv *mcp.Server, sessions session.Service, sessionID stri
 				completedCount++
 			}
 		}
-				slog.Debug("cliprovider: MCP todos saved", "pending", pendingCount, "in_progress", inProgressCount, "completed", completedCount)
+		slog.Debug("cliprovider: MCP todos saved", "pending", pendingCount, "in_progress", inProgressCount, "completed", completedCount)
 		return toolText(fmt.Sprintf("Todo list updated. Status: %d pending, %d in progress, %d completed", pendingCount, inProgressCount, completedCount)), nil, nil
 	})
 }

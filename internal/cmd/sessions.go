@@ -760,14 +760,14 @@ func sessionsLocksCmdRun(cmd *cobra.Command, args []string) error {
 	}
 
 	type lockItem struct {
-		SessionID    string `json:"session_id"`
-		PID          int    `json:"pid"`
-		PulseSec     int64  `json:"pulse_sec"`
-		Pulse        string `json:"pulse"` // alive / ping / stopping / offline
-		AcquiredAt   int64  `json:"acquired_at_unix"`
-		DurationSec  int64  `json:"duration_seconds"`
-		Stale        bool   `json:"stale"`
-		BudgetSec    int64  `json:"budget_sec,omitempty"` // --timeout seconds, 0 if not set
+		SessionID   string `json:"session_id"`
+		PID         int    `json:"pid"`
+		PulseSec    int64  `json:"pulse_sec"`
+		Pulse       string `json:"pulse"` // alive / ping / stopping / offline
+		AcquiredAt  int64  `json:"acquired_at_unix"`
+		DurationSec int64  `json:"duration_seconds"`
+		Stale       bool   `json:"stale"`
+		BudgetSec   int64  `json:"budget_sec,omitempty"` // --timeout seconds, 0 if not set
 	}
 
 	var locks []lockItem
@@ -816,14 +816,14 @@ func sessionsLocksCmdRun(cmd *cobra.Command, args []string) error {
 		duration := int64(now.Sub(info.ModTime()).Seconds())
 
 		locks = append(locks, lockItem{
-			SessionID:    sessionID,
-			PID:          pid,
-			PulseSec:     pulseSec,
-			Pulse:        pulse,
-			AcquiredAt:   acqTime,
-			DurationSec:  duration,
-			Stale:        stale,
-			BudgetSec:    budgetSec,
+			SessionID:   sessionID,
+			PID:         pid,
+			PulseSec:    pulseSec,
+			Pulse:       pulse,
+			AcquiredAt:  acqTime,
+			DurationSec: duration,
+			Stale:       stale,
+			BudgetSec:   budgetSec,
 		})
 	}
 

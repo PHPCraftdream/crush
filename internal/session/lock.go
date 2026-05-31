@@ -34,7 +34,7 @@ type SessionLock struct {
 
 	f       *os.File
 	stop    chan struct{} // closed by Release to stop the heartbeat goroutine
-	release sync.Once    // Fork patch: review-fix — prevents double-close panic on concurrent Release()
+	release sync.Once     // Fork patch: review-fix — prevents double-close panic on concurrent Release()
 }
 
 // SessionLockBusyError is returned by TryAcquireSessionLock when the

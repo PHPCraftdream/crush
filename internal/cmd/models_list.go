@@ -73,10 +73,10 @@ type atomJSON struct {
 }
 
 type rawModelJSON struct {
-	Provider string `json:"provider"`
-	Model    string `json:"model"`
-	Ctx      int64  `json:"context_window,omitempty"`
-	CanReason bool  `json:"can_reason,omitempty"`
+	Provider  string `json:"provider"`
+	Model     string `json:"model"`
+	Ctx       int64  `json:"context_window,omitempty"`
+	CanReason bool   `json:"can_reason,omitempty"`
 }
 
 func emitModelsListJSON(cfg *config.Config) error {

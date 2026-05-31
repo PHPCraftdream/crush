@@ -12,9 +12,9 @@ import (
 
 func TestSplitModelEffort(t *testing.T) {
 	cases := []struct {
-		in           string
-		wantModel    string
-		wantEffort   string
+		in         string
+		wantModel  string
+		wantEffort string
 	}{
 		{"", "", ""},
 		{"gpt-5", "gpt-5", ""},
@@ -22,7 +22,7 @@ func TestSplitModelEffort(t *testing.T) {
 		{"gpt-5@high", "gpt-5", "high"},
 		{"openai/gpt-5@low", "openai/gpt-5", "low"},
 		{"@only-effort", "", "only-effort"}, // edge: leading @
-		{"weird@a@b", "weird@a", "b"},        // last @ wins
+		{"weird@a@b", "weird@a", "b"},       // last @ wins
 	}
 	for _, tc := range cases {
 		t.Run(tc.in, func(t *testing.T) {

@@ -2,7 +2,7 @@
 // coding agent from inside a crush sub-agent's tool surface. This closes
 // the silent-recursion path where:
 //
-//   parent agent → crush run → sub-agent → bash → claude/codex/gemini → …
+//	parent agent → crush run → sub-agent → bash → claude/codex/gemini → …
 //
 // — every link adds latency, multiplies token spend, and routinely
 // times out before the deepest agent ever returns a useful answer.
@@ -17,7 +17,6 @@ package agentguard
 import (
 	"encoding/base64"
 	"fmt"
-	"path/filepath"
 	"strings"
 	"unicode/utf16"
 )
@@ -74,51 +73,51 @@ var deniedAgents = map[string]string{
 // deniedNpmPackages lists packages a sub-agent might launch through npx /
 // pnpm dlx / yarn dlx / bunx without the agent binary being on PATH.
 var deniedNpmPackages = map[string]string{
-	"@anthropic-ai/claude-code":    "Anthropic Claude Code (via npx)",
-	"@openai/codex":                "OpenAI Codex CLI (via npx)",
-	"@google/gemini-cli":           "Google Gemini CLI (via npx)",
-	"@opencode-ai/opencode":        "opencode (via npx)",
-	"@continue/cli":                "Continue.dev (via npx)",
-	"@sourcegraph/amp":             "Sourcegraph Amp (via npx)",
-	"@sourcegraph/cody":            "Sourcegraph Cody (via npx)",
-	"@cursor-agent/cli":            "Cursor Agent (via npx)",
-	"@windsurf/cli":                "Windsurf (via npx)",
-	"@qwen-ai/qwen-cli":            "Qwen (via npx)",
+	"@anthropic-ai/claude-code": "Anthropic Claude Code (via npx)",
+	"@openai/codex":             "OpenAI Codex CLI (via npx)",
+	"@google/gemini-cli":        "Google Gemini CLI (via npx)",
+	"@opencode-ai/opencode":     "opencode (via npx)",
+	"@continue/cli":             "Continue.dev (via npx)",
+	"@sourcegraph/amp":          "Sourcegraph Amp (via npx)",
+	"@sourcegraph/cody":         "Sourcegraph Cody (via npx)",
+	"@cursor-agent/cli":         "Cursor Agent (via npx)",
+	"@windsurf/cli":             "Windsurf (via npx)",
+	"@qwen-ai/qwen-cli":         "Qwen (via npx)",
 }
 
 // deniedPypiPackages: pipx / uvx wrappers.
 var deniedPypiPackages = map[string]string{
-	"aider-chat":  "aider (via pipx/uvx)",
-	"aider-cli":   "aider (via pipx/uvx)",
-	"mentat-cli":  "mentat (via pipx/uvx)",
+	"aider-chat": "aider (via pipx/uvx)",
+	"aider-cli":  "aider (via pipx/uvx)",
+	"mentat-cli": "mentat (via pipx/uvx)",
 }
 
 // runners we look INTO — these wrap another command we must re-check.
 var packageRunners = map[string]bool{
-	"npx":   true,
-	"pnpm":  true, // pnpm dlx X
-	"yarn":  true, // yarn dlx X
-	"bunx":  true,
-	"bun":   true, // bun x X
-	"pipx":  true, // pipx run X
-	"uvx":   true,
-	"uv":    true, // uv tool run X
+	"npx":  true,
+	"pnpm": true, // pnpm dlx X
+	"yarn": true, // yarn dlx X
+	"bunx": true,
+	"bun":  true, // bun x X
+	"pipx": true, // pipx run X
+	"uvx":  true,
+	"uv":   true, // uv tool run X
 }
 
 var shellRunners = map[string]bool{
-	"bash":          true,
-	"sh":            true,
-	"dash":          true,
-	"zsh":           true,
-	"ksh":           true,
-	"fish":          true,
-	"cmd":           true,
-	"cmd.exe":       true,
-	"powershell":    true,
+	"bash":           true,
+	"sh":             true,
+	"dash":           true,
+	"zsh":            true,
+	"ksh":            true,
+	"fish":           true,
+	"cmd":            true,
+	"cmd.exe":        true,
+	"powershell":     true,
 	"powershell.exe": true,
-	"pwsh":          true,
-	"pwsh.exe":      true,
-	"nu":            true, // nushell
+	"pwsh":           true,
+	"pwsh.exe":       true,
+	"nu":             true, // nushell
 }
 
 // commandWrappers are commands that take ANOTHER command as their first
@@ -246,7 +245,15 @@ func checkSegment(segment string) error {
 // canonicalName strips directory prefix and a known executable suffix,
 // then lower-cases. "/usr/bin/Claude.EXE" → "claude".
 func canonicalName(name string) string {
-	base := filepath.Base(name)
+	// Strip the directory using BOTH path separators regardless of host OS.
+	// The command string we inspect can carry a Windows path
+	// (D:\bin\claude.exe) even when crush runs on Linux/macOS, where
+	// filepath.Base only understands "/". Without this, agentguard could be
+	// bypassed on non-Windows hosts by spelling the binary with backslashes.
+	base := name
+	if i := strings.LastIndexAny(base, `/\`); i >= 0 {
+		base = base[i+1:]
+	}
 	low := strings.ToLower(base)
 	for _, suf := range []string{".exe", ".cmd", ".bat", ".ps1", ".sh", ".py"} {
 		if strings.HasSuffix(low, suf) {

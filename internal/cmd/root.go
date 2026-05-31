@@ -1,4 +1,4 @@
-﻿package cmd
+package cmd
 
 // Fork patch: the upstream `rootCmd` launches the Bubble Tea TUI. In this fork
 // it launches the embedded web server (`crush web`) by default, opens the
@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"time"
 
+	"charm.land/fang/v2"
 	"github.com/atotto/clipboard"
 	"github.com/charmbracelet/crush/internal/app"
 	"github.com/charmbracelet/crush/internal/config"
@@ -27,9 +28,8 @@ import (
 	"github.com/charmbracelet/crush/internal/projects"
 	"github.com/charmbracelet/crush/internal/server"
 	"github.com/charmbracelet/crush/internal/version"
-	"charm.land/fang/v2"
-	"github.com/charmbracelet/x/term"
 	crushweb "github.com/charmbracelet/crush/web"
+	"github.com/charmbracelet/x/term"
 	"github.com/pkg/browser"
 	"github.com/spf13/cobra"
 )
@@ -148,7 +148,6 @@ func runWebMode(cmd *cobra.Command) error {
 		return err
 	}
 	defer a.Shutdown()
-
 
 	addr := fmt.Sprintf("%s:%d", host, port)
 	srv := server.New(a, addr, crushweb.FS())

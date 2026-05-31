@@ -1,4 +1,4 @@
-﻿// Package hyper provides a fantasy.Provider that proxies requests to Hyper.
+// Package hyper provides a fantasy.Provider that proxies requests to Hyper.
 package hyper
 
 import (
@@ -87,7 +87,7 @@ func New(opts ...Option) (fantasy.Provider, error) {
 		baseURL: BaseURL() + "/api/v1/fantasy",
 		name:    Name,
 		headers: map[string]string{},
-		client: &http.Client{Timeout: 0}, // stream-safe
+		client:  &http.Client{Timeout: 0}, // stream-safe
 	}
 	for _, opt := range opts {
 		opt(&o)

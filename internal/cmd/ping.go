@@ -54,7 +54,7 @@ crush ping --prompt "Reply with yes or no"
 var pingFastCmd = &cobra.Command{
 	Use:   "ping-fast [--json] [--timeout 15s] [--prompt \"<custom>\"]",
 	Short: "Ping the small model to verify connectivity and API key",
-	Long: `Same as 'crush ping' but for the configured small model.`,
+	Long:  `Same as 'crush ping' but for the configured small model.`,
 	Example: `
 # Default text output
 crush ping-fast
@@ -71,17 +71,17 @@ crush ping-fast --timeout 30s
 }
 
 type PingResult struct {
-	Provider           string `json:"provider"`
-	Model              string `json:"model"`
-	Effort             string `json:"effort,omitempty"`
-	Atom               string `json:"atom,omitempty"`
-	Status             string `json:"status"`
-	LatencyMs          int64  `json:"latency_ms"`
-	Response           string `json:"response,omitempty"`
-	PromptTokens       int64  `json:"prompt_tokens,omitempty"`
-	CompletionTokens   int64  `json:"completion_tokens,omitempty"`
-	CostUSD            float64 `json:"cost_usd,omitempty"`
-	Error              *string `json:"error"`
+	Provider         string  `json:"provider"`
+	Model            string  `json:"model"`
+	Effort           string  `json:"effort,omitempty"`
+	Atom             string  `json:"atom,omitempty"`
+	Status           string  `json:"status"`
+	LatencyMs        int64   `json:"latency_ms"`
+	Response         string  `json:"response,omitempty"`
+	PromptTokens     int64   `json:"prompt_tokens,omitempty"`
+	CompletionTokens int64   `json:"completion_tokens,omitempty"`
+	CostUSD          float64 `json:"cost_usd,omitempty"`
+	Error            *string `json:"error"`
 }
 
 func runPing(cmd *cobra.Command, modelType config.SelectedModelType) error {

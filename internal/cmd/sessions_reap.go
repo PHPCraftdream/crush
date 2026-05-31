@@ -35,10 +35,10 @@ crush sessions reap --all      # also nuke locks with unreadable PIDs
 }
 
 type reapItem struct {
-	Path    string
-	PID     int
-	AgeSec  int
-	Action  string // "remove-dead", "remove-unreadable", "skip-alive", "skip-young"
+	Path   string
+	PID    int
+	AgeSec int
+	Action string // "remove-dead", "remove-unreadable", "skip-alive", "skip-young"
 }
 
 func sessionsReapCmdRun(cmd *cobra.Command, args []string) error {

@@ -358,9 +358,9 @@ type codexEvent struct {
 	Type string `json:"type"`
 	// item.started / item.completed
 	Item struct {
-		Type            string `json:"type"`   // "agent_message" | "command_execution" | "reasoning" | ...
-		Text            string `json:"text"`   // agent_message: full response text
-		Command         string `json:"command"` // command_execution: command string
+		Type             string `json:"type"`              // "agent_message" | "command_execution" | "reasoning" | ...
+		Text             string `json:"text"`              // agent_message: full response text
+		Command          string `json:"command"`           // command_execution: command string
 		AggregatedOutput string `json:"aggregated_output"` // command_execution: combined stdout+stderr
 	} `json:"item"`
 	// turn.completed usage
@@ -729,13 +729,13 @@ type cliSessionEntry struct {
 }
 
 type cliProvider struct {
-	workingDir    string
-	yoloFn        func() bool
-	perms         permission.Service
-	sessions      session.Service
-	mcpProxy      ExternalMCPProxy
-	specs         map[string]CLISpec
-	cliSessions   *csync.Map[string, cliSessionEntry] // crush session key → CLI session entry
+	workingDir  string
+	yoloFn      func() bool
+	perms       permission.Service
+	sessions    session.Service
+	mcpProxy    ExternalMCPProxy
+	specs       map[string]CLISpec
+	cliSessions *csync.Map[string, cliSessionEntry] // crush session key → CLI session entry
 }
 
 // ExternalMCPTool describes an external MCP tool to expose through the crush MCP bridge.
@@ -767,12 +767,12 @@ func New(workingDir string, yoloFn func() bool, perms permission.Service, sessio
 		specs[s.ModelID] = s
 	}
 	return &cliProvider{
-		workingDir:    workingDir,
-		yoloFn:        yoloFn,
-		perms:         perms,
-		sessions:      sessions,
-		mcpProxy:      mcpProxy,
-		specs:         specs,
+		workingDir:  workingDir,
+		yoloFn:      yoloFn,
+		perms:       perms,
+		sessions:    sessions,
+		mcpProxy:    mcpProxy,
+		specs:       specs,
 		cliSessions: csync.NewMap[string, cliSessionEntry](),
 	}
 }
@@ -791,10 +791,10 @@ type cliModel struct {
 	spec        CLISpec
 	mcpProxy    ExternalMCPProxy
 	cliSessions *csync.Map[string, cliSessionEntry]
-	workingDir string
-	yoloFn     func() bool
-	perms      permission.Service
-	sessions   session.Service
+	workingDir  string
+	yoloFn      func() bool
+	perms       permission.Service
+	sessions    session.Service
 }
 
 func (m *cliModel) Provider() string { return ProviderID }
@@ -917,8 +917,8 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 	// (before the closure runs), deleting the config file before claude CLI
 	// can read it.
 	var mcpSrv *crushMCPServer
-	var mcpTmpCfg string    // path to temp MCP config file (claude-style); "" if not used
-	var qwenMCPName string  // registered name in ~/.qwen/settings.json; "" if not used
+	var mcpTmpCfg string     // path to temp MCP config file (claude-style); "" if not used
+	var qwenMCPName string   // registered name in ~/.qwen/settings.json; "" if not used
 	var geminiMCPName string // registered name in ~/.gemini/settings.json; "" if not used
 	// Fork patch: batch 20 — keep the MCP bridge active even in yolo/bypass mode.
 	// Before this fix, `!yolo` here meant that `crush run` (which sets yolo=true via

@@ -55,10 +55,10 @@ func TestReadLockPID_FileMissing(t *testing.T) {
 
 func TestSanitiseSessionIDForFilename(t *testing.T) {
 	cases := map[string]string{
-		"simple-id":       "simple-id",
-		"with/slash":      "with_slash",
-		"with\\backslash": "with_backslash",
-		"with space":      "with_space",
+		"simple-id":        "simple-id",
+		"with/slash":       "with_slash",
+		"with\\backslash":  "with_backslash",
+		"with space":       "with_space",
 		"a:b*c?d\"e<f>g|h": "a_b_c_d_e_f_g_h",
 	}
 	for in, want := range cases {

@@ -107,12 +107,12 @@ func TestSanitiseSessionID(t *testing.T) {
 	// like "audit-A", "pr-42". Belt-and-suspenders against future schemes
 	// that include path separators or shell-special chars.
 	cases := map[string]string{
-		"audit-A":                                "audit-A",
-		"abc/def":                                "abc_def",
-		"abc\\def":                               "abc_def",
-		"weird:id:with:colons":                   "weird_id_with_colons",
-		"a*b?c\"d<e>f|g h":                       "a_b_c_d_e_f_g_h",
-		"550e8400-e29b-41d4-a716-446655440000":   "550e8400-e29b-41d4-a716-446655440000",
+		"audit-A":                              "audit-A",
+		"abc/def":                              "abc_def",
+		"abc\\def":                             "abc_def",
+		"weird:id:with:colons":                 "weird_id_with_colons",
+		"a*b?c\"d<e>f|g h":                     "a_b_c_d_e_f_g_h",
+		"550e8400-e29b-41d4-a716-446655440000": "550e8400-e29b-41d4-a716-446655440000",
 	}
 	for in, want := range cases {
 		assert.Equal(t, want, sanitiseSessionID(in), "input: %q", in)
