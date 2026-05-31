@@ -18,6 +18,9 @@ permissions:
 
 jobs:
   triage:
+    # Fork: upstream-only — needs Charm's PERSONAL_ACCESS_TOKEN and labels Charm's
+    # issues/PRs. Skipped on forks.
+    if: github.repository == 'charmbracelet/crush'
     runs-on: ubuntu-latest
     steps:
       - uses: github/issue-labeler@c1b0f9f52a63158c4adc09425e858e87b32e9685 # v3.4

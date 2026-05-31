@@ -14,6 +14,9 @@ concurrency:
 
 jobs:
   snapshot:
+    # Fork: upstream-only — needs Charm's `releasers` runner group + GoReleaser
+    # Pro (GORELEASER_KEY). Skipped on forks, still runs on charmbracelet/crush.
+    if: github.repository == 'charmbracelet/crush'
     runs-on:
       # Use our own large runners with more CPU and RAM for faster builds
       group: releasers

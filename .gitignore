@@ -57,7 +57,11 @@ completions/crush.*sh
 /web/test-results/
 /test-results/
 
-/web/dist/
+/web/dist/*
+# Keep a committed placeholder so `//go:embed all:dist` (web/embed.go) resolves
+# in CI without a Node build step — fixes build/lint/CodeQL on the fork. The
+# real `npm run build` output stays ignored; only .gitkeep is tracked.
+!/web/dist/.gitkeep
 /web/node_modules/
 /chroma_data/
 

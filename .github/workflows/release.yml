@@ -13,6 +13,9 @@ concurrency:
 
 jobs:
   goreleaser:
+    # Fork: upstream-only — needs GoReleaser Pro + Charm's release secrets
+    # (Docker/Fury/NFPM/AUR/macOS signing). Skipped on forks.
+    if: github.repository == 'charmbracelet/crush'
     uses: charmbracelet/meta/.github/workflows/goreleaser.yml@main
     with:
       go_version: "1.26"

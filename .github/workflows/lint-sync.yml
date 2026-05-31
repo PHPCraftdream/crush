@@ -11,4 +11,7 @@ permissions:
 
 jobs:
   lint:
+    # Fork: upstream-only — syncs Charm's golangci config and opens PRs.
+    # Manual-only anyway; skipped on forks.
+    if: github.repository == 'charmbracelet/crush'
     uses: charmbracelet/meta/.github/workflows/lint-sync.yml@main
