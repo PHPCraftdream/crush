@@ -31,6 +31,7 @@ func newMockCheckpointMsgSvc() *mockCheckpointMsgSvc {
 func (m *mockCheckpointMsgSvc) Create(_ context.Context, _ string, _ message.CreateMessageParams) (message.Message, error) {
 	return message.Message{}, nil
 }
+
 func (m *mockCheckpointMsgSvc) Update(_ context.Context, msg message.Message) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -39,25 +40,31 @@ func (m *mockCheckpointMsgSvc) Update(_ context.Context, msg message.Message) er
 	m.lastUpdated = &cp
 	return nil
 }
+
 func (m *mockCheckpointMsgSvc) Notify(msg message.Message) {
 	m.Publish(pubsub.UpdatedEvent, msg.Clone())
 }
+
 func (m *mockCheckpointMsgSvc) Get(_ context.Context, _ string) (message.Message, error) {
 	return message.Message{}, nil
 }
+
 func (m *mockCheckpointMsgSvc) List(_ context.Context, _ string) ([]message.Message, error) {
 	return nil, nil
 }
+
 func (m *mockCheckpointMsgSvc) ListUserMessages(_ context.Context, _ string) ([]message.Message, error) {
 	return nil, nil
 }
+
 func (m *mockCheckpointMsgSvc) ListAllUserMessages(_ context.Context) ([]message.Message, error) {
 	return nil, nil
 }
-func (m *mockCheckpointMsgSvc) Delete(_ context.Context, _ string) error  { return nil }
+func (m *mockCheckpointMsgSvc) Delete(_ context.Context, _ string) error { return nil }
 func (m *mockCheckpointMsgSvc) DeleteSessionMessages(_ context.Context, _ string) error {
 	return nil
 }
+
 func (m *mockCheckpointMsgSvc) SetPinned(_ context.Context, _ string, _ bool) error {
 	return nil
 }
@@ -203,10 +210,8 @@ func TestCheckpointDisabledWhenZero(t *testing.T) {
 
 	// Simulate startCheckpoint with interval=0 — it returns immediately.
 	interval := time.Duration(0)
-	started := false
-	if interval > 0 {
-		started = true
-	}
+	started := interval > 0
+
 	require.False(t, started, "checkpoint should not start when interval is 0")
 
 	count := msgSvc.updateCount.Load()

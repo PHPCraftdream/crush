@@ -131,9 +131,9 @@ func TestMCPList_Grep(t *testing.T) {
 	t.Parallel()
 
 	servers := map[string]config.MCPConfig{
-		"memory":  {Type: config.MCPStdio, Command: "npx"},
-		"fetch":   {Type: config.MCPStdio, Command: "python"},
-		"remote":  {Type: config.MCPHttp, URL: "http://api.example.com/mcp"},
+		"memory": {Type: config.MCPStdio, Command: "npx"},
+		"fetch":  {Type: config.MCPStdio, Command: "python"},
+		"remote": {Type: config.MCPHttp, URL: "http://api.example.com/mcp"},
 	}
 
 	// Filter by "stdio" matches memory and fetch.
@@ -286,9 +286,9 @@ func TestMCPStore_AddAndRetrieve(t *testing.T) {
 	store, configPath := newTestStoreWithDir(t)
 
 	err := store.SetConfigFields(config.ScopeGlobal, map[string]any{
-		"mcp.myserver.type":    "stdio",
-		"mcp.myserver.command": "npx",
-		"mcp.myserver.args":    []string{"-y", "@mcp/server-memory"},
+		"mcp.myserver.type":     "stdio",
+		"mcp.myserver.command":  "npx",
+		"mcp.myserver.args":     []string{"-y", "@mcp/server-memory"},
 		"mcp.myserver.disabled": false,
 	})
 	require.NoError(t, err)
@@ -377,8 +377,6 @@ func TestMatchesMCPGrep(t *testing.T) {
 }
 
 func TestParseKVPairs(t *testing.T) {
-	t.Parallel()
-
 	cases := []struct {
 		name     string
 		input    []string

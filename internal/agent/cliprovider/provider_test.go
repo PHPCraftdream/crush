@@ -6,11 +6,20 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
 	"charm.land/fantasy"
 )
+
+func TestMain(m *testing.M) {
+	// go-pty's Windows ConPTY path has an internal data race that the -race
+	// detector flags. Force pipe mode for the whole cliprovider suite on
+	// Windows so streaming tests stay race-clean; Unix keeps PTY coverage.
+	testDisablePTY = runtime.GOOS == "windows"
+	os.Exit(m.Run())
+}
 
 func TestFormatPrompt(t *testing.T) {
 	tests := []struct {
@@ -285,8 +294,12 @@ func TestStreamExitError(t *testing.T) {
 	if gotError == nil {
 		t.Fatal("expected error from non-zero exit code")
 	}
-	if !strings.Contains(gotError.Error(), "error-text") {
-		t.Errorf("error should contain stderr, got: %v", gotError)
+	// stderr must surface somewhere. In pipe mode (NoPTY, e.g. Windows) it is
+	// appended to the error; in PTY mode (Unix) the kernel merges stderr into
+	// the tty's stdout, so it arrives as streamed text instead. Accept either.
+	surfaced := gotError.Error() + "\n" + gotText.String()
+	if !strings.Contains(surfaced, "error-text") {
+		t.Errorf("stderr should surface in error or output; err=%v text=%q", gotError, gotText.String())
 	}
 }
 
@@ -967,12 +980,12 @@ func TestStreamWithCodexParser(t *testing.T) {
 
 	readCmd := "cat " + strings.ReplaceAll(tmpFile, "\\", "/")
 	spec := CLISpec{
-		ModelID:       "test-codex",
-		ModelName:     "Test Codex",
-		Binary:        "bash",
-		PromptFlag:    "-p",
-		BuildArgs:     func(bool) []string { return []string{"-c", readCmd} },
-		NewPartParser: codexPartParser,
+		ModelID:        "test-codex",
+		ModelName:      "Test Codex",
+		Binary:         "bash",
+		PromptFlag:     "-p",
+		BuildArgs:      func(bool) []string { return []string{"-c", readCmd} },
+		NewPartParser:  codexPartParser,
 		ParseUsageLine: codexParseUsageLine,
 	}
 	m := &cliModel{spec: spec, workingDir: tmpDir}

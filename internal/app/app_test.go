@@ -12,8 +12,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-
-
 // TestEvents_ZeroConsumers verifies that publishing with no subscribers does
 // not block or panic.
 func TestEvents_ZeroConsumers(t *testing.T) {

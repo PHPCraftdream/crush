@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	_ "github.com/ncruces/go-sqlite3/driver"
-	_ "github.com/ncruces/go-sqlite3/embed"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -17,7 +16,7 @@ func setupTestDB(t *testing.T) *sql.DB {
 	require.NoError(t, err)
 	t.Cleanup(func() { db.Close() })
 
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS queue_tasks (
+	_, err = db.ExecContext(context.Background(), `CREATE TABLE IF NOT EXISTS queue_tasks (
 		id TEXT PRIMARY KEY,
 		session_id TEXT,
 		prompt TEXT NOT NULL,

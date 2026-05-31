@@ -140,7 +140,8 @@ func newCrushMCPServer(ctx context.Context, perms permission.Service, sessions s
 		rawHandler.ServeHTTP(w, r)
 	})
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	var lc net.ListenConfig
+	ln, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, fmt.Errorf("cliprovider: start MCP listener: %w", err)
 	}
@@ -405,7 +406,13 @@ func registerViewTool(srv *mcp.Server, perms permission.Service, workingDir stri
 var crushClaudeInitBlockPattern = regexp.MustCompile(`(?s)<!-- crush-claude-init:v\d+ -->.*?<!-- /crush-claude-init -->\s*`)
 
 func isClaudeMdPath(path string) bool {
-	base := filepath.Base(path)
+	// Split on BOTH separators regardless of host OS: the path may be a
+	// Windows path (…\CLAUDE.md) even when crush runs on Linux/macOS, where
+	// filepath.Base only understands "/".
+	base := path
+	if i := strings.LastIndexAny(base, `/\`); i >= 0 {
+		base = base[i+1:]
+	}
 	// Case-insensitive — Windows users sometimes write "Claude.md".
 	return strings.EqualFold(base, "CLAUDE.md")
 }
@@ -614,7 +621,6 @@ func mcpStatusLevel(s session.TodoStatus) int {
 	}
 }
 
-
 type mcpTodoItem struct {
 	Content    string `json:"content"     description:"What needs to be done (imperative form)"`
 	Status     string `json:"status"      description:"Task status: pending, in_progress, or completed"`
@@ -670,7 +676,7 @@ func registerTodosTool(srv *mcp.Server, sessions session.Service, sessionID stri
 				completedCount++
 			}
 		}
-				slog.Debug("cliprovider: MCP todos saved", "pending", pendingCount, "in_progress", inProgressCount, "completed", completedCount)
+		slog.Debug("cliprovider: MCP todos saved", "pending", pendingCount, "in_progress", inProgressCount, "completed", completedCount)
 		return toolText(fmt.Sprintf("Todo list updated. Status: %d pending, %d in progress, %d completed", pendingCount, inProgressCount, completedCount)), nil, nil
 	})
 }

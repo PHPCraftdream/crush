@@ -130,9 +130,6 @@ func runStats(cmd *cobra.Command, _ []string) error {
 	if dataDir == "" {
 		dataDir = cfg.Config().Options.DataDirectory
 	}
-	if shouldEnableMetrics(cfg.Config()) {
-	}
-
 	conn, err := db.Connect(ctx, dataDir)
 	if err != nil {
 		return fmt.Errorf("failed to connect to database: %w", err)

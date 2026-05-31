@@ -22,9 +22,9 @@ func tryLockFile(f *os.File) error {
 	err := windows.LockFileEx(
 		windows.Handle(f.Fd()),
 		flags,
-		0,                  // reserved, must be 0
-		^uint32(0),         // nNumberOfBytesToLockLow
-		^uint32(0),         // nNumberOfBytesToLockHigh
+		0,          // reserved, must be 0
+		^uint32(0), // nNumberOfBytesToLockLow
+		^uint32(0), // nNumberOfBytesToLockHigh
 		&overlapped,
 	)
 	return err

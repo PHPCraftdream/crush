@@ -73,8 +73,8 @@ type ViewResponseMetadata struct {
 }
 
 const (
-	ViewToolName     = "view"
-	MaxViewSize      = 200 * 1024 // 200KB
+	ViewToolName = "view"
+	MaxViewSize  = 200 * 1024 // 200KB
 	// Fork merge note (origin/main 1811bec2 "fix(prompts): tweak file reads
 	// to encourage more targeted reads"): upstream cut the default from
 	// 2000 to 200 to push the model toward offset/limit usage. We picked

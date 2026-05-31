@@ -7,6 +7,9 @@ on:
 
 jobs:
   check:
+    # Fork: upstream-only — the nightly build needs GoReleaser Pro (GORELEASER_KEY).
+    # Skipped on forks, still runs on charmbracelet/crush.
+    if: github.repository == 'charmbracelet/crush'
     runs-on: ubuntu-latest
     outputs:
       should_run: ${{ steps.check.outputs.should_run }}
@@ -25,7 +28,7 @@ jobs:
           fi
   nightly:
     needs: check
-    if: needs.check.outputs.should_run == 'true'
+    if: github.repository == 'charmbracelet/crush' && needs.check.outputs.should_run == 'true'
     uses: charmbracelet/meta/.github/workflows/nightly.yml@main
     secrets:
       goreleaser_key: ${{ secrets.GORELEASER_KEY }}

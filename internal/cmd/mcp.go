@@ -9,8 +9,8 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/charmbracelet/crush/internal/config"
 	mcpmanager "github.com/charmbracelet/crush/internal/agent/tools/mcp"
+	"github.com/charmbracelet/crush/internal/config"
 	"github.com/spf13/cobra"
 )
 
@@ -379,11 +379,12 @@ crush mcp add auth-server --type http --url http://api.example.com/mcp --header 
 		command, _ := cmd.Flags().GetString("command")
 		mcpURL, _ := cmd.Flags().GetString("url")
 
-		if mcpType == config.MCPStdio {
+		switch mcpType {
+		case config.MCPStdio:
 			if command == "" {
 				return fmt.Errorf("--command is required for stdio type")
 			}
-		} else if mcpType == config.MCPSSE || mcpType == config.MCPHttp {
+		case config.MCPSSE, config.MCPHttp:
 			if mcpURL == "" {
 				return fmt.Errorf("--url is required for %s type", mcpType)
 			}
@@ -607,7 +608,7 @@ func makeMCPListItem(id string, m config.MCPConfig) mcpListItem {
 		DisabledTools: m.DisabledTools,
 		EnabledTools:  m.EnabledTools,
 		Timeout:       m.Timeout,
-		Source:         string(m.Source),
+		Source:        string(m.Source),
 	}
 }
 

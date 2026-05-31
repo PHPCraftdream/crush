@@ -3,6 +3,7 @@
 package session
 
 import (
+	"context"
 	"fmt"
 	"os/exec"
 
@@ -33,7 +34,7 @@ func KillProcess(pid int) error {
 		return nil
 	}
 	if path, lookErr := exec.LookPath("taskkill"); lookErr == nil {
-		out, err := exec.Command(path, "/F", "/T", "/PID", fmt.Sprintf("%d", pid)).CombinedOutput()
+		out, err := exec.CommandContext(context.Background(), path, "/F", "/T", "/PID", fmt.Sprintf("%d", pid)).CombinedOutput()
 		if err == nil {
 			return nil
 		}

@@ -290,9 +290,9 @@ crush providers add local-llm --name "Local LLM" --type openai-compat --base-url
 		}
 
 		fields := map[string]any{
-			"providers." + id + ".name":      name,
-			"providers." + id + ".type":      typeStr,
-			"providers." + id + ".disable":   pc.Disable,
+			"providers." + id + ".name":    name,
+			"providers." + id + ".type":    typeStr,
+			"providers." + id + ".disable": pc.Disable,
 		}
 		if baseURL != "" {
 			fields["providers."+id+".base_url"] = baseURL
@@ -377,7 +377,7 @@ func updateSingleProvider(a *app.App, id string) error {
 
 	var diffStr strings.Builder
 	if newCount > oldCount {
-		diffStr.WriteString(fmt.Sprintf(" (+%d", newCount-oldCount))
+		fmt.Fprintf(&diffStr, " (+%d", newCount-oldCount)
 		if len(added) > 0 && len(added) <= 3 {
 			diffStr.WriteString(": ")
 			for i, m := range added {
@@ -389,7 +389,7 @@ func updateSingleProvider(a *app.App, id string) error {
 		}
 		diffStr.WriteString(")")
 	} else if newCount < oldCount {
-		diffStr.WriteString(fmt.Sprintf(" (-%d", oldCount-newCount))
+		fmt.Fprintf(&diffStr, " (-%d", oldCount-newCount)
 		if len(removed) > 0 && len(removed) <= 3 {
 			diffStr.WriteString(": ")
 			for i, m := range removed {
@@ -582,28 +582,42 @@ var providersGrepCmd = &cobra.Command{
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		a, err := setupApp(cmd)
-		if err != nil { return err }
+		if err != nil {
+			return err
+		}
 		defer a.Shutdown()
 		needle := strings.ToLower(args[0])
 		providers := a.Config().Providers.Copy()
 		ids := make([]string, 0, len(providers))
-		for id := range providers { ids = append(ids, id) }
+		for id := range providers {
+			ids = append(ids, id)
+		}
 		sort.Strings(ids)
 		tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 		fmt.Fprintln(tw, "ID	NAME	TYPE	STATUS	MODELS	API_KEY	BASE_URL")
 		matched := 0
 		for _, id := range ids {
 			p := providers[id]
-			if !matchesGrep(id, p, needle) { continue }
+			if !matchesGrep(id, p, needle) {
+				continue
+			}
 			status := "enabled"
-			if p.Disable { status = "disabled" }
+			if p.Disable {
+				status = "disabled"
+			}
 			modelCount := "—"
-			if len(p.Models) > 0 { modelCount = fmt.Sprintf("%d", len(p.Models)) }
+			if len(p.Models) > 0 {
+				modelCount = fmt.Sprintf("%d", len(p.Models))
+			}
 			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", id, dash(p.Name), dash(string(p.Type)), status, modelCount, maskKey(p.APIKey), dash(p.BaseURL))
 			matched++
 		}
-		if err := tw.Flush(); err != nil { return err }
-		if matched == 0 { fmt.Fprintf(os.Stderr, "no providers matched %q\n", args[0]) }
+		if err := tw.Flush(); err != nil {
+			return err
+		}
+		if matched == 0 {
+			fmt.Fprintf(os.Stderr, "no providers matched %q\n", args[0])
+		}
 		return nil
 	},
 }

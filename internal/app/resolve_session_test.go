@@ -145,15 +145,16 @@ func (m *mockSessionService) UpdateSystemPrompt(context.Context, string, string)
 	return nil
 }
 
-func (m *mockSessionService) RequestCancel(context.Context, string) error        { return nil }
+func (m *mockSessionService) RequestCancel(context.Context, string) error { return nil }
 func (m *mockSessionService) IsCancelRequested(context.Context, string) (bool, error) {
 	return false, nil
 }
-func (m *mockSessionService) ClearCancelRequest(context.Context, string) error { return nil }
+func (m *mockSessionService) ClearCancelRequest(context.Context, string) error     { return nil }
 func (m *mockSessionService) SetEndedReason(context.Context, string, string) error { return nil }
 func (m *mockSessionService) SetBudget(context.Context, string, float64, int64, int64) error {
 	return nil
 }
+
 func (m *mockSessionService) ListAll(context.Context) ([]session.Session, error) {
 	return m.sessions, nil
 }

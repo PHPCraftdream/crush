@@ -123,18 +123,19 @@ func binaryName() string {
 //  1. $CRUSH_DEPLOY_PATH set → single forced target, used as-is.
 //  2. Otherwise we discover the npm-installed crush via exec.LookPath
 //     and return EVERY binary we can find around it:
-//       a. <npm-dir>/node_modules/@charmland/crush/bin/crush(.exe)
-//          — the real binary the JS wrapper execs via `node`.
-//       b. <npm-dir>/crush.exe (Windows only) — a sibling native
-//          binary that `cmd` may pick BEFORE the JS wrapper depending
-//          on PATHEXT and PATH ordering. Historically this slot
-//          received an out-of-band copy from a previous install and
-//          then drifted, producing "crush --version is fresh but
-//          claude-init --replace is unknown" symptoms.
-//       c. The LookPath result itself, only if it is an executable
-//          (.exe on Windows, no extension on Unix) — covers raw
-//          binaries dropped on PATH without an npm package around
-//          them.
+//     a. <npm-dir>/node_modules/@charmland/crush/bin/crush(.exe)
+//     — the real binary the JS wrapper execs via `node`.
+//     b. <npm-dir>/crush.exe (Windows only) — a sibling native
+//     binary that `cmd` may pick BEFORE the JS wrapper depending
+//     on PATHEXT and PATH ordering. Historically this slot
+//     received an out-of-band copy from a previous install and
+//     then drifted, producing "crush --version is fresh but
+//     claude-init --replace is unknown" symptoms.
+//     c. The LookPath result itself, only if it is an executable
+//     (.exe on Windows, no extension on Unix) — covers raw
+//     binaries dropped on PATH without an npm package around
+//     them.
+//
 // We deduplicate by absolute path so the same file isn't replaced
 // twice on a same-file collision.
 func resolveDests() ([]string, error) {

@@ -20,7 +20,7 @@ func TestIsClaudeMdPath(t *testing.T) {
 		{"CLAUDE.md", true},
 		{"/home/x/repo/CLAUDE.md", true},
 		{"D:\\dev\\go\\crush\\c\\CLAUDE.md", true},
-		{"claude.md", true},        // case-insensitive
+		{"claude.md", true}, // case-insensitive
 		{"Claude.md", true},
 		{"CLAUDE.MD", true},
 		{"AGENTS.md", false},

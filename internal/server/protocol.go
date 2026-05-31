@@ -14,26 +14,26 @@ type WSMessage struct {
 
 // Outbound event types (server → client).
 const (
-	EventMessageCreated          = "message_created"
-	EventMessageUpdated          = "message_updated"
-	EventMessageDeleted          = "message_deleted"
-	EventSessionCreated          = "session_created"
-	EventSessionUpdated          = "session_updated"
-	EventSessionDeleted          = "session_deleted"
-	EventPermissionRequest       = "permission_request"
-	EventPermissionNotification  = "permission_notification"
-	EventFileUpdated             = "file_updated"
-	EventMCPState                = "mcp_state"
-	EventLSPState                = "lsp_state"
-	EventAgentBusy               = "agent_busy"
-	EventSessionsList            = "sessions_list"
-	EventMessagesList            = "messages_list"
-	EventConfig                  = "config"
-	EventLogs                    = "logs"
-	EventResponse                = "response"
-	EventError                   = "error"
-	EventSystemPrompt            = "system_prompt"
-	EventSkills                  = "skills"
+	EventMessageCreated         = "message_created"
+	EventMessageUpdated         = "message_updated"
+	EventMessageDeleted         = "message_deleted"
+	EventSessionCreated         = "session_created"
+	EventSessionUpdated         = "session_updated"
+	EventSessionDeleted         = "session_deleted"
+	EventPermissionRequest      = "permission_request"
+	EventPermissionNotification = "permission_notification"
+	EventFileUpdated            = "file_updated"
+	EventMCPState               = "mcp_state"
+	EventLSPState               = "lsp_state"
+	EventAgentBusy              = "agent_busy"
+	EventSessionsList           = "sessions_list"
+	EventMessagesList           = "messages_list"
+	EventConfig                 = "config"
+	EventLogs                   = "logs"
+	EventResponse               = "response"
+	EventError                  = "error"
+	EventSystemPrompt           = "system_prompt"
+	EventSkills                 = "skills"
 	// EventSummarizeQueued is sent when a manual summarise is queued (busy=true)
 	// or dequeued/completed (busy=false) for a session.
 	EventSummarizeQueued = "summarize_queued"
@@ -41,38 +41,38 @@ const (
 
 // Inbound command types (client → server).
 const (
-	CmdSendMessage                  = "send_message"
-	CmdInterruptAndSend             = "interrupt_and_send"
-	CmdCancelAgent                  = "cancel_agent"
-	CmdCreateSession                = "create_session"
-	CmdForkSession                  = "fork_session"
-	CmdDeleteSession                = "delete_session"
-	CmdListSessions                 = "list_sessions"
-	CmdLoadMessages                 = "load_messages"
-	CmdGrantPermission              = "grant_permission"
-	CmdGrantPermissionPersistent    = "grant_permission_persistent"
-	CmdDenyPermission               = "deny_permission"
-	CmdListSessionPermissions       = "list_session_permissions"
-	CmdUpdatePermissionRule         = "update_permission_rule"
-	CmdDeletePermissionRule         = "delete_permission_rule"
-	CmdGetConfig                    = "get_config"
-	CmdGetLogs                      = "get_logs"
-	CmdSetTheme                     = "set_theme"
-	CmdRenameSession                = "rename_session"
-	CmdSetSessionModels             = "set_session_models"
-	CmdRemoveRecentModel            = "remove_recent_model"
-	CmdTrackModelUsage              = "track_model_usage"
-	CmdDeleteMessage                = "delete_message"
-	CmdDeleteMessages               = "delete_messages"
-	CmdUpdateMessageContent         = "update_message_content"
-	CmdUpdateMessageThinking        = "update_message_thinking"
-	CmdGetSystemPrompt              = "get_system_prompt"
-	CmdSetSystemPrompt              = "set_system_prompt"
-	CmdSummarizeSession             = "summarize_session"
-	CmdCancelQueuedSummarize        = "cancel_queued_summarize"
-	CmdDeleteMessagePart            = "delete_message_part"
-	CmdUpdateMessagePart            = "update_message_part"
-	CmdTogglePinMessage             = "toggle_pin_message"
+	CmdSendMessage               = "send_message"
+	CmdInterruptAndSend          = "interrupt_and_send"
+	CmdCancelAgent               = "cancel_agent"
+	CmdCreateSession             = "create_session"
+	CmdForkSession               = "fork_session"
+	CmdDeleteSession             = "delete_session"
+	CmdListSessions              = "list_sessions"
+	CmdLoadMessages              = "load_messages"
+	CmdGrantPermission           = "grant_permission"
+	CmdGrantPermissionPersistent = "grant_permission_persistent"
+	CmdDenyPermission            = "deny_permission"
+	CmdListSessionPermissions    = "list_session_permissions"
+	CmdUpdatePermissionRule      = "update_permission_rule"
+	CmdDeletePermissionRule      = "delete_permission_rule"
+	CmdGetConfig                 = "get_config"
+	CmdGetLogs                   = "get_logs"
+	CmdSetTheme                  = "set_theme"
+	CmdRenameSession             = "rename_session"
+	CmdSetSessionModels          = "set_session_models"
+	CmdRemoveRecentModel         = "remove_recent_model"
+	CmdTrackModelUsage           = "track_model_usage"
+	CmdDeleteMessage             = "delete_message"
+	CmdDeleteMessages            = "delete_messages"
+	CmdUpdateMessageContent      = "update_message_content"
+	CmdUpdateMessageThinking     = "update_message_thinking"
+	CmdGetSystemPrompt           = "get_system_prompt"
+	CmdSetSystemPrompt           = "set_system_prompt"
+	CmdSummarizeSession          = "summarize_session"
+	CmdCancelQueuedSummarize     = "cancel_queued_summarize"
+	CmdDeleteMessagePart         = "delete_message_part"
+	CmdUpdateMessagePart         = "update_message_part"
+	CmdTogglePinMessage          = "toggle_pin_message"
 )
 
 // Payload structs for inbound commands.
@@ -480,14 +480,14 @@ type SetMCPDisabledPayload struct {
 // AddMCPServerPayload carries a new MCP server definition.
 // The JSON format mirrors MCPConfig with an extra "name" field.
 type AddMCPServerPayload struct {
-	Name    string `json:"name"`
-	Type    string `json:"type"`
-	Command string `json:"command,omitempty"`
-	Args    []string `json:"args,omitempty"`
-	URL     string `json:"url,omitempty"`
+	Name    string            `json:"name"`
+	Type    string            `json:"type"`
+	Command string            `json:"command,omitempty"`
+	Args    []string          `json:"args,omitempty"`
+	URL     string            `json:"url,omitempty"`
 	Env     map[string]string `json:"env,omitempty"`
 	Headers map[string]string `json:"headers,omitempty"`
-	Timeout int    `json:"timeout,omitempty"`
+	Timeout int               `json:"timeout,omitempty"`
 }
 
 type RemoveMCPServerPayload struct {
@@ -510,7 +510,7 @@ type UpdateMCPServerPayload struct {
 
 // UpdateTodosPayload replaces the todo list for a session.
 type UpdateTodosPayload struct {
-	SessionID string    `json:"sessionID"`
+	SessionID string     `json:"sessionID"`
 	Todos     []TodoWire `json:"todos"`
 }
 

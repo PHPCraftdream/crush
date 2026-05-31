@@ -4,6 +4,7 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -68,7 +69,7 @@ func fetchModelsOpenAICompat(baseURL, apiKey string) ([]catwalk.Model, []string,
 	baseURL = strings.TrimRight(baseURL, "/")
 	endpoint := baseURL + "/models"
 
-	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, warnings, fmt.Errorf("failed to create request: %w", err)
 	}
@@ -124,7 +125,7 @@ func fetchModelsAnthropic(baseURL, apiKey string) ([]catwalk.Model, []string, er
 	baseURL = strings.TrimRight(baseURL, "/")
 	endpoint := baseURL + "/models"
 
-	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, warnings, fmt.Errorf("failed to create request: %w", err)
 	}

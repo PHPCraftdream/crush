@@ -10,6 +10,9 @@ on:
 
 jobs:
   update-schema:
+    # Fork: upstream-only — uses Charm's PERSONAL_ACCESS_TOKEN and auto-commits
+    # to main as Charm. Skipped on forks.
+    if: github.repository == 'charmbracelet/crush'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2

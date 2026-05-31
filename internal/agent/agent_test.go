@@ -53,6 +53,12 @@ func TestCoderAgent(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skipping on windows for now")
 	}
+	if testing.Short() {
+		// VCR-backed integration test against hyper.charm.land. The cassettes
+		// drift and re-recording needs a Charm hyper key, so skip in -short
+		// (CI). Runs in full `go test` locally for anyone who can re-record.
+		t.Skip("skipping network/VCR integration test in -short mode")
+	}
 
 	for _, pair := range modelPairs {
 		t.Run(pair.name, func(t *testing.T) {

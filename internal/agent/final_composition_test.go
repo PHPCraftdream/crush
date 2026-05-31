@@ -13,7 +13,9 @@ import (
 // "final composition started" log fires on the first text delta after a tool
 // boundary.
 func TestFinalCompositionLog_FirstTextDeltaAfterToolBoundary(t *testing.T) {
-	t.Parallel()
+	// Not parallel: this test swaps the global slog default logger and reads
+	// its bytes.Buffer directly (outside slog's handler mutex), so running it
+	// in parallel races with slog writes from other tests in this package.
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
@@ -43,7 +45,7 @@ func TestFinalCompositionLog_FirstTextDeltaAfterToolBoundary(t *testing.T) {
 // TestFinalCompositionLog_ManyTextDeltasStillOnce verifies that many text
 // deltas in a row produce only one log line.
 func TestFinalCompositionLog_ManyTextDeltasStillOnce(t *testing.T) {
-	t.Parallel()
+	// Not parallel — see TestFinalCompositionLog_FirstTextDeltaAfterToolBoundary.
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)

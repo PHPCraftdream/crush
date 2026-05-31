@@ -358,9 +358,9 @@ type codexEvent struct {
 	Type string `json:"type"`
 	// item.started / item.completed
 	Item struct {
-		Type            string `json:"type"`   // "agent_message" | "command_execution" | "reasoning" | ...
-		Text            string `json:"text"`   // agent_message: full response text
-		Command         string `json:"command"` // command_execution: command string
+		Type             string `json:"type"`              // "agent_message" | "command_execution" | "reasoning" | ...
+		Text             string `json:"text"`              // agent_message: full response text
+		Command          string `json:"command"`           // command_execution: command string
 		AggregatedOutput string `json:"aggregated_output"` // command_execution: combined stdout+stderr
 	} `json:"item"`
 	// turn.completed usage
@@ -705,7 +705,21 @@ var All = []CLISpec{
 }
 
 // Available returns the subset of All whose Binary is found in PATH.
-func Available() []CLISpec {
+// AvailableFunc returns the locally-installed CLI specs. It is a package
+// var so tests can stub CLI detection deterministically — otherwise the set
+// depends on whatever binaries (claude, gemini, npx, …) happen to be on the
+// runner's PATH, which makes provider-count assertions environment-dependent.
+var AvailableFunc = detectAvailable
+
+// testDisablePTY, when true, forces pipe mode regardless of spec. The
+// cliprovider test suite sets it on Windows, where go-pty's ConPTY path has
+// an internal data race the -race detector flags. Always false in production.
+var testDisablePTY bool
+
+// Available reports which CLI model specs are usable on this machine.
+func Available() []CLISpec { return AvailableFunc() }
+
+func detectAvailable() []CLISpec {
 	seen := make(map[string]bool)
 	var result []CLISpec
 	for _, spec := range All {
@@ -729,13 +743,13 @@ type cliSessionEntry struct {
 }
 
 type cliProvider struct {
-	workingDir    string
-	yoloFn        func() bool
-	perms         permission.Service
-	sessions      session.Service
-	mcpProxy      ExternalMCPProxy
-	specs         map[string]CLISpec
-	cliSessions   *csync.Map[string, cliSessionEntry] // crush session key → CLI session entry
+	workingDir  string
+	yoloFn      func() bool
+	perms       permission.Service
+	sessions    session.Service
+	mcpProxy    ExternalMCPProxy
+	specs       map[string]CLISpec
+	cliSessions *csync.Map[string, cliSessionEntry] // crush session key → CLI session entry
 }
 
 // ExternalMCPTool describes an external MCP tool to expose through the crush MCP bridge.
@@ -767,12 +781,12 @@ func New(workingDir string, yoloFn func() bool, perms permission.Service, sessio
 		specs[s.ModelID] = s
 	}
 	return &cliProvider{
-		workingDir:    workingDir,
-		yoloFn:        yoloFn,
-		perms:         perms,
-		sessions:      sessions,
-		mcpProxy:      mcpProxy,
-		specs:         specs,
+		workingDir:  workingDir,
+		yoloFn:      yoloFn,
+		perms:       perms,
+		sessions:    sessions,
+		mcpProxy:    mcpProxy,
+		specs:       specs,
 		cliSessions: csync.NewMap[string, cliSessionEntry](),
 	}
 }
@@ -791,10 +805,10 @@ type cliModel struct {
 	spec        CLISpec
 	mcpProxy    ExternalMCPProxy
 	cliSessions *csync.Map[string, cliSessionEntry]
-	workingDir string
-	yoloFn     func() bool
-	perms      permission.Service
-	sessions   session.Service
+	workingDir  string
+	yoloFn      func() bool
+	perms       permission.Service
+	sessions    session.Service
 }
 
 func (m *cliModel) Provider() string { return ProviderID }
@@ -917,8 +931,8 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 	// (before the closure runs), deleting the config file before claude CLI
 	// can read it.
 	var mcpSrv *crushMCPServer
-	var mcpTmpCfg string    // path to temp MCP config file (claude-style); "" if not used
-	var qwenMCPName string  // registered name in ~/.qwen/settings.json; "" if not used
+	var mcpTmpCfg string     // path to temp MCP config file (claude-style); "" if not used
+	var qwenMCPName string   // registered name in ~/.qwen/settings.json; "" if not used
 	var geminiMCPName string // registered name in ~/.gemini/settings.json; "" if not used
 	// Fork patch: batch 20 — keep the MCP bridge active even in yolo/bypass mode.
 	// Before this fix, `!yolo` here meant that `crush run` (which sets yolo=true via
@@ -1092,7 +1106,8 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 		}
 	}
 
-	useStdin := m.spec.AlwaysStdin || m.spec.NoPTY || len(prompt) > maxPromptArgLen
+	noPTY := m.spec.NoPTY || testDisablePTY
+	useStdin := m.spec.AlwaysStdin || noPTY || len(prompt) > maxPromptArgLen
 	if !useStdin && m.spec.PromptFlag != "" {
 		args = append(args, m.spec.PromptFlag, prompt)
 	}
@@ -1111,7 +1126,7 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 
 	var proc procHandle
 
-	if !useStdin && !m.spec.NoPTY {
+	if !useStdin && !noPTY {
 		// Use a PTY so the subprocess (e.g. Node.js claude CLI) sees a TTY on
 		// stdout and does not buffer output internally. go-pty supports both
 		// Unix PTY and Windows ConPTY transparently.
@@ -1248,11 +1263,16 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 				}
 			},
 			wait: func() (string, error) {
+				// cmd.Wait() must return before reading stderrBuf: os/exec's
+				// stderr-copy goroutine writes that buffer and is only joined
+				// by Wait(), so reading earlier races with it (caught by -race,
+				// and real for npx/NoPTY specs in production).
+				waitErr := cmd.Wait()
 				stderr := strings.TrimSpace(stderrBuf.String())
 				if stderr != "" {
 					slog.Warn("cliprovider: process stderr", "binary", m.spec.Binary, "stderr", stderr)
 				}
-				return stderr, cmd.Wait()
+				return stderr, waitErr
 			},
 		}
 	}

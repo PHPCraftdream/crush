@@ -13,10 +13,10 @@ import (
 	"strings"
 	"time"
 
-	appPkg "github.com/charmbracelet/crush/internal/app"
 	"github.com/charmbracelet/crush/internal/agent"
 	"github.com/charmbracelet/crush/internal/agent/cliprovider"
 	"github.com/charmbracelet/crush/internal/agent/tools/mcp"
+	appPkg "github.com/charmbracelet/crush/internal/app"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/permission"
@@ -1782,6 +1782,7 @@ func handleUpdateCustomProvider(a *appPkg.App, c *Client, msg WSMessage) {
 	}
 	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
 }
+
 func handleRemoveLSPServer(ctx context.Context, a *appPkg.App, c *Client, msg WSMessage) {
 	var p RemoveLSPServerPayload
 	if err := json.Unmarshal(msg.Payload, &p); err != nil {

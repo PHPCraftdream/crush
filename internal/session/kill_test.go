@@ -1,10 +1,10 @@
 package session
 
 import (
+	"context"
 	"os/exec"
 	"runtime"
 	"testing"
-	"time"
 )
 
 // TestKillProcess_Live spawns a real long-running child, asks KillProcess
@@ -14,9 +14,9 @@ func TestKillProcess_Live(t *testing.T) {
 	var cmd *exec.Cmd
 	switch runtime.GOOS {
 	case "windows":
-		cmd = exec.Command("cmd.exe", "/c", "ping", "-n", "30", "127.0.0.1")
+		cmd = exec.CommandContext(context.Background(), "cmd.exe", "/c", "ping", "-n", "30", "127.0.0.1")
 	default:
-		cmd = exec.Command("sleep", "30")
+		cmd = exec.CommandContext(context.Background(), "sleep", "30")
 	}
 	if err := cmd.Start(); err != nil {
 		t.Skipf("cannot spawn child process for kill test: %v", err)
@@ -31,26 +31,23 @@ func TestKillProcess_Live(t *testing.T) {
 		t.Fatalf("KillProcess(%d): %v", pid, err)
 	}
 
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if !IsProcessAlive(pid) {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	if IsProcessAlive(pid) {
-		t.Fatalf("PID %d still alive 5s after KillProcess", pid)
-	}
+	// Reap the killed child so it is not left as a zombie. On Unix a zombie
+	// still answers kill(pid, 0), so IsProcessAlive would report it alive
+	// until the parent (this test) waits on it. Wait() returns promptly once
+	// SIGKILL lands; on Windows it returns after the process terminates.
 	_, _ = cmd.Process.Wait()
+	if IsProcessAlive(pid) {
+		t.Fatalf("PID %d still alive after KillProcess + reap", pid)
+	}
 }
 
 func TestKillProcess_AlreadyDead(t *testing.T) {
 	var cmd *exec.Cmd
 	switch runtime.GOOS {
 	case "windows":
-		cmd = exec.Command("cmd.exe", "/c", "exit", "0")
+		cmd = exec.CommandContext(context.Background(), "cmd.exe", "/c", "exit", "0")
 	default:
-		cmd = exec.Command("true")
+		cmd = exec.CommandContext(context.Background(), "true")
 	}
 	if err := cmd.Run(); err != nil {
 		t.Skipf("cannot run trivial child: %v", err)

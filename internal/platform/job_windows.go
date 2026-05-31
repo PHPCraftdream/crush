@@ -42,11 +42,7 @@ func AssignToNewJobObject() error {
 		return fmt.Errorf("SetInformationJobObject: %w", err)
 	}
 
-	proc, err := windows.GetCurrentProcess()
-	if err != nil {
-		windows.CloseHandle(job)
-		return fmt.Errorf("GetCurrentProcess: %w", err)
-	}
+	proc := windows.CurrentProcess()
 
 	if err := windows.AssignProcessToJobObject(job, proc); err != nil {
 		windows.CloseHandle(job)

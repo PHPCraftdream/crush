@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -106,7 +107,7 @@ func sessionsPickCmdRun(cmd *cobra.Command, args []string) error {
 		cmdArgs = []string{"sessions", "last", m.selected}
 	}
 
-	subCmd := exec.Command(m.binary, cmdArgs...)
+	subCmd := exec.CommandContext(context.Background(), m.binary, cmdArgs...)
 	subCmd.Stdin = os.Stdin
 	subCmd.Stdout = os.Stdout
 	subCmd.Stderr = os.Stderr

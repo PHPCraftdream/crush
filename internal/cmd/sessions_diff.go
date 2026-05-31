@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -222,7 +223,7 @@ func isGitAvailable() bool {
 	if err != nil {
 		return false
 	}
-	cmd := exec.Command("git", "rev-parse", "--is-inside-work-tree")
+	cmd := exec.CommandContext(context.Background(), "git", "rev-parse", "--is-inside-work-tree")
 	cmd.Stderr = nil
 	cmd.Stdout = nil
 	return cmd.Run() == nil
@@ -230,7 +231,7 @@ func isGitAvailable() bool {
 
 // gitNameStatus returns the git status letter (M/A/D) for a file, or "" on error.
 func gitNameStatus(path string) string {
-	cmd := exec.Command("git", "diff", "--name-status", "HEAD", "--", path)
+	cmd := exec.CommandContext(context.Background(), "git", "diff", "--name-status", "HEAD", "--", path)
 	out, err := cmd.Output()
 	if err != nil {
 		return ""
@@ -238,7 +239,7 @@ func gitNameStatus(path string) string {
 	line := strings.TrimSpace(string(out))
 	if line == "" {
 		// Maybe untracked.
-		cmd2 := exec.Command("git", "ls-files", "--error-unmatch", "--", path)
+		cmd2 := exec.CommandContext(context.Background(), "git", "ls-files", "--error-unmatch", "--", path)
 		if cmd2.Run() != nil {
 			return "?"
 		}
@@ -253,7 +254,7 @@ func gitNameStatus(path string) string {
 
 // gitDiffStat returns the git diff --stat output for a file.
 func gitDiffStat(path string) string {
-	cmd := exec.Command("git", "diff", "--stat", "HEAD", "--", path)
+	cmd := exec.CommandContext(context.Background(), "git", "diff", "--stat", "HEAD", "--", path)
 	out, err := cmd.Output()
 	if err != nil {
 		return ""

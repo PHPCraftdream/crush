@@ -43,6 +43,7 @@ func (m *mockSessionAgent) ClearQueue(sessionID string)                 {}
 func (m *mockSessionAgent) QueueMessage(call SessionAgentCall) {
 	m.queuedCalls = append(m.queuedCalls, call)
 }
+
 func (m *mockSessionAgent) Summarize(context.Context, string, fantasy.ProviderOptions) error {
 	return nil
 }

@@ -35,7 +35,7 @@ func CheckForbiddenWrite(path string) error {
 		}
 		if normalizeForbiddenPath(entry) == target {
 			return fmt.Errorf(
-				"write to %q forbidden by %s (this path is on the orchestrator's blacklist — typically a shell stdout-redirect target). Return the content as your tool output or in final_text, or write to a different path.",
+				"write to %q forbidden by %s (this path is on the orchestrator's blacklist — typically a shell stdout-redirect target). Return the content as your tool output or in final_text, or write to a different path",
 				path, ForbiddenWritesEnv,
 			)
 		}

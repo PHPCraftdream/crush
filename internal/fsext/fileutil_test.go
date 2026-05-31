@@ -10,6 +10,19 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// toSlashAll normalises separators so glob assertions are independent of the
+// separator fastwalk happens to emit, which varies by launch environment:
+// forward slashes under MSYS / Git-Bash, native backslashes under PowerShell
+// or cmd on Windows. Matching is always done on ToSlash'd paths internally;
+// only the returned absolute path carries the env-dependent separator.
+func toSlashAll(paths []string) []string {
+	out := make([]string, len(paths))
+	for i, p := range paths {
+		out[i] = filepath.ToSlash(p)
+	}
+	return out
+}
+
 func TestGlobWithDoubleStar(t *testing.T) {
 	t.Run("finds files matching pattern", func(t *testing.T) {
 		testDir := t.TempDir()
@@ -28,7 +41,7 @@ func TestGlobWithDoubleStar(t *testing.T) {
 		require.NoError(t, err)
 		require.False(t, truncated)
 
-		require.Equal(t, matches, []string{mainGo})
+		require.Equal(t, toSlashAll(matches), []string{filepath.ToSlash(mainGo)})
 	})
 
 	t.Run("finds directories matching pattern", func(t *testing.T) {
@@ -51,7 +64,7 @@ func TestGlobWithDoubleStar(t *testing.T) {
 		require.NoError(t, err)
 		require.False(t, truncated)
 
-		require.Equal(t, matches, []string{pkgDir})
+		require.Equal(t, toSlashAll(matches), []string{filepath.ToSlash(pkgDir)})
 	})
 
 	t.Run("finds nested directories with wildcard patterns", func(t *testing.T) {
@@ -147,7 +160,7 @@ func TestGlobWithDoubleStar(t *testing.T) {
 		require.NoError(t, err)
 		require.False(t, truncated)
 
-		require.Equal(t, []string{file1}, matches)
+		require.Equal(t, []string{filepath.ToSlash(file1)}, toSlashAll(matches))
 	})
 
 	t.Run("returns results sorted by modification time (newest first)", func(t *testing.T) {
@@ -175,7 +188,7 @@ func TestGlobWithDoubleStar(t *testing.T) {
 		require.NoError(t, err)
 		require.False(t, truncated)
 
-		require.Equal(t, []string{file3, file2, file1}, matches)
+		require.Equal(t, []string{filepath.ToSlash(file3), filepath.ToSlash(file2), filepath.ToSlash(file1)}, toSlashAll(matches))
 	})
 
 	t.Run("handles empty directory", func(t *testing.T) {
@@ -185,7 +198,7 @@ func TestGlobWithDoubleStar(t *testing.T) {
 		require.NoError(t, err)
 		require.False(t, truncated)
 		// Even empty directories should return the directory itself
-		require.Equal(t, []string{testDir}, matches)
+		require.Equal(t, []string{filepath.ToSlash(testDir)}, toSlashAll(matches))
 	})
 
 	t.Run("handles non-existent search path", func(t *testing.T) {
@@ -232,7 +245,7 @@ func TestGlobWithDoubleStar(t *testing.T) {
 		matches, truncated, err = GlobGitignoreAware("*.txt", testDir, 0)
 		require.NoError(t, err)
 		require.False(t, truncated)
-		require.Equal(t, []string{goodFile}, matches)
+		require.Equal(t, []string{filepath.ToSlash(goodFile)}, toSlashAll(matches))
 	})
 
 	t.Run("handles mixed file and directory matching with sorting", func(t *testing.T) {
@@ -264,6 +277,6 @@ func TestGlobWithDoubleStar(t *testing.T) {
 
 		// Results should be sorted by mod time, but we set the oldestFile
 		// to have the most recent mod time
-		require.Equal(t, []string{oldestFile, middleDir, newestFile}, matches)
+		require.Equal(t, []string{filepath.ToSlash(oldestFile), filepath.ToSlash(middleDir), filepath.ToSlash(newestFile)}, toSlashAll(matches))
 	})
 }

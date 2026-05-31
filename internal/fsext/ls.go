@@ -240,8 +240,11 @@ func (dl *directoryLister) shouldIgnore(path string, ignorePatterns []string, is
 		}
 	}
 
-	// Don't apply gitignore rules to the root directory itself.
-	if path == dl.rootPath {
+	// Don't apply gitignore rules to the root directory itself. `path` has
+	// been normalised with filepath.ToSlash above, so compare against the
+	// normalised root too — otherwise on Windows the "/"-path never equals
+	// the "\"-rootPath and the root dir leaks into the listing.
+	if path == filepath.ToSlash(dl.rootPath) {
 		return false
 	}
 
@@ -294,9 +297,13 @@ func ListDirectory(initialPath string, ignorePatterns []string, depth, limit int
 			return nil
 		}
 
-		if path != initialPath {
+		// Skip the root dir itself. fastwalk's separator for `path` is
+		// environment-dependent (forward under MSYS/Git-Bash, native under
+		// PowerShell/cmd), so normalise BOTH sides before comparing — otherwise
+		// the root leaks into the listing whenever the two separators differ.
+		if filepath.ToSlash(path) != filepath.ToSlash(initialPath) {
 			if isDir {
-				path = path + string(filepath.Separator)
+				path += string(filepath.Separator)
 			}
 			found.Append(path)
 		}
