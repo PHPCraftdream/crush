@@ -405,7 +405,13 @@ func registerViewTool(srv *mcp.Server, perms permission.Service, workingDir stri
 var crushClaudeInitBlockPattern = regexp.MustCompile(`(?s)<!-- crush-claude-init:v\d+ -->.*?<!-- /crush-claude-init -->\s*`)
 
 func isClaudeMdPath(path string) bool {
-	base := filepath.Base(path)
+	// Split on BOTH separators regardless of host OS: the path may be a
+	// Windows path (…\CLAUDE.md) even when crush runs on Linux/macOS, where
+	// filepath.Base only understands "/".
+	base := path
+	if i := strings.LastIndexAny(base, `/\`); i >= 0 {
+		base = base[i+1:]
+	}
 	// Case-insensitive — Windows users sometimes write "Claude.md".
 	return strings.EqualFold(base, "CLAUDE.md")
 }
