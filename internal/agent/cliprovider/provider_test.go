@@ -285,8 +285,12 @@ func TestStreamExitError(t *testing.T) {
 	if gotError == nil {
 		t.Fatal("expected error from non-zero exit code")
 	}
-	if !strings.Contains(gotError.Error(), "error-text") {
-		t.Errorf("error should contain stderr, got: %v", gotError)
+	// stderr must surface somewhere. In pipe mode (NoPTY, e.g. Windows) it is
+	// appended to the error; in PTY mode (Unix) the kernel merges stderr into
+	// the tty's stdout, so it arrives as streamed text instead. Accept either.
+	surfaced := gotError.Error() + "\n" + gotText.String()
+	if !strings.Contains(surfaced, "error-text") {
+		t.Errorf("stderr should surface in error or output; err=%v text=%q", gotError, gotText.String())
 	}
 }
 
