@@ -705,7 +705,16 @@ var All = []CLISpec{
 }
 
 // Available returns the subset of All whose Binary is found in PATH.
-func Available() []CLISpec {
+// AvailableFunc returns the locally-installed CLI specs. It is a package
+// var so tests can stub CLI detection deterministically — otherwise the set
+// depends on whatever binaries (claude, gemini, npx, …) happen to be on the
+// runner's PATH, which makes provider-count assertions environment-dependent.
+var AvailableFunc = detectAvailable
+
+// Available reports which CLI model specs are usable on this machine.
+func Available() []CLISpec { return AvailableFunc() }
+
+func detectAvailable() []CLISpec {
 	seen := make(map[string]bool)
 	var result []CLISpec
 	for _, spec := range All {

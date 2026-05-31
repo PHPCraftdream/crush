@@ -108,14 +108,18 @@ func TestForceKillHolder_LiveProcess(t *testing.T) {
 	if err := cmd.Start(); err != nil {
 		t.Skipf("cannot spawn child: %v", err)
 	}
-	defer func() { _ = cmd.Process.Kill(); _, _ = cmd.Process.Wait() }()
 
 	pid := cmd.Process.Pid
+	// Reap in the background so the child does not linger as a zombie once
+	// forceKillHolder kills it. forceKillHolder polls IsProcessAlive, and on
+	// Unix a zombie still answers kill(pid, 0) until the parent waits on it —
+	// so without this concurrent reap the poll never observes the exit.
+	go func() { _, _ = cmd.Process.Wait() }()
+
 	require.True(t, session.IsProcessAlive(pid))
 	report := forceKillHolder(pid, 5*time.Second)
 	t.Logf("report: %s", report)
 	assert.True(t, strings.Contains(report, "killed PID") || strings.Contains(report, "already gone"))
 	assert.Contains(t, report, "exited")
 	assert.False(t, session.IsProcessAlive(pid), "PID should be dead after forceKillHolder")
-	_, _ = cmd.Process.Wait()
 }

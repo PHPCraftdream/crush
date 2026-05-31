@@ -4,7 +4,6 @@ import (
 	"os/exec"
 	"runtime"
 	"testing"
-	"time"
 )
 
 // TestKillProcess_Live spawns a real long-running child, asks KillProcess
@@ -31,17 +30,14 @@ func TestKillProcess_Live(t *testing.T) {
 		t.Fatalf("KillProcess(%d): %v", pid, err)
 	}
 
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if !IsProcessAlive(pid) {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	if IsProcessAlive(pid) {
-		t.Fatalf("PID %d still alive 5s after KillProcess", pid)
-	}
+	// Reap the killed child so it is not left as a zombie. On Unix a zombie
+	// still answers kill(pid, 0), so IsProcessAlive would report it alive
+	// until the parent (this test) waits on it. Wait() returns promptly once
+	// SIGKILL lands; on Windows it returns after the process terminates.
 	_, _ = cmd.Process.Wait()
+	if IsProcessAlive(pid) {
+		t.Fatalf("PID %d still alive after KillProcess + reap", pid)
+	}
 }
 
 func TestKillProcess_AlreadyDead(t *testing.T) {
