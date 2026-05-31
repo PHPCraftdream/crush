@@ -275,9 +275,10 @@ func isEnvAssignment(tok string) bool {
 		return false
 	}
 	for _, r := range name {
-		if !(r == '_' || (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9')) {
-			return false
+		if r == '_' || (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			continue
 		}
+		return false
 	}
 	return true
 }

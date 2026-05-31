@@ -16,7 +16,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strconv"
 	"time"
 
 	"charm.land/fang/v2"
@@ -243,23 +242,7 @@ func setupApp(cmd *cobra.Command) (*app.App, error) {
 		return nil, err
 	}
 
-	if shouldEnableMetrics(cfg) {
-	}
-
 	return appInstance, nil
-}
-
-func shouldEnableMetrics(cfg *config.Config) bool {
-	if v, _ := strconv.ParseBool(os.Getenv("CRUSH_DISABLE_METRICS")); v {
-		return false
-	}
-	if v, _ := strconv.ParseBool(os.Getenv("DO_NOT_TRACK")); v {
-		return false
-	}
-	if cfg.Options.DisableMetrics {
-		return false
-	}
-	return true
 }
 
 func MaybePrependStdin(prompt string) (string, error) {

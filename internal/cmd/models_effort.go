@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"os/exec"
@@ -31,7 +32,7 @@ func (s *cliEffortSource) Levels() []string {
 	if v, ok := effortCache[s.Binary]; ok {
 		return v
 	}
-	out, err := exec.Command(s.Binary, s.HelpArg).CombinedOutput()
+	out, err := exec.CommandContext(context.Background(), s.Binary, s.HelpArg).CombinedOutput()
 	if err != nil {
 		slog.Warn("could not detect effort levels — falling back", "binary", s.Binary, "err", err)
 		effortCache[s.Binary] = defaultEffortLevels

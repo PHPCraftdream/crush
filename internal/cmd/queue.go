@@ -210,10 +210,7 @@ reason) are written back to the queue.`,
 		ctx := cmd.Context()
 		processed := 0
 
-		for {
-			if maxTasks > 0 && processed >= maxTasks {
-				break
-			}
+		for maxTasks <= 0 || processed < maxTasks {
 
 			limit := concurrent
 			if maxTasks > 0 {

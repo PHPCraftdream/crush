@@ -131,11 +131,12 @@ func printEffectiveLine(label string, has bool, m config.SelectedModel, scope st
 		}
 	}
 	src := scope
-	if scope == "global" {
+	switch scope {
+	case "global":
 		src = "from GLOBAL"
-	} else if scope == "local" {
+	case "local":
 		src = "from LOCAL"
-	} else {
+	default:
 		src = "scope unknown"
 	}
 	fmt.Printf("  %s:  %s/%s%s%s   (%s)\n",

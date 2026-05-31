@@ -210,10 +210,8 @@ func TestCheckpointDisabledWhenZero(t *testing.T) {
 
 	// Simulate startCheckpoint with interval=0 — it returns immediately.
 	interval := time.Duration(0)
-	started := false
-	if interval > 0 {
-		started = true
-	}
+	started := interval > 0
+
 	require.False(t, started, "checkpoint should not start when interval is 0")
 
 	count := msgSvc.updateCount.Load()

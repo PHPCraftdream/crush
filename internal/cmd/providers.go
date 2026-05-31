@@ -377,7 +377,7 @@ func updateSingleProvider(a *app.App, id string) error {
 
 	var diffStr strings.Builder
 	if newCount > oldCount {
-		diffStr.WriteString(fmt.Sprintf(" (+%d", newCount-oldCount))
+		fmt.Fprintf(&diffStr, " (+%d", newCount-oldCount)
 		if len(added) > 0 && len(added) <= 3 {
 			diffStr.WriteString(": ")
 			for i, m := range added {
@@ -389,7 +389,7 @@ func updateSingleProvider(a *app.App, id string) error {
 		}
 		diffStr.WriteString(")")
 	} else if newCount < oldCount {
-		diffStr.WriteString(fmt.Sprintf(" (-%d", oldCount-newCount))
+		fmt.Fprintf(&diffStr, " (-%d", oldCount-newCount)
 		if len(removed) > 0 && len(removed) <= 3 {
 			diffStr.WriteString(": ")
 			for i, m := range removed {

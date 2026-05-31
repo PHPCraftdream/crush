@@ -351,9 +351,10 @@ var oldFormatNames = func() []string {
 	var names []string
 	for _, pfx := range []string{"o47", "o46", "s46", "s45", "h45"} {
 		max := 4
-		if pfx == "s45" || pfx == "h45" {
+		switch pfx {
+		case "s45", "h45":
 			max = 2
-		} else if pfx == "o46" || pfx == "s46" {
+		case "o46", "s46":
 			max = 3
 		}
 		for i := 0; i <= max; i++ {

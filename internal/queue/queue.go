@@ -127,6 +127,7 @@ func (s *Service) ClaimPending(ctx context.Context, n int) ([]Task, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer rows.Close()
 	var tasks []Task
 	for rows.Next() {
 		var t Task
@@ -135,11 +136,16 @@ func (s *Service) ClaimPending(ctx context.Context, n int) ([]Task, error) {
 			&t.Cost, &t.Tokens, &t.ExitReason,
 			&t.CreatedAt, &t.StartedAt, &t.FinishedAt,
 		); err != nil {
-			rows.Close()
 			return nil, err
 		}
 		tasks = append(tasks, t)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// Release the read cursor before issuing writes on the same tx (SQLite
+	// dislikes an open cursor during writes); the deferred Close is then a
+	// harmless no-op.
 	rows.Close()
 
 	now := time.Now().Unix()

@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -88,9 +89,9 @@ func TestForceKillHolder_AlreadyDead(t *testing.T) {
 	var cmd *exec.Cmd
 	switch runtime.GOOS {
 	case "windows":
-		cmd = exec.Command("cmd.exe", "/c", "exit", "0")
+		cmd = exec.CommandContext(context.Background(), "cmd.exe", "/c", "exit", "0")
 	default:
-		cmd = exec.Command("true")
+		cmd = exec.CommandContext(context.Background(), "true")
 	}
 	require.NoError(t, cmd.Run())
 	report := forceKillHolder(cmd.Process.Pid, time.Second)
@@ -101,9 +102,9 @@ func TestForceKillHolder_LiveProcess(t *testing.T) {
 	var cmd *exec.Cmd
 	switch runtime.GOOS {
 	case "windows":
-		cmd = exec.Command("cmd.exe", "/c", "ping", "-n", "30", "127.0.0.1")
+		cmd = exec.CommandContext(context.Background(), "cmd.exe", "/c", "ping", "-n", "30", "127.0.0.1")
 	default:
-		cmd = exec.Command("sleep", "30")
+		cmd = exec.CommandContext(context.Background(), "sleep", "30")
 	}
 	if err := cmd.Start(); err != nil {
 		t.Skipf("cannot spawn child: %v", err)

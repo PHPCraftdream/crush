@@ -49,7 +49,8 @@ func (s *Server) Token() string { return s.auth.Token() }
 // Start runs the server until ctx is cancelled. onReady is called once the
 // listener is bound (with the actual address, useful when port was 0).
 func (s *Server) Start(ctx context.Context, onReady func(addr string)) error {
-	ln, err := net.Listen("tcp", s.addr)
+	var lc net.ListenConfig
+	ln, err := lc.Listen(ctx, "tcp", s.addr)
 	if err != nil {
 		return err
 	}

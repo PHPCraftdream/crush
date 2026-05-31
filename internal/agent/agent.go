@@ -1557,7 +1557,7 @@ If not, please feel free to ignore. Again do not mention this message to the use
 			var sb strings.Builder
 			sb.WriteString("This is a reminder of your CURRENT todo list. This is the authoritative ground truth — it overrides anything in your conversation history:\n\n")
 			for _, t := range todos {
-				sb.WriteString(fmt.Sprintf("- [%s] %s\n", t.Status, t.Content))
+				fmt.Fprintf(&sb, "- [%s] %s\n", t.Status, t.Content)
 			}
 			sb.WriteString("\nIMPORTANT: Tasks NOT in this list have been DELETED (by the user or by you). Do NOT add them back. Only manage the tasks listed above, plus any new ones the user explicitly requests. DO NOT mention this reminder to the user.")
 			reminderText = sb.String()

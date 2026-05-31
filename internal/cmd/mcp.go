@@ -379,11 +379,12 @@ crush mcp add auth-server --type http --url http://api.example.com/mcp --header 
 		command, _ := cmd.Flags().GetString("command")
 		mcpURL, _ := cmd.Flags().GetString("url")
 
-		if mcpType == config.MCPStdio {
+		switch mcpType {
+		case config.MCPStdio:
 			if command == "" {
 				return fmt.Errorf("--command is required for stdio type")
 			}
-		} else if mcpType == config.MCPSSE || mcpType == config.MCPHttp {
+		case config.MCPSSE, config.MCPHttp:
 			if mcpURL == "" {
 				return fmt.Errorf("--url is required for %s type", mcpType)
 			}

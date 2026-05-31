@@ -81,7 +81,7 @@ func newTestDB(t *testing.T) (*sql.DB, *db.Queries) {
 	t.Cleanup(func() { sqlDB.Close() })
 
 	// Run migrations
-	_, err = sqlDB.Exec(`
+	_, err = sqlDB.ExecContext(context.Background(), `
 		CREATE TABLE sessions (
 			id TEXT PRIMARY KEY,
 			parent_session_id TEXT,
