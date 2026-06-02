@@ -1,8 +1,12 @@
 name: nightly
 
 on:
-  schedule:
-    - cron: "0 0 * * *" # every day at midnight
+  # Fork: cron disabled. The scheduled run can't be guarded by the job-level
+  # `if:` below — GitHub validates the reusable-workflow + secrets contract at
+  # startup (before `if`), so the run fails with `startup_failure` and emails on
+  # every fire. Manual `workflow_dispatch` stays available; upstream keeps cron.
+  # schedule:
+  #   - cron: "0 0 * * *" # every day at midnight
   workflow_dispatch: # allows manual triggering
 
 jobs:
