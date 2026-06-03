@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# pre-push: mirror the CI gates so a red build never reaches origin.
+#
+# Runs the same checks as .github/workflows/{build,lint}.yml:
+#   1. go build ./...                 — compile + //go:embed all:dist
+#   2. golangci-lint run              — v2.10, same as lint.yml (covers gofumpt)
+#   3. go test -short -failfast ./... — like build.yml, minus -race (that needs
+#                                       a local gcc/cgo that isn't guaranteed)
+#
+# golangci-lint is used from PATH when present, otherwise `go run` fetches the
+# pinned version (downloaded once into the module cache, then reused).
+#
+# Bypass in an emergency with:  git push --no-verify
+set -uo pipefail
+
+# Keep in sync with golangci_version in .github/workflows/lint.yml.
+GOLANGCI_VERSION="v2.10"
+
+cd "$(git rev-parse --show-toplevel)" || exit 1
+
+fail() { printf '\n\033[31m✗ pre-push: %s\033[0m\n' "$1" >&2; exit 1; }
+step() { printf '\033[36m▸ %s\033[0m\n' "$1"; }
+
+step "go build ./..."
+go build ./... || fail "build failed"
+
+step "golangci-lint run ($GOLANGCI_VERSION)"
+if command -v golangci-lint >/dev/null 2>&1; then
+	golangci-lint run || fail "lint failed"
+else
+	go run "github.com/golangci/golangci-lint/v2/cmd/golangci-lint@${GOLANGCI_VERSION}" run \
+		|| fail "lint failed (ran via 'go run'; install golangci-lint for speed)"
+fi
+
+step "go test -short -failfast ./..."
+go test -short -failfast ./... || fail "tests failed"
+
+printf '\033[32m✓ pre-push checks passed\033[0m\n'

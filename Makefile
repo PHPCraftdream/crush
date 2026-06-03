@@ -1,4 +1,4 @@
-.PHONY: build web web-dev clean
+.PHONY: build web web-dev clean install-hooks
 
 # Build everything: React app + Go binary with embedded assets.
 build: web
@@ -14,3 +14,8 @@ web-dev:
 
 clean:
 	rm -rf web/dist web/node_modules crush
+
+# Point git at the versioned hooks in .githooks/ (run once per clone).
+install-hooks:
+	git config core.hooksPath .githooks
+	@echo "git hooks installed: core.hooksPath=.githooks"
