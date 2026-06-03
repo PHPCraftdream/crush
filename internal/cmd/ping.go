@@ -3,9 +3,13 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
+	"net/http"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"charm.land/fantasy"
@@ -207,6 +211,7 @@ func runPing(cmd *cobra.Command, modelType config.SelectedModelType) error {
 			if asJSON {
 				return json.NewEncoder(os.Stdout).Encode(result)
 			}
+			printPingTextError(result, time.Time{})
 			os.Exit(2)
 			return nil
 		}
@@ -223,6 +228,8 @@ func runPing(cmd *cobra.Command, modelType config.SelectedModelType) error {
 		if asJSON {
 			return json.NewEncoder(os.Stdout).Encode(result)
 		}
+		resetAt, _ := pingRateLimitReset(err, time.Now())
+		printPingTextError(result, resetAt)
 		os.Exit(1)
 		return nil
 	}
@@ -240,6 +247,7 @@ func runPing(cmd *cobra.Command, modelType config.SelectedModelType) error {
 		if asJSON {
 			return json.NewEncoder(os.Stdout).Encode(result)
 		}
+		printPingTextError(result, time.Time{})
 		os.Exit(1)
 		return nil
 	}
@@ -446,6 +454,109 @@ func buildPingProvider(ctx context.Context, store *config.ConfigStore, providerC
 	default:
 		return nil, fmt.Errorf("provider type not supported: %q", providerCfg.Type)
 	}
+}
+
+// printPingTextError renders a failed ping (timeout / stream error / empty
+// response) for the human-readable output path. Without this the text mode
+// silently exited non-zero — a rate-limit / quota error from the provider
+// produced no message at all, the error was only ever emitted under --json.
+// Goes to stderr so it doesn't pollute any stdout parsing of the OK path.
+// When resetAt is non-zero (rate-limit error), the moment the limit window
+// reopens is printed in local time so the user knows when to retry.
+func printPingTextError(r PingResult, resetAt time.Time) {
+	if r.Effort != "" {
+		fmt.Fprintf(os.Stderr, "provider:  %s / %s effort=%s\n", r.Provider, r.Model, r.Effort)
+	} else {
+		fmt.Fprintf(os.Stderr, "provider:  %s / %s\n", r.Provider, r.Model)
+	}
+	fmt.Fprintf(os.Stderr, "status:    %s\n", r.Status)
+	fmt.Fprintf(os.Stderr, "latency:   %dms\n", r.LatencyMs)
+	if r.Error != nil {
+		fmt.Fprintf(os.Stderr, "error:     %s\n", *r.Error)
+	}
+	if !resetAt.IsZero() {
+		local := resetAt.Local()
+		if in := time.Until(local).Round(time.Second); in > 0 {
+			fmt.Fprintf(os.Stderr, "limit reset: %s (in %s)\n", local.Format("2006-01-02 15:04:05 MST"), in)
+		} else {
+			fmt.Fprintf(os.Stderr, "limit reset: %s\n", local.Format("2006-01-02 15:04:05 MST"))
+		}
+	}
+}
+
+// pingRateLimitReset extracts, from a provider error, the wall-clock time at
+// which the rate-limit window reopens. The hint lives in the 429 response
+// headers (never the error string), so it's read off fantasy.ProviderError's
+// captured headers. Returns ok=false when the error isn't a provider error or
+// carries no usable reset hint. `now` is taken as an argument for testability.
+func pingRateLimitReset(err error, now time.Time) (time.Time, bool) {
+	var pe *fantasy.ProviderError
+	if !errors.As(err, &pe) || pe.ResponseHeaders == nil {
+		return time.Time{}, false
+	}
+	get := func(name string) string {
+		for k, v := range pe.ResponseHeaders {
+			if strings.EqualFold(k, name) {
+				return strings.TrimSpace(v)
+			}
+		}
+		return ""
+	}
+
+	// Retry-After (RFC 7231): delta-seconds or an HTTP-date.
+	if ra := get("retry-after"); ra != "" {
+		if secs, e := strconv.Atoi(ra); e == nil {
+			return now.Add(time.Duration(secs) * time.Second), true
+		}
+		if t, e := http.ParseTime(ra); e == nil {
+			return t, true
+		}
+	}
+
+	// Anthropic reset headers: RFC 3339 timestamps (unix seconds for the
+	// unified one). Take the latest — that's when every bucket has refilled.
+	var latest time.Time
+	for _, h := range []string{
+		"anthropic-ratelimit-unified-reset",
+		"anthropic-ratelimit-tokens-reset",
+		"anthropic-ratelimit-input-tokens-reset",
+		"anthropic-ratelimit-output-tokens-reset",
+		"anthropic-ratelimit-requests-reset",
+	} {
+		v := get(h)
+		if v == "" {
+			continue
+		}
+		if t, e := time.Parse(time.RFC3339, v); e == nil {
+			if t.After(latest) {
+				latest = t
+			}
+			continue
+		}
+		if secs, e := strconv.ParseInt(v, 10, 64); e == nil {
+			if t := time.Unix(secs, 0); t.After(latest) {
+				latest = t
+			}
+		}
+	}
+	if !latest.IsZero() {
+		return latest, true
+	}
+
+	// OpenAI-style: durations like "1s" / "6m0s" relative to now.
+	var maxDur time.Duration
+	for _, h := range []string{"x-ratelimit-reset-requests", "x-ratelimit-reset-tokens"} {
+		if v := get(h); v != "" {
+			if d, e := time.ParseDuration(v); e == nil && d > maxDur {
+				maxDur = d
+			}
+		}
+	}
+	if maxDur > 0 {
+		return now.Add(maxDur), true
+	}
+
+	return time.Time{}, false
 }
 
 func stringPtr(s string) *string {

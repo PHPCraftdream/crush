@@ -2,11 +2,84 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
+	"charm.land/fantasy"
 	"github.com/stretchr/testify/require"
 )
+
+func TestPingRateLimitReset(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 6, 2, 12, 0, 0, 0, time.UTC)
+
+	t.Run("retry-after seconds", func(t *testing.T) {
+		t.Parallel()
+		err := &fantasy.ProviderError{
+			StatusCode:      429,
+			ResponseHeaders: map[string]string{"Retry-After": "30"},
+		}
+		got, ok := pingRateLimitReset(err, now)
+		require.True(t, ok)
+		require.Equal(t, now.Add(30*time.Second), got)
+	})
+
+	t.Run("anthropic reset picks the latest bucket", func(t *testing.T) {
+		t.Parallel()
+		err := &fantasy.ProviderError{
+			StatusCode: 429,
+			ResponseHeaders: map[string]string{
+				"Anthropic-Ratelimit-Requests-Reset":     "2026-06-02T12:00:10Z",
+				"Anthropic-Ratelimit-Input-Tokens-Reset": "2026-06-02T12:00:45Z",
+				"Anthropic-Ratelimit-Tokens-Reset":       "2026-06-02T12:00:20Z",
+			},
+		}
+		got, ok := pingRateLimitReset(err, now)
+		require.True(t, ok)
+		require.Equal(t, time.Date(2026, 6, 2, 12, 0, 45, 0, time.UTC), got.UTC())
+	})
+
+	t.Run("retry-after wins over reset headers", func(t *testing.T) {
+		t.Parallel()
+		err := &fantasy.ProviderError{
+			ResponseHeaders: map[string]string{
+				"Retry-After":                         "5",
+				"Anthropic-Ratelimit-Requests-Reset": "2026-06-02T13:00:00Z",
+			},
+		}
+		got, ok := pingRateLimitReset(err, now)
+		require.True(t, ok)
+		require.Equal(t, now.Add(5*time.Second), got)
+	})
+
+	t.Run("openai duration headers", func(t *testing.T) {
+		t.Parallel()
+		err := &fantasy.ProviderError{
+			ResponseHeaders: map[string]string{
+				"X-Ratelimit-Reset-Requests": "1s",
+				"X-Ratelimit-Reset-Tokens":   "6m0s",
+			},
+		}
+		got, ok := pingRateLimitReset(err, now)
+		require.True(t, ok)
+		require.Equal(t, now.Add(6*time.Minute), got)
+	})
+
+	t.Run("non-provider error", func(t *testing.T) {
+		t.Parallel()
+		_, ok := pingRateLimitReset(errors.New("boom"), now)
+		require.False(t, ok)
+	})
+
+	t.Run("provider error without reset hints", func(t *testing.T) {
+		t.Parallel()
+		err := &fantasy.ProviderError{StatusCode: 500, ResponseHeaders: map[string]string{"X-Foo": "bar"}}
+		_, ok := pingRateLimitReset(err, now)
+		require.False(t, ok)
+	})
+}
 
 func TestPingCmd_Exists(t *testing.T) {
 	t.Parallel()
