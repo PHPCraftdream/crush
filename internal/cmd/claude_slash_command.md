@@ -58,12 +58,14 @@ transient failures.
 - `--role smart` for non-trivial, `--role fast` for one-liners.
 - Stable, task-meaningful `--session` id (issue / branch / topic slug)
   — same id continues across runs and is recognisable in `sessions watch`.
-- `--timeout` proportional to scope: small tweak → `5m`; new file
-  → `10m`; multi-file refactor → `20m`; bug-hunt → `30m`. Over-provision
-  when in doubt — a mid-edit timeout leaves partial state.
+- `--timeout 60m` as the standard ceiling — set it on every run. It's
+  generous on purpose: a mid-edit timeout leaves partial state, so a
+  long ceiling is cheap insurance (the run still ends as soon as the
+  task is done, well before 60m). Only drop lower for a genuinely tiny
+  task where you want a fast failure signal.
 - Run in the background (`Bash` `run_in_background: true`), redirect to
   `.crush/stdin/<task>.{out,err}`, react on the completion notification.
-  Don't poll with sleep.
+  Don't sleep-poll for output — but do run the liveness watchdog below.
 - Multi-line prompts → `Write` to `.crush/stdin/<task>.prompt`, feed via
   `< file`. Avoid positional `"…"` past one line.
 - Permissions inside `crush run` are auto-approved — run only in
@@ -98,6 +100,30 @@ Read-only secondaries: `sessions list` (with STATUS column),
 `Ctrl+C` in `watch` prints `(interrupted — session still running)`
 without a summary — deliberate, so "I stopped watching" never reads
 as "session ended".
+
+**Liveness watchdog — check every ~10 minutes.** A 60m ceiling is a
+long time to be blind, so don't just wait for the completion
+notification. Every ~10 minutes while the run is in flight, probe that
+the session is still alive:
+
+```
+crush sessions locks <id>   # heartbeat: alive / ping / stopping / offline
+```
+
+This is a liveness probe, not output polling — the completion
+notification still delivers the result. But if the heartbeat reads
+`offline` / `stopping` and no completion notification has arrived, the
+holder died silently: stop waiting, inspect
+`.crush/stdin/<task>.{out,err}` + `crush sessions last <id>`, and
+re-launch into the same `--session` rather than burning the rest of
+the 60m on a dead process.
+
+**Tear the watchdog down when it has nothing left to watch.** The
+10-minute cycle exists only to babysit live runs. Once a session
+finishes — and you are not launching a replacement and no other
+`/crush` runs are still in flight — drop the liveness loop entirely.
+Don't keep probing `sessions locks` on an empty field; an idle
+watchdog is just noise. Re-arm it only when you launch the next run.
 
 ## Repo-wide default system prompt
 
