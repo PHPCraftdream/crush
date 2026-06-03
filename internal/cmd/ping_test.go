@@ -45,7 +45,7 @@ func TestPingRateLimitReset(t *testing.T) {
 		t.Parallel()
 		err := &fantasy.ProviderError{
 			ResponseHeaders: map[string]string{
-				"Retry-After":                         "5",
+				"Retry-After":                        "5",
 				"Anthropic-Ratelimit-Requests-Reset": "2026-06-02T13:00:00Z",
 			},
 		}
