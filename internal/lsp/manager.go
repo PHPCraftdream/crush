@@ -168,16 +168,24 @@ func (s *Manager) startServer(ctx context.Context, name, filepath string, server
 		}
 	}
 
+	// Back off on a server that recently failed to start — for ALL servers,
+	// user-configured as well as auto-detected. Fork patch: previously this
+	// guard lived inside the !isUserConfigured branch and markUnavailable was
+	// only set when the binary was missing from PATH. A server whose binary
+	// DOES resolve but then fails to initialise (e.g. a rustup proxy shim for
+	// an uninstalled rust-analyzer: "Unknown binary 'rust-analyzer.exe' …")
+	// was therefore retried on every file event — thousands of times, pegging
+	// CPU and flooding the log. Now any init/create failure marks the server
+	// unavailable (see below) and this guard suppresses the retry storm.
+	if s.recentlyUnavailable(name) {
+		return
+	}
 	if !isUserConfigured {
-		if s.recentlyUnavailable(name) {
-			return
-		}
 		if _, err := exec.LookPath(server.Command); err != nil {
 			slog.Debug("LSP server not installed, skipping", "name", name, "command", server.Command)
 			s.markUnavailable(name)
 			return
 		}
-		s.clearUnavailable(name)
 		if skipAutoStartCommands[server.Command] {
 			slog.Debug("LSP command too generic for auto-start, skipping", "name", name, "command", server.Command)
 			return
@@ -209,6 +217,7 @@ func (s *Manager) startServer(ctx context.Context, name, filepath string, server
 	)
 	if err != nil {
 		slog.Error("Failed to create LSP client", "name", name, "error", err)
+		s.markUnavailable(name)
 		return
 	}
 	// Only store non-nil clients. If another goroutine raced us,
@@ -239,10 +248,13 @@ func (s *Manager) startServer(ctx context.Context, name, filepath string, server
 
 	if _, err := client.Initialize(initCtx, s.cfg.WorkingDir()); err != nil {
 		slog.Error("LSP client initialization failed", "name", name, "error", err)
+		s.markUnavailable(name)
 		_ = client.Close(ctx)
 		s.clients.Del(name)
 		return
 	}
+	// Initialised OK — clear any prior unavailable backoff.
+	s.clearUnavailable(name)
 
 	if err := client.WaitForServerReady(initCtx); err != nil {
 		slog.Warn("LSP server not fully ready, continuing anyway", "name", name, "error", err)

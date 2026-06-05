@@ -437,6 +437,28 @@ crush run --timeout 5m --session "long-task" "refactor the storage layer"
 			var timeoutCancel context.CancelFunc
 			ctx, timeoutCancel = context.WithTimeout(ctx, timeoutDur)
 			defer timeoutCancel()
+
+			// Hard wall-clock kill. The context deadline above is the GRACEFUL
+			// path — it only unblocks code that actually observes ctx. A real
+			// freeze (deadlock on a shared mutex, a provider/LSP read that
+			// ignores ctx) won't honour it, and the process can zombie for
+			// hours holding its session lock — observed: a ~2h hang where even
+			// the stream watchdog's cancel() couldn't unblock it. This timer
+			// depends on nothing inside the app: after the deadline plus a
+			// grace window for clean shutdown, it force-exits. The defer stops
+			// it on any normal return, so it only ever fires on a true hang.
+			// os.Exit skips defers, leaving the lock file with a now-dead PID —
+			// `crush sessions reap`/`kill` reclaims it, far better than a live
+			// zombie holding the handle. (Fork patch.)
+			const hardKillGrace = 60 * time.Second
+			hardDeadline := timeoutDur + hardKillGrace
+			killTimer := time.AfterFunc(hardDeadline, func() {
+				fmt.Fprintf(os.Stderr,
+					"crush: run exceeded %s (timeout %s + %s grace) without exiting — force-killing\n",
+					hardDeadline, timeoutDur, hardKillGrace)
+				os.Exit(124)
+			})
+			defer killTimer.Stop()
 		}
 
 		a, err := setupApp(cmd)
@@ -535,7 +557,7 @@ func init() {
 	runCmd.Flags().String("effort", "", "Reasoning effort for this turn: low|medium|high. Applies to whichever slot --role picked. Persisted on the session so subsequent runs inherit it.")
 	runCmd.Flags().Bool("stream", false, "Stream every assistant token to stdout. Default is terse: tool-call names on stderr + final answer on stdout.")
 	runCmd.Flags().Bool("json", false, "Emit one JSON object on stdout summarising the run (session_id, final_text, tool_calls, usage, duration, exit_reason). Mutually exclusive with --stream.")
-	runCmd.Flags().String("timeout", "0", "Abort the run after this duration (e.g. 30s, 5m, 900 — plain number = seconds). 0 = no timeout.")
+	runCmd.Flags().String("timeout", "60m", "Abort the run after this duration (e.g. 30s, 5m, 900 — plain number = seconds). A hard wall-clock kill force-exits the process 60s past this even on a freeze. Default 60m; pass 0 to disable both.")
 	runCmd.Flags().StringP("model", "m", "", "Model to use. Accepts 'model' or 'provider/model' to disambiguate models with the same name across providers")
 	runCmd.Flags().String("small-model", "", "Small model to use. If not provided, uses the default small model for the provider")
 	runCmd.Flags().StringP("session", "s", "", "Session ID to continue OR create. If a session with this id exists it is continued; otherwise a new one is created with this id. Accepts a hash prefix for existing sessions only.")
