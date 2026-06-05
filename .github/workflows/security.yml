@@ -4,8 +4,12 @@ on:
   pull_request:
   push:
     branches: [main]
-  schedule:
-    - cron: "0 2 * * *"
+  # Fork: cron disabled. The daily scan re-runs grype against the latest
+  # vuln DB and fails the build on any newly-disclosed critical in a
+  # dependency — even when our code is unchanged — emailing on every fire.
+  # It still runs on push / PR, which is when our deps actually change.
+  # schedule:
+  #   - cron: "0 2 * * *"
 
 permissions:
   contents: read
