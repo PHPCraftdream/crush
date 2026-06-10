@@ -347,7 +347,7 @@ func TestClaudeInit_InstallsAgents(t *testing.T) {
 	require.NoError(t, err)
 
 	// Check a few representative files exist with correct content.
-	for _, name := range []string{"ao47h", "ao47xx", "as46m", "ah45l", "aol", "asl", "ahh"} {
+	for _, name := range []string{"ao47h", "ao47xx", "as46m", "ah45l", "aol", "asl", "ahh", "afh", "afxx"} {
 		path := filepath.Join(agentsDir, name+".md")
 		data, err := os.ReadFile(path)
 		require.NoError(t, err, "agent %s should exist", name)
@@ -441,13 +441,13 @@ func TestClaudeInit_InstallsBothCommandsAndAgents(t *testing.T) {
 	agentsDir := filepath.Join(dir, ".claude", "agents")
 
 	// Verify slash-commands exist.
-	for _, name := range []string{"o47h", "s46m", "hh"} {
+	for _, name := range []string{"o47h", "s46m", "hh", "fh"} {
 		_, err := os.Stat(filepath.Join(cmdDir, name+".md"))
 		require.NoError(t, err, "slash-command %s should exist", name)
 	}
 
 	// Verify agents exist.
-	for _, name := range []string{"ao47h", "as46m", "ahh"} {
+	for _, name := range []string{"ao47h", "as46m", "ahh", "afh"} {
 		_, err := os.Stat(filepath.Join(agentsDir, name+".md"))
 		require.NoError(t, err, "agent %s should exist", name)
 	}

@@ -1,3 +1,7 @@
+// Fork patch: batch 32 — Fable 5 shipped. Added top-model fable shortcuts
+// (fl/fm/fh/fx/fxx and agents afl..afxx) pointing at `claude-fable-5`
+// with 1M context window.
+//
 // Fork patch: batch 31 — Opus 4.8 shipped. Top-of-family opus shortcuts
 // (ol/om/oh/ox/oxx and agents aol..aoxx) now point at `claude-opus-4-8`;
 // the versioned o47*/ao47* family stays on `claude-opus-4-7` so 4.7 is
@@ -157,6 +161,12 @@ var allModelCommands = []modelCmd{
 	{"hl", "claude-haiku-4-5", "low", "Haiku (top, 200k) – low"},
 	{"hm", "claude-haiku-4-5", "medium", "Haiku (top, 200k) – medium"},
 	{"hh", "claude-haiku-4-5", "high", "Haiku (top, 200k) – high"},
+	// Top-model Fable shortcuts
+	{"fl", "claude-fable-5", "low", "Fable (top, 1M) – low"},
+	{"fm", "claude-fable-5", "medium", "Fable (top, 1M) – medium"},
+	{"fh", "claude-fable-5", "high", "Fable (top, 1M) – high"},
+	{"fx", "claude-fable-5", "xhigh", "Fable (top, 1M) – xhigh"},
+	{"fxx", "claude-fable-5", "max", "Fable (top, 1M) – max"},
 }
 
 var claudeInitCmd = &cobra.Command{
@@ -174,7 +184,7 @@ Concretely:
   1. Write ` + "`.claude/commands/crush.md`" + ` — the ` + "`/crush`" + ` delegation command.
      Skipped (with a warning) if the file exists without our sentinel.
 
-  2. Write 31 per-model slash commands (versioned + top-model shortcuts):
+  2. Write 36 per-model slash commands (versioned + top-model shortcuts):
 
        o47l..o47xx  claude-opus-4-7    1M ctx   effort low→max
        o46l..o46xx  claude-opus-4-6    1M ctx   effort low→max (no xhigh)
@@ -184,13 +194,14 @@ Concretely:
        ol,om,oh,ox,oxx  claude-opus-4-8    1M ctx   (top opus shortcuts)
        sl,sm,sh,sx      claude-sonnet-4-6  200k ctx (top sonnet shortcuts)
        hl,hm,hh         claude-haiku-4-5   200k ctx (top haiku shortcuts)
+       fl,fm,fh,fx,fxx  claude-fable-5     1M ctx   (top fable shortcuts)
 
      Each passes ` + "`$ARGUMENTS`" + ` straight to the chosen model/effort.
      Existing files without our sentinel are left alone.
 
-  3. Write 31 per-model sub-agents (a<short-code>.md):
+  3. Write 36 per-model sub-agents (a<short-code>.md):
        ao47l..ao47xx, ao46l..ao46xx, as46l..as46xx, as45l..as45h,
-       ah45l..ah45h, aol..aoxx, asl..asx, ahl..ahh
+       ah45l..ah45h, aol..aoxx, asl..asx, ahl..ahh, afl..afxx
 
      Each mirrors its slash-command twin but runs in an ISOLATED context
      (fresh 1M/200k window, returns only a summary to the parent chat).
@@ -217,6 +228,7 @@ crush claude-init --cwd /path/to/project
 #   /s46m fix the lint warnings          → Sonnet 4.6 medium, same conversation
 #   /h45l summarise this file            → Haiku 4.5 low, same conversation
 #   /oh   deep analysis                  → Opus (top) high, same conversation
+#   /fh   autonomous coding task         → Fable 5 high, same conversation
 
 # Slash-commands continue current conversation; sub-agents run in fresh context:
 #   /ao47x analyze codebase, return list → Opus 4.7 xhigh, isolated, returns summary only

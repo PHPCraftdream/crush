@@ -13,8 +13,8 @@ var claudeDelCmd = &cobra.Command{
 	Use:   "claude-del",
 	Short: "Remove crush slash-commands, sub-agents, and legacy CLAUDE.md block",
 	Long: `Undo ` + "`crush claude-init`" + `: remove the /crush slash-command, all
-per-model slash-commands (o47-*, s46-*, h45-*, …), all per-model
-sub-agents (ao47-*, as46-*, ah45-*, …), and strip any
+per-model slash-commands (o47-*, s46-*, h45-*, fl-*, …), all per-model
+sub-agents (ao47-*, as46-*, ah45-*, afl-*, …), and strip any
 crush-claude-init block from CLAUDE.md.
 
 Only files that carry our sentinel are removed — foreign files with the
