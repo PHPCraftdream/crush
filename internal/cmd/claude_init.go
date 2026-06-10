@@ -450,6 +450,7 @@ func buildAgentContent(mc modelCmd) string {
 		"$ARGUMENTS\n\n" +
 		"Do the task autonomously. Return only the final result — no preamble, no recap of steps. If the task is a question, answer it directly. If it's an action, do it and report what changed.\n\n" +
 		agentGitSafetyClause +
+		"\n" + agentTestScopeClause +
 		"\n" + claudeModelAgentSentinel + "\n"
 }
 
@@ -460,6 +461,16 @@ func buildAgentContent(mc modelCmd) string {
 // / `git stash` / `git pull` from one of them silently corrupts the
 // in-progress work of the others. The clause is in English because the
 // agent prompts themselves are in English.
+// agentTestScopeClause tells agents to run only scoped tests, not the
+// full project suite. The orchestrator runs the global suite after all
+// agents finish and re-delegates any failures.
+const agentTestScopeClause = "**Test scope — no global test suites.** Run ONLY tests that directly " +
+	"cover YOUR changes — typically `go test ./path/to/package/...` for the " +
+	"package(s) you modified or created. Do NOT run project-wide test suites " +
+	"(`go test ./...`, `make test`, or equivalent broad commands). The " +
+	"orchestrator will run the full suite after all agents complete their work " +
+	"and will delegate any regressions back to the responsible agent.\n"
+
 const agentGitSafetyClause = "**Git safety — shared workspace.** You are one of several agents that " +
 	"may be working in this repository at the same time. Do NOT run any " +
 	"git command that mutates the working tree, index, refs or remotes — " +

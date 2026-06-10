@@ -21,6 +21,7 @@ import (
 	"charm.land/fantasy/providers/openaicompat"
 	"charm.land/fantasy/providers/openrouter"
 	"charm.land/fantasy/providers/vercel"
+	"github.com/charmbracelet/crush/internal/agent/cliprovider"
 	"github.com/charmbracelet/crush/internal/agent/hyper"
 	"github.com/charmbracelet/crush/internal/config"
 	openaisdk "github.com/charmbracelet/openai-go/option"
@@ -31,24 +32,36 @@ var pingCmd = &cobra.Command{
 	Use:   "ping [--json] [--timeout 15s] [--prompt \"<custom>\"]",
 	Short: "Ping the large model to verify connectivity and API key",
 	Long: `Send a minimal request to the configured large model to verify connectivity,
-API key validity, and measure latency. This is a per-slot ping (complements
-'crush providers test <id>' which is per-provider).
+API key validity, and measure latency. Works with any provider: API-based
+(Anthropic, OpenAI, Google, …) and CLI-based (claude, gemini, codex, qwen).
 
 A system prompt instructs the model to reply with exactly "OK". Any other
-response sets status=degraded. Auth/quota errors set status=error with exit
-code 1. Timeouts set status=timeout with exit code 2.`,
+response sets status=degraded (for CLI models, any non-empty reply counts
+as ok because the local CLI injects its own system context).
+
+Auth/quota errors set status=error with exit code 1.
+Timeouts set status=timeout with exit code 2.`,
 	Example: `
-# Default text output
+# Ping whichever large model is currently configured
 crush ping
+
+# Ping the small model slot
+crush ping-fast
+
+# First set the model, then ping (API provider)
+crush models use glm5_turbo glm5_turbo && crush ping
+
+# Set a CLI model and ping it (Claude via local CLI)
+crush models use fh hh && crush ping
+
+# Set Opus 4.8 via short code and ping
+crush models use ox hl && crush ping --timeout 60s
 
 # Machine-readable JSON
 crush ping --json
 
-# With 30s timeout
-crush ping --timeout 30s
-
-# Custom prompt
-crush ping --prompt "Reply with yes or no"
+# Custom prompt and timeout
+crush ping --timeout 30s --prompt "Reply with yes or no"
   `,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return runPing(cmd, config.SelectedModelTypeLarge)
@@ -58,10 +71,14 @@ crush ping --prompt "Reply with yes or no"
 var pingFastCmd = &cobra.Command{
 	Use:   "ping-fast [--json] [--timeout 15s] [--prompt \"<custom>\"]",
 	Short: "Ping the small model to verify connectivity and API key",
-	Long:  `Same as 'crush ping' but for the configured small model.`,
+	Long: `Same as 'crush ping' but for the configured small (fast) model slot.
+Works with any provider type — API or CLI.`,
 	Example: `
-# Default text output
+# Ping the small model
 crush ping-fast
+
+# CLI model in the small slot
+crush models use oh hl && crush ping-fast
 
 # Machine-readable JSON
 crush ping-fast --json
@@ -140,8 +157,10 @@ func runPing(cmd *cobra.Command, modelType config.SelectedModelType) error {
 	ctx, cancel := context.WithTimeout(cmd.Context(), timeout)
 	defer cancel()
 
+	cwd, _ := ResolveCwd(cmd)
+
 	// Build the provider
-	provider, err := buildPingProvider(ctx, store, providerCfg, &modelCfg)
+	provider, err := buildPingProvider(ctx, store, providerCfg, &modelCfg, cwd)
 	if err != nil {
 		msg := err.Error()
 		result := PingResult{
@@ -186,6 +205,11 @@ func runPing(cmd *cobra.Command, modelType config.SelectedModelType) error {
 		fantasy.WithSystemPrompt(systemPrompt),
 		fantasy.WithMaxOutputTokens(1024),
 	)
+
+	// Pass reasoning effort to CLI providers via context.
+	if modelCfg.ReasoningEffort != "" {
+		ctx = context.WithValue(ctx, cliprovider.ReasoningEffortContextKey, modelCfg.ReasoningEffort)
+	}
 
 	// Measure request time
 	start := time.Now()
@@ -258,10 +282,19 @@ func runPing(cmd *cobra.Command, modelType config.SelectedModelType) error {
 	promptTokens := resp.Steps[len(resp.Steps)-1].Usage.InputTokens
 	completionTokens := resp.Steps[len(resp.Steps)-1].Usage.OutputTokens
 
-	// Determine status based on response
+	// Determine status based on response.
+	// CLI providers pipe through `claude` which injects its own system prompt
+	// (CLAUDE.md, project context, etc.), so the model rarely echoes bare "OK".
+	// For CLI we accept any non-empty reply as healthy.
 	status := "ok"
 	if response != "OK" {
-		status = "degraded"
+		if providerCfg.Type == cliprovider.ProviderType {
+			if strings.TrimSpace(response) == "" {
+				status = "degraded"
+			}
+		} else {
+			status = "degraded"
+		}
 	}
 
 	// Build atom label
@@ -323,7 +356,7 @@ func runPing(cmd *cobra.Command, modelType config.SelectedModelType) error {
 
 // buildPingProvider constructs a provider for the ping request.
 // Mirrors the coordinator's buildProvider logic.
-func buildPingProvider(ctx context.Context, store *config.ConfigStore, providerCfg config.ProviderConfig, modelCfg *config.SelectedModel) (fantasy.Provider, error) {
+func buildPingProvider(ctx context.Context, store *config.ConfigStore, providerCfg config.ProviderConfig, modelCfg *config.SelectedModel, cwd string) (fantasy.Provider, error) {
 	headers := maps.Clone(providerCfg.ExtraHeaders)
 	if headers == nil {
 		headers = make(map[string]string)
@@ -450,6 +483,9 @@ func buildPingProvider(ctx context.Context, store *config.ConfigStore, providerC
 			}
 		}
 		return openaicompat.New(opts...)
+
+	case cliprovider.ProviderType:
+		return cliprovider.New(cwd, func() bool { return true }, nil, nil, nil), nil
 
 	default:
 		return nil, fmt.Errorf("provider type not supported: %q", providerCfg.Type)

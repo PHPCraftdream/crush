@@ -26,6 +26,7 @@ var atomRegistry = map[string]atom{
 	"opus":         {Provider: "local-cli", Model: "cli-claude-opus", DisplayName: "Claude Opus", CtxLabel: "1M", Group: "anthropic", GroupNote: "via local `claude` CLI", EffortSource: claudeEffortSource},
 	"sonnet":       {Provider: "local-cli", Model: "cli-claude-sonnet", DisplayName: "Claude Sonnet", CtxLabel: "200k", Group: "anthropic", GroupNote: "via local `claude` CLI", EffortSource: claudeEffortSource},
 	"haiku":        {Provider: "local-cli", Model: "cli-claude-haiku", DisplayName: "Claude Haiku", CtxLabel: "200k", Group: "anthropic", GroupNote: "via local `claude` CLI", EffortSource: claudeEffortSource},
+	"fable":        {Provider: "local-cli", Model: "cli-claude-fable", DisplayName: "Claude Fable", CtxLabel: "1M", Group: "anthropic", EffortSource: claudeEffortSource},
 	"glm5_1":       {Provider: "zai", Model: "glm-5.1", DisplayName: "GLM 5.1", CtxLabel: "204.8k", Group: "zai", GroupNote: "openai-compat, no effort"},
 	"glm5":         {Provider: "zai", Model: "glm-5", DisplayName: "GLM 5", CtxLabel: "204.8k", Group: "zai"},
 	"glm5_turbo":   {Provider: "zai", Model: "glm-5-turbo", DisplayName: "GLM 5 turbo", CtxLabel: "200k", Group: "zai"},
@@ -45,7 +46,7 @@ var atomGroupOrder = []string{"anthropic", "zai"}
 // display order keeps the human-readable list predictable (Opus first, then
 // Sonnet, then Haiku; newest GLM first, then descending versions).
 var atomDisplayOrder = map[string][]string{
-	"anthropic": {"opus", "sonnet", "haiku"},
+	"anthropic": {"opus", "fable", "sonnet", "haiku"},
 	"zai": {
 		"glm5_1", "glm5", "glm5_turbo",
 		"glm4_7", "glm4_7_flash",
@@ -266,6 +267,11 @@ func renderShortCodesBlock() string {
 		{"hl", "claude-haiku-4-5", "200k", "low"},
 		{"hm", "claude-haiku-4-5", "200k", "medium"},
 		{"hh", "claude-haiku-4-5", "200k", "high"},
+		{"fl", "claude-fable-5", "1M", "low"},
+		{"fm", "claude-fable-5", "1M", "medium"},
+		{"fh", "claude-fable-5", "1M", "high"},
+		{"fx", "claude-fable-5", "1M", "xhigh"},
+		{"fxx", "claude-fable-5", "1M", "max"},
 	}
 	tw := tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
 	for _, r := range rows {
@@ -297,6 +303,7 @@ var shortCodeBase = map[string]string{
 	"o":   "opus",
 	"s":   "sonnet",
 	"h":   "haiku",
+	"f":   "fable",
 }
 
 // shortCodeValidEfforts lists which effort suffixes each base accepts.
@@ -309,6 +316,7 @@ var shortCodeValidEfforts = map[string][]string{
 	"o":   {"l", "m", "h", "x", "xx"},
 	"s":   {"l", "m", "h", "xx"},
 	"h":   {"l", "m", "h"},
+	"f":   {"l", "m", "h", "x", "xx"},
 }
 
 // parseShortCode tries to parse a short-code atom like "o47x" or "h45l".
