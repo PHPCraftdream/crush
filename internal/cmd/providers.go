@@ -576,6 +576,96 @@ unset with the matching --global / --local to fully clear it.`,
 	},
 }
 
+var providersFetchModelsCmd = &cobra.Command{
+	Use:   "fetch-models <id>",
+	Short: "Query the provider's API live and list available models (read-only)",
+	Long: `Hit the provider's models endpoint (GET <base_url>/models for
+openai-compat, GET /v1/models for anthropic) using the resolved API
+key and print whatever the server actually returns. Unlike
+'crush providers update', this does NOT write anything to crush.json —
+use it to discover newly-released models before deciding whether to
+update the local cache.`,
+	Example: `
+# Inspect z.ai's live model list (looks for newly-released GLM versions)
+crush providers fetch-models zai
+
+# JSON for scripts
+crush providers fetch-models openai --json
+
+# Diff against locally-cached models
+crush providers fetch-models zai --diff
+  `,
+	Args: cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		asJSON, _ := cmd.Flags().GetBool("json")
+		showDiff, _ := cmd.Flags().GetBool("diff")
+
+		a, err := setupApp(cmd)
+		if err != nil {
+			return err
+		}
+		defer a.Shutdown()
+
+		id := args[0]
+		p, ok := a.Config().Providers.Get(id)
+		if !ok {
+			return fmt.Errorf("provider %q not found", id)
+		}
+
+		models, warnings, err := fetchModels(a, p)
+		if err != nil {
+			return fmt.Errorf("fetch-models %s: %w", id, err)
+		}
+
+		if asJSON {
+			out := struct {
+				Provider string          `json:"provider"`
+				Count    int             `json:"count"`
+				Models   []catwalk.Model `json:"models"`
+				Warnings []string        `json:"warnings,omitempty"`
+			}{Provider: id, Count: len(models), Models: models, Warnings: warnings}
+			return json.NewEncoder(os.Stdout).Encode(out)
+		}
+
+		fmt.Fprintf(os.Stdout, "provider:  %s (%s)\n", id, dash(string(p.Type)))
+		fmt.Fprintf(os.Stdout, "endpoint:  %s\n", dash(p.BaseURL))
+		fmt.Fprintf(os.Stdout, "models:    %d returned by server\n\n", len(models))
+
+		tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(tw, "ID\tCONTEXT\tNAME")
+		for _, m := range models {
+			ctx := "—"
+			if m.ContextWindow > 0 {
+				ctx = fmt.Sprintf("%d", m.ContextWindow)
+			}
+			fmt.Fprintf(tw, "%s\t%s\t%s\n", m.ID, ctx, dash(m.Name))
+		}
+		if err := tw.Flush(); err != nil {
+			return err
+		}
+
+		if showDiff {
+			added, removed := computeDiff(p.Models, models)
+			fmt.Fprintln(os.Stdout)
+			fmt.Fprintf(os.Stdout, "diff vs cached (%d locally):\n", len(p.Models))
+			if len(added) == 0 && len(removed) == 0 {
+				fmt.Fprintln(os.Stdout, "  no changes")
+			}
+			for _, m := range added {
+				fmt.Fprintf(os.Stdout, "  + %s\n", m.ID)
+			}
+			for _, m := range removed {
+				fmt.Fprintf(os.Stdout, "  - %s\n", m.ID)
+			}
+		}
+
+		for _, w := range warnings {
+			fmt.Fprintf(os.Stderr, "note: %s\n", w)
+		}
+		return nil
+	},
+}
+
 var providersGrepCmd = &cobra.Command{
 	Use:   "grep <pattern>",
 	Short: "Filter providers by id, name, or type (sugar for `list --grep <pattern>`)",
@@ -652,7 +742,10 @@ func init() {
 
 	providersUpdateCmd.Flags().Bool("all", false, "Update all enabled providers")
 
-	providersCmd.AddCommand(providersListCmd, providersShowCmd, providersSetCmd, providersAddCmd, providersEnableCmd, providersDisableCmd, providersUnsetCmd, providersUpdateCmd, providersGrepCmd)
+	providersFetchModelsCmd.Flags().Bool("json", false, "Emit a JSON object instead of a table")
+	providersFetchModelsCmd.Flags().Bool("diff", false, "Also show added/removed vs the locally-cached model list")
+
+	providersCmd.AddCommand(providersListCmd, providersShowCmd, providersSetCmd, providersAddCmd, providersEnableCmd, providersDisableCmd, providersUnsetCmd, providersUpdateCmd, providersGrepCmd, providersFetchModelsCmd)
 	rootCmd.AddCommand(providersCmd)
 }
 

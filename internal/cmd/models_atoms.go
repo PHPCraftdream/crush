@@ -27,7 +27,8 @@ var atomRegistry = map[string]atom{
 	"sonnet":       {Provider: "local-cli", Model: "cli-claude-sonnet", DisplayName: "Claude Sonnet", CtxLabel: "200k", Group: "anthropic", GroupNote: "via local `claude` CLI", EffortSource: claudeEffortSource},
 	"haiku":        {Provider: "local-cli", Model: "cli-claude-haiku", DisplayName: "Claude Haiku", CtxLabel: "200k", Group: "anthropic", GroupNote: "via local `claude` CLI", EffortSource: claudeEffortSource},
 	"fable":        {Provider: "local-cli", Model: "cli-claude-fable", DisplayName: "Claude Fable", CtxLabel: "1M", Group: "anthropic", EffortSource: claudeEffortSource},
-	"glm5_1":       {Provider: "zai", Model: "glm-5.1", DisplayName: "GLM 5.1", CtxLabel: "204.8k", Group: "zai", GroupNote: "openai-compat, no effort"},
+	"glm5_2":       {Provider: "zai", Model: "glm-5.2", DisplayName: "GLM 5.2", CtxLabel: "1M", Group: "zai", GroupNote: "openai-compat, no effort"},
+	"glm5_1":       {Provider: "zai", Model: "glm-5.1", DisplayName: "GLM 5.1", CtxLabel: "204.8k", Group: "zai"},
 	"glm5":         {Provider: "zai", Model: "glm-5", DisplayName: "GLM 5", CtxLabel: "204.8k", Group: "zai"},
 	"glm5_turbo":   {Provider: "zai", Model: "glm-5-turbo", DisplayName: "GLM 5 turbo", CtxLabel: "200k", Group: "zai"},
 	"glm4_7":       {Provider: "zai", Model: "glm-4.7", DisplayName: "GLM 4.7", CtxLabel: "204.8k", Group: "zai"},
@@ -48,7 +49,7 @@ var atomGroupOrder = []string{"anthropic", "zai"}
 var atomDisplayOrder = map[string][]string{
 	"anthropic": {"opus", "fable", "sonnet", "haiku"},
 	"zai": {
-		"glm5_1", "glm5", "glm5_turbo",
+		"glm5_2", "glm5_1", "glm5", "glm5_turbo",
 		"glm4_7", "glm4_7_flash",
 		"glm4_6", "glm4_6v",
 		"glm4_5", "glm4_5_air", "glm4_5v",

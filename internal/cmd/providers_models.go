@@ -22,23 +22,37 @@ import (
 func fetchModels(a *app.App, p config.ProviderConfig) ([]catwalk.Model, []string, error) {
 	var warnings []string
 
+	// Resolve env-template API keys (e.g. "$ZAI_API_KEY") before HTTP calls —
+	// otherwise the Authorization header is dropped and the API returns 401.
+	apiKey := p.APIKey
+	if strings.HasPrefix(apiKey, "$") {
+		if v, err := a.Store().Resolve(apiKey); err == nil {
+			apiKey = v
+		}
+	}
+	baseURL := p.BaseURL
+	if strings.HasPrefix(baseURL, "$") {
+		if v, err := a.Store().Resolve(baseURL); err == nil {
+			baseURL = v
+		}
+	}
+
 	switch p.Type {
 	case "cli":
 		models := fetchModelsCLI()
 		return models, warnings, nil
 	case "openai-compat":
-		if p.BaseURL == "" {
+		if baseURL == "" {
 			return nil, warnings, fmt.Errorf("openai-compat requires base_url")
 		}
-		models, warns, err := fetchModelsOpenAICompat(p.BaseURL, p.APIKey)
+		models, warns, err := fetchModelsOpenAICompat(baseURL, apiKey)
 		warnings = append(warnings, warns...)
 		return models, warnings, err
 	case "anthropic":
-		baseURL := p.BaseURL
 		if baseURL == "" {
 			baseURL = "https://api.anthropic.com/v1"
 		}
-		models, warns, err := fetchModelsAnthropic(baseURL, p.APIKey)
+		models, warns, err := fetchModelsAnthropic(baseURL, apiKey)
 		warnings = append(warnings, warns...)
 		return models, warnings, err
 	default:
@@ -74,7 +88,7 @@ func fetchModelsOpenAICompat(baseURL, apiKey string) ([]catwalk.Model, []string,
 		return nil, warnings, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	if apiKey != "" && !strings.HasPrefix(apiKey, "$") {
+	if apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 
