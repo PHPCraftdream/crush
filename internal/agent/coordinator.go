@@ -453,7 +453,7 @@ func (c *coordinator) runInternal(ctx context.Context, sessionID string, prompt 
 	}
 	beforeLoaded := c.skillTracker.LoadedNames()
 	var result *fantasy.AgentResult
-	var originalErr error = c.runWithUnauthorizedRetry(ctx, providerCfg, func() error {
+	originalErr := c.runWithUnauthorizedRetry(ctx, providerCfg, func() error {
 		var err error
 		result, err = run()
 		return err
