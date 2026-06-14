@@ -13,13 +13,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 	"unicode/utf8"
 
 	"charm.land/fantasy"
 	"github.com/charmbracelet/crush/internal/filepathext"
 	"github.com/charmbracelet/crush/internal/filetracker"
-	"github.com/charmbracelet/crush/internal/lsp"
 	"github.com/charmbracelet/crush/internal/permission"
 	"github.com/charmbracelet/crush/internal/skills"
 	"github.com/charmbracelet/crush/internal/stringext"
@@ -96,7 +94,6 @@ func (e contentTooLargeError) Error() string {
 }
 
 func NewViewTool(
-	lspManager *lsp.Manager,
 	permissions permission.Service,
 	filetracker filetracker.Service,
 	skillTracker *skills.Tracker,
@@ -253,8 +250,6 @@ func NewViewTool(
 				return fantasy.NewTextErrorResponse("File content is not valid UTF-8"), nil
 			}
 
-			openInLSPs(ctx, lspManager, filePath)
-			waitForLSPDiagnostics(ctx, lspManager, filePath, 300*time.Millisecond)
 			output := "<file>\n"
 			output += addLineNumbers(content, params.Offset+1)
 
@@ -263,7 +258,6 @@ func NewViewTool(
 					params.Offset+len(strings.Split(content, "\n")))
 			}
 			output += "\n</file>\n"
-			output += getDiagnostics(filePath, lspManager)
 			filetracker.RecordRead(ctx, sessionID, filePath)
 
 			meta := ViewResponseMetadata{

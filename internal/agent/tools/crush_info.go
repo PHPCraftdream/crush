@@ -10,7 +10,6 @@ import (
 	"charm.land/fantasy"
 	"github.com/charmbracelet/crush/internal/agent/tools/mcp"
 	"github.com/charmbracelet/crush/internal/config"
-	"github.com/charmbracelet/crush/internal/lsp"
 	"github.com/charmbracelet/crush/internal/skills"
 )
 
@@ -23,7 +22,6 @@ type CrushInfoParams struct{}
 
 func NewCrushInfoTool(
 	cfg *config.ConfigStore,
-	lspManager *lsp.Manager,
 	allSkills []*skills.Skill,
 	activeSkills []*skills.Skill,
 	skillTracker *skills.Tracker,
@@ -32,19 +30,18 @@ func NewCrushInfoTool(
 		CrushInfoToolName,
 		crushInfoDescription,
 		func(ctx context.Context, _ CrushInfoParams, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
-			return fantasy.NewTextResponse(buildCrushInfo(cfg, lspManager, allSkills, activeSkills, skillTracker)), nil
+			return fantasy.NewTextResponse(buildCrushInfo(cfg, allSkills, activeSkills, skillTracker)), nil
 		},
 	)
 }
 
-func buildCrushInfo(cfg *config.ConfigStore, lspManager *lsp.Manager, allSkills []*skills.Skill, activeSkills []*skills.Skill, skillTracker *skills.Tracker) string {
+func buildCrushInfo(cfg *config.ConfigStore, allSkills []*skills.Skill, activeSkills []*skills.Skill, skillTracker *skills.Tracker) string {
 	var b strings.Builder
 
 	writeConfigFiles(&b, cfg)
 	writeConfigStaleness(&b, cfg)
 	writeModels(&b, cfg)
 	writeProviders(&b, cfg)
-	writeLSP(&b, lspManager, cfg)
 	writeMCP(&b, mcp.GetStates(), cfg)
 	writeSkills(&b, allSkills, activeSkills, skillTracker, cfg)
 	writeHooks(&b, cfg)
@@ -133,77 +130,6 @@ func writeProviders(b *strings.Builder, cfg *config.ConfigStore) {
 		fmt.Fprintf(b, "%s = enabled (%d models)\n", p.name, p.count)
 	}
 	b.WriteString("\n")
-}
-
-func writeLSP(b *strings.Builder, lspManager *lsp.Manager, cfg *config.ConfigStore) {
-	// Write runtime LSP clients
-	if lspManager != nil && lspManager.Clients().Len() > 0 {
-		type entry struct {
-			name      string
-			state     lsp.ServerState
-			fileTypes []string
-		}
-		var entries []entry
-		for name, client := range lspManager.Clients().Seq2() {
-			entries = append(entries, entry{
-				name:      name,
-				state:     client.GetServerState(),
-				fileTypes: client.FileTypes(),
-			})
-		}
-		if len(entries) > 0 {
-			slices.SortFunc(entries, func(a, b entry) int { return strings.Compare(a.name, b.name) })
-			b.WriteString("[lsp]\n")
-			for _, e := range entries {
-				stateStr := lspStateString(e.state)
-				if len(e.fileTypes) > 0 {
-					sorted := slices.Clone(e.fileTypes)
-					slices.Sort(sorted)
-					fmt.Fprintf(b, "%s = %s (%s)\n", e.name, stateStr, strings.Join(sorted, ", "))
-				} else {
-					fmt.Fprintf(b, "%s = %s\n", e.name, stateStr)
-				}
-			}
-			b.WriteString("\n")
-		}
-	}
-
-	// Write configured but not running LSP servers
-	c := cfg.Config()
-	if len(c.LSP) > 0 {
-		runtimeNames := make(map[string]bool)
-		if lspManager != nil {
-			for name := range lspManager.Clients().Seq2() {
-				runtimeNames[name] = true
-			}
-		}
-
-		type configuredEntry struct {
-			name   string
-			status string
-		}
-		var entries []configuredEntry
-		for name, lspCfg := range c.LSP {
-			// Skip if already in runtime
-			if runtimeNames[name] {
-				continue
-			}
-			status := "not_started"
-			if lspCfg.Disabled {
-				status = "disabled"
-			}
-			entries = append(entries, configuredEntry{name: name, status: status})
-		}
-
-		if len(entries) > 0 {
-			slices.SortFunc(entries, func(a, b configuredEntry) int { return strings.Compare(a.name, b.name) })
-			b.WriteString("[lsp_configured]\n")
-			for _, e := range entries {
-				fmt.Fprintf(b, "%s = %s\n", e.name, e.status)
-			}
-			b.WriteString("\n")
-		}
-	}
 }
 
 func writeMCP(b *strings.Builder, states map[string]mcp.ClientInfo, cfg *config.ConfigStore) {
@@ -394,8 +320,6 @@ func writeOptions(b *strings.Builder, cfg *config.ConfigStore) {
 
 	opts = append(opts, kv{"data_directory", c.Options.DataDirectory})
 	opts = append(opts, kv{"debug", fmt.Sprintf("%v", c.Options.Debug)})
-	autoLSP := c.Options.AutoLSP == nil || *c.Options.AutoLSP
-	opts = append(opts, kv{"auto_lsp", fmt.Sprintf("%v", autoLSP)})
 	autoSummarize := !c.Options.DisableAutoSummarize
 	opts = append(opts, kv{"auto_summarize", fmt.Sprintf("%v", autoSummarize)})
 
@@ -467,21 +391,3 @@ func writeHooks(b *strings.Builder, cfg *config.ConfigStore) {
 	b.WriteString("\n")
 }
 
-func lspStateString(state lsp.ServerState) string {
-	switch state {
-	case lsp.StateUnstarted:
-		return "unstarted"
-	case lsp.StateStarting:
-		return "starting"
-	case lsp.StateReady:
-		return "ready"
-	case lsp.StateError:
-		return "error"
-	case lsp.StateStopped:
-		return "stopped"
-	case lsp.StateDisabled:
-		return "disabled"
-	default:
-		return "unknown"
-	}
-}

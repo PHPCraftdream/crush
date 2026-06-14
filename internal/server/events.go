@@ -9,7 +9,6 @@ import (
 	appPkg "github.com/charmbracelet/crush/internal/app"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/history"
-	"github.com/charmbracelet/crush/internal/lsp"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/permission"
 	"github.com/charmbracelet/crush/internal/pubsub"
@@ -156,25 +155,6 @@ func subscribeAndBroadcast(ctx context.Context, a *appPkg.App, h *Hub) {
 		}
 	}()
 
-	// LSP state changes ΓÇö broadcast a full snapshot on each event.
-	go func() {
-		ch := appPkg.SubscribeLSPEvents(ctx)
-		for {
-			select {
-			case _, ok := <-ch:
-				if !ok {
-					return
-				}
-				h.Broadcast(EventLSPState, buildLSPSnapshot(a.Config()))
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-
-	// Send initial LSP snapshot so new clients see configured servers immediately.
-	h.Broadcast(EventLSPState, buildLSPSnapshot(a.Config()))
-
 	slog.Debug("ws: event subscriptions started")
 
 	// Unused imports guard ΓÇö referenced through the generic channels above.
@@ -182,57 +162,6 @@ func subscribeAndBroadcast(ctx context.Context, a *appPkg.App, h *Hub) {
 	_ = message.Message{}
 	_ = permission.PermissionRequest{}
 	_ = history.File{}
-}
-
-// buildLSPSnapshot returns the current state of all configured LSP servers in wire format.
-func buildLSPSnapshot(cfg *config.Config) LSPSnapshot {
-	states := appPkg.GetLSPStates()
-	servers := make([]LSPServerInfo, 0)
-
-	if cfg == nil {
-		return LSPSnapshot{Servers: servers}
-	}
-
-	for name, lspCfg := range cfg.LSP {
-		info := LSPServerInfo{
-			Name:      name,
-			Disabled:  lspCfg.Disabled,
-			Command:   lspCfg.Command,
-			Args:      lspCfg.Args,
-			Env:       lspCfg.Env,
-			FileTypes: lspCfg.FileTypes,
-		}
-		if clientInfo, ok := states[name]; ok {
-			info.State = serverStateString(clientInfo.State)
-			info.DiagnosticCount = clientInfo.DiagnosticCount
-		} else if lspCfg.Disabled {
-			info.State = "disabled"
-		} else {
-			info.State = "unstarted"
-		}
-		servers = append(servers, info)
-	}
-
-	return LSPSnapshot{Servers: servers}
-}
-
-func serverStateString(state lsp.ServerState) string {
-	switch state {
-	case lsp.StateUnstarted:
-		return "unstarted"
-	case lsp.StateStarting:
-		return "starting"
-	case lsp.StateReady:
-		return "ready"
-	case lsp.StateError:
-		return "error"
-	case lsp.StateStopped:
-		return "stopped"
-	case lsp.StateDisabled:
-		return "disabled"
-	default:
-		return "unknown"
-	}
 }
 
 // buildMCPSnapshot returns the current state of all MCP servers in wire format.

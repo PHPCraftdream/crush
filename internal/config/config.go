@@ -235,18 +235,6 @@ type MCPConfig struct {
 	Source MCPSource `json:"-"`
 }
 
-type LSPConfig struct {
-	Disabled    bool              `json:"disabled,omitempty" jsonschema:"description=Whether this LSP server is disabled,default=false"`
-	Command     string            `json:"command,omitempty" jsonschema:"description=Command to execute for the LSP server,example=gopls"`
-	Args        []string          `json:"args,omitempty" jsonschema:"description=Arguments to pass to the LSP server command"`
-	Env         map[string]string `json:"env,omitempty" jsonschema:"description=Environment variables to set to the LSP server command"`
-	FileTypes   []string          `json:"filetypes,omitempty" jsonschema:"description=File types this LSP server handles,example=go,example=mod,example=rs,example=c,example=js,example=ts"`
-	RootMarkers []string          `json:"root_markers,omitempty" jsonschema:"description=Files or directories that indicate the project root,example=go.mod,example=package.json,example=Cargo.toml"`
-	InitOptions map[string]any    `json:"init_options,omitempty" jsonschema:"description=Initialization options passed to the LSP server during initialize request"`
-	Options     map[string]any    `json:"options,omitempty" jsonschema:"description=LSP server-specific settings passed during initialization"`
-	Timeout     int               `json:"timeout,omitempty" jsonschema:"description=Timeout in seconds for LSP server initialization,default=30,example=60,example=120"`
-}
-
 type TUIOptions struct {
 	CompactMode bool   `json:"compact_mode,omitempty" jsonschema:"description=Enable compact mode for the TUI interface,default=false"`
 	DiffMode    string `json:"diff_mode,omitempty" jsonschema:"description=Diff mode for the TUI interface,enum=unified,enum=split"`
@@ -301,7 +289,6 @@ type Options struct {
 	SkillsPaths          []string    `json:"skills_paths,omitempty" jsonschema:"description=Paths to directories containing Agent Skills (folders with SKILL.md files),example=~/.config/crush/skills,example=./skills"`
 	TUI                  *TUIOptions `json:"tui,omitempty" jsonschema:"description=Terminal user interface options"`
 	Debug                bool        `json:"debug,omitempty" jsonschema:"description=Enable debug logging,default=false"`
-	DebugLSP             bool        `json:"debug_lsp,omitempty" jsonschema:"description=Enable debug logging for LSP servers,default=false"`
 	DisableAutoSummarize bool        `json:"disable_auto_summarize,omitempty" jsonschema:"description=Disable automatic conversation summarization,default=false"`
 	// DataDirectory is where Crush keeps per-project state such as
 	// the SQLite database and workspace overrides. Relative paths are
@@ -314,7 +301,6 @@ type Options struct {
 	Attribution               *Attribution `json:"attribution,omitempty" jsonschema:"description=Attribution settings for generated content"`
 	DisableMetrics            bool         `json:"disable_metrics,omitempty" jsonschema:"description=Disable sending metrics,default=false"`
 	InitializeAs              string       `json:"initialize_as,omitempty" jsonschema:"description=Name of the context file to create/update during project initialization,default=AGENTS.md,example=AGENTS.md,example=CRUSH.md,example=CLAUDE.md,example=docs/LLMs.md"`
-	AutoLSP                   *bool        `json:"auto_lsp,omitempty" jsonschema:"description=Automatically setup LSPs based on root markers,default=true"`
 	Progress                  *bool        `json:"progress,omitempty" jsonschema:"description=Show indeterminate progress updates during long operations,default=true"`
 	DisableNotifications      bool         `json:"disable_notifications,omitempty" jsonschema:"description=Disable desktop notifications,default=false"`
 	DisabledSkills            []string     `json:"disabled_skills,omitempty" jsonschema:"description=List of skill names to disable and hide from the agent,example=crush-config"`
@@ -360,27 +346,6 @@ func (m MCPs) Sorted() []MCP {
 		})
 	}
 	slices.SortFunc(sorted, func(a, b MCP) int {
-		return strings.Compare(a.Name, b.Name)
-	})
-	return sorted
-}
-
-type LSPs map[string]LSPConfig
-
-type LSP struct {
-	Name string    `json:"name"`
-	LSP  LSPConfig `json:"lsp"`
-}
-
-func (l LSPs) Sorted() []LSP {
-	sorted := make([]LSP, 0, len(l))
-	for k, v := range l {
-		sorted = append(sorted, LSP{
-			Name: k,
-			LSP:  v,
-		})
-	}
-	slices.SortFunc(sorted, func(a, b LSP) int {
 		return strings.Compare(a.Name, b.Name)
 	})
 	return sorted
@@ -487,73 +452,6 @@ func (m MCPConfig) ResolvedHeaders(r VariableResolver) (map[string]string, error
 	return out, nil
 }
 
-// ResolvedArgs returns l.Args with every element expanded through the
-// given resolver. A fresh slice is allocated; l.Args is never mutated.
-// On the first resolution failure it returns nil and an error
-// identifying the offending positional index; the inner resolver error
-// is already sanitized by ResolveValue and is wrapped with %w so
-// errors.Is/As continues to work.
-//
-// Empty resolved values are kept (a deliberate "empty positional arg"
-// like --flag "" is sometimes valid), matching MCPConfig.ResolvedArgs.
-//
-// The resolver choice matters: in server mode pass the shell resolver
-// so $VAR / $(cmd) expand; in client mode pass IdentityResolver so the
-// template is forwarded verbatim.
-func (l LSPConfig) ResolvedArgs(r VariableResolver) ([]string, error) {
-	if len(l.Args) == 0 {
-		return nil, nil
-	}
-	out := make([]string, len(l.Args))
-	for i, a := range l.Args {
-		v, err := r.ResolveValue(a)
-		if err != nil {
-			return nil, fmt.Errorf("arg %d: %w", i, err)
-		}
-		out[i] = v
-	}
-	return out, nil
-}
-
-// ResolvedEnv returns l.Env with every value expanded through the
-// given resolver. A fresh map is allocated; l.Env is never mutated.
-// On the first resolution failure it returns nil and an error that
-// identifies the offending key; the inner resolver error is already
-// sanitized by ResolveValue and is wrapped with %w so errors.Is/As
-// continues to work.
-//
-// Empty resolved values are kept ("FOO=" is a legitimate request;
-// opt out via ${VAR:+...}), matching MCPConfig.ResolvedEnv.
-//
-// Shape note: this returns map[string]string rather than the []string
-// shape MCPConfig.ResolvedEnv uses because the consumer
-// (powernap.ClientConfig.Environment in internal/lsp/client.go) takes
-// a map directly — returning a []string here would only force a
-// round-trip back to a map at the call site.
-//
-// See ResolvedArgs for guidance on picking a resolver.
-func (l LSPConfig) ResolvedEnv(r VariableResolver) (map[string]string, error) {
-	if len(l.Env) == 0 {
-		return map[string]string{}, nil
-	}
-	out := make(map[string]string, len(l.Env))
-	// Sort keys so failures are reported deterministically when more
-	// than one value would fail.
-	keys := make([]string, 0, len(l.Env))
-	for k := range l.Env {
-		keys = append(keys, k)
-	}
-	slices.Sort(keys)
-	for _, k := range keys {
-		v, err := r.ResolveValue(l.Env[k])
-		if err != nil {
-			return nil, fmt.Errorf("env %q: %w", k, err)
-		}
-		out[k] = v
-	}
-	return out, nil
-}
-
 type Agent struct {
 	ID          string `json:"id,omitempty"`
 	Name        string `json:"name,omitempty"`
@@ -644,8 +542,6 @@ type Config struct {
 
 	MCP MCPs `json:"mcp,omitempty" jsonschema:"description=Model Context Protocol server configurations"`
 
-	LSP LSPs `json:"lsp,omitempty" jsonschema:"description=Language Server Protocol configurations"`
-
 	Options *Options `json:"options,omitempty" jsonschema:"description=General application options"`
 
 	Permissions *Permissions `json:"permissions,omitempty" jsonschema:"description=Permission settings for tool usage"`
@@ -731,9 +627,6 @@ func allToolNames() []string {
 		"download",
 		"edit",
 		"multiedit",
-		"lsp_diagnostics",
-		"lsp_references",
-		"lsp_restart",
 		"fetch",
 		"agentic_fetch",
 		"glob",

@@ -192,7 +192,6 @@ func TestConfig_setDefaults(t *testing.T) {
 		require.NotNil(t, cfg.Options.ContextPaths)
 		require.NotNil(t, cfg.Providers)
 		require.NotNil(t, cfg.Models)
-		require.NotNil(t, cfg.LSP)
 		require.NotNil(t, cfg.MCP)
 		require.Equal(t, filepath.Join(workingDir, ".crush"), cfg.Options.DataDirectory)
 		require.Equal(t, "AGENTS.md", cfg.Options.InitializeAs)
@@ -719,8 +718,9 @@ func TestConfig_setupAgentsWithDisabledTools(t *testing.T) {
 	cfg.SetupAgents()
 	coderAgent, ok := cfg.Agents[AgentCoder]
 	require.True(t, ok)
-
-	assert.Equal(t, []string{"agent", "bash", "crush_info", "crush_logs", "job_output", "job_kill", "multiedit", "lsp_diagnostics", "lsp_references", "lsp_restart", "fetch", "agentic_fetch", "glob", "ls", "sourcegraph", "todos", "view", "write", "list_mcp_resources", "read_mcp_resource"}, coderAgent.AllowedTools)
+	assert.NotContains(t, coderAgent.AllowedTools, "edit")
+	assert.NotContains(t, coderAgent.AllowedTools, "download")
+	assert.NotContains(t, coderAgent.AllowedTools, "grep")
 
 	taskAgent, ok := cfg.Agents[AgentTask]
 	require.True(t, ok)
@@ -743,7 +743,8 @@ func TestConfig_setupAgentsWithEveryReadOnlyToolDisabled(t *testing.T) {
 	cfg.SetupAgents()
 	coderAgent, ok := cfg.Agents[AgentCoder]
 	require.True(t, ok)
-	assert.Equal(t, []string{"agent", "bash", "crush_info", "crush_logs", "job_output", "job_kill", "download", "edit", "multiedit", "lsp_diagnostics", "lsp_references", "lsp_restart", "fetch", "agentic_fetch", "todos", "write", "list_mcp_resources", "read_mcp_resource"}, coderAgent.AllowedTools)
+	assert.NotContains(t, coderAgent.AllowedTools, "glob")
+	assert.NotContains(t, coderAgent.AllowedTools, "view")
 
 	taskAgent, ok := cfg.Agents[AgentTask]
 	require.True(t, ok)

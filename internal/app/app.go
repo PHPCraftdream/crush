@@ -27,7 +27,6 @@ import (
 	"github.com/charmbracelet/crush/internal/filetracker"
 	"github.com/charmbracelet/crush/internal/format"
 	"github.com/charmbracelet/crush/internal/history"
-	"github.com/charmbracelet/crush/internal/lsp"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/permission"
 	"github.com/charmbracelet/crush/internal/pubsub"
@@ -48,8 +47,6 @@ type App struct {
 	FileTracker filetracker.Service
 
 	AgentCoordinator agent.Coordinator
-
-	LSPManager *lsp.Manager
 
 	config *config.ConfigStore
 
@@ -89,7 +86,6 @@ func New(ctx context.Context, conn *sql.DB, store *config.ConfigStore) (*App, er
 		History:     files,
 		Permissions: permission.NewPermissionService(ctx, store.WorkingDir(), skipPermissionsRequests, allowedTools, q),
 		FileTracker: filetracker.NewService(q),
-		LSPManager:  lsp.NewManager(store),
 
 		DB: func() *sql.DB { return conn },
 
@@ -131,17 +127,6 @@ func New(ctx context.Context, conn *sql.DB, store *config.ConfigStore) (*App, er
 	if err := app.InitCoderAgent(ctx); err != nil {
 		return nil, fmt.Errorf("failed to initialize coder agent: %w", err)
 	}
-
-	// Set up callback for LSP state updates.
-	app.LSPManager.SetCallback(func(name string, client *lsp.Client) {
-		if client == nil {
-			updateLSPState(name, lsp.StateUnstarted, nil, nil, 0)
-			return
-		}
-		client.SetDiagnosticsCallback(updateLSPDiagnostics)
-		updateLSPState(name, client.GetServerState(), nil, client, 0)
-	})
-	go app.LSPManager.TrackConfigured()
 
 	return app, nil
 }
@@ -1173,7 +1158,6 @@ func (app *App) InitCoderAgent(ctx context.Context) error {
 		app.Permissions,
 		app.History,
 		app.FileTracker,
-		app.LSPManager,
 		app.agentNotifications,
 	)
 	if err != nil {
@@ -1346,11 +1330,6 @@ func (app *App) Shutdown() {
 	// Kill all background shells.
 	wg.Go(func() {
 		shell.GetBackgroundShellManager().KillAll(shutdownCtx)
-	})
-
-	// Shutdown all LSP clients.
-	wg.Go(func() {
-		app.LSPManager.KillAll(shutdownCtx)
 	})
 
 	// Call all cleanup functions.

@@ -25,7 +25,6 @@ import (
 	"github.com/charmbracelet/crush/internal/filepathext"
 	"github.com/charmbracelet/crush/internal/fsext"
 	"github.com/charmbracelet/crush/internal/home"
-	powernapConfig "github.com/charmbracelet/x/powernap/pkg/config"
 	"github.com/qjebbs/go-jsons"
 )
 
@@ -461,12 +460,6 @@ func (c *Config) setDefaults(workingDir, dataDir string) {
 	if c.MCP == nil {
 		c.MCP = make(map[string]MCPConfig)
 	}
-	if c.LSP == nil {
-		c.LSP = make(map[string]LSPConfig)
-	}
-
-	// Apply defaults to LSP configurations
-	c.applyLSPDefaults()
 
 	// Add the default context paths if they are not already present
 	c.Options.ContextPaths = append(defaultContextPaths, c.Options.ContextPaths...)
@@ -509,46 +502,6 @@ func (c *Config) setDefaults(workingDir, dataDir string) {
 		}
 	}
 	c.Options.InitializeAs = cmp.Or(c.Options.InitializeAs, defaultInitializeAs)
-}
-
-// applyLSPDefaults applies default values from powernap to LSP configurations
-func (c *Config) applyLSPDefaults() {
-	// Get powernap's default configuration
-	configManager := powernapConfig.NewManager()
-	configManager.LoadDefaults()
-
-	// Apply defaults to each LSP configuration
-	for name, cfg := range c.LSP {
-		// Try to get defaults from powernap based on name or command name.
-		base, ok := configManager.GetServer(name)
-		if !ok {
-			base, ok = configManager.GetServer(cfg.Command)
-			if !ok {
-				continue
-			}
-		}
-		if cfg.Options == nil {
-			cfg.Options = base.Settings
-		}
-		if cfg.InitOptions == nil {
-			cfg.InitOptions = base.InitOptions
-		}
-		if len(cfg.FileTypes) == 0 {
-			cfg.FileTypes = base.FileTypes
-		}
-		if len(cfg.RootMarkers) == 0 {
-			cfg.RootMarkers = base.RootMarkers
-		}
-		cfg.Command = cmp.Or(cfg.Command, base.Command)
-		if len(cfg.Args) == 0 {
-			cfg.Args = base.Args
-		}
-		if len(cfg.Env) == 0 {
-			cfg.Env = base.Environment
-		}
-		// Update the config in the map
-		c.LSP[name] = cfg
-	}
 }
 
 func (c *Config) defaultModelSelection(knownProviders []catwalk.Provider) (largeModel SelectedModel, smallModel SelectedModel, err error) {

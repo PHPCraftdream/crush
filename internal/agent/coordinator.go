@@ -51,7 +51,6 @@ import (
 	"github.com/charmbracelet/crush/internal/home"
 	"github.com/charmbracelet/crush/internal/hooks"
 	"github.com/charmbracelet/crush/internal/log"
-	"github.com/charmbracelet/crush/internal/lsp"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/oauth/copilot"
 	"github.com/charmbracelet/crush/internal/permission"
@@ -163,7 +162,6 @@ type coordinator struct {
 	permissions permission.Service
 	history     history.Service
 	filetracker filetracker.Service
-	lspManager  *lsp.Manager
 	prompt      *prompt.Prompt
 	notify      pubsub.Publisher[notify.Notification]
 
@@ -193,7 +191,6 @@ func NewCoordinator(
 	permissions permission.Service,
 	history history.Service,
 	filetracker filetracker.Service,
-	lspManager *lsp.Manager,
 	notify pubsub.Publisher[notify.Notification],
 ) (Coordinator, error) {
 	p, err := coderPrompt(prompt.WithWorkingDir(cfg.WorkingDir()))
@@ -212,7 +209,6 @@ func NewCoordinator(
 		permissions:  permissions,
 		history:      history,
 		filetracker:  filetracker,
-		lspManager:   lspManager,
 		prompt:       p,
 		notify:       notify,
 		agents:       make(map[string]SessionAgent),
@@ -843,27 +839,22 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubA
 	allTools = append(
 		allTools,
 		tools.NewBashTool(c.permissions, c.cfg.WorkingDir(), c.cfg.Config().Options.Attribution, modelID),
-		tools.NewCrushInfoTool(c.cfg, c.lspManager, c.allSkills, c.activeSkills, c.skillTracker),
+		tools.NewCrushInfoTool(c.cfg, c.allSkills, c.activeSkills, c.skillTracker),
 		tools.NewCrushLogsTool(logFile),
 		tools.NewJobOutputTool(),
 		tools.NewJobKillTool(),
 		tools.NewDownloadTool(c.permissions, c.cfg.WorkingDir(), nil),
-		tools.NewEditTool(c.lspManager, c.permissions, c.history, c.filetracker, c.cfg.WorkingDir()),
-		tools.NewMultiEditTool(c.lspManager, c.permissions, c.history, c.filetracker, c.cfg.WorkingDir()),
+		tools.NewEditTool(c.permissions, c.history, c.filetracker, c.cfg.WorkingDir()),
+		tools.NewMultiEditTool(c.permissions, c.history, c.filetracker, c.cfg.WorkingDir()),
 		tools.NewFetchTool(c.permissions, c.cfg.WorkingDir(), nil),
 		tools.NewGlobTool(c.cfg.WorkingDir()),
 		tools.NewGrepTool(c.cfg.WorkingDir(), c.cfg.Config().Tools.Grep),
 		tools.NewLsTool(c.permissions, c.cfg.WorkingDir(), c.cfg.Config().Tools.Ls),
 		tools.NewSourcegraphTool(nil),
 		tools.NewTodosTool(c.sessions),
-		tools.NewViewTool(c.lspManager, c.permissions, c.filetracker, c.skillTracker, c.cfg.WorkingDir(), c.cfg.Config().Options.SkillsPaths...),
-		tools.NewWriteTool(c.lspManager, c.permissions, c.history, c.filetracker, c.cfg.WorkingDir()),
+		tools.NewViewTool(c.permissions, c.filetracker, c.skillTracker, c.cfg.WorkingDir(), c.cfg.Config().Options.SkillsPaths...),
+		tools.NewWriteTool(c.permissions, c.history, c.filetracker, c.cfg.WorkingDir()),
 	)
-
-	// Add LSP tools if user has configured LSPs or auto_lsp is enabled (nil or true).
-	if len(c.cfg.Config().LSP) > 0 || c.cfg.Config().Options.AutoLSP == nil || *c.cfg.Config().Options.AutoLSP {
-		allTools = append(allTools, tools.NewDiagnosticsTool(c.lspManager), tools.NewReferencesTool(c.lspManager), tools.NewLSPRestartTool(c.lspManager))
-	}
 
 	if len(c.cfg.Config().MCP) > 0 {
 		allTools = append(

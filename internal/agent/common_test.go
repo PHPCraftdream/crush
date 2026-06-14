@@ -15,11 +15,9 @@ import (
 	"github.com/charmbracelet/crush/internal/agent/prompt"
 	"github.com/charmbracelet/crush/internal/agent/tools"
 	"github.com/charmbracelet/crush/internal/config"
-	"github.com/charmbracelet/crush/internal/csync"
 	"github.com/charmbracelet/crush/internal/db"
 	"github.com/charmbracelet/crush/internal/filetracker"
 	"github.com/charmbracelet/crush/internal/history"
-	"github.com/charmbracelet/crush/internal/lsp"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/permission"
 	"github.com/charmbracelet/crush/internal/session"
@@ -36,7 +34,6 @@ type fakeEnv struct {
 	permissions permission.Service
 	history     history.Service
 	filetracker *filetracker.Service
-	lspClients  *csync.Map[string, *lsp.Client]
 }
 
 type builderFunc func(t *testing.T, r *vcr.Recorder) (fantasy.LanguageModel, error)
@@ -78,7 +75,6 @@ func testEnv(t *testing.T) fakeEnv {
 	permissions := permission.NewPermissionService(t.Context(), workingDir, true, []string{}, q)
 	history := history.NewService(q, conn)
 	filetrackerService := filetracker.NewService(q)
-	lspClients := csync.NewMap[string, *lsp.Client]()
 
 	t.Cleanup(func() {
 		conn.Close()
@@ -92,7 +88,6 @@ func testEnv(t *testing.T) fakeEnv {
 		permissions,
 		history,
 		&filetrackerService,
-		lspClients,
 	}
 }
 
@@ -152,7 +147,6 @@ func coderAgent(r *vcr.Recorder, env fakeEnv, large, small fantasy.LanguageModel
 	cfg.Config().Options.SkillsPaths = nil
 	cfg.Config().Options.DisabledSkills = []string{"crush-config"}
 	cfg.Config().Options.ContextPaths = nil
-	cfg.Config().LSP = nil
 
 	systemPrompt, err := prompt.Build(context.TODO(), large.Provider(), large.Model(), cfg)
 	if err != nil {
@@ -168,15 +162,15 @@ func coderAgent(r *vcr.Recorder, env fakeEnv, large, small fantasy.LanguageModel
 	allTools := []fantasy.AgentTool{
 		tools.NewBashTool(env.permissions, env.workingDir, cfg.Config().Options.Attribution, modelName),
 		tools.NewDownloadTool(env.permissions, env.workingDir, r.GetDefaultClient()),
-		tools.NewEditTool(nil, env.permissions, env.history, *env.filetracker, env.workingDir),
-		tools.NewMultiEditTool(nil, env.permissions, env.history, *env.filetracker, env.workingDir),
+		tools.NewEditTool(env.permissions, env.history, *env.filetracker, env.workingDir),
+		tools.NewMultiEditTool(env.permissions, env.history, *env.filetracker, env.workingDir),
 		tools.NewFetchTool(env.permissions, env.workingDir, r.GetDefaultClient()),
 		tools.NewGlobTool(env.workingDir),
 		tools.NewGrepTool(env.workingDir, cfg.Config().Tools.Grep),
 		tools.NewLsTool(env.permissions, env.workingDir, cfg.Config().Tools.Ls),
 		tools.NewSourcegraphTool(r.GetDefaultClient()),
-		tools.NewViewTool(nil, env.permissions, *env.filetracker, nil, env.workingDir),
-		tools.NewWriteTool(nil, env.permissions, env.history, *env.filetracker, env.workingDir),
+		tools.NewViewTool(env.permissions, *env.filetracker, nil, env.workingDir),
+		tools.NewWriteTool(env.permissions, env.history, *env.filetracker, env.workingDir),
 	}
 
 	return testSessionAgent(env, large, small, systemPrompt, allTools...), nil
