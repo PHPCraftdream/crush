@@ -390,4 +390,3 @@ func writeHooks(b *strings.Builder, cfg *config.ConfigStore) {
 
 	b.WriteString("\n")
 }
-

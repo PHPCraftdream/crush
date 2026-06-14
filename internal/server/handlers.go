@@ -1343,7 +1343,6 @@ func handleUpdateMCPServer(ctx context.Context, a *appPkg.App, c *Client, msg WS
 	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
 }
 
-
 // ── Debug settings ────────────────────────────────────────────────────────────
 
 func handleSetDebug(a *appPkg.App, c *Client, msg WSMessage) {
@@ -1700,7 +1699,6 @@ func handleUpdateCustomProvider(a *appPkg.App, c *Client, msg WSMessage) {
 	}
 	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
 }
-
 
 // ── Todos ─────────────────────────────────────────────────────────────────────
 

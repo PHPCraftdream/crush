@@ -118,4 +118,3 @@ type PermissionGrant struct {
 type PermissionSkipRequest struct {
 	Skip bool `json:"skip"`
 }
-

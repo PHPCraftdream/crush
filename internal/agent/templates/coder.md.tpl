@@ -19,9 +19,6 @@ Git status (snapshot):
 {{.GitStatus}}
 {{end}}</env>
 
-{{if gt (len .Config.LSP) 0}}
-<lsp>LSP diagnostics arrive in tool output. Fix issues in files you changed; ignore the rest.</lsp>
-{{end}}
 {{- if .AvailSkillXML}}
 
 {{.AvailSkillXML}}
