@@ -3,7 +3,6 @@ import { ws } from "./ws";
 import {
   $connected,
   $config,
-  $lspSnapshot,
   $mcpState,
   $agentError,
   $yolo,
@@ -35,7 +34,7 @@ import {
   setSubAgentMessages,
   trackMessageParts,
 } from "./store";
-import type { WSMessage, Session, Message, PermissionRequest, ConfigPayload, LSPSnapshot, MCPState, AgentBusyPayload, SkillsSnapshot, SummarizeQueuedPayload } from "./types";
+import type { WSMessage, Session, Message, PermissionRequest, ConfigPayload, MCPState, AgentBusyPayload, SkillsSnapshot, SummarizeQueuedPayload } from "./types";
 
 function getIDFromHash(): string | null {
   const hash = window.location.hash; // #/uuid
@@ -270,10 +269,6 @@ export function useWS() {
         } else {
           $recentSmallModels.set([]);
         }
-      }),
-
-      ws.on("lsp_state", (msg: WSMessage) => {
-        $lspSnapshot.set(msg.payload as LSPSnapshot);
       }),
 
       ws.on("mcp_state", (msg: WSMessage) =>

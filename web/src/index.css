@@ -274,6 +274,24 @@
     @apply text-text-muted text-xs whitespace-pre-wrap overflow-x-auto max-h-48 leading-relaxed;
   }
 
+  /* <details> wrapper used by ToolCallBlock to collapse the raw input of
+     write-family tools (the whole file content), and by ToolResultBlock to
+     keep the rendered diff toggleable. */
+  .tool-output-details summary { @apply mb-1 hover:text-text-muted; }
+
+  /* Unified diff viewer rendered after a write/edit/multiedit tool result.
+     Each line is one <div> with class diff-add | diff-del | diff-ctx |
+     diff-hdr | diff-meta so colours match conventional patch viewers. */
+  .diff-view  { @apply mt-1 text-xs font-mono leading-snug; }
+  .diff-body  { @apply rounded border border-surface overflow-x-auto max-h-96 whitespace-pre; }
+  .diff-line  { @apply px-2 py-px; }
+  .diff-add   { @apply bg-green/10 text-green; }
+  .diff-del   { @apply bg-red/10 text-red; }
+  .diff-ctx   { @apply text-text-muted; }
+  .diff-hdr   { @apply bg-base-subtle text-text-subtle italic; }
+  .diff-meta  { @apply text-text-subtle; }
+  .diff-stats { @apply font-mono; }
+
   /* Thinking block — streaming / in-progress state */
   .thinking-card { @apply my-2 rounded-xl border border-surface bg-base-subtle overflow-hidden; }
 

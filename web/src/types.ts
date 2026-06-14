@@ -59,6 +59,7 @@ export interface ToolResult {
   Name: string;
   Content: string;
   IsError: boolean;
+  Metadata?: string;
 }
 
 export interface FinishPart {
@@ -161,24 +162,6 @@ export interface SkillsSnapshot {
   skills: SkillInfo[];
   paths: string[];
 }
-
-export interface LSPServerInfo {
-  name: string;
-  state: string; // "disabled" | "unstarted" | "starting" | "ready" | "error" | "stopped"
-  disabled: boolean;
-  diagnosticCount: number;
-  command?: string;
-  args?: string[];
-  env?: Record<string, string>;
-  fileTypes?: string[];
-}
-
-export interface LSPSnapshot {
-  servers: LSPServerInfo[];
-}
-
-// Keep LSPState as alias for backwards compat
-export type LSPState = LSPServerInfo;
 
 export interface MCPServerInfo {
   name: string;

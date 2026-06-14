@@ -186,24 +186,99 @@ const AssistantHoverActions = memo(function AssistantHoverActions({
 
 // ── Tool blocks ───────────────────────────────────────────────────────────────
 
+// FileWriteTools — tool names whose input.content is the full file body and
+// whose result metadata carries a unified diff. The UI hides the bulk content,
+// shows just the file path on the call, and renders a coloured diff on the
+// result instead of the noisy "<result>\nFile successfully written: …\n</result>"
+// blob the model sees.
+const FileWriteTools = new Set(["write", "edit", "multiedit"]);
+
+// DiffLine — one rendered line of a unified diff. We do not require a real
+// parser: a single pass over the string is enough to colour +/- lines and
+// drop the noisy "+++"/"---" file headers.
+type DiffLineKind = "add" | "del" | "ctx" | "hdr" | "meta";
+interface DiffLine { kind: DiffLineKind; text: string }
+
+function parseUnifiedDiff(diff: string): DiffLine[] {
+  const out: DiffLine[] = [];
+  const lines = diff.split(/\r?\n/);
+  for (const line of lines) {
+    if (line.startsWith("+++") || line.startsWith("---")) { out.push({ kind: "meta", text: line }); continue; }
+    if (line.startsWith("@@")) { out.push({ kind: "hdr", text: line }); continue; }
+    if (line.startsWith("+"))  { out.push({ kind: "add", text: line }); continue; }
+    if (line.startsWith("-"))  { out.push({ kind: "del", text: line }); continue; }
+    out.push({ kind: "ctx", text: line });
+  }
+  // Trim trailing blank line(s) — split adds an empty entry when diff ends with \n.
+  while (out.length && out[out.length - 1].text === "" && out[out.length - 1].kind === "ctx") out.pop();
+  return out;
+}
+
+interface WriteMetadata { diff?: string; additions?: number; removals?: number }
+
+function safeParseWriteMetadata(raw: string | undefined): WriteMetadata | null {
+  if (!raw) return null;
+  try { return JSON.parse(raw) as WriteMetadata; } catch { return null; }
+}
+
+interface WriteInput { file_path?: string; content?: string; old_string?: string; new_string?: string }
+
+function safeParseWriteInput(raw: string): WriteInput {
+  try { return JSON.parse(raw) as WriteInput; } catch { return {}; }
+}
+
+const DiffView = memo(function DiffView({ diff, additions, removals }: { diff: string; additions?: number; removals?: number }) {
+  const lines = useMemo(() => parseUnifiedDiff(diff), [diff]);
+  return (
+    <div data-test-id="diff-view" className="diff-view">
+      {(additions !== undefined || removals !== undefined) && (
+        <div className="diff-stats text-xs mb-1">
+          {additions !== undefined && <span className="text-green">+{additions}</span>}{" "}
+          {removals !== undefined && <span className="text-red">−{removals}</span>}
+        </div>
+      )}
+      <pre className="diff-body">
+        {lines.map((l, i) => (
+          <div key={i} className={`diff-line diff-${l.kind}`}>{l.text || " "}</div>
+        ))}
+      </pre>
+    </div>
+  );
+});
+
 const ToolCallBlock = memo(function ToolCallBlock({ name, input, finished }: { name: string; input: string; finished: boolean }) {
-  const formatted = useMemo(() => formatJSON(input), [input]);
+  const isFileWrite = FileWriteTools.has(name);
+  const writeInput  = isFileWrite ? safeParseWriteInput(input) : null;
+  const formatted   = useMemo(() => formatJSON(input), [input]);
+
   return (
     <div data-test-id="tool-call" className="tool-block my-2">
       <div className="flex items-center justify-between gap-2 mb-2">
         <div className="flex items-center gap-2">
           <span className="text-xs text-text-subtle">⚡</span>
           <span className="text-mauve font-semibold text-sm">{name}</span>
+          {writeInput?.file_path && <span className="text-text-muted text-xs font-mono truncate max-w-[36em]">{writeInput.file_path}</span>}
           {!finished && <span data-test-id="tool-call-running" className="text-text-subtle text-xs animate-pulse">running…</span>}
         </div>
         <CopyButton text={input} />
       </div>
-      <pre className="tool-output">{formatted}</pre>
+      {isFileWrite ? (
+        <details className="tool-output-details">
+          <summary className="cursor-pointer text-text-subtle text-xs select-none">show raw input</summary>
+          <pre className="tool-output mt-1">{formatted}</pre>
+        </details>
+      ) : (
+        <pre className="tool-output">{formatted}</pre>
+      )}
     </div>
   );
 });
 
-const ToolResultBlock = memo(function ToolResultBlock({ name, content, isError }: { name: string; content: string; isError: boolean }) {
+const ToolResultBlock = memo(function ToolResultBlock({ name, content, isError, metadata }: { name: string; content: string; isError: boolean; metadata?: string }) {
+  const isFileWrite = FileWriteTools.has(name);
+  const meta        = isFileWrite ? safeParseWriteMetadata(metadata) : null;
+  const hasDiff     = !!meta?.diff;
+
   return (
     <div data-test-id="tool-result" className="tool-block my-2 opacity-80">
       <div className="flex items-center justify-between gap-2 mb-2">
@@ -212,9 +287,19 @@ const ToolResultBlock = memo(function ToolResultBlock({ name, content, isError }
           <span className="text-text-muted font-semibold text-sm">{name}</span>
           {isError && <span data-test-id="tool-result-error" className="badge-error">error</span>}
         </div>
-        <CopyButton text={content} />
+        <CopyButton text={hasDiff ? meta!.diff! : content} />
       </div>
-      <pre className="tool-output">{content}</pre>
+      {hasDiff ? (
+        <details open className="tool-output-details">
+          <summary className="cursor-pointer text-text-subtle text-xs select-none">
+            diff <span className="text-green">+{meta!.additions ?? 0}</span>{" "}
+            <span className="text-red">−{meta!.removals ?? 0}</span>
+          </summary>
+          <DiffView diff={meta!.diff!} additions={meta!.additions} removals={meta!.removals} />
+        </details>
+      ) : (
+        <pre className="tool-output">{content}</pre>
+      )}
     </div>
   );
 });
@@ -365,7 +450,7 @@ const Part = memo(function Part({ part, index, isUser, messageID, thinkingDone }
     }
     case "tool_result": {
       if (part.Name === "agent") return null;
-      return <ToolResultBlock name={part.Name} content={part.Content} isError={part.IsError} />;
+      return <ToolResultBlock name={part.Name} content={part.Content} isError={part.IsError} metadata={part.Metadata} />;
     }
     // Fork patch: render explicit error/empty finish parts so a failed turn is
     // never silently rendered as a blank block. See CHANGELOG.fork.md.

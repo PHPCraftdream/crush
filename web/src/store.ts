@@ -1,5 +1,5 @@
 import { atom } from "nanostores";
-import type { Session, Message, PermissionRequest, PermissionRule, ConfigPayload, LSPSnapshot, MCPState, Todo, SkillInfo } from "./types";
+import type { Session, Message, PermissionRequest, PermissionRule, ConfigPayload, MCPState, Todo, SkillInfo } from "./types";
 
 // ── Connection state ─────────────────────────────────────────────────────────
 export const $connected = atom(false);
@@ -13,7 +13,6 @@ export const $messages = atom<Message[]>([]);
 export const $permissions = atom<PermissionRequest[]>([]);
 export const $permissionRules = atom<Map<string, PermissionRule[]>>(new Map()); // sessionID -> rules
 export const $config = atom<ConfigPayload | null>(null);
-export const $lspSnapshot = atom<LSPSnapshot | null>(null);
 export const $mcpState = atom<MCPState | null>(null);
 export const $busySessions = atom<Set<string>>(new Set());
 // Sessions where the user has queued a compact/summarise request.

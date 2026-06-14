@@ -23,6 +23,7 @@ type PartWire struct {
 	ToolCallID string `json:"ToolCallID,omitempty"`
 	Content    string `json:"Content,omitempty"`
 	IsError    bool   `json:"IsError,omitempty"`
+	Metadata   string `json:"Metadata,omitempty"`
 
 	// finish
 	Reason        string `json:"Reason,omitempty"`
@@ -54,7 +55,7 @@ func toPartWire(part message.ContentPart) PartWire {
 	case message.ToolCall:
 		return PartWire{Type: "tool_call", ID: p.ID, Name: p.Name, Input: p.Input, Finished: p.Finished}
 	case message.ToolResult:
-		return PartWire{Type: "tool_result", ToolCallID: p.ToolCallID, Name: p.Name, Content: p.Content, IsError: p.IsError}
+		return PartWire{Type: "tool_result", ToolCallID: p.ToolCallID, Name: p.Name, Content: p.Content, IsError: p.IsError, Metadata: p.Metadata}
 	case message.Finish:
 		return PartWire{Type: "finish", Reason: string(p.Reason), FinishMessage: p.Message, Details: p.Details}
 	default:

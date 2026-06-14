@@ -11,7 +11,6 @@ import {
 } from "../store";
 import { ws } from "../ws";
 import { MCPSettings } from "./MCPSettings";
-import { LSPSettings } from "./LSPSettings";
 import { SettingsModal } from "./SettingsModal";
 import { ProvidersModal } from "./ProvidersModal";
 import { buildModelList } from "./ModelSelector";
@@ -192,8 +191,6 @@ export function Header() {
   const closeSystemPrompt = useCallback(() => setShowSystemPrompt(false), []);
   const [showMCPSettings, setShowMCPSettings] = useState(false);
   const closeMCPSettings = useCallback(() => setShowMCPSettings(false), []);
-  const [showLSPSettings, setShowLSPSettings] = useState(false);
-  const closeLSPSettings = useCallback(() => setShowLSPSettings(false), []);
   const [showSettings, setShowSettings] = useState(false);
   const closeSettings = useCallback(() => setShowSettings(false), []);
   const [showProviders, setShowProviders] = useState(false);
@@ -288,16 +285,6 @@ export function Header() {
         </button>
 
         <button
-          data-test-id="header-lsp-button"
-          onClick={() => setShowLSPSettings(true)}
-          title="LSP server settings"
-          className="flex items-center gap-1.5 text-xs font-medium rounded-lg px-2.5 py-1.5 border transition-colors bg-base-overlay border-surface text-text-subtle hover:border-accent/50 hover:text-text"
-        >
-          <Code2 size={13} />
-          <span>LSP</span>
-        </button>
-
-        <button
           data-test-id="header-providers-button"
           onClick={() => setShowProviders(true)}
           title="Custom providers"
@@ -349,7 +336,6 @@ export function Header() {
     </header>
     {showSystemPrompt && activeSessionID && <SystemPromptModal sessionID={activeSessionID} onClose={closeSystemPrompt} />}
     {showMCPSettings && <MCPSettings onClose={closeMCPSettings} />}
-    {showLSPSettings && <LSPSettings onClose={closeLSPSettings} />}
     {showSettings && <SettingsModal onClose={closeSettings} />}
     {showProviders && <ProvidersModal onClose={closeProviders} />}
     {showLogs && <LogsModal onClose={closeLogs} />}

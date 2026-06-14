@@ -1,20 +1,5 @@
 import { useStore } from "@nanostores/react";
-import { $lspSnapshot, $mcpState, $connected } from "../store";
-
-function lspDot(state: string): string {
-  switch (state) {
-    case "running":
-    case "ready":
-      return "bg-green";
-    case "starting":
-      return "bg-yellow";
-    case "error":
-    case "stopped":
-      return "bg-red";
-    default:
-      return "bg-surface";
-  }
-}
+import { $mcpState, $connected } from "../store";
 
 function mcpDot(status: string): string {
   switch (status) {
@@ -32,8 +17,6 @@ function mcpDot(status: string): string {
 }
 
 export function StatusBar() {
-  const lspSnapshot = useStore($lspSnapshot);
-  const lspStates = lspSnapshot?.servers ?? [];
   const mcpState = useStore($mcpState);
   const connected = useStore($connected);
 
@@ -46,25 +29,6 @@ export function StatusBar() {
         />
         <span>{connected ? "Connected" : "Disconnected"}</span>
       </div>
-
-      {/* LSP */}
-      {lspStates.length > 0 && (
-        <>
-          <span className="text-surface">|</span>
-          <div data-test-id="status-lsp" className="flex items-center gap-3 shrink-0">
-            <span className="text-text-subtle font-semibold">LSP</span>
-            {lspStates.map((l) => (
-              <div key={l.name} data-test-id={`status-lsp-${l.name}`} className="flex items-center gap-1" title={`${l.name}: ${l.state}`}>
-                <span className={`w-1.5 h-1.5 rounded-full inline-block ${lspDot(l.state)}`} />
-                <span>{l.name}</span>
-                {l.diagnosticCount > 0 && (
-                  <span className="text-yellow ml-0.5">({l.diagnosticCount})</span>
-                )}
-              </div>
-            ))}
-          </div>
-        </>
-      )}
 
       {/* MCP */}
       {mcpState && (mcpState.servers?.length ?? 0) > 0 && (

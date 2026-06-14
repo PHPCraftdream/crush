@@ -11,6 +11,7 @@ import (
 	"charm.land/fantasy/providers/anthropic"
 	"charm.land/fantasy/providers/bedrock"
 	"github.com/charmbracelet/crush/internal/config"
+	"github.com/charmbracelet/crush/internal/message"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -427,4 +428,87 @@ func TestGetProviderOptionsReasoningEffort(t *testing.T) {
 			assert.Equal(t, anthropic.Effort("max"), *parsed.Effort)
 		})
 	}
+}
+
+// Pins the contract of shouldRetryStalledMessage: a watchdog-stalled turn
+// is only worth re-running when the assistant message is genuinely empty.
+// ANY content reaching the assistant — text, reasoning, even a half-emitted
+// tool call — proves the server received and processed the prompt; the
+// retry is for cases where nothing came back at all. Prevents the
+// duplicate-user-message bug observed in or-coin sessions where z.ai went
+// silent at the tail of the stream after a complete reply and the retry
+// loop re-sent the same prompt 2× more, copying the user message in the
+// DB three times.
+func TestShouldRetryStalledMessage(t *testing.T) {
+	t.Parallel()
+
+	stalledFinish := message.Finish{
+		Reason:  message.FinishReasonError,
+		Message: "Stream stalled",
+	}
+
+	t.Run("no finish part returns false", func(t *testing.T) {
+		t.Parallel()
+		m := message.Message{Role: message.Assistant}
+		assert.False(t, shouldRetryStalledMessage(m))
+	})
+
+	t.Run("non-stalled finish returns false", func(t *testing.T) {
+		t.Parallel()
+		m := message.Message{Role: message.Assistant, Parts: []message.ContentPart{
+			message.Finish{Reason: message.FinishReasonEndTurn},
+		}}
+		assert.False(t, shouldRetryStalledMessage(m))
+	})
+
+	t.Run("stalled with no content returns true", func(t *testing.T) {
+		t.Parallel()
+		m := message.Message{Role: message.Assistant, Parts: []message.ContentPart{stalledFinish}}
+		assert.True(t, shouldRetryStalledMessage(m), "empty stalled turn must be retried")
+	})
+
+	t.Run("stalled with whitespace-only text returns true", func(t *testing.T) {
+		t.Parallel()
+		m := message.Message{Role: message.Assistant, Parts: []message.ContentPart{
+			message.TextContent{Text: "   \n\t "},
+			stalledFinish,
+		}}
+		assert.True(t, shouldRetryStalledMessage(m), "whitespace-only output is no output")
+	})
+
+	t.Run("stalled with any real text returns false", func(t *testing.T) {
+		t.Parallel()
+		m := message.Message{Role: message.Assistant, Parts: []message.ContentPart{
+			message.TextContent{Text: "ok"},
+			stalledFinish,
+		}}
+		assert.False(t, shouldRetryStalledMessage(m), "any answer means the server saw the prompt")
+	})
+
+	t.Run("stalled with reasoning only returns false", func(t *testing.T) {
+		t.Parallel()
+		m := message.Message{Role: message.Assistant, Parts: []message.ContentPart{
+			message.ReasoningContent{Thinking: "considering options..."},
+			stalledFinish,
+		}}
+		assert.False(t, shouldRetryStalledMessage(m), "reasoning proves the model started working")
+	})
+
+	t.Run("stalled with finished tool call returns false", func(t *testing.T) {
+		t.Parallel()
+		m := message.Message{Role: message.Assistant, Parts: []message.ContentPart{
+			message.ToolCall{ID: "1", Name: "bash", Finished: true},
+			stalledFinish,
+		}}
+		assert.False(t, shouldRetryStalledMessage(m), "a completed tool call counts as real work")
+	})
+
+	t.Run("stalled with unfinished tool call returns false", func(t *testing.T) {
+		t.Parallel()
+		m := message.Message{Role: message.Assistant, Parts: []message.ContentPart{
+			message.ToolCall{ID: "1", Name: "bash", Finished: false},
+			stalledFinish,
+		}}
+		assert.False(t, shouldRetryStalledMessage(m), "even a partial tool call proves the prompt was received")
+	})
 }

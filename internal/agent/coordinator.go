@@ -496,11 +496,40 @@ func (c *coordinator) runInternal(ctx context.Context, sessionID string, prompt 
 	return result, originalErr
 }
 
+// shouldRetryStalledMessage decides whether a watchdog-stalled assistant
+// message warrants re-running the turn. The retry exists to recover from
+// turns where the provider never delivered anything; ANY content reaching
+// the assistant — text, reasoning, even a half-emitted tool call — proves
+// the server received and processed the prompt, and re-running would just
+// duplicate the user message in the DB and burn tokens redoing work the
+// user already (partially) has.
+//
+// Returns false for any non-stalled finish reason (including nil), so the
+// caller can pass the last assistant message unconditionally.
+func shouldRetryStalledMessage(msg message.Message) bool {
+	fp := msg.FinishPart()
+	if fp == nil {
+		return false
+	}
+	if fp.Reason != message.FinishReasonError || fp.Message != streamStalledFinishTitle {
+		return false
+	}
+	if strings.TrimSpace(msg.FullText()) != "" {
+		return false
+	}
+	if strings.TrimSpace(msg.ReasoningContent().Thinking) != "" {
+		return false
+	}
+	if len(msg.ToolCalls()) > 0 {
+		return false
+	}
+	return true
+}
+
 // lastTurnStalled reports whether the most recent assistant message in
-// the given session was finished with FinishReasonError("Stream stalled")
-// — i.e. the watchdog fired. Used by the retry loop in runInternal.
-// Errors querying the DB are treated as "not stalled" so a transient
-// DB hiccup doesn't trigger unnecessary retries.
+// the given session warrants a retry — see shouldRetryStalledMessage for
+// the decision. Errors querying the DB are treated as "not stalled" so a
+// transient DB hiccup doesn't trigger unnecessary retries.
 func (c *coordinator) lastTurnStalled(ctx context.Context, sessionID string) bool {
 	msgs, err := c.messages.List(ctx, sessionID)
 	if err != nil {
@@ -510,11 +539,7 @@ func (c *coordinator) lastTurnStalled(ctx context.Context, sessionID string) boo
 		if msgs[i].Role != message.Assistant {
 			continue
 		}
-		fp := msgs[i].FinishPart()
-		if fp == nil {
-			return false
-		}
-		return fp.Reason == message.FinishReasonError && fp.Message == streamStalledFinishTitle
+		return shouldRetryStalledMessage(msgs[i])
 	}
 	return false
 }
