@@ -519,8 +519,12 @@ func (c *Config) defaultModelSelection(knownProviders []catwalk.Provider) (large
 		}
 		defaultLargeModel := c.GetModel(string(p.ID), p.DefaultLargeModelID)
 		if defaultLargeModel == nil {
-			err = fmt.Errorf("default large model %s not found for provider %s", p.DefaultLargeModelID, p.ID)
-			return largeModel, smallModel, err
+			slog.Warn("Default large model not found for provider, falling back to first available",
+				"model", p.DefaultLargeModelID, "provider", p.ID)
+			if len(providerConfig.Models) == 0 {
+				return largeModel, smallModel, fmt.Errorf("default large model %s not found for provider %s", p.DefaultLargeModelID, p.ID)
+			}
+			defaultLargeModel = &providerConfig.Models[0]
 		}
 		largeModel = SelectedModel{
 			Provider:        string(p.ID),
@@ -531,8 +535,12 @@ func (c *Config) defaultModelSelection(knownProviders []catwalk.Provider) (large
 
 		defaultSmallModel := c.GetModel(string(p.ID), p.DefaultSmallModelID)
 		if defaultSmallModel == nil {
-			err = fmt.Errorf("default small model %s not found for provider %s", p.DefaultSmallModelID, p.ID)
-			return largeModel, smallModel, err
+			slog.Warn("Default small model not found for provider, falling back to first available",
+				"model", p.DefaultSmallModelID, "provider", p.ID)
+			if len(providerConfig.Models) == 0 {
+				return largeModel, smallModel, fmt.Errorf("default small model %s not found for provider %s", p.DefaultSmallModelID, p.ID)
+			}
+			defaultSmallModel = &providerConfig.Models[0]
 		}
 		smallModel = SelectedModel{
 			Provider:        string(p.ID),
