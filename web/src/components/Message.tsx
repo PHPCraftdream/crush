@@ -436,7 +436,7 @@ function groupPartsIntoBlocks(parts: ContentPart[], breaks: Set<number>): Visual
 
 // ── Part router ───────────────────────────────────────────────────────────────
 
-const Part = memo(function Part({ part, index, isUser, messageID, thinkingDone }: { part: ContentPart; index: number; isUser: boolean; messageID: string; thinkingDone: boolean }) {
+const Part = memo(function Part({ part, index, isUser, messageID, thinkingDone, partialWorkDone }: { part: ContentPart; index: number; isUser: boolean; messageID: string; thinkingDone: boolean; partialWorkDone: boolean }) {
   switch (part.type) {
     case "text":     return <TextBlock text={part.Text} isUser={isUser} />;
     case "thinking": return <ThinkingPart thinking={part.Thinking} messageID={messageID} partIndex={index} done={thinkingDone} />;
@@ -455,6 +455,14 @@ const Part = memo(function Part({ part, index, isUser, messageID, thinkingDone }
     // Fork patch: render explicit error/empty finish parts so a failed turn is
     // never silently rendered as a blank block. See CHANGELOG.fork.md.
     case "finish": {
+      // Stream stalled AFTER substantive work happened (tool calls, text,
+      // reasoning) is not a real error — the model did useful things, the
+      // provider just went quiet on the tail and the watchdog cut the stream.
+      // Render that case as a soft amber "paused" notice so the user sees the
+      // work above as legitimate, not framed inside a scary red failure block.
+      if (part.Reason === "error" && part.Message === "Stream stalled" && partialWorkDone) {
+        return <StreamPausedBlock details={part.Details} />;
+      }
       if (part.Reason === "error" || part.Reason === "canceled") {
         return <FinishErrorBlock reason={part.Reason} message={part.Message} details={part.Details} />;
       }
@@ -475,6 +483,23 @@ const FinishErrorBlock = memo(function FinishErrorBlock({ reason, message, detai
         <span className="badge-error">{reason}</span>
       </div>
       {details && <pre className="tool-output whitespace-pre-wrap">{details}</pre>}
+    </div>
+  );
+});
+
+// StreamPausedBlock — soft notice for a watchdog stall that happened AFTER
+// the model already produced substantive output. The work above is intact;
+// only the tail of the stream was cut. Distinct from FinishErrorBlock to
+// stop the UI from screaming "ERROR" when nothing in the turn actually
+// failed — the user can re-prompt to continue with the inventory.
+const StreamPausedBlock = memo(function StreamPausedBlock({ details }: { details: string }) {
+  return (
+    <div data-test-id="stream-paused" className="tool-block my-2 border-yellow/40 bg-yellow/[6%]">
+      <div className="flex items-center gap-2 mb-1">
+        <span className="text-yellow font-semibold text-sm">Stream paused</span>
+        <span className="text-text-subtle text-xs">watchdog cut the tail · work above is intact</span>
+      </div>
+      {details && <pre className="tool-output whitespace-pre-wrap text-text-subtle">{details}</pre>}
     </div>
   );
 });
@@ -548,7 +573,13 @@ const AssistantContent = memo(function AssistantContent({
     );
   }
   if (!hasVisibleContent) {
-    if (isFinished) {
+    // A turn that's still in flight may already carry a finish-part in the DB
+    // (created speculatively by recovery / cancel paths and rewritten the
+    // moment the first real delta arrives). Suppressing the "Empty response"
+    // notice while busy avoids the flash where the placeholder shows for a
+    // few hundred milliseconds and then disappears under the actual answer.
+    const isLive = busy.has(message.SessionID);
+    if (isFinished && !isLive) {
       const reason = finishPart?.Reason ?? "unknown";
       const msg = finishPart?.Message || "Empty response";
       const details = finishPart?.Details || "The provider closed the stream without returning any content. Please retry.";
@@ -558,19 +589,22 @@ const AssistantContent = memo(function AssistantContent({
         </div>
       );
     }
-    const isLive = busy.has(message.SessionID);
     return (
       <div className="text-text-subtle leading-relaxed italic" style={{ fontSize: "var(--chat-font-size)" }}>
         {isLive ? "streaming…" : "(no content)"}
       </div>
     );
   }
+  // partialWorkDone — used by the finish-part router to pick StreamPausedBlock
+  // (soft amber) over FinishErrorBlock (red) when the watchdog stall happened
+  // after the model already produced something substantive.
+  const partialWorkDone = hasVisibleContent;
   return (
     <div className="text-text leading-relaxed" style={{ fontSize: "var(--chat-font-size)" }}>
       {blocks.map((block, bi) => (
         <div key={bi} className={bi > 0 ? "msg-block-sep" : undefined}>
           {block.items.map(({ part, idx }) => (
-            <Part key={idx} part={part} index={idx} isUser={false} messageID={message.ID} thinkingDone={block.thinkingDone} />
+            <Part key={idx} part={part} index={idx} isUser={false} messageID={message.ID} thinkingDone={block.thinkingDone} partialWorkDone={partialWorkDone} />
           ))}
         </div>
       ))}
