@@ -1,8 +1,8 @@
 import { useState, useRef, useEffect } from "react";
 import { useStore } from "@nanostores/react";
-import { $sessions, $activeSessionID, $busySessions, setActiveSession, removeSession } from "../store";
+import { $sessions, $activeSessionID, $busySessions, $config, setActiveSession, removeSession } from "../store";
 import { ws } from "../ws";
-import { MessageSquare, Plus, Pencil, X, Check } from "lucide-react";
+import { MessageSquare, Plus, Pencil, X, Check, Folder } from "lucide-react";
 import { ConfirmDialog } from "./ConfirmDialog";
 
 function formatTokens(n: number): string {
@@ -16,6 +16,7 @@ export function Sidebar() {
   const sessions = allSessions.filter((s) => !s.ParentSessionID);
   const activeID = useStore($activeSessionID);
   const busySessions = useStore($busySessions);
+  const config = useStore($config);
   const [editingID, setEditingID] = useState<string | null>(null);
   const [editTitle, setEditTitle] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
@@ -91,6 +92,14 @@ export function Sidebar() {
           New
         </button>
       </div>
+
+      {/* Working directory */}
+      {config?.cwd && (
+        <div className="flex items-center gap-1.5 px-6 py-2 border-t border-surface/50 text-[11px] text-text-subtle font-mono truncate" title={config.cwd}>
+          <Folder size={11} className="shrink-0" />
+          <span className="truncate">{config.cwd}</span>
+        </div>
+      )}
 
       {/* Session list */}
       <div className="flex-1 overflow-y-auto py-3 px-3" data-test-id="sidebar-session-list">

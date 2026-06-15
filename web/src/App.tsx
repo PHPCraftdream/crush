@@ -4,7 +4,6 @@ import { $authed, $connected } from "./store";
 import { useWS } from "./useWS";
 import { Sidebar } from "./components/Sidebar";
 import { Chat } from "./components/Chat";
-import { Header } from "./components/Header";
 import { StatusBar } from "./components/StatusBar";
 import { Login } from "./components/Login";
 
@@ -21,7 +20,6 @@ function AuthedApp() {
       )}
       <Sidebar />
       <div className="flex-1 flex flex-col overflow-hidden">
-        <Header />
         <Chat />
         <StatusBar />
       </div>
