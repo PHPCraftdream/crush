@@ -18,13 +18,14 @@ import {
   type QueuedMessage,
 } from "../store";
 import { ws } from "../ws";
-import { Message } from "./Message";
+import { Message, ToolActivityGroup } from "./Message";
 import { ChatInput } from "./ChatInput";
 import { PermissionDialog } from "./PermissionDialog";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { ChatToolbar } from "./ChatToolbar";
 import { TodoList } from "./TodoList";
 import { MessageSquare, Pencil, Sparkles, Square, Trash2, X } from "lucide-react";
+import type { Message as Msg, ContentPart } from "../types";
 
 // ── Queued message item ───────────────────────────────────────────────────────
 
@@ -113,6 +114,107 @@ function QueuedMessageItem({
   );
 }
 
+// ── Cross-message tool-run grouping ──────────────────────────────────────────
+//
+// The agent emits a brand-new assistant message per turn-step, so a session
+// with N tool steps lands as N separate assistant rows in the transcript —
+// each row with its own container, header chrome, and (until now) its own
+// almost-empty "1 action" accordion. Useless.
+//
+// buildRenderItems folds runs of consecutive tool-only assistant messages
+// into a single ToolRun item. Inside ToolRun, ToolActivityGroup receives
+// the concatenation of every tool_call / tool_result part across the whole
+// run, so the burst behaves like one accordion: 28 actions, last open,
+// prior collapsed. User-, summary-, text-bearing and error-finish messages
+// always pass through untouched (they break the run).
+
+interface PartLike { type: string; Reason?: string }
+
+function isToolOnly(m: Msg): boolean {
+  if (m.Role !== "assistant") return false;
+  if (m.Hidden) return false;
+  if (m.IsSummaryMessage) return false;
+  let hasTool = false;
+  for (const raw of m.Parts) {
+    const p = raw as unknown as PartLike;
+    if (p.type === "text") return false;
+    if (p.type === "thinking") return false;
+    if (p.type === "finish" && (p.Reason === "error" || p.Reason === "canceled")) return false;
+    if (p.type === "tool_call" || p.type === "tool_result") hasTool = true;
+  }
+  return hasTool;
+}
+
+type RenderItem =
+  | { kind: "message"; message: Msg; index: number }
+  | { kind: "toolrun"; messages: Msg[]; startIndex: number };
+
+function buildRenderItems(messages: Msg[]): RenderItem[] {
+  const out: RenderItem[] = [];
+  let run: Msg[] = [];
+  let runStart = -1;
+
+  const flush = () => {
+    if (run.length === 0) return;
+    if (run.length === 1) {
+      // A single tool-only message keeps its own <Message> chrome so its
+      // checkbox / hover actions stay reachable. The inside-message
+      // ToolActivityGroup routing in AssistantContent still renders the
+      // accordion — we only deduplicate when there are 2+ in a row.
+      out.push({ kind: "message", message: run[0], index: runStart });
+    } else {
+      out.push({ kind: "toolrun", messages: [...run], startIndex: runStart });
+    }
+    run = [];
+    runStart = -1;
+  };
+
+  messages.forEach((m, i) => {
+    if (isToolOnly(m)) {
+      if (runStart === -1) runStart = i;
+      run.push(m);
+    } else {
+      flush();
+      out.push({ kind: "message", message: m, index: i });
+    }
+  });
+  flush();
+  return out;
+}
+
+function ToolRun({ messages, sessionID, isLive }: { messages: Msg[]; sessionID: string; isLive: boolean }) {
+  // Concatenate every tool_call / tool_result part from every message in the
+  // run, preserving order. ToolActivityGroup will pair calls and results by
+  // ToolCallID even though they came from different message rows.
+  const parts = useMemo(() => {
+    const out: { part: ContentPart; idx: number }[] = [];
+    let counter = 0;
+    for (const m of messages) {
+      for (const p of m.Parts) {
+        if (p.type === "tool_call" || p.type === "tool_result") {
+          out.push({ part: p, idx: counter++ });
+        }
+      }
+    }
+    return out;
+  }, [messages]);
+
+  const firstID = messages[0]?.ID ?? "";
+  return (
+    <div
+      id={firstID ? `msg-${firstID}` : undefined}
+      data-msg-role="assistant"
+      data-tool-run="true"
+      className="msg-row flex flex-col px-5 py-3"
+      title={`${messages.length} tool-only assistant steps grouped`}
+    >
+      <div className="w-full min-w-0">
+        <ToolActivityGroup items={parts} live={isLive} />
+      </div>
+    </div>
+  );
+}
+
 // ── Chat ─────────────────────────────────────────────────────────────────────
 
 export function Chat() {
@@ -141,6 +243,11 @@ export function Chat() {
     () => (isBusy ? null : [...messages].reverse().find((m) => m.Role === "user")?.ID ?? null),
     [messages, isBusy]
   );
+
+  // Group consecutive tool-only assistant messages into a single ToolRun so
+  // a long burst of N steps renders as one container with N actions instead
+  // of N near-empty per-message containers.
+  const renderItems = useMemo(() => buildRenderItems(messages), [messages]);
 
   const forkDefaultTitle = useMemo(
     () => (activeSession?.Title || "Session") + " fork",
@@ -232,20 +339,33 @@ export function Chat() {
             <p className="empty-state-desc">Say something to get started</p>
           </div>
         ) : (
-          messages.map((m, i) => (
-            <Message
-              key={m.ID}
-              index={i}
-              message={m}
-              onDeleteRequest={requestDeleteOne}
-              onRangeSelect={handleRangeSelect}
-              selectionActive={selectionActive}
-              isLastUserMsg={m.ID === lastUserMsgID}
-              isSelected={selectedIDs.has(m.ID)}
-              forkDefaultTitle={forkDefaultTitle}
-              sessionID={activeSessionID ?? ""}
-            />
-          ))
+          renderItems.map((item) => {
+            if (item.kind === "toolrun") {
+              return (
+                <ToolRun
+                  key={`run-${item.messages[0].ID}`}
+                  messages={item.messages}
+                  sessionID={activeSessionID ?? ""}
+                  isLive={isBusy}
+                />
+              );
+            }
+            const m = item.message;
+            return (
+              <Message
+                key={m.ID}
+                index={item.index}
+                message={m}
+                onDeleteRequest={requestDeleteOne}
+                onRangeSelect={handleRangeSelect}
+                selectionActive={selectionActive}
+                isLastUserMsg={m.ID === lastUserMsgID}
+                isSelected={selectedIDs.has(m.ID)}
+                forkDefaultTitle={forkDefaultTitle}
+                sessionID={activeSessionID ?? ""}
+              />
+            );
+          })
         )}
 
         {agentError && (

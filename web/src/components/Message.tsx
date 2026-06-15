@@ -411,7 +411,7 @@ interface ToolActivityGroupProps {
   live: boolean;
 }
 
-const ToolActivityGroup = memo(function ToolActivityGroup({ items, live }: ToolActivityGroupProps) {
+export const ToolActivityGroup = memo(function ToolActivityGroup({ items, live }: ToolActivityGroupProps) {
   // Manual group-collapse. NEVER auto-collapsed — the user explicitly asked
   // to keep "the process" visible. They can fold the burst by hand.
   const [collapsed, setCollapsed] = useState(false);
