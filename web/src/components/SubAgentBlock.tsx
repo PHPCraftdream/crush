@@ -6,6 +6,7 @@ import remarkBreaks from "remark-breaks";
 import rehypeHighlight from "rehype-highlight";
 import { Bot } from "lucide-react";
 import { $subAgentMessages, $busySessions } from "../store";
+import { ws } from "../ws";
 import type { Message, ContentPart } from "../types";
 
 const MD_REMARK = [remarkGfm, remarkBreaks];
@@ -58,7 +59,12 @@ export const SubAgentBlock = memo(function SubAgentBlock({
   toolCallID: string;
   prompt: string;
 }) {
-  const subSessionID = `${messageID}$$${toolCallID}`;
+  // Backend creates the sub-agent session with `ID = toolCallID`
+  // (see internal/session/session.go CreateTaskSession), so the
+  // sub-session is keyed by the spawning tool_call ID directly.
+  // The `messageID` prop is unused but kept for future linking.
+  void messageID;
+  const subSessionID = toolCallID;
   const allSubMessages = useStore($subAgentMessages);
   const busySessions = useStore($busySessions);
   const messages = allSubMessages.get(subSessionID) ?? [];
@@ -75,6 +81,17 @@ export const SubAgentBlock = memo(function SubAgentBlock({
     const text = prompt.length > maxLen ? prompt.slice(0, maxLen) + "..." : prompt;
     return text;
   }, [prompt]);
+
+  // Lazy-load sub-agent messages on first mount when nothing is in the
+  // store yet (the WS handler only auto-loads sub-sessions created during
+  // the live session — past runs surfaced after a reload start empty).
+  const requested = useRef(false);
+  useEffect(() => {
+    if (requested.current) return;
+    if (messages.length > 0) return;
+    requested.current = true;
+    ws.send("load_messages", { sessionID: subSessionID });
+  }, [subSessionID, messages.length]);
 
   // Open while the sub-agent is still working (mirrors prior `open={!done}`
   // behaviour); the user's manual toggle wins once they touch the chevron.

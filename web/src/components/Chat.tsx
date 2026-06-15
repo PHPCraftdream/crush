@@ -211,11 +211,14 @@ function buildRenderItems(messages: Msg[]): RenderItem[] {
     }
 
     if (hasTool) {
-      // Tool-bearing message: drop text/thinking (their info is in the
-      // tool arg headers), append tool parts to the burst.
+      // Tool-bearing message: drop bare text (it would duplicate the
+      // tool arg headers), but KEEP thinking parts so the group can
+      // render them inline alongside the tool rows in original order.
       if (burstFirstID === "") burstFirstID = m.ID;
       for (const p of m.Parts) {
-        if (p.type === "tool_call" || p.type === "tool_result") burstParts.push(p as ContentPart);
+        if (p.type === "tool_call" || p.type === "tool_result" || p.type === "thinking") {
+          burstParts.push(p as ContentPart);
+        }
       }
       return;
     }

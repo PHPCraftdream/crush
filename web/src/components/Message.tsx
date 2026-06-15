@@ -365,12 +365,20 @@ function formatActionArgs(name: string, input: string): string {
   }
 }
 
-interface ActionItem {
-  callPart?: ContentPart & { type: "tool_call"; ID: string; Name: string; Input: string; Finished: boolean };
-  resultPart?: ContentPart & { type: "tool_result"; ToolCallID: string; Name: string; Content: string; IsError: boolean; Metadata?: string };
-  idx: number;
-  key: string;
-}
+type ActionItem =
+  | {
+      kind: "tool";
+      callPart?: ContentPart & { type: "tool_call"; ID: string; Name: string; Input: string; Finished: boolean };
+      resultPart?: ContentPart & { type: "tool_result"; ToolCallID: string; Name: string; Content: string; IsError: boolean; Metadata?: string };
+      idx: number;
+      key: string;
+    }
+  | {
+      kind: "thinking";
+      text: string;
+      idx: number;
+      key: string;
+    };
 
 interface ActionRowProps {
   item: ActionItem;
@@ -390,6 +398,40 @@ const ActionRow = memo(function ActionRow({ item, isCurrent, suppressAutoCurrent
   const effectiveCurrent = suppressAutoCurrent ? false : isCurrent;
   const open = override ?? effectiveCurrent;
   const toggle = useCallback(() => setOverride(!open), [open]);
+
+  if (item.kind === "thinking") {
+    // Thinking rows live alongside tool rows in the accordion. Same
+    // open/close + auto-current rules; collapsed header shows a one-line
+    // preview of the model's reasoning so the operator can scan the
+    // chain without expanding every row.
+    const preview = item.text.replace(/\s+/g, " ").trim();
+    return (
+      <div data-test-id="action-row" className="action-row">
+        <button
+          type="button"
+          onClick={toggle}
+          aria-expanded={open}
+          data-test-id="action-row-toggle"
+          className="action-row-head"
+          title={preview || "thinking"}
+        >
+          <span className="text-accent/70 shrink-0"><BrainCircuit size={13} /></span>
+          <span className="text-accent/80 font-semibold text-sm shrink-0">thinking</span>
+          <span className="text-text font-mono text-sm truncate flex-1 min-w-0">
+            {preview || "—"}
+          </span>
+          <span className="text-text-subtle shrink-0">
+            {open ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+          </span>
+        </button>
+        {open && (
+          <div className="action-row-body">
+            <pre className="tool-output whitespace-pre-wrap">{item.text}</pre>
+          </div>
+        )}
+      </div>
+    );
+  }
 
   const call    = item.callPart;
   const result  = item.resultPart;
@@ -509,18 +551,22 @@ export const ToolActivityGroup = memo(function ToolActivityGroup({ items, live, 
     const rawAgentParts: { part: ContentPart; idx: number }[] = [];
     const indexByCallID = new Map<string, number>();
     for (const { part, idx } of items) {
-      if (part.type === "tool_call") {
+      if (part.type === "thinking") {
+        const text = (part as { type: "thinking"; Thinking: string }).Thinking ?? "";
+        actions.push({ kind: "thinking", text, idx, key: `think-${idx}` });
+      } else if (part.type === "tool_call") {
         if (part.Name === "agent") { rawAgentParts.push({ part, idx }); continue; }
-        const a: ActionItem = { callPart: part, idx, key: `call-${part.ID}` };
+        const a: ActionItem = { kind: "tool", callPart: part, idx, key: `call-${part.ID}` };
         indexByCallID.set(part.ID, actions.length);
         actions.push(a);
       } else if (part.type === "tool_result") {
         if (part.Name === "agent") { rawAgentParts.push({ part, idx }); continue; }
         const pos = indexByCallID.get(part.ToolCallID);
         if (pos !== undefined) {
-          actions[pos].resultPart = part;
+          const slot = actions[pos];
+          if (slot.kind === "tool") slot.resultPart = part;
         } else {
-          actions.push({ resultPart: part, idx, key: `res-${part.ToolCallID}-${idx}` });
+          actions.push({ kind: "tool", resultPart: part, idx, key: `res-${part.ToolCallID}-${idx}` });
         }
       }
     }
@@ -529,12 +575,16 @@ export const ToolActivityGroup = memo(function ToolActivityGroup({ items, live, 
 
   const tally = useMemo(() => {
     const counts = new Map<string, number>();
+    let thinkingCount = 0;
     for (const a of actions) {
+      if (a.kind === "thinking") { thinkingCount++; continue; }
       const n = a.callPart?.Name ?? a.resultPart?.Name ?? "tool";
       counts.set(n, (counts.get(n) ?? 0) + 1);
     }
-    return [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 4)
-      .map(([k, v]) => `${v} ${k}`).join(" · ");
+    const parts = [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 4)
+      .map(([k, v]) => `${v} ${k}`);
+    if (thinkingCount > 0) parts.push(`${thinkingCount} thinking`);
+    return parts.join(" · ");
   }, [actions]);
 
   // SubAgent parts always render in their own (existing) component, in their
@@ -548,6 +598,18 @@ export const ToolActivityGroup = memo(function ToolActivityGroup({ items, live, 
     }
     return null;
   });
+
+  // Nothing to show — neither real actions nor sub-agent calls. Without this
+  // guard buildRenderItems-driven empty bursts would render a stray "0 actions"
+  // header with an empty body.
+  if (actions.length === 0 && rawAgentParts.length === 0) return null;
+
+  // Group contained ONLY agent tool_calls (e.g. fan-out steps). The accordion
+  // header is meaningless ("0 actions"), so render the sub-agent blocks
+  // inline without the group wrapper.
+  if (actions.length === 0) {
+    return <>{renderAgents()}</>;
+  }
 
   return (
     <div data-test-id="tool-activity-group" className="tool-activity-group">
