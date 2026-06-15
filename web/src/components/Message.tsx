@@ -421,42 +421,62 @@ const ActionRow = memo(function ActionRow({ item, isCurrent, suppressAutoCurrent
 interface ToolActivityGroupProps {
   items: { part: ContentPart; idx: number }[];
   live: boolean;
+  // True when this group is the most recent activity in the transcript
+  // (i.e. nothing rendered after it). When false, the auto-rule collapses
+  // the group — the user moved on, the work is in the past.
+  isCurrent: boolean;
 }
 
-export const ToolActivityGroup = memo(function ToolActivityGroup({ items, live }: ToolActivityGroupProps) {
+export const ToolActivityGroup = memo(function ToolActivityGroup({ items, live, isCurrent }: ToolActivityGroupProps) {
   // Group open/close state machine.
   //
-  // `collapsed` is the visible state. `suppressAuto` is the safety latch
-  // that's flipped on by a manual collapse: once the user has collapsed the
-  // group, re-expanding it leaves EVERY row closed (including the row that
-  // would normally auto-open because it's the most recent). The latch is
-  // released the moment a NEW tool arrives — that's a live event the user
-  // wants to see, so the group auto-expands and the new row auto-opens.
+  // The default collapsed state follows `isCurrent`: the most recent group
+  // stays expanded, older groups fold automatically as soon as a newer
+  // renderitem (typically a user message or the next group) appears in the
+  // transcript. The user's own toggle wins via `collapsedOverride` and
+  // sticks until explicitly changed.
+  //
+  // `suppressAuto` is a one-shot latch for the inside-of-the-group auto-
+  // current rule: after a manual collapse, re-expanding the group leaves
+  // EVERY row closed (including the row that would normally auto-open
+  // because it's the last one). The latch is released the moment a NEW
+  // tool arrives within the same group — that's a live event the user
+  // wants to see — or when the group transitions back to isCurrent.
   //
   // When the body is unmounted (`collapsed === true`) every ActionRow's
   // internal override state is reset (React unmount discards useState), so
-  // collapsing the group also drops any per-row pins the user had set.
-  // That matches "сворачивание идёт с уничтожением контента" verbatim.
-  const [collapsed, setCollapsed] = useState(false);
+  // collapsing the group also drops any per-row pins the user had set —
+  // "сворачивание идёт с уничтожением контента" verbatim.
+  const [collapsedOverride, setCollapsedOverride] = useState<boolean | undefined>(undefined);
   const [suppressAuto, setSuppressAuto] = useState(false);
+  const autoCollapsed = !isCurrent;
+  const collapsed = collapsedOverride ?? autoCollapsed;
+
   const prevItemsLen = useRef(items.length);
+  const prevIsCurrent = useRef(isCurrent);
   useEffect(() => {
-    if (items.length > prevItemsLen.current) {
-      // A new tool just arrived. Bring the group back to live-auto mode:
-      // expand it (if a manual collapse was in effect) and clear the
-      // suppress latch so the new row auto-opens via its isCurrent prop.
-      setCollapsed(false);
+    const grew = items.length > prevItemsLen.current;
+    const becameCurrent = isCurrent && !prevIsCurrent.current;
+    if (grew || becameCurrent) {
+      // Either a new tool arrived in this group, or this group just became
+      // the latest activity. Drop the user's collapse pin (live event takes
+      // precedence) and clear the suppress latch so the new last row auto-
+      // opens via its isCurrent prop in ActionRow.
+      setCollapsedOverride(undefined);
       setSuppressAuto(false);
     }
     prevItemsLen.current = items.length;
-  }, [items.length]);
+    prevIsCurrent.current = isCurrent;
+  }, [items.length, isCurrent]);
+
   const toggle = useCallback(() => {
-    setCollapsed((c) => {
-      const next = !c;
+    setCollapsedOverride((prev) => {
+      const cur = prev ?? autoCollapsed;
+      const next = !cur;
       if (next) setSuppressAuto(true); // collapsing now → suppress auto on next expand
       return next;
     });
-  }, []);
+  }, [autoCollapsed]);
 
   // Pair calls and results by ToolCallID. Order is the order calls appear.
   // An "agent" tool_call is passed through unchanged — SubAgentBlock owns

@@ -16,12 +16,21 @@ function mcpDot(status: string): string {
   }
 }
 
-export function StatusBar() {
+// StatusBar shows the WebSocket connection state and MCP server health.
+// `inline` switches off the standalone strip styling (border, background,
+// extra padding) so the same widget can sit in the middle of ChatToolbar
+// without breaking that row's flex layout. Default behaviour matches the
+// original standalone footer strip.
+export function StatusBar({ inline = false }: { inline?: boolean }) {
   const mcpState = useStore($mcpState);
   const connected = useStore($connected);
 
+  const outerClass = inline
+    ? "flex items-center gap-3 text-xs text-text-subtle shrink-0 min-w-0 overflow-x-auto"
+    : "flex items-center gap-4 px-5 py-2 border-t border-surface bg-base-subtle text-xs text-text-subtle shrink-0 overflow-x-auto";
+
   return (
-    <div data-test-id="status-bar" className="flex items-center gap-4 px-5 py-2 border-t border-surface bg-base-subtle text-xs text-text-subtle shrink-0 overflow-x-auto">
+    <div data-test-id="status-bar" className={outerClass}>
       {/* Connection */}
       <div data-test-id="status-connection" className="flex items-center gap-1.5 shrink-0">
         <span

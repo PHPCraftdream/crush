@@ -18,7 +18,7 @@ import {
   type QueuedMessage,
 } from "../store";
 import { ws } from "../ws";
-import { Message, ToolActivityGroup, StandaloneThinking, StandaloneText } from "./Message";
+import { Message, ToolActivityGroup } from "./Message";
 import { ChatInput } from "./ChatInput";
 import { PermissionDialog } from "./PermissionDialog";
 import { ConfirmDialog } from "./ConfirmDialog";
@@ -136,39 +136,36 @@ function QueuedMessageItem({
 // "last row open, prior closed, user-clicks pin" auto-rule kicks in for
 // real.
 
-interface PartLike { type: string; Reason?: string; Thinking?: string; Text?: string }
+interface PartLike { type: string; Reason?: string }
 
 type RenderItem =
   | { kind: "message"; message: Msg; index: number }
-  | { kind: "thinking"; messageID: string; partIndex: number; thinking: string; done: boolean }
-  | { kind: "text"; messageID: string; partIndex: number; text: string }
   | { kind: "toolrun"; parts: ContentPart[]; firstMsgID: string };
 
-// buildRenderItems peels every assistant turn apart at the part level and
-// rebuilds it as a sequence of cheap standalone items + ONE tool burst per
-// stretch of activity. The agent's transcript has two awkward shapes that
-// the previous "fold tool-only messages" version couldn't handle:
+// buildRenderItems groups consecutive tool activity across messages into
+// one cross-message accordion (ToolRun) and renders everything else as a
+// normal <Message>. The model emits a short "I'll check the next file"
+// preface next to every tool_call, but its information value is already
+// in the tool's args (file_path / command / pattern) which the action row
+// header surfaces verbatim — so for a tool-bearing assistant message we
+// drop the text/thinking parts and keep only the tools. That collapses a
+// 250-step turn into ONE accordion with 250 rows, matching the user's
+// "merge consecutive ones" requirement.
 //
-//   (a) Most assistant messages carry a short "I'll check X" text part next
-//       to their tool_call. The old rule flushed the burst on text → every
-//       step landed in its own near-empty accordion.
-//   (b) tool_result parts live in their OWN message with Role="tool", not
-//       inside the assistant message. The old rule treated tool messages
-//       as non-assistant and rendered them standalone — same fragmenting.
-//
-// The new rule is part-based:
-//   - User / summary / hidden message → flush, render whole message.
-//   - Assistant message with an error/canceled finish → flush, render
-//     whole message so the soft "Stream paused" / red error block is
-//     positioned the same as before.
-//   - Tool-role message (Role === "tool") → pluck every tool_result part
-//     into the burst. Nothing else is visible on these messages, so they
-//     produce no standalone items.
-//   - Assistant message otherwise → walk parts: text and thinking become
-//     standalone items in chronological order; tool_call / tool_result
-//     append to the burst. Brief prefatory text "Now I'll check the next
-//     file" still renders as a small bubble; the action it introduces
-//     gets folded into the cross-message accordion.
+// Rules (one pass over messages):
+//   - hidden message              → skip entirely (does NOT break the run)
+//   - user / summary              → flush + standalone <Message>
+//   - error/canceled finish       → flush + standalone <Message> so the
+//                                    StreamPausedBlock / FinishErrorBlock
+//                                    renders in the right context
+//   - Role === "tool"             → append every tool_result part to the
+//                                    burst (tool-role messages carry only
+//                                    results, no standalone needed)
+//   - assistant w/ any tool_call  → drop text/thinking, append all
+//                                    tool_call / tool_result to the burst
+//   - assistant w/o tool_call     → flush + standalone <Message> (this is
+//                                    the model's final prose answer, or
+//                                    a pure-thinking turn)
 function buildRenderItems(messages: Msg[]): RenderItem[] {
   const out: RenderItem[] = [];
   let burstParts: ContentPart[] = [];
@@ -182,16 +179,14 @@ function buildRenderItems(messages: Msg[]): RenderItem[] {
   };
 
   messages.forEach((m, i) => {
-    if (m.Hidden) return; // hidden messages produce nothing AND don't cut the run
+    if (m.Hidden) return; // hidden messages do not break the run
     if (m.Role === "user" || m.IsSummaryMessage) {
       flushBurst();
       out.push({ kind: "message", message: m, index: i });
       return;
     }
 
-    // Tool-role messages carry tool_result parts that belong to the
-    // currently-open burst. Append every result, but do not emit a
-    // standalone Message — tool-role messages have no other visible content.
+    // Tool-role messages contribute only tool_result parts to the burst.
     if (m.Role === "tool") {
       if (burstFirstID === "") burstFirstID = m.ID;
       for (const p of m.Parts) {
@@ -200,42 +195,43 @@ function buildRenderItems(messages: Msg[]): RenderItem[] {
       return;
     }
 
-    // Assistant message from here on. Error / canceled finish gets rendered
-    // by the full <Message> path because StreamPausedBlock / FinishErrorBlock
-    // already live there and depend on the surrounding parts.
-    const hasErrorFinish = m.Parts.some((raw) => {
+    // Assistant messages from here on.
+    let hasTool = false;
+    let hasErrorFinish = false;
+    for (const raw of m.Parts) {
       const p = raw as unknown as PartLike;
-      return p.type === "finish" && (p.Reason === "error" || p.Reason === "canceled");
-    });
+      if (p.type === "tool_call" || p.type === "tool_result") hasTool = true;
+      if (p.type === "finish" && (p.Reason === "error" || p.Reason === "canceled")) hasErrorFinish = true;
+    }
+
     if (hasErrorFinish) {
       flushBurst();
       out.push({ kind: "message", message: m, index: i });
       return;
     }
 
-    // Walk parts in order. Text and thinking are emitted as standalone
-    // chronological items; tool_call / tool_result join the burst.
-    m.Parts.forEach((raw, partIdx) => {
-      const p = raw as unknown as PartLike;
-      if (p.type === "thinking") {
-        out.push({ kind: "thinking", messageID: m.ID, partIndex: partIdx, thinking: p.Thinking ?? "", done: true });
-      } else if (p.type === "text") {
-        const text = (p.Text ?? "").trim();
-        if (text) out.push({ kind: "text", messageID: m.ID, partIndex: partIdx, text });
-      } else if (p.type === "tool_call" || p.type === "tool_result") {
-        if (burstFirstID === "") burstFirstID = m.ID;
-        burstParts.push(raw as ContentPart);
+    if (hasTool) {
+      // Tool-bearing message: drop text/thinking (their info is in the
+      // tool arg headers), append tool parts to the burst.
+      if (burstFirstID === "") burstFirstID = m.ID;
+      for (const p of m.Parts) {
+        if (p.type === "tool_call" || p.type === "tool_result") burstParts.push(p as ContentPart);
       }
-      // finish (non-error) and any other unrecognised parts are dropped:
-      // a normal stop reason has no visible effect inside a tool burst.
-    });
+      return;
+    }
+
+    // Pure-prose / pure-thinking assistant message — the final answer
+    // most often. Flush burst (positions the accordion before the answer)
+    // and render the whole message.
+    flushBurst();
+    out.push({ kind: "message", message: m, index: i });
   });
 
   flushBurst();
   return out;
 }
 
-function ToolRun({ parts, firstMsgID, sessionID, isLive }: { parts: ContentPart[]; firstMsgID: string; sessionID: string; isLive: boolean }) {
+function ToolRun({ parts, firstMsgID, sessionID, isLive, isCurrent }: { parts: ContentPart[]; firstMsgID: string; sessionID: string; isLive: boolean; isCurrent: boolean }) {
   // ToolActivityGroup pairs call↔result by ToolCallID — no further prep
   // needed here, just give each part a stable index for its key.
   const items = useMemo(
@@ -251,7 +247,7 @@ function ToolRun({ parts, firstMsgID, sessionID, isLive }: { parts: ContentPart[
       title={`${parts.length} tool parts grouped across messages`}
     >
       <div className="w-full min-w-0">
-        <ToolActivityGroup items={items} live={isLive} />
+        <ToolActivityGroup items={items} live={isLive} isCurrent={isCurrent} />
       </div>
     </div>
   );
@@ -383,6 +379,12 @@ export function Chat() {
         ) : (
           renderItems.map((item, ri) => {
             if (item.kind === "toolrun") {
+              // A toolrun is "current" only when nothing rendered AFTER it.
+              // The moment the user sends a new message, that message
+              // becomes the renderitem after this toolrun → isCurrent goes
+              // false → the group's auto-rule collapses everything inside
+              // (user-pinned rows survive via their own override).
+              const isCurrent = ri === renderItems.length - 1;
               return (
                 <ToolRun
                   key={`run-${item.firstMsgID}-${ri}`}
@@ -390,25 +392,7 @@ export function Chat() {
                   firstMsgID={item.firstMsgID}
                   sessionID={activeSessionID ?? ""}
                   isLive={isBusy}
-                />
-              );
-            }
-            if (item.kind === "thinking") {
-              return (
-                <StandaloneThinking
-                  key={`th-${item.messageID}-${item.partIndex}`}
-                  messageID={item.messageID}
-                  partIndex={item.partIndex}
-                  thinking={item.thinking}
-                  done={item.done}
-                />
-              );
-            }
-            if (item.kind === "text") {
-              return (
-                <StandaloneText
-                  key={`tx-${item.messageID}-${item.partIndex}`}
-                  text={item.text}
+                  isCurrent={isCurrent}
                 />
               );
             }

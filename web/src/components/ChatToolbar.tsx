@@ -15,6 +15,7 @@ import {
   getDefaultModelKey,
 } from "../store";
 import { ModelSelector, buildModelList } from "./ModelSelector";
+import { StatusBar } from "./StatusBar";
 import { LogsModal } from "./LogsModal";
 import { MCPSettings } from "./MCPSettings";
 import { SettingsModal } from "./SettingsModal";
@@ -182,7 +183,9 @@ export function ChatToolbar() {
   return (
     <>
       <div className="px-5 pt-3 pb-1 border-t border-surface bg-canvas shrink-0 flex items-center gap-2 flex-wrap">
-        {/* LEFT cluster — migrated from Header */}
+        {/* LEFT cluster — tokens + Compact sit together (Compact directly
+            operates on the context window the token pill displays) followed
+            by the migrated header buttons. */}
         {activeSession && totalTokens > 0 && (
           <span
             data-test-id="header-token-indicator"
@@ -197,6 +200,28 @@ export function ChatToolbar() {
               <span data-test-id="header-summarized-badge" title="Session has been summarized"><CheckCheck size={13} className="text-accent" /></span>
             )}
           </span>
+        )}
+
+        {isQueued ? (
+          <button
+            onClick={() => cancelQueuedSummarize(activeSessionID)}
+            title="Compact is queued — click to cancel"
+            className="btn-toolbar text-accent border-accent/30 bg-accent/5 hover:bg-red/10 hover:text-red hover:border-red/30 flex items-center gap-1"
+          >
+            <Minimize2 size={13} />
+            Compact queued
+            <X size={11} className="opacity-60" />
+          </button>
+        ) : (
+          <button
+            onClick={() => summarizeSession(activeSessionID)}
+            disabled={!hasMessages}
+            title={isBusy ? "Compact will run after the current task finishes" : "Compact — compress conversation history to free up context window"}
+            className="btn-toolbar"
+          >
+            <Minimize2 size={13} />
+            Compact
+          </button>
         )}
 
         <button
@@ -269,35 +294,19 @@ export function ChatToolbar() {
           </div>
         )}
 
-        <div className="mr-auto" />
+        {/* MIDDLE — connection + MCP server status. Two spacers around it
+            make it gravitate to the geometric centre of the toolbar row;
+            with flex-wrap=true it stays on the same line when there's room
+            and reflows below otherwise. */}
+        <div className="flex-1" />
+        <StatusBar inline />
+        <div className="flex-1" />
 
-        {/* RIGHT cluster — existing */}
+        {/* RIGHT cluster */}
         <ModelSelector session={activeSession} modelType="large" />
         <ModelSelector session={activeSession} modelType="small" />
 
         <div className="w-px h-4 bg-surface/50 mx-1 shrink-0" />
-
-        {isQueued ? (
-          <button
-            onClick={() => cancelQueuedSummarize(activeSessionID)}
-            title="Compact is queued — click to cancel"
-            className="btn-toolbar text-accent border-accent/30 bg-accent/5 hover:bg-red/10 hover:text-red hover:border-red/30 flex items-center gap-1"
-          >
-            <Minimize2 size={13} />
-            Compact queued
-            <X size={11} className="opacity-60" />
-          </button>
-        ) : (
-          <button
-            onClick={() => summarizeSession(activeSessionID)}
-            disabled={!hasMessages}
-            title={isBusy ? "Compact will run after the current task finishes" : "Compact — compress conversation history to free up context window"}
-            className="btn-toolbar"
-          >
-            <Minimize2 size={13} />
-            Compact
-          </button>
-        )}
 
         <button
           onClick={() => activeSessionID && setYolo(activeSessionID, !yolo)}
