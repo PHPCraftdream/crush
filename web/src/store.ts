@@ -1,4 +1,4 @@
-import { atom } from "nanostores";
+import { atom, computed } from "nanostores";
 import type { Session, Message, PermissionRequest, PermissionRule, ConfigPayload, MCPState, Todo, SkillInfo } from "./types";
 
 // ── Connection state ─────────────────────────────────────────────────────────
@@ -593,4 +593,56 @@ export function updateCustomProvider(payload: {
   models?: { id: string; name: string; contextWindow?: number; costPer1mIn?: number; costPer1mOut?: number }[];
 }, msgID?: string) {
   ws.send("update_custom_provider", payload, msgID);
+}
+
+// ── My prompts history ─────────────────────────────────────────────────────
+//
+// Derived from $messages (current active session). One entry per visible
+// user message, newest first — feeds:
+//   • shell-style recall in the chat input (ArrowUp/Down on caret edge),
+//   • the history dropdown (clickable list + jump-to button).
+//
+// Hidden / IsSummary / non-user messages are excluded. Empty texts are
+// dropped so the recall stack only holds prompts the user could actually
+// re-send.
+
+export interface MyPromptItem {
+  id: string;
+  text: string;
+}
+
+function partsToText(parts: Array<{ type: string; Text?: string }>): string {
+  let out = "";
+  for (const p of parts) {
+    if (p.type === "text" && p.Text) out += p.Text;
+  }
+  return out;
+}
+
+export const $myPrompts = computed($messages, (msgs): MyPromptItem[] => {
+  const out: MyPromptItem[] = [];
+  for (const m of msgs) {
+    if (m.Hidden) continue;
+    if (m.IsSummaryMessage) continue;
+    if (m.Role !== "user") continue;
+    const text = partsToText(m.Parts as unknown as Array<{ type: string; Text?: string }>).trim();
+    if (!text) continue;
+    out.push({ id: m.ID, text });
+  }
+  // Newest first — matches "press ↑ to get the previous prompt".
+  return out.reverse();
+});
+
+// jumpToMessage — scrolls the transcript to the given message ID and flashes
+// it briefly. The Message component renders id={`msg-${ID}`} on its row and
+// the .msg-flash CSS class drives a one-second highlight.
+export function jumpToMessage(id: string) {
+  const el = document.getElementById(`msg-${id}`);
+  if (!el) return;
+  el.scrollIntoView({ behavior: "smooth", block: "center" });
+  el.classList.remove("msg-flash"); // restart animation if already there
+  // Reflow so the class re-add re-triggers the keyframes.
+  void (el as HTMLElement).offsetWidth;
+  el.classList.add("msg-flash");
+  window.setTimeout(() => el.classList.remove("msg-flash"), 1100);
 }
