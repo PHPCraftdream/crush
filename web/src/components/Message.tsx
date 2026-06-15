@@ -675,6 +675,24 @@ export function StandaloneThinking({ messageID, partIndex, thinking, done }: { m
   );
 }
 
+// StandaloneText renders a small assistant-prose chunk that was extracted
+// from an otherwise-tool-bearing assistant message. These usually carry one
+// short sentence ("Let me check the next file") between actions in a long
+// tool burst — the action itself moves into the cross-message accordion,
+// the words stay on their own row so the reader still sees the model's
+// running narrative. Uses TextBlock for the markdown render path so links,
+// code spans and bullet lists all work identically to a normal assistant
+// message body.
+export function StandaloneText({ text }: { text: string }) {
+  return (
+    <div className="msg-row flex flex-col px-5 py-2 text-text leading-relaxed" style={{ fontSize: "var(--chat-font-size)" }}>
+      <div className="w-full min-w-0">
+        <TextBlock text={text} isUser={false} />
+      </div>
+    </div>
+  );
+}
+
 // ── Block grouping for zebra pattern ──────────────────────────────────────
 
 const EMPTY_BREAKS = new Set<number>();
