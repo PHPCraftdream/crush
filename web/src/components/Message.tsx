@@ -250,6 +250,7 @@ const ToolCallBlock = memo(function ToolCallBlock({ name, input, finished }: { n
   const isFileWrite = FileWriteTools.has(name);
   const writeInput  = isFileWrite ? safeParseWriteInput(input) : null;
   const formatted   = useMemo(() => formatJSON(input), [input]);
+  const [rawOpen, setRawOpen] = useState(false);
 
   return (
     <div data-test-id="tool-call" className="tool-block my-2">
@@ -263,10 +264,17 @@ const ToolCallBlock = memo(function ToolCallBlock({ name, input, finished }: { n
         <CopyButton text={input} />
       </div>
       {isFileWrite ? (
-        <details className="tool-output-details">
-          <summary className="cursor-pointer text-text-subtle text-xs select-none">show raw input</summary>
-          <pre className="tool-output mt-1">{formatted}</pre>
-        </details>
+        <div className="tool-output-details">
+          <button
+            type="button"
+            onClick={() => setRawOpen((v) => !v)}
+            aria-expanded={rawOpen}
+            className="cursor-pointer text-text-subtle text-xs select-none bg-transparent border-0 p-0"
+          >
+            {rawOpen ? "hide raw input" : "show raw input"}
+          </button>
+          {rawOpen && <pre className="tool-output mt-1">{formatted}</pre>}
+        </div>
       ) : (
         <pre className="tool-output">{formatted}</pre>
       )}
@@ -278,6 +286,7 @@ const ToolResultBlock = memo(function ToolResultBlock({ name, content, isError, 
   const isFileWrite = FileWriteTools.has(name);
   const meta        = isFileWrite ? safeParseWriteMetadata(metadata) : null;
   const hasDiff     = !!meta?.diff;
+  const [diffOpen, setDiffOpen] = useState(true);
 
   return (
     <div data-test-id="tool-result" className="tool-block my-2 opacity-80">
@@ -290,13 +299,18 @@ const ToolResultBlock = memo(function ToolResultBlock({ name, content, isError, 
         <CopyButton text={hasDiff ? meta!.diff! : content} />
       </div>
       {hasDiff ? (
-        <details open className="tool-output-details">
-          <summary className="cursor-pointer text-text-subtle text-xs select-none">
+        <div className="tool-output-details">
+          <button
+            type="button"
+            onClick={() => setDiffOpen((v) => !v)}
+            aria-expanded={diffOpen}
+            className="cursor-pointer text-text-subtle text-xs select-none bg-transparent border-0 p-0"
+          >
             diff <span className="text-green">+{meta!.additions ?? 0}</span>{" "}
             <span className="text-red">−{meta!.removals ?? 0}</span>
-          </summary>
-          <DiffView diff={meta!.diff!} additions={meta!.additions} removals={meta!.removals} />
-        </details>
+          </button>
+          {diffOpen && <DiffView diff={meta!.diff!} additions={meta!.additions} removals={meta!.removals} />}
+        </div>
       ) : (
         <pre className="tool-output">{content}</pre>
       )}
@@ -960,6 +974,7 @@ const SummaryMessage = memo(function SummaryMessage({ message }: { message: Msg 
   const text = useMemo(() => extractText(message.Parts), [message.Parts]);
   const isFinished = useMemo(() => message.Parts.some(p => p.type === "finish"), [message.Parts]);
   const [editing, setEditing] = useState(false);
+  const [open, setOpen] = useState(false);
 
   const handleSave = useCallback((newText: string) => {
     if (newText && newText !== text) updateMessageContent(message.ID, newText);
@@ -987,12 +1002,16 @@ const SummaryMessage = memo(function SummaryMessage({ message }: { message: Msg 
             </button>
           )}
         </div>
-        <details className="group">
-          <summary className="summary-toggle">
-            <span className="group-open:hidden">Show summary ▸</span>
-            <span className="hidden group-open:inline">Hide summary ▾</span>
-          </summary>
-          {editing ? (
+        <div className="group">
+          <button
+            type="button"
+            onClick={() => setOpen((v) => !v)}
+            aria-expanded={open}
+            className="summary-toggle w-full text-left bg-transparent border-0"
+          >
+            {open ? "Hide summary ▾" : "Show summary ▸"}
+          </button>
+          {open && (editing ? (
             <div className="summary-body chat-font">
               <EditForm
                 initialValue={text}
@@ -1006,8 +1025,8 @@ const SummaryMessage = memo(function SummaryMessage({ message }: { message: Msg 
             <div className="summary-body md">
               <ReactMarkdown remarkPlugins={MD_REMARK} rehypePlugins={MD_REHYPE}>{text}</ReactMarkdown>
             </div>
-          ) : null}
-        </details>
+          ) : null)}
+        </div>
       </div>
     </div>
   );

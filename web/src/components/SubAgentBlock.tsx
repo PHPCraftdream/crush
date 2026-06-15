@@ -1,4 +1,4 @@
-import { memo, useMemo } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { useStore } from "@nanostores/react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -76,25 +76,43 @@ export const SubAgentBlock = memo(function SubAgentBlock({
     return text;
   }, [prompt]);
 
+  // Open while the sub-agent is still working (mirrors prior `open={!done}`
+  // behaviour); the user's manual toggle wins once they touch the chevron.
+  const [override, setOverride] = useState<boolean | undefined>(undefined);
+  const open = override ?? !done;
+  const prevDone = useRef(done);
+  useEffect(() => {
+    if (done && !prevDone.current) setOverride(undefined);
+    prevDone.current = done;
+  }, [done]);
+  const toggle = () => setOverride(!open);
+
   return (
-    <details open={!done} className="sub-agent-block my-2">
-      <summary className="sub-agent-toggle">
+    <div className="sub-agent-block my-2">
+      <button
+        type="button"
+        onClick={toggle}
+        aria-expanded={open}
+        className="sub-agent-toggle w-full text-left bg-transparent border-0"
+      >
         <Bot size={15} className={`shrink-0 ${isRunning ? "text-accent animate-pulse" : "text-text-subtle"}`} />
         <span className="font-semibold text-sm">{done ? "Agent" : "Agent"}</span>
         {isRunning && <span className="text-xs text-text-subtle animate-pulse">running...</span>}
         {done && <span className="text-xs text-green font-medium">done</span>}
         <span className="text-xs text-text-muted truncate ml-1 max-w-[400px]">{label}</span>
-      </summary>
-      <div className="sub-agent-body">
-        {messages.length === 0 && isRunning && (
-          <div className="text-xs text-text-subtle animate-pulse py-2">Starting agent...</div>
-        )}
-        {messages
-          .filter((m) => m.Role === "assistant")
-          .map((m) => (
-            <SubAgentMessage key={m.ID} message={m} />
-          ))}
-      </div>
-    </details>
+      </button>
+      {open && (
+        <div className="sub-agent-body">
+          {messages.length === 0 && isRunning && (
+            <div className="text-xs text-text-subtle animate-pulse py-2">Starting agent...</div>
+          )}
+          {messages
+            .filter((m) => m.Role === "assistant")
+            .map((m) => (
+              <SubAgentMessage key={m.ID} message={m} />
+            ))}
+        </div>
+      )}
+    </div>
   );
 });
