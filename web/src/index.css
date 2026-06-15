@@ -303,11 +303,48 @@
   /* Thinking block — finished / collapsible state */
   .thinking-card-done { @apply my-3 border border-surface rounded-xl overflow-hidden shadow-sm; }
 
-  /* <summary> toggle inside a finished thinking block */
+  /* Top toggle of a finished thinking block — toggles its open state */
   .thinking-toggle {
     @apply px-5 py-3 cursor-pointer select-none text-base text-text-muted
            bg-base-subtle hover:bg-base-overlay transition-colors
            flex items-center gap-2.5 font-medium;
+  }
+
+  /* Sticky strip pinned to the bottom of an expanded thinking block. Lets
+     the user collapse the block from wherever they ended up reading, without
+     scrolling back to the header. Anchored via position: sticky, not fixed,
+     so it stays within its parent's flow. */
+  .thinking-collapse-bottom {
+    @apply sticky bottom-0 z-10 w-full px-5 py-2 cursor-pointer select-none
+           text-xs text-text-subtle border-t border-surface
+           bg-base-subtle hover:bg-base-overlay hover:text-text-muted
+           transition-colors flex items-center justify-center gap-1.5;
+  }
+
+  /* ── Tool activity group ───────────────────────────────────────────────
+     One "tool" visual block (a burst of tool_call+tool_result pairs) is
+     rendered as a tight accordion list inside a single shell. Header gives
+     the action count + a short tally + a chevron; body is a vertical stack
+     of <ActionRow>s, each with its own header + collapsible body. */
+  .tool-activity-group {
+    @apply my-3 border border-surface rounded-xl overflow-hidden bg-base-subtle;
+  }
+  .tool-activity-head {
+    @apply w-full px-4 py-2.5 flex items-center gap-3 select-none cursor-pointer
+           text-left bg-base-subtle hover:bg-base-overlay transition-colors
+           border-b border-surface;
+  }
+  .tool-activity-body { @apply divide-y divide-surface/70; }
+
+  .action-row {
+    @apply bg-canvas;
+  }
+  .action-row-head {
+    @apply w-full px-4 py-2 flex items-center gap-2 select-none cursor-pointer
+           text-left bg-base-subtle/40 hover:bg-base-overlay/70 transition-colors;
+  }
+  .action-row-body {
+    @apply px-4 pb-3 pt-1 border-t border-surface/60 bg-canvas;
   }
 
   /* Sub-agent inline block */

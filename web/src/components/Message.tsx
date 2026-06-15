@@ -5,7 +5,7 @@ import remarkGfm from "remark-gfm";
 import remarkBreaks from "remark-breaks";
 import rehypeHighlight from "rehype-highlight";
 import type { Message as Msg, ContentPart } from "../types";
-import { BrainCircuit, Check, Copy, GitFork, Pencil, RotateCcw, Star, Trash2, BookMarked } from "lucide-react";
+import { BrainCircuit, Check, Copy, GitFork, Pencil, RotateCcw, Star, Trash2, BookMarked, ChevronDown, ChevronUp } from "lucide-react";
 import { SubAgentBlock } from "./SubAgentBlock";
 import {
   $busySessions,
@@ -304,6 +304,200 @@ const ToolResultBlock = memo(function ToolResultBlock({ name, content, isError, 
   );
 });
 
+// ── Tool activity group ───────────────────────────────────────────────────────
+//
+// A "tool" visual block (a burst of tool_call/tool_result parts between two
+// stretches of text or thinking) gets rendered as a vertical accordion list
+// instead of a flat stack of cards. Rules:
+//
+//   • One row per pair: a tool_call is paired with its tool_result by
+//     ToolCallID. Unpaired results (rare — orphaned from an aborted earlier
+//     call) get their own row with no head.
+//
+//   • Row open-state: `open = userOverride ?? isCurrent`.
+//     isCurrent = last row in the list. While the turn is live, that's the
+//     in-flight action. After the turn ends, the last action stays expanded
+//     by default (most relevant to look at), prior rows stay collapsed.
+//     A click freezes the override and the auto-rule no longer touches it.
+//
+//   • Group open-state: open by default (user wanted to "see the process").
+//     Manual collapse via the chevron in the header — never auto-collapsed.
+
+// formatActionArgs — one-line preview shown in the collapsed row header.
+// Picks the most useful identifying argument for known tool names so the
+// reader scans by file path / command / pattern, not by raw JSON.
+function formatActionArgs(name: string, input: string): string {
+  if (!input) return "";
+  let parsed: Record<string, unknown> = {};
+  try { parsed = JSON.parse(input) as Record<string, unknown>; } catch { return ""; }
+  const s = (k: string) => typeof parsed[k] === "string" ? (parsed[k] as string) : "";
+  switch (name) {
+    case "bash":      return s("command");
+    case "view":      return s("file_path") || s("path") || s("filePath");
+    case "write":
+    case "edit":
+    case "multiedit": return s("file_path");
+    case "glob":      return s("pattern");
+    case "grep":      return [s("pattern"), s("path")].filter(Boolean).join(" · ");
+    case "ls":        return s("path");
+    case "fetch":     return s("url");
+    case "download":  return s("url");
+    case "agent":     return s("prompt") || s("description");
+    default: {
+      // First string value in the object as a sensible fallback.
+      for (const v of Object.values(parsed)) if (typeof v === "string" && v) return v;
+      return "";
+    }
+  }
+}
+
+interface ActionItem {
+  callPart?: ContentPart & { type: "tool_call"; ID: string; Name: string; Input: string; Finished: boolean };
+  resultPart?: ContentPart & { type: "tool_result"; ToolCallID: string; Name: string; Content: string; IsError: boolean; Metadata?: string };
+  idx: number;
+  key: string;
+}
+
+interface ActionRowProps {
+  item: ActionItem;
+  isCurrent: boolean;
+}
+
+const ActionRow = memo(function ActionRow({ item, isCurrent }: ActionRowProps) {
+  // override:
+  //   undefined → follow auto-rule (open iff isCurrent)
+  //   true / false → user pinned, ignore auto-rule from now on
+  const [override, setOverride] = useState<boolean | undefined>(undefined);
+  const open = override ?? isCurrent;
+  const toggle = useCallback(() => setOverride(!open), [open]);
+
+  const call    = item.callPart;
+  const result  = item.resultPart;
+  const name    = call?.Name ?? result?.Name ?? "tool";
+  const args    = call ? formatActionArgs(call.Name, call.Input) : "";
+  const running = !!call && !call.Finished && !result;
+  const errored = !!result?.IsError;
+  return (
+    <div data-test-id="action-row" className="action-row">
+      <button
+        type="button"
+        onClick={toggle}
+        aria-expanded={open}
+        data-test-id="action-row-toggle"
+        className="action-row-head"
+      >
+        <span className="text-xs text-text-subtle shrink-0">⚡</span>
+        <span className="text-mauve font-semibold text-sm shrink-0">{name}</span>
+        {args && <span className="text-text-muted text-xs font-mono truncate flex-1 min-w-0">{args}</span>}
+        {!args && <span className="flex-1" />}
+        {running && <span className="text-text-subtle text-xs animate-pulse shrink-0">running…</span>}
+        {errored && <span className="badge-error shrink-0">error</span>}
+        <span className="text-text-subtle shrink-0">
+          {open ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+        </span>
+      </button>
+      {open && (
+        <div className="action-row-body">
+          {call && <ToolCallBlock name={call.Name} input={call.Input} finished={call.Finished} />}
+          {result && <ToolResultBlock name={result.Name} content={result.Content} isError={result.IsError} metadata={result.Metadata} />}
+        </div>
+      )}
+    </div>
+  );
+});
+
+interface ToolActivityGroupProps {
+  items: { part: ContentPart; idx: number }[];
+  live: boolean;
+}
+
+const ToolActivityGroup = memo(function ToolActivityGroup({ items, live }: ToolActivityGroupProps) {
+  // Manual group-collapse. NEVER auto-collapsed — the user explicitly asked
+  // to keep "the process" visible. They can fold the burst by hand.
+  const [collapsed, setCollapsed] = useState(false);
+  const toggle = useCallback(() => setCollapsed((v) => !v), []);
+
+  // Pair calls and results by ToolCallID. Order is the order calls appear.
+  // An "agent" tool_call is passed through unchanged — SubAgentBlock owns
+  // its own rendering and lives outside the row schema. Same for the matching
+  // tool_result if any.
+  const { actions, rawAgentParts } = useMemo(() => {
+    const actions: ActionItem[] = [];
+    const rawAgentParts: { part: ContentPart; idx: number }[] = [];
+    const indexByCallID = new Map<string, number>();
+    for (const { part, idx } of items) {
+      if (part.type === "tool_call") {
+        if (part.Name === "agent") { rawAgentParts.push({ part, idx }); continue; }
+        const a: ActionItem = { callPart: part, idx, key: `call-${part.ID}` };
+        indexByCallID.set(part.ID, actions.length);
+        actions.push(a);
+      } else if (part.type === "tool_result") {
+        if (part.Name === "agent") { rawAgentParts.push({ part, idx }); continue; }
+        const pos = indexByCallID.get(part.ToolCallID);
+        if (pos !== undefined) {
+          actions[pos].resultPart = part;
+        } else {
+          actions.push({ resultPart: part, idx, key: `res-${part.ToolCallID}-${idx}` });
+        }
+      }
+    }
+    return { actions, rawAgentParts };
+  }, [items]);
+
+  const tally = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const a of actions) {
+      const n = a.callPart?.Name ?? a.resultPart?.Name ?? "tool";
+      counts.set(n, (counts.get(n) ?? 0) + 1);
+    }
+    return [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 4)
+      .map(([k, v]) => `${v} ${k}`).join(" · ");
+  }, [actions]);
+
+  // SubAgent parts always render in their own (existing) component, in their
+  // original order at the END of the group so they don't get swallowed by the
+  // collapse toggle. They're rare in practice — usually zero per group.
+  const renderAgents = () => rawAgentParts.map(({ part, idx }) => {
+    if (part.type === "tool_call") {
+      let prompt = "";
+      try { prompt = (JSON.parse(part.Input) as { prompt?: string }).prompt ?? part.Input; } catch { prompt = part.Input; }
+      return <SubAgentBlock key={`a-${idx}`} messageID="" toolCallID={part.ID} prompt={prompt} />;
+    }
+    return null;
+  });
+
+  return (
+    <div data-test-id="tool-activity-group" className="tool-activity-group">
+      <button
+        type="button"
+        onClick={toggle}
+        data-test-id="tool-activity-toggle"
+        className="tool-activity-head"
+        aria-expanded={!collapsed}
+        title={collapsed ? "Expand actions" : "Collapse actions"}
+      >
+        <span className="text-mauve font-semibold text-sm shrink-0">
+          {actions.length} {actions.length === 1 ? "action" : "actions"}
+        </span>
+        {tally && <span className="text-text-subtle text-xs truncate flex-1 min-w-0">{tally}</span>}
+        {!tally && <span className="flex-1" />}
+        {live && <span className="text-text-subtle text-xs animate-pulse shrink-0">live</span>}
+        <span className="text-text-subtle shrink-0">
+          {collapsed ? <ChevronDown size={16} /> : <ChevronUp size={16} />}
+        </span>
+      </button>
+      {!collapsed && (
+        <div className="tool-activity-body">
+          {actions.map((a, i) => (
+            <ActionRow key={a.key} item={a} isCurrent={i === actions.length - 1} />
+          ))}
+          {renderAgents()}
+        </div>
+      )}
+    </div>
+  );
+});
+
 const TextBlock = memo(function TextBlock({ text, isUser }: { text: string; isUser: boolean }) {
   if (isUser) return <span className="whitespace-pre-wrap">{text}</span>;
   return (
@@ -318,10 +512,15 @@ const TextBlock = memo(function TextBlock({ text, isUser }: { text: string; isUs
 const ThinkingPart = memo(function ThinkingPart({ thinking, messageID, partIndex, done }: { thinking: string; messageID: string; partIndex: number; done: boolean }) {
   const [editing, setEditing] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  // Controlled open-state (not <details>) so we can render a sticky
+  // collapse strip at the bottom — long reasoning blocks are tedious to
+  // close when the toggle is only at the top.
+  const [open, setOpen] = useState(false);
 
   const closeEdit  = useCallback(() => setEditing(false), []);
   const openDel    = useCallback((e: React.MouseEvent) => { e.preventDefault(); e.stopPropagation(); setConfirmDelete(true); }, []);
   const openEditEv = useCallback((e: React.MouseEvent) => { e.preventDefault(); e.stopPropagation(); setEditing(true); }, []);
+  const toggleOpen = useCallback(() => setOpen((v) => !v), []);
 
   const handleSave = useCallback((text: string) => {
     if (text && text !== thinking) updateMessageThinking(messageID, text);
@@ -333,6 +532,8 @@ const ThinkingPart = memo(function ThinkingPart({ thinking, messageID, partIndex
     setConfirmDelete(false);
   }, [messageID, partIndex]);
 
+  // While the model is still thinking we always render fully (no toggle);
+  // streaming reasoning hidden behind a click is useless.
   if (!done) {
     return (
       <div data-test-id="thinking-card" className="thinking-card">
@@ -350,17 +551,26 @@ const ThinkingPart = memo(function ThinkingPart({ thinking, messageID, partIndex
   }
 
   return (
-    <details data-test-id="thinking-card" className="thinking-card-done group">
-      <summary data-test-id="thinking-toggle" className="thinking-toggle">
+    <div data-test-id="thinking-card" className="thinking-card-done group">
+      <button
+        type="button"
+        onClick={toggleOpen}
+        data-test-id="thinking-toggle"
+        className="thinking-toggle w-full text-left"
+        aria-expanded={open}
+      >
         <span className="text-accent/70"><BrainCircuit size={18} /></span>
         <span data-test-id="thinking-label">Thoughts</span>
-        <div className="ml-auto flex items-center gap-0.5 hover-reveal">
+        <div className="ml-auto flex items-center gap-0.5 hover-reveal" onClick={(e) => e.stopPropagation()}>
           <CopyButton text={thinking} className="px-1.5 py-1 text-xs" />
           <button onClick={openEditEv} title="Edit thinking"   className="btn-icon-sm"><Pencil size={13} /></button>
           <button onClick={openDel}    title="Delete thinking" className="btn-icon-sm-danger"><Trash2 size={13} /></button>
         </div>
-      </summary>
-      {confirmDelete && (
+        <span className="text-text-subtle ml-1 shrink-0">
+          {open ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
+        </span>
+      </button>
+      {open && confirmDelete && (
         <ConfirmDialog
           title="Delete thinking"
           message="The model's reasoning will be removed from this message. This cannot be undone."
@@ -369,7 +579,7 @@ const ThinkingPart = memo(function ThinkingPart({ thinking, messageID, partIndex
           onCancel={() => setConfirmDelete(false)}
         />
       )}
-      {editing ? (
+      {open && (editing ? (
         <div className="p-4 bg-base-overlay border-t border-surface">
           <EditForm
             initialValue={thinking}
@@ -380,11 +590,26 @@ const ThinkingPart = memo(function ThinkingPart({ thinking, messageID, partIndex
           />
         </div>
       ) : (
-        <pre data-test-id="thinking-content" className="p-5 bg-base-overlay font-mono whitespace-pre-wrap overflow-x-auto text-text-muted border-t border-surface leading-relaxed" style={{ fontSize: "var(--chat-font-size)" }}>
-          {thinking}
-        </pre>
-      )}
-    </details>
+        <>
+          <pre data-test-id="thinking-content" className="p-5 bg-base-overlay font-mono whitespace-pre-wrap overflow-x-auto text-text-muted border-t border-surface leading-relaxed" style={{ fontSize: "var(--chat-font-size)" }}>
+            {thinking}
+          </pre>
+          {/* Sticky bottom collapse strip: stays visible as the user scrolls
+              past the reasoning so closing it is one click away — no need to
+              scroll back up to the header toggle. */}
+          <button
+            type="button"
+            onClick={toggleOpen}
+            data-test-id="thinking-collapse-bottom"
+            className="thinking-collapse-bottom"
+            title="Collapse thinking"
+          >
+            <ChevronUp size={14} />
+            <span>Collapse thinking</span>
+          </button>
+        </>
+      ))}
+    </div>
   );
 });
 
@@ -599,13 +824,22 @@ const AssistantContent = memo(function AssistantContent({
   // (soft amber) over FinishErrorBlock (red) when the watchdog stall happened
   // after the model already produced something substantive.
   const partialWorkDone = hasVisibleContent;
+  const isLive = busy.has(message.SessionID);
   return (
     <div className="text-text leading-relaxed" style={{ fontSize: "var(--chat-font-size)" }}>
       {blocks.map((block, bi) => (
         <div key={bi} className={bi > 0 ? "msg-block-sep" : undefined}>
-          {block.items.map(({ part, idx }) => (
-            <Part key={idx} part={part} index={idx} isUser={false} messageID={message.ID} thinkingDone={block.thinkingDone} partialWorkDone={partialWorkDone} />
-          ))}
+          {block.kind === "tool" ? (
+            // Whole tool burst is rendered through the accordion group: one
+            // collapsible row per call+result pair, last row open by default
+            // (the "current action"), prior rows collapsed. User can pin any
+            // row open/closed and the auto-rule stops touching that row.
+            <ToolActivityGroup items={block.items} live={isLive} />
+          ) : (
+            block.items.map(({ part, idx }) => (
+              <Part key={idx} part={part} index={idx} isUser={false} messageID={message.ID} thinkingDone={block.thinkingDone} partialWorkDone={partialWorkDone} />
+            ))
+          )}
         </div>
       ))}
     </div>
