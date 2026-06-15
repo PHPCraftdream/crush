@@ -132,7 +132,13 @@ func NewWriteTool(
 				return fantasy.ToolResponse{}, err
 			}
 			if !p {
-				return NewPermissionDeniedResponse(), nil
+				resp := NewPermissionDeniedResponse()
+				resp = fantasy.WithResponseMetadata(resp, WriteResponseMetadata{
+					Diff:      diff,
+					Additions: additions,
+					Removals:  removals,
+				})
+				return resp, nil
 			}
 
 			err = fsext.AtomicWriteFile(filePath, []byte(params.Content), 0o644)

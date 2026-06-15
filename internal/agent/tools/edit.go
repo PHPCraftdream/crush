@@ -155,7 +155,14 @@ func createNewFile(edit editContext, filePath, content string, call fantasy.Tool
 		return fantasy.ToolResponse{}, err
 	}
 	if !p {
-		return NewPermissionDeniedResponse(), nil
+		resp := NewPermissionDeniedResponse()
+		resp = fantasy.WithResponseMetadata(resp, EditResponseMetadata{
+			OldContent: "",
+			NewContent: content,
+			Additions:  additions,
+			Removals:   removals,
+		})
+		return resp, nil
 	}
 
 	err = fsext.AtomicWriteFile(filePath, []byte(content), 0o644)
@@ -276,7 +283,14 @@ func deleteContent(edit editContext, filePath, oldString string, replaceAll bool
 		return fantasy.ToolResponse{}, err
 	}
 	if !p {
-		return NewPermissionDeniedResponse(), nil
+		resp := NewPermissionDeniedResponse()
+		resp = fantasy.WithResponseMetadata(resp, EditResponseMetadata{
+			OldContent: oldContent,
+			NewContent: newContent,
+			Additions:  additions,
+			Removals:   removals,
+		})
+		return resp, nil
 	}
 
 	if isCrlf {
@@ -408,7 +422,14 @@ func replaceContent(edit editContext, filePath, oldString, newString string, rep
 		return fantasy.ToolResponse{}, err
 	}
 	if !p {
-		return NewPermissionDeniedResponse(), nil
+		resp := NewPermissionDeniedResponse()
+		resp = fantasy.WithResponseMetadata(resp, EditResponseMetadata{
+			OldContent: oldContent,
+			NewContent: newContent,
+			Additions:  additions,
+			Removals:   removals,
+		})
+		return resp, nil
 	}
 
 	if isCrlf {
