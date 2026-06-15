@@ -469,12 +469,20 @@ export const ToolActivityGroup = memo(function ToolActivityGroup({ items, live, 
     prevIsCurrent.current = isCurrent;
   }, [items.length, isCurrent]);
 
+  // Any collapse (manual OR automatic via isCurrent → false) latches
+  // suppressAuto. The body unmounts, which already discards each ActionRow's
+  // override state; setting the latch ensures that on the next expand the
+  // auto-current rule doesn't re-open the last row either — every row stays
+  // closed until the user clicks one, or a fresh tool arrival clears the
+  // latch via the effect above.
+  useEffect(() => {
+    if (collapsed) setSuppressAuto(true);
+  }, [collapsed]);
+
   const toggle = useCallback(() => {
     setCollapsedOverride((prev) => {
       const cur = prev ?? autoCollapsed;
-      const next = !cur;
-      if (next) setSuppressAuto(true); // collapsing now → suppress auto on next expand
-      return next;
+      return !cur;
     });
   }, [autoCollapsed]);
 

@@ -15,7 +15,6 @@ import {
   getDefaultModelKey,
 } from "../store";
 import { ModelSelector, buildModelList } from "./ModelSelector";
-import { StatusBar } from "./StatusBar";
 import { LogsModal } from "./LogsModal";
 import { MCPSettings } from "./MCPSettings";
 import { SettingsModal } from "./SettingsModal";
@@ -294,12 +293,7 @@ export function ChatToolbar() {
           </div>
         )}
 
-        {/* MIDDLE — connection + MCP server status. Two spacers around it
-            make it gravitate to the geometric centre of the toolbar row;
-            with flex-wrap=true it stays on the same line when there's room
-            and reflows below otherwise. */}
-        <div className="flex-1" />
-        <StatusBar inline />
+        {/* Push the right cluster to the far edge. */}
         <div className="flex-1" />
 
         {/* RIGHT cluster */}

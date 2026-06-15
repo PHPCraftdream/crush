@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect } from "react";
 import type { Todo, TodoStatus } from "../types";
 import { updateTodos } from "../store";
+import { StatusBar } from "./StatusBar";
 
 // ── Status symbol ─────────────────────────────────────────────────────────────
 
@@ -256,7 +257,7 @@ export function TodoList({ sessionID, todos }: { sessionID: string; todos: Todo[
         <button
           data-test-id="todo-list-toggle"
           onClick={() => setCollapsed((c) => !c)}
-          className="flex-1 flex items-center gap-2 px-4 py-2 text-left hover:bg-base-overlay/50 transition-colors"
+          className="shrink-0 flex items-center gap-2 px-4 py-2 text-left hover:bg-base-overlay/50 transition-colors"
         >
           <span className={`text-text-subtle text-[11px] transition-transform inline-block ${collapsed ? "" : "rotate-90"}`}>
             ▶
@@ -270,6 +271,12 @@ export function TodoList({ sessionID, todos }: { sessionID: string; todos: Todo[
             </span>
           )}
         </button>
+
+        {/* Connection + MCP status occupies the empty horizontal strip
+            between the "Tasks" toggle and the row's action buttons. */}
+        <div className="flex-1 flex items-center justify-center min-w-0 px-3">
+          <StatusBar inline />
+        </div>
 
         {/* Clear completed / Add task buttons */}
         {completed > 0 && (
