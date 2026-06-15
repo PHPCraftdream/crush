@@ -18,7 +18,7 @@ import {
   type QueuedMessage,
 } from "../store";
 import { ws } from "../ws";
-import { Message, ToolActivityGroup } from "./Message";
+import { Message, ToolActivityGroup, StandaloneThinking } from "./Message";
 import { ChatInput } from "./ChatInput";
 import { PermissionDialog } from "./PermissionDialog";
 import { ConfirmDialog } from "./ConfirmDialog";
@@ -116,100 +116,115 @@ function QueuedMessageItem({
 
 // ── Cross-message tool-run grouping ──────────────────────────────────────────
 //
-// The agent emits a brand-new assistant message per turn-step, so a session
-// with N tool steps lands as N separate assistant rows in the transcript —
-// each row with its own container, header chrome, and (until now) its own
-// almost-empty "1 action" accordion. Useless.
+// The agent emits a brand-new assistant message per turn-step, and almost
+// every step carries a `thinking` part next to its tool_call (the model's
+// pre-action reasoning). The previous version of this grouper rejected any
+// message that had thinking — so each "thinking + tool_call + tool_result"
+// step landed as its own standalone <Message> with a near-empty "1 action"
+// accordion, defeating the whole point of grouping.
 //
-// buildRenderItems folds runs of consecutive tool-only assistant messages
-// into a single ToolRun item. Inside ToolRun, ToolActivityGroup receives
-// the concatenation of every tool_call / tool_result part across the whole
-// run, so the burst behaves like one accordion: 28 actions, last open,
-// prior collapsed. User-, summary-, text-bearing and error-finish messages
-// always pass through untouched (they break the run).
+// The new rule lifts grouping to the part level. We walk through the parts
+// of consecutive assistant messages and pick out a single contiguous tool
+// burst: a stretch of tool_call / tool_result parts across N adjacent
+// assistant messages, with intervening thinking parts pulled out as their
+// own standalone items. A `text` part, a user message, an error/canceled
+// finish, a summary or hidden message all flush the burst — so the
+// accordion always corresponds to one uninterrupted stretch of tool work.
+//
+// Inside the burst, ToolActivityGroup pairs calls with their results by
+// ToolCallID even though they came from different message rows, and the
+// "last row open, prior closed, user-clicks pin" auto-rule kicks in for
+// real.
 
-interface PartLike { type: string; Reason?: string }
-
-function isToolOnly(m: Msg): boolean {
-  if (m.Role !== "assistant") return false;
-  if (m.Hidden) return false;
-  if (m.IsSummaryMessage) return false;
-  let hasTool = false;
-  for (const raw of m.Parts) {
-    const p = raw as unknown as PartLike;
-    if (p.type === "text") return false;
-    if (p.type === "thinking") return false;
-    if (p.type === "finish" && (p.Reason === "error" || p.Reason === "canceled")) return false;
-    if (p.type === "tool_call" || p.type === "tool_result") hasTool = true;
-  }
-  return hasTool;
-}
+interface PartLike { type: string; Reason?: string; Thinking?: string }
 
 type RenderItem =
   | { kind: "message"; message: Msg; index: number }
-  | { kind: "toolrun"; messages: Msg[]; startIndex: number };
+  | { kind: "thinking"; messageID: string; partIndex: number; thinking: string; done: boolean }
+  | { kind: "toolrun"; parts: ContentPart[]; firstMsgID: string };
 
 function buildRenderItems(messages: Msg[]): RenderItem[] {
   const out: RenderItem[] = [];
-  let run: Msg[] = [];
-  let runStart = -1;
+  let burstParts: ContentPart[] = [];
+  let burstFirstID = "";
 
-  const flush = () => {
-    if (run.length === 0) return;
-    if (run.length === 1) {
-      // A single tool-only message keeps its own <Message> chrome so its
-      // checkbox / hover actions stay reachable. The inside-message
-      // ToolActivityGroup routing in AssistantContent still renders the
-      // accordion — we only deduplicate when there are 2+ in a row.
-      out.push({ kind: "message", message: run[0], index: runStart });
-    } else {
-      out.push({ kind: "toolrun", messages: [...run], startIndex: runStart });
-    }
-    run = [];
-    runStart = -1;
+  const flushBurst = () => {
+    if (burstParts.length === 0) return;
+    out.push({ kind: "toolrun", parts: burstParts, firstMsgID: burstFirstID });
+    burstParts = [];
+    burstFirstID = "";
   };
 
   messages.forEach((m, i) => {
-    if (isToolOnly(m)) {
-      if (runStart === -1) runStart = i;
-      run.push(m);
-    } else {
-      flush();
+    // Anything that is not a plain assistant message flushes the burst and
+    // renders as its own <Message> — user prompts, summary cards, hidden
+    // rows (Message returns null for those, but we still want the run cut).
+    if (m.Role !== "assistant" || m.Hidden || m.IsSummaryMessage) {
+      flushBurst();
       out.push({ kind: "message", message: m, index: i });
+      return;
     }
+
+    // Scan the message's parts. A `text` or error finish forces a flush AND
+    // sends the whole message through <Message> so its body renders inline
+    // (we don't try to tease apart text + tool inside the same message —
+    // that's rare and not worth the complexity). Otherwise, thinking parts
+    // become standalone items in the burst's region, and tool parts append
+    // to the running burst.
+    let hasTool = false;
+    let hasText = false;
+    let hasErrorFinish = false;
+    for (const raw of m.Parts) {
+      const p = raw as unknown as PartLike;
+      if (p.type === "text") hasText = true;
+      if (p.type === "tool_call" || p.type === "tool_result") hasTool = true;
+      if (p.type === "finish" && (p.Reason === "error" || p.Reason === "canceled")) hasErrorFinish = true;
+    }
+
+    if (hasText || hasErrorFinish || !hasTool) {
+      // Text-bearing, errored, or pure-thinking-without-tools message:
+      // flush the burst (this message ends any prior tool stretch) and
+      // render the message in full.
+      flushBurst();
+      out.push({ kind: "message", message: m, index: i });
+      return;
+    }
+
+    // Tool-bearing message with no text and no error finish — fold it.
+    if (burstFirstID === "") burstFirstID = m.ID;
+    m.Parts.forEach((p, partIdx) => {
+      if (p.type === "thinking") {
+        const thinking = (p as unknown as PartLike).Thinking ?? "";
+        out.push({ kind: "thinking", messageID: m.ID, partIndex: partIdx, thinking, done: true });
+      } else if (p.type === "tool_call" || p.type === "tool_result") {
+        burstParts.push(p);
+      }
+      // finish (non-error) and other parts are dropped — they have no
+      // visible effect inside a tool burst.
+    });
   });
-  flush();
+
+  flushBurst();
   return out;
 }
 
-function ToolRun({ messages, sessionID, isLive }: { messages: Msg[]; sessionID: string; isLive: boolean }) {
-  // Concatenate every tool_call / tool_result part from every message in the
-  // run, preserving order. ToolActivityGroup will pair calls and results by
-  // ToolCallID even though they came from different message rows.
-  const parts = useMemo(() => {
-    const out: { part: ContentPart; idx: number }[] = [];
-    let counter = 0;
-    for (const m of messages) {
-      for (const p of m.Parts) {
-        if (p.type === "tool_call" || p.type === "tool_result") {
-          out.push({ part: p, idx: counter++ });
-        }
-      }
-    }
-    return out;
-  }, [messages]);
-
-  const firstID = messages[0]?.ID ?? "";
+function ToolRun({ parts, firstMsgID, sessionID, isLive }: { parts: ContentPart[]; firstMsgID: string; sessionID: string; isLive: boolean }) {
+  // ToolActivityGroup pairs call↔result by ToolCallID — no further prep
+  // needed here, just give each part a stable index for its key.
+  const items = useMemo(
+    () => parts.map((part, idx) => ({ part, idx })),
+    [parts]
+  );
   return (
     <div
-      id={firstID ? `msg-${firstID}` : undefined}
+      id={firstMsgID ? `msg-${firstMsgID}` : undefined}
       data-msg-role="assistant"
       data-tool-run="true"
       className="msg-row flex flex-col px-5 py-3"
-      title={`${messages.length} tool-only assistant steps grouped`}
+      title={`${parts.length} tool parts grouped across messages`}
     >
       <div className="w-full min-w-0">
-        <ToolActivityGroup items={parts} live={isLive} />
+        <ToolActivityGroup items={items} live={isLive} />
       </div>
     </div>
   );
@@ -339,14 +354,26 @@ export function Chat() {
             <p className="empty-state-desc">Say something to get started</p>
           </div>
         ) : (
-          renderItems.map((item) => {
+          renderItems.map((item, ri) => {
             if (item.kind === "toolrun") {
               return (
                 <ToolRun
-                  key={`run-${item.messages[0].ID}`}
-                  messages={item.messages}
+                  key={`run-${item.firstMsgID}-${ri}`}
+                  parts={item.parts}
+                  firstMsgID={item.firstMsgID}
                   sessionID={activeSessionID ?? ""}
                   isLive={isBusy}
+                />
+              );
+            }
+            if (item.kind === "thinking") {
+              return (
+                <StandaloneThinking
+                  key={`th-${item.messageID}-${item.partIndex}`}
+                  messageID={item.messageID}
+                  partIndex={item.partIndex}
+                  thinking={item.thinking}
+                  done={item.done}
                 />
               );
             }

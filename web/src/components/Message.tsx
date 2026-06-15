@@ -361,20 +361,26 @@ interface ActionItem {
 interface ActionRowProps {
   item: ActionItem;
   isCurrent: boolean;
+  // When set, the auto-current rule is suppressed for this render. Comes
+  // from ToolActivityGroup after a manual collapse: re-expanding the group
+  // should leave every row closed until the user explicitly clicks one,
+  // or a live tool arrival kicks the group back into auto mode.
+  suppressAutoCurrent: boolean;
 }
 
-const ActionRow = memo(function ActionRow({ item, isCurrent }: ActionRowProps) {
+const ActionRow = memo(function ActionRow({ item, isCurrent, suppressAutoCurrent }: ActionRowProps) {
   // override:
-  //   undefined → follow auto-rule (open iff isCurrent)
+  //   undefined → follow auto-rule (open iff isCurrent, AND auto isn't suppressed)
   //   true / false → user pinned, ignore auto-rule from now on
   const [override, setOverride] = useState<boolean | undefined>(undefined);
-  const open = override ?? isCurrent;
+  const effectiveCurrent = suppressAutoCurrent ? false : isCurrent;
+  const open = override ?? effectiveCurrent;
   const toggle = useCallback(() => setOverride(!open), [open]);
 
   const call    = item.callPart;
   const result  = item.resultPart;
   const name    = call?.Name ?? result?.Name ?? "tool";
-  const args    = call ? formatActionArgs(call.Name, call.Input) : "";
+  const subject = call ? formatActionArgs(call.Name, call.Input) : "";
   const running = !!call && !call.Finished && !result;
   const errored = !!result?.IsError;
   return (
@@ -385,11 +391,17 @@ const ActionRow = memo(function ActionRow({ item, isCurrent }: ActionRowProps) {
         aria-expanded={open}
         data-test-id="action-row-toggle"
         className="action-row-head"
+        title={subject || name}
       >
         <span className="text-xs text-text-subtle shrink-0">⚡</span>
         <span className="text-mauve font-semibold text-sm shrink-0">{name}</span>
-        {args && <span className="text-text-muted text-xs font-mono truncate flex-1 min-w-0">{args}</span>}
-        {!args && <span className="flex-1" />}
+        {/* Subject (file path, command, pattern, …) is the primary readable
+            label of the row — same size and weight as the tool name so a
+            collapsed accordion immediately tells the operator WHICH file
+            each action touched, not just that "an edit happened". */}
+        <span className="text-text font-mono text-sm truncate flex-1 min-w-0">
+          {subject || "—"}
+        </span>
         {running && <span className="text-text-subtle text-xs animate-pulse shrink-0">running…</span>}
         {errored && <span className="badge-error shrink-0">error</span>}
         <span className="text-text-subtle shrink-0">
@@ -412,10 +424,39 @@ interface ToolActivityGroupProps {
 }
 
 export const ToolActivityGroup = memo(function ToolActivityGroup({ items, live }: ToolActivityGroupProps) {
-  // Manual group-collapse. NEVER auto-collapsed — the user explicitly asked
-  // to keep "the process" visible. They can fold the burst by hand.
+  // Group open/close state machine.
+  //
+  // `collapsed` is the visible state. `suppressAuto` is the safety latch
+  // that's flipped on by a manual collapse: once the user has collapsed the
+  // group, re-expanding it leaves EVERY row closed (including the row that
+  // would normally auto-open because it's the most recent). The latch is
+  // released the moment a NEW tool arrives — that's a live event the user
+  // wants to see, so the group auto-expands and the new row auto-opens.
+  //
+  // When the body is unmounted (`collapsed === true`) every ActionRow's
+  // internal override state is reset (React unmount discards useState), so
+  // collapsing the group also drops any per-row pins the user had set.
+  // That matches "сворачивание идёт с уничтожением контента" verbatim.
   const [collapsed, setCollapsed] = useState(false);
-  const toggle = useCallback(() => setCollapsed((v) => !v), []);
+  const [suppressAuto, setSuppressAuto] = useState(false);
+  const prevItemsLen = useRef(items.length);
+  useEffect(() => {
+    if (items.length > prevItemsLen.current) {
+      // A new tool just arrived. Bring the group back to live-auto mode:
+      // expand it (if a manual collapse was in effect) and clear the
+      // suppress latch so the new row auto-opens via its isCurrent prop.
+      setCollapsed(false);
+      setSuppressAuto(false);
+    }
+    prevItemsLen.current = items.length;
+  }, [items.length]);
+  const toggle = useCallback(() => {
+    setCollapsed((c) => {
+      const next = !c;
+      if (next) setSuppressAuto(true); // collapsing now → suppress auto on next expand
+      return next;
+    });
+  }, []);
 
   // Pair calls and results by ToolCallID. Order is the order calls appear.
   // An "agent" tool_call is passed through unchanged — SubAgentBlock owns
@@ -489,7 +530,12 @@ export const ToolActivityGroup = memo(function ToolActivityGroup({ items, live }
       {!collapsed && (
         <div className="tool-activity-body">
           {actions.map((a, i) => (
-            <ActionRow key={a.key} item={a} isCurrent={i === actions.length - 1} />
+            <ActionRow
+              key={a.key}
+              item={a}
+              isCurrent={i === actions.length - 1}
+              suppressAutoCurrent={suppressAuto}
+            />
           ))}
           {renderAgents()}
         </div>
@@ -612,6 +658,22 @@ const ThinkingPart = memo(function ThinkingPart({ thinking, messageID, partIndex
     </div>
   );
 });
+
+// StandaloneThinking is the renderer for a thinking part that was extracted
+// out of its assistant message because the surrounding tool parts were
+// folded into a cross-message ToolRun. It reuses ThinkingPart so the edit /
+// delete / copy / sticky-collapse affordances stay identical to the in-
+// message rendering. Wrapped in a small flex container so it sits in the
+// chat scroll list at the same horizontal padding as a message row.
+export function StandaloneThinking({ messageID, partIndex, thinking, done }: { messageID: string; partIndex: number; thinking: string; done: boolean }) {
+  return (
+    <div className="msg-row flex flex-col px-5 py-2">
+      <div className="w-full min-w-0">
+        <ThinkingPart messageID={messageID} partIndex={partIndex} thinking={thinking} done={done} />
+      </div>
+    </div>
+  );
+}
 
 // ── Block grouping for zebra pattern ──────────────────────────────────────
 
