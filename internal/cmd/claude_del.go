@@ -11,20 +11,20 @@ import (
 
 var claudeDelCmd = &cobra.Command{
 	Use:   "claude-del",
-	Short: "Remove crush slash-commands, sub-agents, and legacy CLAUDE.md block",
-	Long: `Undo ` + "`crush claude-init`" + `: remove the /crush slash-command, all
-per-model slash-commands (o47-*, s46-*, h45-*, fl-*, …), all per-model
-sub-agents (ao47-*, as46-*, ah45-*, afl-*, …), and strip any
-crush-claude-init block from CLAUDE.md.
+	Short: "Remove the /crush slash-command and strip legacy CLAUDE.md block",
+	Long: `Undo ` + "`crush claude-init`" + `: remove the /crush slash-command and strip
+any crush-claude-init block from CLAUDE.md.
 
 Only files that carry our sentinel are removed — foreign files with the
-same names are left alone with a warning.
+same name are left alone with a warning.
 
-Use --global to remove from ~/.claude/commands/ and ~/.claude/agents/
-instead of the local .claude/ directories. --global and --cwd are mutually
-exclusive.
+Use --global to remove from ~/.claude/commands/ instead of the local
+.claude/commands/. --global and --cwd are mutually exclusive.
 
-Idempotent: running this twice is a no-op the second time.`,
+Idempotent: running this twice is a no-op the second time.
+
+For per-model commands, agents and skills, use ` + "`cah uninstall`" + ` from the
+cc-arch-hands repo.`,
 	Example: `
 # Remove from the current workspace
 crush claude-del
@@ -38,20 +38,13 @@ crush claude-del --cwd /path/to/project
 	RunE: func(cmd *cobra.Command, args []string) error {
 		global, _ := cmd.Flags().GetBool("global")
 
-		var (
-			cmdDir    string
-			agentsDir string
-		)
+		var cmdDir string
 		if global {
 			if cmd.Flags().Changed("cwd") {
 				return fmt.Errorf("--global and --cwd are mutually exclusive")
 			}
 			var err error
 			cmdDir, err = resolveCommandsDir("", true)
-			if err != nil {
-				return err
-			}
-			agentsDir, err = resolveAgentsDir("", true)
 			if err != nil {
 				return err
 			}
@@ -66,16 +59,9 @@ crush claude-del --cwd /path/to/project
 				return err
 			}
 			cmdDir = filepath.Join(cwd, claudeCommandsDir)
-			agentsDir = filepath.Join(cwd, claudeAgentsDir)
 		}
 
-		if err := removeSlashCommandFromDir(cmdDir); err != nil {
-			return err
-		}
-		if err := removeModelCommandsFromDir(cmdDir); err != nil {
-			return err
-		}
-		return removeModelAgentsFromDir(agentsDir)
+		return removeSlashCommandFromDir(cmdDir)
 	},
 }
 
@@ -86,14 +72,7 @@ func runClaudeDel(cwd string) error {
 		return err
 	}
 	cmdDir := filepath.Join(cwd, claudeCommandsDir)
-	if err := removeSlashCommandFromDir(cmdDir); err != nil {
-		return err
-	}
-	if err := removeModelCommandsFromDir(cmdDir); err != nil {
-		return err
-	}
-	agentsDir := filepath.Join(cwd, claudeAgentsDir)
-	return removeModelAgentsFromDir(agentsDir)
+	return removeSlashCommandFromDir(cmdDir)
 }
 
 func removeSlashCommand(cwd string) error {
@@ -117,62 +96,6 @@ func removeSlashCommandFromDir(dir string) error {
 		return fmt.Errorf("failed to remove %s: %w", path, err)
 	}
 	fmt.Fprintf(os.Stderr, "removed %s\n", path)
-	return nil
-}
-
-func removeModelCommands(cwd string) error {
-	return removeModelCommandsFromDir(filepath.Join(cwd, claudeCommandsDir))
-}
-
-func removeModelCommandsFromDir(dir string) error {
-	removed := 0
-	for _, mc := range allModelCommands {
-		path := filepath.Join(dir, mc.name+".md")
-		data, err := os.ReadFile(path)
-		if err != nil {
-			if os.IsNotExist(err) {
-				continue
-			}
-			return fmt.Errorf("read %s: %w", path, err)
-		}
-		if !strings.Contains(string(data), claudeModelCmdSentinel) {
-			fmt.Fprintf(os.Stderr, "refusing to delete %s — missing sentinel\n", path)
-			continue
-		}
-		if err := os.Remove(path); err != nil {
-			return fmt.Errorf("remove %s: %w", path, err)
-		}
-		removed++
-	}
-	if removed > 0 {
-		fmt.Fprintf(os.Stderr, "removed %d model commands from %s\n", removed, dir)
-	}
-	return nil
-}
-
-func removeModelAgentsFromDir(dir string) error {
-	removed := 0
-	for _, mc := range allModelCommands {
-		path := filepath.Join(dir, "a"+mc.name+".md")
-		data, err := os.ReadFile(path)
-		if err != nil {
-			if os.IsNotExist(err) {
-				continue
-			}
-			return fmt.Errorf("read %s: %w", path, err)
-		}
-		if !strings.Contains(string(data), claudeModelAgentSentinel) {
-			fmt.Fprintf(os.Stderr, "refusing to delete %s — missing sentinel\n", path)
-			continue
-		}
-		if err := os.Remove(path); err != nil {
-			return fmt.Errorf("remove %s: %w", path, err)
-		}
-		removed++
-	}
-	if removed > 0 {
-		fmt.Fprintf(os.Stderr, "removed %d model agents from %s\n", removed, dir)
-	}
 	return nil
 }
 

@@ -1,37 +1,8 @@
-// Fork patch: batch 32 — Fable 5 shipped. Added top-model fable shortcuts
-// (fl/fm/fh/fx/fxx and agents afl..afxx) pointing at `claude-fable-5`
-// with 1M context window.
-//
-// Fork patch: batch 31 — Opus 4.8 shipped. Top-of-family opus shortcuts
-// (ol/om/oh/ox/oxx and agents aol..aoxx) now point at `claude-opus-4-8`;
-// the versioned o47*/ao47* family stays on `claude-opus-4-7` so 4.7 is
-// still reachable by its own prefix. Also: the crush-model-{command,agent}
-// sentinels moved OUT of the visible `description` (command → leading
-// comment line; agent → comment at end of body) so they stop leaking into
-// the Claude Code command list / agent picker. Frontmatter stays on line 1
-// (else Claude Code renders the leading line as the description); the
-// command marker is buried far below the body so it stays out of the
-// command-body preview too, and the agent marker sits at the end of its
-// (already long) body. The whole-file Contains() ownership check is
-// unchanged, so overwrite-protection + GC still work.
-//
-// Fork patch: batch 25 — rename model slash-commands from `<model>-<digit>`
-// (o47-0..o47-4) to letter-suffix notation (o47l..o47xx) and add top-model
-// shortcuts (ol, om, oh, ox, oxx, sl, sm, sh, sx, hl, hm, hh).
-//
-// Also in batch 25: `claude-init` deletes old-format files that carry our sentinel.
-//
-// Fork patch: batch 23 — `claude-init` also installs per-model slash commands.
-// Fork patch: batch 22 — `claude-init` no longer writes a delegation block
-// into CLAUDE.md. The block (versions v1..v10) was the proximate cause of
-// a recursive-delegation fork-bomb: any Claude Code session in the
-// workspace read it on startup and tried to delegate every task back into
-// `crush run`, which spawned another Claude Code session, which read the
-// same block, and so on. agentguard (batch 16) + MCP-bridge re-activation
-// (batch 20) close the cycle at the tool-call layer, but the cleanest
-// fix is to remove the trigger entirely. `claude-init` now ONLY installs
-// the `/crush` slash-command — that command is invoked explicitly by the
-// operator when they actually want to delegate, never auto-discovered.
+// Fork patch: `claude-init` installs ONLY the `/crush` slash-command and
+// strips any legacy crush-claude-init block from CLAUDE.md. The per-model
+// slash-commands, per-model sub-agents and model-registry / agent-clause /
+// sentinel code have been extracted to a separate repo (`cc-arch-hands`);
+// use `cah install` from there for the rest.
 //
 // On invocation we still STRIP any pre-existing crush-claude-init block
 // from CLAUDE.md (any version) so users upgrading from an older crush
@@ -69,22 +40,9 @@ const (
 	claudeMdFile               = "CLAUDE.md"
 	claudeSlashCommandPath     = ".claude/commands/crush.md"
 	claudeSlashCommandSentinel = "<!-- crush-slash-command:v1 -->"
-	claudeModelCmdSentinel     = "<!-- crush-model-command:v1 -->"
-	claudeModelAgentSentinel   = "<!-- crush-model-agent:v1 -->"
 	claudeCommandsDir          = ".claude/commands"
 	claudeGlobalCommandsDir    = ".claude/commands" // relative to $HOME
-	claudeAgentsDir            = ".claude/agents"
-	claudeGlobalAgentsDir      = ".claude/agents" // relative to $HOME
 )
-
-// sentinelBodyGap is how many blank lines separate `$ARGUMENTS` from the
-// ownership sentinel at the bottom of a model-command body. The sentinel
-// has to live in the file (the whole-file Contains() check is how
-// claude-init / claude-del recognise files they own), but it must not show
-// up in Claude Code's command-body preview — so it is buried well below the
-// visible region. The exact count is not load-bearing; "comfortably off
-// screen" is the only requirement.
-const sentinelBodyGap = 50
 
 // resolveCommandsDir returns the directory where slash commands should be
 // written. When global is true it returns ~/.claude/commands; otherwise it
@@ -100,121 +58,31 @@ func resolveCommandsDir(cwd string, global bool) (string, error) {
 	return filepath.Join(cwd, claudeCommandsDir), nil
 }
 
-// resolveAgentsDir returns the directory where sub-agents should be written.
-// When global is true it returns ~/.claude/agents; otherwise it returns
-// <cwd>/.claude/agents.
-func resolveAgentsDir(cwd string, global bool) (string, error) {
-	if global {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return "", fmt.Errorf("cannot determine home directory: %w", err)
-		}
-		return filepath.Join(home, claudeGlobalAgentsDir), nil
-	}
-	return filepath.Join(cwd, claudeAgentsDir), nil
-}
-
-// modelCmd describes one per-model slash command.
-type modelCmd struct {
-	name    string // filename without .md, e.g. "o47-3"
-	model   string // full Anthropic model ID
-	effort  string // low/medium/high/xhigh/max
-	display string // human-readable label for description
-}
-
-// allModelCommands is the canonical list of per-model slash commands.
-var allModelCommands = []modelCmd{
-	// Opus 4.7 — low medium high xhigh max
-	{"o47l", "claude-opus-4-7", "low", "Opus 4.7 (1M) – low"},
-	{"o47m", "claude-opus-4-7", "medium", "Opus 4.7 (1M) – medium"},
-	{"o47h", "claude-opus-4-7", "high", "Opus 4.7 (1M) – high"},
-	{"o47x", "claude-opus-4-7", "xhigh", "Opus 4.7 (1M) – xhigh"},
-	{"o47xx", "claude-opus-4-7", "max", "Opus 4.7 (1M) – max"},
-	// Opus 4.6 — low medium high max (no xhigh)
-	{"o46l", "claude-opus-4-6", "low", "Opus 4.6 (1M) – low"},
-	{"o46m", "claude-opus-4-6", "medium", "Opus 4.6 (1M) – medium"},
-	{"o46h", "claude-opus-4-6", "high", "Opus 4.6 (1M) – high"},
-	{"o46xx", "claude-opus-4-6", "max", "Opus 4.6 (1M) – max"},
-	// Sonnet 4.6 — low medium high max (no xhigh)
-	{"s46l", "claude-sonnet-4-6", "low", "Sonnet 4.6 (200k) – low"},
-	{"s46m", "claude-sonnet-4-6", "medium", "Sonnet 4.6 (200k) – medium"},
-	{"s46h", "claude-sonnet-4-6", "high", "Sonnet 4.6 (200k) – high"},
-	{"s46xx", "claude-sonnet-4-6", "max", "Sonnet 4.6 (200k) – max"},
-	// Sonnet 4.5 — low medium high
-	{"s45l", "claude-sonnet-4-5", "low", "Sonnet 4.5 (200k) – low"},
-	{"s45m", "claude-sonnet-4-5", "medium", "Sonnet 4.5 (200k) – medium"},
-	{"s45h", "claude-sonnet-4-5", "high", "Sonnet 4.5 (200k) – high"},
-	// Haiku 4.5 — low medium high
-	{"h45l", "claude-haiku-4-5", "low", "Haiku 4.5 (200k) – low"},
-	{"h45m", "claude-haiku-4-5", "medium", "Haiku 4.5 (200k) – medium"},
-	{"h45h", "claude-haiku-4-5", "high", "Haiku 4.5 (200k) – high"},
-	// Top-model shortcuts (point to top version of each family)
-	{"ol", "claude-opus-4-8", "low", "Opus (top, 1M) – low"},
-	{"om", "claude-opus-4-8", "medium", "Opus (top, 1M) – medium"},
-	{"oh", "claude-opus-4-8", "high", "Opus (top, 1M) – high"},
-	{"ox", "claude-opus-4-8", "xhigh", "Opus (top, 1M) – xhigh"},
-	{"oxx", "claude-opus-4-8", "max", "Opus (top, 1M) – max"},
-	{"sl", "claude-sonnet-4-6", "low", "Sonnet (top, 200k) – low"},
-	{"sm", "claude-sonnet-4-6", "medium", "Sonnet (top, 200k) – medium"},
-	{"sh", "claude-sonnet-4-6", "high", "Sonnet (top, 200k) – high"},
-	{"sx", "claude-sonnet-4-6", "max", "Sonnet (top, 200k) – max"},
-	{"hl", "claude-haiku-4-5", "low", "Haiku (top, 200k) – low"},
-	{"hm", "claude-haiku-4-5", "medium", "Haiku (top, 200k) – medium"},
-	{"hh", "claude-haiku-4-5", "high", "Haiku (top, 200k) – high"},
-	// Top-model Fable shortcuts
-	{"fl", "claude-fable-5", "low", "Fable (top, 1M) – low"},
-	{"fm", "claude-fable-5", "medium", "Fable (top, 1M) – medium"},
-	{"fh", "claude-fable-5", "high", "Fable (top, 1M) – high"},
-	{"fx", "claude-fable-5", "xhigh", "Fable (top, 1M) – xhigh"},
-	{"fxx", "claude-fable-5", "max", "Fable (top, 1M) – max"},
-}
-
 var claudeInitCmd = &cobra.Command{
 	Use:   "claude-init",
-	Short: "Install /crush and per-model slash-commands locally; strip legacy CLAUDE.md block",
+	Short: "Install the /crush slash-command and strip legacy CLAUDE.md block",
 	Long: `Set up the current workspace (project-local) so an operator can delegate
-tasks to crush or invoke a specific model directly from Claude Code.
+tasks to crush from Claude Code via ` + "`/crush <task>`" + `.
 
-All files are written to ` + "`.claude/commands/`" + ` inside the project directory
-(or --cwd). This is the LOCAL scope — Claude Code also supports a global
-scope at ` + "`~/.claude/commands/`" + `, which this command does NOT touch.
+The slash-command file is written to ` + "`.claude/commands/crush.md`" + ` inside the
+project directory (or --cwd). This is the LOCAL scope — Claude Code also
+supports a global scope at ` + "`~/.claude/commands/`" + ` (use --global).
 
 Concretely:
 
   1. Write ` + "`.claude/commands/crush.md`" + ` — the ` + "`/crush`" + ` delegation command.
      Skipped (with a warning) if the file exists without our sentinel.
 
-  2. Write 36 per-model slash commands (versioned + top-model shortcuts):
-
-       o47l..o47xx  claude-opus-4-7    1M ctx   effort low→max
-       o46l..o46xx  claude-opus-4-6    1M ctx   effort low→max (no xhigh)
-       s46l..s46xx  claude-sonnet-4-6  200k ctx effort low→max (no xhigh)
-       s45l..s45h   claude-sonnet-4-5  200k ctx effort low→high
-       h45l..h45h   claude-haiku-4-5   200k ctx effort low→high
-       ol,om,oh,ox,oxx  claude-opus-4-8    1M ctx   (top opus shortcuts)
-       sl,sm,sh,sx      claude-sonnet-4-6  200k ctx (top sonnet shortcuts)
-       hl,hm,hh         claude-haiku-4-5   200k ctx (top haiku shortcuts)
-       fl,fm,fh,fx,fxx  claude-fable-5     1M ctx   (top fable shortcuts)
-
-     Each passes ` + "`$ARGUMENTS`" + ` straight to the chosen model/effort.
-     Existing files without our sentinel are left alone.
-
-  3. Write 36 per-model sub-agents (a<short-code>.md):
-       ao47l..ao47xx, ao46l..ao46xx, as46l..as46xx, as45l..as45h,
-       ah45l..ah45h, aol..aoxx, asl..asx, ahl..ahh, afl..afxx
-
-     Each mirrors its slash-command twin but runs in an ISOLATED context
-     (fresh 1M/200k window, returns only a summary to the parent chat).
-
-  4. Delete any old-format files (o47-0.md..h45-2.md) that carry our sentinel.
-
-  5. Strip any pre-existing crush-claude-init block from ` + "`CLAUDE.md`" + `
+  2. Strip any pre-existing crush-claude-init block from ` + "`CLAUDE.md`" + `
      (any version v1..vN). If the file becomes empty it is removed.
 
 ` + "`claude-init`" + ` no longer writes anything into ` + "`CLAUDE.md`" + `. Delegation is
-explicit-only — invoke ` + "`/crush <task>`" + ` or ` + "`/o47x <task>`" + ` when you want it.`,
+explicit-only — invoke ` + "`/crush <task>`" + ` when you want it.
+
+For per-model commands, agents and skills, use ` + "`cah install`" + ` from the
+cc-arch-hands repo.`,
 	Example: `
-# Install / refresh all slash-commands in the current workspace (local)
+# Install / refresh the /crush slash-command in the current workspace (local)
 crush claude-init
 
 # Install globally for every project (~/.claude/commands/)
@@ -222,26 +90,11 @@ crush claude-init --global
 
 # Scope to another project
 crush claude-init --cwd /path/to/project
-
-# After init, in Claude Code you can type:
-#   /o47x explain this function          → Opus 4.7 xhigh, same conversation
-#   /s46m fix the lint warnings          → Sonnet 4.6 medium, same conversation
-#   /h45l summarise this file            → Haiku 4.5 low, same conversation
-#   /oh   deep analysis                  → Opus (top) high, same conversation
-#   /fh   autonomous coding task         → Fable 5 high, same conversation
-
-# Slash-commands continue current conversation; sub-agents run in fresh context:
-#   /ao47x analyze codebase, return list → Opus 4.7 xhigh, isolated, returns summary only
-#   /as46m refactor this module          → Sonnet 4.6 medium, isolated, returns summary only
 `,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		global, _ := cmd.Flags().GetBool("global")
 
-		var (
-			cmdDir    string
-			agentsDir string
-			cwd       string
-		)
+		var cmdDir string
 		if global {
 			if cmd.Flags().Changed("cwd") {
 				return fmt.Errorf("--global and --cwd are mutually exclusive")
@@ -251,39 +104,22 @@ crush claude-init --cwd /path/to/project
 			if err != nil {
 				return err
 			}
-			agentsDir, err = resolveAgentsDir("", true)
-			if err != nil {
-				return err
-			}
 		} else {
-			var err error
-			cwd, err = ResolveCwd(cmd)
+			cwd, err := ResolveCwd(cmd)
 			if err != nil {
 				return err
 			}
-			// 1. Strip any legacy crush-claude-init block from CLAUDE.md (local only).
+			// Strip any legacy crush-claude-init block from CLAUDE.md (local only).
 			if err := stripLegacyBlockFromCLAUDEMd(cwd); err != nil {
 				return err
 			}
 			cmdDir = filepath.Join(cwd, claudeCommandsDir)
-			agentsDir = filepath.Join(cwd, claudeAgentsDir)
 		}
 
-		// 2. Install / refresh the /crush slash-command.
+		// Install / refresh the /crush slash-command.
 		if err := writeSlashCommandToDir(cmdDir); err != nil {
 			return fmt.Errorf("slash command: %w", err)
 		}
-
-		// 3. Install / refresh per-model slash commands.
-		if err := writeModelCommandsToDir(cmdDir); err != nil {
-			return fmt.Errorf("model commands: %w", err)
-		}
-
-		// 4. Install / refresh per-model sub-agents.
-		if err := writeModelAgentsToDir(agentsDir); err != nil {
-			return fmt.Errorf("model agents: %w", err)
-		}
-
 		return nil
 	},
 }
@@ -352,160 +188,6 @@ func writeSlashCommandToDir(dir string) error {
 // from the operator.
 func claudeSlashCommandContent() string {
 	return claudeSlashCommandSentinel + "\n" + claudeSlashCommandTemplate
-}
-
-func writeModelCommands(cwd string) error {
-	return writeModelCommandsToDir(filepath.Join(cwd, claudeCommandsDir))
-}
-
-// oldFormatNames lists old-style command file bases (o47-0..h45-2) to clean up.
-var oldFormatNames = func() []string {
-	var names []string
-	for _, pfx := range []string{"o47", "o46", "s46", "s45", "h45"} {
-		max := 4
-		switch pfx {
-		case "s45", "h45":
-			max = 2
-		case "o46", "s46":
-			max = 3
-		}
-		for i := 0; i <= max; i++ {
-			names = append(names, fmt.Sprintf("%s-%d", pfx, i))
-		}
-	}
-	return names
-}()
-
-// removeOldFormatModelCommands deletes old-style command files that carry our sentinel.
-func removeOldFormatModelCommands(dir string) {
-	for _, name := range oldFormatNames {
-		path := filepath.Join(dir, name+".md")
-		data, err := os.ReadFile(path)
-		if err != nil {
-			continue
-		}
-		if strings.Contains(string(data), claudeModelCmdSentinel) {
-			_ = os.Remove(path)
-		}
-	}
-}
-
-// writeModelCommandsToDir installs one <name>.md per entry in allModelCommands
-// into dir. Files we don't own (missing sentinel) are left alone with a warning.
-// Also removes any old-format files (o47-0..h45-2) that carry our sentinel.
-func writeModelCommandsToDir(dir string) error {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("mkdir %s: %w", dir, err)
-	}
-
-	// Remove old-format files left over from previous installs.
-	removeOldFormatModelCommands(dir)
-
-	for _, mc := range allModelCommands {
-		path := filepath.Join(dir, mc.name+".md")
-		if data, err := os.ReadFile(path); err == nil {
-			if !strings.Contains(string(data), claudeModelCmdSentinel) {
-				fmt.Fprintf(os.Stderr, "warning: %s exists but is not ours — skipping\n", path)
-				continue
-			}
-		} else if !os.IsNotExist(err) {
-			return fmt.Errorf("read %s: %w", path, err)
-		}
-		// Frontmatter MUST start on line 1 — a leading comment makes Claude
-		// Code fail to parse it and show that first line as the description.
-		// The visible `description` is kept clean (model + effort). The
-		// ownership sentinel is an HTML comment (inert in the prompt) pushed
-		// FAR below the body so it never surfaces in the command-body preview,
-		// yet is still found by our whole-file Contains() check.
-		content := "---\n" +
-			"description: " + mc.model + " effort=" + mc.effort + "\n" +
-			"model: " + mc.model + "\n" +
-			"effort: " + mc.effort + "\n" +
-			"---\n\n" +
-			"$ARGUMENTS\n" +
-			strings.Repeat("\n", sentinelBodyGap) +
-			claudeModelCmdSentinel + "\n"
-		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-			return fmt.Errorf("write %s: %w", path, err)
-		}
-	}
-	fmt.Fprintf(os.Stderr, "wrote %d model commands to %s\n", len(allModelCommands), dir)
-	return nil
-}
-
-// buildAgentContent returns the body of `.claude/agents/a<name>.md`.
-//
-// The ownership sentinel lives as an HTML comment at the END of the body
-// (not in `description`) so it stays out of the user-visible agent picker /
-// tool listing but is still found by our whole-file Contains() check. An
-// HTML comment is inert in the system prompt itself.
-func buildAgentContent(mc modelCmd) string {
-	return "---\n" +
-		"name: a" + mc.name + "\n" +
-		"description: " + mc.model + " effort=" + mc.effort + " (" + mc.display + ") — delegate task in isolated context\n" +
-		"model: " + mc.model + "\n" +
-		"---\n\n" +
-		"You are a delegated worker invoked with reasoning effort: " + mc.effort + ".\n\n" +
-		"The user passed:\n\n" +
-		"$ARGUMENTS\n\n" +
-		"Do the task autonomously. Return only the final result — no preamble, no recap of steps. If the task is a question, answer it directly. If it's an action, do it and report what changed.\n\n" +
-		agentGitSafetyClause +
-		"\n" + agentTestScopeClause +
-		"\n" + claudeModelAgentSentinel + "\n"
-}
-
-// agentGitSafetyClause is the shared "do not touch shared git state"
-// instruction injected into every delegated-worker agent. Many agents
-// can be active in the same repo at the same time (parallel crush runs,
-// concurrent /agent invocations); a single `git checkout` / `git reset`
-// / `git stash` / `git pull` from one of them silently corrupts the
-// in-progress work of the others. The clause is in English because the
-// agent prompts themselves are in English.
-// agentTestScopeClause tells agents to run only scoped tests, not the
-// full project suite. The orchestrator runs the global suite after all
-// agents finish and re-delegates any failures.
-const agentTestScopeClause = "**Test scope — no global test suites.** Run ONLY tests that directly " +
-	"cover YOUR changes — typically `go test ./path/to/package/...` for the " +
-	"package(s) you modified or created. Do NOT run project-wide test suites " +
-	"(`go test ./...`, `make test`, or equivalent broad commands). The " +
-	"orchestrator will run the full suite after all agents complete their work " +
-	"and will delegate any regressions back to the responsible agent.\n"
-
-const agentGitSafetyClause = "**Git safety — shared workspace.** You are one of several agents that " +
-	"may be working in this repository at the same time. Do NOT run any " +
-	"git command that mutates the working tree, index, refs or remotes — " +
-	"specifically `git checkout`, `git switch`, `git reset`, `git restore`, " +
-	"`git stash`, `git clean`, `git pull`, `git rebase`, `git merge`, " +
-	"`git branch -D/--delete`, `git commit`, `git push`, `git fetch --prune`, " +
-	"`git reflog expire`. Those operations can clobber another agent's " +
-	"in-flight edits or unstaged changes. Read-only inspection is fine " +
-	"(`git status`, `git log`, `git diff`, `git show`, `git branch -v`, " +
-	"`git rev-parse`, `git ls-files`). Only run a mutating git command " +
-	"when the task prompt you were given **explicitly tells you to**.\n"
-
-// writeModelAgentsToDir installs one a<name>.md per entry in allModelCommands
-// into dir. Files we don't own (missing sentinel) are left alone with a warning.
-func writeModelAgentsToDir(dir string) error {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("mkdir %s: %w", dir, err)
-	}
-
-	for _, mc := range allModelCommands {
-		path := filepath.Join(dir, "a"+mc.name+".md")
-		if data, err := os.ReadFile(path); err == nil {
-			if !strings.Contains(string(data), claudeModelAgentSentinel) {
-				fmt.Fprintf(os.Stderr, "warning: %s exists but is not ours — skipping\n", path)
-				continue
-			}
-		} else if !os.IsNotExist(err) {
-			return fmt.Errorf("read %s: %w", path, err)
-		}
-		if err := os.WriteFile(path, []byte(buildAgentContent(mc)), 0o644); err != nil {
-			return fmt.Errorf("write %s: %w", path, err)
-		}
-	}
-	fmt.Fprintf(os.Stderr, "wrote %d model agents to %s\n", len(allModelCommands), dir)
-	return nil
 }
 
 func init() {
