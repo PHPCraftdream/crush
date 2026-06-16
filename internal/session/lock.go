@@ -245,6 +245,42 @@ func ReadLockTimeoutSec(path string) int64 {
 	return t
 }
 
+// LockState describes the inter-process ownership of a session: who holds
+// the lock right now, and how fresh the heartbeat is. Used by the web
+// server's session list to surface "Owned externally by PID N" so a tab
+// opened on a session that's being driven from another process renders
+// read-only.
+type LockState struct {
+	Exists bool          // lock file is present on disk
+	PID    int           // PID written into the lock file (0 if unreadable)
+	Age    time.Duration // time since the last heartbeat touch (mtime)
+	Live   bool          // Age < liveThreshold — a healthy owner is touching it
+}
+
+// InspectSessionLock reads the lock file for `sessionID` under `dataDir`
+// without acquiring it. Safe to call from any process — no side effects.
+// `liveThreshold` defines how fresh the heartbeat must be to count as
+// "live" (callers typically pass 20s — the same expiry the heartbeat
+// loop uses; see TryAcquireSessionLock comments).
+func InspectSessionLock(dataDir, sessionID string, liveThreshold time.Duration) LockState {
+	if dataDir == "" || sessionID == "" {
+		return LockState{}
+	}
+	path := filepath.Join(dataDir, "locks", "session-"+sanitiseSessionID(sessionID)+".lock")
+	st, err := os.Stat(path)
+	if err != nil {
+		return LockState{}
+	}
+	pid := ReadLockPID(path)
+	age := time.Since(st.ModTime())
+	return LockState{
+		Exists: true,
+		PID:    pid,
+		Age:    age,
+		Live:   age < liveThreshold,
+	}
+}
+
 // readLockFile returns (PID, timeoutSec) from a lock file. Both default to 0
 // on any parse error — backward compatible with old one-line files.
 func readLockFile(path string) (int, int64) {

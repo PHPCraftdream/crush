@@ -145,6 +145,10 @@ type Coordinator interface {
 	// turn so the queued message picks up immediately with everything
 	// produced so far retained in history.
 	InterruptAndSend(ctx context.Context, sessionID, prompt string, large, small *ModelOverride, attachments ...message.Attachment) error
+	// InjectMessage persists a user message and, if the session is currently
+	// running, schedules it to be merged into the next provider request
+	// without cancelling the in-flight turn. See SessionAgent.InjectMessage.
+	InjectMessage(ctx context.Context, sessionID, prompt string, attachments ...message.Attachment) (message.Message, error)
 	Summarize(context.Context, string) error
 	SummarizeQueued(sessionID string) bool
 	TakeSummarizeQueue(sessionID string) (fantasy.ProviderOptions, bool)
@@ -1392,6 +1396,18 @@ func (c *coordinator) InterruptAndSend(ctx context.Context, sessionID, prompt st
 	c.currentAgent.QueueMessage(call)
 	c.currentAgent.Cancel(sessionID)
 	return nil
+}
+
+// InjectMessage — see Coordinator interface.
+func (c *coordinator) InjectMessage(ctx context.Context, sessionID, prompt string, attachments ...message.Attachment) (message.Message, error) {
+	if err := c.readyWg.Wait(); err != nil {
+		return message.Message{}, err
+	}
+	call, err := c.buildCall(ctx, sessionID, prompt, attachments)
+	if err != nil {
+		return message.Message{}, err
+	}
+	return c.currentAgent.InjectMessage(ctx, call)
 }
 
 func (c *coordinator) IsBusy() bool {

@@ -145,6 +145,14 @@ type SessionAgent interface {
 	// server: the caller queues, then Cancel()s the running turn, and the
 	// in-flight Run() drains the queue from its cancel-handling branch.
 	QueueMessage(call SessionAgentCall)
+	// InjectMessage persists `call` as a regular user message in the DB
+	// immediately (so the UI sees it the moment the operator clicks Inject)
+	// AND — if the session is currently running — schedules the message to
+	// be appended to `prepared.Messages` at the next PrepareStep boundary so
+	// it lands in the next provider request without a restart. Returns the
+	// persisted message. When the session is NOT busy, the message is just
+	// persisted; the caller can decide whether to start a new Run.
+	InjectMessage(ctx context.Context, call SessionAgentCall) (message.Message, error)
 	// Summarize compresses the session history. If the session is currently
 	// busy the request is queued; call TakeSummarizeQueue after the task
 	// finishes to pick it up.  Returns ErrSummarizeQueued when queued.
@@ -208,6 +216,13 @@ type sessionAgent struct {
 	timeoutHardCap time.Duration
 
 	messageQueue   *csync.Map[string, []SessionAgentCall]
+	// injectQueue holds user messages that were ALREADY persisted to the DB
+	// (visible in the UI immediately) and are waiting to be merged into the
+	// next provider request via PrepareStep. Unlike messageQueue (where the
+	// DB write happens at drain time), injectQueue entries are pre-created
+	// rows from InjectMessage — the drain just adds them to prepared.Messages
+	// so the in-flight Run() sees them without restart. Seamless injection.
+	injectQueue    *csync.Map[string, []message.Message]
 	activeRequests *csync.Map[string, context.CancelFunc]
 	// summarizeQueue holds a pending manual-summarise request per session,
 	// queued while the session was busy.
@@ -271,6 +286,7 @@ func NewSessionAgent(
 		isYolo:                   opts.IsYolo,
 		notify:                   opts.Notify,
 		messageQueue:             csync.NewMap[string, []SessionAgentCall](),
+		injectQueue:              csync.NewMap[string, []message.Message](),
 		activeRequests:           csync.NewMap[string, context.CancelFunc](),
 		summarizeQueue:           csync.NewMap[string, fantasy.ProviderOptions](),
 		streamIdleTimeout:        opts.StreamIdleTimeout,
@@ -630,6 +646,16 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 					return callContext, prepared, createErr
 				}
 				prepared.Messages = append(prepared.Messages, userMessage.ToAIMessage()...)
+			}
+
+			// Drain InjectMessage queue: these rows are ALREADY in the DB
+			// (persisted at click time by InjectMessage), so we only need
+			// to splice them into the current prompt — no second Create
+			// call, no duplicate rows in history.
+			injected, _ := a.injectQueue.Get(call.SessionID)
+			a.injectQueue.Del(call.SessionID)
+			for _, inj := range injected {
+				prepared.Messages = append(prepared.Messages, inj.ToAIMessage()...)
 			}
 
 			// Sliding-window context management: when the context is nearly
@@ -1960,6 +1986,7 @@ func (a *sessionAgent) Cancel(sessionID string) {
 		slog.Debug("Clearing queued prompts", "session_id", sessionID)
 		a.messageQueue.Del(sessionID)
 	}
+	a.injectQueue.Del(sessionID)
 }
 
 func (a *sessionAgent) ClearQueue(sessionID string) {
@@ -1967,11 +1994,29 @@ func (a *sessionAgent) ClearQueue(sessionID string) {
 		slog.Debug("Clearing queued prompts", "session_id", sessionID)
 		a.messageQueue.Del(sessionID)
 	}
+	a.injectQueue.Del(sessionID)
 }
 
 func (a *sessionAgent) QueueMessage(call SessionAgentCall) {
 	existing, _ := a.messageQueue.Get(call.SessionID)
 	a.messageQueue.Set(call.SessionID, append(existing, call))
+}
+
+// InjectMessage — see SessionAgent interface comment. Persists immediately
+// (UI updates via the same pubsub path that handleSendMessage uses) and, if
+// the session is currently running, latches the persisted row into
+// injectQueue so the next PrepareStep dredges it into prepared.Messages
+// without duplicating the DB write.
+func (a *sessionAgent) InjectMessage(ctx context.Context, call SessionAgentCall) (message.Message, error) {
+	msg, err := a.createUserMessage(ctx, call)
+	if err != nil {
+		return message.Message{}, err
+	}
+	if a.IsSessionBusy(call.SessionID) {
+		existing, _ := a.injectQueue.Get(call.SessionID)
+		a.injectQueue.Set(call.SessionID, append(existing, msg))
+	}
+	return msg, nil
 }
 
 func (a *sessionAgent) CancelAll() {

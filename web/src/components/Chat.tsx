@@ -235,12 +235,17 @@ function buildRenderItems(messages: Msg[]): RenderItem[] {
 }
 
 function ToolRun({ parts, firstMsgID, sessionID, isLive, isCurrent }: { parts: ContentPart[]; firstMsgID: string; sessionID: string; isLive: boolean; isCurrent: boolean }) {
+  const messages = useStore($messages);
   // ToolActivityGroup pairs call↔result by ToolCallID — no further prep
   // needed here, just give each part a stable index for its key.
   const items = useMemo(
     () => parts.map((part, idx) => ({ part, idx })),
     [parts]
   );
+  const startedAt = useMemo(() => {
+    if (!firstMsgID) return undefined;
+    return messages.find((m) => m.ID === firstMsgID)?.CreatedAt;
+  }, [messages, firstMsgID]);
   return (
     <div
       id={firstMsgID ? `msg-${firstMsgID}` : undefined}
@@ -250,7 +255,7 @@ function ToolRun({ parts, firstMsgID, sessionID, isLive, isCurrent }: { parts: C
       title={`${parts.length} tool parts grouped across messages`}
     >
       <div className="w-full min-w-0">
-        <ToolActivityGroup items={items} live={isLive} isCurrent={isCurrent} />
+        <ToolActivityGroup items={items} live={isLive} isCurrent={isCurrent} startedAt={startedAt} />
       </div>
     </div>
   );

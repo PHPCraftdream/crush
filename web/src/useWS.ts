@@ -117,6 +117,19 @@ export function useWS() {
         const sessions = (msg.payload as Session[]) ?? [];
         setSessions(sessions);
 
+        // Foreign-owned active session: kick a load_messages refresh on
+        // every sessions_list poll too. This guarantees we never sit
+        // longer than the sessions poll interval (5s) without a fresh
+        // history read, in case the dedicated 1.5s messages poll
+        // missed a window during a pause.
+        const activeID0 = $activeSessionID.get();
+        if (activeID0) {
+          const a = sessions.find((s) => s.ID === activeID0);
+          if (a && a.OwnedExternal) {
+            ws.send("load_messages", { sessionID: activeID0 });
+          }
+        }
+
         for (const s of sessions) {
           if (s.ParentSessionID) {
             registerSubAgentSession(s.ID, s.ParentSessionID);
@@ -193,11 +206,32 @@ export function useWS() {
         removeMessage(m.ID);
       }),
       ws.on("messages_list", (msg: WSMessage) => {
-        const msgs = (msg.payload as Message[]) ?? [];
-        if (msgs.length > 0 && isSubAgentSession(msgs[0].SessionID)) {
-          setSubAgentMessages(msgs[0].SessionID, msgs);
+        // New envelope: { SessionID, Messages }. Old shape (raw array) is
+        // kept as a fallback for back-compat with cached frontends, but the
+        // backend now always wraps so we can route empty replies safely —
+        // a lazy load_messages for an empty sub-agent session must NOT
+        // overwrite the active main session's messages.
+        const payload = msg.payload as
+          | { SessionID?: string; Messages?: Message[] }
+          | Message[]
+          | undefined;
+        let sid: string | undefined;
+        let msgs: Message[] = [];
+        if (Array.isArray(payload)) {
+          msgs = payload;
+          sid = msgs[0]?.SessionID;
+        } else if (payload) {
+          msgs = payload.Messages ?? [];
+          sid = payload.SessionID ?? msgs[0]?.SessionID;
+        }
+        if (sid && isSubAgentSession(sid)) {
+          setSubAgentMessages(sid, msgs);
           return;
         }
+        // For the main chat: only apply if it's for the currently active
+        // session (we might have polled in flight and the user switched).
+        const activeID = $activeSessionID.get();
+        if (sid && activeID && sid !== activeID) return;
         setMessages(msgs);
       }),
 
@@ -302,8 +336,59 @@ export function useWS() {
       }),
     ];
 
+    // Visibility-gated polling. When the tab is hidden we let the WS
+    // pubsub do its thing without any extra requests. When the tab is
+    // visible:
+    //   - poll sessions_list every 5s — keeps the sidebar fresh (titles,
+    //     ownership, message counts) even when another crush process
+    //     drives a session on the same .crush/.
+    //   - if the active session is externally owned (another process
+    //     holds the lock — OwnedExternal: true), poll its messages_list
+    //     every 1.5s so the conversation streams visibly without going
+    //     through that other process's in-memory pubsub.
+    // On visibilitychange we tear down both intervals together, then
+    // rebuild them and do an immediate fire when the tab comes back.
+    let listInterval: number | undefined;
+    let messagesInterval: number | undefined;
+
+    const SESSIONS_POLL_MS = 5000;
+    const FOLLOW_MESSAGES_POLL_MS = 1500;
+
+    const stopPolling = () => {
+      if (listInterval !== undefined) { clearInterval(listInterval); listInterval = undefined; }
+      if (messagesInterval !== undefined) { clearInterval(messagesInterval); messagesInterval = undefined; }
+    };
+
+    const pollMessagesIfFollowed = () => {
+      const id = $activeSessionID.get();
+      if (!id) return;
+      const sess = $sessions.get().find((s) => s.ID === id);
+      if (!sess || !sess.OwnedExternal) return;
+      ws.send("load_messages", { sessionID: id });
+    };
+
+    const startPolling = () => {
+      stopPolling();
+      // Immediate refresh on tab focus so the user doesn't sit through
+      // a full interval before the first update lands.
+      ws.send("list_sessions");
+      pollMessagesIfFollowed();
+      listInterval = window.setInterval(() => ws.send("list_sessions"), SESSIONS_POLL_MS);
+      messagesInterval = window.setInterval(pollMessagesIfFollowed, FOLLOW_MESSAGES_POLL_MS);
+    };
+
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") startPolling();
+      else stopPolling();
+    };
+
+    document.addEventListener("visibilitychange", onVisibility);
+    if (document.visibilityState === "visible") startPolling();
+
     return () => {
       window.removeEventListener("hashchange", onHashChange);
+      document.removeEventListener("visibilitychange", onVisibility);
+      stopPolling();
       offs.forEach((off) => off());
       ws.disconnect();
     };

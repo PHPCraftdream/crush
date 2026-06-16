@@ -15,6 +15,7 @@ import {
   getDefaultModelKey,
 } from "../store";
 import { ModelSelector, buildModelList } from "./ModelSelector";
+import { StatusBar } from "./StatusBar";
 import { LogsModal } from "./LogsModal";
 import { MCPSettings } from "./MCPSettings";
 import { SettingsModal } from "./SettingsModal";
@@ -176,8 +177,44 @@ export function ChatToolbar() {
   }, [effectiveLargeKey, allModels]);
 
   const contextPct = contextWindow > 0 ? Math.min(100, Math.round((totalTokens / contextWindow) * 100)) : null;
+  // Read-only follow mode: another live crush process holds this session's
+  // lock. The toolbar still renders so the operator can see the token
+  // counter, status, etc., but every mutation control collapses to a
+  // single inline notice so we don't fight the foreign agent.
+  const foreignOwned = !!activeSession?.OwnedExternal;
 
   if (!activeSessionID) return null;
+
+  if (foreignOwned) {
+    return (
+      <div className="px-5 pt-3 pb-1 border-t border-surface bg-canvas shrink-0 flex items-center gap-2 flex-wrap">
+        {activeSession && totalTokens > 0 && (
+          <span
+            data-test-id="header-token-indicator"
+            className="text-sm font-medium text-text-subtle bg-base-overlay border border-surface rounded-xl px-3.5 py-2 flex items-center gap-1.5"
+            title={`${totalTokens.toLocaleString()} tokens`}
+          >
+            {formatTokens(totalTokens)}
+            {contextPct !== null && (
+              <span className={`font-semibold ${pctColor(contextPct)}`}>{contextPct}%</span>
+            )}
+          </span>
+        )}
+        {isBusy && (
+          <div className="flex items-center gap-2 animate-pulse-dots px-2" title={activeLargeModelName ? `Running ${activeLargeModelName}…` : "Agent is working…"}>
+            {activeLargeModelName && (
+              <span className="text-xs text-text-subtle font-medium">{activeLargeModelName}</span>
+            )}
+            <span className="w-2 h-2 rounded-full bg-accent inline-block" />
+            <span className="w-2 h-2 rounded-full bg-accent inline-block" />
+            <span className="w-2 h-2 rounded-full bg-accent inline-block" />
+          </div>
+        )}
+        <div className="flex-1" />
+        <StatusBar inline />
+      </div>
+    );
+  }
 
   return (
     <>

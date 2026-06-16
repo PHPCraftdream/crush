@@ -31,6 +31,13 @@ export interface Session {
 
   SystemPrompt: string;
   YoloEnabled: boolean;
+
+  // Set by the server when another live crush process holds the session
+  // lock (heartbeat fresher than ~20s). When true, the UI flips the
+  // session into a read-only "follow" mode: input disabled, controls
+  // hidden, banner shown, polling drives live updates instead of pubsub.
+  OwnedExternal?: boolean;
+  OwnedByPID?: number;
 }
 
 export type MessageRole = "user" | "assistant" | "tool" | "system";

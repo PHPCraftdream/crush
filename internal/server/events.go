@@ -36,9 +36,13 @@ func subscribeAndBroadcast(ctx context.Context, a *appPkg.App, h *Hub) {
 				}
 				switch ev.Type {
 				case pubsub.CreatedEvent:
-					h.Broadcast(EventSessionCreated, ev.Payload)
+					sess := ev.Payload
+					AnnotateSessionExternalOwnership(a, &sess)
+					h.Broadcast(EventSessionCreated, sess)
 				case pubsub.UpdatedEvent:
-					h.Broadcast(EventSessionUpdated, ev.Payload)
+					sess := ev.Payload
+					AnnotateSessionExternalOwnership(a, &sess)
+					h.Broadcast(EventSessionUpdated, sess)
 				case pubsub.DeletedEvent:
 					h.Broadcast(EventSessionDeleted, ev.Payload)
 				}

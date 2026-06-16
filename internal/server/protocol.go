@@ -43,6 +43,7 @@ const (
 const (
 	CmdSendMessage               = "send_message"
 	CmdInterruptAndSend          = "interrupt_and_send"
+	CmdInjectMessage             = "inject_message"
 	CmdCancelAgent               = "cancel_agent"
 	CmdCreateSession             = "create_session"
 	CmdForkSession               = "fork_session"

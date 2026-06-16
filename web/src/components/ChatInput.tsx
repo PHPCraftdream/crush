@@ -3,6 +3,7 @@ import { useStore } from "@nanostores/react";
 import {
   $activeSessionID,
   $busySessions,
+  $sessions,
   $skills,
   $lastUsedSkill,
   $myPrompts,
@@ -13,7 +14,7 @@ import {
   jumpToMessage,
 } from "../store";
 import { ws } from "../ws";
-import { ListOrdered, Send, SendHorizonal, Paperclip, X, Zap, History, CornerLeftUp } from "lucide-react";
+import { ListOrdered, Send, SendHorizonal, Paperclip, X, Zap, History, CornerLeftUp, PlusCircle } from "lucide-react";
 import type { SkillInfo } from "../types";
 import type { MyPromptItem } from "../store";
 
@@ -199,6 +200,16 @@ export function ChatInput() {
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
   const activeSessionID = useStore($activeSessionID);
   const busySessions = useStore($busySessions);
+  const sessions = useStore($sessions);
+  const activeSession = useMemo(
+    () => sessions.find((s) => s.ID === activeSessionID) ?? null,
+    [sessions, activeSessionID],
+  );
+  // Foreign-owned: another live crush process holds the session lock.
+  // We can read the conversation but can't drive it — the input row and
+  // all action buttons are replaced by a read-only banner.
+  const foreignOwned = !!activeSession?.OwnedExternal;
+  const ownerPID = activeSession?.OwnedByPID ?? 0;
   const skills = useStore($skills);
   const lastUsedSkill = useStore($lastUsedSkill);
   const myPrompts = useStore($myPrompts);
@@ -353,6 +364,38 @@ export function ChatInput() {
       }));
     }
     ws.send("interrupt_and_send", payload);
+    setText("");
+    setAttachments([]);
+    setHistIdx(-1);
+    setStash("");
+    setHistoryOpen(false);
+    if (textareaRef.current) textareaRef.current.style.height = "auto";
+  }, [text, activeSessionID, attachments]);
+
+  // Inject the new message into the running turn WITHOUT cancelling it.
+  // Backend persists the user message to the DB immediately (UI updates via
+  // the same pubsub path as a regular send_message) and schedules it to be
+  // appended to prepared.Messages at the next PrepareStep — so the model
+  // sees it on its next provider request inside the SAME Run(). Anything in
+  // the front-end local queue is folded in so we don't race.
+  const inject = useCallback(() => {
+    if (!activeSessionID) return;
+    const queued = dequeueAllMessages(activeSessionID);
+    const parts: string[] = [];
+    if (queued) parts.push(queued);
+    const msg = text.trim();
+    if (msg) parts.push(msg);
+    const content = parts.join("\n\n");
+    if (!content) return;
+    const payload: Record<string, unknown> = { sessionID: activeSessionID, content };
+    if (attachments.length > 0) {
+      payload.attachments = attachments.map((a) => ({
+        fileName: a.fileName,
+        mimeType: a.mimeType,
+        data: a.data,
+      }));
+    }
+    ws.send("inject_message", payload);
     setText("");
     setAttachments([]);
     setHistIdx(-1);
@@ -569,6 +612,24 @@ export function ChatInput() {
       : "Message… (/ for skills, Enter to send)"
     : "Select or create a session";
 
+  if (foreignOwned) {
+    return (
+      <div className="px-5 pt-2 pb-4 bg-canvas shrink-0">
+        <div
+          data-test-id="chat-input-foreign-owned-banner"
+          className="rounded-xl border border-yellow/40 bg-yellow/10 text-yellow px-4 py-3 text-sm flex items-center gap-2"
+          title="Read-only follow mode. Another live crush process holds the session lock — this tab polls the database for updates instead of driving the agent."
+        >
+          <Zap size={14} className="shrink-0" />
+          <span>
+            Read-only follow mode — session is driven by another crush process
+            {ownerPID > 0 ? ` (PID ${ownerPID})` : ""}.
+          </span>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="px-5 pt-2 pb-4 bg-canvas shrink-0">
       {/* Attachment badges */}
@@ -684,6 +745,18 @@ export function ChatInput() {
               >
                 <Zap size={15} />
                 Interrupt
+              </button>
+            )}
+            {agentBusy && (
+              <button
+                onClick={inject}
+                disabled={!canSend}
+                data-test-id="chat-input-inject-button"
+                title="Inject this message into the running turn without cancelling. The agent sees it in the next provider request inside the same Run()."
+                className="font-bold rounded-xl px-4 py-2.5 text-sm disabled:opacity-30 active:scale-95 transition-all shadow-sm flex items-center gap-2 bg-green/15 border border-green/40 text-green hover:bg-green/25"
+              >
+                <PlusCircle size={15} />
+                Inject
               </button>
             )}
             <button

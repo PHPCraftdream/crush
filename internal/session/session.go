@@ -75,6 +75,13 @@ type Session struct {
 	BudgetMaxCost    float64 // --max-cost value, 0 if unlimited
 	BudgetMaxTokens  int64   // --max-tokens value, 0 if unlimited
 	BudgetTimeoutSec int64   // --timeout in seconds, 0 if unlimited
+
+	// Wire-only fields filled by the web server when sending Session over WS;
+	// NOT persisted to SQLite. Together they answer "is this session being
+	// driven by another live process right now?" so the web UI can render
+	// foreign sessions read-only with a "Followed: PID N" banner.
+	OwnedExternal bool `json:",omitempty"` // a different live process holds the lock
+	OwnedByPID    int  `json:",omitempty"` // PID of the lock holder, 0 if free / stale
 }
 
 type Service interface {

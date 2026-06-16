@@ -43,6 +43,8 @@ func handleIncoming(ctx context.Context, a *appPkg.App, c *Client, raw []byte) {
 		go handleSendMessage(ctx, a, c, msg)
 	case CmdInterruptAndSend:
 		go handleInterruptAndSend(ctx, a, c, msg)
+	case CmdInjectMessage:
+		go handleInjectMessage(ctx, a, c, msg)
 	case CmdCancelAgent:
 		go handleCancelAgent(ctx, a, c, msg)
 	case CmdCreateSession:
@@ -335,6 +337,50 @@ func handleInterruptAndSend(ctx context.Context, a *appPkg.App, c *Client, msg W
 	c.reply(msg.ID, EventResponse, map[string]string{"status": "queued"}, "")
 }
 
+// handleInjectMessage persists a user message to the session DB right now
+// (so the UI shows it instantly) and — if the session is busy — schedules
+// the same message to be merged into the next provider request without
+// cancelling the in-flight turn. See SessionAgent.InjectMessage for the
+// drain-at-PrepareStep mechanism.
+func handleInjectMessage(ctx context.Context, a *appPkg.App, c *Client, msg WSMessage) {
+	var p SendMessagePayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		c.reply(msg.ID, EventError, nil, "invalid payload")
+		return
+	}
+
+	slog.Info("ws: handleInjectMessage", "sessionID", p.SessionID, "content", p.Content, "attachments", len(p.Attachments))
+
+	if a.AgentCoordinator == nil {
+		c.reply(msg.ID, EventError, nil, "agent not configured")
+		return
+	}
+
+	// Same attachments path as handleSendMessage.
+	var attachments []message.Attachment
+	for _, att := range p.Attachments {
+		savedPath, saveErr := saveAttachmentToDisk(a.Store().WorkingDir(), att.FileName, att.Data)
+		if saveErr != nil {
+			slog.Warn("ws: failed to save attachment to disk", "err", saveErr)
+		} else {
+			p.Content += "\n[Attached file: " + savedPath + "]"
+		}
+		attachments = append(attachments, message.Attachment{
+			FileName: att.FileName,
+			MimeType: att.MimeType,
+			Content:  att.Data,
+		})
+	}
+
+	agentCtx := context.WithoutCancel(ctx)
+	if _, err := a.AgentCoordinator.InjectMessage(agentCtx, p.SessionID, p.Content, attachments...); err != nil {
+		slog.Error("ws: inject-message failed", "err", err)
+		c.reply(msg.ID, EventError, nil, err.Error())
+		return
+	}
+	c.reply(msg.ID, EventResponse, map[string]string{"status": "injected"}, "")
+}
+
 func handleSetSessionModels(ctx context.Context, a *appPkg.App, c *Client, msg WSMessage) {
 	var p SetSessionModelsPayload
 	if err := json.Unmarshal(msg.Payload, &p); err != nil {
@@ -618,6 +664,64 @@ func handleDeleteSession(ctx context.Context, a *appPkg.App, c *Client, msg WSMe
 	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
 }
 
+// externalOwnerLiveThreshold mirrors the heartbeat expiry used by the lock
+// acquisition path: a lock whose mtime is fresher than this is treated as a
+// live external owner. The lock-renewer touches the file every ~10s, so 20s
+// gives one missed tick of slack without flipping foreign-owned sessions
+// in and out of read-only mode.
+const externalOwnerLiveThreshold = 20 * time.Second
+
+// annotateExternalOwnership fills OwnedExternal/OwnedByPID for every session
+// in the slice. Only flags sessions whose live lock holder is a DIFFERENT
+// process — sessions held by us are owned-but-not-external (the UI keeps
+// full controls). Sessions with no lock or only a stale lock are left clean.
+func annotateExternalOwnership(a *appPkg.App, sessions []session.Session) {
+	dataDir := externalOwnershipDataDir(a)
+	if dataDir == "" {
+		return
+	}
+	self := os.Getpid()
+	for i := range sessions {
+		st := session.InspectSessionLock(dataDir, sessions[i].ID, externalOwnerLiveThreshold)
+		if !st.Live || st.PID == 0 || st.PID == self {
+			continue
+		}
+		sessions[i].OwnedExternal = true
+		sessions[i].OwnedByPID = st.PID
+	}
+}
+
+// AnnotateSessionExternalOwnership is the single-session variant used by the
+// session pubsub bridge in events.go and by every handler that broadcasts a
+// fresh Session payload over WS. Exported so events.go can reach it without
+// duplicating the lock-inspection logic.
+func AnnotateSessionExternalOwnership(a *appPkg.App, s *session.Session) {
+	if s == nil {
+		return
+	}
+	dataDir := externalOwnershipDataDir(a)
+	if dataDir == "" {
+		return
+	}
+	self := os.Getpid()
+	st := session.InspectSessionLock(dataDir, s.ID, externalOwnerLiveThreshold)
+	if !st.Live || st.PID == 0 || st.PID == self {
+		s.OwnedExternal = false
+		s.OwnedByPID = 0
+		return
+	}
+	s.OwnedExternal = true
+	s.OwnedByPID = st.PID
+}
+
+func externalOwnershipDataDir(a *appPkg.App) string {
+	cfg := a.Config()
+	if cfg == nil || cfg.Options == nil {
+		return ""
+	}
+	return cfg.Options.DataDirectory
+}
+
 func handleListSessions(ctx context.Context, a *appPkg.App, c *Client, msg WSMessage) {
 	sessions, err := a.Sessions.List(ctx)
 	if err != nil {
@@ -627,6 +731,7 @@ func handleListSessions(ctx context.Context, a *appPkg.App, c *Client, msg WSMes
 	if sessions == nil {
 		sessions = []session.Session{}
 	}
+	annotateExternalOwnership(a, sessions)
 	c.reply(msg.ID, EventSessionsList, sessions, "")
 
 	// Correct any stale agent_busy state in the replay buffer by sending the
@@ -654,7 +759,15 @@ func handleLoadMessages(ctx context.Context, a *appPkg.App, c *Client, msg WSMes
 	if msgs == nil {
 		msgs = []message.Message{}
 	}
-	c.reply(msg.ID, EventMessagesList, toMessagesWire(msgs), "")
+	// Wrap with the source sessionID so the frontend can route even an
+	// EMPTY list to the right store (sub-agent vs main session). Without
+	// this, a lazy load_messages for a sub-agent session that's still empty
+	// returns [], and the frontend can't tell whether to clear the active
+	// chat or the sub-agent buffer — it would blindly clear the active.
+	c.reply(msg.ID, EventMessagesList, map[string]any{
+		"SessionID": p.SessionID,
+		"Messages":  toMessagesWire(msgs),
+	}, "")
 }
 
 func handleGrantPermission(a *appPkg.App, c *Client, msg WSMessage, persistent bool) {

@@ -31,6 +31,53 @@ function formatDuration(s: number) {
   return `${Math.floor(s / 60)}m ${Math.floor(s % 60)}s`;
 }
 
+// formatEventTime returns "HH:MM:SS" in the operator's local timezone
+// (Intl picks the system TZ automatically). The value is shown next to
+// every event header — message, tool group, tool row, thinking row — so
+// the operator can correlate the chat against logs / external runs.
+// Epoch seconds; we keep 1s precision intentionally (matches the int64
+// column in SQLite).
+function formatEventTime(epochSec: number | undefined): string {
+  if (!epochSec || epochSec <= 0) return "";
+  const d = new Date(epochSec * 1000);
+  // Force 24h + seconds; locale may otherwise drop seconds in toLocaleTimeString.
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mm = String(d.getMinutes()).padStart(2, "0");
+  const ss = String(d.getSeconds()).padStart(2, "0");
+  return `${hh}:${mm}:${ss}`;
+}
+
+// formatEventDateTime — for tooltips: full local "YYYY-MM-DD HH:MM:SS".
+function formatEventDateTime(epochSec: number | undefined): string {
+  if (!epochSec || epochSec <= 0) return "";
+  const d = new Date(epochSec * 1000);
+  const yyyy = d.getFullYear();
+  const mo = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mm = String(d.getMinutes()).padStart(2, "0");
+  const ss = String(d.getSeconds()).padStart(2, "0");
+  const tz = -d.getTimezoneOffset();
+  const tzSign = tz >= 0 ? "+" : "-";
+  const tzAbs = Math.abs(tz);
+  const tzH = String(Math.floor(tzAbs / 60)).padStart(2, "0");
+  const tzM = String(tzAbs % 60).padStart(2, "0");
+  return `${yyyy}-${mo}-${dd} ${hh}:${mm}:${ss} UTC${tzSign}${tzH}:${tzM}`;
+}
+
+const TimeBadge = memo(function TimeBadge({ epochSec }: { epochSec: number | undefined }) {
+  const text = formatEventTime(epochSec);
+  if (!text) return null;
+  return (
+    <span
+      className="text-xs text-text-subtle font-mono tabular-nums"
+      title={formatEventDateTime(epochSec)}
+    >
+      {text}
+    </span>
+  );
+});
+
 function extractText(parts: ContentPart[]) {
   return parts.filter(p => p.type === "text").map(p => (p as any).Text).join("\n");
 }
@@ -168,6 +215,7 @@ const AssistantHoverActions = memo(function AssistantHoverActions({
         <button onClick={onDelete}  title="Delete"       className="btn-icon-danger"><Trash2 size={13} /></button>
       </div>
       <div className="flex items-center gap-2 ml-auto">
+        <TimeBadge epochSec={message.CreatedAt} />
         <DurationBadge message={message} />
         {message.Model && (
           <span className="text-xs text-text-subtle font-mono flex items-center gap-1">
@@ -481,9 +529,13 @@ interface ToolActivityGroupProps {
   // (i.e. nothing rendered after it). When false, the auto-rule collapses
   // the group — the user moved on, the work is in the past.
   isCurrent: boolean;
+  // Epoch-seconds timestamp of the first message that contributed to this
+  // burst. Shown as a "HH:MM:SS" badge in the group header so the operator
+  // can correlate the activity with logs.
+  startedAt?: number;
 }
 
-export const ToolActivityGroup = memo(function ToolActivityGroup({ items, live, isCurrent }: ToolActivityGroupProps) {
+export const ToolActivityGroup = memo(function ToolActivityGroup({ items, live, isCurrent, startedAt }: ToolActivityGroupProps) {
   // Group open/close state machine.
   //
   // The default collapsed state follows `isCurrent`: the most recent group
@@ -505,7 +557,23 @@ export const ToolActivityGroup = memo(function ToolActivityGroup({ items, live, 
   // "сворачивание идёт с уничтожением контента" verbatim.
   const [collapsedOverride, setCollapsedOverride] = useState<boolean | undefined>(undefined);
   const [suppressAuto, setSuppressAuto] = useState(false);
-  const autoCollapsed = !isCurrent;
+  // Sticky-current latch. While the session is `live` (busy), buildRenderItems
+  // can flicker isCurrent off for a frame whenever a streaming assistant
+  // message is briefly tool-less (thinking-only). Letting that flicker
+  // collapse the container would unmount its body and lose all per-row
+  // pins/state. So:
+  //   - isCurrent === true  → latch to true.
+  //   - isCurrent === false AND live === true → keep prior latch value.
+  //   - isCurrent === false AND live === false → release latch (true → false).
+  // Once the agent finishes (live = false) the natural !isCurrent auto-collapse
+  // kicks in again and old groups fold.
+  const [stickyCurrent, setStickyCurrent] = useState(isCurrent);
+  useEffect(() => {
+    if (isCurrent) setStickyCurrent(true);
+    else if (!live) setStickyCurrent(false);
+  }, [isCurrent, live]);
+  const effectiveCurrent = stickyCurrent;
+  const autoCollapsed = !effectiveCurrent;
   const collapsed = collapsedOverride ?? autoCollapsed;
 
   const prevItemsLen = useRef(items.length);
@@ -626,6 +694,7 @@ export const ToolActivityGroup = memo(function ToolActivityGroup({ items, live, 
         </span>
         {tally && <span className="text-text-subtle text-xs truncate flex-1 min-w-0">{tally}</span>}
         {!tally && <span className="flex-1" />}
+        <TimeBadge epochSec={startedAt} />
         {live && <span className="text-text-subtle text-xs animate-pulse shrink-0">live</span>}
         <span className="text-text-subtle shrink-0">
           {collapsed ? <ChevronDown size={16} /> : <ChevronUp size={16} />}
@@ -642,6 +711,19 @@ export const ToolActivityGroup = memo(function ToolActivityGroup({ items, live, 
             />
           ))}
           {renderAgents()}
+          {/* Sticky bottom collapse strip, same affordance as ThinkingPart:
+              long tool bursts are tedious to fold when the toggle is only
+              at the top. Reuses the .thinking-collapse-bottom style. */}
+          <button
+            type="button"
+            onClick={toggle}
+            data-test-id="tool-activity-collapse-bottom"
+            className="thinking-collapse-bottom"
+            title="Collapse actions"
+          >
+            <ChevronUp size={14} />
+            <span>Collapse actions</span>
+          </button>
         </div>
       )}
     </div>
