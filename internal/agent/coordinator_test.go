@@ -44,6 +44,7 @@ func (m *mockSessionAgent) ClearQueue(sessionID string)                 {}
 func (m *mockSessionAgent) QueueMessage(call SessionAgentCall) {
 	m.queuedCalls = append(m.queuedCalls, call)
 }
+
 func (m *mockSessionAgent) InjectMessage(_ context.Context, call SessionAgentCall) (message.Message, error) {
 	m.queuedCalls = append(m.queuedCalls, call)
 	return message.Message{SessionID: call.SessionID}, nil

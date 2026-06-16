@@ -215,7 +215,7 @@ type sessionAgent struct {
 	// Fork patch: batch 8.
 	timeoutHardCap time.Duration
 
-	messageQueue   *csync.Map[string, []SessionAgentCall]
+	messageQueue *csync.Map[string, []SessionAgentCall]
 	// injectQueue holds user messages that were ALREADY persisted to the DB
 	// (visible in the UI immediately) and are waiting to be merged into the
 	// next provider request via PrepareStep. Unlike messageQueue (where the
