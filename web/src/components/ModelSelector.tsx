@@ -16,8 +16,33 @@ import {
 import type { ConfigPayload, Session } from "../types";
 
 // Effort levels in cycle order: left arrow decrements, right arrow increments
-const EFFORT_LEVELS = ["low", "medium", "high", "max"] as const;
-const EFFORT_LABELS: Record<string, string> = { low: "L", medium: "M", high: "H", max: "X" };
+// Five effort tiers — same names the Claude CLI accepts on `--effort`
+// (and what `defaultEffortLevels` in internal/cmd/models_effort.go ships).
+// Labels mirror our short-code convention: oh / ox / oxx → high / xhigh / max.
+const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
+const EFFORT_LABELS: Record<string, string> = {
+  low: "L",
+  medium: "M",
+  high: "H",
+  xhigh: "X",
+  max: "XX",
+};
+
+// z.ai GLM-5.x only exposes High / Max natively (see docs.z.ai/devpack/
+// latest-model and the MarkTechPost launch coverage). The chevron selector
+// cycles through just these two; the backend mirrors them onto the
+// provider's reasoning_effort field.
+const EFFORT_LEVELS_ZAI = ["high", "max"] as const;
+
+// Returns true for any GLM-5.x model regardless of which provider key
+// it lives under — users sometimes wire z.ai via a custom OpenAI-compat
+// provider (id "z-ai" / "zhipu" / etc.), so matching the model id is
+// the robust signal. The "[1m]" suffix variant (glm-5.2[1m]) is also
+// covered. Older GLM-4.x families fall through to the binary thinking
+// on/off in the coordinator and don't get the selector.
+function isZAIReasoningModel(_provider: string, model: string): boolean {
+  return /^glm-5(\.|-|\[|$)/i.test(model);
+}
 
 // Returns true if the model is a CLI Claude model (supports reasoning_effort)
 function isCLIClaudeModel(provider: string, model: string): boolean {
@@ -208,18 +233,28 @@ export function ModelSelector({ session, modelType }: { session: Session | null;
   const currentProvider = currentEntry?.providerID ?? "";
   const currentModelID = currentEntry?.modelID ?? "";
   const isCLIClaudeModelFlag = isCLIClaudeModel(currentProvider, currentModelID);
-  let currentEffort = "medium";
+  const isZAIReasoningFlag = isZAIReasoningModel(currentProvider, currentModelID);
+  const effortLevels: readonly string[] = isZAIReasoningFlag ? EFFORT_LEVELS_ZAI : EFFORT_LEVELS;
+  // Default: Claude CLI keeps the legacy "medium"; z.ai GLM-5.x defaults
+  // to "high" (Max is opt-in for heavy work — same wording z.ai uses).
+  let currentEffort = isZAIReasoningFlag ? "high" : "medium";
   if (session) {
     const effort = modelType === "large" ? session.LargeModelReasoningEffort : session.SmallModelReasoningEffort;
     if (effort) currentEffort = effort;
   }
+  const showEffortPicker = isCLIClaudeModelFlag || isZAIReasoningFlag;
 
   function cycleEffort(direction: 1 | -1) {
-    if (!session || !isCLIClaudeModelFlag) return;
-    const idx = EFFORT_LEVELS.indexOf(currentEffort as typeof EFFORT_LEVELS[number]);
-    if (idx === -1) return;
-    const newIdx = (idx + direction + EFFORT_LEVELS.length) % EFFORT_LEVELS.length;
-    const newEffort = EFFORT_LEVELS[newIdx];
+    if (!session || !showEffortPicker) return;
+    let idx = effortLevels.indexOf(currentEffort);
+    if (idx === -1) {
+      // Picked a value the current selector doesn't own (e.g. switched
+      // model from Claude → GLM and "medium" isn't in the z.ai set).
+      // Reset to the first level so the chevron behaves predictably.
+      idx = 0;
+    }
+    const newIdx = (idx + direction + effortLevels.length) % effortLevels.length;
+    const newEffort = effortLevels[newIdx];
     setSessionReasoningEffort(
       session.ID,
       modelType === "large" ? newEffort : null,
@@ -310,7 +345,7 @@ export function ModelSelector({ session, modelType }: { session: Session | null;
       >
         <Icon size={12} className="shrink-0" />
         <span className="font-medium truncate max-w-[180px]">{displayName}</span>
-        {isCLIClaudeModelFlag && (
+        {showEffortPicker && (
           <div
             className="flex items-center gap-0.5 shrink-0 ml-1"
             onClick={e => e.stopPropagation()}

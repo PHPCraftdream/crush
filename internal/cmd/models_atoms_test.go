@@ -21,7 +21,11 @@ func TestParseAtom_AnthropicWithLevel(t *testing.T) {
 	sm, err := parseAtom("opus-high")
 	require.NoError(t, err)
 	assert.Equal(t, "local-cli", sm.Provider)
-	assert.Equal(t, "cli-claude-opus", sm.Model)
+	// `opus` is now an alias for the latest pinned Opus version (4.8).
+	// Earlier atoms pointed at the legacy "cli-claude-opus" alias entry;
+	// we kept the registry pointing at the pinned id so newly-created
+	// sessions track the freshest generation.
+	assert.Equal(t, "cli-claude-opus-4-8", sm.Model)
 	assert.Equal(t, "high", sm.ReasoningEffort)
 }
 
@@ -99,7 +103,7 @@ func TestParseAtomOrRaw_AtomWinsOverFallback(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, called, "resolver must NOT be called when atom matches")
 	assert.Equal(t, "local-cli", sm.Provider)
-	assert.Equal(t, "cli-claude-opus", sm.Model)
+	assert.Equal(t, "cli-claude-opus-4-8", sm.Model)
 }
 
 func TestParseAtomOrRaw_UnknownAtomAndNoSlash(t *testing.T) {
@@ -109,8 +113,11 @@ func TestParseAtomOrRaw_UnknownAtomAndNoSlash(t *testing.T) {
 }
 
 func TestLookupAtomForModel(t *testing.T) {
-	k := lookupAtomForModel(config.SelectedModel{Provider: "local-cli", Model: "cli-claude-opus"})
-	assert.Equal(t, "opus", k)
+	k := lookupAtomForModel(config.SelectedModel{Provider: "local-cli", Model: "cli-claude-opus-4-8"})
+	// Both "opus" (alias to latest) and "opus48" (explicit pin) resolve to
+	// the same underlying model id; lookupAtomForModel returns whichever
+	// key the registry walk reaches first, so accept either.
+	assert.Contains(t, []string{"opus", "opus48"}, k)
 	k2 := lookupAtomForModel(config.SelectedModel{Provider: "zai", Model: "glm-5-turbo"})
 	assert.Equal(t, "glm5_turbo", k2)
 	k3 := lookupAtomForModel(config.SelectedModel{Provider: "openai", Model: "gpt-5"})
@@ -125,14 +132,16 @@ func TestParseShortCode_Valid(t *testing.T) {
 		model  string
 		effort string
 	}{
-		{"o47h", "cli-claude-opus", "high"},
-		{"o47xx", "cli-claude-opus", "max"},
-		{"o47x", "cli-claude-opus", "xhigh"},
-		{"o46xx", "cli-claude-opus", "max"},
+		{"o48h", "cli-claude-opus-4-8", "high"},
+		{"o48xx", "cli-claude-opus-4-8", "max"},
+		{"o47h", "cli-claude-opus-4-7", "high"},
+		{"o47xx", "cli-claude-opus-4-7", "max"},
+		{"o47x", "cli-claude-opus-4-7", "xhigh"},
+		{"o46xx", "cli-claude-opus-4-6", "max"},
 		{"s46h", "cli-claude-sonnet", "high"},
 		{"s45h", "cli-claude-sonnet", "high"},
 		{"h45l", "cli-claude-haiku", "low"},
-		{"oh", "cli-claude-opus", "high"},
+		{"oh", "cli-claude-opus-4-8", "high"},
 		{"sl", "cli-claude-sonnet", "low"},
 		{"hm", "cli-claude-haiku", "medium"},
 	}
@@ -148,7 +157,7 @@ func TestParseShortCode_Valid(t *testing.T) {
 }
 
 func TestParseShortCode_Invalid(t *testing.T) {
-	invalid := []string{"o47-3", "o47-0", "o46x", "s45xx", "h45x", "x47h", "o99h", "", "opus-high"}
+	invalid := []string{"o47-3", "o47-0", "s45xx", "h45x", "x47h", "o99h", "", "opus-high"}
 	for _, code := range invalid {
 		_, ok := parseShortCode(code)
 		assert.False(t, ok, "expected not-ok for %q", code)
@@ -160,6 +169,6 @@ func TestParseAtom_ShortCodeRoundtrip(t *testing.T) {
 	sm, err := parseAtom("o47x")
 	require.NoError(t, err)
 	assert.Equal(t, "local-cli", sm.Provider)
-	assert.Equal(t, "cli-claude-opus", sm.Model)
+	assert.Equal(t, "cli-claude-opus-4-7", sm.Model)
 	assert.Equal(t, "xhigh", sm.ReasoningEffort)
 }

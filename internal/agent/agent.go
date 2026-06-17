@@ -69,11 +69,16 @@ const (
 	// through SessionAgentOptions.StreamIdleTimeout. Read at Run()-time
 	// via effectiveStreamIdleTimeout below.
 	//
-	// 3 min covers most non-thinking turns comfortably (network jitter +
-	// model decode time). Extended-thinking models (Opus 4.7 / Sonnet 4.5
-	// with thinking_budget ~32k) can legitimately stall mid-reasoning for
-	// >5 min; those callers should set Options.StreamIdleTimeoutSeconds.
-	streamIdleTimeoutDefault = 3 * time.Minute
+	// Raised to 10 min on 2026-06-17. Extended-thinking models (GLM-5.2
+	// on max effort, Opus 4.7+ with large thinking budgets, Sonnet 4.5
+	// with thinking_budget ~32k) routinely go silent at the wire while
+	// reasoning server-side — no reasoning_content deltas are streamed
+	// until the final answer arrives. The previous 3-minute default
+	// killed those runs prematurely. 10 minutes covers every observed
+	// case so far without letting truly hung streams sit forever.
+	// Operators who want the old behaviour can set the value back via
+	// Options.StreamIdleTimeoutSeconds.
+	streamIdleTimeoutDefault = 10 * time.Minute
 	// streamWatchdogTick is how often the watchdog re-checks the
 	// last-activity timestamp. Keep small enough that a stall is detected
 	// promptly (well under streamIdleTimeout) but large enough not to

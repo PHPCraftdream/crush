@@ -1153,11 +1153,12 @@ func TestCodexSpecsHaveCorrectBinary(t *testing.T) {
 }
 
 func TestAll_HaikuModelsRegistered(t *testing.T) {
+	// After the 2026-06-17 cleanup the per-thinking and npx variants
+	// were removed. We only carry the canonical `cli-claude-haiku`
+	// alias now; the operator picks effort via the UI selector and the
+	// cliprovider forwards it through context at call time.
 	want := []string{
 		"cli-claude-haiku",
-		"cli-claude-haiku-thinking",
-		"cli-npx-claude-haiku",
-		"cli-npx-claude-haiku-thinking",
 	}
 	byID := make(map[string]CLISpec, len(All))
 	for _, s := range All {

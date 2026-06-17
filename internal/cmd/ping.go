@@ -8,6 +8,7 @@ import (
 	"maps"
 	"net/http"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -513,10 +514,31 @@ func printPingTextError(r PingResult, resetAt time.Time) {
 	if !resetAt.IsZero() {
 		local := resetAt.Local()
 		if in := time.Until(local).Round(time.Second); in > 0 {
-			fmt.Fprintf(os.Stderr, "limit reset: %s (in %s)\n", local.Format("2006-01-02 15:04:05 MST"), in)
+			fmt.Fprintf(os.Stderr, "limit reset: %s (in %s)\n", local.Format("2006-01-02 15:04:05 -07:00"), formatResetDuration(in))
 		} else {
-			fmt.Fprintf(os.Stderr, "limit reset: %s\n", local.Format("2006-01-02 15:04:05 MST"))
+			fmt.Fprintf(os.Stderr, "limit reset: %s\n", local.Format("2006-01-02 15:04:05 -07:00"))
 		}
+	}
+}
+
+// formatResetDuration humanises a positive countdown — "4h12m07s" reads
+// cleaner than Go's default "4h12m6.832s" because we round to seconds and
+// omit zero leading components.
+func formatResetDuration(d time.Duration) string {
+	if d < time.Second {
+		return "0s"
+	}
+	d = d.Round(time.Second)
+	h := int(d / time.Hour)
+	m := int((d % time.Hour) / time.Minute)
+	s := int((d % time.Minute) / time.Second)
+	switch {
+	case h > 0:
+		return fmt.Sprintf("%dh%02dm%02ds", h, m, s)
+	case m > 0:
+		return fmt.Sprintf("%dm%02ds", m, s)
+	default:
+		return fmt.Sprintf("%ds", s)
 	}
 }
 
@@ -526,8 +548,26 @@ func printPingTextError(r PingResult, resetAt time.Time) {
 // captured headers. Returns ok=false when the error isn't a provider error or
 // carries no usable reset hint. `now` is taken as an argument for testability.
 func pingRateLimitReset(err error, now time.Time) (time.Time, bool) {
+	// Last-resort string parse: even when fantasy didn't surface a
+	// ProviderError, the err.Error() text often still contains the
+	// z.ai-style "Your limit will reset at ..." hint (it's wrapped by
+	// the retry layer). Try it before we give up entirely.
 	var pe *fantasy.ProviderError
-	if !errors.As(err, &pe) || pe.ResponseHeaders == nil {
+	if !errors.As(err, &pe) {
+		if t, ok := parseZAIResetHint(err.Error()); ok {
+			return t, true
+		}
+		return time.Time{}, false
+	}
+	if pe.ResponseHeaders == nil {
+		if pe.Message != "" {
+			if t, ok := parseZAIResetHint(pe.Message); ok {
+				return t, true
+			}
+		}
+		if t, ok := parseZAIResetHint(err.Error()); ok {
+			return t, true
+		}
 		return time.Time{}, false
 	}
 	get := func(name string) string {
@@ -592,7 +632,39 @@ func pingRateLimitReset(err error, now time.Time) (time.Time, bool) {
 		return now.Add(maxDur), true
 	}
 
+	// z.ai-style fallback: the reset hint only lives in the error body,
+	// e.g. "Your limit will reset at 2026-06-17 14:49:28". No tz marker —
+	// z.ai's servers report in China Standard Time (UTC+8), so we parse
+	// the wall-clock as CST and let the caller .Local() it.
+	if pe.Message != "" {
+		if t, ok := parseZAIResetHint(pe.Message); ok {
+			return t, true
+		}
+	}
+
 	return time.Time{}, false
+}
+
+// zaiResetRe matches z.ai's "Your limit will reset at YYYY-MM-DD HH:MM:SS"
+// fragment as emitted by their rate-limit error bodies. Time is captured
+// without a zone — by convention CST (UTC+8).
+var zaiResetRe = regexp.MustCompile(`limit will reset at\s+(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})`)
+
+func parseZAIResetHint(text string) (time.Time, bool) {
+	m := zaiResetRe.FindStringSubmatch(text)
+	if len(m) < 2 {
+		return time.Time{}, false
+	}
+	stamp := strings.ReplaceAll(m[1], "T", " ")
+	// Fixed CST zone — z.ai's API surface is anchored there. Using a fixed
+	// offset (no historical DST table) is exactly right for a wall-clock
+	// stamp like this one.
+	cst := time.FixedZone("CST", 8*3600)
+	t, err := time.ParseInLocation("2006-01-02 15:04:05", stamp, cst)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
 }
 
 func stringPtr(s string) *string {

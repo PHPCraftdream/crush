@@ -344,14 +344,10 @@ func claudeArgs(model string, extra ...string) func(bool) []string {
 	}
 }
 
-// npxClaudeArgs returns a BuildArgs func for claude invoked via npx @anthropic-ai/claude-code.
-// --yes skips the install confirmation prompt that npx may show.
-func npxClaudeArgs(model string, extra ...string) func(bool) []string {
-	inner := claudeArgs(model, extra...)
-	return func(yolo bool) []string {
-		return append([]string{"--yes", "@anthropic-ai/claude-code"}, inner(yolo)...)
-	}
-}
+// npxClaudeArgs was used for the cli-npx-claude-* family. Removed in the
+// 2026-06-17 cleanup — the variants doubled the model list with no real
+// benefit (anyone with `claude` on PATH gets identical behaviour faster,
+// and Windows ConPTY relay through npx.cmd was unreliable anyway).
 
 // codexEvent is the top-level JSONL envelope emitted by `codex exec --json`.
 type codexEvent struct {
@@ -447,212 +443,45 @@ func geminiArgs(model string) func(bool) []string {
 	}
 }
 
+// claudeSpec builds a CLI-Claude entry. The model argument is what gets
+// passed to `claude --model <X>` — either an alias ("sonnet", "haiku",
+// "opus", "fable", which the CLI resolves to its current default) or a
+// pinned model id ("claude-opus-4-7", "claude-opus-4-8", …). We no longer
+// generate per-effort -thinking variants: the UI's reasoning-effort
+// selector (low/medium/high/xhigh/max) is forwarded via context at call
+// time and rewrites the `--effort` flag in BuildArgs.
+func claudeSpec(modelID, modelName, modelArg string, ctxWindow int64) CLISpec {
+	return CLISpec{
+		ModelID:        modelID,
+		ModelName:      modelName,
+		ContextWindow:  ctxWindow,
+		Binary:         "claude",
+		PromptFlag:     "-p",
+		BuildArgs:      claudeArgs(modelArg),
+		NewPartParser:  claudePartParser,
+		ParseUsageLine: claudeParseUsageLine,
+		UseCrushMCP:    true,
+		SupportsResume: true,
+	}
+}
+
 // All is the list of hardcoded CLI model specs.
 // Add new entries here to register additional CLI-backed models.
 var All = []CLISpec{
-	{
-		ModelID:        "cli-claude-sonnet",
-		ModelName:      "Claude Sonnet (CLI)",
-		ContextWindow:  1_000_000,
-		Binary:         "claude",
-		PromptFlag:     "-p",
-		BuildArgs:      claudeArgs("sonnet"),
-		NewPartParser:  claudePartParser,
-		ParseUsageLine: claudeParseUsageLine,
-		UseCrushMCP:    true,
-		SupportsResume: true,
-	},
-	{
-		ModelID:        "cli-claude-opus",
-		ModelName:      "Claude Opus (CLI)",
-		ContextWindow:  1_000_000,
-		Binary:         "claude",
-		PromptFlag:     "-p",
-		BuildArgs:      claudeArgs("opus"),
-		NewPartParser:  claudePartParser,
-		ParseUsageLine: claudeParseUsageLine,
-		UseCrushMCP:    true,
-		SupportsResume: true,
-	},
-	{
-		ModelID:        "cli-claude-haiku",
-		ModelName:      "Claude Haiku (CLI)",
-		ContextWindow:  200_000,
-		Binary:         "claude",
-		PromptFlag:     "-p",
-		BuildArgs:      claudeArgs("haiku"),
-		NewPartParser:  claudePartParser,
-		ParseUsageLine: claudeParseUsageLine,
-		UseCrushMCP:    true,
-		SupportsResume: true,
-	},
-	{
-		ModelID:        "cli-claude-sonnet-thinking",
-		ModelName:      "Claude Sonnet Thinking (CLI)",
-		ContextWindow:  1_000_000,
-		Binary:         "claude",
-		PromptFlag:     "-p",
-		BuildArgs:      claudeArgs("sonnet", "--effort", "high"),
-		NewPartParser:  claudePartParser,
-		ParseUsageLine: claudeParseUsageLine,
-		UseCrushMCP:    true,
-		SupportsResume: true,
-	},
-	{
-		ModelID:        "cli-claude-opus-thinking",
-		ModelName:      "Claude Opus Thinking (CLI)",
-		ContextWindow:  1_000_000,
-		Binary:         "claude",
-		PromptFlag:     "-p",
-		BuildArgs:      claudeArgs("opus", "--effort", "high"),
-		NewPartParser:  claudePartParser,
-		ParseUsageLine: claudeParseUsageLine,
-		UseCrushMCP:    true,
-		SupportsResume: true,
-	},
-	{
-		ModelID:        "cli-claude-haiku-thinking",
-		ModelName:      "Claude Haiku Thinking (CLI)",
-		ContextWindow:  200_000,
-		Binary:         "claude",
-		PromptFlag:     "-p",
-		BuildArgs:      claudeArgs("haiku", "--effort", "high"),
-		NewPartParser:  claudePartParser,
-		ParseUsageLine: claudeParseUsageLine,
-		UseCrushMCP:    true,
-		SupportsResume: true,
-	},
-	{
-		ModelID:        "cli-claude-fable",
-		ModelName:      "Claude Fable (CLI)",
-		ContextWindow:  1_000_000,
-		Binary:         "claude",
-		PromptFlag:     "-p",
-		BuildArgs:      claudeArgs("fable"),
-		NewPartParser:  claudePartParser,
-		ParseUsageLine: claudeParseUsageLine,
-		UseCrushMCP:    true,
-		SupportsResume: true,
-	},
-	{
-		ModelID:        "cli-claude-fable-thinking",
-		ModelName:      "Claude Fable Thinking (CLI)",
-		ContextWindow:  1_000_000,
-		Binary:         "claude",
-		PromptFlag:     "-p",
-		BuildArgs:      claudeArgs("fable", "--effort", "high"),
-		NewPartParser:  claudePartParser,
-		ParseUsageLine: claudeParseUsageLine,
-		UseCrushMCP:    true,
-		SupportsResume: true,
-	},
-	// npx @anthropic-ai/claude-code variants.
-	// NoPTY is required because npx.cmd on Windows doesn't relay
-	// child-process output through ConPTY reliably.
-	{
-		ModelID:        "cli-npx-claude-sonnet",
-		ModelName:      "Claude Sonnet (npx)",
-		ContextWindow:  1_000_000,
-		Binary:         "npx",
-		PromptFlag:     "-p",
-		BuildArgs:      npxClaudeArgs("sonnet"),
-		NewPartParser:  claudePartParser,
-		ParseUsageLine: claudeParseUsageLine,
-		UseCrushMCP:    true,
-		NoPTY:          true,
-		SupportsResume: true,
-	},
-	{
-		ModelID:        "cli-npx-claude-opus",
-		ModelName:      "Claude Opus (npx)",
-		ContextWindow:  1_000_000,
-		Binary:         "npx",
-		PromptFlag:     "-p",
-		BuildArgs:      npxClaudeArgs("opus"),
-		NewPartParser:  claudePartParser,
-		ParseUsageLine: claudeParseUsageLine,
-		UseCrushMCP:    true,
-		NoPTY:          true,
-		SupportsResume: true,
-	},
-	{
-		ModelID:        "cli-npx-claude-haiku",
-		ModelName:      "Claude Haiku (npx)",
-		ContextWindow:  200_000,
-		Binary:         "npx",
-		PromptFlag:     "-p",
-		BuildArgs:      npxClaudeArgs("haiku"),
-		NewPartParser:  claudePartParser,
-		ParseUsageLine: claudeParseUsageLine,
-		UseCrushMCP:    true,
-		NoPTY:          true,
-		SupportsResume: true,
-	},
-	{
-		ModelID:        "cli-npx-claude-sonnet-thinking",
-		ModelName:      "Claude Sonnet Thinking (npx)",
-		ContextWindow:  1_000_000,
-		Binary:         "npx",
-		PromptFlag:     "-p",
-		BuildArgs:      npxClaudeArgs("sonnet", "--effort", "high"),
-		NewPartParser:  claudePartParser,
-		ParseUsageLine: claudeParseUsageLine,
-		UseCrushMCP:    true,
-		NoPTY:          true,
-		SupportsResume: true,
-	},
-	{
-		ModelID:        "cli-npx-claude-opus-thinking",
-		ModelName:      "Claude Opus Thinking (npx)",
-		ContextWindow:  1_000_000,
-		Binary:         "npx",
-		PromptFlag:     "-p",
-		BuildArgs:      npxClaudeArgs("opus", "--effort", "high"),
-		NewPartParser:  claudePartParser,
-		ParseUsageLine: claudeParseUsageLine,
-		UseCrushMCP:    true,
-		NoPTY:          true,
-		SupportsResume: true,
-	},
-	{
-		ModelID:        "cli-npx-claude-haiku-thinking",
-		ModelName:      "Claude Haiku Thinking (npx)",
-		ContextWindow:  200_000,
-		Binary:         "npx",
-		PromptFlag:     "-p",
-		BuildArgs:      npxClaudeArgs("haiku", "--effort", "high"),
-		NewPartParser:  claudePartParser,
-		ParseUsageLine: claudeParseUsageLine,
-		UseCrushMCP:    true,
-		NoPTY:          true,
-		SupportsResume: true,
-	},
-	{
-		ModelID:        "cli-npx-claude-fable",
-		ModelName:      "Claude Fable (npx)",
-		ContextWindow:  1_000_000,
-		Binary:         "npx",
-		PromptFlag:     "-p",
-		BuildArgs:      npxClaudeArgs("fable"),
-		NewPartParser:  claudePartParser,
-		ParseUsageLine: claudeParseUsageLine,
-		UseCrushMCP:    true,
-		NoPTY:          true,
-		SupportsResume: true,
-	},
-	{
-		ModelID:        "cli-npx-claude-fable-thinking",
-		ModelName:      "Claude Fable Thinking (npx)",
-		ContextWindow:  1_000_000,
-		Binary:         "npx",
-		PromptFlag:     "-p",
-		BuildArgs:      npxClaudeArgs("fable", "--effort", "high"),
-		NewPartParser:  claudePartParser,
-		ParseUsageLine: claudeParseUsageLine,
-		UseCrushMCP:    true,
-		NoPTY:          true,
-		SupportsResume: true,
-	},
+	// Anthropic's `claude` CLI on PATH. One entry per model family;
+	// pinned Opus versions because the operator usually wants a specific
+	// generation (4.6/4.7/4.8 differ meaningfully). Sonnet / Haiku /
+	// Fable use the aliases so each tab auto-tracks the latest.
+	claudeSpec("cli-claude-haiku", "Claude Haiku 4.5 (CLI)", "haiku", 200_000),
+	claudeSpec("cli-claude-sonnet", "Claude Sonnet 4.6 (CLI)", "sonnet", 1_000_000),
+	// Opus: alias entry kept so DB rows / atoms (`opus`) referencing the
+	// classic ModelID don't dangle, plus three pinned variants the operator
+	// can pick explicitly.
+	claudeSpec("cli-claude-opus", "Claude Opus (CLI, latest)", "opus", 1_000_000),
+	claudeSpec("cli-claude-opus-4-6", "Claude Opus 4.6 (CLI)", "claude-opus-4-6", 1_000_000),
+	claudeSpec("cli-claude-opus-4-7", "Claude Opus 4.7 (CLI)", "claude-opus-4-7", 1_000_000),
+	claudeSpec("cli-claude-opus-4-8", "Claude Opus 4.8 (CLI)", "claude-opus-4-8", 1_000_000),
+	claudeSpec("cli-claude-fable", "Claude Fable 5 (CLI)", "fable", 1_000_000),
 	{
 		ModelID:              "cli-gemini-flash",
 		ModelName:            "Gemini 3 Flash (CLI)",

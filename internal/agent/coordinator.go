@@ -777,6 +777,23 @@ func getProviderOptions(model Model, providerCfg config.ProviderConfig) fantasy.
 					"type": "disabled",
 				}
 			}
+			// GLM-5.x exposes two thinking-effort levels (high / max).
+			// We forward via `extra_body.reasoning_effort` — the
+			// OpenAI-compat field z.ai already accepts on its Anthropic-
+			// compatible coding endpoint. Mapping mirrors z.ai's own
+			// "Claude Code selected effort → GLM-5.2 actual mapped effort"
+			// table from docs.z.ai/devpack/latest-model:
+			//   low, medium, high (default) → high
+			//   xhigh, max, ultracode       → max
+			// Older GLM-4.x ignore the field harmlessly.
+			if model.ModelCfg.ReasoningEffort != "" {
+				switch strings.ToLower(model.ModelCfg.ReasoningEffort) {
+				case "xhigh", "max", "ultracode":
+					extraBody["reasoning_effort"] = "max"
+				default:
+					extraBody["reasoning_effort"] = "high"
+				}
+			}
 		case string(catwalk.InferenceProviderAlibabaSingapore):
 			if model.CatwalkCfg.CanReason {
 				extraBody["enable_thinking"] = model.ModelCfg.Think

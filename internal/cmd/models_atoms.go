@@ -23,10 +23,13 @@ type atom struct {
 }
 
 var atomRegistry = map[string]atom{
-	"opus":         {Provider: "local-cli", Model: "cli-claude-opus", DisplayName: "Claude Opus", CtxLabel: "1M", Group: "anthropic", GroupNote: "via local `claude` CLI", EffortSource: claudeEffortSource},
-	"sonnet":       {Provider: "local-cli", Model: "cli-claude-sonnet", DisplayName: "Claude Sonnet", CtxLabel: "200k", Group: "anthropic", GroupNote: "via local `claude` CLI", EffortSource: claudeEffortSource},
-	"haiku":        {Provider: "local-cli", Model: "cli-claude-haiku", DisplayName: "Claude Haiku", CtxLabel: "200k", Group: "anthropic", GroupNote: "via local `claude` CLI", EffortSource: claudeEffortSource},
-	"fable":        {Provider: "local-cli", Model: "cli-claude-fable", DisplayName: "Claude Fable", CtxLabel: "1M", Group: "anthropic", EffortSource: claudeEffortSource},
+	"opus":         {Provider: "local-cli", Model: "cli-claude-opus-4-8", DisplayName: "Claude Opus 4.8", CtxLabel: "1M", Group: "anthropic", GroupNote: "via local `claude` CLI", EffortSource: claudeEffortSource},
+	"opus46":       {Provider: "local-cli", Model: "cli-claude-opus-4-6", DisplayName: "Claude Opus 4.6", CtxLabel: "1M", Group: "anthropic", GroupNote: "via local `claude` CLI", EffortSource: claudeEffortSource},
+	"opus47":       {Provider: "local-cli", Model: "cli-claude-opus-4-7", DisplayName: "Claude Opus 4.7", CtxLabel: "1M", Group: "anthropic", GroupNote: "via local `claude` CLI", EffortSource: claudeEffortSource},
+	"opus48":       {Provider: "local-cli", Model: "cli-claude-opus-4-8", DisplayName: "Claude Opus 4.8", CtxLabel: "1M", Group: "anthropic", GroupNote: "via local `claude` CLI", EffortSource: claudeEffortSource},
+	"sonnet":       {Provider: "local-cli", Model: "cli-claude-sonnet", DisplayName: "Claude Sonnet 4.6", CtxLabel: "1M", Group: "anthropic", GroupNote: "via local `claude` CLI", EffortSource: claudeEffortSource},
+	"haiku":        {Provider: "local-cli", Model: "cli-claude-haiku", DisplayName: "Claude Haiku 4.5", CtxLabel: "200k", Group: "anthropic", GroupNote: "via local `claude` CLI", EffortSource: claudeEffortSource},
+	"fable":        {Provider: "local-cli", Model: "cli-claude-fable", DisplayName: "Claude Fable 5", CtxLabel: "1M", Group: "anthropic", EffortSource: claudeEffortSource},
 	"glm5_2":       {Provider: "zai", Model: "glm-5.2", DisplayName: "GLM 5.2", CtxLabel: "1M", Group: "zai", GroupNote: "openai-compat, no effort"},
 	"glm5_1":       {Provider: "zai", Model: "glm-5.1", DisplayName: "GLM 5.1", CtxLabel: "204.8k", Group: "zai"},
 	"glm5":         {Provider: "zai", Model: "glm-5", DisplayName: "GLM 5", CtxLabel: "204.8k", Group: "zai"},
@@ -47,7 +50,7 @@ var atomGroupOrder = []string{"anthropic", "zai"}
 // display order keeps the human-readable list predictable (Opus first, then
 // Sonnet, then Haiku; newest GLM first, then descending versions).
 var atomDisplayOrder = map[string][]string{
-	"anthropic": {"opus", "fable", "sonnet", "haiku"},
+	"anthropic": {"opus", "opus48", "opus47", "opus46", "fable", "sonnet", "haiku"},
 	"zai": {
 		"glm5_2", "glm5_1", "glm5", "glm5_turbo",
 		"glm4_7", "glm4_7_flash",
@@ -296,8 +299,9 @@ var shortCodeEffort = map[string]string{
 // corresponding atom key in atomRegistry. Includes both versioned
 // prefixes (o47, s46, …) and top-model shortcuts (o, s, h).
 var shortCodeBase = map[string]string{
-	"o47": "opus",
-	"o46": "opus",
+	"o48": "opus48",
+	"o47": "opus47",
+	"o46": "opus46",
 	"s46": "sonnet",
 	"s45": "sonnet",
 	"h45": "haiku",
@@ -309,8 +313,9 @@ var shortCodeBase = map[string]string{
 
 // shortCodeValidEfforts lists which effort suffixes each base accepts.
 var shortCodeValidEfforts = map[string][]string{
+	"o48": {"l", "m", "h", "x", "xx"},
 	"o47": {"l", "m", "h", "x", "xx"},
-	"o46": {"l", "m", "h", "xx"},
+	"o46": {"l", "m", "h", "x", "xx"},
 	"s46": {"l", "m", "h", "xx"},
 	"s45": {"l", "m", "h"},
 	"h45": {"l", "m", "h"},

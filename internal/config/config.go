@@ -313,8 +313,8 @@ type Options struct {
 	// Set higher (e.g. 900 = 15 min) when using extended-thinking models
 	// (Opus 4.7 / Sonnet 4.5 with large thinking budgets) where the
 	// model may legitimately pause for minutes while reasoning. 0 (the
-	// default when omitted) keeps the 3-minute built-in value.
-	StreamIdleTimeoutSeconds int `json:"stream_idle_timeout_seconds,omitempty" jsonschema:"description=Override the stream watchdog idle timeout in seconds. Default 180 (3 min). Raise for extended-thinking models that pause for long reasoning gaps. 0 = use default.,default=0,example=600"`
+	// default when omitted) keeps the 10-minute built-in value.
+	StreamIdleTimeoutSeconds int `json:"stream_idle_timeout_seconds,omitempty" jsonschema:"description=Override the stream watchdog idle timeout in seconds. Default 600 (10 min). Raise further for extreme extended-thinking models that pause longer than 10 min mid-reasoning; lower (e.g. 180) for the old aggressive behaviour. 0 = use default.,default=0,example=900"`
 	// StreamStallRetries is the number of times to automatically retry a
 	// turn that ended in FinishReasonError("Stream stalled"). Embodies
 	// "solve it ourselves before bothering the user": instead of
