@@ -14,6 +14,7 @@ import {
   jumpToMessage,
 } from "../store";
 import { ws } from "../ws";
+import { handleSitterCommand } from "../sitter";
 import { ListOrdered, Send, SendHorizonal, Paperclip, X, Zap, History, CornerLeftUp, PlusCircle } from "lucide-react";
 import type { SkillInfo } from "../types";
 import type { MyPromptItem } from "../store";
@@ -305,6 +306,17 @@ export function ChatInput() {
   const send = useCallback(() => {
     const msg = text.trim();
     if (!msg || !activeSessionID) return;
+    // Intercept `/sitter`-family before any server roundtrip — it's a
+    // pure-client toggle (start/stop the auto-resume loop). Other slash
+    // commands flow through unchanged.
+    if (handleSitterCommand(msg)) {
+      setText("");
+      setHistIdx(-1);
+      setStash("");
+      setHistoryOpen(false);
+      if (textareaRef.current) textareaRef.current.style.height = "auto";
+      return;
+    }
     if (agentBusy) {
       enqueueMessage(activeSessionID, msg);
     } else {

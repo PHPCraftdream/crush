@@ -420,12 +420,18 @@ type ActionItem =
       resultPart?: ContentPart & { type: "tool_result"; ToolCallID: string; Name: string; Content: string; IsError: boolean; Metadata?: string };
       idx: number;
       key: string;
+      // CreatedAt of the source message that contributed this row. For a
+      // paired call+result we keep the EARLIER timestamp (the call) — the
+      // result's createdAt arrives later but the user thinks of the action
+      // by when it started.
+      createdAt?: number;
     }
   | {
       kind: "thinking";
       text: string;
       idx: number;
       key: string;
+      createdAt?: number;
     };
 
 interface ActionRowProps {
@@ -468,6 +474,7 @@ const ActionRow = memo(function ActionRow({ item, isCurrent, suppressAutoCurrent
           <span className="text-text font-mono text-sm truncate flex-1 min-w-0">
             {preview || "—"}
           </span>
+          <TimeBadge epochSec={item.createdAt} />
           <span className="text-text-subtle shrink-0">
             {open ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
           </span>
@@ -508,6 +515,7 @@ const ActionRow = memo(function ActionRow({ item, isCurrent, suppressAutoCurrent
         </span>
         {running && <span className="text-text-subtle text-xs animate-pulse shrink-0">running…</span>}
         {errored && <span className="badge-error shrink-0">error</span>}
+        <TimeBadge epochSec={item.createdAt} />
         <span className="text-text-subtle shrink-0">
           {open ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
         </span>
@@ -523,7 +531,7 @@ const ActionRow = memo(function ActionRow({ item, isCurrent, suppressAutoCurrent
 });
 
 interface ToolActivityGroupProps {
-  items: { part: ContentPart; idx: number }[];
+  items: { part: ContentPart; idx: number; createdAt?: number }[];
   live: boolean;
   // True when this group is the most recent activity in the transcript
   // (i.e. nothing rendered after it). When false, the auto-rule collapses
@@ -618,13 +626,13 @@ export const ToolActivityGroup = memo(function ToolActivityGroup({ items, live, 
     const actions: ActionItem[] = [];
     const rawAgentParts: { part: ContentPart; idx: number }[] = [];
     const indexByCallID = new Map<string, number>();
-    for (const { part, idx } of items) {
+    for (const { part, idx, createdAt } of items) {
       if (part.type === "thinking") {
         const text = (part as { type: "thinking"; Thinking: string }).Thinking ?? "";
-        actions.push({ kind: "thinking", text, idx, key: `think-${idx}` });
+        actions.push({ kind: "thinking", text, idx, key: `think-${idx}`, createdAt });
       } else if (part.type === "tool_call") {
         if (part.Name === "agent") { rawAgentParts.push({ part, idx }); continue; }
-        const a: ActionItem = { kind: "tool", callPart: part, idx, key: `call-${part.ID}` };
+        const a: ActionItem = { kind: "tool", callPart: part, idx, key: `call-${part.ID}`, createdAt };
         indexByCallID.set(part.ID, actions.length);
         actions.push(a);
       } else if (part.type === "tool_result") {
@@ -633,8 +641,9 @@ export const ToolActivityGroup = memo(function ToolActivityGroup({ items, live, 
         if (pos !== undefined) {
           const slot = actions[pos];
           if (slot.kind === "tool") slot.resultPart = part;
+          // intentionally keep the earlier createdAt: that's when the action began
         } else {
-          actions.push({ kind: "tool", resultPart: part, idx, key: `res-${part.ToolCallID}-${idx}` });
+          actions.push({ kind: "tool", resultPart: part, idx, key: `res-${part.ToolCallID}-${idx}`, createdAt });
         }
       }
     }

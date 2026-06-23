@@ -59,6 +59,7 @@ const (
 	CmdGetConfig                 = "get_config"
 	CmdGetLogs                   = "get_logs"
 	CmdSetTheme                  = "set_theme"
+	CmdSetKeepAlive              = "set_keep_alive"
 	CmdRenameSession             = "rename_session"
 	CmdSetSessionModels          = "set_session_models"
 	CmdRemoveRecentModel         = "remove_recent_model"
@@ -134,6 +135,10 @@ type PermissionResponsePayload struct {
 
 type SetThemePayload struct {
 	Theme string `json:"theme"` // "dark" or "light"
+}
+
+type SetKeepAlivePayload struct {
+	Enabled bool `json:"enabled"`
 }
 
 type RenameSessionPayload struct {
@@ -393,6 +398,10 @@ type ConfigWire struct {
 	InitializeAs      string                    `json:"initializeAs,omitempty"`
 	Version           string                    `json:"version,omitempty"`
 	CWD               string                    `json:"cwd,omitempty"`
+	// KeepAliveEnabled mirrors Options.KeepAliveEnabled with the default
+	// resolved server-side (nil → true), so the frontend never sees an
+	// ambiguous undefined.
+	KeepAliveEnabled bool `json:"keepAliveEnabled"`
 }
 
 // ModelEntryWire represents a selected model entry (large/small/etc).

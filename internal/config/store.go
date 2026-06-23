@@ -548,6 +548,20 @@ func (s *ConfigStore) SetTheme(scope Scope, theme string) error {
 	return s.SetConfigField(scope, "options.tui.theme", theme)
 }
 
+// SetKeepAliveEnabled persists the WebAudio keep-alive preference.
+// Persisted as a literal bool (NOT *bool) so the JSON form is
+// `"keep_alive_enabled": true|false` — the in-memory Options carries a
+// *bool only to distinguish "not set, use default ON" from an explicit
+// choice, and SetConfigField writes the underlying primitive.
+func (s *ConfigStore) SetKeepAliveEnabled(scope Scope, enabled bool) error {
+	if s.config.Options == nil {
+		s.config.Options = &Options{}
+	}
+	v := enabled
+	s.config.Options.KeepAliveEnabled = &v
+	return s.SetConfigField(scope, "options.keep_alive_enabled", enabled)
+}
+
 // RemoveProviderAPIKey removes the API key for the given provider from disk and
 // removes it from the in-memory enabled providers list.
 func (s *ConfigStore) RemoveProviderAPIKey(scope Scope, providerID string) error {

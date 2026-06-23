@@ -75,6 +75,8 @@ func handleIncoming(ctx context.Context, a *appPkg.App, c *Client, raw []byte) {
 		go handleGetLogs(a, c, msg)
 	case CmdSetTheme:
 		go handleSetTheme(a, c, msg)
+	case CmdSetKeepAlive:
+		go handleSetKeepAlive(a, c, msg)
 	case CmdRenameSession:
 		go handleRenameSession(ctx, a, c, msg)
 	case CmdSetSessionModels:
@@ -913,6 +915,11 @@ func buildConfigWire(a *appPkg.App) (ConfigWire, bool) {
 	if cfg.Options != nil && cfg.Options.TUI != nil {
 		wire.Theme = cfg.Options.TUI.Theme
 	}
+	// KeepAliveEnabled: default ON. nil → true; explicit value passes through.
+	wire.KeepAliveEnabled = true
+	if cfg.Options != nil && cfg.Options.KeepAliveEnabled != nil {
+		wire.KeepAliveEnabled = *cfg.Options.KeepAliveEnabled
+	}
 
 	for _, m := range cfg.RecentModels[config.SelectedModelTypeLarge] {
 		wire.RecentLargeModels = append(wire.RecentLargeModels, ModelEntryWire{Provider: m.Provider, Model: m.Model})
@@ -1338,6 +1345,21 @@ func handleSetTheme(a *appPkg.App, c *Client, msg WSMessage) {
 		return
 	}
 	if err := a.Store().SetTheme(config.ScopeGlobal, p.Theme); err != nil {
+		c.reply(msg.ID, EventError, nil, err.Error())
+		return
+	}
+	if wire, ok := buildConfigWire(a); ok {
+		c.hub.Broadcast(EventConfig, wire)
+	}
+}
+
+func handleSetKeepAlive(a *appPkg.App, c *Client, msg WSMessage) {
+	var p SetKeepAlivePayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		c.reply(msg.ID, EventError, nil, "invalid payload")
+		return
+	}
+	if err := a.Store().SetKeepAliveEnabled(config.ScopeGlobal, p.Enabled); err != nil {
 		c.reply(msg.ID, EventError, nil, err.Error())
 		return
 	}

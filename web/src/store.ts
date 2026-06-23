@@ -377,6 +377,14 @@ export function setTheme(theme: "light" | "dark") {
   ws.send("set_theme", { theme });
 }
 
+// setKeepAliveEnabled toggles the WebAudio keep-alive preference. The
+// backend persists it to the global crush.json under
+// options.keep_alive_enabled and broadcasts a fresh `config` event;
+// useWS.ts reacts to that broadcast and starts/stops the local audio.
+export function setKeepAliveEnabled(enabled: boolean) {
+  ws.send("set_keep_alive", { enabled });
+}
+
 // ── Yolo mode ────────────────────────────────────────────────────────────────
 export const $yolo = atom<boolean>(false);
 

@@ -329,6 +329,14 @@ type Options struct {
 	// at most once per this interval, bounding text lost to SIGTERM
 	// during final composition. 0 = use the default (2s). -1 = disable.
 	CheckpointIntervalSeconds int `json:"checkpoint_interval_seconds,omitempty" jsonschema:"description=Mid-stream auto-checkpoint interval in seconds. Flushes in-progress assistant text to DB so SIGTERM during final composition does not lose work. Default 2. 0 = use default. -1 = disable.,default=0,example=5"`
+	// KeepAliveEnabled toggles the web UI's tiny WebAudio noise loop
+	// that keeps the audio output device "audibly alive" — prevents
+	// Bluetooth headphones from suspending the stream during long
+	// agent-runs, which otherwise eats the first second of a real
+	// notification sound. Pointer so nil == "not set, use default ON".
+	// Persisted globally because BT-headphone preferences track the
+	// operator's machine, not any single project's repo.
+	KeepAliveEnabled *bool `json:"keep_alive_enabled,omitempty" jsonschema:"description=Web UI WebAudio keep-alive: emits an inaudible loop so Bluetooth headphones do not auto-suspend during long agent runs. Default true. Set false to disable.,default=true"`
 }
 
 type MCPs map[string]MCPConfig

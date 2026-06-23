@@ -138,9 +138,14 @@ function QueuedMessageItem({
 
 interface PartLike { type: string; Reason?: string }
 
+// BurstPart carries each tool/thinking part alongside its source message's
+// CreatedAt. Needed so each row in ToolActivityGroup can render its own
+// HH:MM:SS timestamp — the part itself has no time field, the message does.
+type BurstPart = { part: ContentPart; createdAt: number };
+
 type RenderItem =
   | { kind: "message"; message: Msg; index: number }
-  | { kind: "toolrun"; parts: ContentPart[]; firstMsgID: string };
+  | { kind: "toolrun"; parts: BurstPart[]; firstMsgID: string };
 
 // buildRenderItems groups consecutive tool activity across messages into
 // one cross-message accordion (ToolRun) and renders everything else as a
@@ -168,7 +173,7 @@ type RenderItem =
 //                                    a pure-thinking turn)
 function buildRenderItems(messages: Msg[]): RenderItem[] {
   const out: RenderItem[] = [];
-  let burstParts: ContentPart[] = [];
+  let burstParts: BurstPart[] = [];
   let burstFirstID = "";
 
   const flushBurst = () => {
@@ -190,7 +195,7 @@ function buildRenderItems(messages: Msg[]): RenderItem[] {
     if (m.Role === "tool") {
       if (burstFirstID === "") burstFirstID = m.ID;
       for (const p of m.Parts) {
-        if (p.type === "tool_result") burstParts.push(p);
+        if (p.type === "tool_result") burstParts.push({ part: p, createdAt: m.CreatedAt });
       }
       return;
     }
@@ -217,7 +222,7 @@ function buildRenderItems(messages: Msg[]): RenderItem[] {
       if (burstFirstID === "") burstFirstID = m.ID;
       for (const p of m.Parts) {
         if (p.type === "tool_call" || p.type === "tool_result" || p.type === "thinking") {
-          burstParts.push(p as ContentPart);
+          burstParts.push({ part: p as ContentPart, createdAt: m.CreatedAt });
         }
       }
       return;
@@ -234,12 +239,13 @@ function buildRenderItems(messages: Msg[]): RenderItem[] {
   return out;
 }
 
-function ToolRun({ parts, firstMsgID, sessionID, isLive, isCurrent }: { parts: ContentPart[]; firstMsgID: string; sessionID: string; isLive: boolean; isCurrent: boolean }) {
+function ToolRun({ parts, firstMsgID, sessionID, isLive, isCurrent }: { parts: BurstPart[]; firstMsgID: string; sessionID: string; isLive: boolean; isCurrent: boolean }) {
   const messages = useStore($messages);
   // ToolActivityGroup pairs call↔result by ToolCallID — no further prep
-  // needed here, just give each part a stable index for its key.
+  // needed here, just give each part a stable index for its key. createdAt
+  // travels with each part so action rows can render per-row timestamps.
   const items = useMemo(
-    () => parts.map((part, idx) => ({ part, idx })),
+    () => parts.map((bp, idx) => ({ part: bp.part, idx, createdAt: bp.createdAt })),
     [parts]
   );
   const startedAt = useMemo(() => {

@@ -35,6 +35,8 @@ import {
   trackMessageParts,
 } from "./store";
 import type { WSMessage, Session, Message, PermissionRequest, ConfigPayload, MCPState, AgentBusyPayload, SkillsSnapshot, SummarizeQueuedPayload } from "./types";
+import { isKeepAliveRunning, startKeepAlive, stopKeepAlive, installKeepAliveAutoResume } from "./keepAlive";
+import { installSitterAutoRestore } from "./sitter";
 
 function getIDFromHash(): string | null {
   const hash = window.location.hash; // #/uuid
@@ -47,6 +49,14 @@ function getIDFromHash(): string | null {
 export function useWS() {
   useEffect(() => {
     ws.connect();
+    // One-shot per session: re-resume the AudioContext when the tab is
+    // foregrounded after a long sleep. The actual start/stop is gated on
+    // the server-side preference (see the `config` event handler below).
+    installKeepAliveAutoResume();
+    // Re-arm the sitter loop if the operator had it on before reload.
+    // First tick happens after the saved interval — no risk of a flurry
+    // of resume messages on every reload.
+    installSitterAutoRestore();
 
     const onHashChange = () => {
       const id = getIDFromHash();
@@ -290,6 +300,16 @@ export function useWS() {
         if (cfg.theme) {
           applyTheme(cfg.theme);
         }
+        // Sync the WebAudio keep-alive runtime to the server preference.
+        // Backend resolves nil → true, so we treat anything other than an
+        // explicit false as "ON". AudioContext requires a user gesture;
+        // if startKeepAlive runs before the user has clicked anything in
+        // the page, the AudioContext is constructed in suspended state —
+        // installKeepAliveAutoResume + the visibilitychange listener
+        // handle the resume once a gesture lands.
+        const wantOn = cfg.keepAliveEnabled !== false;
+        if (wantOn && !isKeepAliveRunning()) startKeepAlive();
+        else if (!wantOn && isKeepAliveRunning()) stopKeepAlive();
         // Restore recent models from server (persisted across restarts)
         if (cfg.recentLargeModels?.length) {
           const keys = cfg.recentLargeModels.map(m => `${m.Provider}:::${m.Model}`);

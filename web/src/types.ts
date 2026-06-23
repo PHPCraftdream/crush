@@ -155,6 +155,11 @@ export interface ConfigPayload {
   initializeAs?: string;
   version?: string;
   cwd?: string;
+  // Server-resolved keep-alive preference: backend defaults nil → true and
+  // always sends an explicit bool, so this is non-nullable in practice
+  // (kept optional only to survive transitional reloads against an older
+  // server build).
+  keepAliveEnabled?: boolean;
 }
 
 export interface SkillInfo {

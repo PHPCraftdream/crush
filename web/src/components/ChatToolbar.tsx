@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
 import { useStore } from "@nanostores/react";
-import { Minimize2, Zap, ShieldOff, X, CheckCheck, ScrollText, Plug, Sun, Moon, Settings, ServerCog, FileText } from "lucide-react";
+import { Minimize2, Zap, ShieldOff, X, CheckCheck, ScrollText, Plug, Sun, Moon, Settings, ServerCog, FileText, Headphones, Eye } from "lucide-react";
+import { $sitter, stopSitter } from "../sitter";
 import {
   $sessions,
   $activeSessionID,
@@ -12,6 +13,7 @@ import {
   summarizeSession,
   cancelQueuedSummarize,
   setTheme,
+  setKeepAliveEnabled,
   getDefaultModelKey,
 } from "../store";
 import { ModelSelector, buildModelList } from "./ModelSelector";
@@ -132,6 +134,7 @@ export function ChatToolbar() {
   const summarizeQueued = useStore($summarizeQueued);
   const yolo = useStore($yolo);
   const config = useStore($config);
+  const sitter = useStore($sitter);
 
   // Modal state
   const [showSystemPrompt, setShowSystemPrompt] = useState(false);
@@ -154,6 +157,9 @@ export function ChatToolbar() {
   function toggleTheme() {
     setTheme(isDark ? "light" : "dark");
   }
+  // Default ON when the server omits the field (older backend) or sends
+  // explicit true; OFF only when the operator has explicitly disabled it.
+  const keepAliveOn = config?.keepAliveEnabled !== false;
 
   const totalTokens = activeSession ? activeSession.PromptTokens + activeSession.CompletionTokens : 0;
   const isSummarized = !!activeSession?.SummaryMessageID;
@@ -318,6 +324,43 @@ export function ChatToolbar() {
         >
           {isDark ? <Sun size={14} /> : <Moon size={14} />}
         </button>
+
+        {/* BT keep-alive: tiny inaudible WebAudio loop that prevents
+            Bluetooth headphones from suspending the audio device during
+            long agent runs (otherwise they eat the first second of any
+            real notification). Backed by Options.KeepAliveEnabled in the
+            global crush.json; default ON. */}
+        <button
+          data-test-id="header-keepalive-toggle"
+          onClick={() => setKeepAliveEnabled(!keepAliveOn)}
+          title={keepAliveOn
+            ? "BT keep-alive ON — inaudible audio loop keeps Bluetooth headphones awake. Click to disable."
+            : "BT keep-alive OFF — Bluetooth headphones may suspend during silent periods. Click to enable."}
+          className={`flex items-center justify-center w-8 h-8 rounded-lg border transition-colors ${
+            keepAliveOn
+              ? "bg-yellow/10 border-yellow/40 text-yellow hover:bg-yellow/20"
+              : "bg-base-overlay border-surface text-text-subtle hover:border-accent/50 hover:text-text"
+          }`}
+        >
+          <Headphones size={14} />
+        </button>
+
+        {/* Sitter pill: visible only while the auto-resume loop is armed.
+            Shows the session it's watching (initials from the title) and
+            the wake interval. Click to disarm. Toggled from the chat input
+            via `/sitter [N]`. */}
+        {sitter.running && (
+          <button
+            data-test-id="header-sitter-pill"
+            onClick={() => stopSitter()}
+            title={`Sitter armed — checking session every ${sitter.intervalMin}m. Resumes the agent if it stalls AND there are open todos. Click to disable. (Or type /sitter in the chat.)`}
+            className="flex items-center gap-1.5 text-xs font-medium rounded-lg px-2.5 py-1.5 border bg-accent/10 border-accent/40 text-accent hover:bg-red/10 hover:border-red/40 hover:text-red transition-colors"
+          >
+            <Eye size={13} />
+            <span>Sitter {sitter.intervalMin}m</span>
+            <X size={11} className="opacity-60" />
+          </button>
+        )}
 
         {isBusy && (
           <div className="flex items-center gap-2 animate-pulse-dots px-2" title={activeLargeModelName ? `Running ${activeLargeModelName}…` : "Agent is working…"}>
