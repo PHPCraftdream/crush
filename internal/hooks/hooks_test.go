@@ -748,6 +748,13 @@ func TestParseStdoutClaudeCodeFormat(t *testing.T) {
 		require.Equal(t, DecisionNone, r.Decision)
 	})
 
+	t.Run("additionalContext bridges onto Context", func(t *testing.T) {
+		t.Parallel()
+		r := parseStdout(`{"hookSpecificOutput":{"permissionDecision":"allow","additionalContext":"extra info for the model"}}`)
+		require.Equal(t, DecisionAllow, r.Decision)
+		require.Equal(t, "extra info for the model", r.Context)
+	})
+
 	t.Run("crush format still works", func(t *testing.T) {
 		t.Parallel()
 		r := parseStdout(`{"decision":"allow","context":"hello"}`)

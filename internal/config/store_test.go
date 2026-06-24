@@ -495,13 +495,15 @@ func TestAutoReloadDisabledDuringReload(t *testing.T) {
 	}`
 	require.NoError(t, os.WriteFile(configPath, []byte(initialConfig), 0o600))
 
-	// Load will trigger configureProviders which removes anthropic OAuth config
-	// This should NOT cause infinite recursion thanks to autoReloadDisabled guard
+	// Load will trigger configureProviders which removes anthropic OAuth config.
+	// This should NOT cause infinite recursion thanks to the reloadMu guard
+	// (the re-entrant auto-reload is skipped via TryLock).
 	store, err := Load(dir, dir, false)
 	require.NoError(t, err)
 
-	// Verify the store loaded successfully and autoReloadDisabled was unset
-	require.False(t, store.autoReloadDisabled)
+	// Verify the store loaded successfully and reloadMu was released.
+	require.True(t, store.reloadMu.TryLock(), "reloadMu should be free after Load")
+	store.reloadMu.Unlock()
 
 	// Capture snapshot and verify reload also works without recursion
 	store.globalDataPath = configPath
@@ -514,8 +516,9 @@ func TestAutoReloadDisabledDuringReload(t *testing.T) {
 	err = store.ReloadFromDisk(context.Background())
 	require.NoError(t, err)
 
-	// Verify reload completed successfully
-	require.False(t, store.autoReloadDisabled, "autoReloadDisabled should be false after ReloadFromDisk")
+	// Verify reload completed successfully and reloadMu was released.
+	require.True(t, store.reloadMu.TryLock(), "reloadMu should be free after ReloadFromDisk")
+	store.reloadMu.Unlock()
 }
 
 // TestSetConfigFields_AutoReloadsAtomically verifies that SetConfigFields writes

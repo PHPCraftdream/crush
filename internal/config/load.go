@@ -15,12 +15,15 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"charm.land/catwalk/pkg/catwalk"
 	"github.com/charmbracelet/crush/internal/agent/cliprovider"
 	"github.com/charmbracelet/crush/internal/agent/hyper"
 	"github.com/charmbracelet/crush/internal/csync"
+	"github.com/charmbracelet/crush/internal/discover"
 	"github.com/charmbracelet/crush/internal/env"
 	"github.com/charmbracelet/crush/internal/filepathext"
 	"github.com/charmbracelet/crush/internal/fsext"
@@ -110,12 +113,13 @@ func Load(workingDir, dataDir string, debug bool) (*ConfigStore, error) {
 	valueResolver := NewShellVariableResolver(env)
 	store.resolver = valueResolver
 
-	// Disable auto-reload during initial load to prevent nested calls from
-	// config-modifying operations inside configureProviders.
-	store.autoReloadDisabled = true
-	defer func() { store.autoReloadDisabled = false }()
+	// Hold reloadMu during the initial load so that auto-reload triggered by
+	// config-modifying operations inside configureProviders (e.g.
+	// RemoveConfigField) is skipped instead of recursing.
+	store.reloadMu.Lock()
+	defer store.reloadMu.Unlock()
 
-	if err := cfg.configureProviders(store, env, valueResolver, store.knownProviders); err != nil {
+	if err := cfg.configureProviders(context.Background(), store, env, valueResolver, store.knownProviders); err != nil {
 		return nil, fmt.Errorf("failed to configure providers: %w", err)
 	}
 
@@ -173,7 +177,7 @@ func PushPopCrushEnv() func() {
 	return restore
 }
 
-func (c *Config) configureProviders(store *ConfigStore, env env.Env, resolver VariableResolver, knownProviders []catwalk.Provider) error {
+func (c *Config) configureProviders(ctx context.Context, store *ConfigStore, env env.Env, resolver VariableResolver, knownProviders []catwalk.Provider) error {
 	knownProviderNames := make(map[string]bool)
 	restore := PushPopCrushEnv()
 	defer restore()
@@ -268,9 +272,11 @@ func (c *Config) configureProviders(store *ConfigStore, env env.Env, resolver Va
 		switch {
 		case p.ID == catwalk.InferenceProviderAnthropic && config.OAuthToken != nil:
 			// Claude Code subscription is not supported anymore. Remove to show onboarding.
-			if !store.reloadInProgress {
-				store.RemoveConfigField(ScopeGlobal, "providers.anthropic")
-			}
+			// RemoveConfigField persists the deletion to disk; its auto-reload
+			// is skipped because the caller (Load / reloadFromDiskLocked) holds
+			// reloadMu. The in-memory state stays consistent via Providers.Del
+			// below, and any racing reload re-reads the removal from disk.
+			store.RemoveConfigField(ScopeGlobal, "providers.anthropic")
 			c.Providers.Del(string(p.ID))
 			continue
 		case p.ID == catwalk.InferenceProviderCopilot && config.OAuthToken != nil:
@@ -361,6 +367,55 @@ func (c *Config) configureProviders(store *ConfigStore, env env.Env, resolver Va
 		knownProviderNames[cliprovider.ProviderID] = true // skip custom-provider validation
 	}
 
+	// Discover models concurrently for custom providers that need it.
+	// A provider needs discovery when discover_models is explicitly true,
+	// or when the models list is empty (auto-trigger, unless opted out).
+	type discoveryResult struct {
+		models []catwalk.Model
+		err    error
+	}
+
+	discoveryResults := make(map[string]discoveryResult)
+	var discoverMu sync.Mutex
+	var discoverWg sync.WaitGroup
+
+	discoverCtx, discoverCancel := context.WithTimeout(ctx, 3*time.Second)
+	for id, pc := range c.Providers.Seq2() {
+		if knownProviderNames[id] {
+			continue
+		}
+		if pc.Disable || pc.BaseURL == "" {
+			continue
+		}
+		wantsDiscovery := pc.AutoDiscoverModels != nil && *pc.AutoDiscoverModels
+		autoTrigger := len(pc.Models) == 0 && (pc.AutoDiscoverModels == nil || *pc.AutoDiscoverModels)
+		if !wantsDiscovery && !autoTrigger {
+			continue
+		}
+		providerID := cmp.Or(pc.ID, id)
+		dcfg := discover.Config{
+			ID:             providerID,
+			BaseURL:        pc.BaseURL,
+			APIKey:         pc.APIKey,
+			ExtraHeaders:   pc.ExtraHeaders,
+			ExistingModels: pc.Models,
+		}
+		providerType := cmp.Or(pc.Type, catwalk.TypeOpenAICompat)
+		discoverWg.Go(func() {
+			models, err := discover.DiscoverModels(discoverCtx, dcfg, resolver)
+			if err == nil && len(models) > 0 {
+				if enricher := discover.GetEnricher(string(providerType)); enricher != nil {
+					models, _ = enricher.EnrichModels(discoverCtx, dcfg, resolver, models)
+				}
+			}
+			discoverMu.Lock()
+			discoveryResults[id] = discoveryResult{models: models, err: err}
+			discoverMu.Unlock()
+		})
+	}
+	discoverWg.Wait()
+	discoverCancel()
+
 	// validate the custom providers
 	for id, providerConfig := range c.Providers.Seq2() {
 		if knownProviderNames[id] {
@@ -372,7 +427,9 @@ func (c *Config) configureProviders(store *ConfigStore, env env.Env, resolver Va
 		providerConfig.Name = cmp.Or(providerConfig.Name, id) // Use ID as name if not set
 		// default to OpenAI if not set
 		providerConfig.Type = cmp.Or(providerConfig.Type, catwalk.TypeOpenAICompat)
-		if !slices.Contains(catwalk.KnownProviderTypes(), providerConfig.Type) && providerConfig.Type != hyper.Name {
+		if !slices.Contains(catwalk.KnownProviderTypes(), providerConfig.Type) &&
+			providerConfig.Type != hyper.Name &&
+			!discover.IsKnownCustomProvider(string(providerConfig.Type)) {
 			slog.Warn("Skipping custom provider due to unsupported provider type", "provider", id)
 			c.Providers.Del(id)
 			continue
@@ -391,6 +448,22 @@ func (c *Config) configureProviders(store *ConfigStore, env env.Env, resolver Va
 			c.Providers.Del(id)
 			continue
 		}
+
+		// Apply discovery results if available.
+		if result, ok := discoveryResults[id]; ok {
+			if result.err != nil {
+				slog.Warn("Model discovery failed", "provider", id, "error", result.err)
+				if len(providerConfig.Models) == 0 {
+					slog.Warn("Skipping provider with no models after failed discovery", "provider", id)
+					c.Providers.Del(id)
+					continue
+				}
+			} else if len(result.models) > 0 {
+				providerConfig.Models = result.models
+				slog.Info("Discovered models for provider", "provider", id, "count", len(result.models))
+			}
+		}
+
 		if len(providerConfig.Models) == 0 {
 			slog.Warn("Skipping custom provider because the provider has no models", "provider", id)
 			c.Providers.Del(id)

@@ -309,6 +309,30 @@ func (a *sessionAgent) SetTimeoutOptions(extendsOnProgress bool, hardCap time.Du
 	a.timeoutHardCap = hardCap
 }
 
+// logProviderWarnings emits each fantasy CallWarning from a step at WARN
+// level. Without this, warnings such as malformed-tool-call input
+// sanitization are silently dropped and never reach the logs. Optional
+// fields (setting, tool, details) are attached only when present so the
+// line stays terse for the common type+message case.
+func logProviderWarnings(warnings []fantasy.CallWarning) {
+	for _, w := range warnings {
+		attrs := []any{"type", w.Type}
+		if w.Message != "" {
+			attrs = append(attrs, "message", w.Message)
+		}
+		if w.Setting != "" {
+			attrs = append(attrs, "setting", w.Setting)
+		}
+		if w.Tool != nil && w.Tool.GetName() != "" {
+			attrs = append(attrs, "tool", w.Tool.GetName())
+		}
+		if w.Details != "" {
+			attrs = append(attrs, "details", w.Details)
+		}
+		slog.Warn("Provider warning", attrs...)
+	}
+}
+
 func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy.AgentResult, error) {
 	if call.Prompt == "" && !message.ContainsTextAttachment(call.Attachments) {
 		return nil, ErrEmptyPrompt
@@ -864,6 +888,10 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 		},
 		OnStepFinish: func(stepResult fantasy.StepResult) error {
 			bumpActivity()
+			// Surface provider CallWarnings (malformed tool-call sanitization,
+			// unsupported settings, etc.) that fantasy otherwise discards
+			// silently. Visible in logs only — does not interrupt the turn.
+			logProviderWarnings(stepResult.Warnings)
 			// Fork patch: batch 8 — stop the checkpoint ticker BEFORE the
 			// final write so the ticker doesn't race with OnStepFinish.
 			stopCheckpoint()
@@ -1773,14 +1801,23 @@ func (a *sessionAgent) generateTitle(ctx context.Context, sessionID string, user
 		return
 	}
 
+	// Ensure the session always gets a title even if every path below
+	// fails or the context is cancelled before we finish. WithoutCancel so
+	// the fallback still lands when the caller's ctx is already done.
+	var titleSaved bool
+	defer func() {
+		if !titleSaved {
+			fallbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancel()
+			if err := a.sessions.Rename(fallbackCtx, sessionID, DefaultSessionName); err != nil {
+				slog.Error("Failed to save fallback session title", "error", err)
+			}
+		}
+	}()
+
 	smallModel := a.smallModel.Get()
 	largeModel := a.largeModel.Get()
 	systemPromptPrefix := a.systemPromptPrefix.Get()
-
-	var maxOutputTokens int64 = 40
-	if smallModel.CatwalkCfg.CanReason {
-		maxOutputTokens = smallModel.CatwalkCfg.DefaultMaxTokens
-	}
 
 	newAgent := func(m fantasy.LanguageModel, p []byte, tok int64) fantasy.Agent {
 		return fantasy.NewAgent(
@@ -1804,41 +1841,46 @@ func (a *sessionAgent) generateTitle(ctx context.Context, sessionID string, user
 		},
 	}
 
-	// Use the small model to generate the title.
-	model := smallModel
-	agent := newAgent(model.Model, titlePrompt, maxOutputTokens)
-	resp, err := agent.Stream(ctx, streamCall)
-	if err == nil {
-		// We successfully generated a title with the small model.
-		slog.Debug("Generated title with small model")
-	} else {
-		// It didn't work. Let's try with the big model.
-		slog.Error("Error generating title with small model; trying big model", "err", err)
-		model = largeModel
-		agent = newAgent(model.Model, titlePrompt, maxOutputTokens)
-		resp, err = agent.Stream(ctx, streamCall)
-		if err == nil {
-			slog.Debug("Generated title with large model")
-		} else {
-			// Welp, the large model didn't work either. Use the default
-			// session name and return.
-			slog.Error("Error generating title with large model", "err", err)
-			saveErr := a.sessions.Rename(ctx, sessionID, DefaultSessionName)
-			if saveErr != nil {
-				slog.Error("Failed to save session title", "error", saveErr)
-			}
-			return
-		}
+	// Try the small model first, then fall back to the large one. A
+	// response that hit the token limit (FinishReasonLength) is treated as
+	// a failure so we retry rather than save a truncated title.
+	type modelAttempt struct {
+		name  string
+		model Model
+	}
+	attempts := []modelAttempt{
+		{"small", smallModel},
+		{"large", largeModel},
 	}
 
-	if resp == nil {
-		// Actually, we didn't get a response so we can't. Use the default
-		// session name and return.
-		slog.Error("Response is nil; can't generate title")
-		saveErr := a.sessions.Rename(ctx, sessionID, DefaultSessionName)
-		if saveErr != nil {
-			slog.Error("Failed to save session title", "error", saveErr)
+	var resp *fantasy.AgentResult
+	var err error
+	var model Model
+	var success bool
+	for _, attempt := range attempts {
+		tok := int64(40)
+		if attempt.model.CatwalkCfg.CanReason {
+			tok = attempt.model.CatwalkCfg.DefaultMaxTokens
 		}
+		agent := newAgent(attempt.model.Model, titlePrompt, tok)
+		resp, err = agent.Stream(ctx, streamCall)
+		if err == nil && resp != nil && resp.Response.FinishReason != fantasy.FinishReasonLength {
+			model = attempt.model
+			slog.Debug("Generated title with " + attempt.name + " model")
+			success = true
+			break
+		}
+		switch {
+		case err != nil:
+			slog.Error("Error generating title with "+attempt.name+" model; trying next", "err", err)
+		case resp == nil:
+			slog.Error("Title generation returned nil response with " + attempt.name + " model; trying next")
+		default:
+			slog.Error("Title generation hit token limit with " + attempt.name + " model; trying next")
+		}
+	}
+	if !success {
+		// The deferred fallback will save the default session name.
 		return
 	}
 
@@ -1892,6 +1934,7 @@ func (a *sessionAgent) generateTitle(ctx context.Context, sessionID string, user
 		slog.Error("Failed to save session title and usage", "error", saveErr)
 		return
 	}
+	titleSaved = true
 }
 
 func (a *sessionAgent) openrouterCost(metadata fantasy.ProviderMetadata) *float64 {

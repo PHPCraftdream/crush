@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sync"
 
 	"charm.land/catwalk/pkg/catwalk"
 	hyperp "github.com/charmbracelet/crush/internal/agent/hyper"
@@ -48,8 +49,13 @@ type ConfigStore struct {
 	overrides          RuntimeOverrides
 	trackedConfigPaths []string                // unique, normalized config file paths
 	snapshots          map[string]fileSnapshot // path -> snapshot at last capture
-	autoReloadDisabled bool                    // set during load/reload to prevent re-entrancy
-	reloadInProgress   bool                    // set during reload to avoid disk writes mid-reload
+
+	// reloadMu serialises ReloadFromDisk calls so concurrent reloads (e.g.
+	// the web UI's file watcher racing a config write) cannot tear store
+	// fields against each other. autoReload uses TryLock on reloadMu to
+	// skip a redundant reload when one is already in progress — this also
+	// covers the re-entrant call from configureProviders during a reload.
+	reloadMu sync.Mutex
 }
 
 // Config returns the pure-data config struct (read-only after load).
@@ -148,9 +154,17 @@ func (s *ConfigStore) SetConfigFields(scope Scope, kv map[string]any) error {
 		}
 	}
 
+	// Apply keys in sorted order so the on-disk output is deterministic
+	// regardless of map iteration order (keeps crush.json diffs stable).
+	keys := make([]string, 0, len(kv))
+	for key := range kv {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+
 	newValue := string(data)
-	for key, value := range kv {
-		newValue, err = sjson.Set(newValue, key, value)
+	for _, key := range keys {
+		newValue, err = sjson.Set(newValue, key, kv[key])
 		if err != nil {
 			return fmt.Errorf("failed to set config field %s: %w", key, err)
 		}
@@ -727,14 +741,16 @@ func (s *ConfigStore) ReloadFromDisk(ctx context.Context) error {
 	if s.workingDir == "" {
 		return fmt.Errorf("cannot reload: working directory not set")
 	}
+	s.reloadMu.Lock()
+	defer s.reloadMu.Unlock()
+	return s.reloadFromDiskLocked(ctx)
+}
 
-	s.autoReloadDisabled = true
-	s.reloadInProgress = true
-	defer func() {
-		s.autoReloadDisabled = false
-		s.reloadInProgress = false
-	}()
-
+// reloadFromDiskLocked performs the actual reload. The caller must hold
+// reloadMu, which both serialises concurrent reloads and prevents the
+// re-entrant auto-reload that configureProviders would otherwise trigger
+// via RemoveConfigField mid-reload.
+func (s *ConfigStore) reloadFromDiskLocked(ctx context.Context) error {
 	configPaths := lookupConfigs(s.workingDir)
 	cfg, loadedPaths, err := loadFromConfigPaths(configPaths)
 	if err != nil {
@@ -774,7 +790,7 @@ func (s *ConfigStore) ReloadFromDisk(ctx context.Context) error {
 		return fmt.Errorf("failed to load providers during reload: %w", err)
 	}
 
-	if err := cfg.configureProviders(s, env, resolver, providers); err != nil {
+	if err := cfg.configureProviders(ctx, s, env, resolver, providers); err != nil {
 		return fmt.Errorf("failed to configure providers during reload: %w", err)
 	}
 
@@ -819,11 +835,21 @@ func (s *ConfigStore) ReloadFromDisk(ctx context.Context) error {
 }
 
 func (s *ConfigStore) autoReload(ctx context.Context) error {
-	if s.autoReloadDisabled {
-		return nil
-	}
 	if s.workingDir == "" {
+		return nil // Expected skip: working directory not set.
+	}
+	// Skip if a reload is already in progress. This covers both concurrent
+	// auto-reloads after parallel writes and the re-entrant call from
+	// configureProviders during a reload (which holds reloadMu).
+	//
+	// Note: a write that completes after the in-progress reload has already
+	// read the config file won't be reflected in memory until the next
+	// reload. That's acceptable — writes are rare and the next user action
+	// or file-watch tick picks it up. Callers needing guaranteed freshness
+	// after a write should call ReloadFromDisk explicitly.
+	if !s.reloadMu.TryLock() {
 		return nil
 	}
-	return s.ReloadFromDisk(ctx)
+	defer s.reloadMu.Unlock()
+	return s.reloadFromDiskLocked(ctx)
 }
