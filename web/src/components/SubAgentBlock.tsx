@@ -59,12 +59,15 @@ export const SubAgentBlock = memo(function SubAgentBlock({
   toolCallID: string;
   prompt: string;
 }) {
-  // Backend creates the sub-agent session with `ID = toolCallID`
-  // (see internal/session/session.go CreateTaskSession), so the
-  // sub-session is keyed by the spawning tool_call ID directly.
-  // The `messageID` prop is unused but kept for future linking.
-  void messageID;
-  const subSessionID = toolCallID;
+  // Backend keys the sub-agent session as `${messageID}$$${toolCallID}`
+  // (see internal/session/session.go CreateAgentToolSessionID), and the WS
+  // layer stores its messages + busy-state under that exact composite ID
+  // (useWS.ts: registerSubAgentSession / upsertSubAgentMessage). We MUST look
+  // up by the same key — using toolCallID alone silently misses every event,
+  // which left the block permanently empty ("Starting agent..."). Fall back
+  // to the bare toolCallID only when messageID is unavailable (defensive;
+  // should not happen for a live sub-agent).
+  const subSessionID = messageID ? `${messageID}$$${toolCallID}` : toolCallID;
   const allSubMessages = useStore($subAgentMessages);
   const busySessions = useStore($busySessions);
   const messages = allSubMessages.get(subSessionID) ?? [];

@@ -531,7 +531,7 @@ const ActionRow = memo(function ActionRow({ item, isCurrent, suppressAutoCurrent
 });
 
 interface ToolActivityGroupProps {
-  items: { part: ContentPart; idx: number; createdAt?: number }[];
+  items: { part: ContentPart; idx: number; createdAt?: number; messageID?: string }[];
   live: boolean;
   // True when this group is the most recent activity in the transcript
   // (i.e. nothing rendered after it). When false, the auto-rule collapses
@@ -624,19 +624,19 @@ export const ToolActivityGroup = memo(function ToolActivityGroup({ items, live, 
   // tool_result if any.
   const { actions, rawAgentParts } = useMemo(() => {
     const actions: ActionItem[] = [];
-    const rawAgentParts: { part: ContentPart; idx: number }[] = [];
+    const rawAgentParts: { part: ContentPart; idx: number; messageID?: string }[] = [];
     const indexByCallID = new Map<string, number>();
-    for (const { part, idx, createdAt } of items) {
+    for (const { part, idx, createdAt, messageID } of items) {
       if (part.type === "thinking") {
         const text = (part as { type: "thinking"; Thinking: string }).Thinking ?? "";
         actions.push({ kind: "thinking", text, idx, key: `think-${idx}`, createdAt });
       } else if (part.type === "tool_call") {
-        if (part.Name === "agent") { rawAgentParts.push({ part, idx }); continue; }
+        if (part.Name === "agent") { rawAgentParts.push({ part, idx, messageID }); continue; }
         const a: ActionItem = { kind: "tool", callPart: part, idx, key: `call-${part.ID}`, createdAt };
         indexByCallID.set(part.ID, actions.length);
         actions.push(a);
       } else if (part.type === "tool_result") {
-        if (part.Name === "agent") { rawAgentParts.push({ part, idx }); continue; }
+        if (part.Name === "agent") { rawAgentParts.push({ part, idx, messageID }); continue; }
         const pos = indexByCallID.get(part.ToolCallID);
         if (pos !== undefined) {
           const slot = actions[pos];
@@ -667,11 +667,11 @@ export const ToolActivityGroup = memo(function ToolActivityGroup({ items, live, 
   // SubAgent parts always render in their own (existing) component, in their
   // original order at the END of the group so they don't get swallowed by the
   // collapse toggle. They're rare in practice — usually zero per group.
-  const renderAgents = () => rawAgentParts.map(({ part, idx }) => {
+  const renderAgents = () => rawAgentParts.map(({ part, idx, messageID }) => {
     if (part.type === "tool_call") {
       let prompt = "";
       try { prompt = (JSON.parse(part.Input) as { prompt?: string }).prompt ?? part.Input; } catch { prompt = part.Input; }
-      return <SubAgentBlock key={`a-${idx}`} messageID="" toolCallID={part.ID} prompt={prompt} />;
+      return <SubAgentBlock key={`a-${idx}`} messageID={messageID ?? ""} toolCallID={part.ID} prompt={prompt} />;
     }
     return null;
   });
@@ -1109,7 +1109,7 @@ const AssistantContent = memo(function AssistantContent({
             // collapsible row per call+result pair, last row open by default
             // (the "current action"), prior rows collapsed. User can pin any
             // row open/closed and the auto-rule stops touching that row.
-            <ToolActivityGroup items={block.items} live={isLive} />
+            <ToolActivityGroup items={block.items.map((it) => ({ ...it, messageID: message.ID }))} live={isLive} />
           ) : (
             block.items.map(({ part, idx }) => (
               <Part key={idx} part={part} index={idx} isUser={false} messageID={message.ID} thinkingDone={block.thinkingDone} partialWorkDone={partialWorkDone} />

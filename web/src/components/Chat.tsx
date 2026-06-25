@@ -141,7 +141,7 @@ interface PartLike { type: string; Reason?: string }
 // BurstPart carries each tool/thinking part alongside its source message's
 // CreatedAt. Needed so each row in ToolActivityGroup can render its own
 // HH:MM:SS timestamp — the part itself has no time field, the message does.
-type BurstPart = { part: ContentPart; createdAt: number };
+type BurstPart = { part: ContentPart; createdAt: number; messageID: string };
 
 type RenderItem =
   | { kind: "message"; message: Msg; index: number }
@@ -195,7 +195,7 @@ function buildRenderItems(messages: Msg[]): RenderItem[] {
     if (m.Role === "tool") {
       if (burstFirstID === "") burstFirstID = m.ID;
       for (const p of m.Parts) {
-        if (p.type === "tool_result") burstParts.push({ part: p, createdAt: m.CreatedAt });
+        if (p.type === "tool_result") burstParts.push({ part: p, createdAt: m.CreatedAt, messageID: m.ID });
       }
       return;
     }
@@ -222,7 +222,7 @@ function buildRenderItems(messages: Msg[]): RenderItem[] {
       if (burstFirstID === "") burstFirstID = m.ID;
       for (const p of m.Parts) {
         if (p.type === "tool_call" || p.type === "tool_result" || p.type === "thinking") {
-          burstParts.push({ part: p as ContentPart, createdAt: m.CreatedAt });
+          burstParts.push({ part: p as ContentPart, createdAt: m.CreatedAt, messageID: m.ID });
         }
       }
       return;
@@ -245,7 +245,7 @@ function ToolRun({ parts, firstMsgID, sessionID, isLive, isCurrent }: { parts: B
   // needed here, just give each part a stable index for its key. createdAt
   // travels with each part so action rows can render per-row timestamps.
   const items = useMemo(
-    () => parts.map((bp, idx) => ({ part: bp.part, idx, createdAt: bp.createdAt })),
+    () => parts.map((bp, idx) => ({ part: bp.part, idx, createdAt: bp.createdAt, messageID: bp.messageID })),
     [parts]
   );
   const startedAt = useMemo(() => {
