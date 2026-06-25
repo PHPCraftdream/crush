@@ -50,6 +50,7 @@ type BackgroundShell struct {
 	Description string
 	Shell       *Shell
 	WorkingDir  string
+	StartTime   time.Time
 	ctx         context.Context
 	cancel      context.CancelFunc
 	stdout      *syncBuffer
@@ -106,6 +107,7 @@ func (m *BackgroundShellManager) Start(ctx context.Context, workingDir string, b
 		Command:     command,
 		Description: description,
 		WorkingDir:  workingDir,
+		StartTime:   time.Now(),
 		Shell:       shell,
 		ctx:         shellCtx,
 		cancel:      cancel,
@@ -241,5 +243,38 @@ func (bs *BackgroundShell) WaitContext(ctx context.Context) bool {
 		return true
 	case <-ctx.Done():
 		return false
+	}
+}
+
+// Elapsed returns the wall-clock runtime of the background shell. For a job
+// that has completed this is start→now (not start→finish); callers polling a
+// finished job see a stable, monotonically increasing value which is fine for
+// a "how long has this been going" status hint.
+func (bs *BackgroundShell) Elapsed() time.Duration {
+	if bs.StartTime.IsZero() {
+		return 0
+	}
+	return time.Since(bs.StartTime)
+}
+
+// WaitForChange blocks until the job finishes, total buffered output grows
+// beyond sinceLen bytes, or ctx ends. It polls the buffered output on a short
+// ticker — there is no event bus for incremental writes, so the granularity
+// is the ticker interval (250ms). Returns without error from any branch.
+func (bs *BackgroundShell) WaitForChange(ctx context.Context, sinceLen int) {
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-bs.done:
+			return
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			so, se, _, _ := bs.GetOutput()
+			if len(so)+len(se) > sinceLen {
+				return
+			}
+		}
 	}
 }

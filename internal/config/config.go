@@ -322,6 +322,16 @@ type Options struct {
 	// model may legitimately pause for minutes while reasoning. 0 (the
 	// default when omitted) keeps the 10-minute built-in value.
 	StreamIdleTimeoutSeconds int `json:"stream_idle_timeout_seconds,omitempty" jsonschema:"description=Override the stream watchdog idle timeout in seconds. Default 600 (10 min). Raise further for extreme extended-thinking models that pause longer than 10 min mid-reasoning; lower (e.g. 180) for the old aggressive behaviour. 0 = use default.,default=0,example=900"`
+	// StreamToolTimeoutSeconds bounds the stream watchdog's tool-pause
+	// (never-freeze backstop). The watchdog pauses its idle timer while a
+	// tool executes (between OnToolCall and OnToolResult) so a long
+	// `cargo build`/test isn't a false provider stall — but that pause was
+	// previously unbounded, freezing the turn on a stuck tool (hung MCP
+	// tool, blocking job_output --wait). Past this cap the watchdog fires
+	// with a distinct "tool timeout" reason so the turn ends. 0 (default)
+	// keeps the built-in 900s (15m) backstop; raise it for very long
+	// synchronous tools.
+	StreamToolTimeoutSeconds int `json:"stream_tool_timeout_seconds,omitempty" jsonschema:"description=Max seconds a single tool may run while the stream watchdog is paused before it force-cancels the turn (never-freeze backstop). Omit to use the built-in default (900s = 15m). Raise for very long synchronous tools.,default=0,example=1800"`
 	// StreamStallRetries is the number of times to automatically retry a
 	// turn that ended in a transient provider failure (stream stall, empty
 	// stream, overload, 5xx, network). Embodies "solve it ourselves before

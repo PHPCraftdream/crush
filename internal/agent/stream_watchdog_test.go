@@ -23,14 +23,9 @@ func TestStreamWatchdog_BumpKeepsItAlive(t *testing.T) {
 	const tick = 10 * time.Millisecond
 
 	var fired atomic.Int32
-	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(time.Duration) {
+	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(time.Duration, bool) {
 		fired.Add(1)
-	}, false, 0)
-	defer func() {
-		cancel()
-		<-wd.done
-	}()
-
+	}, false, 0, 0)
 	// Bump every 20ms for ~300ms — well past idle*3 worth of ticks.
 	// Watchdog must NOT fire.
 	stop := time.After(300 * time.Millisecond)
@@ -60,10 +55,10 @@ func TestStreamWatchdog_FiresOnNoActivity(t *testing.T) {
 
 	var fired atomic.Int32
 	var firedIdle atomic.Int64
-	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(observedIdle time.Duration) {
+	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(observedIdle time.Duration, _ bool) {
 		fired.Add(1)
 		firedIdle.Store(int64(observedIdle))
-	}, false, 0)
+	}, false, 0, 0)
 
 	// Wait long enough for the watchdog to fire on its own.
 	select {
@@ -87,9 +82,9 @@ func TestStreamWatchdog_ExitsCleanlyOnCtxCancel(t *testing.T) {
 	const tick = 10 * time.Millisecond
 
 	var fired atomic.Int32
-	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(time.Duration) {
+	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(time.Duration, bool) {
 		fired.Add(1)
-	}, false, 0)
+	}, false, 0, 0)
 
 	// Cancel ctx externally — watchdog must exit promptly without firing.
 	time.Sleep(40 * time.Millisecond)
@@ -115,7 +110,7 @@ func TestStreamWatchdog_BumpAfterFireIsHarmless(t *testing.T) {
 	const idle = 30 * time.Millisecond
 	const tick = 5 * time.Millisecond
 
-	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(time.Duration) {}, false, 0)
+	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(time.Duration, bool) {}, false, 0, 0)
 
 	// Let it fire.
 	<-wd.done
@@ -142,14 +137,9 @@ func TestStreamWatchdog_PausedDuringToolExecution(t *testing.T) {
 	const tick = 10 * time.Millisecond
 
 	var fired atomic.Int32
-	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(time.Duration) {
+	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(time.Duration, bool) {
 		fired.Add(1)
-	}, false, 0)
-	defer func() {
-		cancel()
-		<-wd.done
-	}()
-
+	}, false, 0, 0)
 	// A tool starts and runs WAY past idleTimeout with zero provider
 	// activity — the watchdog must NOT fire.
 	wd.toolStarted()
@@ -183,14 +173,9 @@ func TestStreamWatchdog_PauseCountsParallelTools(t *testing.T) {
 	const tick = 10 * time.Millisecond
 
 	var fired atomic.Int32
-	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(time.Duration) {
+	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(time.Duration, bool) {
 		fired.Add(1)
-	}, false, 0)
-	defer func() {
-		cancel()
-		<-wd.done
-	}()
-
+	}, false, 0, 0)
 	// Two parallel tool calls in flight; finishing ONE must keep the
 	// watchdog paused (counter still > 0).
 	wd.toolStarted()
@@ -217,9 +202,9 @@ func TestStreamWatchdog_ExtendsOnProgress(t *testing.T) {
 	const hardCap = 500 * time.Millisecond
 
 	var fired atomic.Int32
-	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(time.Duration) {
+	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(time.Duration, bool) {
 		fired.Add(1)
-	}, true, hardCap)
+	}, true, hardCap, 0)
 	defer func() {
 		cancel()
 		<-wd.done
@@ -253,9 +238,9 @@ func TestStreamWatchdog_ExtendsOnProgress_FiresWhenIdle(t *testing.T) {
 	const hardCap = 500 * time.Millisecond
 
 	var fired atomic.Int32
-	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(time.Duration) {
+	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(time.Duration, bool) {
 		fired.Add(1)
-	}, true, hardCap)
+	}, true, hardCap, 0)
 
 	// Bump once to extend, then stop.
 	wd.bump()
@@ -281,9 +266,9 @@ func TestStreamWatchdog_HardCapRespected(t *testing.T) {
 	const hardCap = 200 * time.Millisecond
 
 	var fired atomic.Int32
-	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(time.Duration) {
+	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(time.Duration, bool) {
 		fired.Add(1)
-	}, true, hardCap)
+	}, true, hardCap, 0)
 
 	start := time.Now()
 
@@ -308,4 +293,88 @@ loop:
 	// somewhere between 200-250ms.
 	assert.LessOrEqual(t, elapsed, 350*time.Millisecond,
 		"watchdog must fire near the hard cap")
+}
+
+// TestStreamWatchdog_ToolPauseBoundedByCap verifies the never-freeze
+// backstop: when toolMaxDuration > 0 and a tool stays in flight past that
+// cap, the watchdog fires with toolTimeout==true instead of pausing
+// forever. This is what keeps a stuck tool (hung MCP tool, blocking
+// job_output --wait) from freezing the whole agent turn.
+func TestStreamWatchdog_ToolPauseBoundedByCap(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(t.Context())
+
+	const idle = 5 * time.Second // large — idle path must NOT fire
+	const tick = 10 * time.Millisecond
+	const toolMaxDuration = 60 * time.Millisecond
+
+	var fired atomic.Int32
+	var firedToolTimeout atomic.Bool
+	var firedElapsed atomic.Int64
+	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(elapsed time.Duration, toolTimeout bool) {
+		fired.Add(1)
+		firedToolTimeout.Store(toolTimeout)
+		firedElapsed.Store(int64(elapsed))
+	}, false, 0, toolMaxDuration)
+
+	// A tool starts and runs past toolMaxDuration with zero provider
+	// activity. The watchdog must fire with toolTimeout==true.
+	wd.toolStarted()
+	select {
+	case <-wd.done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("watchdog never fired after toolMaxDuration")
+	}
+
+	assert.Equal(t, int32(1), fired.Load(), "onFire should fire exactly once")
+	assert.True(t, firedToolTimeout.Load(), "toolTimeout must be true when the cap is exceeded")
+	assert.True(t, wd.stalled.Load(), "stalled flag must be true after fire")
+	assert.Error(t, ctx.Err(), "ctx must be cancelled by the watchdog")
+	assert.GreaterOrEqual(t, time.Duration(firedElapsed.Load()), toolMaxDuration,
+		"elapsed passed to onFire must be >= toolMaxDuration")
+}
+
+// TestStreamWatchdog_ToolPauseUnderCapDoesNotFire verifies that a tool
+// running UNDER the cap does not trip the backstop, and that after the
+// tool finishes the watchdog still fires normally on idle.
+func TestStreamWatchdog_ToolPauseUnderCapDoesNotFire(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	const idle = 60 * time.Millisecond
+	const tick = 10 * time.Millisecond
+	const toolMaxDuration = 5 * time.Second // generous — well above the tool runtime
+
+	var fired atomic.Int32
+	var firedToolTimeout atomic.Bool
+	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(_ time.Duration, toolTimeout bool) {
+		fired.Add(1)
+		firedToolTimeout.Store(toolTimeout)
+	}, false, 0, toolMaxDuration)
+	defer func() {
+		cancel()
+		<-wd.done
+	}()
+
+	// Tool runs for a few idle periods — well under the cap. The
+	// watchdog must NOT fire.
+	wd.toolStarted()
+	time.Sleep(idle * 3)
+	assert.Equal(t, int32(0), fired.Load(),
+		"watchdog must not fire while a tool runs under the cap")
+	assert.False(t, wd.stalled.Load())
+	assert.NoError(t, ctx.Err())
+
+	// Tool finishes; with no further activity the watchdog resumes and
+	// must fire on idle afterwards (toolTimeout==false).
+	wd.toolFinished()
+	select {
+	case <-wd.done:
+	case <-time.After(idle + 300*time.Millisecond):
+		t.Fatal("watchdog must fire on idle after the tool finished")
+	}
+	assert.Equal(t, int32(1), fired.Load())
+	assert.False(t, firedToolTimeout.Load(), "the post-tool fire must be an idle fire, not a tool timeout")
+	assert.True(t, wd.stalled.Load())
 }

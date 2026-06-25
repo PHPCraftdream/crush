@@ -328,3 +328,117 @@ func TestBackgroundShell_WaitContext_Canceled(t *testing.T) {
 
 	require.False(t, bgShell.WaitContext(ctx))
 }
+
+// TestBackgroundShell_WaitForChange_ReturnsOnOutputGrowth proves the wait
+// returns promptly when buffered output grows past the supplied baseline,
+// without waiting for the job to finish or the ctx to time out.
+func TestBackgroundShell_WaitForChange_ReturnsOnOutputGrowth(t *testing.T) {
+	t.Parallel()
+
+	bgShell := &BackgroundShell{
+		stdout:    &syncBuffer{},
+		stderr:    &syncBuffer{},
+		done:      make(chan struct{}),
+		StartTime: time.Now(),
+	}
+
+	// Baseline is one byte; we will write more into the buffer.
+	sinceLen := 1
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	t.Cleanup(cancel)
+
+	done := make(chan struct{})
+	go func() {
+		bgShell.WaitForChange(ctx, sinceLen)
+		close(done)
+	}()
+
+	// Give the goroutine a moment to enter the select, then push output.
+	time.Sleep(350 * time.Millisecond)
+	bgShell.stdout.WriteString("hello world")
+
+	select {
+	case <-done:
+		// Expected: returned because output grew past baseline.
+	case <-time.After(2 * time.Second):
+		t.Fatal("WaitForChange did not return after output grew past baseline")
+	}
+}
+
+// TestBackgroundShell_WaitForChange_ReturnsOnCompletion proves the wait
+// returns the moment the job's done channel closes.
+func TestBackgroundShell_WaitForChange_ReturnsOnCompletion(t *testing.T) {
+	t.Parallel()
+
+	bgShell := &BackgroundShell{
+		stdout:    &syncBuffer{},
+		stderr:    &syncBuffer{},
+		done:      make(chan struct{}),
+		StartTime: time.Now(),
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	t.Cleanup(cancel)
+
+	done := make(chan struct{})
+	go func() {
+		// Baseline huge so the only way out is the done channel.
+		bgShell.WaitForChange(ctx, 1<<30)
+		close(done)
+	}()
+
+	time.Sleep(350 * time.Millisecond)
+	close(bgShell.done)
+
+	select {
+	case <-done:
+		// Expected: returned because job completed.
+	case <-time.After(2 * time.Second):
+		t.Fatal("WaitForChange did not return after job completed")
+	}
+}
+
+// TestBackgroundShell_WaitForChange_ReturnsOnCtxDone proves the wait never
+// blocks indefinitely: a ctx that times out (or is canceled) without any
+// output growth or job completion still unblocks the caller.
+func TestBackgroundShell_WaitForChange_ReturnsOnCtxDone(t *testing.T) {
+	t.Parallel()
+
+	bgShell := &BackgroundShell{
+		stdout:    &syncBuffer{},
+		stderr:    &syncBuffer{},
+		done:      make(chan struct{}),
+		StartTime: time.Now(),
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 400*time.Millisecond)
+	t.Cleanup(cancel)
+
+	start := time.Now()
+	// Huge baseline, never-completing job → only ctx.Done() can fire.
+	bgShell.WaitForChange(ctx, 1<<30)
+	elapsed := time.Since(start)
+
+	// Must return ~right after the ctx deadline, not hang.
+	require.Less(t, elapsed, 2*time.Second, "WaitForChange should return when ctx ends")
+}
+
+// TestBackgroundShell_Elapsed confirms Elapsed reports a non-zero duration
+// once StartTime is set, and zero when it is not.
+func TestBackgroundShell_Elapsed(t *testing.T) {
+	t.Parallel()
+
+	t.Run("zero when unset", func(t *testing.T) {
+		t.Parallel()
+		bgShell := &BackgroundShell{}
+		require.Zero(t, bgShell.Elapsed())
+	})
+
+	t.Run("positive when set", func(t *testing.T) {
+		t.Parallel()
+		bgShell := &BackgroundShell{StartTime: time.Now()}
+		time.Sleep(5 * time.Millisecond)
+		require.Positive(t, bgShell.Elapsed())
+	})
+}

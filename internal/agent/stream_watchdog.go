@@ -46,20 +46,27 @@ type streamWatchdog struct {
 //
 // onFire, if non-nil, is invoked AFTER stalled is set to true and BEFORE
 // cancel() — typically used to emit a slog.Warn with diagnostic context the
-// watchdog itself does not have (session ID, model, provider, etc.).
+// watchdog itself does not have (session ID, model, provider, etc.). The
+// toolTimeout bool is true when the fire was triggered by a tool exceeding
+// toolMaxDuration (rather than by provider idle).
 //
 // Fork patch: batch 8 — extendsOnProgress + hardCap parameters.
 // When extendsOnProgress is true, every bump() also extends the effective
 // deadline to max(absoluteDeadline, now+idleTimeout), capped at hardCap
 // from the start time. This prevents killing healthy long compositions
 // while still bounding the worst case.
+//
+// Fork patch: never-freeze backstop — toolMaxDuration bounds the tool
+// pause. Past it the watchdog fires with toolTimeout=true so the turn
+// ends instead of hanging forever on a stuck tool.
 func startStreamWatchdog(
 	ctx context.Context,
 	cancel context.CancelFunc,
 	idleTimeout, tick time.Duration,
-	onFire func(idle time.Duration),
+	onFire func(elapsed time.Duration, toolTimeout bool),
 	extendsOnProgress bool,
 	hardCap time.Duration,
+	toolMaxDuration time.Duration,
 ) streamWatchdog {
 	var last atomic.Int64
 	startTime := time.Now()
@@ -68,6 +75,11 @@ func startStreamWatchdog(
 	// toolsInFlight counts tool executions currently running. While > 0 the
 	// idle timer is paused (see toolStarted/toolFinished in the struct doc).
 	var toolsInFlight atomic.Int64
+	// toolStartedAt records the wall-clock time (UnixNano) at which the
+	// first tool in the current in-flight batch started. Used with
+	// toolMaxDuration to bound the tool pause. Reset to 0 when all tools
+	// finish.
+	var toolStartedAt atomic.Int64
 	// absoluteDeadline is the original deadline from process start.
 	absoluteDeadline := startTime.Add(idleTimeout)
 	// hardDeadline is the hard cap (e.g. 4x idleTimeout).
@@ -103,13 +115,16 @@ func startStreamWatchdog(
 	}
 
 	toolStarted := func() {
-		toolsInFlight.Add(1)
+		if toolsInFlight.Add(1) == 1 {
+			toolStartedAt.Store(time.Now().UnixNano())
+		}
 	}
 	toolFinished := func() {
-		if toolsInFlight.Add(-1) < 0 {
+		if toolsInFlight.Add(-1) <= 0 {
 			// Defensive: a missing OnToolCall (or a double result) must not
 			// leave the counter negative and silently disable the watchdog.
 			toolsInFlight.Store(0)
+			toolStartedAt.Store(0)
 		}
 		// Restart the idle clock fresh: the provider is about to resume, so
 		// don't count the tool's runtime against the next stall window.
@@ -129,7 +144,22 @@ func startStreamWatchdog(
 				// Pause while a tool is executing — provider silence during a
 				// long compile/test is expected, not a stall. Keep `last`
 				// fresh so the idle window starts clean once the tool returns.
+				// The pause is bounded by toolMaxDuration: past it the
+				// watchdog fires with toolTimeout=true (never-freeze
+				// backstop).
 				if toolsInFlight.Load() > 0 {
+					if toolMaxDuration > 0 {
+						if startedAt := toolStartedAt.Load(); startedAt > 0 {
+							if elapsed := now.Sub(time.Unix(0, startedAt)); elapsed >= toolMaxDuration {
+								stalled.Store(true)
+								cancel()
+								if onFire != nil {
+									onFire(elapsed, true)
+								}
+								return
+							}
+						}
+					}
 					last.Store(now.UnixNano())
 					continue
 				}
@@ -151,7 +181,7 @@ func startStreamWatchdog(
 						stalled.Store(true)
 						cancel()
 						if onFire != nil {
-							onFire(idle)
+							onFire(idle, false)
 						}
 						return
 					}
@@ -162,7 +192,7 @@ func startStreamWatchdog(
 						stalled.Store(true)
 						cancel()
 						if onFire != nil {
-							onFire(idle)
+							onFire(idle, false)
 						}
 						return
 					}

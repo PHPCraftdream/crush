@@ -507,7 +507,8 @@ func (c *coordinator) runInternal(ctx context.Context, sessionID string, prompt 
 		for i := 1; i < attempt; i++ {
 			backoff = time.Duration(float64(backoff) * streamStallRetryBackoffMultiplier)
 		}
-		slog.Warn("coordinator: retrying transient turn failure",
+		slog.Warn(
+			"coordinator: retrying transient turn failure",
 			"session_id", sessionID,
 			"attempt", attempt+1,
 			"max_attempts", maxRetries+1,
@@ -950,6 +951,11 @@ func (c *coordinator) buildAgent(ctx context.Context, prompt *prompt.Prompt, age
 	if opts != nil && opts.StreamIdleTimeoutSeconds > 0 {
 		streamIdleTimeout = time.Duration(opts.StreamIdleTimeoutSeconds) * time.Second
 	}
+	// Never-freeze backstop: bound the watchdog's tool-pause.
+	var toolMaxDuration time.Duration
+	if opts != nil && opts.StreamToolTimeoutSeconds > 0 {
+		toolMaxDuration = time.Duration(opts.StreamToolTimeoutSeconds) * time.Second
+	}
 	// Fork patch: batch 8 — mid-stream checkpoint interval.
 	var checkpointInterval time.Duration
 	if opts != nil {
@@ -975,6 +981,7 @@ func (c *coordinator) buildAgent(ctx context.Context, prompt *prompt.Prompt, age
 		Tools:                nil,
 		Notify:               c.notify,
 		StreamIdleTimeout:    streamIdleTimeout,
+		ToolMaxDuration:      toolMaxDuration,
 		DataDirectory:        c.cfg.Config().Options.DataDirectory,
 		CheckpointInterval:   checkpointInterval, // Fork patch: batch 8
 	})
@@ -1793,7 +1800,8 @@ func (c *coordinator) runSubAgent(ctx context.Context, params subAgentParams) (f
 	// Update parent session cost on a best-effort basis. A failure here must
 	// not discard the sub-agent output that was already produced.
 	if err := c.updateParentSessionCost(ctx, session.ID, params.SessionID); err != nil {
-		slog.Warn("Failed to update parent session cost",
+		slog.Warn(
+			"Failed to update parent session cost",
 			"child_session", session.ID,
 			"parent_session", params.SessionID,
 			"error", err,

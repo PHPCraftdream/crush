@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"charm.land/catwalk/pkg/catwalk"
@@ -84,6 +85,15 @@ const (
 	// promptly (well under streamIdleTimeout) but large enough not to
 	// dominate logs.
 	streamWatchdogTick = 30 * time.Second
+
+	// toolExecutionMaxDefault is the never-freeze backstop: the maximum
+	// wall-clock a single tool may run while the stream watchdog is
+	// paused (between OnToolCall and OnToolResult) before the watchdog
+	// force-cancels the turn. Bash auto-backgrounds at 60s and Phase 1b
+	// bounds job_output, so this only catches truly stuck tools (hung MCP
+	// tools, blocking job_output --wait on a deadlocked process).
+	// Configurable via Options.StreamToolTimeoutSeconds.
+	toolExecutionMaxDefault = 15 * time.Minute
 
 	// defaultCheckpointInterval is the default coalescing interval for
 	// mid-stream DB flushes of in-progress assistant text. When > 0,
@@ -219,6 +229,12 @@ type sessionAgent struct {
 	// allow, even with continuous progress. 0 = no cap.
 	// Fork patch: batch 8.
 	timeoutHardCap time.Duration
+	// toolMaxDuration bounds the watchdog's tool-pause (never-freeze
+	// backstop). Past it the watchdog fires with a distinct "tool timeout"
+	// reason so the agent turn ends instead of hanging on a stuck tool.
+	// 0 = use toolExecutionMaxDefault. Plumbed from
+	// Options.StreamToolTimeoutSeconds via SessionAgentOptions.
+	toolMaxDuration time.Duration
 
 	messageQueue *csync.Map[string, []SessionAgentCall]
 	// injectQueue holds user messages that were ALREADY persisted to the DB
@@ -273,6 +289,12 @@ type SessionAgentOptions struct {
 	// callers typically set 4x the idle timeout when extending).
 	// Fork patch: batch 8.
 	TimeoutHardCap time.Duration
+	// ToolMaxDuration bounds the watchdog's tool-pause (never-freeze
+	// backstop). Past it the watchdog fires with a "tool timeout" reason
+	// so the turn ends instead of hanging on a stuck tool. 0 = use the
+	// built-in toolExecutionMaxDefault (15m). Plumbed from
+	// Options.StreamToolTimeoutSeconds in the coordinator.
+	ToolMaxDuration time.Duration
 }
 
 func NewSessionAgent(
@@ -299,6 +321,7 @@ func NewSessionAgent(
 		checkpointInterval:       opts.CheckpointInterval,
 		timeoutExtendsOnProgress: opts.TimeoutExtendsOnProgress,
 		timeoutHardCap:           opts.TimeoutHardCap,
+		toolMaxDuration:          opts.ToolMaxDuration,
 	}
 }
 
@@ -484,20 +507,38 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	if a.streamIdleTimeout > 0 {
 		idleTimeout = a.streamIdleTimeout
 	}
+	toolMaxDuration := toolExecutionMaxDefault
+	if a.toolMaxDuration > 0 {
+		toolMaxDuration = a.toolMaxDuration
+	}
+	var watchdogToolTimeout atomic.Bool
 	wd := startStreamWatchdog(
 		genCtx, cancel, idleTimeout, streamWatchdogTick,
-		func(idle time.Duration) {
+		func(elapsed time.Duration, toolTimeout bool) {
+			if toolTimeout {
+				watchdogToolTimeout.Store(true)
+				slog.Warn(
+					"agent: watchdog firing — tool execution exceeded cap, force-cancelling",
+					"session_id", call.SessionID,
+					"provider", largeModel.ModelCfg.Provider,
+					"model", largeModel.ModelCfg.Model,
+					"elapsed", elapsed.String(),
+					"cap", toolMaxDuration.String(),
+				)
+				return
+			}
 			slog.Warn(
 				"agent: stream watchdog firing — no provider activity, force-cancelling",
 				"session_id", call.SessionID,
 				"provider", largeModel.ModelCfg.Provider,
 				"model", largeModel.ModelCfg.Model,
-				"idle_duration", idle.String(),
+				"idle_duration", elapsed.String(),
 				"threshold", idleTimeout.String(),
 			)
 		},
 		a.timeoutExtendsOnProgress, // Fork patch: batch 8
 		a.timeoutHardCap,           // Fork patch: batch 8
+		toolMaxDuration,            // never-freeze backstop
 	)
 	bumpActivity := wd.bump
 	// toolStarted/toolFinished bracket tool execution so the watchdog pauses
@@ -1157,14 +1198,25 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 				"session_id", call.SessionID,
 				"provider", largeModel.ModelCfg.Provider,
 			)
-			currentAssistant.AddFinish(
-				message.FinishReasonError,
-				"Stream stalled",
-				fmt.Sprintf(
-					"Provider %q stopped sending streaming data for over %s — the request was auto-cancelled by the stream watchdog. Retry the prompt; if it keeps happening, try a different model or provider.",
-					largeModel.ModelCfg.Provider, idleTimeout,
-				),
-			)
+			if watchdogToolTimeout.Load() {
+				currentAssistant.AddFinish(
+					message.FinishReasonError,
+					"Tool timeout",
+					fmt.Sprintf(
+						"A tool ran for over %s without returning and was auto-cancelled by the watchdog to keep the agent responsive. Re-run the step; if it's a long job, poll its status instead of blocking.",
+						toolMaxDuration,
+					),
+				)
+			} else {
+				currentAssistant.AddFinish(
+					message.FinishReasonError,
+					"Stream stalled",
+					fmt.Sprintf(
+						"Provider %q stopped sending streaming data for over %s — the request was auto-cancelled by the stream watchdog. Retry the prompt; if it keeps happening, try a different model or provider.",
+						largeModel.ModelCfg.Provider, idleTimeout,
+					),
+				)
+			}
 		} else if isCancelErr {
 			currentAssistant.AddFinish(message.FinishReasonCanceled, "User canceled request", "")
 		} else if isHyper && errors.As(err, &providerErr) && providerErr.StatusCode == http.StatusUnauthorized {
