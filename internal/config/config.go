@@ -363,6 +363,14 @@ type Options struct {
 	// Web/interactive only — crush run is single-turn and never
 	// receives it.
 	NotifyOnBackgroundJobDone *bool `json:"notify_on_background_job_done,omitempty" jsonschema:"description=Push a completion message into the session when a background command finishes (web/interactive). Default true. Set false to disable.,default=true"`
+	// AutoResumeOnJobDone enables Phase 4 autonomous idle-resume: when a
+	// background command finishes and the owning session is idle, the agent
+	// starts a fresh turn on its own (bounded by maxConsecutiveAutoResumes,
+	// reset by any human message). OPT-IN: default (nil) = DISABLED. This is
+	// the opposite default from NotifyOnBackgroundJobDone (which defaults on)
+	// because autonomy must be deliberately enabled. Web/interactive only —
+	// never fires for crush run.
+	AutoResumeOnJobDone *bool `json:"auto_resume_on_job_done,omitempty" jsonschema:"description=Autonomously resume an idle session when a background job finishes (web/interactive). Default false (opt-in). Bounded by an internal consecutive-resume cap, reset by any human message.,default=false"`
 }
 
 type MCPs map[string]MCPConfig

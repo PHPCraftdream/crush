@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"sync"
 	"testing"
 	"time"
 
@@ -471,6 +472,94 @@ func TestUpdateParentSessionCost(t *testing.T) {
 		require.NoError(t, err)
 		assert.InDelta(t, 0.0, updated.Cost, 1e-9)
 	})
+}
+
+// boolPtr is a tiny helper for building *bool config values in tests.
+func boolPtr(b bool) *bool { return &b }
+
+func TestConsecutiveAutoResumeCounter(t *testing.T) {
+	coord := &coordinator{consecutiveAutoResumes: make(map[string]int)}
+
+	t.Run("starts at zero", func(t *testing.T) {
+		assert.Equal(t, 0, coord.consecutiveResume("sess-1"))
+	})
+
+	t.Run("bump increments and consecutiveResume reflects it", func(t *testing.T) {
+		coord.bumpConsecutiveResume("sess-1")
+		coord.bumpConsecutiveResume("sess-1")
+		assert.Equal(t, 2, coord.consecutiveResume("sess-1"))
+	})
+
+	t.Run("reset clears to zero", func(t *testing.T) {
+		coord.bumpConsecutiveResume("sess-reset")
+		require.Equal(t, 1, coord.consecutiveResume("sess-reset"))
+		coord.resetConsecutiveResume("sess-reset")
+		assert.Equal(t, 0, coord.consecutiveResume("sess-reset"))
+	})
+
+	t.Run("sessions are independent", func(t *testing.T) {
+		coord.bumpConsecutiveResume("a")
+		coord.bumpConsecutiveResume("a")
+		coord.bumpConsecutiveResume("b")
+		assert.Equal(t, 2, coord.consecutiveResume("a"))
+		assert.Equal(t, 1, coord.consecutiveResume("b"))
+	})
+
+	t.Run("reset on unknown session is a no-op", func(t *testing.T) {
+		coord.resetConsecutiveResume("never-seen")
+		assert.Equal(t, 0, coord.consecutiveResume("never-seen"))
+	})
+
+	t.Run("concurrent bumps are serialized by the mutex", func(t *testing.T) {
+		const sessionID = "sess-concurrent"
+		const n = 100
+		var wg sync.WaitGroup
+		wg.Add(n)
+		for range n {
+			go func() {
+				defer wg.Done()
+				coord.bumpConsecutiveResume(sessionID)
+			}()
+		}
+		wg.Wait()
+		assert.Equal(t, n, coord.consecutiveResume(sessionID))
+	})
+}
+
+func TestMaxConsecutiveAutoResumesCap(t *testing.T) {
+	// Guard against accidental edits to the runaway bound.
+	assert.Equal(t, 5, maxConsecutiveAutoResumes)
+}
+
+func TestAutonomyEnabled(t *testing.T) {
+	env := testEnv(t)
+	cfg, err := config.Init(env.workingDir, "", false)
+	require.NoError(t, err)
+	coord := &coordinator{cfg: cfg}
+
+	t.Run("nil Options.AutoResumeOnJobDone defaults disabled", func(t *testing.T) {
+		cfg.Config().Options = nil
+		assert.False(t, coord.autonomyEnabled())
+	})
+
+	t.Run("explicit false stays disabled", func(t *testing.T) {
+		cfg.Config().Options = &config.Options{AutoResumeOnJobDone: boolPtr(false)}
+		assert.False(t, coord.autonomyEnabled())
+	})
+
+	t.Run("explicit true enables", func(t *testing.T) {
+		cfg.Config().Options = &config.Options{AutoResumeOnJobDone: boolPtr(true)}
+		assert.True(t, coord.autonomyEnabled())
+	})
+}
+
+func TestSetPersistentMode(t *testing.T) {
+	coord := &coordinator{}
+	assert.False(t, coord.persistentMode, "default must be false (crush run is non-persistent)")
+	coord.SetPersistentMode(true)
+	assert.True(t, coord.persistentMode)
+	coord.SetPersistentMode(false)
+	assert.False(t, coord.persistentMode)
 }
 
 func TestGetProviderOptionsReasoningEffort(t *testing.T) {

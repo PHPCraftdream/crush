@@ -147,6 +147,7 @@ func runWebMode(cmd *cobra.Command) error {
 		return err
 	}
 	defer a.Shutdown()
+	a.AgentCoordinator.SetPersistentMode(true)
 
 	addr := fmt.Sprintf("%s:%d", host, port)
 	srv := server.New(a, addr, crushweb.FS())

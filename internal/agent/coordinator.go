@@ -133,6 +133,11 @@ const (
 	streamStalledFinishTitle = "Stream stalled"
 )
 
+// maxConsecutiveAutoResumes bounds Phase 4 autonomous idle-resumes per session
+// without human involvement (reset by any human message). Anti-runaway: an
+// agent that keeps backgrounding self-completing jobs cannot loop forever.
+const maxConsecutiveAutoResumes = 5
+
 type Coordinator interface {
 	// INFO: (kujtim) this is not used yet we will use this when we have multiple agents
 	// SetMainAgent(string)
@@ -170,6 +175,10 @@ type Coordinator interface {
 	// SetRunLimits sets cost and token caps for the next Run call.
 	// Fork patch: batch 30.
 	SetRunLimits(maxCost float64, maxTokens int64)
+	// SetPersistentMode marks this coordinator as the long-lived web/interactive
+	// server (enables Phase 4 autonomous idle-resume eligibility). crush run
+	// leaves it false.
+	SetPersistentMode(persistent bool)
 }
 
 type coordinator struct {
@@ -198,6 +207,11 @@ type coordinator struct {
 	runLimitsMu sync.Mutex
 	maxCost     float64
 	maxTokens   int64
+
+	// Phase 4 autonomous idle-resume guardrails.
+	persistentMode         bool           // true only for the long-lived web server; false for crush run.
+	autoResumeMu           sync.Mutex     // guards consecutiveAutoResumes.
+	consecutiveAutoResumes map[string]int // sessionID -> consecutive auto-resumes since last human message.
 }
 
 func NewCoordinator(
@@ -220,18 +234,19 @@ func NewCoordinator(
 	skillTracker := skills.NewTracker(activeSkills)
 
 	c := &coordinator{
-		cfg:          cfg,
-		sessions:     sessions,
-		messages:     messages,
-		permissions:  permissions,
-		history:      history,
-		filetracker:  filetracker,
-		prompt:       p,
-		notify:       notify,
-		agents:       make(map[string]SessionAgent),
-		allSkills:    allSkills,
-		activeSkills: activeSkills,
-		skillTracker: skillTracker,
+		cfg:                    cfg,
+		sessions:               sessions,
+		messages:               messages,
+		permissions:            permissions,
+		history:                history,
+		filetracker:            filetracker,
+		prompt:                 p,
+		notify:                 notify,
+		agents:                 make(map[string]SessionAgent),
+		allSkills:              allSkills,
+		activeSkills:           activeSkills,
+		skillTracker:           skillTracker,
+		consecutiveAutoResumes: make(map[string]int),
 	}
 
 	agentCfg, ok := cfg.Config().Agents[config.AgentCoder]
@@ -281,6 +296,42 @@ func (c *coordinator) SetRunLimits(maxCost float64, maxTokens int64) {
 	c.maxCost = maxCost
 	c.maxTokens = maxTokens
 	c.runLimitsMu.Unlock()
+}
+
+// SetPersistentMode marks this coordinator as the long-lived web/interactive
+// server (Phase 4 autonomous idle-resume eligibility). crush run leaves it
+// false.
+func (c *coordinator) SetPersistentMode(persistent bool) {
+	c.persistentMode = persistent
+}
+
+// autonomyEnabled reports whether Phase 4 auto-resume is opted in via config.
+func (c *coordinator) autonomyEnabled() bool {
+	opts := c.cfg.Config().Options
+	return opts != nil && opts.AutoResumeOnJobDone != nil && *opts.AutoResumeOnJobDone
+}
+
+// consecutiveResume returns the number of auto-resumes for sessionID since the
+// last human message.
+func (c *coordinator) consecutiveResume(sessionID string) int {
+	c.autoResumeMu.Lock()
+	defer c.autoResumeMu.Unlock()
+	return c.consecutiveAutoResumes[sessionID]
+}
+
+// bumpConsecutiveResume increments the auto-resume counter for sessionID.
+func (c *coordinator) bumpConsecutiveResume(sessionID string) {
+	c.autoResumeMu.Lock()
+	defer c.autoResumeMu.Unlock()
+	c.consecutiveAutoResumes[sessionID]++
+}
+
+// resetConsecutiveResume clears the auto-resume counter for sessionID. Called
+// from the human send path so a human re-entering the loop re-arms autonomy.
+func (c *coordinator) resetConsecutiveResume(sessionID string) {
+	c.autoResumeMu.Lock()
+	defer c.autoResumeMu.Unlock()
+	delete(c.consecutiveAutoResumes, sessionID)
 }
 
 // applyModelOverrides sets up the agent with the given model overrides (modifies currentAgent in place).
