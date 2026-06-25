@@ -29,6 +29,7 @@ import (
 	"io"
 	"log/slog"
 	"maps"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -113,9 +114,11 @@ const (
 	// streamStallRetriesDefault is the default Options.StreamStallRetries
 	// when the config key is absent or zero. We default to 2 (3 total
 	// attempts per turn) rather than 0 because the user-visible failure
-	// mode of a single stall is a hard turn-error that the orchestrator
-	// then has to handle — silently absorbing 1-2 provider hiccups is
-	// almost always what an operator wants.
+	// mode of a single transient provider error is a hard turn-error that
+	// the orchestrator then has to handle — silently absorbing 1-2
+	// provider hiccups is almost always what an operator wants. This bounds
+	// retries for ALL transient turn failures (stream stall, empty stream,
+	// overload, 5xx, network), not just stalls.
 	streamStallRetriesDefault = 2
 	// streamStallRetryBaseBackoff and streamStallRetryBackoffMultiplier
 	// shape exponential backoff: 10s → 30s → 90s. Long enough to let a
@@ -474,9 +477,13 @@ func (c *coordinator) runInternal(ctx context.Context, sessionID string, prompt 
 		})
 	}
 
-	// Auto-retry on watchdog stall. The agent already wrote
-	// FinishReasonError("Stream stalled") to the last assistant message;
-	// we re-run the turn with the same prompt after exponential backoff.
+	// Auto-retry on transient provider failures. The agent may have written
+	// a FinishReasonError message (stream stall, empty stream) or returned a
+	// transient error (429 overload, 5xx, GOAWAY/EOF, network drop); we
+	// re-run the turn with the same prompt after exponential backoff as long
+	// as it produced NO content (so a re-run cannot clobber a partial answer)
+	// AND the failure is not operator-actionable (quota wall, auth, context
+	// overflow, bad request, user cancel).
 	// "Solve it ourselves before bothering the user" — provider hiccups
 	// (rate limits, HTTP/2 stalls, brief capacity drops) usually clear
 	// within tens of seconds, so 2 retries after 10s + 30s of backoff
@@ -493,14 +500,14 @@ func (c *coordinator) runInternal(ctx context.Context, sessionID string, prompt 
 		}
 	}
 	for attempt := 1; attempt <= maxRetries; attempt++ {
-		if !c.lastTurnStalled(ctx, sessionID) {
+		if !c.shouldRetryTurn(ctx, sessionID, originalErr) {
 			break
 		}
 		backoff := streamStallRetryBaseBackoff
 		for i := 1; i < attempt; i++ {
 			backoff = time.Duration(float64(backoff) * streamStallRetryBackoffMultiplier)
 		}
-		slog.Warn("coordinator: retrying after stream stall",
+		slog.Warn("coordinator: retrying transient turn failure",
 			"session_id", sessionID,
 			"attempt", attempt+1,
 			"max_attempts", maxRetries+1,
@@ -515,6 +522,82 @@ func (c *coordinator) runInternal(ctx context.Context, sessionID string, prompt 
 	}
 
 	return result, originalErr
+}
+
+// retryClass partitions a turn-terminating failure into "surface it" vs
+// "transparently re-run it". See shouldRetryTurn for the policy.
+type retryClass int
+
+const (
+	// classTerminal is an operator-actionable failure (quota wall, auth,
+	// context overflow, bad request, user cancel) that must surface.
+	classTerminal retryClass = iota
+	// classTransient is a provider/network hiccup worth a re-run.
+	classTransient
+)
+
+// classifyProviderError classifies a NON-NIL turn-terminating error.
+// context cancellation is terminal here — watchdog stalls are matched
+// separately by their persisted finish title in shouldRetryTurn, because
+// a stall surfaces only as context.Canceled.
+func classifyProviderError(err error) retryClass {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return classTerminal
+	}
+	var providerErr *fantasy.ProviderError
+	if errors.As(err, &providerErr) {
+		if providerErr.IsContextTooLarge() {
+			return classTerminal // the auto-summarize path owns this
+		}
+		switch providerErr.StatusCode {
+		case http.StatusUnauthorized, http.StatusPaymentRequired, http.StatusForbidden:
+			return classTerminal
+		case http.StatusTooManyRequests:
+			if isQuotaLimit(providerErr) {
+				return classTerminal // multi-hour usage wall — operator accepts a fast fail
+			}
+			return classTransient // momentary overload
+		case http.StatusRequestTimeout, http.StatusConflict:
+			return classTransient
+		}
+		if providerErr.StatusCode >= 500 {
+			return classTransient
+		}
+		if providerErr.StatusCode >= 400 {
+			return classTerminal // genuine client error (400, 404, ...)
+		}
+		// No HTTP status (status 0): EOF / network wrapped as ProviderError.
+		if providerErr.IsRetryable() {
+			return classTransient
+		}
+		return classTerminal
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return classTransient
+	}
+	return classTerminal
+}
+
+// isQuotaLimit reports whether a 429 is a hard usage/quota wall (resets on
+// the order of hours) rather than a momentary overload. The two share
+// status 429, so we discriminate on the provider's message text.
+func isQuotaLimit(providerErr *fantasy.ProviderError) bool {
+	msg := strings.ToLower(providerErr.Title + " " + providerErr.Message)
+	return strings.Contains(msg, "usage limit") ||
+		strings.Contains(msg, "limit will reset") ||
+		strings.Contains(msg, "reset at") ||
+		strings.Contains(msg, "quota")
+}
+
+// turnMadeProgress reports whether the assistant message carries any real
+// output — text, reasoning, or a tool call (even a partial one). A turn
+// that made progress must never be re-run: it would duplicate work the
+// user already has.
+func turnMadeProgress(msg message.Message) bool {
+	return strings.TrimSpace(msg.FullText()) != "" ||
+		strings.TrimSpace(msg.ReasoningContent().Thinking) != "" ||
+		len(msg.ToolCalls()) > 0
 }
 
 // shouldRetryStalledMessage decides whether a watchdog-stalled assistant
@@ -535,34 +618,57 @@ func shouldRetryStalledMessage(msg message.Message) bool {
 	if fp.Reason != message.FinishReasonError || fp.Message != streamStalledFinishTitle {
 		return false
 	}
-	if strings.TrimSpace(msg.FullText()) != "" {
-		return false
-	}
-	if strings.TrimSpace(msg.ReasoningContent().Thinking) != "" {
-		return false
-	}
-	if len(msg.ToolCalls()) > 0 {
-		return false
-	}
-	return true
+	return !turnMadeProgress(msg)
 }
 
-// lastTurnStalled reports whether the most recent assistant message in
-// the given session warrants a retry — see shouldRetryStalledMessage for
-// the decision. Errors querying the DB are treated as "not stalled" so a
-// transient DB hiccup doesn't trigger unnecessary retries.
-func (c *coordinator) lastTurnStalled(ctx context.Context, sessionID string) bool {
+// lastAssistantMessage returns the most recent assistant message in the
+// session. ok is false on a DB error or when there is no assistant message
+// yet — callers treat that as "nothing to retry".
+func (c *coordinator) lastAssistantMessage(ctx context.Context, sessionID string) (message.Message, bool) {
 	msgs, err := c.messages.List(ctx, sessionID)
 	if err != nil {
-		return false
+		return message.Message{}, false
 	}
 	for i := len(msgs) - 1; i >= 0; i-- {
-		if msgs[i].Role != message.Assistant {
-			continue
+		if msgs[i].Role == message.Assistant {
+			return msgs[i], true
 		}
-		return shouldRetryStalledMessage(msgs[i])
 	}
-	return false
+	return message.Message{}, false
+}
+
+// shouldRetryTurn decides whether a finished turn should be transparently
+// re-run. A turn qualifies ONLY if it ended in error WITHOUT producing any
+// content (so a re-run cannot clobber a partial answer) AND the failure is
+// a transient provider/network hiccup rather than an operator-actionable
+// condition. This generalizes the original stall-only retry: a watchdog
+// stall is one transient class among several.
+//
+// Decision order:
+//   - no assistant message / clean finish / user-cancel finish → don't retry
+//   - turn produced any content                                 → don't retry
+//   - persisted "Stream stalled" title (err is context.Canceled) → retry
+//   - turn returned no error (empty-stream close)                → retry
+//   - otherwise classify the returned error                      → transient?
+func (c *coordinator) shouldRetryTurn(ctx context.Context, sessionID string, err error) bool {
+	msg, ok := c.lastAssistantMessage(ctx, sessionID)
+	if !ok {
+		return false
+	}
+	fp := msg.FinishPart()
+	if fp == nil || fp.Reason != message.FinishReasonError {
+		return false
+	}
+	if turnMadeProgress(msg) {
+		return false
+	}
+	if fp.Message == streamStalledFinishTitle {
+		return true
+	}
+	if err == nil {
+		return true
+	}
+	return classifyProviderError(err) == classTransient
 }
 
 // RunWithOverrides implements Coordinator. It is like Run but uses the given

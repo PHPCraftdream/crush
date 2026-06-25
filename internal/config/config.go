@@ -323,14 +323,16 @@ type Options struct {
 	// default when omitted) keeps the 10-minute built-in value.
 	StreamIdleTimeoutSeconds int `json:"stream_idle_timeout_seconds,omitempty" jsonschema:"description=Override the stream watchdog idle timeout in seconds. Default 600 (10 min). Raise further for extreme extended-thinking models that pause longer than 10 min mid-reasoning; lower (e.g. 180) for the old aggressive behaviour. 0 = use default.,default=0,example=900"`
 	// StreamStallRetries is the number of times to automatically retry a
-	// turn that ended in FinishReasonError("Stream stalled"). Embodies
-	// "solve it ourselves before bothering the user": instead of
-	// surfacing a stall on the first occurrence, crush waits with
-	// exponential backoff (10s, 30s, 90s) and retries. Pointer so we
-	// can distinguish nil ("use built-in default") from 0 ("explicitly
-	// disable retries — surface stall on first occurrence"). Built-in
-	// default is 2 retries (3 total attempts).
-	StreamStallRetries *int `json:"stream_stall_retries,omitempty" jsonschema:"description=Number of automatic retries after a Stream stalled finish. Omit to use the default (2 retries\\, 3 total attempts). 0 = disabled. Useful under parallel-session provider load. Exponential backoff: 10s\\, 30s\\, 90s.,example=3"`
+	// turn that ended in a transient provider failure (stream stall, empty
+	// stream, overload, 5xx, network). Embodies "solve it ourselves before
+	// bothering the user": instead of surfacing a transient error on the
+	// first occurrence, crush waits with exponential backoff (10s, 30s,
+	// 90s) and retries. Operator-actionable failures (quota wall, auth,
+	// context overflow, bad request, user cancel) are surfaced immediately
+	// regardless of this setting. Pointer so we can distinguish nil ("use
+	// built-in default") from 0 ("explicitly disable retries — surface on
+	// first occurrence"). Built-in default is 2 retries (3 total attempts).
+	StreamStallRetries *int `json:"stream_stall_retries,omitempty" jsonschema:"description=Number of automatic retries after a transient provider failure (stream stall\\, empty stream\\, overload\\, 5xx\\, network). Omit to use the default (2 retries\\, 3 total attempts). 0 = disabled. Operator-actionable failures (quota\\, auth\\, context overflow) always surface immediately. Exponential backoff: 10s\\, 30s\\, 90s.,example=3"`
 	// Fork patch: batch 8 — mid-stream auto-checkpoint interval.
 	// When > 0, the agent flushes in-progress streaming Parts to DB
 	// at most once per this interval, bounding text lost to SIGTERM
