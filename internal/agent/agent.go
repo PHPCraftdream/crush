@@ -442,8 +442,17 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	}
 
 	var wg sync.WaitGroup
-	// Generate title if first message.
-	if len(msgs) == 0 {
+	// Generate the title on the first message — OR self-heal on a later turn
+	// when the session is still nameless. Title generation is best-effort and
+	// a transient provider blip (z.ai overload, a token-limit truncation) on
+	// turn 1 used to doom the session to "Untitled Session" forever, since it
+	// only ever fired at len(msgs)==0. Retrying while the title is still
+	// empty/default lets the next message recover it; it stops the moment a
+	// real title lands.
+	needsTitle := len(msgs) == 0 ||
+		currentSession.Title == "" ||
+		currentSession.Title == DefaultSessionName
+	if needsTitle {
 		titleCtx := ctx // Copy to avoid race with ctx reassignment below.
 		wg.Go(func() {
 			a.generateTitle(titleCtx, call.SessionID, call.Prompt)
@@ -1818,6 +1827,16 @@ func (a *sessionAgent) getSessionMessages(ctx context.Context, session session.S
 	return msgs, nil
 }
 
+// cleanTitle normalises a raw model title response: collapse newlines, strip
+// any (orphan) think tags, and trim. Returns "" when nothing usable remains
+// (e.g. a pure-reasoning response with no actual title text).
+func cleanTitle(raw string) string {
+	t := strings.ReplaceAll(raw, "\n", " ")
+	t = thinkTagRegex.ReplaceAllString(t, "")
+	t = orphanThinkTagRegex.ReplaceAllString(t, "")
+	return strings.TrimSpace(t)
+}
+
 // generateTitle generates a session titled based on the initial prompt.
 func (a *sessionAgent) generateTitle(ctx context.Context, sessionID string, userPrompt string) {
 	if userPrompt == "" {
@@ -1879,43 +1898,53 @@ func (a *sessionAgent) generateTitle(ctx context.Context, sessionID string, user
 	var resp *fantasy.AgentResult
 	var err error
 	var model Model
+	var title string
 	var success bool
 	for _, attempt := range attempts {
-		tok := int64(40)
+		// Non-reasoning models: a title is a handful of tokens, but GLM-style
+		// models don't always honour /no_think and leak a short preamble — 40
+		// tokens then truncates the title itself. 96 gives headroom while
+		// staying cheap. Reasoning models get their full budget (the think
+		// block is suppressed but still counts against the cap).
+		tok := int64(96)
 		if attempt.model.CatwalkCfg.CanReason {
 			tok = attempt.model.CatwalkCfg.DefaultMaxTokens
 		}
 		agent := newAgent(attempt.model.Model, titlePrompt, tok)
 		resp, err = agent.Stream(ctx, streamCall)
-		if err == nil && resp != nil && resp.Response.FinishReason != fantasy.FinishReasonLength {
-			model = attempt.model
-			slog.Debug("Generated title with " + attempt.name + " model")
-			success = true
-			break
-		}
-		switch {
-		case err != nil:
+		if err != nil {
 			slog.Error("Error generating title with "+attempt.name+" model; trying next", "err", err)
-		case resp == nil:
-			slog.Error("Title generation returned nil response with " + attempt.name + " model; trying next")
-		default:
-			slog.Error("Title generation hit token limit with " + attempt.name + " model; trying next")
+			continue
 		}
+		if resp == nil {
+			slog.Error("Title generation returned nil response with " + attempt.name + " model; trying next")
+			continue
+		}
+		// A length-truncated response usually still carries a usable title —
+		// only a genuinely empty one (pure reasoning, no text) is a real miss.
+		// Discarding a truncated-but-good title just retries the same tiny
+		// budget on the next model, typically fails the same way, and leaves
+		// the session "Untitled" for a transient reason.
+		candidate := cleanTitle(resp.Response.Content.Text())
+		if candidate == "" {
+			slog.Error("Title generation produced no usable text with " + attempt.name + " model; trying next")
+			continue
+		}
+		if resp.Response.FinishReason == fantasy.FinishReasonLength {
+			slog.Debug("Title truncated (FinishReasonLength) but usable with " + attempt.name + " model")
+		} else {
+			slog.Debug("Generated title with " + attempt.name + " model")
+		}
+		title = candidate
+		model = attempt.model
+		success = true
+		break
 	}
 	if !success {
 		// The deferred fallback will save the default session name.
 		return
 	}
 
-	// Clean up title.
-	var title string
-	title = strings.ReplaceAll(resp.Response.Content.Text(), "\n", " ")
-
-	// Remove thinking tags if present.
-	title = thinkTagRegex.ReplaceAllString(title, "")
-	title = orphanThinkTagRegex.ReplaceAllString(title, "")
-
-	title = strings.TrimSpace(title)
 	title = cmp.Or(title, DefaultSessionName)
 
 	// Calculate usage and cost.

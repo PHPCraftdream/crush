@@ -99,16 +99,23 @@ Shaping the model's output:
 
 Sub-agent policy:
   --agents <single|with-agents|agent-allow>
-                            single        -- the "agent" and "agentic_fetch"
+                            (unset)       -- DEFAULT. No sub-agents: the
+                                             "agent" and "agentic_fetch"
                                              tools are removed from the
-                                             toolset for this run; the
-                                             model literally cannot fan
-                                             out.
-                            with-agents   -- model is nudged to fan out
-                                             via the "agent" tool when
+                                             toolset for this run. A
+                                             non-interactive run has no UI
+                                             to surface sub-agent work and a
+                                             nested run burns tokens out of
+                                             view (and risks recursion), so
+                                             the model EXECUTES instead of
+                                             re-delegating.
+                            single        -- same as the default, explicit.
+                            agent-allow   -- opt in: tools present, the
+                                             model decides whether to use
+                                             them.
+                            with-agents   -- opt in + nudge the model to fan
+                                             out via the "agent" tool when
                                              work is decomposable.
-                            agent-allow   -- default. Tool present, model
-                                             decides whether to use it.
 
 Sub-agent aggregation (only matters when --agents permits fan-out):
   --aggregation <summary|concat|attach>
@@ -370,12 +377,19 @@ crush run --timeout 5m --session "long-task" "refactor the storage layer"
 			agentsHint    string
 		)
 		switch agentsMode {
-		case "", "agent-allow":
-			// default: tool present, no nudge — model decides.
+		case "", "single":
+			// New non-interactive default: NO sub-agent fan-out. `crush run`
+			// has no UI to surface sub-agent work, and a nested run silently
+			// burns time/tokens out of view (and risks recursion). The model
+			// should EXECUTE rather than re-delegate. The `agent` and
+			// `agentic_fetch` tools are removed from the toolset for this
+			// process. Opt back in explicitly with --agents agent-allow or
+			// --agents with-agents.
+			agentsDisable = true
+		case "agent-allow":
+			// Explicit opt-in: tools present, no nudge — model decides.
 		case "with-agents":
 			agentsHint = agentsModePromptHint
-		case "single":
-			agentsDisable = true
 		default:
 			return fmt.Errorf("--agents: invalid value %q (allowed: single|with-agents|agent-allow)", agentsMode)
 		}
@@ -572,7 +586,7 @@ func init() {
 	// Fork patch (orchestrator UX): per-turn output-shape and sub-agent
 	// policy. Neither persists on the session.
 	runCmd.Flags().String("format", "", "Per-turn output-shape hint appended to the user prompt. Presets: 'json' (final answer must be a single JSON value, no fences, no prose) | 'json-schema:<file>' (json + conform to this schema) | '@<file>' (use file contents verbatim as the hint) | any other text (used as a freeform 'Output format:' instruction). With --json or --format json, the envelope's final_text is also post-processed to strip ```json fences and prose preamble; the original is preserved in assistant_notes.")
-	runCmd.Flags().String("agents", "", "Sub-agent dispatch policy for this run. 'single' (no sub-agents — the `agent` tool is removed from the toolset for this process) | 'with-agents' (model is nudged to fan out via the `agent` tool) | 'agent-allow' (default — tool present, model decides).")
+	runCmd.Flags().String("agents", "", "Sub-agent dispatch policy for this run. Default (unset) = NO sub-agents: the `agent`/`agentic_fetch` tools are removed from the toolset for this non-interactive process (no UI to surface sub-agent work; a nested run burns tokens out of view). 'single' (same — explicit) | 'agent-allow' (opt in: tools present, model decides) | 'with-agents' (opt in + nudge the model to fan out).")
 	runCmd.Flags().String("aggregation", "", "How sub-agent fan-out output reaches the orchestrator. 'summary' (default — parent composes a wrap-up, sub-agent detail lives in DB only) | 'concat' (prompt-nudge: parent includes each sub-agent reply verbatim in final_text) | 'attach' (collect each sub-agent's last assistant text into envelope.sub_agent_outputs; final_text becomes a brief wrap-up). An always-on reduction-loss warning fires regardless when parent collapses sub-agent outputs to <40% of their combined size.")
 	// Fork patch: batch 8 — timeout extension flags.
 	runCmd.Flags().Bool("timeout-extends-on-progress", false, "Reset the stream watchdog deadline every time streaming progress occurs. Prevents killing healthy long compositions. Default: false (static deadline).")
