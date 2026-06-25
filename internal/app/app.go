@@ -612,6 +612,40 @@ type RunOverrides struct {
 
 // RunNonInteractive runs a single agent turn and writes its result to
 // `output`. See RunMode for the available output shapes.
+// runIncompleteError marks a non-interactive run that finished but did not
+// complete its work cleanly (in-band provider error / stall, cancellation,
+// timeout, or a max_tokens truncation). The envelope / final text was already
+// emitted to stdout; this error exists only to drive a non-zero process exit
+// so orchestrators and CI can branch on success without parsing stdout.
+type runIncompleteError struct {
+	reason string
+	detail string
+}
+
+func (e *runIncompleteError) Error() string {
+	if e.detail != "" {
+		return fmt.Sprintf("run did not complete cleanly (%s): %s", e.reason, e.detail)
+	}
+	return fmt.Sprintf("run did not complete cleanly (%s)", e.reason)
+}
+
+// runFailed reports whether a finished non-interactive turn should map to a
+// non-zero exit code. A clean end_turn (or a bare finish with no captured
+// reason) is success; a hard error, a cancellation/timeout, an in-band error
+// finish (stall / provider error / empty stream), or a max_tokens truncation
+// are all "did not finish the work".
+func runFailed(finalReason string, runErr error, isCanceled bool) bool {
+	if runErr != nil || isCanceled {
+		return true
+	}
+	switch message.FinishReason(finalReason) {
+	case message.FinishReasonError, message.FinishReasonCanceled, message.FinishReasonMaxTokens:
+		return true
+	default:
+		return false
+	}
+}
+
 func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt string, overrides RunOverrides, hideSpinner bool, mode RunMode, continueSessionID string, useLast bool) error {
 	largeModel := overrides.LargeModel
 	smallModel := overrides.SmallModel
@@ -946,22 +980,44 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt 
 				if encErr := enc.Encode(summary); encErr != nil {
 					return fmt.Errorf("failed to encode JSON result: %w", encErr)
 				}
-				if isCanceled || runErr == nil {
-					return nil
+				// The envelope (incl. exit_reason + error) is already on
+				// stdout. Drive the PROCESS exit code off the outcome so
+				// orchestrators / CI branch on success without parsing stdout:
+				// a clean end_turn exits 0; an in-band error finish (stall,
+				// provider error, empty stream), a cancellation/timeout, or a
+				// max_tokens truncation exit non-zero.
+				if runFailed(finalReason, runErr, isCanceled) {
+					return &runIncompleteError{reason: summary.ExitReason, detail: summary.Error}
 				}
-				// Non-cancel error: JSON already carries it; surface a
-				// non-zero exit code by returning the err.
-				return runErr
+				return nil
 			}
 
-			hookExitReason = "cancelled"
 			if runErr != nil {
 				if isCanceled {
 					slog.Debug("Non-interactive: agent processing cancelled", "session_id", sess.ID)
-					return nil
+					hookExitReason = "cancelled"
+					return &runIncompleteError{reason: "cancelled"}
 				}
 				hookExitReason = "error"
 				return fmt.Errorf("agent processing failed: %w", runErr)
+			}
+			// runErr == nil, but the turn may still have ended in-band on an
+			// error / canceled / max_tokens finish — not a clean completion,
+			// so exit non-zero (the final text is already on stdout).
+			if runFailed(finalReason, runErr, isCanceled) {
+				reason := finalReason
+				if reason == "" {
+					reason = "error"
+				}
+				hookExitReason = reason
+				detail := finalErrTitle
+				if finalErrDetails != "" {
+					if detail != "" {
+						detail += ": "
+					}
+					detail += finalErrDetails
+				}
+				return &runIncompleteError{reason: reason, detail: detail}
 			}
 			hookExitReason = "stop"
 			return nil
@@ -1237,7 +1293,8 @@ func (app *App) recoverInterruptedTurns(ctx context.Context) {
 			"The previous crush process exited before this turn completed (silent dying — see CHANGELOG.fork.md section 4.D). The assistant message had tool calls but no finish part. Cleanly recovered on startup; you can retry from the previous user message.",
 		)
 		if err := app.Messages.Update(ctx, *lastAssistant); err != nil {
-			slog.Warn("startup recovery: failed to mark orphan assistant",
+			slog.Warn(
+				"startup recovery: failed to mark orphan assistant",
 				"session_id", sess.ID,
 				"message_id", lastAssistant.ID,
 				"err", err,
@@ -1248,7 +1305,8 @@ func (app *App) recoverInterruptedTurns(ctx context.Context) {
 	}
 	elapsed := time.Since(start)
 	if recovered > 0 || skippedFresh > 0 {
-		slog.Info("startup recovery: completed",
+		slog.Info(
+			"startup recovery: completed",
 			"recovered", recovered,
 			"skipped_fresh", skippedFresh,
 			"total_sessions_scanned", len(sessions),
@@ -1258,7 +1316,8 @@ func (app *App) recoverInterruptedTurns(ctx context.Context) {
 		// Silent normally, but if the sweep took noticeable time
 		// (10k+ sessions on slow disk), surface it so the user can
 		// diagnose a slow startup without enabling debug logs.
-		slog.Info("startup recovery: nothing to recover",
+		slog.Info(
+			"startup recovery: nothing to recover",
 			"total_sessions_scanned", len(sessions),
 			"elapsed", elapsed.String(),
 		)

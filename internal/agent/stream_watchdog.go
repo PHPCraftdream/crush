@@ -19,6 +19,17 @@ type streamWatchdog struct {
 	// (OnTextDelta, OnReasoningDelta, OnToolInputStart, OnToolCall,
 	// OnToolResult, OnStepFinish, OnRetry, ...).
 	bump func()
+	// toolStarted / toolFinished bracket synchronous tool execution. While
+	// any tool is in flight the idle timer is PAUSED — a long `cargo build`,
+	// `cargo clippy`, test run or compile is not a provider stall, and the
+	// provider legitimately sends nothing until the tool returns. Without
+	// this, any single bash command longer than idleTimeout was force-
+	// cancelled as a false stall (observed: shamir-db f1-rename-index killed
+	// at exactly 180s during a workspace clippy). Tool runtime is bounded by
+	// the bash tool's own timeout and `crush run --timeout`, not by this
+	// provider-stall watchdog.
+	toolStarted  func()
+	toolFinished func()
 	// stalled reports whether THIS watchdog (not user/web cancel) is what
 	// fired the cancel. Callers use it to distinguish "user pressed
 	// Ctrl-C" from "watchdog timed out" when crafting the finish-part
@@ -54,6 +65,9 @@ func startStreamWatchdog(
 	startTime := time.Now()
 	last.Store(startTime.UnixNano())
 	var stalled atomic.Bool
+	// toolsInFlight counts tool executions currently running. While > 0 the
+	// idle timer is paused (see toolStarted/toolFinished in the struct doc).
+	var toolsInFlight atomic.Int64
 	// absoluteDeadline is the original deadline from process start.
 	absoluteDeadline := startTime.Add(idleTimeout)
 	// hardDeadline is the hard cap (e.g. 4x idleTimeout).
@@ -79,12 +93,27 @@ func startStreamWatchdog(
 			// Rate-limited INFO log for extensions.
 			if now.UnixNano()-lastLogNanos.Load() > int64(logInterval) {
 				lastLogNanos.Store(now.UnixNano())
-				slog.Info("stream-watchdog deadline extended",
+				slog.Info(
+					"stream-watchdog deadline extended",
 					"new_deadline", newDeadline.Format(time.RFC3339),
 					"reason", "progress",
 				)
 			}
 		}
+	}
+
+	toolStarted := func() {
+		toolsInFlight.Add(1)
+	}
+	toolFinished := func() {
+		if toolsInFlight.Add(-1) < 0 {
+			// Defensive: a missing OnToolCall (or a double result) must not
+			// leave the counter negative and silently disable the watchdog.
+			toolsInFlight.Store(0)
+		}
+		// Restart the idle clock fresh: the provider is about to resume, so
+		// don't count the tool's runtime against the next stall window.
+		last.Store(time.Now().UnixNano())
 	}
 
 	go func() {
@@ -96,8 +125,15 @@ func startStreamWatchdog(
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				lastActivity := time.Unix(0, last.Load())
 				now := time.Now()
+				// Pause while a tool is executing — provider silence during a
+				// long compile/test is expected, not a stall. Keep `last`
+				// fresh so the idle window starts clean once the tool returns.
+				if toolsInFlight.Load() > 0 {
+					last.Store(now.UnixNano())
+					continue
+				}
+				lastActivity := time.Unix(0, last.Load())
 				idle := now.Sub(lastActivity)
 
 				if extendsOnProgress {
@@ -135,8 +171,10 @@ func startStreamWatchdog(
 		}
 	}()
 	return streamWatchdog{
-		bump:    bump,
-		stalled: &stalled,
-		done:    done,
+		bump:         bump,
+		toolStarted:  toolStarted,
+		toolFinished: toolFinished,
+		stalled:      &stalled,
+		done:         done,
 	}
 }

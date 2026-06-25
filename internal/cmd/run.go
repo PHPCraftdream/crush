@@ -551,6 +551,11 @@ crush run --timeout 5m --session "long-task" "refactor the storage layer"
 }
 
 func init() {
+	// A failed/incomplete run returns an error to drive a non-zero exit code
+	// (see app.RunNonInteractive / runIncompleteError). That is a runtime
+	// outcome, not a usage mistake — don't dump the (very long) help text on
+	// it. The concise error still prints to stderr.
+	runCmd.SilenceUsage = true
 	runCmd.Flags().BoolP("quiet", "q", false, "Hide spinner")
 	runCmd.Flags().BoolP("verbose", "v", false, "Show logs")
 	runCmd.Flags().String("role", "", "REQUIRED. Which preselected model to use: smart|large (the strong one) or fast|small (the cheap one). The actual model id comes from `crush models show`; override with --model.")

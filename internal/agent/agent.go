@@ -366,7 +366,8 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 		if lockErr != nil {
 			var busyErr *session.SessionLockBusyError
 			if errors.As(lockErr, &busyErr) {
-				slog.Warn("agent.Run: rejected — session locked by another process",
+				slog.Warn(
+					"agent.Run: rejected — session locked by another process",
 					"session_id", call.SessionID,
 					"holder_pid", busyErr.HolderPID,
 					"lock_path", busyErr.Path,
@@ -474,9 +475,11 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	if a.streamIdleTimeout > 0 {
 		idleTimeout = a.streamIdleTimeout
 	}
-	wd := startStreamWatchdog(genCtx, cancel, idleTimeout, streamWatchdogTick,
+	wd := startStreamWatchdog(
+		genCtx, cancel, idleTimeout, streamWatchdogTick,
 		func(idle time.Duration) {
-			slog.Warn("agent: stream watchdog firing — no provider activity, force-cancelling",
+			slog.Warn(
+				"agent: stream watchdog firing — no provider activity, force-cancelling",
 				"session_id", call.SessionID,
 				"provider", largeModel.ModelCfg.Provider,
 				"model", largeModel.ModelCfg.Model,
@@ -488,6 +491,10 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 		a.timeoutHardCap,           // Fork patch: batch 8
 	)
 	bumpActivity := wd.bump
+	// toolStarted/toolFinished bracket tool execution so the watchdog pauses
+	// its idle timer while a (possibly long) tool runs — see streamWatchdog.
+	toolStarted := wd.toolStarted
+	toolFinished := wd.toolFinished
 	// Defer order matters: <-wd.done is deferred FIRST so it runs LAST
 	// (LIFO), AFTER cancel() has signalled the goroutine to exit.
 	// Without this the wait would deadlock the function return.
@@ -553,7 +560,8 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 							}
 						}
 						if err := a.messages.Update(genCtx, snap); err != nil {
-							slog.Debug("agent: checkpoint flush failed",
+							slog.Debug(
+								"agent: checkpoint flush failed",
 								"session_id", call.SessionID,
 								"message_id", snap.ID,
 								"err", err,
@@ -812,7 +820,8 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			if sawToolBoundary && currentAssistant != nil {
 				sawToolBoundary = false
 				sessionLock.Lock()
-				slog.Info("agent: final composition started",
+				slog.Info(
+					"agent: final composition started",
 					"session_id", call.SessionID,
 					"message_id", currentAssistant.ID,
 					"chars_in_message_so_far", len(currentAssistant.FullText()),
@@ -859,6 +868,11 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 		},
 		OnToolCall: func(tc fantasy.ToolCallContent) error {
 			bumpActivity()
+			// A tool is about to execute — pause the stall watchdog until its
+			// result arrives (OnToolResult). fantasy fires every OnToolCall
+			// for a step before executing any tool, so the counter brackets
+			// the whole executeTools window.
+			toolStarted()
 			sawToolBoundary = true // Fork patch: batch 8
 			toolCall := message.ToolCall{
 				ID:               tc.ToolCallID,
@@ -874,6 +888,9 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 		},
 		OnToolResult: func(result fantasy.ToolResultContent) error {
 			bumpActivity()
+			// Tool finished — resume the stall watchdog (and restart its idle
+			// window so the tool's runtime isn't counted against the provider).
+			toolFinished()
 			sawToolBoundary = true // Fork patch: batch 8
 			toolResult := a.convertToToolResult(result)
 			// Use parent ctx instead of genCtx to ensure the message is created
@@ -929,7 +946,8 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 				currentAssistant.FullText() == "" &&
 				currentAssistant.ReasoningContent().Thinking == "" &&
 				len(currentAssistant.ToolCalls()) == 0 {
-				slog.Warn("agent: empty stream from provider — recording as error",
+				slog.Warn(
+					"agent: empty stream from provider — recording as error",
 					"sessionID", call.SessionID,
 					"provider", largeModel.ModelCfg.Provider,
 					"model", largeModel.ModelCfg.Model,
@@ -985,7 +1003,8 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 				return fmt.Errorf("session %s cancelled by user", call.SessionID)
 			}
 			if call.MaxCost > 0 && updatedSession.Cost > call.MaxCost {
-				slog.Warn("agent: aborting — max-cost exceeded",
+				slog.Warn(
+					"agent: aborting — max-cost exceeded",
 					"session_id", call.SessionID,
 					"cost", updatedSession.Cost,
 					"max", call.MaxCost,
@@ -998,7 +1017,8 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			}
 			totalTokens := updatedSession.PromptTokens + updatedSession.CompletionTokens
 			if call.MaxTokens > 0 && totalTokens > call.MaxTokens {
-				slog.Warn("agent: aborting — max-tokens exceeded",
+				slog.Warn(
+					"agent: aborting — max-tokens exceeded",
 					"session_id", call.SessionID,
 					"tokens", totalTokens,
 					"max", call.MaxTokens,
@@ -1123,7 +1143,8 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			// emitted its slog.Warn at fire-time, but a log reader
 			// chasing the trail needs to see that the stall actually
 			// made it into the user-visible finish part on this session.
-			slog.Info("agent: watchdog stall surfaced as FinishReasonError",
+			slog.Info(
+				"agent: watchdog stall surfaced as FinishReasonError",
 				"session_id", call.SessionID,
 				"provider", largeModel.ModelCfg.Provider,
 			)
@@ -1165,7 +1186,8 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 		// in-flight forever.
 		updateErr := a.messages.Update(flushCtx, *currentAssistant)
 		if updateErr != nil {
-			slog.Error("agent: failed to persist final finish part",
+			slog.Error(
+				"agent: failed to persist final finish part",
 				"session_id", call.SessionID,
 				"err", updateErr,
 			)
@@ -1464,7 +1486,8 @@ func (a *sessionAgent) runSummarizeSilent(ctx context.Context, sessionID string,
 	defer a.activeRequests.Del(summarizeKey)
 	defer cancel()
 
-	agent := fantasy.NewAgent(largeModel.Model,
+	agent := fantasy.NewAgent(
+		largeModel.Model,
 		fantasy.WithSystemPrompt(string(summaryPrompt)),
 	)
 	// Create the summary message as hidden so it is invisible in the UI.

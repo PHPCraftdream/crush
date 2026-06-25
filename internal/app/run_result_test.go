@@ -227,3 +227,41 @@ func assertContainsAll(s string, parts ...string) bool {
 	}
 	return true
 }
+
+// TestRunFailed pins the success/failure classification that drives the
+// process exit code: only a clean end_turn (or an empty captured reason)
+// exits 0; in-band error/canceled/max_tokens finishes, a hard error, or a
+// cancellation/timeout all exit non-zero.
+func TestRunFailed(t *testing.T) {
+	tests := []struct {
+		name        string
+		finalReason string
+		runErr      error
+		isCanceled  bool
+		want        bool
+	}{
+		{"clean end_turn", "end_turn", nil, false, false},
+		{"empty reason, no error", "", nil, false, false},
+		{"unknown reason is not a failure", "unknown", nil, false, false},
+		{"in-band error finish", "error", nil, false, true},
+		{"in-band canceled finish", "canceled", nil, false, true},
+		{"max_tokens truncation", "max_tokens", nil, false, true},
+		{"hard runErr", "end_turn", errors.New("boom"), false, true},
+		{"isCanceled (timeout/watchdog/user)", "end_turn", nil, true, true},
+		{"runErr context.Canceled", "", context.Canceled, true, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, runFailed(tc.finalReason, tc.runErr, tc.isCanceled))
+		})
+	}
+}
+
+// TestRunIncompleteError_Message ensures the sentinel renders both with and
+// without detail (it drives stderr diagnostics on a non-zero exit).
+func TestRunIncompleteError_Message(t *testing.T) {
+	assert.Equal(t, "run did not complete cleanly (error): Stream stalled: provider X",
+		(&runIncompleteError{reason: "error", detail: "Stream stalled: provider X"}).Error())
+	assert.Equal(t, "run did not complete cleanly (cancelled)",
+		(&runIncompleteError{reason: "cancelled"}).Error())
+}
