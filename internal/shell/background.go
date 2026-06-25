@@ -222,6 +222,21 @@ func (bs *BackgroundShell) GetOutput() (stdout string, stderr string, done bool,
 	}
 }
 
+// OnDone registers fn to be called EXACTLY ONCE when this background shell
+// reaches a terminal state (the command exits, or it is killed). If the shell
+// is already done when OnDone is called, fn runs promptly. fn runs on its own
+// goroutine — it must not block. Used by higher layers (the agent) to react to
+// a backgrounded command finishing without internal/shell importing them.
+func (bs *BackgroundShell) OnDone(fn func()) {
+	if fn == nil {
+		return
+	}
+	go func() {
+		<-bs.done
+		fn()
+	}()
+}
+
 // IsDone checks if the background shell has finished execution.
 func (bs *BackgroundShell) IsDone() bool {
 	select {

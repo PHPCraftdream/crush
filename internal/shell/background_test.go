@@ -424,6 +424,67 @@ func TestBackgroundShell_WaitForChange_ReturnsOnCtxDone(t *testing.T) {
 	require.Less(t, elapsed, 2*time.Second, "WaitForChange should return when ctx ends")
 }
 
+// TestBackgroundShell_OnDone_FiresOnCompletion proves OnDone fires promptly
+// when a short-lived background command finishes on its own.
+func TestBackgroundShell_OnDone_FiresOnCompletion(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	workingDir := t.TempDir()
+	manager := newBackgroundShellManager()
+
+	bgShell, err := manager.Start(ctx, workingDir, nil, "echo hi", "")
+	require.NoError(t, err)
+
+	fired := make(chan struct{})
+	bgShell.OnDone(func() { close(fired) })
+
+	select {
+	case <-fired:
+		// Expected: OnDone fired once the echo finished.
+	case <-time.After(3 * time.Second):
+		t.Fatal("OnDone did not fire after command completed")
+	}
+
+	// Clean up (no-op once already gone, but keeps the manager tidy).
+	_ = manager.Kill(bgShell.ID)
+}
+
+// TestBackgroundShell_OnDone_FiresOnKill proves OnDone does NOT fire while a
+// long-running command is still alive, but DOES fire promptly once the job is
+// killed via the manager.
+func TestBackgroundShell_OnDone_FiresOnKill(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	workingDir := t.TempDir()
+	manager := newBackgroundShellManager()
+
+	bgShell, err := manager.Start(ctx, workingDir, nil, "sleep 30", "")
+	require.NoError(t, err)
+
+	fired := make(chan struct{})
+	bgShell.OnDone(func() { close(fired) })
+
+	// While the job is alive, OnDone must not fire.
+	select {
+	case <-fired:
+		t.Fatal("OnDone fired while command was still running")
+	case <-time.After(300 * time.Millisecond):
+		// Expected: still running.
+	}
+
+	// Killing the job must release OnDone.
+	require.NoError(t, manager.Kill(bgShell.ID))
+
+	select {
+	case <-fired:
+		// Expected: OnDone fired after Kill.
+	case <-time.After(3 * time.Second):
+		t.Fatal("OnDone did not fire after Kill")
+	}
+}
+
 // TestBackgroundShell_Elapsed confirms Elapsed reports a non-zero duration
 // once StartTime is set, and zero when it is not.
 func TestBackgroundShell_Elapsed(t *testing.T) {
