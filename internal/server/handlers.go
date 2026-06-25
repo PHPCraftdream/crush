@@ -205,6 +205,9 @@ func handleSendMessage(ctx context.Context, a *appPkg.App, c *Client, msg WSMess
 		return
 	}
 
+	// A human re-entering the loop re-arms Phase 4 autonomy for this session.
+	a.AgentCoordinator.ResetAutoResumeCounter(p.SessionID)
+
 	// Priority:
 	// 1. Explicit override in message payload (from UI)
 	// 2. Models stored in the session record in DB
@@ -288,6 +291,9 @@ func handleInterruptAndSend(ctx context.Context, a *appPkg.App, c *Client, msg W
 		return
 	}
 
+	// A human re-entering the loop re-arms Phase 4 autonomy for this session.
+	a.AgentCoordinator.ResetAutoResumeCounter(p.SessionID)
+
 	// Same attachments path as handleSendMessage: save to disk, append paths
 	// to the prompt text so CLI tools can read them, and forward attachment
 	// metadata so vision-capable providers can ingest images.
@@ -357,6 +363,9 @@ func handleInjectMessage(ctx context.Context, a *appPkg.App, c *Client, msg WSMe
 		c.reply(msg.ID, EventError, nil, "agent not configured")
 		return
 	}
+
+	// A human re-entering the loop re-arms Phase 4 autonomy for this session.
+	a.AgentCoordinator.ResetAutoResumeCounter(p.SessionID)
 
 	// Same attachments path as handleSendMessage.
 	var attachments []message.Attachment
@@ -608,7 +617,8 @@ func handleForkSession(ctx context.Context, a *appPkg.App, c *Client, msg WSMess
 
 	// Copy models from source
 	if src.LargeModelProvider != "" || src.SmallModelProvider != "" {
-		_ = a.Sessions.UpdateModels(ctx, fork.ID,
+		_ = a.Sessions.UpdateModels(
+			ctx, fork.ID,
 			src.LargeModelProvider, src.LargeModelID,
 			src.SmallModelProvider, src.SmallModelID,
 		)
@@ -1858,7 +1868,8 @@ func handleUpdateTodos(ctx context.Context, a *appPkg.App, c *Client, msg WSMess
 	}
 	prev := sess.Todos
 	sess.Todos = todos
-	slog.Info("ws: user updated todos",
+	slog.Info(
+		"ws: user updated todos",
 		"session", p.SessionID,
 		"prev_count", len(prev),
 		"new_count", len(todos),

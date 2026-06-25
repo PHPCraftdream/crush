@@ -179,6 +179,10 @@ type Coordinator interface {
 	// server (enables Phase 4 autonomous idle-resume eligibility). crush run
 	// leaves it false.
 	SetPersistentMode(persistent bool)
+	// ResetAutoResumeCounter clears the Phase 4 consecutive-auto-resume bound
+	// for a session. Called from the human send path so a human re-entering the
+	// loop re-arms autonomy.
+	ResetAutoResumeCounter(sessionID string)
 }
 
 type coordinator struct {
@@ -332,6 +336,24 @@ func (c *coordinator) resetConsecutiveResume(sessionID string) {
 	c.autoResumeMu.Lock()
 	defer c.autoResumeMu.Unlock()
 	delete(c.consecutiveAutoResumes, sessionID)
+}
+
+// ResetAutoResumeCounter is the exported wrapper around resetConsecutiveResume
+// for the server package's human send path.
+func (c *coordinator) ResetAutoResumeCounter(sessionID string) {
+	c.resetConsecutiveResume(sessionID)
+}
+
+// autoResumeEligible reports whether a finished background job should
+// autonomously resume the (idle-or-busy; Run handles that) owning session.
+// Pure autonomy policy: opt-in config, persistent (web) coordinator only, and
+// under the consecutive-resume runaway bound. Per-turn cost/token caps are
+// still enforced by the normal Run path; a Cancel aborts the auto-turn like any
+// other. NEVER eligible for crush run (persistentMode stays false there).
+func (c *coordinator) autoResumeEligible(sessionID string) bool {
+	return c.autonomyEnabled() &&
+		c.persistentMode &&
+		c.consecutiveResume(sessionID) < maxConsecutiveAutoResumes
 }
 
 // applyModelOverrides sets up the agent with the given model overrides (modifies currentAgent in place).
@@ -1651,14 +1673,40 @@ func backgroundJobSummary(id, command string, stdout, stderr string, exitCode in
 
 // notifyBackgroundJobDone is invoked from a BackgroundShell.OnDone goroutine
 // once a backgrounded bash command reaches a terminal state. It builds a
-// concise summary and pushes it into the owning session via InjectMessage.
-// Detached: the OnDone goroutine outlives the turn that started it, so we
-// use a fresh context with a bounded timeout and never block or cancel the
-// agent. Delivery failures (e.g. session closed) are logged at debug level.
+// concise summary and either (Phase 4, when autonomy is eligible) starts a
+// fresh turn over it, or (Phase 3 fallback) pushes it into the owning session
+// via InjectMessage. Detached: the OnDone goroutine outlives the turn that
+// started it, so we never block or cancel the agent. Delivery failures (e.g.
+// session closed) are logged at debug level.
 func (c *coordinator) notifyBackgroundJobDone(sessionID string, sh *shell.BackgroundShell) {
 	stdout, stderr, _, runErr := sh.GetOutput()
 	summary := backgroundJobSummary(sh.ID, sh.Command, stdout, stderr, shell.ExitCode(runErr), sh.Elapsed())
 
+	if c.autoResumeEligible(sessionID) {
+		// Autonomous idle-resume: start (or, if busy, queue — single-flight via
+		// sessionAgent.Run) a fresh turn over the completion summary. The bound
+		// is incremented per completion (conservative: a coalesced queued
+		// completion still counts toward the cap, which only makes runaway
+		// protection stricter). Reset by any human message.
+		c.bumpConsecutiveResume(sessionID)
+		slog.Info("Phase 4: auto-resuming session on background job completion",
+			"session_id", sessionID, "shell_id", sh.ID,
+			"consecutive", c.consecutiveResume(sessionID))
+		go func() {
+			// Detached + cancelable: outlives the OnDone goroutine; the turn's
+			// own watchdog/Cancel(sessionID) governs its lifetime, so NO short
+			// timeout here (unlike the InjectMessage path — a turn can be long).
+			ctx := context.Background()
+			if _, err := c.Run(ctx, sessionID, summary); err != nil {
+				slog.Debug("Phase 4 auto-resume run failed (session likely closed)",
+					"session_id", sessionID, "shell_id", sh.ID, "err", err)
+			}
+		}()
+		return
+	}
+
+	// Phase 3 behavior (unchanged): persist + (if busy) merge into the running
+	// turn; if idle, just persisted + web-visible, no auto-turn.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if _, err := c.InjectMessage(ctx, sessionID, summary); err != nil {

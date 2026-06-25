@@ -933,3 +933,68 @@ func TestBackgroundJobSummary(t *testing.T) {
 		assert.Contains(t, got, "warn: deprecated")
 	})
 }
+
+func TestAutoResumeEligible(t *testing.T) {
+	// Truth table for the Phase 4 autonomy policy surface. The eligibility
+	// decision is the whole gate; the branch in notifyBackgroundJobDone just
+	// routes eligible->Run vs not->InjectMessage.
+	env := testEnv(t)
+	cfg, err := config.Init(env.workingDir, "", false)
+	require.NoError(t, err)
+	coord := &coordinator{cfg: cfg, consecutiveAutoResumes: make(map[string]int)}
+	const sid = "sess-eligible"
+
+	t.Run("autonomy OFF (nil Options) is never eligible regardless of persistentMode", func(t *testing.T) {
+		cfg.Config().Options = nil
+		coord.persistentMode = true
+		assert.False(t, coord.autoResumeEligible(sid))
+	})
+
+	t.Run("autonomy OFF (explicit false) is never eligible", func(t *testing.T) {
+		cfg.Config().Options = &config.Options{AutoResumeOnJobDone: boolPtr(false)}
+		coord.persistentMode = true
+		assert.False(t, coord.autoResumeEligible(sid))
+	})
+
+	t.Run("autonomy ON + persistentMode false (crush run) is not eligible", func(t *testing.T) {
+		cfg.Config().Options = &config.Options{AutoResumeOnJobDone: boolPtr(true)}
+		coord.persistentMode = false
+		assert.False(t, coord.autoResumeEligible(sid))
+	})
+
+	t.Run("autonomy ON + persistentMode true + counter below cap is eligible", func(t *testing.T) {
+		cfg.Config().Options = &config.Options{AutoResumeOnJobDone: boolPtr(true)}
+		coord.persistentMode = true
+		coord.resetConsecutiveResume(sid)
+		assert.True(t, coord.autoResumeEligible(sid))
+	})
+
+	t.Run("at the cap (== maxConsecutiveAutoResumes) flips to not eligible", func(t *testing.T) {
+		cfg.Config().Options = &config.Options{AutoResumeOnJobDone: boolPtr(true)}
+		coord.persistentMode = true
+		coord.resetConsecutiveResume(sid)
+		// Bump to exactly the cap; one below the cap is still eligible.
+		for i := 0; i < maxConsecutiveAutoResumes-1; i++ {
+			coord.bumpConsecutiveResume(sid)
+		}
+		assert.True(t, coord.autoResumeEligible(sid), "one below the cap must still be eligible")
+		// The boundary bump that reaches the cap flips eligibility off.
+		coord.bumpConsecutiveResume(sid)
+		assert.False(t, coord.autoResumeEligible(sid), "at the cap autonomy must stop")
+	})
+}
+
+func TestResetAutoResumeCounter(t *testing.T) {
+	// The exported wrapper is what the server package calls on the human send
+	// path; it must clear the consecutive bound so a human message re-arms
+	// autonomy.
+	coord := &coordinator{consecutiveAutoResumes: make(map[string]int)}
+	const sid = "sess-reset-exported"
+
+	coord.bumpConsecutiveResume(sid)
+	coord.bumpConsecutiveResume(sid)
+	require.Equal(t, 2, coord.consecutiveResume(sid))
+
+	coord.ResetAutoResumeCounter(sid)
+	assert.Equal(t, 0, coord.consecutiveResume(sid))
+}
