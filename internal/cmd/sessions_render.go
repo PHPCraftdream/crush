@@ -137,11 +137,10 @@ func formatToolCallPreview(name, input string) string {
 //	[tool-result: view] internal/cmd/sessions.go: package cmd  (+412 lines)
 //	[tool-result: edit] internal/cmd/sessions.go (+3 lines)
 //	[tool-result: grep] "TODO" in internal/: internal/cmd/run.go:142:…  (+8 lines)
+//	[tool-result: bash] cargo build: Compiling sefer-alloc… (+14 lines)
+//	[tool-result: bash] git add -A && git commit -m x: no output
 //
-// For tools whose content IS the interesting output (bash command
-// output, fetch result body, sourcegraph match list) we keep the
-// content-first behaviour. Empty / whitespace-only content with no
-// origin returns "".
+// Empty / whitespace-only content with no origin returns "".
 func formatToolResultPreview(content, originName, originInput string) string {
 	hint := toolResultOriginHint(originName, originInput)
 	body := summariseResultContent(content)
@@ -199,11 +198,11 @@ func summariseResultContent(content string) string {
 }
 
 // toolResultOriginHint extracts the most useful argument from the
-// originating ToolCall's JSON input — typically a file path, URL or
-// pattern — to be shown alongside the tool result. Returns "" when the
-// origin info is missing, unparseable, or for tools whose result
-// content is the interesting payload by itself (bash, sourcegraph
-// matches, todo updates).
+// originating ToolCall's JSON input — a file path, URL, pattern, the bash
+// command, the sub-agent prompt, etc. — to be shown alongside the tool
+// result so the row is self-describing. Returns "" when the origin info is
+// missing/unparseable or for tools whose result content already says it all
+// (todowrite, unknown).
 func toolResultOriginHint(name, input string) string {
 	if strings.TrimSpace(input) == "" {
 		return ""
@@ -238,9 +237,26 @@ func toolResultOriginHint(name, input string) string {
 			return dst
 		}
 		return stringField(params, "url")
+	case "bash":
+		// Show WHAT ran next to the result. Critical when the output is
+		// empty (the bash tool returns "no output") or the preceding
+		// assistant tool-call row wasn't rendered (a checkpoint/empty-stream
+		// placeholder shows "(no content yet)") — without this the operator
+		// sees a bare "[tool-result: bash] no output" and can't tell what
+		// happened. firstLine collapses a multi-line command; the cap keeps
+		// room for the output after the ": " join.
+		if cmd := firstLine(stringField(params, "command")); cmd != "" {
+			return truncatePreview(cmd, toolPreviewMaxLen)
+		}
+	case "sourcegraph":
+		return stringField(params, "query")
+	case "agent", "sub_agent", "task":
+		if v := stringField(params, "description"); v != "" {
+			return truncatePreview(v, toolPreviewMaxLen)
+		}
+		return truncatePreview(stringField(params, "prompt"), toolPreviewMaxLen)
 	}
-	// bash / sourcegraph / agent / task / todowrite / unknown — fall through
-	// to content-only preview.
+	// todowrite / unknown — fall through to content-only preview.
 	return ""
 }
 

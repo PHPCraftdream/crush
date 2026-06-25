@@ -160,18 +160,37 @@ func TestFormatToolResultPreview_WithOriginHint(t *testing.T) {
 			"https://x.com/y: saved",
 		},
 
-		// bash / sourcegraph / todowrite / unknown → content-only (no hint).
+		// bash / sourcegraph / agent → command/query/prompt hint + content,
+		// so the result row says WHAT ran even when output is empty.
 		{
-			"bash keeps content-only behaviour",
+			"bash shows command + output",
 			"hello world",
 			"bash", `{"command":"echo hello world"}`,
-			"hello world",
+			"echo hello world: hello world",
 		},
 		{
-			"sourcegraph keeps content-only behaviour",
+			"bash empty output shows command only",
+			"no output",
+			"bash", `{"command":"git add -A"}`,
+			"git add -A: no output",
+		},
+		{
+			"sourcegraph shows query + matches",
 			"match 1\nmatch 2",
 			"sourcegraph", `{"query":"repo:foo lang:go"}`,
-			"match 1 (+1 lines)",
+			"repo:foo lang:go: match 1 (+1 lines)",
+		},
+		{
+			"agent shows description + content",
+			"done",
+			"agent", `{"description":"refactor login","prompt":"do it"}`,
+			"refactor login: done",
+		},
+		{
+			"todowrite stays content-only (no hint)",
+			"Todo list updated successfully.",
+			"todowrite", `{"todos":[]}`,
+			"Todo list updated successfully.",
 		},
 		{
 			"unknown tool falls back to content-only",
@@ -237,8 +256,11 @@ func TestToolResultOriginHint(t *testing.T) {
 		{"agentic_fetch", "agentic_fetch", `{"url":"https://x.com"}`, "https://x.com"},
 		{"download with file_path", "download", `{"url":"https://x.com","file_path":"/tmp/y"}`, "/tmp/y"},
 		{"download without file_path", "download", `{"url":"https://x.com"}`, "https://x.com"},
-		{"bash → no hint", "bash", `{"command":"echo"}`, ""},
-		{"sourcegraph → no hint", "sourcegraph", `{"query":"x"}`, ""},
+		{"bash → command", "bash", `{"command":"echo"}`, "echo"},
+		{"bash multiline → first line", "bash", "{\"command\":\"cd x\\nmake\"}", "cd x"},
+		{"sourcegraph → query", "sourcegraph", `{"query":"x"}`, "x"},
+		{"agent → description", "agent", `{"description":"refactor","prompt":"p"}`, "refactor"},
+		{"task → prompt fallback", "task", `{"prompt":"audit"}`, "audit"},
 		{"empty input → no hint", "view", "", ""},
 		{"unparseable → no hint", "view", "{not-json", ""},
 		{"case insensitive", "VIEW", `{"file_path":"a.go"}`, "a.go"},
