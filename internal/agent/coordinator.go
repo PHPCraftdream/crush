@@ -58,6 +58,7 @@ import (
 	"github.com/charmbracelet/crush/internal/permission"
 	"github.com/charmbracelet/crush/internal/pubsub"
 	"github.com/charmbracelet/crush/internal/session"
+	"github.com/charmbracelet/crush/internal/shell"
 	"github.com/charmbracelet/crush/internal/skills"
 	"golang.org/x/sync/errgroup"
 
@@ -1041,9 +1042,25 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubA
 		hookRunner = hooks.NewRunner(preToolHooks, c.cfg.WorkingDir(), c.cfg.WorkingDir())
 	}
 
+	// Background-job completion notification (web/interactive only).
+	// When a bash command auto-backgrounds and later finishes, push a
+	// one-message completion notice into the owning session via the
+	// existing InjectMessage path. Kill-switch defaults to ON; a session
+	// that is BUSY merges it into the running turn, IDLE sessions get a
+	// persisted message (no auto-resume). crush run is single-turn and
+	// never receives it.
+	opts := c.cfg.Config().Options
+	notifyDone := opts.NotifyOnBackgroundJobDone == nil || *opts.NotifyOnBackgroundJobDone
+	var onBgDone func(string, *shell.BackgroundShell)
+	if notifyDone {
+		onBgDone = func(sessionID string, sh *shell.BackgroundShell) {
+			c.notifyBackgroundJobDone(sessionID, sh)
+		}
+	}
+
 	allTools = append(
 		allTools,
-		tools.NewBashTool(c.permissions, c.cfg.WorkingDir(), c.cfg.Config().Options.Attribution, modelID),
+		tools.NewBashTool(c.permissions, c.cfg.WorkingDir(), c.cfg.Config().Options.Attribution, modelID, onBgDone),
 		tools.NewCrushInfoTool(c.cfg, c.allSkills, c.activeSkills, c.skillTracker),
 		tools.NewCrushLogsTool(logFile),
 		tools.NewJobOutputTool(),
@@ -1554,6 +1571,51 @@ func (c *coordinator) InjectMessage(ctx context.Context, sessionID, prompt strin
 		return message.Message{}, err
 	}
 	return c.currentAgent.InjectMessage(ctx, call)
+}
+
+// filterNonEmpty returns the subset of inputs that are non-empty after
+// trimming surrounding whitespace. Used to join stdout/stderr cleanly.
+func filterNonEmpty(parts ...string) []string {
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if strings.TrimSpace(p) != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// backgroundJobSummary formats a finished background command for injection
+// into the owning session. Pure and deterministic so it can be unit-tested
+// without a running shell.
+func backgroundJobSummary(id, command string, stdout, stderr string, exitCode int, elapsed time.Duration) string {
+	out := strings.TrimSpace(strings.Join(filterNonEmpty(stdout, stderr), "\n"))
+	out = tools.TruncateOutput(out)
+	if out == "" {
+		out = "(no output)"
+	}
+	return fmt.Sprintf("Background job %s (`%s`) finished: exit %d, ran %s.\n\n%s",
+		id, command, exitCode, elapsed.Round(time.Second), out)
+}
+
+// notifyBackgroundJobDone is invoked from a BackgroundShell.OnDone goroutine
+// once a backgrounded bash command reaches a terminal state. It builds a
+// concise summary and pushes it into the owning session via InjectMessage.
+// Detached: the OnDone goroutine outlives the turn that started it, so we
+// use a fresh context with a bounded timeout and never block or cancel the
+// agent. Delivery failures (e.g. session closed) are logged at debug level.
+func (c *coordinator) notifyBackgroundJobDone(sessionID string, sh *shell.BackgroundShell) {
+	stdout, stderr, _, runErr := sh.GetOutput()
+	summary := backgroundJobSummary(sh.ID, sh.Command, stdout, stderr, shell.ExitCode(runErr), sh.Elapsed())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if _, err := c.InjectMessage(ctx, sessionID, summary); err != nil {
+		slog.Debug("background job completion not delivered (session likely closed)",
+			"session_id", sessionID,
+			"shell_id", sh.ID,
+			"err", err)
+	}
 }
 
 func (c *coordinator) IsBusy() bool {

@@ -356,6 +356,13 @@ type Options struct {
 	// Persisted globally because BT-headphone preferences track the
 	// operator's machine, not any single project's repo.
 	KeepAliveEnabled *bool `json:"keep_alive_enabled,omitempty" jsonschema:"description=Web UI WebAudio keep-alive: emits an inaudible loop so Bluetooth headphones do not auto-suspend during long agent runs. Default true. Set false to disable.,default=true"`
+	// NotifyOnBackgroundJobDone controls whether a finished background
+	// command (one bash auto-backgrounded after AutoBackgroundAfter)
+	// pushes a completion message into the owning session. Default
+	// (nil) = enabled. Set false to disable the auto-notification.
+	// Web/interactive only — crush run is single-turn and never
+	// receives it.
+	NotifyOnBackgroundJobDone *bool `json:"notify_on_background_job_done,omitempty" jsonschema:"description=Push a completion message into the session when a background command finishes (web/interactive). Default true. Set false to disable.,default=true"`
 }
 
 type MCPs map[string]MCPConfig

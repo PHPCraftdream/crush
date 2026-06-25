@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"testing"
+	"time"
 
 	"charm.land/fantasy"
 	"github.com/charmbracelet/crush/internal/config"
@@ -140,7 +141,7 @@ func (m *recordingPermissionService) DeletePermission(ruleID string) error {
 func newBashToolForTest(workingDir string) fantasy.AgentTool {
 	permissions := &mockBashPermissionService{Broker: pubsub.NewBroker[permission.PermissionRequest]()}
 	attribution := &config.Attribution{TrailerStyle: config.TrailerStyleNone}
-	return NewBashTool(permissions, workingDir, attribution, "test-model")
+	return NewBashTool(permissions, workingDir, attribution, "test-model", nil)
 }
 
 func newBashToolWithRecordingPerms(workingDir string, allow bool) (fantasy.AgentTool, *recordingPermissionService) {
@@ -149,7 +150,7 @@ func newBashToolWithRecordingPerms(workingDir string, allow bool) (fantasy.Agent
 		allow:  allow,
 	}
 	attribution := &config.Attribution{TrailerStyle: config.TrailerStyleNone}
-	return NewBashTool(perms, workingDir, attribution, "test-model"), perms
+	return NewBashTool(perms, workingDir, attribution, "test-model", nil), perms
 }
 
 func TestBashTool_ChainedCommandsRequirePermission(t *testing.T) {
@@ -206,4 +207,53 @@ func runBashTool(t *testing.T, tool fantasy.AgentTool, ctx context.Context, para
 	resp, err := tool.Run(ctx, call)
 	require.NoError(t, err)
 	return resp
+}
+
+// TestBashTool_OnBackgroundCompleteFires proves the onBackgroundComplete
+// callback (wired through BackgroundShell.OnDone in NewBashTool) is invoked
+// once a command that auto-backgrounds reaches a terminal state. We shrink
+// AutoBackgroundAfter so the command backgrounds quickly, then assert the
+// stub fires within a few seconds.
+func TestBashTool_OnBackgroundCompleteFires(t *testing.T) {
+	workingDir := t.TempDir()
+
+	type completion struct {
+		sessionID string
+		sh        *shell.BackgroundShell
+	}
+	done := make(chan completion, 1)
+	permissions := &mockBashPermissionService{Broker: pubsub.NewBroker[permission.PermissionRequest]()}
+	attribution := &config.Attribution{TrailerStyle: config.TrailerStyleNone}
+	onComplete := func(sessionID string, sh *shell.BackgroundShell) {
+		select {
+		case done <- completion{sessionID: sessionID, sh: sh}:
+		default:
+		}
+	}
+	tool := NewBashTool(permissions, workingDir, attribution, "test-model", onComplete)
+	ctx := context.WithValue(context.Background(), SessionIDContextKey, "bg-complete-session")
+
+	resp := runBashTool(t, tool, ctx, BashParams{
+		Description:         "auto-bg with callback",
+		Command:             "sleep 1.5 && echo finished",
+		AutoBackgroundAfter: 1,
+	})
+
+	require.False(t, resp.IsError)
+	var meta BashResponseMetadata
+	require.NoError(t, json.Unmarshal([]byte(resp.Metadata), &meta))
+	require.True(t, meta.Background, "command should have been auto-backgrounded")
+	require.NotEmpty(t, meta.ShellID)
+
+	select {
+	case got := <-done:
+		require.Equal(t, "bg-complete-session", got.sessionID)
+		require.NotNil(t, got.sh)
+		require.Equal(t, meta.ShellID, got.sh.ID)
+	case <-time.After(10 * time.Second):
+		t.Fatal("onBackgroundComplete was not invoked within 10s")
+	}
+
+	// Clean up the background shell if it is still tracked.
+	_ = shell.GetBackgroundShellManager().Kill(meta.ShellID)
 }

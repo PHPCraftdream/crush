@@ -192,7 +192,7 @@ func blockFuncs() []shell.BlockFunc {
 	}
 }
 
-func NewBashTool(permissions permission.Service, workingDir string, attribution *config.Attribution, modelID string) fantasy.AgentTool {
+func NewBashTool(permissions permission.Service, workingDir string, attribution *config.Attribution, modelID string, onBackgroundComplete func(sessionID string, sh *shell.BackgroundShell)) fantasy.AgentTool {
 	return fantasy.NewAgentTool(
 		BashToolName,
 		string(bashDescription(attribution, modelID)),
@@ -296,6 +296,11 @@ func NewBashTool(permissions permission.Service, workingDir string, attribution 
 				}
 
 				// Still running after fast-failure check - return as background job
+				if onBackgroundComplete != nil {
+					sh := bgShell
+					sid := sessionID
+					sh.OnDone(func() { onBackgroundComplete(sid, sh) })
+				}
 				metadata := BashResponseMetadata{
 					StartTime:        startTime.UnixMilli(),
 					EndTime:          time.Now().UnixMilli(),
@@ -380,6 +385,11 @@ func NewBashTool(permissions permission.Service, workingDir string, attribution 
 			}
 
 			// Still running - keep as background job
+			if onBackgroundComplete != nil {
+				sh := bgShell
+				sid := sessionID
+				sh.OnDone(func() { onBackgroundComplete(sid, sh) })
+			}
 			metadata := BashResponseMetadata{
 				StartTime:        startTime.UnixMilli(),
 				EndTime:          time.Now().UnixMilli(),
