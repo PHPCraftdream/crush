@@ -1027,6 +1027,14 @@ const UserContent = memo(function UserContent({
   }
   return (
     <div className="msg-bubble-user" style={{ fontSize: "var(--chat-font-size)" }}>
+      {message.AutoResumed && (
+        <span
+          className="px-1 py-0.5 rounded bg-base-subtle text-text-muted font-mono text-[10px] mb-1 inline-block"
+          title="auto-resumed: background job finished"
+        >
+          ↻ auto-resumed
+        </span>
+      )}
       {message.Parts.map((part, i) => <Part key={i} part={part} index={i} isUser messageID={message.ID} thinkingDone={false} />)}
     </div>
   );

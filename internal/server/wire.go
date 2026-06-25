@@ -44,6 +44,7 @@ type MessageWire struct {
 	IsSummaryMessage bool       `json:"IsSummaryMessage"`
 	Pinned           bool       `json:"Pinned"`
 	Hidden           bool       `json:"Hidden"`
+	AutoResumed      bool       `json:"AutoResumed"`
 }
 
 func toPartWire(part message.ContentPart) PartWire {
@@ -80,6 +81,7 @@ func toMessageWire(m message.Message) MessageWire {
 		IsSummaryMessage: m.IsSummaryMessage,
 		Pinned:           m.Pinned,
 		Hidden:           m.Hidden,
+		AutoResumed:      m.AutoResumed,
 	}
 }
 

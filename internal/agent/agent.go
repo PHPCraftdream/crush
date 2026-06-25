@@ -1660,6 +1660,12 @@ func (a *sessionAgent) getCacheControlOptions() fantasy.ProviderOptions {
 	}
 }
 
+// autoResumedCtxKey tags a context so that createUserMessage marks the
+// resulting user message as AutoResumed. Set only on the Phase 4 idle-resume
+// path in coordinator.notifyBackgroundJobDone; human and InjectMessage paths
+// leave it unset (false).
+type autoResumedCtxKey struct{}
+
 func (a *sessionAgent) createUserMessage(ctx context.Context, call SessionAgentCall) (message.Message, error) {
 	parts := []message.ContentPart{message.TextContent{Text: call.Prompt}}
 	var attachmentParts []message.ContentPart
@@ -1667,9 +1673,11 @@ func (a *sessionAgent) createUserMessage(ctx context.Context, call SessionAgentC
 		attachmentParts = append(attachmentParts, message.BinaryContent{Path: attachment.FilePath, MIMEType: attachment.MimeType, Data: attachment.Content})
 	}
 	parts = append(parts, attachmentParts...)
+	autoResumed, _ := ctx.Value(autoResumedCtxKey{}).(bool)
 	msg, err := a.messages.Create(ctx, call.SessionID, message.CreateMessageParams{
-		Role:  message.User,
-		Parts: parts,
+		Role:        message.User,
+		Parts:       parts,
+		AutoResumed: autoResumed,
 	})
 	if err != nil {
 		return message.Message{}, fmt.Errorf("failed to create user message: %w", err)

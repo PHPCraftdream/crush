@@ -96,6 +96,7 @@ export interface Message {
   IsSummaryMessage: boolean;
   Pinned: boolean;
   Hidden: boolean;
+  AutoResumed: boolean;
 }
 
 export interface PermissionRequest {

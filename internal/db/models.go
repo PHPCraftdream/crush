@@ -32,6 +32,7 @@ type Message struct {
 	Pinned           int64          `json:"pinned"`
 	Hidden           int64          `json:"hidden"`
 	ReasoningEffort  sql.NullString `json:"reasoning_effort"`
+	AutoResumed      int64          `json:"auto_resumed"`
 }
 
 type ReadFile struct {

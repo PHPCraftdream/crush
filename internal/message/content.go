@@ -152,6 +152,10 @@ type Message struct {
 	// Hidden messages are not rendered in the UI but are still passed to the
 	// LLM as context (used for silent background summaries).
 	Hidden bool
+	// AutoResumed marks a user message created by Phase 4 autonomous
+	// idle-resume; rendered as a badge in the web UI so operators can see
+	// where the agent started a turn on its own.
+	AutoResumed bool
 }
 
 func (m *Message) Content() TextContent {

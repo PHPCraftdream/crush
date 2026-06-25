@@ -21,12 +21,13 @@ INSERT INTO messages (
     reasoning_effort,
     is_summary_message,
     hidden,
+    auto_resumed,
     created_at,
     updated_at
 ) VALUES (
-    ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'), strftime('%s', 'now')
+    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'), strftime('%s', 'now')
 )
-RETURNING id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden, reasoning_effort
+RETURNING id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden, reasoning_effort, auto_resumed
 `
 
 type CreateMessageParams struct {
@@ -39,10 +40,12 @@ type CreateMessageParams struct {
 	ReasoningEffort  sql.NullString `json:"reasoning_effort"`
 	IsSummaryMessage int64          `json:"is_summary_message"`
 	Hidden           int64          `json:"hidden"`
+	AutoResumed      int64          `json:"auto_resumed"`
 }
 
 func (q *Queries) CreateMessage(ctx context.Context, arg CreateMessageParams) (Message, error) {
-	row := q.queryRow(ctx, q.createMessageStmt, createMessage,
+	row := q.queryRow(
+		ctx, q.createMessageStmt, createMessage,
 		arg.ID,
 		arg.SessionID,
 		arg.Role,
@@ -52,6 +55,7 @@ func (q *Queries) CreateMessage(ctx context.Context, arg CreateMessageParams) (M
 		arg.ReasoningEffort,
 		arg.IsSummaryMessage,
 		arg.Hidden,
+		arg.AutoResumed,
 	)
 	var i Message
 	err := row.Scan(
@@ -68,6 +72,7 @@ func (q *Queries) CreateMessage(ctx context.Context, arg CreateMessageParams) (M
 		&i.Pinned,
 		&i.Hidden,
 		&i.ReasoningEffort,
+		&i.AutoResumed,
 	)
 	return i, err
 }
@@ -93,7 +98,7 @@ func (q *Queries) DeleteSessionMessages(ctx context.Context, sessionID string) e
 }
 
 const getMessage = `-- name: GetMessage :one
-SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden, reasoning_effort
+SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden, reasoning_effort, auto_resumed
 FROM messages
 WHERE id = ? LIMIT 1
 `
@@ -115,12 +120,13 @@ func (q *Queries) GetMessage(ctx context.Context, id string) (Message, error) {
 		&i.Pinned,
 		&i.Hidden,
 		&i.ReasoningEffort,
+		&i.AutoResumed,
 	)
 	return i, err
 }
 
 const listAllUserMessages = `-- name: ListAllUserMessages :many
-SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden, reasoning_effort
+SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden, reasoning_effort, auto_resumed
 FROM messages
 WHERE role = 'user'
 ORDER BY created_at DESC
@@ -149,6 +155,7 @@ func (q *Queries) ListAllUserMessages(ctx context.Context) ([]Message, error) {
 			&i.Pinned,
 			&i.Hidden,
 			&i.ReasoningEffort,
+			&i.AutoResumed,
 		); err != nil {
 			return nil, err
 		}
@@ -164,7 +171,7 @@ func (q *Queries) ListAllUserMessages(ctx context.Context) ([]Message, error) {
 }
 
 const listMessagesBySession = `-- name: ListMessagesBySession :many
-SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden, reasoning_effort
+SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden, reasoning_effort, auto_resumed
 FROM messages
 WHERE session_id = ?
 ORDER BY created_at ASC
@@ -193,6 +200,7 @@ func (q *Queries) ListMessagesBySession(ctx context.Context, sessionID string) (
 			&i.Pinned,
 			&i.Hidden,
 			&i.ReasoningEffort,
+			&i.AutoResumed,
 		); err != nil {
 			return nil, err
 		}
@@ -208,7 +216,7 @@ func (q *Queries) ListMessagesBySession(ctx context.Context, sessionID string) (
 }
 
 const listUserMessagesBySession = `-- name: ListUserMessagesBySession :many
-SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden, reasoning_effort
+SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden, reasoning_effort, auto_resumed
 FROM messages
 WHERE session_id = ? AND role = 'user'
 ORDER BY created_at DESC
@@ -237,6 +245,7 @@ func (q *Queries) ListUserMessagesBySession(ctx context.Context, sessionID strin
 			&i.Pinned,
 			&i.Hidden,
 			&i.ReasoningEffort,
+			&i.AutoResumed,
 		); err != nil {
 			return nil, err
 		}

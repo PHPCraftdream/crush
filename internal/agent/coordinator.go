@@ -1696,7 +1696,9 @@ func (c *coordinator) notifyBackgroundJobDone(sessionID string, sh *shell.Backgr
 			// Detached + cancelable: outlives the OnDone goroutine; the turn's
 			// own watchdog/Cancel(sessionID) governs its lifetime, so NO short
 			// timeout here (unlike the InjectMessage path — a turn can be long).
-			ctx := context.Background()
+			// Tag the context so the persisted user message is marked
+			// AutoResumed and rendered with a badge in the web UI.
+			ctx := context.WithValue(context.Background(), autoResumedCtxKey{}, true)
 			if _, err := c.Run(ctx, sessionID, summary); err != nil {
 				slog.Debug("Phase 4 auto-resume run failed (session likely closed)",
 					"session_id", sessionID, "shell_id", sh.ID, "err", err)

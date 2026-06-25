@@ -39,6 +39,9 @@ type CreateMessageParams struct {
 	// background summaries that provide context to the LLM without cluttering
 	// the conversation view.
 	Hidden bool
+	// AutoResumed marks a user message that was created by Phase 4 autonomous
+	// idle-resume, not typed by a human; surfaced as a web badge.
+	AutoResumed bool
 }
 
 type Service interface {
@@ -103,6 +106,10 @@ func (s *service) Create(ctx context.Context, sessionID string, params CreateMes
 	if params.Hidden {
 		hidden = 1
 	}
+	autoResumed := int64(0)
+	if params.AutoResumed {
+		autoResumed = 1
+	}
 	dbMessage, err := s.q.CreateMessage(ctx, db.CreateMessageParams{
 		ID:               uuid.New().String(),
 		SessionID:        sessionID,
@@ -113,6 +120,7 @@ func (s *service) Create(ctx context.Context, sessionID string, params CreateMes
 		ReasoningEffort:  sql.NullString{String: params.ReasoningEffort, Valid: params.ReasoningEffort != ""},
 		IsSummaryMessage: isSummary,
 		Hidden:           hidden,
+		AutoResumed:      autoResumed,
 	})
 	if err != nil {
 		return Message{}, err
@@ -247,6 +255,7 @@ func (s *service) fromDBItem(item db.Message) (Message, error) {
 		IsSummaryMessage: item.IsSummaryMessage != 0,
 		Pinned:           item.Pinned != 0,
 		Hidden:           item.Hidden != 0,
+		AutoResumed:      item.AutoResumed != 0,
 	}, nil
 }
 

@@ -55,7 +55,8 @@ func newTestMessageDB(t *testing.T) (*sql.DB, *db.Queries) {
 			finished_at INTEGER,
 			is_summary_message INTEGER NOT NULL DEFAULT 0,
 			pinned INTEGER NOT NULL DEFAULT 0,
-			hidden INTEGER NOT NULL DEFAULT 0
+			hidden INTEGER NOT NULL DEFAULT 0,
+			auto_resumed INTEGER NOT NULL DEFAULT 0
 		);
 	`)
 	require.NoError(t, err)
@@ -265,4 +266,48 @@ func TestFinishToolCall_PreservesProviderExecuted(t *testing.T) {
 	assert.Equal(t, "call-1", tc.ID)
 	assert.Equal(t, "bash", tc.Name)
 	assert.Equal(t, `{"cmd":"ls"}`, tc.Input)
+}
+
+func TestCreateMessage_AutoResumedRoundTrip(t *testing.T) {
+	_, q := newTestMessageDB(t)
+	svc := NewService(q)
+
+	ctx := t.Context()
+	sessionID := "test-session-auto-resumed"
+
+	t.Run("auto-resumed flag persists and reads back true", func(t *testing.T) {
+		params := CreateMessageParams{
+			Role:        User,
+			Parts:       []ContentPart{TextContent{Text: "Background job xyz finished"}},
+			AutoResumed: true,
+		}
+		created, err := svc.Create(ctx, sessionID, params)
+		require.NoError(t, err)
+		assert.True(t, created.AutoResumed, "created message should have AutoResumed=true")
+
+		// Round-trip through Get.
+		got, err := svc.Get(ctx, created.ID)
+		require.NoError(t, err)
+		assert.True(t, got.AutoResumed, "Get should return AutoResumed=true")
+
+		// Round-trip through List.
+		listed, err := svc.List(ctx, sessionID)
+		require.NoError(t, err)
+		require.Len(t, listed, 1)
+		assert.True(t, listed[0].AutoResumed, "List should return AutoResumed=true")
+	})
+
+	t.Run("default is false when flag omitted", func(t *testing.T) {
+		params := CreateMessageParams{
+			Role:  User,
+			Parts: []ContentPart{TextContent{Text: "normal human message"}},
+		}
+		created, err := svc.Create(ctx, sessionID, params)
+		require.NoError(t, err)
+		assert.False(t, created.AutoResumed, "omitted AutoResumed should default to false")
+
+		got, err := svc.Get(ctx, created.ID)
+		require.NoError(t, err)
+		assert.False(t, got.AutoResumed, "Get should return AutoResumed=false for default")
+	})
 }
