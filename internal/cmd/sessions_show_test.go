@@ -117,7 +117,8 @@ func newTestDB(t *testing.T) (*sql.DB, *db.Queries) {
 			finished_at INTEGER,
 			is_summary_message INTEGER NOT NULL DEFAULT 0,
 			pinned INTEGER NOT NULL DEFAULT 0,
-			hidden INTEGER NOT NULL DEFAULT 0
+			hidden INTEGER NOT NULL DEFAULT 0,
+			auto_resumed INTEGER NOT NULL DEFAULT 0
 		);
 
 		CREATE INDEX idx_messages_session_id ON messages(session_id);
