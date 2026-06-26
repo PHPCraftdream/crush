@@ -1,5 +1,5 @@
 import { atom, computed } from "nanostores";
-import type { Session, Message, ContentPart, ReasoningContent, PermissionRequest, PermissionRule, ConfigPayload, MCPState, Todo, SkillInfo } from "./types";
+import type { Session, Message, ContentPart, PermissionRequest, PermissionRule, ConfigPayload, MCPState, Todo, SkillInfo } from "./types";
 
 // ── Connection state ─────────────────────────────────────────────────────────
 export const $connected = atom(false);
@@ -129,50 +129,88 @@ export function setMessages(msgs: Message[]) {
 // per reasoning round in a multi-step turn), so we sum them all rather
 // than reading only Parts[0].
 function totalThinking(parts: ContentPart[]): string {
-  return parts
-    .filter((p): p is ReasoningContent => p.type === "thinking")
+  return partsOfKind(parts, "thinking")
     .map((p) => p.Thinking)
     .join("");
 }
 
-// mergePreserveThinking guards already-shown reasoning against a
-// wholesale-replace that would shrink or erase it.
+// totalText returns the concatenated answer text across every `text`
+// part. An assistant turn can carry multiple text parts (text between
+// tool calls, a closing summary, …); sum them so the length comparison
+// reflects everything the user was shown.
+function totalText(parts: ContentPart[]): string {
+  return partsOfKind(parts, "text")
+    .map((p) => p.Text)
+    .join("");
+}
+
+// partsOfKind returns the parts of a single accumulating kind, preserving
+// their in-message order. Used for both `thinking` and `text`.
+function partsOfKind<T extends ContentPart["type"]>(
+  parts: ContentPart[],
+  kind: T,
+): Extract<ContentPart, { type: T }>[] {
+  return parts.filter(
+    (p): p is Extract<ContentPart, { type: T }> => p.type === kind,
+  );
+}
+
+// mergePreserveContent guards already-shown assistant content — BOTH the
+// reasoning (inside the thinking spoiler) AND the answer text (rendered
+// outside it) — against a wholesale-replace that would shrink or erase
+// either one.
 //
 // The backend streams an assistant message by APPENDING reasoning/text to
 // one in-memory message and broadcasting it via `message_updated`. Most
-// deltas only touch text/tool parts, but occasionally an update arrives
-// whose thinking Part is missing or shorter than what the user was just
-// shown (e.g. a reload after a tool boundary that hasn't re-read the
-// in-flight reasoning yet). Replacing the message wholesale in that case
-// makes the reasoning the operator was watching vanish mid-turn.
+// deltas only grow content, but occasionally a stale snapshot arrives
+// (the backend ticker re-broadcasts a moment before the latest delta
+// lands) whose thinking OR text is shorter than what the user was just
+// shown. Replacing the message wholesale in that case makes the content
+// the operator was watching vanish mid-turn — the answer text blinks out
+// the instant the thinking spoiler updates again.
 //
-// Rule: if the incoming total thinking is strictly shorter than the
-// existing total thinking, keep the existing thinking part(s) and splice
-// in the incoming non-thinking parts (text, tool_call, tool_result,
-// finish) so the latest non-reasoning content still flows through.
-// Otherwise (equal or longer — the normal streaming-growth case, or a
-// genuinely richer update) use the incoming message as-is. Non-thinking
-// parts are NEVER carried over from the existing message: text and tools
-// legitimately change between updates and must reflect the latest state.
-export function mergePreserveThinking(existing: Message, incoming: Message): Message {
+// Rule, per accumulating kind:
+//   - THINKING: if incoming total thinking is shorter than existing →
+//     keep existing thinking part(s); else use incoming's.
+//   - TEXT: if incoming total text is shorter than existing → keep
+//     existing text part(s); else use incoming's.
+//   - TOOL / FINISH / OTHER (tool_call, tool_result, finish, anything
+//     else): ALWAYS take from incoming — these advance legitimately.
+//
+// Rebuilt render order is the natural assistant order: thinking → text →
+// tools/finish/other (in their incoming order). If NEITHER kind
+// regressed (the normal growth case), the incoming message is returned
+// verbatim — the cheapest path, and it preserves any incoming ordering
+// nuance.
+export function mergePreserveContent(existing: Message, incoming: Message): Message {
   const existingThinking = totalThinking(existing.Parts);
   const incomingThinking = totalThinking(incoming.Parts);
+  const existingText = totalText(existing.Parts);
+  const incomingText = totalText(incoming.Parts);
 
-  // Normal growth or no regression — take the update verbatim.
-  if (incomingThinking.length >= existingThinking.length) {
+  const thinkingRegressed = incomingThinking.length < existingThinking.length;
+  const textRegressed = incomingText.length < existingText.length;
+
+  // Normal growth or no regression on either accumulating kind — take
+  // the update verbatim.
+  if (!thinkingRegressed && !textRegressed) {
     return incoming;
   }
 
-  // Regression: incoming would erase/shrink shown reasoning. Rebuild by
-  // taking the existing thinking parts (in their original positions) and
-  // appending the incoming non-thinking parts, so reasoning stays visible
-  // while text/tools still advance.
-  const existingThinkingParts = existing.Parts.filter(
-    (p): p is ReasoningContent => p.type === "thinking",
+  // One or both kinds regressed: rebuild. Pick the longer side per kind
+  // (existing wins ties because it is what the user is currently seeing),
+  // then append all non-accumulating parts from incoming.
+  const thinkingParts = thinkingRegressed
+    ? partsOfKind(existing.Parts, "thinking")
+    : partsOfKind(incoming.Parts, "thinking");
+  const textParts = textRegressed
+    ? partsOfKind(existing.Parts, "text")
+    : partsOfKind(incoming.Parts, "text");
+  const advancingParts = incoming.Parts.filter(
+    (p) => p.type !== "thinking" && p.type !== "text",
   );
-  const incomingNonThinking = incoming.Parts.filter((p) => p.type !== "thinking");
 
-  return { ...incoming, Parts: [...existingThinkingParts, ...incomingNonThinking] };
+  return { ...incoming, Parts: [...thinkingParts, ...textParts, ...advancingParts] };
 }
 
 export function upsertMessage(msg: Message) {
@@ -188,7 +226,7 @@ export function upsertMessage(msg: Message) {
     // unaffected.
     next[idx] =
       prev.Role === "assistant" && msg.Role === "assistant"
-        ? mergePreserveThinking(prev, msg)
+        ? mergePreserveContent(prev, msg)
         : msg;
     $messages.set(next);
   }
