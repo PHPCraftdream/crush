@@ -1,5 +1,5 @@
 import { atom, computed } from "nanostores";
-import type { Session, Message, PermissionRequest, PermissionRule, ConfigPayload, MCPState, Todo, SkillInfo } from "./types";
+import type { Session, Message, ContentPart, ReasoningContent, PermissionRequest, PermissionRule, ConfigPayload, MCPState, Todo, SkillInfo } from "./types";
 
 // ── Connection state ─────────────────────────────────────────────────────────
 export const $connected = atom(false);
@@ -124,14 +124,72 @@ export function setMessages(msgs: Message[]) {
   $messages.set(msgs);
 }
 
+// totalThinking returns the concatenated thinking text across every
+// `thinking` part in a message. Reasoning can span multiple parts (one
+// per reasoning round in a multi-step turn), so we sum them all rather
+// than reading only Parts[0].
+function totalThinking(parts: ContentPart[]): string {
+  return parts
+    .filter((p): p is ReasoningContent => p.type === "thinking")
+    .map((p) => p.Thinking)
+    .join("");
+}
+
+// mergePreserveThinking guards already-shown reasoning against a
+// wholesale-replace that would shrink or erase it.
+//
+// The backend streams an assistant message by APPENDING reasoning/text to
+// one in-memory message and broadcasting it via `message_updated`. Most
+// deltas only touch text/tool parts, but occasionally an update arrives
+// whose thinking Part is missing or shorter than what the user was just
+// shown (e.g. a reload after a tool boundary that hasn't re-read the
+// in-flight reasoning yet). Replacing the message wholesale in that case
+// makes the reasoning the operator was watching vanish mid-turn.
+//
+// Rule: if the incoming total thinking is strictly shorter than the
+// existing total thinking, keep the existing thinking part(s) and splice
+// in the incoming non-thinking parts (text, tool_call, tool_result,
+// finish) so the latest non-reasoning content still flows through.
+// Otherwise (equal or longer — the normal streaming-growth case, or a
+// genuinely richer update) use the incoming message as-is. Non-thinking
+// parts are NEVER carried over from the existing message: text and tools
+// legitimately change between updates and must reflect the latest state.
+export function mergePreserveThinking(existing: Message, incoming: Message): Message {
+  const existingThinking = totalThinking(existing.Parts);
+  const incomingThinking = totalThinking(incoming.Parts);
+
+  // Normal growth or no regression — take the update verbatim.
+  if (incomingThinking.length >= existingThinking.length) {
+    return incoming;
+  }
+
+  // Regression: incoming would erase/shrink shown reasoning. Rebuild by
+  // taking the existing thinking parts (in their original positions) and
+  // appending the incoming non-thinking parts, so reasoning stays visible
+  // while text/tools still advance.
+  const existingThinkingParts = existing.Parts.filter(
+    (p): p is ReasoningContent => p.type === "thinking",
+  );
+  const incomingNonThinking = incoming.Parts.filter((p) => p.type !== "thinking");
+
+  return { ...incoming, Parts: [...existingThinkingParts, ...incomingNonThinking] };
+}
+
 export function upsertMessage(msg: Message) {
   const list = $messages.get();
   const idx = list.findIndex((m) => m.ID === msg.ID);
   if (idx === -1) {
     $messages.set([...list, msg]);
   } else {
+    const prev = list[idx];
     const next = [...list];
-    next[idx] = msg;
+    // For assistant messages, never let an update erase reasoning the
+    // user was already shown. Non-assistant and brand-new messages are
+    // unaffected.
+    next[idx] =
+      prev.Role === "assistant" && msg.Role === "assistant"
+        ? mergePreserveThinking(prev, msg)
+        : msg;
     $messages.set(next);
   }
 }
