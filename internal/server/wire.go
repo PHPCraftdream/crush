@@ -33,18 +33,19 @@ type PartWire struct {
 
 // MessageWire is the JSON wire format for a Message sent to the browser.
 type MessageWire struct {
-	ID               string     `json:"ID"`
-	Role             string     `json:"Role"`
-	SessionID        string     `json:"SessionID"`
-	Parts            []PartWire `json:"Parts"`
-	Model            string     `json:"Model"`
-	Provider         string     `json:"Provider"`
-	CreatedAt        int64      `json:"CreatedAt"`
-	UpdatedAt        int64      `json:"UpdatedAt"`
-	IsSummaryMessage bool       `json:"IsSummaryMessage"`
-	Pinned           bool       `json:"Pinned"`
-	Hidden           bool       `json:"Hidden"`
-	AutoResumed      bool       `json:"AutoResumed"`
+	ID                  string     `json:"ID"`
+	Role                string     `json:"Role"`
+	SessionID           string     `json:"SessionID"`
+	Parts               []PartWire `json:"Parts"`
+	Model               string     `json:"Model"`
+	Provider            string     `json:"Provider"`
+	CreatedAt           int64      `json:"CreatedAt"`
+	UpdatedAt           int64      `json:"UpdatedAt"`
+	IsSummaryMessage    bool       `json:"IsSummaryMessage"`
+	Pinned              bool       `json:"Pinned"`
+	Hidden              bool       `json:"Hidden"`
+	AutoResumed         bool       `json:"AutoResumed"`
+	BackgroundJobNotice bool       `json:"BackgroundJobNotice"`
 }
 
 func toPartWire(part message.ContentPart) PartWire {
@@ -70,18 +71,19 @@ func toMessageWire(m message.Message) MessageWire {
 		parts[i] = toPartWire(p)
 	}
 	return MessageWire{
-		ID:               m.ID,
-		Role:             string(m.Role),
-		SessionID:        m.SessionID,
-		Parts:            parts,
-		Model:            m.Model,
-		Provider:         m.Provider,
-		CreatedAt:        m.CreatedAt,
-		UpdatedAt:        m.UpdatedAt,
-		IsSummaryMessage: m.IsSummaryMessage,
-		Pinned:           m.Pinned,
-		Hidden:           m.Hidden,
-		AutoResumed:      m.AutoResumed,
+		ID:                  m.ID,
+		Role:                string(m.Role),
+		SessionID:           m.SessionID,
+		Parts:               parts,
+		Model:               m.Model,
+		Provider:            m.Provider,
+		CreatedAt:           m.CreatedAt,
+		UpdatedAt:           m.UpdatedAt,
+		IsSummaryMessage:    m.IsSummaryMessage,
+		Pinned:              m.Pinned,
+		Hidden:              m.Hidden,
+		AutoResumed:         m.AutoResumed,
+		BackgroundJobNotice: m.BackgroundJobNotice,
 	}
 }
 

@@ -42,6 +42,9 @@ type CreateMessageParams struct {
 	// AutoResumed marks a user message that was created by Phase 4 autonomous
 	// idle-resume, not typed by a human; surfaced as a web badge.
 	AutoResumed bool
+	// BackgroundJobNotice marks a system-injected background-job-completion
+	// notice so the web renders it as a notice, not a human message.
+	BackgroundJobNotice bool
 }
 
 type Service interface {
@@ -110,17 +113,22 @@ func (s *service) Create(ctx context.Context, sessionID string, params CreateMes
 	if params.AutoResumed {
 		autoResumed = 1
 	}
+	backgroundJobNotice := int64(0)
+	if params.BackgroundJobNotice {
+		backgroundJobNotice = 1
+	}
 	dbMessage, err := s.q.CreateMessage(ctx, db.CreateMessageParams{
-		ID:               uuid.New().String(),
-		SessionID:        sessionID,
-		Role:             string(params.Role),
-		Parts:            string(partsJSON),
-		Model:            sql.NullString{String: string(params.Model), Valid: true},
-		Provider:         sql.NullString{String: params.Provider, Valid: params.Provider != ""},
-		ReasoningEffort:  sql.NullString{String: params.ReasoningEffort, Valid: params.ReasoningEffort != ""},
-		IsSummaryMessage: isSummary,
-		Hidden:           hidden,
-		AutoResumed:      autoResumed,
+		ID:                  uuid.New().String(),
+		SessionID:           sessionID,
+		Role:                string(params.Role),
+		Parts:               string(partsJSON),
+		Model:               sql.NullString{String: string(params.Model), Valid: true},
+		Provider:            sql.NullString{String: params.Provider, Valid: params.Provider != ""},
+		ReasoningEffort:     sql.NullString{String: params.ReasoningEffort, Valid: params.ReasoningEffort != ""},
+		IsSummaryMessage:    isSummary,
+		Hidden:              hidden,
+		AutoResumed:         autoResumed,
+		BackgroundJobNotice: backgroundJobNotice,
 	})
 	if err != nil {
 		return Message{}, err
@@ -243,19 +251,20 @@ func (s *service) fromDBItem(item db.Message) (Message, error) {
 		return Message{}, err
 	}
 	return Message{
-		ID:               item.ID,
-		SessionID:        item.SessionID,
-		Role:             MessageRole(item.Role),
-		Parts:            parts,
-		Model:            item.Model.String,
-		Provider:         item.Provider.String,
-		ReasoningEffort:  item.ReasoningEffort.String,
-		CreatedAt:        item.CreatedAt,
-		UpdatedAt:        item.UpdatedAt,
-		IsSummaryMessage: item.IsSummaryMessage != 0,
-		Pinned:           item.Pinned != 0,
-		Hidden:           item.Hidden != 0,
-		AutoResumed:      item.AutoResumed != 0,
+		ID:                  item.ID,
+		SessionID:           item.SessionID,
+		Role:                MessageRole(item.Role),
+		Parts:               parts,
+		Model:               item.Model.String,
+		Provider:            item.Provider.String,
+		ReasoningEffort:     item.ReasoningEffort.String,
+		CreatedAt:           item.CreatedAt,
+		UpdatedAt:           item.UpdatedAt,
+		IsSummaryMessage:    item.IsSummaryMessage != 0,
+		Pinned:              item.Pinned != 0,
+		Hidden:              item.Hidden != 0,
+		AutoResumed:         item.AutoResumed != 0,
+		BackgroundJobNotice: item.BackgroundJobNotice != 0,
 	}, nil
 }
 

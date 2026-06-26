@@ -97,6 +97,7 @@ export interface Message {
   Pinned: boolean;
   Hidden: boolean;
   AutoResumed: boolean;
+  BackgroundJobNotice: boolean;
 }
 
 export interface PermissionRequest {

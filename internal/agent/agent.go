@@ -1666,6 +1666,12 @@ func (a *sessionAgent) getCacheControlOptions() fantasy.ProviderOptions {
 // leave it unset (false).
 type autoResumedCtxKey struct{}
 
+// backgroundJobNoticeCtxKey tags a context so that createUserMessage marks
+// the resulting user message as a BackgroundJobNotice. Set on both delivery
+// paths in coordinator.notifyBackgroundJobDone so the web can render the
+// injected completion summary as a notice rather than a human message.
+type backgroundJobNoticeCtxKey struct{}
+
 func (a *sessionAgent) createUserMessage(ctx context.Context, call SessionAgentCall) (message.Message, error) {
 	parts := []message.ContentPart{message.TextContent{Text: call.Prompt}}
 	var attachmentParts []message.ContentPart
@@ -1674,10 +1680,12 @@ func (a *sessionAgent) createUserMessage(ctx context.Context, call SessionAgentC
 	}
 	parts = append(parts, attachmentParts...)
 	autoResumed, _ := ctx.Value(autoResumedCtxKey{}).(bool)
+	backgroundJobNotice, _ := ctx.Value(backgroundJobNoticeCtxKey{}).(bool)
 	msg, err := a.messages.Create(ctx, call.SessionID, message.CreateMessageParams{
-		Role:        message.User,
-		Parts:       parts,
-		AutoResumed: autoResumed,
+		Role:                message.User,
+		Parts:               parts,
+		AutoResumed:         autoResumed,
+		BackgroundJobNotice: backgroundJobNotice,
 	})
 	if err != nil {
 		return message.Message{}, fmt.Errorf("failed to create user message: %w", err)

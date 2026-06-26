@@ -22,25 +22,27 @@ INSERT INTO messages (
     is_summary_message,
     hidden,
     auto_resumed,
+    background_job_notice,
     created_at,
     updated_at
 ) VALUES (
-    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'), strftime('%s', 'now')
+    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'), strftime('%s', 'now')
 )
-RETURNING id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden, reasoning_effort, auto_resumed
+RETURNING id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden, reasoning_effort, auto_resumed, background_job_notice
 `
 
 type CreateMessageParams struct {
-	ID               string         `json:"id"`
-	SessionID        string         `json:"session_id"`
-	Role             string         `json:"role"`
-	Parts            string         `json:"parts"`
-	Model            sql.NullString `json:"model"`
-	Provider         sql.NullString `json:"provider"`
-	ReasoningEffort  sql.NullString `json:"reasoning_effort"`
-	IsSummaryMessage int64          `json:"is_summary_message"`
-	Hidden           int64          `json:"hidden"`
-	AutoResumed      int64          `json:"auto_resumed"`
+	ID                  string         `json:"id"`
+	SessionID           string         `json:"session_id"`
+	Role                string         `json:"role"`
+	Parts               string         `json:"parts"`
+	Model               sql.NullString `json:"model"`
+	Provider            sql.NullString `json:"provider"`
+	ReasoningEffort     sql.NullString `json:"reasoning_effort"`
+	IsSummaryMessage    int64          `json:"is_summary_message"`
+	Hidden              int64          `json:"hidden"`
+	AutoResumed         int64          `json:"auto_resumed"`
+	BackgroundJobNotice int64          `json:"background_job_notice"`
 }
 
 func (q *Queries) CreateMessage(ctx context.Context, arg CreateMessageParams) (Message, error) {
@@ -56,6 +58,7 @@ func (q *Queries) CreateMessage(ctx context.Context, arg CreateMessageParams) (M
 		arg.IsSummaryMessage,
 		arg.Hidden,
 		arg.AutoResumed,
+		arg.BackgroundJobNotice,
 	)
 	var i Message
 	err := row.Scan(
@@ -73,6 +76,7 @@ func (q *Queries) CreateMessage(ctx context.Context, arg CreateMessageParams) (M
 		&i.Hidden,
 		&i.ReasoningEffort,
 		&i.AutoResumed,
+		&i.BackgroundJobNotice,
 	)
 	return i, err
 }
@@ -98,7 +102,7 @@ func (q *Queries) DeleteSessionMessages(ctx context.Context, sessionID string) e
 }
 
 const getMessage = `-- name: GetMessage :one
-SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden, reasoning_effort, auto_resumed
+SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden, reasoning_effort, auto_resumed, background_job_notice
 FROM messages
 WHERE id = ? LIMIT 1
 `
@@ -121,12 +125,13 @@ func (q *Queries) GetMessage(ctx context.Context, id string) (Message, error) {
 		&i.Hidden,
 		&i.ReasoningEffort,
 		&i.AutoResumed,
+		&i.BackgroundJobNotice,
 	)
 	return i, err
 }
 
 const listAllUserMessages = `-- name: ListAllUserMessages :many
-SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden, reasoning_effort, auto_resumed
+SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden, reasoning_effort, auto_resumed, background_job_notice
 FROM messages
 WHERE role = 'user'
 ORDER BY created_at DESC
@@ -156,6 +161,7 @@ func (q *Queries) ListAllUserMessages(ctx context.Context) ([]Message, error) {
 			&i.Hidden,
 			&i.ReasoningEffort,
 			&i.AutoResumed,
+			&i.BackgroundJobNotice,
 		); err != nil {
 			return nil, err
 		}
@@ -171,7 +177,7 @@ func (q *Queries) ListAllUserMessages(ctx context.Context) ([]Message, error) {
 }
 
 const listMessagesBySession = `-- name: ListMessagesBySession :many
-SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden, reasoning_effort, auto_resumed
+SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden, reasoning_effort, auto_resumed, background_job_notice
 FROM messages
 WHERE session_id = ?
 ORDER BY created_at ASC
@@ -201,6 +207,7 @@ func (q *Queries) ListMessagesBySession(ctx context.Context, sessionID string) (
 			&i.Hidden,
 			&i.ReasoningEffort,
 			&i.AutoResumed,
+			&i.BackgroundJobNotice,
 		); err != nil {
 			return nil, err
 		}
@@ -216,7 +223,7 @@ func (q *Queries) ListMessagesBySession(ctx context.Context, sessionID string) (
 }
 
 const listUserMessagesBySession = `-- name: ListUserMessagesBySession :many
-SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden, reasoning_effort, auto_resumed
+SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden, reasoning_effort, auto_resumed, background_job_notice
 FROM messages
 WHERE session_id = ? AND role = 'user'
 ORDER BY created_at DESC
@@ -246,6 +253,7 @@ func (q *Queries) ListUserMessagesBySession(ctx context.Context, sessionID strin
 			&i.Hidden,
 			&i.ReasoningEffort,
 			&i.AutoResumed,
+			&i.BackgroundJobNotice,
 		); err != nil {
 			return nil, err
 		}

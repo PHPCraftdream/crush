@@ -156,6 +156,9 @@ type Message struct {
 	// idle-resume; rendered as a badge in the web UI so operators can see
 	// where the agent started a turn on its own.
 	AutoResumed bool
+	// BackgroundJobNotice marks a system-injected background-job-completion
+	// notice so the web renders it as a notice, not a human message.
+	BackgroundJobNotice bool
 }
 
 func (m *Message) Content() TextContent {

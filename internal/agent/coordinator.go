@@ -1697,8 +1697,11 @@ func (c *coordinator) notifyBackgroundJobDone(sessionID string, sh *shell.Backgr
 			// own watchdog/Cancel(sessionID) governs its lifetime, so NO short
 			// timeout here (unlike the InjectMessage path — a turn can be long).
 			// Tag the context so the persisted user message is marked
-			// AutoResumed and rendered with a badge in the web UI.
+			// AutoResumed and rendered with a badge in the web UI. Also tag it
+			// as a BackgroundJobNotice so the web shows the notice badge (an
+			// auto-resume is also a job-completion notice).
 			ctx := context.WithValue(context.Background(), autoResumedCtxKey{}, true)
+			ctx = context.WithValue(ctx, backgroundJobNoticeCtxKey{}, true)
 			if _, err := c.Run(ctx, sessionID, summary); err != nil {
 				slog.Debug("Phase 4 auto-resume run failed (session likely closed)",
 					"session_id", sessionID, "shell_id", sh.ID, "err", err)
@@ -1708,8 +1711,10 @@ func (c *coordinator) notifyBackgroundJobDone(sessionID string, sh *shell.Backgr
 	}
 
 	// Phase 3 behavior (unchanged): persist + (if busy) merge into the running
-	// turn; if idle, just persisted + web-visible, no auto-turn.
+	// turn; if idle, just persisted + web-visible, no auto-turn. Tag the context
+	// so the injected user message is flagged as a BackgroundJobNotice.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx = context.WithValue(ctx, backgroundJobNoticeCtxKey{}, true)
 	defer cancel()
 	if _, err := c.InjectMessage(ctx, sessionID, summary); err != nil {
 		slog.Debug("background job completion not delivered (session likely closed)",

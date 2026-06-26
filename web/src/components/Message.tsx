@@ -1035,6 +1035,14 @@ const UserContent = memo(function UserContent({
           ↻ auto-resumed
         </span>
       )}
+      {message.BackgroundJobNotice && (
+        <span
+          className="px-1 py-0.5 rounded bg-base-subtle text-text-muted font-mono text-[10px] mb-1 inline-block"
+          title="background job finished — injected by crush, not typed by you"
+        >
+          ⚙ background job
+        </span>
+      )}
       {message.Parts.map((part, i) => <Part key={i} part={part} index={i} isUser messageID={message.ID} thinkingDone={false} />)}
     </div>
   );

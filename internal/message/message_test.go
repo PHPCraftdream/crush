@@ -56,7 +56,8 @@ func newTestMessageDB(t *testing.T) (*sql.DB, *db.Queries) {
 			is_summary_message INTEGER NOT NULL DEFAULT 0,
 			pinned INTEGER NOT NULL DEFAULT 0,
 			hidden INTEGER NOT NULL DEFAULT 0,
-			auto_resumed INTEGER NOT NULL DEFAULT 0
+			auto_resumed INTEGER NOT NULL DEFAULT 0,
+			background_job_notice INTEGER NOT NULL DEFAULT 0
 		);
 	`)
 	require.NoError(t, err)
@@ -309,5 +310,49 @@ func TestCreateMessage_AutoResumedRoundTrip(t *testing.T) {
 		got, err := svc.Get(ctx, created.ID)
 		require.NoError(t, err)
 		assert.False(t, got.AutoResumed, "Get should return AutoResumed=false for default")
+	})
+}
+
+func TestCreateMessage_BackgroundJobNoticeRoundTrip(t *testing.T) {
+	_, q := newTestMessageDB(t)
+	svc := NewService(q)
+
+	ctx := t.Context()
+	sessionID := "test-session-bg-job-notice"
+
+	t.Run("background-job-notice flag persists and reads back true", func(t *testing.T) {
+		params := CreateMessageParams{
+			Role:                User,
+			Parts:               []ContentPart{TextContent{Text: "Background job xyz finished"}},
+			BackgroundJobNotice: true,
+		}
+		created, err := svc.Create(ctx, sessionID, params)
+		require.NoError(t, err)
+		assert.True(t, created.BackgroundJobNotice, "created message should have BackgroundJobNotice=true")
+
+		// Round-trip through Get.
+		got, err := svc.Get(ctx, created.ID)
+		require.NoError(t, err)
+		assert.True(t, got.BackgroundJobNotice, "Get should return BackgroundJobNotice=true")
+
+		// Round-trip through List.
+		listed, err := svc.List(ctx, sessionID)
+		require.NoError(t, err)
+		require.Len(t, listed, 1)
+		assert.True(t, listed[0].BackgroundJobNotice, "List should return BackgroundJobNotice=true")
+	})
+
+	t.Run("default is false when flag omitted", func(t *testing.T) {
+		params := CreateMessageParams{
+			Role:  User,
+			Parts: []ContentPart{TextContent{Text: "normal human message"}},
+		}
+		created, err := svc.Create(ctx, sessionID, params)
+		require.NoError(t, err)
+		assert.False(t, created.BackgroundJobNotice, "omitted BackgroundJobNotice should default to false")
+
+		got, err := svc.Get(ctx, created.ID)
+		require.NoError(t, err)
+		assert.False(t, got.BackgroundJobNotice, "Get should return BackgroundJobNotice=false for default")
 	})
 }
