@@ -1035,14 +1035,6 @@ const UserContent = memo(function UserContent({
           ↻ auto-resumed
         </span>
       )}
-      {message.BackgroundJobNotice && (
-        <span
-          className="px-1 py-0.5 rounded bg-base-subtle text-text-muted font-mono text-[10px] mb-1 inline-block"
-          title="background job finished — injected by crush, not typed by you"
-        >
-          ⚙ background job
-        </span>
-      )}
       {message.Parts.map((part, i) => <Part key={i} part={part} index={i} isUser messageID={message.ID} thinkingDone={false} />)}
     </div>
   );
@@ -1201,6 +1193,42 @@ const SummaryMessage = memo(function SummaryMessage({ message }: { message: Msg 
   );
 });
 
+// ── BackgroundJobNotice ───────────────────────────────────────────────────────
+// Background-job notices are persisted as Role:"user" (the model must react to
+// the job's result) but the operator never typed them, so they render on the
+// LEFT as a muted system notice — mirroring SummaryMessage's container idiom.
+
+const BackgroundJobNotice = memo(function BackgroundJobNotice({ message }: { message: Msg }) {
+  const text = useMemo(() => extractText(message.Parts), [message.Parts]);
+  return (
+    <div className="px-8 py-3">
+      <div className="summary-card">
+        <div className="summary-header">
+          <span
+            className="px-1 py-0.5 rounded bg-base-subtle text-text-muted font-mono text-[10px]"
+            title="background job finished — injected by crush, not typed by you"
+          >
+            ⚙ background job
+          </span>
+          {message.AutoResumed && (
+            <span
+              className="px-1 py-0.5 rounded bg-base-subtle text-text-muted font-mono text-[10px]"
+              title="auto-resumed: background job finished"
+            >
+              ↻ auto-resumed
+            </span>
+          )}
+        </div>
+        {text ? (
+          <div className="summary-body md">
+            <ReactMarkdown remarkPlugins={MD_REMARK} rehypePlugins={MD_REHYPE}>{text}</ReactMarkdown>
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+});
+
 // ── Message ───────────────────────────────────────────────────────────────────
 
 export interface MessageProps {
@@ -1220,6 +1248,7 @@ export const Message = memo(function Message({
 }: MessageProps) {
   if (message.Hidden) return null;
   if (message.IsSummaryMessage) return <SummaryMessage message={message} />;
+  if (message.BackgroundJobNotice) return <BackgroundJobNotice message={message} />;
 
   const isUser = message.Role === "user";
 
