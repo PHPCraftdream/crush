@@ -48,6 +48,7 @@ const (
 	CmdCreateSession             = "create_session"
 	CmdForkSession               = "fork_session"
 	CmdDeleteSession             = "delete_session"
+	CmdDeleteOtherSessions       = "delete_other_sessions"
 	CmdListSessions              = "list_sessions"
 	CmdLoadMessages              = "load_messages"
 	CmdGrantPermission           = "grant_permission"
@@ -122,6 +123,12 @@ type ForkSessionPayload struct {
 
 type DeleteSessionPayload struct {
 	SessionID string `json:"sessionID"`
+}
+
+// DeleteOtherSessionsPayload asks the server to delete every top-level
+// session except the one identified by KeepID.
+type DeleteOtherSessionsPayload struct {
+	KeepID string `json:"keepID"`
 }
 
 type LoadMessagesPayload struct {

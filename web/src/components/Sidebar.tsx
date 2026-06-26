@@ -2,7 +2,7 @@ import { useState, useRef, useEffect } from "react";
 import { useStore } from "@nanostores/react";
 import { $sessions, $activeSessionID, $busySessions, $config, setActiveSession, removeSession } from "../store";
 import { ws } from "../ws";
-import { MessageSquare, Plus, Pencil, X, Check, Folder } from "lucide-react";
+import { MessageSquare, Plus, Pencil, X, Check, Folder, Trash2 } from "lucide-react";
 import { ConfirmDialog } from "./ConfirmDialog";
 
 function formatTokens(n: number): string {
@@ -21,6 +21,7 @@ export function Sidebar() {
   const [editTitle, setEditTitle] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
   const [pendingDelete, setPendingDelete] = useState<{ id: string; title: string } | null>(null);
+  const [confirmDeleteOthers, setConfirmDeleteOthers] = useState(false);
 
   useEffect(() => {
     if (editingID && inputRef.current) {
@@ -50,6 +51,15 @@ export function Sidebar() {
     removeSession(pendingDelete.id);
     if (activeID === pendingDelete.id) setActiveSession(null);
     setPendingDelete(null);
+  }
+
+  function confirmDeleteOtherSessions() {
+    if (!activeID) return;
+    ws.send("delete_other_sessions", { keepID: activeID });
+    for (const s of allSessions) {
+      if (s.ID !== activeID) removeSession(s.ID);
+    }
+    setConfirmDeleteOthers(false);
   }
 
   function startEditing(e: React.MouseEvent, id: string, title: string) {
@@ -82,15 +92,26 @@ export function Sidebar() {
           <span className="text-[10px] text-text-subtle font-mono opacity-60">#{__GIT_COUNT__} · {__GIT_COMMIT__}</span>
           <span className="text-[10px] text-text-subtle font-mono opacity-50">{__GIT_BRANCH__}</span>
         </div>
-        <button
-          onClick={newSession}
-          title="New session"
-          data-test-id="sidebar-new-session"
-          className="flex items-center gap-2 px-4 py-2 bg-accent-fill text-white/90 text-sm font-bold rounded-xl hover:bg-accent/90 active:scale-95 transition-all shadow-sm"
-        >
-          <Plus size={18} />
-          New
-        </button>
+        <div className="flex items-center gap-1.5">
+          <button
+            onClick={newSession}
+            title="New session"
+            data-test-id="sidebar-new-session"
+            className="flex items-center gap-2 px-4 py-2 bg-accent-fill text-white/90 text-sm font-bold rounded-xl hover:bg-accent/90 active:scale-95 transition-all shadow-sm"
+          >
+            <Plus size={18} />
+            New
+          </button>
+          <button
+            onClick={() => setConfirmDeleteOthers(true)}
+            disabled={!activeID || sessions.length <= 1}
+            title="Delete all sessions except the current one"
+            data-test-id="sidebar-delete-others"
+            className="flex items-center justify-center w-9 h-9 rounded-xl text-text-subtle hover:text-red hover:bg-red/10 disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent disabled:hover:text-text-subtle transition-all"
+          >
+            <Trash2 size={16} />
+          </button>
+        </div>
       </div>
 
       {/* Working directory */}
@@ -224,6 +245,16 @@ export function Sidebar() {
           confirmLabel="Delete"
           onConfirm={confirmDelete}
           onCancel={() => setPendingDelete(null)}
+        />
+      )}
+
+      {confirmDeleteOthers && (
+        <ConfirmDialog
+          title="Delete all other sessions"
+          message="Delete all sessions except the current one? This cannot be undone."
+          confirmLabel="Delete all"
+          onConfirm={confirmDeleteOtherSessions}
+          onCancel={() => setConfirmDeleteOthers(false)}
         />
       )}
     </aside>

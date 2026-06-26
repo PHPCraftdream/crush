@@ -53,6 +53,8 @@ func handleIncoming(ctx context.Context, a *appPkg.App, c *Client, raw []byte) {
 		go handleForkSession(ctx, a, c, msg)
 	case CmdDeleteSession:
 		go handleDeleteSession(ctx, a, c, msg)
+	case CmdDeleteOtherSessions:
+		go handleDeleteOtherSessions(ctx, a, c, msg)
 	case CmdListSessions:
 		go handleListSessions(ctx, a, c, msg)
 	case CmdLoadMessages:
@@ -672,6 +674,41 @@ func handleDeleteSession(ctx context.Context, a *appPkg.App, c *Client, msg WSMe
 	if err := a.Sessions.Delete(ctx, p.SessionID); err != nil {
 		c.reply(msg.ID, EventError, nil, err.Error())
 		return
+	}
+	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
+}
+
+// handleDeleteOtherSessions deletes every top-level session except the one
+// identified by KeepID. Sub-sessions are not deleted directly — they are
+// cleaned up by a.Sessions.Delete when their parent is removed, mirroring
+// handleDeleteSession. Each deletion publishes a DeletedEvent that the
+// events.go pubsub bridge broadcasts as session_deleted, so every connected
+// client updates. A no-op ack is returned when KeepID is empty or there is
+// nothing else to delete.
+func handleDeleteOtherSessions(ctx context.Context, a *appPkg.App, c *Client, msg WSMessage) {
+	var p DeleteOtherSessionsPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		c.reply(msg.ID, EventError, nil, "invalid payload")
+		return
+	}
+	if p.KeepID == "" {
+		c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
+		return
+	}
+	sessions, err := a.Sessions.List(ctx)
+	if err != nil {
+		c.reply(msg.ID, EventError, nil, err.Error())
+		return
+	}
+	for _, s := range sessions {
+		// Skip the kept session and any sub-session (those go when their
+		// parent is deleted, matching handleDeleteSession's behaviour).
+		if s.ID == p.KeepID || s.ParentSessionID != "" {
+			continue
+		}
+		if err := a.Sessions.Delete(ctx, s.ID); err != nil {
+			slog.Warn("delete_other_sessions: failed to delete session", "id", s.ID, "err", err)
+		}
 	}
 	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
 }
