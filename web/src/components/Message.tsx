@@ -325,6 +325,23 @@ const DiffView = memo(function DiffView({ diff, additions, removals }: { diff: s
   );
 });
 
+// EditPreview — renders old_string→new_string as red/green lines so the
+// operator sees the intent of an edit at a glance without expanding raw JSON.
+const EditPreview = memo(function EditPreview({ old, new_ }: { old: string; new_: string }) {
+  const oldLines = old.split("\n");
+  const newLines = new_.split("\n");
+  return (
+    <pre className="diff-body text-xs mt-1">
+      {oldLines.map((l, i) => (
+        <div key={`d${i}`} className="diff-line diff-del">-{l}</div>
+      ))}
+      {newLines.map((l, i) => (
+        <div key={`a${i}`} className="diff-line diff-add">+{l}</div>
+      ))}
+    </pre>
+  );
+});
+
 const ToolCallBlock = memo(function ToolCallBlock({ name, input, finished }: { name: string; input: string; finished: boolean }) {
   const isFileWrite = FileWriteTools.has(name);
   const writeInput  = isFileWrite ? safeParseWriteInput(input) : null;
@@ -342,8 +359,25 @@ const ToolCallBlock = memo(function ToolCallBlock({ name, input, finished }: { n
         </div>
         <CopyButton text={input} />
       </div>
-      {isFileWrite ? (
+      {isFileWrite && writeInput?.old_string != null ? (
+        // edit / multiedit: show old→new as a mini inline diff
         <div className="tool-output-details">
+          <EditPreview old={writeInput.old_string} new_={writeInput.new_string ?? ""} />
+          <button
+            type="button"
+            onClick={() => setRawOpen((v) => !v)}
+            aria-expanded={rawOpen}
+            className="cursor-pointer text-text-subtle text-xs select-none bg-transparent border-0 p-0 mt-1"
+          >
+            {rawOpen ? "hide raw input" : "show raw input"}
+          </button>
+          {rawOpen && <pre className="tool-output mt-1">{formatted}</pre>}
+        </div>
+      ) : isFileWrite ? (
+        <div className="tool-output-details">
+          {writeInput?.content && (
+            <pre className="tool-output mb-1 max-h-40 overflow-y-auto">{writeInput.content.length > 2000 ? writeInput.content.slice(0, 2000) + "\n…" : writeInput.content}</pre>
+          )}
           <button
             type="button"
             onClick={() => setRawOpen((v) => !v)}
