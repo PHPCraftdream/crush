@@ -90,6 +90,37 @@ function formatJSON(s: string) {
   try { return JSON.stringify(JSON.parse(s), null, 2); } catch { return s; }
 }
 
+// prettyToolInput renders a tool-call argument object so multiline string
+// values (a bash heredoc, a grep pattern, a fetched body) keep their REAL
+// line breaks and indentation instead of being flattened into a single
+// `"command": "…\n…\n…"` JSON line where every newline shows as a literal
+// `\n`. Flat objects render as `key: value`, with multiline strings broken
+// onto their own lines; nested objects/arrays (e.g. multiedit's edits) fall
+// back to indented JSON so structure is never lost. Non-object inputs go
+// through formatJSON unchanged.
+function prettyToolInput(input: string): string {
+  let parsed: unknown;
+  try { parsed = JSON.parse(input); } catch { return input; }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return formatJSON(input);
+  }
+  const out: string[] = [];
+  for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+    if (typeof v === "object" && v !== null) {
+      out.push(`${k}: ${JSON.stringify(v, null, 2)}`);
+    } else if (typeof v === "string" && v.includes("\n")) {
+      out.push(`${k}:`);
+      out.push(v.replace(/\s+$/, ""));
+      out.push("");
+    } else if (typeof v === "string") {
+      out.push(`${k}: ${v}`);
+    } else {
+      out.push(`${k}: ${JSON.stringify(v)}`);
+    }
+  }
+  return out.join("\n").replace(/\n+$/, "");
+}
+
 // ── Leaf components ───────────────────────────────────────────────────────────
 
 const DurationBadge = memo(function DurationBadge({ message }: { message: Msg }) {
@@ -297,7 +328,7 @@ const DiffView = memo(function DiffView({ diff, additions, removals }: { diff: s
 const ToolCallBlock = memo(function ToolCallBlock({ name, input, finished }: { name: string; input: string; finished: boolean }) {
   const isFileWrite = FileWriteTools.has(name);
   const writeInput  = isFileWrite ? safeParseWriteInput(input) : null;
-  const formatted   = useMemo(() => formatJSON(input), [input]);
+  const formatted   = useMemo(() => prettyToolInput(input), [input]);
   const [rawOpen, setRawOpen] = useState(false);
 
   return (
@@ -420,11 +451,8 @@ type ActionItem =
       resultPart?: ContentPart & { type: "tool_result"; ToolCallID: string; Name: string; Content: string; IsError: boolean; Metadata?: string };
       idx: number;
       key: string;
-      // CreatedAt of the source message that contributed this row. For a
-      // paired call+result we keep the EARLIER timestamp (the call) — the
-      // result's createdAt arrives later but the user thinks of the action
-      // by when it started.
       createdAt?: number;
+      repeatCount?: number;
     }
   | {
       kind: "thinking";
@@ -437,14 +465,12 @@ type ActionItem =
 interface ActionRowProps {
   item: ActionItem;
   isCurrent: boolean;
-  // When set, the auto-current rule is suppressed for this render. Comes
-  // from ToolActivityGroup after a manual collapse: re-expanding the group
-  // should leave every row closed until the user explicitly clicks one,
-  // or a live tool arrival kicks the group back into auto mode.
   suppressAutoCurrent: boolean;
+  model?: string;
+  effort?: string;
 }
 
-const ActionRow = memo(function ActionRow({ item, isCurrent, suppressAutoCurrent }: ActionRowProps) {
+const ActionRow = memo(function ActionRow({ item, isCurrent, suppressAutoCurrent, model, effort }: ActionRowProps) {
   // override:
   //   undefined → follow auto-rule (open iff isCurrent, AND auto isn't suppressed)
   //   true / false → user pinned, ignore auto-rule from now on
@@ -471,6 +497,8 @@ const ActionRow = memo(function ActionRow({ item, isCurrent, suppressAutoCurrent
         >
           <span className="text-accent/70 shrink-0"><BrainCircuit size={13} /></span>
           <span className="text-accent/80 font-semibold text-sm shrink-0">thinking</span>
+          {model && <span className="text-xs text-text-subtle font-mono shrink-0">{model}</span>}
+          {effort && <span className="px-1 py-0.5 rounded bg-base-subtle text-text-muted font-mono text-[10px] shrink-0">{effort === "low" ? "L" : effort === "medium" ? "M" : effort === "high" ? "H" : "X"}</span>}
           <span className="text-text font-mono text-sm truncate flex-1 min-w-0">
             {preview || "—"}
           </span>
@@ -513,6 +541,7 @@ const ActionRow = memo(function ActionRow({ item, isCurrent, suppressAutoCurrent
         <span className="text-text font-mono text-sm truncate flex-1 min-w-0">
           {subject || "—"}
         </span>
+        {item.repeatCount && item.repeatCount > 1 && <span className="px-1 py-0.5 rounded bg-base-subtle text-text-muted font-mono text-[10px] shrink-0">×{item.repeatCount}</span>}
         {running && <span className="text-text-subtle text-xs animate-pulse shrink-0">running…</span>}
         {errored && <span className="badge-error shrink-0">error</span>}
         <TimeBadge epochSec={item.createdAt} />
@@ -537,13 +566,12 @@ interface ToolActivityGroupProps {
   // (i.e. nothing rendered after it). When false, the auto-rule collapses
   // the group — the user moved on, the work is in the past.
   isCurrent: boolean;
-  // Epoch-seconds timestamp of the first message that contributed to this
-  // burst. Shown as a "HH:MM:SS" badge in the group header so the operator
-  // can correlate the activity with logs.
   startedAt?: number;
+  model?: string;
+  effort?: string;
 }
 
-export const ToolActivityGroup = memo(function ToolActivityGroup({ items, live, isCurrent, startedAt }: ToolActivityGroupProps) {
+export const ToolActivityGroup = memo(function ToolActivityGroup({ items, live, isCurrent, startedAt, model, effort }: ToolActivityGroupProps) {
   // Group open/close state machine.
   //
   // The default collapsed state follows `isCurrent`: the most recent group
@@ -647,7 +675,30 @@ export const ToolActivityGroup = memo(function ToolActivityGroup({ items, live, 
         }
       }
     }
-    return { actions, rawAgentParts };
+    // Dedup consecutive tool actions with identical Name+Input (e.g. repeated
+    // job_output polling). Keep the LAST occurrence (freshest result) and
+    // annotate it with repeatCount so the UI can show "×N".
+    const deduped: ActionItem[] = [];
+    for (const a of actions) {
+      const prev = deduped[deduped.length - 1];
+      if (
+        prev &&
+        a.kind === "tool" &&
+        prev.kind === "tool" &&
+        a.callPart &&
+        prev.callPart &&
+        a.callPart.Name === prev.callPart.Name &&
+        a.callPart.Input === prev.callPart.Input
+      ) {
+        // Replace prev with current (fresher result), bump count
+        a.repeatCount = (prev.repeatCount ?? 1) + 1;
+        a.createdAt = prev.createdAt;
+        deduped[deduped.length - 1] = a;
+      } else {
+        deduped.push(a);
+      }
+    }
+    return { actions: deduped, rawAgentParts };
   }, [items]);
 
   const tally = useMemo(() => {
@@ -717,6 +768,8 @@ export const ToolActivityGroup = memo(function ToolActivityGroup({ items, live, 
               item={a}
               isCurrent={i === actions.length - 1}
               suppressAutoCurrent={suppressAuto}
+              model={model}
+              effort={effort}
             />
           ))}
           {renderAgents()}
@@ -750,7 +803,7 @@ const TextBlock = memo(function TextBlock({ text, isUser }: { text: string; isUs
 
 // ── ThinkingPart — owns its own edit/delete state ─────────────────────────────
 
-const ThinkingPart = memo(function ThinkingPart({ thinking, messageID, partIndex, done }: { thinking: string; messageID: string; partIndex: number; done: boolean }) {
+const ThinkingPart = memo(function ThinkingPart({ thinking, messageID, partIndex, done, model, effort }: { thinking: string; messageID: string; partIndex: number; done: boolean; model?: string; effort?: string }) {
   const [editing, setEditing] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   // Controlled open-state (not <details>) so we can render a sticky
@@ -781,6 +834,8 @@ const ThinkingPart = memo(function ThinkingPart({ thinking, messageID, partIndex
         <div className="thinking-card-header">
           <BrainCircuit size={15} className="text-accent/70 shrink-0 animate-pulse" />
           <span data-test-id="thinking-label">Thinking…</span>
+          {model && <span className="text-xs text-text-subtle font-mono">{model}</span>}
+          {effort && <span className="px-1 py-0.5 rounded bg-base-subtle text-text-muted font-mono text-[10px]">{effort === "low" ? "L" : effort === "medium" ? "M" : effort === "high" ? "H" : "X"}</span>}
         </div>
         {thinking && (
           <pre data-test-id="thinking-content" className="px-4 pb-3 font-mono whitespace-pre-wrap text-text-subtle leading-relaxed max-h-40 overflow-y-auto border-t border-surface/50" style={{ fontSize: "var(--chat-font-size)" }}>
@@ -802,6 +857,8 @@ const ThinkingPart = memo(function ThinkingPart({ thinking, messageID, partIndex
       >
         <span className="text-accent/70"><BrainCircuit size={18} /></span>
         <span data-test-id="thinking-label">Thoughts</span>
+        {model && <span className="text-xs text-text-subtle font-mono">{model}</span>}
+        {effort && <span className="px-1 py-0.5 rounded bg-base-subtle text-text-muted font-mono text-[10px]">{effort === "low" ? "L" : effort === "medium" ? "M" : effort === "high" ? "H" : "X"}</span>}
         <div className="ml-auto flex items-center gap-0.5 hover-reveal" onClick={(e) => e.stopPropagation()}>
           <CopyButton text={thinking} className="px-1.5 py-1 text-xs" />
           <button onClick={openEditEv} title="Edit thinking"   className="btn-icon-sm"><Pencil size={13} /></button>
@@ -860,11 +917,11 @@ const ThinkingPart = memo(function ThinkingPart({ thinking, messageID, partIndex
 // delete / copy / sticky-collapse affordances stay identical to the in-
 // message rendering. Wrapped in a small flex container so it sits in the
 // chat scroll list at the same horizontal padding as a message row.
-export function StandaloneThinking({ messageID, partIndex, thinking, done }: { messageID: string; partIndex: number; thinking: string; done: boolean }) {
+export function StandaloneThinking({ messageID, partIndex, thinking, done, model, effort }: { messageID: string; partIndex: number; thinking: string; done: boolean; model?: string; effort?: string }) {
   return (
     <div className="msg-row flex flex-col px-5 py-2">
       <div className="w-full min-w-0">
-        <ThinkingPart messageID={messageID} partIndex={partIndex} thinking={thinking} done={done} />
+        <ThinkingPart messageID={messageID} partIndex={partIndex} thinking={thinking} done={done} model={model} effort={effort} />
       </div>
     </div>
   );
@@ -936,10 +993,10 @@ function groupPartsIntoBlocks(parts: ContentPart[], breaks: Set<number>): Visual
 
 // ── Part router ───────────────────────────────────────────────────────────────
 
-const Part = memo(function Part({ part, index, isUser, messageID, thinkingDone, partialWorkDone }: { part: ContentPart; index: number; isUser: boolean; messageID: string; thinkingDone: boolean; partialWorkDone: boolean }) {
+const Part = memo(function Part({ part, index, isUser, messageID, thinkingDone, partialWorkDone, model, effort }: { part: ContentPart; index: number; isUser: boolean; messageID: string; thinkingDone: boolean; partialWorkDone: boolean; model?: string; effort?: string }) {
   switch (part.type) {
     case "text":     return <TextBlock text={part.Text} isUser={isUser} />;
-    case "thinking": return <ThinkingPart thinking={part.Thinking} messageID={messageID} partIndex={index} done={thinkingDone} />;
+    case "thinking": return <ThinkingPart thinking={part.Thinking} messageID={messageID} partIndex={index} done={thinkingDone} model={model} effort={effort} />;
     case "tool_call": {
       if (part.Name === "agent") {
         let prompt = "";
@@ -1117,10 +1174,10 @@ const AssistantContent = memo(function AssistantContent({
             // collapsible row per call+result pair, last row open by default
             // (the "current action"), prior rows collapsed. User can pin any
             // row open/closed and the auto-rule stops touching that row.
-            <ToolActivityGroup items={block.items.map((it) => ({ ...it, messageID: message.ID }))} live={isLive} />
+            <ToolActivityGroup items={block.items.map((it) => ({ ...it, messageID: message.ID }))} live={isLive} model={message.Model} effort={message.ReasoningEffort} />
           ) : (
             block.items.map(({ part, idx }) => (
-              <Part key={idx} part={part} index={idx} isUser={false} messageID={message.ID} thinkingDone={block.thinkingDone} partialWorkDone={partialWorkDone} />
+              <Part key={idx} part={part} index={idx} isUser={false} messageID={message.ID} thinkingDone={block.thinkingDone} partialWorkDone={partialWorkDone} model={message.Model} effort={message.ReasoningEffort} />
             ))
           )}
         </div>
@@ -1200,6 +1257,10 @@ const SummaryMessage = memo(function SummaryMessage({ message }: { message: Msg 
 
 const BackgroundJobNotice = memo(function BackgroundJobNotice({ message }: { message: Msg }) {
   const text = useMemo(() => extractText(message.Parts), [message.Parts]);
+  // Collapsed by default — orchestrator output is noise the operator only
+  // occasionally needs to inspect, so it folds into a spoiler like every
+  // other orchestrator block (mirrors SummaryMessage's toggle).
+  const [open, setOpen] = useState(false);
   return (
     <div className="px-8 py-3">
       <div className="summary-card">
@@ -1220,8 +1281,20 @@ const BackgroundJobNotice = memo(function BackgroundJobNotice({ message }: { mes
           )}
         </div>
         {text ? (
-          <div className="summary-body md">
-            <ReactMarkdown remarkPlugins={MD_REMARK} rehypePlugins={MD_REHYPE}>{text}</ReactMarkdown>
+          <div className="group">
+            <button
+              type="button"
+              onClick={() => setOpen((v) => !v)}
+              aria-expanded={open}
+              className="summary-toggle w-full text-left bg-transparent border-0"
+            >
+              {open ? "Hide output ▾" : "Show output ▸"}
+            </button>
+            {open && (
+              <div className="summary-body md">
+                <ReactMarkdown remarkPlugins={MD_REMARK} rehypePlugins={MD_REHYPE}>{text}</ReactMarkdown>
+              </div>
+            )}
           </div>
         ) : null}
       </div>
