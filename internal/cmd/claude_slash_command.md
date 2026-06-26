@@ -73,6 +73,17 @@ transient failures.
 - **Parallel runs** MUST name the file-set each prompt may touch
   ("only edit `internal/foo/`"). Two runs writing the same file race
   and corrupt silently.
+- **Parallel runs MUST forbid git writes.** When more than one `crush
+  run` is in flight against the same worktree, every prompt MUST tell the
+  agent NOT to run git write commands — no `commit`, `add`, `stash`,
+  `reset`, `checkout`/`restore`, `rebase`, `merge`. Concurrent index/tree
+  writes clobber each other (`index.lock` races, one run's `checkout`
+  reverting another's edits). Read-only git (`status`, `diff`, `log`) is
+  fine. The orchestrator stages and commits **sequentially, itself**,
+  after the runs finish and it has verified each diff. (A single solo run
+  may still be told not to commit per the usual scope rules; this clause
+  is specifically about the multi-run race.) When edits genuinely overlap
+  and can't be serialized, give each run its own `git worktree` instead.
 
 ## Monitoring
 
