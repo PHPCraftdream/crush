@@ -546,28 +546,10 @@ export function togglePinMessage(messageID: string, pinned: boolean) {
 }
 
 export function rerunFromMessage(messageID: string) {
-  const msgs = $messages.get();
   const sessionID = $activeSessionID.get();
   if (!sessionID) return;
-
-  const idx = msgs.findIndex((m) => m.ID === messageID);
-  if (idx === -1) return;
-
-  const text = msgs[idx].Parts.filter((p) => p.type === "text")
-    .map((p) => (p as { type: "text"; Text: string }).Text)
-    .join("\n")
-    .trim();
-  if (!text) return;
-
-  // Delete the user message itself and everything after it (agent responses),
-  // then resend — this avoids a duplicate since send_message creates a new entry.
-  const toDelete = msgs.slice(idx).map((m) => m.ID);
-  if (toDelete.length > 0) {
-    deleteMessages(toDelete);
-  }
-
-  logClientEvent("rerun_message", { sessionID, contentPreview: text.slice(0, 200) });
-  ws.send("send_message", { sessionID, content: text });
+  logClientEvent("rerun_message", { sessionID, messageID });
+  ws.send("rerun_message", { messageID });
 }
 
 export function sendWithSmallModel(sessionID: string, content: string) {

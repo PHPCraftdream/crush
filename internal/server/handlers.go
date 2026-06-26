@@ -115,6 +115,8 @@ func handleIncoming(ctx context.Context, a *appPkg.App, c *Client, raw []byte) {
 		go handleUpdateMessagePart(ctx, a, c, msg)
 	case CmdTogglePinMessage:
 		go handleTogglePinMessage(ctx, a, c, msg)
+	case CmdRerunMessage:
+		go handleRerunMessage(ctx, a, c, msg)
 	case CmdLogClientEvent:
 		go handleLogClientEvent(a, c, msg)
 	case CmdLogClientError:
@@ -1913,6 +1915,105 @@ func handleUpdateTodos(ctx context.Context, a *appPkg.App, c *Client, msg WSMess
 	)
 	if _, err := a.Sessions.Save(ctx, sess); err != nil {
 		c.reply(msg.ID, EventError, nil, "failed to save todos")
+		return
+	}
+	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
+}
+
+// handleRerunMessage is an atomic "retry from this user message": it cancels
+// any in-flight agent run, waits for idle, deletes every message created AFTER
+// the target user message, then deletes the target itself and re-runs the agent
+// with the same prompt. Run() creates a fresh user message so the history reads
+// naturally. All steps happen in one goroutine — no client-side race.
+func handleRerunMessage(ctx context.Context, a *appPkg.App, c *Client, msg WSMessage) {
+	var p RerunMessagePayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		c.reply(msg.ID, EventError, nil, "invalid payload")
+		return
+	}
+
+	targetMsg, err := a.Messages.Get(ctx, p.MessageID)
+	if err != nil {
+		c.reply(msg.ID, EventError, nil, "message not found")
+		return
+	}
+	if targetMsg.Role != message.User {
+		c.reply(msg.ID, EventError, nil, "can only rerun user messages")
+		return
+	}
+
+	text := targetMsg.Content().Text
+	if text == "" {
+		c.reply(msg.ID, EventError, nil, "empty message")
+		return
+	}
+
+	sessionID := targetMsg.SessionID
+	slog.Info("ws: handleRerunMessage", "sessionID", sessionID, "messageID", p.MessageID,
+		"contentPreview", text[:min(len(text), 80)])
+
+	if a.AgentCoordinator == nil {
+		c.reply(msg.ID, EventError, nil, "agent not configured")
+		return
+	}
+
+	// 1. Cancel + clear queue if busy, then poll until idle (up to 10s).
+	a.AgentCoordinator.Cancel(sessionID)
+	a.AgentCoordinator.ClearQueue(sessionID)
+	for i := 0; i < 100; i++ {
+		if !a.AgentCoordinator.IsSessionBusy(sessionID) {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// 2. Delete every message AFTER the target (by CreatedAt), keep the target.
+	allMsgs, listErr := a.Messages.List(ctx, sessionID)
+	if listErr != nil {
+		c.reply(msg.ID, EventError, nil, "failed to list messages")
+		return
+	}
+	for _, m := range allMsgs {
+		if m.CreatedAt > targetMsg.CreatedAt ||
+			(m.CreatedAt == targetMsg.CreatedAt && m.ID != targetMsg.ID) {
+			if delErr := a.Messages.Delete(ctx, m.ID); delErr != nil {
+				slog.Warn("ws: rerun: failed to delete tail message", "id", m.ID, "err", delErr)
+			}
+		}
+	}
+
+	// 3. Delete the original user message — Run() will recreate it.
+	if delErr := a.Messages.Delete(ctx, targetMsg.ID); delErr != nil {
+		slog.Warn("ws: rerun: failed to delete original user message", "id", targetMsg.ID, "err", delErr)
+	}
+
+	// 4. Re-arm Phase 4 autonomy.
+	a.AgentCoordinator.ResetAutoResumeCounter(sessionID)
+
+	// 5. Resolve model overrides (same priority as handleSendMessage).
+	var largeOverride, smallOverride *agent.ModelOverride
+	if sess, sessErr := a.Sessions.Get(ctx, sessionID); sessErr == nil {
+		if sess.LargeModelID != "" {
+			largeOverride = &agent.ModelOverride{Provider: sess.LargeModelProvider, Model: sess.LargeModelID}
+		}
+		if sess.SmallModelID != "" {
+			smallOverride = &agent.ModelOverride{Provider: sess.SmallModelProvider, Model: sess.SmallModelID}
+		}
+	}
+
+	// 6. Run the agent with the same prompt.
+	agentCtx := context.WithoutCancel(ctx)
+	c.hub.Broadcast(EventAgentBusy, AgentBusyPayload{SessionID: sessionID, Busy: true})
+	if largeOverride != nil || smallOverride != nil {
+		_, err = a.AgentCoordinator.RunWithOverrides(agentCtx, sessionID, text, largeOverride, smallOverride)
+	} else {
+		_, err = a.AgentCoordinator.Run(agentCtx, sessionID, text)
+	}
+	c.hub.Broadcast(EventAgentBusy, AgentBusyPayload{SessionID: sessionID, Busy: false})
+
+	if err != nil {
+		slog.Error("ws: rerun agent error", "err", err)
+		c.reply(msg.ID, EventError, nil, err.Error())
 		return
 	}
 	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")

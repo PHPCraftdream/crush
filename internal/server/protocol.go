@@ -76,6 +76,7 @@ const (
 	CmdDeleteMessagePart         = "delete_message_part"
 	CmdUpdateMessagePart         = "update_message_part"
 	CmdTogglePinMessage          = "toggle_pin_message"
+	CmdRerunMessage              = "rerun_message"
 )
 
 // Payload structs for inbound commands.
@@ -151,6 +152,10 @@ type SetKeepAlivePayload struct {
 type RenameSessionPayload struct {
 	SessionID string `json:"sessionID"`
 	Title     string `json:"title"`
+}
+
+type RerunMessagePayload struct {
+	MessageID string `json:"messageID"`
 }
 
 // AgentBusyPayload is sent server→client; PascalCase matches other data structs.
