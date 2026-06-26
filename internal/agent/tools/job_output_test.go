@@ -17,8 +17,10 @@ import (
 // Status: running and a re-poll hint. We shrink jobOutputMaxWait for the test
 // rather than sleeping for the real 90s window.
 func TestJobOutputTool_BoundedWaitReturnsWhileRunning(t *testing.T) {
-	t.Parallel()
-
+	// NOT t.Parallel(): this test mutates the package-global jobOutputMaxWait
+	// (read by the tool at job_output.go), which the sibling
+	// ...ReturnsCompletedWhenJobFinishes test also mutates. Running them in
+	// parallel is a data race under -race (caught by CI's race-enabled build).
 	workingDir := t.TempDir()
 	ctx := context.Background()
 
@@ -65,8 +67,8 @@ func TestJobOutputTool_BoundedWaitReturnsWhileRunning(t *testing.T) {
 // job which completes inside the wait window is reported as completed, with
 // an explicit exit code (0 on success) and elapsed runtime.
 func TestJobOutputTool_BoundedWaitReturnsCompletedWhenJobFinishes(t *testing.T) {
-	t.Parallel()
-
+	// NOT t.Parallel(): shares the package-global jobOutputMaxWait with the
+	// sibling ...ReturnsWhileRunning test — see the note there.
 	workingDir := t.TempDir()
 	ctx := context.Background()
 
