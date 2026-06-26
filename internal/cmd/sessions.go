@@ -81,6 +81,15 @@ crush sessions list --json | jq 'select(.message_count > 0)'
 		// per-PID probe `sessions reap` uses.
 		statusByID := computeSessionStatuses(cmd)
 
+		// A dead-PID lock can mean two things: a genuine mid-turn crash,
+		// or a `crush run` that finished cleanly (last assistant turn
+		// ended with end_turn) and exited within the ~60s heartbeat
+		// sweep window — its lock file is still on disk but the PID is
+		// gone. Reclassify those to "done" so a clean exit isn't shown
+		// as "crashed". Cheap: only the handful of sessions with a stale
+		// lock actually hit the message store.
+		statusByID = reclassifyCrashedAsDone(cmd.Context(), a, sessions, statusByID)
+
 		if asJSON {
 			enc := json.NewEncoder(os.Stdout)
 			for _, s := range sessions {
@@ -98,7 +107,8 @@ crush sessions list --json | jq 'select(.message_count > 0)'
 		tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 		fmt.Fprintln(tw, "HASH\tID\tTITLE\tMSGS\tSTATUS\tUPDATED\tTOKENS\tCOST")
 		for _, s := range sessions {
-			fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%s\t%s\t%d\t$%.4f\n",
+			fmt.Fprintf(
+				tw, "%s\t%s\t%s\t%d\t%s\t%s\t%d\t$%.4f\n",
 				short(session.HashID(s.ID)),
 				s.ID,
 				truncate(s.Title, 40),
@@ -142,6 +152,44 @@ func computeSessionStatuses(cmd *cobra.Command) map[string]string {
 		}
 	}
 	return out
+}
+
+// reclassifyCrashedAsDone promotes a "crashed" status to "done" when the
+// session's last ASSISTANT message finished cleanly (FinishReasonEndTurn).
+// A dead-PID lock without such a clean finish stays "crashed" — that's the
+// genuine mid-turn-crash case. Mutates and returns statusByID in place so
+// both the JSON and table render paths share the same corrected map.
+//
+// Only sessions currently flagged "crashed" hit the message store, so the
+// cost is proportional to the number of stale locks (usually zero or one).
+func reclassifyCrashedAsDone(
+	ctx context.Context,
+	a *app.App,
+	sessions []session.Session,
+	statusByID map[string]string,
+) map[string]string {
+	if statusByID == nil || a == nil {
+		return statusByID
+	}
+	for _, s := range sessions {
+		if statusByID[s.ID] != "crashed" {
+			continue
+		}
+		msgs, err := a.Messages.List(ctx, s.ID)
+		if err != nil {
+			continue
+		}
+		for i := len(msgs) - 1; i >= 0; i-- {
+			if msgs[i].Role != message.Assistant {
+				continue
+			}
+			if msgs[i].FinishReason() == message.FinishReasonEndTurn {
+				statusByID[s.ID] = "done"
+			}
+			break
+		}
+	}
+	return statusByID
 }
 
 func statusOrDash(s string) string {
@@ -853,7 +901,8 @@ func sessionsLocksCmdRun(cmd *cobra.Command, args []string) error {
 		if lock.BudgetSec > 0 {
 			budget = formatDurationShort(time.Duration(lock.BudgetSec) * time.Second)
 		}
-		fmt.Fprintf(tw, "%s\t%d\t%s\t%ds ago\t%s\t%s\n",
+		fmt.Fprintf(
+			tw, "%s\t%d\t%s\t%ds ago\t%s\t%s\n",
 			truncate(lock.SessionID, 28),
 			lock.PID,
 			lock.Pulse,

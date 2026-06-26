@@ -7,6 +7,7 @@ import (
 
 	_ "modernc.org/sqlite"
 
+	"github.com/charmbracelet/crush/internal/app"
 	"github.com/charmbracelet/crush/internal/db"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/session"
@@ -118,7 +119,8 @@ func newTestDB(t *testing.T) (*sql.DB, *db.Queries) {
 			is_summary_message INTEGER NOT NULL DEFAULT 0,
 			pinned INTEGER NOT NULL DEFAULT 0,
 			hidden INTEGER NOT NULL DEFAULT 0,
-			auto_resumed INTEGER NOT NULL DEFAULT 0
+			auto_resumed INTEGER NOT NULL DEFAULT 0,
+			background_job_notice INTEGER NOT NULL DEFAULT 0
 		);
 
 		CREATE INDEX idx_messages_session_id ON messages(session_id);
@@ -126,4 +128,94 @@ func newTestDB(t *testing.T) (*sql.DB, *db.Queries) {
 	require.NoError(t, err)
 
 	return sqlDB, db.New(sqlDB)
+}
+
+// TestReclassifyCrashedAsDone_EndTurn verifies that a session holding a
+// stale (dead-PID) lock but whose last assistant message finished cleanly
+// (end_turn) is reclassified from "crashed" to "done". This is the
+// clean-exit-but-lock-not-yet-swept case that was previously misreported.
+func TestReclassifyCrashedAsDone_EndTurn(t *testing.T) {
+	t.Parallel()
+
+	conn, q := newTestDB(t)
+	s := session.NewService(q, conn)
+	m := message.NewService(q)
+
+	sess, err := s.Create(context.Background(), "clean exit")
+	require.NoError(t, err)
+
+	_, err = m.Create(context.Background(), sess.ID, message.CreateMessageParams{
+		Role:  message.User,
+		Parts: []message.ContentPart{message.TextContent{Text: "do it"}},
+	})
+	require.NoError(t, err)
+
+	// Final assistant message that finished cleanly with end_turn.
+	assistant, err := m.Create(context.Background(), sess.ID, message.CreateMessageParams{
+		Role:  message.Assistant,
+		Parts: []message.ContentPart{message.TextContent{Text: "done"}},
+	})
+	require.NoError(t, err)
+	assistant.AddFinish(message.FinishReasonEndTurn, "", "")
+	require.NoError(t, m.Update(context.Background(), assistant))
+
+	a := &app.App{Messages: m, Sessions: s}
+	statusByID := map[string]string{sess.ID: "crashed"}
+
+	got := reclassifyCrashedAsDone(context.Background(), a, []session.Session{sess}, statusByID)
+	require.Equal(t, "done", got[sess.ID])
+}
+
+// TestReclassifyCrashedAsDone_Canceled confirms that a dead-PID lock whose
+// last assistant message did NOT finish cleanly (here: canceled) stays
+// "crashed" — the genuine mid-turn-crash / interrupted case.
+func TestReclassifyCrashedAsDone_Canceled(t *testing.T) {
+	t.Parallel()
+
+	conn, q := newTestDB(t)
+	s := session.NewService(q, conn)
+	m := message.NewService(q)
+
+	sess, err := s.Create(context.Background(), "interrupted")
+	require.NoError(t, err)
+
+	assistant, err := m.Create(context.Background(), sess.ID, message.CreateMessageParams{
+		Role:  message.Assistant,
+		Parts: []message.ContentPart{message.TextContent{Text: "partial"}},
+	})
+	require.NoError(t, err)
+	assistant.AddFinish(message.FinishReasonCanceled, "", "")
+	require.NoError(t, m.Update(context.Background(), assistant))
+
+	a := &app.App{Messages: m, Sessions: s}
+	statusByID := map[string]string{sess.ID: "crashed"}
+
+	got := reclassifyCrashedAsDone(context.Background(), a, []session.Session{sess}, statusByID)
+	require.Equal(t, "crashed", got[sess.ID])
+}
+
+// TestReclassifyCrashedAsDone_NoAssistantMessage confirms that a session
+// with no assistant message at all stays "crashed" (no clean finish to
+// promote on).
+func TestReclassifyCrashedAsDone_NoAssistantMessage(t *testing.T) {
+	t.Parallel()
+
+	conn, q := newTestDB(t)
+	s := session.NewService(q, conn)
+	m := message.NewService(q)
+
+	sess, err := s.Create(context.Background(), "no assistant")
+	require.NoError(t, err)
+
+	_, err = m.Create(context.Background(), sess.ID, message.CreateMessageParams{
+		Role:  message.User,
+		Parts: []message.ContentPart{message.TextContent{Text: "hello"}},
+	})
+	require.NoError(t, err)
+
+	a := &app.App{Messages: m, Sessions: s}
+	statusByID := map[string]string{sess.ID: "crashed"}
+
+	got := reclassifyCrashedAsDone(context.Background(), a, []session.Session{sess}, statusByID)
+	require.Equal(t, "crashed", got[sess.ID])
 }
