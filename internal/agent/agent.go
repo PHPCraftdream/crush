@@ -1361,6 +1361,21 @@ func (a *sessionAgent) runSummarize(ctx context.Context, sessionID string, opts 
 		return nil
 	}
 
+	// Snapshot non-pinned message IDs for deletion AFTER the summary stream
+	// completes. Without this manual /compact mirrored runSummarizeSilent only
+	// halfway: it created the summary + reset PromptTokens, but left every
+	// historical message in the DB. A subsequent Run that took session.
+	// SummaryMessageID into account via getSessionMessages worked logically,
+	// but the dangling rows bloated the DB and made provider usage look
+	// inconsistent because the cut never made it to the wire. Symmetric to
+	// the silent path now: pinned messages stay; everything else goes.
+	var toDelete []message.Message
+	for _, m := range msgs {
+		if !m.Pinned {
+			toDelete = append(toDelete, m)
+		}
+	}
+
 	aiMsgs, _ := a.preparePrompt(msgs, nil)
 
 	summarizeKey := sessionID + "-summarize"
@@ -1476,6 +1491,17 @@ func (a *sessionAgent) runSummarize(ctx context.Context, sessionID string, opts 
 	freshSession.PromptTokens = 0
 	if _, err = a.sessions.Save(genCtx, freshSession); err != nil {
 		return err
+	}
+
+	// Now that the summary is persisted and SummaryMessageID is wired up,
+	// drop the historical non-pinned messages. The summary message itself was
+	// created AFTER the snapshot above so it is not in toDelete. Any user
+	// messages that landed via messageQueue during the stream are also safe —
+	// they are not in this snapshot either.
+	for _, m := range toDelete {
+		if delErr := a.messages.Delete(ctx, m.ID); delErr != nil {
+			slog.Warn("manual summarise: failed to delete old message", "id", m.ID, "err", delErr)
+		}
 	}
 
 	// Fork merge note (origin/main 61f49b23 "drain queued messages after manual
