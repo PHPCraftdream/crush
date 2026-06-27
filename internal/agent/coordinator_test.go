@@ -719,7 +719,7 @@ func TestClassifyProviderError(t *testing.T) {
 
 		{"401", providerErr(http.StatusUnauthorized, "nope"), classTerminal},
 		{"402", providerErr(http.StatusPaymentRequired, "pay"), classTerminal},
-		{"403", providerErr(http.StatusForbidden, "forbidden"), classTerminal},
+		{"403", providerErr(http.StatusForbidden, "forbidden"), classTransient},
 
 		{"429 quota wall", providerErr(http.StatusTooManyRequests, quotaMsg), classTerminal},
 		{"429 overload", providerErr(http.StatusTooManyRequests, overloadMsg), classTransient},

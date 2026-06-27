@@ -625,8 +625,15 @@ func classifyProviderError(err error) retryClass {
 			return classTerminal // the auto-summarize path owns this
 		}
 		switch providerErr.StatusCode {
-		case http.StatusUnauthorized, http.StatusPaymentRequired, http.StatusForbidden:
+		case http.StatusUnauthorized, http.StatusPaymentRequired:
 			return classTerminal
+		case http.StatusForbidden:
+			// 403 is ambiguous: it can be a real auth/geo wall (retry pointless)
+			// or a CDN/anti-abuse banner from a fronting balancer that clears in
+			// tens of seconds (z.ai "Forbidden ZS", Cloudflare-fronted providers).
+			// Treat as transient: the worst case is ~40s of bounded backoff on a
+			// truly bad key vs. losing a long agent run on a momentary block.
+			return classTransient
 		case http.StatusTooManyRequests:
 			if isQuotaLimit(providerErr) {
 				return classTerminal // multi-hour usage wall — operator accepts a fast fail
