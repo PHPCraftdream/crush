@@ -62,6 +62,7 @@ type Session struct {
 	YoloEnabled               int64          `json:"yolo_enabled"`
 	LargeModelReasoningEffort sql.NullString `json:"large_model_reasoning_effort"`
 	SmallModelReasoningEffort sql.NullString `json:"small_model_reasoning_effort"`
+	DeletedTodos              string         `json:"deleted_todos"`
 }
 
 type SessionPermission struct {

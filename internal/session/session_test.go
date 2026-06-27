@@ -39,7 +39,8 @@ func newTestDB(t *testing.T) (*sql.DB, *db.Queries) {
 			small_model_id TEXT,
 			small_model_reasoning_effort TEXT DEFAULT 'medium',
 			system_prompt TEXT DEFAULT '',
-			yolo_enabled INTEGER NOT NULL DEFAULT 0
+			yolo_enabled INTEGER NOT NULL DEFAULT 0,
+			deleted_todos TEXT NOT NULL DEFAULT '[]'
 		);
 
 		CREATE TABLE session_permissions (

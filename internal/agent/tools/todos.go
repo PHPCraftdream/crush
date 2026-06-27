@@ -48,23 +48,42 @@ func todoStatusLevel(s session.TodoStatus) int {
 }
 
 // mergeTodos merges the model's desired todo list with the current DB state.
-// The only protective rule is status protection: a task's status can only
-// advance (pending → in_progress → completed). The model cannot revert a
-// status the user manually set.
+//
+// Two protective rules apply:
+//  1. Status protection: a task's status can only advance
+//     (pending → in_progress → completed). The model cannot revert a status
+//     the operator manually set.
+//  2. Tombstone filtering: if the operator explicitly deleted a todo (its
+//     Content string appears in deletedTombstones), the model cannot
+//     resurrect it — the item is silently dropped from the result even if
+//     the model sends it again.
 //
 // The model's list is otherwise authoritative — if the model omits a task,
-// it is removed. User deletions are respected this way because the
-// system_reminder always shows the model the current DB state as ground truth.
-func mergeTodos(dbTodos []session.Todo, modelItems []TodoItem) ([]session.Todo, bool) {
+// it is removed.
+func mergeTodos(dbTodos []session.Todo, modelItems []TodoItem, deletedTombstones []string) ([]session.Todo, bool) {
+	// Build the tombstone set for O(1) lookup.
+	tombstoneSet := make(map[string]struct{}, len(deletedTombstones))
+	for _, c := range deletedTombstones {
+		tombstoneSet[c] = struct{}{}
+	}
+
 	if len(dbTodos) == 0 {
-		// Empty DB → accept model's list as-is (fresh start).
-		todos := make([]session.Todo, len(modelItems))
-		for i, item := range modelItems {
-			todos[i] = session.Todo{
+		// Empty DB → accept model's list as-is (fresh start), but still
+		// honour tombstones so a model that re-sends deleted items on its
+		// very first call after deletion is also filtered.
+		var todos []session.Todo
+		for _, item := range modelItems {
+			if _, tombstoned := tombstoneSet[item.Content]; tombstoned {
+				slog.Info("todos tool: filtered tombstoned todo (fresh start)",
+					"content", item.Content,
+				)
+				continue
+			}
+			todos = append(todos, session.Todo{
 				Content:    item.Content,
 				Status:     session.TodoStatus(item.Status),
 				ActiveForm: item.ActiveForm,
-			}
+			})
 		}
 		return todos, true
 	}
@@ -76,8 +95,14 @@ func mergeTodos(dbTodos []session.Todo, modelItems []TodoItem) ([]session.Todo, 
 
 	var result []session.Todo
 
-	// Process model's items: apply status protection for known tasks.
+	// Process model's items: apply tombstone filter then status protection.
 	for _, item := range modelItems {
+		if _, tombstoned := tombstoneSet[item.Content]; tombstoned {
+			slog.Info("todos tool: filtered tombstoned todo",
+				"content", item.Content,
+			)
+			continue
+		}
 		wantStatus := session.TodoStatus(item.Status)
 		if dbTodo, exists := dbByContent[item.Content]; exists {
 			// Task exists in DB: don't allow status regression.
@@ -123,7 +148,7 @@ func NewTodosTool(sessions session.Service) fantasy.AgentTool {
 				}
 			}
 
-			todos, isNew := mergeTodos(currentSession.Todos, params.Todos)
+			todos, isNew := mergeTodos(currentSession.Todos, params.Todos, currentSession.DeletedTodos)
 
 			slog.Info("todos tool: model updating todos",
 				"session", sessionID,

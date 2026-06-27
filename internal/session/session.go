@@ -69,6 +69,11 @@ type Session struct {
 	YoloEnabled     bool
 	CancelRequested bool // Only populated by ListAll; use IsCancelRequested() for live checks.
 
+	// DeletedTodos holds the Content strings of todos that the operator
+	// explicitly removed via the UI. mergeTodos uses this set as a tombstone
+	// filter so the model cannot resurrect them during multi-step turns.
+	DeletedTodos []string
+
 	// Fork patch (operator UX): persisted from --max-cost / --max-tokens /
 	// --timeout at run start so sessions show/locks can display budget.
 	EndedReason      string  // "done","canceled","timeout","max_cost","max_tokens","error","crash",""
@@ -266,6 +271,11 @@ func (s *service) Save(ctx context.Context, session Session) (Session, error) {
 		return Session{}, err
 	}
 
+	deletedTodosJSON, err := marshalDeletedTodos(session.DeletedTodos)
+	if err != nil {
+		return Session{}, err
+	}
+
 	dbSession, err := s.q.UpdateSession(ctx, db.UpdateSessionParams{
 		ID:               session.ID,
 		Title:            session.Title,
@@ -279,6 +289,7 @@ func (s *service) Save(ctx context.Context, session Session) (Session, error) {
 			String: todosJSON,
 			Valid:  todosJSON != "",
 		},
+		DeletedTodos: deletedTodosJSON,
 	})
 	if err != nil {
 		return Session{}, err
@@ -516,6 +527,10 @@ func (s service) fromDBItem(item db.Session) Session {
 	if err != nil {
 		slog.Error("Failed to unmarshal todos", "session_id", item.ID, "error", err)
 	}
+	deletedTodos, err := unmarshalDeletedTodos(item.DeletedTodos)
+	if err != nil {
+		slog.Error("Failed to unmarshal deleted_todos", "session_id", item.ID, "error", err)
+	}
 	return Session{
 		ID:               item.ID,
 		ParentSessionID:  item.ParentSessionID.String,
@@ -526,6 +541,7 @@ func (s service) fromDBItem(item db.Session) Session {
 		SummaryMessageID: item.SummaryMessageID.String,
 		Cost:             item.Cost,
 		Todos:            todos,
+		DeletedTodos:     deletedTodos,
 		CreatedAt:        item.CreatedAt,
 		UpdatedAt:        item.UpdatedAt,
 
@@ -611,6 +627,28 @@ func unmarshalTodos(data string) ([]Todo, error) {
 		return []Todo{}, err
 	}
 	return todos, nil
+}
+
+func marshalDeletedTodos(contents []string) (string, error) {
+	if len(contents) == 0 {
+		return "[]", nil
+	}
+	data, err := json.Marshal(contents)
+	if err != nil {
+		return "[]", err
+	}
+	return string(data), nil
+}
+
+func unmarshalDeletedTodos(data string) ([]string, error) {
+	if data == "" || data == "[]" {
+		return []string{}, nil
+	}
+	var contents []string
+	if err := json.Unmarshal([]byte(data), &contents); err != nil {
+		return []string{}, err
+	}
+	return contents, nil
 }
 
 func NewService(q *db.Queries, conn *sql.DB) Service {

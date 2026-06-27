@@ -43,7 +43,7 @@ INSERT INTO sessions (
     ?,
     ?,
     0
-) RETURNING id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id, system_prompt, yolo_enabled, large_model_reasoning_effort, small_model_reasoning_effort
+) RETURNING id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id, system_prompt, yolo_enabled, large_model_reasoning_effort, small_model_reasoning_effort, deleted_todos
 `
 
 type CreateSessionParams struct {
@@ -95,6 +95,7 @@ func (q *Queries) CreateSession(ctx context.Context, arg CreateSessionParams) (S
 		&i.YoloEnabled,
 		&i.LargeModelReasoningEffort,
 		&i.SmallModelReasoningEffort,
+		&i.DeletedTodos,
 	)
 	return i, err
 }
@@ -110,7 +111,7 @@ func (q *Queries) DeleteSession(ctx context.Context, id string) error {
 }
 
 const getLastSession = `-- name: GetLastSession :one
-SELECT id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id, system_prompt, yolo_enabled, large_model_reasoning_effort, small_model_reasoning_effort
+SELECT id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id, system_prompt, yolo_enabled, large_model_reasoning_effort, small_model_reasoning_effort, deleted_todos
 FROM sessions
 ORDER BY updated_at DESC
 LIMIT 1
@@ -139,12 +140,13 @@ func (q *Queries) GetLastSession(ctx context.Context) (Session, error) {
 		&i.YoloEnabled,
 		&i.LargeModelReasoningEffort,
 		&i.SmallModelReasoningEffort,
+		&i.DeletedTodos,
 	)
 	return i, err
 }
 
 const getSessionByID = `-- name: GetSessionByID :one
-SELECT id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id, system_prompt, yolo_enabled, large_model_reasoning_effort, small_model_reasoning_effort
+SELECT id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id, system_prompt, yolo_enabled, large_model_reasoning_effort, small_model_reasoning_effort, deleted_todos
 FROM sessions
 WHERE id = ? LIMIT 1
 `
@@ -172,6 +174,7 @@ func (q *Queries) GetSessionByID(ctx context.Context, id string) (Session, error
 		&i.YoloEnabled,
 		&i.LargeModelReasoningEffort,
 		&i.SmallModelReasoningEffort,
+		&i.DeletedTodos,
 	)
 	return i, err
 }
@@ -182,7 +185,7 @@ SET
     cost = cost + ?,
     updated_at = strftime('%s', 'now')
 WHERE id = ?
-RETURNING id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id, system_prompt, yolo_enabled, large_model_reasoning_effort, small_model_reasoning_effort
+RETURNING id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id, system_prompt, yolo_enabled, large_model_reasoning_effort, small_model_reasoning_effort, deleted_todos
 `
 
 type IncrementSessionCostParams struct {
@@ -217,12 +220,13 @@ func (q *Queries) IncrementSessionCost(ctx context.Context, arg IncrementSession
 		&i.YoloEnabled,
 		&i.LargeModelReasoningEffort,
 		&i.SmallModelReasoningEffort,
+		&i.DeletedTodos,
 	)
 	return i, err
 }
 
 const listSessions = `-- name: ListSessions :many
-SELECT id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id, system_prompt, yolo_enabled, large_model_reasoning_effort, small_model_reasoning_effort
+SELECT id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id, system_prompt, yolo_enabled, large_model_reasoning_effort, small_model_reasoning_effort, deleted_todos
 FROM sessions
 WHERE parent_session_id is NULL
 ORDER BY updated_at DESC
@@ -257,6 +261,7 @@ func (q *Queries) ListSessions(ctx context.Context) ([]Session, error) {
 			&i.YoloEnabled,
 			&i.LargeModelReasoningEffort,
 			&i.SmallModelReasoningEffort,
+			&i.DeletedTodos,
 		); err != nil {
 			return nil, err
 		}
@@ -272,7 +277,7 @@ func (q *Queries) ListSessions(ctx context.Context) ([]Session, error) {
 }
 
 const listSubSessions = `-- name: ListSubSessions :many
-SELECT id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id, system_prompt, yolo_enabled, large_model_reasoning_effort, small_model_reasoning_effort
+SELECT id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id, system_prompt, yolo_enabled, large_model_reasoning_effort, small_model_reasoning_effort, deleted_todos
 FROM sessions
 WHERE parent_session_id = ?
 ORDER BY created_at ASC
@@ -310,6 +315,7 @@ func (q *Queries) ListSubSessions(ctx context.Context, parentSessionID sql.NullS
 			&i.YoloEnabled,
 			&i.LargeModelReasoningEffort,
 			&i.SmallModelReasoningEffort,
+			&i.DeletedTodos,
 		); err != nil {
 			return nil, err
 		}
@@ -366,9 +372,10 @@ SET
     completion_tokens = ?,
     summary_message_id = ?,
     todos = ?,
+    deleted_todos = ?,
     updated_at = strftime('%s', 'now')
 WHERE id = ?
-RETURNING id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id, system_prompt, yolo_enabled, large_model_reasoning_effort, small_model_reasoning_effort
+RETURNING id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id, system_prompt, yolo_enabled, large_model_reasoning_effort, small_model_reasoning_effort, deleted_todos
 `
 
 type UpdateSessionParams struct {
@@ -377,6 +384,7 @@ type UpdateSessionParams struct {
 	CompletionTokens int64          `json:"completion_tokens"`
 	SummaryMessageID sql.NullString `json:"summary_message_id"`
 	Todos            sql.NullString `json:"todos"`
+	DeletedTodos     string         `json:"deleted_todos"`
 	ID               string         `json:"id"`
 }
 
@@ -391,6 +399,7 @@ func (q *Queries) UpdateSession(ctx context.Context, arg UpdateSessionParams) (S
 		arg.CompletionTokens,
 		arg.SummaryMessageID,
 		arg.Todos,
+		arg.DeletedTodos,
 		arg.ID,
 	)
 	var i Session
@@ -414,6 +423,7 @@ func (q *Queries) UpdateSession(ctx context.Context, arg UpdateSessionParams) (S
 		&i.YoloEnabled,
 		&i.LargeModelReasoningEffort,
 		&i.SmallModelReasoningEffort,
+		&i.DeletedTodos,
 	)
 	return i, err
 }

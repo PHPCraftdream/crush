@@ -1913,6 +1913,37 @@ func handleUpdateTodos(ctx context.Context, a *appPkg.App, c *Client, msg WSMess
 		"prev_count", len(prev),
 		"new_count", len(todos),
 	)
+
+	// Tombstone management: track which todos the operator explicitly removed.
+	newByContent := make(map[string]struct{}, len(todos))
+	for _, t := range todos {
+		newByContent[t.Content] = struct{}{}
+	}
+
+	tombstones := append([]string(nil), sess.DeletedTodos...)
+	tombstoneSet := make(map[string]struct{}, len(tombstones))
+	for _, tc := range tombstones {
+		tombstoneSet[tc] = struct{}{}
+	}
+
+	// Previous todos absent from the new list → add to tombstones.
+	for _, t := range prev {
+		if _, stillThere := newByContent[t.Content]; !stillThere {
+			if _, already := tombstoneSet[t.Content]; !already {
+				tombstones = append(tombstones, t.Content)
+				tombstoneSet[t.Content] = struct{}{}
+			}
+		}
+	}
+	// Operator re-added a previously tombstoned todo → lift the tombstone.
+	filtered := tombstones[:0]
+	for _, content := range tombstones {
+		if _, returned := newByContent[content]; !returned {
+			filtered = append(filtered, content)
+		}
+	}
+	sess.DeletedTodos = filtered
+
 	if _, err := a.Sessions.Save(ctx, sess); err != nil {
 		c.reply(msg.ID, EventError, nil, "failed to save todos")
 		return
