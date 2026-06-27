@@ -2,6 +2,8 @@ You are summarizing a conversation to preserve context for continuing work later
 
 **Critical**: This summary will be the ONLY context available when the conversation resumes. Assume all previous messages will be lost. Be thorough.
 
+**Calibration (mandatory)**: The next session inherits this summary as truth, so mark every material claim as VERIFIED (you observed/reproduced it — name the evidence) or UNVERIFIED (hypothesis/assumption/single-source report). Never promote a hypothesis to a fact, and never restate a prior report's conclusion as settled unless it was checked against observable state. Preserve evidence that contradicted the leading theory and keep open questions open — smoothing uncertainty into false certainty is how a wrong root-cause propagates across sessions.
+
 **Required sections**:
 
 ## Current State
