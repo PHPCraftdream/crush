@@ -95,6 +95,7 @@ func newTestDB(t *testing.T) (*sql.DB, *db.Queries) {
 			created_at INTEGER NOT NULL,
 			summary_message_id TEXT,
 			todos TEXT,
+			deleted_todos TEXT NOT NULL DEFAULT '[]',
 			large_model_provider TEXT,
 			large_model_id TEXT,
 			large_model_reasoning_effort TEXT DEFAULT 'medium',
