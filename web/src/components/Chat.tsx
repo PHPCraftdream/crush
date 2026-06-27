@@ -18,7 +18,7 @@ import {
   type QueuedMessage,
 } from "../store";
 import { ws } from "../ws";
-import { Message, ToolActivityGroup } from "./Message";
+import { Message, ToolActivityGroup, IntermediateAssistantMessage } from "./Message";
 import { ChatInput } from "./ChatInput";
 import { PermissionDialog } from "./PermissionDialog";
 import { ConfirmDialog } from "./ConfirmDialog";
@@ -145,7 +145,8 @@ type BurstPart = { part: ContentPart; createdAt: number; messageID: string };
 
 type RenderItem =
   | { kind: "message"; message: Msg; index: number }
-  | { kind: "toolrun"; parts: BurstPart[]; firstMsgID: string };
+  | { kind: "toolrun"; parts: BurstPart[]; firstMsgID: string }
+  | { kind: "standalonetext"; messageID: string; partIndex: number; text: string };
 
 // buildRenderItems groups consecutive tool activity across messages into
 // one cross-message accordion (ToolRun) and renders everything else as a
@@ -216,13 +217,22 @@ function buildRenderItems(messages: Msg[]): RenderItem[] {
     }
 
     if (hasTool) {
-      // Tool-bearing message: drop bare text (it would duplicate the
-      // tool arg headers), but KEEP thinking parts so the group can
-      // render them inline alongside the tool rows in original order.
+      // Tool-bearing message: walk parts in order. tool_call/tool_result/
+      // thinking flow into the burst. A text part is the model narrating
+      // between actions ("OK, the file exists, now let me edit it") — those
+      // are valuable, the operator wants them. So a text part FLUSHES the
+      // burst and renders as a StandaloneText row in place, then a new
+      // burst can start with the tools that follow.
       if (burstFirstID === "") burstFirstID = m.ID;
-      for (const p of m.Parts) {
+      for (let pi = 0; pi < m.Parts.length; pi++) {
+        const p = m.Parts[pi];
         if (p.type === "tool_call" || p.type === "tool_result" || p.type === "thinking") {
           burstParts.push({ part: p as ContentPart, createdAt: m.CreatedAt, messageID: m.ID });
+        } else if (p.type === "text") {
+          const t = (p as { type: "text"; Text: string }).Text ?? "";
+          if (t.trim().length === 0) continue;
+          flushBurst();
+          out.push({ kind: "standalonetext", messageID: m.ID, partIndex: pi, text: t });
         }
       }
       return;
@@ -392,6 +402,17 @@ export function Chat() {
           </div>
         ) : (
           renderItems.map((item, ri) => {
+            if (item.kind === "standalonetext") {
+              return (
+                <IntermediateAssistantMessage
+                  key={`txt-${item.messageID}-${item.partIndex}-${ri}`}
+                  messageID={item.messageID}
+                  partIndex={item.partIndex}
+                  text={item.text}
+                  sessionID={activeSessionID ?? ""}
+                />
+              );
+            }
             if (item.kind === "toolrun") {
               // A toolrun is "current" only when nothing rendered AFTER it.
               // The moment the user sends a new message, that message

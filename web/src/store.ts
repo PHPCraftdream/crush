@@ -221,13 +221,21 @@ export function upsertMessage(msg: Message) {
   } else {
     const prev = list[idx];
     const next = [...list];
-    // For assistant messages, never let an update erase reasoning the
-    // user was already shown. Non-assistant and brand-new messages are
-    // unaffected.
-    next[idx] =
-      prev.Role === "assistant" && msg.Role === "assistant"
-        ? mergePreserveContent(prev, msg)
-        : msg;
+    if (prev.Role === "assistant" && msg.Role === "assistant") {
+      const merged = mergePreserveContent(prev, msg);
+      if (merged !== msg) {
+        console.warn("[upsertMessage] content regression blocked", {
+          id: msg.ID,
+          prevText: totalText(prev.Parts).length,
+          incomingText: totalText(msg.Parts).length,
+          prevThinking: totalThinking(prev.Parts).length,
+          incomingThinking: totalThinking(msg.Parts).length,
+        });
+      }
+      next[idx] = merged;
+    } else {
+      next[idx] = msg;
+    }
     $messages.set(next);
   }
 }
@@ -550,6 +558,37 @@ export function rerunFromMessage(messageID: string) {
   if (!sessionID) return;
   logClientEvent("rerun_message", { sessionID, messageID });
   ws.send("rerun_message", { messageID });
+}
+
+// collectTurnContent gathers the agent's response to one user prompt:
+// thinking + text from every assistant message that follows the given user
+// message, stopping at the next user message (or end of conversation). Tool
+// calls and tool results are excluded — the operator wants the agent's prose,
+// not its action log.
+//
+// Returns "" if the user message has no agent response yet.
+export function collectTurnContent(userMessageID: string): string {
+  const msgs = $messages.get();
+  const startIdx = msgs.findIndex((m) => m.ID === userMessageID);
+  if (startIdx === -1) return "";
+
+  const chunks: string[] = [];
+  for (let i = startIdx + 1; i < msgs.length; i++) {
+    const m = msgs[i];
+    if (m.Hidden) continue;
+    if (m.Role === "user") break; // next user turn — stop
+    if (m.Role !== "assistant") continue; // skip tool-role messages
+    for (const p of m.Parts) {
+      if (p.type === "thinking") {
+        const t = (p as { type: "thinking"; Thinking: string }).Thinking;
+        if (t && t.trim()) chunks.push(`<thinking>\n${t}\n</thinking>`);
+      } else if (p.type === "text") {
+        const t = (p as { type: "text"; Text: string }).Text;
+        if (t && t.trim()) chunks.push(t);
+      }
+    }
+  }
+  return chunks.join("\n\n");
 }
 
 export function sendWithSmallModel(sessionID: string, content: string) {

@@ -9,13 +9,16 @@ import { BrainCircuit, Check, Copy, GitFork, Pencil, RotateCcw, Star, Trash2, Bo
 import { SubAgentBlock } from "./SubAgentBlock";
 import {
   $busySessions,
+  $activeSessionID,
   $messageBlockBreaks,
   toggleMessageSelection,
   updateMessageContent,
+  updateMessagePart,
   updateMessageThinking,
   deleteMessagePart,
   rerunFromMessage,
   togglePinMessage,
+  collectTurnContent,
 } from "../store";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { ForkSessionModal } from "./ForkSessionModal";
@@ -155,6 +158,24 @@ const CopyButton = memo(function CopyButton({ text, className = "", label = "Cop
   );
 });
 
+// CopyTurnButton copies the agent's full prose response to one user prompt —
+// thinking + all intermediate text + final text, across every assistant
+// message until the next user turn. Content is gathered LAZILY on click so a
+// long streaming turn doesn't rebuild this string on every delta.
+const CopyTurnButton = memo(function CopyTurnButton({ userMessageID }: { userMessageID: string }) {
+  const [copied, setCopied] = useState(false);
+  const copy = useCallback(() => {
+    const text = collectTurnContent(userMessageID);
+    if (!text) return;
+    navigator.clipboard.writeText(text).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1500); });
+  }, [userMessageID]);
+  return (
+    <button onClick={copy} title="Copy all (thinking + every text reply, no tools)" className="btn-copy">
+      {copied ? <><Check size={14} className="text-green" /><span className="text-green">Copied</span></> : <><Copy size={14} /><span>Copy all</span></>}
+    </button>
+  );
+});
+
 // ── EditForm — owns all editing state and handlers ────────────────────────────
 
 const EditForm = memo(function EditForm({
@@ -219,6 +240,7 @@ const UserHoverActions = memo(function UserHoverActions({
   return (
     <div className="flex items-center gap-1.5">
       {copyText && <CopyButton text={copyText} />}
+      <CopyTurnButton userMessageID={messageID} />
       {isLastUserMsg && <button onClick={handleRerun} title="Rerun" className="btn-icon"><RotateCcw size={13} /></button>}
       <button onClick={handlePin}   title={isPinned ? "Unpin" : "Pin message"} className={`p-1.5 transition-colors rounded ${isPinned ? "text-yellow" : "text-text-subtle hover:text-yellow"}`}><Star size={13} fill={isPinned ? "currentColor" : "none"} /></button>
       <button onClick={onFork}      title="Fork session"                       className="btn-icon"><GitFork size={13} /></button>
@@ -494,6 +516,8 @@ type ActionItem =
       idx: number;
       key: string;
       createdAt?: number;
+      messageID?: string;
+      partIndex?: number;
     };
 
 interface ActionRowProps {
@@ -513,14 +537,20 @@ const ActionRow = memo(function ActionRow({ item, isCurrent, suppressAutoCurrent
   const open = override ?? effectiveCurrent;
   const toggle = useCallback(() => setOverride(!open), [open]);
 
+  // Used only by the thinking branch; useState must be called unconditionally.
+  const [editingThinking, setEditingThinking] = useState(false);
+  const [confirmDeleteThinking, setConfirmDeleteThinking] = useState(false);
+
   if (item.kind === "thinking") {
     // Thinking rows live alongside tool rows in the accordion. Same
     // open/close + auto-current rules; collapsed header shows a one-line
     // preview of the model's reasoning so the operator can scan the
     // chain without expanding every row.
     const preview = item.text.replace(/\s+/g, " ").trim();
+    const messageID = item.messageID ?? "";
+    const partIndex = item.partIndex ?? -1;
     return (
-      <div data-test-id="action-row" className="action-row">
+      <div data-test-id="action-row" className="action-row group">
         <button
           type="button"
           onClick={toggle}
@@ -537,14 +567,54 @@ const ActionRow = memo(function ActionRow({ item, isCurrent, suppressAutoCurrent
             {preview || "—"}
           </span>
           <TimeBadge epochSec={item.createdAt} />
+          {messageID && partIndex >= 0 && (
+            <div className="flex items-center gap-0.5 hover-reveal shrink-0" onClick={(e) => e.stopPropagation()}>
+              <CopyButton text={item.text} className="px-1.5 py-1 text-xs" />
+              <button
+                onClick={(e) => { e.preventDefault(); e.stopPropagation(); setEditingThinking(true); }}
+                title="Edit thinking"
+                className="btn-icon-sm"
+              >
+                <Pencil size={13} />
+              </button>
+              <button
+                onClick={(e) => { e.preventDefault(); e.stopPropagation(); setConfirmDeleteThinking(true); }}
+                title="Delete thinking"
+                className="btn-icon-sm-danger"
+              >
+                <Trash2 size={13} />
+              </button>
+            </div>
+          )}
           <span className="text-text-subtle shrink-0">
             {open ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
           </span>
         </button>
         {open && (
           <div className="action-row-body">
-            <pre className="tool-output whitespace-pre-wrap">{item.text}</pre>
+            {editingThinking ? (
+              <div className="p-4 bg-base-overlay border-t border-surface">
+                <EditForm
+                  initialValue={item.text}
+                  rows={6}
+                  className="w-full bg-base-subtle border border-accent/40 text-text-muted rounded-lg px-4 py-3 text-[14px] font-mono leading-relaxed resize-none outline-none focus:border-accent"
+                  onSave={(t) => { updateMessagePart(messageID, partIndex, t); setEditingThinking(false); }}
+                  onCancel={() => setEditingThinking(false)}
+                />
+              </div>
+            ) : (
+              <pre className="tool-output whitespace-pre-wrap">{item.text}</pre>
+            )}
           </div>
+        )}
+        {confirmDeleteThinking && (
+          <ConfirmDialog
+            title="Delete thinking"
+            message="The model's reasoning will be removed from this message. This cannot be undone."
+            confirmLabel="Delete"
+            onConfirm={() => { deleteMessagePart(messageID, partIndex); setConfirmDeleteThinking(false); }}
+            onCancel={() => setConfirmDeleteThinking(false)}
+          />
         )}
       </div>
     );
@@ -691,7 +761,7 @@ export const ToolActivityGroup = memo(function ToolActivityGroup({ items, live, 
     for (const { part, idx, createdAt, messageID } of items) {
       if (part.type === "thinking") {
         const text = (part as { type: "thinking"; Thinking: string }).Thinking ?? "";
-        actions.push({ kind: "thinking", text, idx, key: `think-${idx}`, createdAt });
+        actions.push({ kind: "thinking", text, idx, key: `think-${idx}`, createdAt, messageID, partIndex: idx });
       } else if (part.type === "tool_call") {
         if (part.Name === "agent") { rawAgentParts.push({ part, idx, messageID }); continue; }
         const a: ActionItem = { kind: "tool", callPart: part, idx, key: `call-${part.ID}`, createdAt };
@@ -961,20 +1031,116 @@ export function StandaloneThinking({ messageID, partIndex, thinking, done, model
   );
 }
 
-// StandaloneText renders a small assistant-prose chunk that was extracted
-// from an otherwise-tool-bearing assistant message. These usually carry one
-// short sentence ("Let me check the next file") between actions in a long
-// tool burst — the action itself moves into the cross-message accordion,
-// the words stay on their own row so the reader still sees the model's
-// running narrative. Uses TextBlock for the markdown render path so links,
-// code spans and bullet lists all work identically to a normal assistant
-// message body.
-export function StandaloneText({ text }: { text: string }) {
+// IntermediateAssistantMessage renders a text part that was extracted from
+// an otherwise-tool-bearing assistant message (the model's running narrative
+// between tool calls). It behaves like a full assistant bubble: hover actions
+// expose Copy, Fork, Edit, and Delete. "Copy all" is intentionally absent
+// because this is a sub-part of a message, not an entire response.
+export function IntermediateAssistantMessage({
+  messageID,
+  partIndex,
+  text,
+  sessionID,
+}: {
+  messageID: string;
+  partIndex: number;
+  text: string;
+  sessionID: string;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [forking, setForking] = useState(false);
+  const [hovered, setHovered] = useState(false);
+
+  const activeSessionID = useStore($activeSessionID);
+
+  const handleSave = useCallback(
+    (newText: string) => {
+      if (newText && newText !== text) updateMessagePart(messageID, partIndex, newText);
+      setEditing(false);
+    },
+    [messageID, partIndex, text],
+  );
+
+  const handleConfirmDelete = useCallback(() => {
+    deleteMessagePart(messageID, partIndex);
+    setConfirmDelete(false);
+  }, [messageID, partIndex]);
+
+  const sid = sessionID || activeSessionID || "";
+
   return (
-    <div className="msg-row flex flex-col px-5 py-2 text-text leading-relaxed" style={{ fontSize: "var(--chat-font-size)" }}>
-      <div className="w-full min-w-0">
-        <TextBlock text={text} isUser={false} />
+    <div
+      className="msg-row flex flex-col px-5 py-3"
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
+    >
+      <div className="flex gap-3 justify-start">
+        <div className="w-full min-w-0">
+          {editing ? (
+            <EditForm
+              initialValue={text}
+              rows={4}
+              className="field-textarea text-[16px]"
+              onSave={handleSave}
+              onCancel={() => setEditing(false)}
+            />
+          ) : (
+            <div className="text-text leading-relaxed" style={{ fontSize: "var(--chat-font-size)" }}>
+              <TextBlock text={text} isUser={false} />
+            </div>
+          )}
+        </div>
       </div>
+
+      {!editing && (
+        <div className="msg-actions justify-start">
+          {hovered && (
+            <div className="flex items-center gap-1.5">
+              <CopyButton text={text} />
+              <button
+                onClick={() => setForking(true)}
+                title="Fork session"
+                className="btn-icon"
+              >
+                <GitFork size={13} />
+              </button>
+              <button
+                onClick={() => setEditing(true)}
+                title="Edit"
+                className="btn-icon"
+              >
+                <Pencil size={13} />
+              </button>
+              <button
+                onClick={() => setConfirmDelete(true)}
+                title="Delete"
+                className="btn-icon-danger"
+              >
+                <Trash2 size={13} />
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+
+      {confirmDelete && (
+        <ConfirmDialog
+          title="Delete message part"
+          message="This intermediate text from the agent will be removed. This cannot be undone."
+          confirmLabel="Delete"
+          onConfirm={handleConfirmDelete}
+          onCancel={() => setConfirmDelete(false)}
+        />
+      )}
+
+      {forking && sid && (
+        <ForkSessionModal
+          sessionID={sid}
+          defaultTitle=""
+          onClose={() => setForking(false)}
+        />
+      )}
     </div>
   );
 }
