@@ -237,23 +237,35 @@ export function ModelSelector({ session, modelType }: { session: Session | null;
   const effortLevels: readonly string[] = isZAIReasoningFlag ? EFFORT_LEVELS_ZAI : EFFORT_LEVELS;
   // Default: Claude CLI keeps the legacy "medium"; z.ai GLM-5.x defaults
   // to "high" (Max is opt-in for heavy work — same wording z.ai uses).
-  let currentEffort = isZAIReasoningFlag ? "high" : "medium";
+  let storedEffort = isZAIReasoningFlag ? "high" : "medium";
   if (session) {
     const effort = modelType === "large" ? session.LargeModelReasoningEffort : session.SmallModelReasoningEffort;
-    if (effort) currentEffort = effort;
+    if (effort) storedEffort = effort;
   }
   const showEffortPicker = isCLIClaudeModelFlag || isZAIReasoningFlag;
+  // Clamp the displayed effort to what THIS model actually supports. Without
+  // this, switching Claude→GLM on a session that stored "medium" leaves the
+  // badge showing M (which GLM does not understand) until the user clicks an
+  // arrow. The useEffect below persists the clamp back to the session so the
+  // backend never sees an unsupported value either.
+  const effortValid = effortLevels.includes(storedEffort);
+  const currentEffort = effortValid ? storedEffort : effortLevels[0];
+
+  useEffect(() => {
+    if (!session || !showEffortPicker) return;
+    if (effortValid) return;
+    setSessionReasoningEffort(
+      session.ID,
+      modelType === "large" ? currentEffort : null,
+      modelType === "small" ? currentEffort : null,
+    );
+  }, [session?.ID, modelType, showEffortPicker, effortValid, currentEffort]);
 
   function cycleEffort(direction: 1 | -1) {
     if (!session || !showEffortPicker) return;
-    let idx = effortLevels.indexOf(currentEffort);
-    if (idx === -1) {
-      // Picked a value the current selector doesn't own (e.g. switched
-      // model from Claude → GLM and "medium" isn't in the z.ai set).
-      // Reset to the first level so the chevron behaves predictably.
-      idx = 0;
-    }
-    const newIdx = (idx + direction + effortLevels.length) % effortLevels.length;
+    const idx = effortLevels.indexOf(currentEffort);
+    const safeIdx = idx === -1 ? 0 : idx;
+    const newIdx = (safeIdx + direction + effortLevels.length) % effortLevels.length;
     const newEffort = effortLevels[newIdx];
     setSessionReasoningEffort(
       session.ID,
