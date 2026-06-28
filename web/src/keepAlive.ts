@@ -19,11 +19,19 @@
 //     browser suspended it while the tab was hidden.
 
 const NOISE_BUFFER_SECONDS = 2;
-const LOWPASS_HZ = 6000;
+// Lowpass cutoff. Lower = less high-frequency content, which the ear
+// perceives as quieter at equal amplitude (equal-loudness contours).
+// 1500 Hz keeps enough body for the audio device to register the stream
+// while pushing the spectral peak well below the 2–5 kHz band where the
+// ear is most sensitive. Was 6000 Hz — operators reported it as audible
+// hiss on quiet headphones.
+const LOWPASS_HZ = 1500;
 // Effective output level. Tuned to be just enough to register as a
 // non-silent stream on the audio device without being perceptible at
-// normal listening volumes. 0.001 = −60 dBFS.
-const GAIN = 0.001;
+// normal listening volumes. 0.0002 ≈ −74 dBFS — 5× quieter than the
+// original 0.001 (−60 dBFS) which some operators could still hear on
+// sensitive headphones in a quiet room.
+const GAIN = 0.0002;
 
 let ctx: AudioContext | null = null;
 let source: AudioBufferSourceNode | null = null;
