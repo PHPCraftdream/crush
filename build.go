@@ -15,6 +15,10 @@ func run(dir, name string, args ...string) {
 	cmd.Dir = dir
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	// CI=true puts pnpm into non-interactive frozen-lockfile mode and lets
+	// it safely remove a stale node_modules directory from a prior npm run
+	// without prompting. Harmless for other commands.
+	cmd.Env = append(os.Environ(), "CI=true")
 	if err := cmd.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "FAILED: %s %v\n", name, args)
 		os.Exit(1)
@@ -25,10 +29,10 @@ func main() {
 	root, _ := os.Getwd()
 
 	fmt.Println("→ Installing web dependencies...")
-	run(root+"/web", "npm", "install")
+	run(root+"/web", "pnpm", "install")
 
 	fmt.Println("→ Building web UI...")
-	run(root+"/web", "npm", "run", "build")
+	run(root+"/web", "pnpm", "run", "build")
 
 	out := "crush"
 	if runtime.GOOS == "windows" {
