@@ -11,6 +11,7 @@ import {
   $busySessions,
   $activeSessionID,
   $messageBlockBreaks,
+  $collapseAllNonce,
   toggleMessageSelection,
   updateMessageContent,
   updateMessagePart,
@@ -145,6 +146,22 @@ const DurationBadge = memo(function DurationBadge({ message }: { message: Msg })
   if (duration < 0.5) return null;
   return <span className="text-xs text-text-subtle font-mono tabular-nums">{formatDuration(duration)}</span>;
 });
+
+// useCollapseAllSignal calls the provided collapser whenever the operator
+// clicks "Collapse all" in the toolbar (i.e. the global $collapseAllNonce
+// counter ticks). The first run after mount is intentionally skipped so a
+// freshly-rendered spoiler with its default open-state isn't forced shut
+// just because it subscribed.
+function useCollapseAllSignal(collapse: () => void) {
+  const nonce = useStore($collapseAllNonce);
+  const seen = useRef(nonce);
+  useEffect(() => {
+    if (seen.current === nonce) return;
+    seen.current = nonce;
+    collapse();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [nonce]);
+}
 
 // EffortBadge renders the model's reasoning-effort tier in square-bracket form
 // next to the model name: [L] / [M] / [H] / [X] / [XX] for low/medium/high/xhigh/max.
@@ -734,6 +751,7 @@ export const ToolActivityGroup = memo(function ToolActivityGroup({ items, live, 
   const effectiveCurrent = stickyCurrent;
   const autoCollapsed = !effectiveCurrent;
   const collapsed = collapsedOverride ?? autoCollapsed;
+  useCollapseAllSignal(() => setCollapsedOverride(true));
 
   const prevItemsLen = useRef(items.length);
   const prevIsCurrent = useRef(isCurrent);
@@ -950,6 +968,7 @@ const ThinkingPart = memo(function ThinkingPart({ thinking, messageID, partIndex
   // collapse strip at the bottom — long reasoning blocks are tedious to
   // close when the toggle is only at the top.
   const [open, setOpen] = useState(false);
+  useCollapseAllSignal(() => setOpen(false));
 
   const closeEdit  = useCallback(() => setEditing(false), []);
   const openDel    = useCallback((e: React.MouseEvent) => { e.preventDefault(); e.stopPropagation(); setConfirmDelete(true); }, []);
@@ -1429,6 +1448,7 @@ const SummaryMessage = memo(function SummaryMessage({ message }: { message: Msg 
   const isFinished = useMemo(() => message.Parts.some(p => p.type === "finish"), [message.Parts]);
   const [editing, setEditing] = useState(false);
   const [open, setOpen] = useState(false);
+  useCollapseAllSignal(() => setOpen(false));
 
   const handleSave = useCallback((newText: string) => {
     if (newText && newText !== text) updateMessageContent(message.ID, newText);
@@ -1493,6 +1513,7 @@ const BackgroundJobNotice = memo(function BackgroundJobNotice({ message }: { mes
   // occasionally needs to inspect, so it folds into a spoiler like every
   // other orchestrator block (mirrors SummaryMessage's toggle).
   const [open, setOpen] = useState(false);
+  useCollapseAllSignal(() => setOpen(false));
   return (
     <div className="px-8 py-3">
       <div className="summary-card">

@@ -27,6 +27,18 @@ export const $subAgentMessages = atom<Map<string, Message[]>>(new Map());
 // Block breaks for zebra pattern: indices where a new visual block starts (5s gap)
 export const $messageBlockBreaks = atom<Map<string, Set<number>>>(new Map());
 
+// Monotonic counter incremented whenever the operator clicks "Collapse all
+// spoilers" in the toolbar. Every collapsible component (ToolActivityGroup,
+// ThinkingPart, SummaryMessage, BackgroundJobNotice) subscribes to it and
+// closes its local open-state on each tick. Components use the value via
+// a useEffect that skips the initial render (so just mounting doesn't
+// collapse anything already open by default).
+export const $collapseAllNonce = atom<number>(0);
+
+export function collapseAllSpoilers() {
+  $collapseAllNonce.set($collapseAllNonce.get() + 1);
+}
+
 // ── Actions ──────────────────────────────────────────────────────────────────
 export function setSkills(skills: SkillInfo[]) {
   $skills.set(skills);

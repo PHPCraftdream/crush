@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
 import { useStore } from "@nanostores/react";
-import { Minimize2, Zap, ShieldOff, X, CheckCheck, ScrollText, Plug, Sun, Moon, Settings, ServerCog, FileText, Headphones, Eye } from "lucide-react";
+import { Minimize2, Zap, ShieldOff, X, CheckCheck, ScrollText, Plug, Sun, Moon, Settings, ServerCog, FileText, Headphones, Eye, ChevronsDownUp } from "lucide-react";
 import { $sitter, stopSitter } from "../sitter";
 import {
   $sessions,
@@ -15,6 +15,7 @@ import {
   setTheme,
   setKeepAliveEnabled,
   getDefaultModelKey,
+  collapseAllSpoilers,
 } from "../store";
 import { ModelSelector, buildModelList } from "./ModelSelector";
 import { StatusBar } from "./StatusBar";
@@ -265,6 +266,16 @@ export function ChatToolbar() {
             Compact
           </button>
         )}
+
+        <button
+          data-test-id="header-collapse-all-button"
+          onClick={collapseAllSpoilers}
+          title="Collapse all spoilers — fold every tool group, thinking block, summary and background-job notice in this chat"
+          className="flex items-center gap-1.5 text-xs font-medium rounded-lg px-2.5 py-1.5 border transition-colors bg-base-overlay border-surface text-text-subtle hover:border-accent/50 hover:text-text"
+        >
+          <ChevronsDownUp size={13} />
+          <span>Collapse all</span>
+        </button>
 
         <button
           data-test-id="header-prompt-button"
