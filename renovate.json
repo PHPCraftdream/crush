@@ -1,0 +1,26 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":enableVulnerabilityAlerts"
+  ],
+  "minimumReleaseAge": "30 days",
+  "internalChecksFilter": "strict",
+  "packageRules": [
+    {
+      "matchManagers": ["npm"],
+      "matchUpdateTypes": ["major", "minor", "patch"],
+      "minimumReleaseAge": "30 days"
+    },
+    {
+      "description": "Security vulnerabilities bypass the cooldown — a known CVE in our deps takes priority over supply-chain quarantine.",
+      "matchPackageNames": ["*"],
+      "matchUpdateTypes": ["pinDigest"],
+      "minimumReleaseAge": "0 days"
+    }
+  ],
+  "vulnerabilityAlerts": {
+    "minimumReleaseAge": "0 days",
+    "labels": ["security"]
+  }
+}
