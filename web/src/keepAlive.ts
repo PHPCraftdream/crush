@@ -26,12 +26,18 @@ const NOISE_BUFFER_SECONDS = 2;
 // ear is most sensitive. Was 6000 Hz — operators reported it as audible
 // hiss on quiet headphones.
 const LOWPASS_HZ = 1500;
-// Effective output level. Tuned to be just enough to register as a
-// non-silent stream on the audio device without being perceptible at
-// normal listening volumes. 0.0002 ≈ −74 dBFS — 5× quieter than the
-// original 0.001 (−60 dBFS) which some operators could still hear on
-// sensitive headphones in a quiet room.
-const GAIN = 0.0002;
+// Effective output level. Trickier than it looks: the BROWSER's tab-is-
+// playing-audio detector watches signal RMS, but the human ear weights
+// the perceived loudness via equal-loudness contours. Narrowing the
+// lowpass 6000→1500 Hz already drops broadband RMS by ~12 dB, so we
+// compensate by RAISING the gain above the original 0.001 — the tab
+// indicator (and Bluetooth-keep-alive) tracks RMS and needs it back;
+// the ear barely notices because almost no energy sits in the
+// sensitive 2–5 kHz band any more. 0.0012 (≈ −58 dBFS) lands at a
+// stable RMS the browser reliably detects while staying inaudible on
+// normal listening volumes. The earlier 0.0002 + 1500 Hz combo went
+// silent enough for the tab to drop its audio-playing icon entirely.
+const GAIN = 0.0012;
 
 let ctx: AudioContext | null = null;
 let source: AudioBufferSourceNode | null = null;
