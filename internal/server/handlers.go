@@ -409,16 +409,10 @@ func handleSetSessionModels(ctx context.Context, a *appPkg.App, c *Client, msg W
 	if p.LargeModel != nil {
 		lp, lm = p.LargeModel.Provider, p.LargeModel.Model
 		lre = p.LargeModel.ReasoningEffort
-		if lre == "" {
-			lre = "medium" // default
-		}
 	}
 	if p.SmallModel != nil {
 		sp, sm = p.SmallModel.Provider, p.SmallModel.Model
 		sre = p.SmallModel.ReasoningEffort
-		if sre == "" {
-			sre = "medium" // default
-		}
 	}
 
 	if err := a.Sessions.UpdateModels(ctx, p.SessionID, lp, lm, sp, sm); err != nil {
@@ -426,8 +420,25 @@ func handleSetSessionModels(ctx context.Context, a *appPkg.App, c *Client, msg W
 		return
 	}
 
-	// Update reasoning effort for models that support it
+	// Update reasoning effort for models that support it. CRITICAL: a single
+	// ModelSelector arrow click only carries ONE effort value but the frontend
+	// always serialises BOTH models in set_session_models. Without preserving
+	// the unset side from the DB, the previous "default to medium" behaviour
+	// would clobber the OTHER model's effort on every click — and on GLM (where
+	// medium is not a supported level) the clamp useEffect would immediately
+	// fire back, locking the UI into a flash-loop that never let the
+	// operator's chosen effort stick.
 	if lre != "" || sre != "" {
+		if lre == "" || sre == "" {
+			if sess, sessErr := a.Sessions.Get(ctx, p.SessionID); sessErr == nil {
+				if lre == "" {
+					lre = sess.LargeModelReasoningEffort
+				}
+				if sre == "" {
+					sre = sess.SmallModelReasoningEffort
+				}
+			}
+		}
 		if err := a.Sessions.UpdateReasoningEffort(ctx, p.SessionID, lre, sre); err != nil {
 			slog.Warn("ws: failed to update reasoning effort", "err", err)
 		}
