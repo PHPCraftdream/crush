@@ -862,6 +862,23 @@ export const ToolActivityGroup = memo(function ToolActivityGroup({ items, live, 
     return <>{renderAgents()}</>;
   }
 
+  // Single action with no sub-agent — the "1 action" accordion header would
+  // just duplicate the row's own header. Render the row inline so the
+  // operator sees one thing, not two. (When sub-agents are present we keep
+  // the wrapper because renderAgents adds another item below.)
+  if (actions.length === 1 && rawAgentParts.length === 0) {
+    return (
+      <ActionRow
+        key={actions[0].key}
+        item={actions[0]}
+        isCurrent={effectiveCurrent}
+        suppressAutoCurrent={false}
+        model={model}
+        effort={effort}
+      />
+    );
+  }
+
   return (
     <div data-test-id="tool-activity-group" className="tool-activity-group">
       <button
