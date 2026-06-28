@@ -1,7 +1,7 @@
 //go:build !dev
 
-//go:generate npm install
-//go:generate npm run build
+//go:generate pnpm install
+//go:generate pnpm run build
 
 package web
 

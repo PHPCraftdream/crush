@@ -3,6 +3,11 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
+  "packageManager": "pnpm@10.28.2",
+  "pnpm": {
+    "minimumReleaseAge": 43200,
+    "minimumReleaseAgeExclude": []
+  },
   "scripts": {
     "dev": "rsbuild dev",
     "build": "rsbuild build",
