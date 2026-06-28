@@ -146,6 +146,25 @@ const DurationBadge = memo(function DurationBadge({ message }: { message: Msg })
   return <span className="text-xs text-text-subtle font-mono tabular-nums">{formatDuration(duration)}</span>;
 });
 
+// EffortBadge renders the model's reasoning-effort tier in square-bracket form
+// next to the model name: [L] / [M] / [H] / [X] / [XX] for low/medium/high/xhigh/max.
+// Shown unconditionally (no provider gate) so GLM/zai messages get their tier
+// too — operators routinely run GLM at high vs max and want to tell them apart
+// at a glance. Returns null when effort is unknown so the layout doesn't carry
+// an empty bracket.
+const EffortBadge = memo(function EffortBadge({ effort, extraClass = "" }: { effort: string | undefined; extraClass?: string }) {
+  if (!effort) return null;
+  const letter = effort === "low" ? "L" : effort === "medium" ? "M" : effort === "high" ? "H" : effort === "xhigh" ? "X" : effort === "max" ? "XX" : "?";
+  return (
+    <span
+      className={`px-1 py-0.5 rounded bg-base-subtle text-text-muted font-mono text-[10px] ${extraClass}`}
+      title={`Reasoning effort: ${effort}`}
+    >
+      [{letter}]
+    </span>
+  );
+});
+
 const CopyButton = memo(function CopyButton({ text, className = "", label = "Copy" }: { text: string; className?: string; label?: string }) {
   const [copied, setCopied] = useState(false);
   const copy = useCallback(() => {
@@ -162,13 +181,17 @@ const CopyButton = memo(function CopyButton({ text, className = "", label = "Cop
 // thinking + all intermediate text + final text, across every assistant
 // message until the next user turn. Content is gathered LAZILY on click so a
 // long streaming turn doesn't rebuild this string on every delta.
-const CopyTurnButton = memo(function CopyTurnButton({ userMessageID }: { userMessageID: string }) {
+//
+// Accepts ANY message ID belonging to the turn: a user prompt, an
+// intermediate assistant step, or the final assistant message. collectTurnContent
+// walks back to the turn's user message either way.
+const CopyTurnButton = memo(function CopyTurnButton({ messageID }: { messageID: string }) {
   const [copied, setCopied] = useState(false);
   const copy = useCallback(() => {
-    const text = collectTurnContent(userMessageID);
+    const text = collectTurnContent(messageID);
     if (!text) return;
     navigator.clipboard.writeText(text).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1500); });
-  }, [userMessageID]);
+  }, [messageID]);
   return (
     <button onClick={copy} title="Copy all (thinking + every text reply, no tools)" className="btn-copy">
       {copied ? <><Check size={14} className="text-green" /><span className="text-green">Copied</span></> : <><Copy size={14} /><span>Copy all</span></>}
@@ -240,7 +263,7 @@ const UserHoverActions = memo(function UserHoverActions({
   return (
     <div className="flex items-center gap-1.5">
       {copyText && <CopyButton text={copyText} />}
-      <CopyTurnButton userMessageID={messageID} />
+      <CopyTurnButton messageID={messageID} />
       {isLastUserMsg && <button onClick={handleRerun} title="Rerun" className="btn-icon"><RotateCcw size={13} /></button>}
       <button onClick={handlePin}   title={isPinned ? "Unpin" : "Pin message"} className={`p-1.5 transition-colors rounded ${isPinned ? "text-yellow" : "text-text-subtle hover:text-yellow"}`}><Star size={13} fill={isPinned ? "currentColor" : "none"} /></button>
       <button onClick={onFork}      title="Fork session"                       className="btn-icon"><GitFork size={13} /></button>
@@ -251,9 +274,9 @@ const UserHoverActions = memo(function UserHoverActions({
 });
 
 const AssistantHoverActions = memo(function AssistantHoverActions({
-  message, copyText, copyAll, onEdit, onDelete, onFork,
+  message, copyText, onEdit, onDelete, onFork,
 }: {
-  message: Msg; copyText: string; copyAll: string;
+  message: Msg; copyText: string;
   onEdit: () => void; onDelete: () => void; onFork: () => void;
 }) {
   const handlePin = useCallback(() => togglePinMessage(message.ID, !message.Pinned), [message.ID, message.Pinned]);
@@ -261,7 +284,7 @@ const AssistantHoverActions = memo(function AssistantHoverActions({
     <div className="flex items-center gap-1 w-full">
       <div className="flex items-center gap-1.5">
         {copyText && <CopyButton text={copyText} />}
-        {copyAll  && <CopyButton text={copyAll}  label="Copy all" />}
+        <CopyTurnButton messageID={message.ID} />
         <button onClick={handlePin} title={message.Pinned ? "Unpin" : "Pin message"} className={`p-1.5 transition-colors rounded ${message.Pinned ? "text-yellow" : "text-text-subtle hover:text-yellow"}`}><Star size={13} fill={message.Pinned ? "currentColor" : "none"} /></button>
         <button onClick={onFork}    title="Fork session" className="btn-icon"><GitFork size={13} /></button>
         <button onClick={onEdit}    title="Edit"         className="btn-icon"><Pencil  size={13} /></button>
@@ -273,11 +296,7 @@ const AssistantHoverActions = memo(function AssistantHoverActions({
         {message.Model && (
           <span className="text-xs text-text-subtle font-mono flex items-center gap-1">
             {message.Model}
-            {message.ReasoningEffort && (message.Provider === "anthropic" || message.Provider === "local-cli") && (
-              <span className="px-1 py-0.5 rounded bg-base-subtle text-text-muted font-mono text-[10px]" title={`Reasoning effort: ${message.ReasoningEffort}`}>
-                {message.ReasoningEffort === "low" ? "L" : message.ReasoningEffort === "medium" ? "M" : message.ReasoningEffort === "high" ? "H" : "X"}
-              </span>
-            )}
+            <EffortBadge effort={message.ReasoningEffort} />
           </span>
         )}
       </div>
@@ -562,7 +581,7 @@ const ActionRow = memo(function ActionRow({ item, isCurrent, suppressAutoCurrent
           <span className="text-accent/70 shrink-0"><BrainCircuit size={13} /></span>
           <span className="text-accent/80 font-semibold text-sm shrink-0">thinking</span>
           {model && <span className="text-xs text-text-subtle font-mono shrink-0">{model}</span>}
-          {effort && <span className="px-1 py-0.5 rounded bg-base-subtle text-text-muted font-mono text-[10px] shrink-0">{effort === "low" ? "L" : effort === "medium" ? "M" : effort === "high" ? "H" : "X"}</span>}
+          <EffortBadge effort={effort} extraClass="shrink-0" />
           <span className="text-text font-mono text-sm truncate flex-1 min-w-0">
             {preview || "—"}
           </span>
@@ -939,7 +958,7 @@ const ThinkingPart = memo(function ThinkingPart({ thinking, messageID, partIndex
           <BrainCircuit size={15} className="text-accent/70 shrink-0 animate-pulse" />
           <span data-test-id="thinking-label">Thinking…</span>
           {model && <span className="text-xs text-text-subtle font-mono">{model}</span>}
-          {effort && <span className="px-1 py-0.5 rounded bg-base-subtle text-text-muted font-mono text-[10px]">{effort === "low" ? "L" : effort === "medium" ? "M" : effort === "high" ? "H" : "X"}</span>}
+          <EffortBadge effort={effort} />
         </div>
         {thinking && (
           <pre data-test-id="thinking-content" className="px-4 pb-3 font-mono whitespace-pre-wrap text-text-subtle leading-relaxed max-h-40 overflow-y-auto border-t border-surface/50" style={{ fontSize: "var(--chat-font-size)" }}>
@@ -1407,11 +1426,7 @@ const SummaryMessage = memo(function SummaryMessage({ message }: { message: Msg 
           <span className="text-sm font-semibold text-yellow">Context condensed</span>
           <span className="ml-auto text-xs text-text-muted font-mono flex items-center gap-1">
             {message.Model}
-            {message.ReasoningEffort && (message.Provider === "anthropic" || message.Provider === "local-cli") && (
-              <span className="px-1 py-0.5 rounded bg-base-subtle text-text-muted font-mono text-[10px]" title={`Reasoning effort: ${message.ReasoningEffort}`}>
-                {message.ReasoningEffort === "low" ? "L" : message.ReasoningEffort === "medium" ? "M" : message.ReasoningEffort === "high" ? "H" : "X"}
-              </span>
-            )}
+            <EffortBadge effort={message.ReasoningEffort} />
           </span>
           {isFinished && <DurationBadge message={message} />}
           {isFinished && (
@@ -1526,11 +1541,6 @@ export const Message = memo(function Message({
   const isUser = message.Role === "user";
 
   const copyText     = useMemo(() => extractText(message.Parts), [message.Parts]);
-  const copyThinking = useMemo(() => !isUser ? extractThinking(message.Parts) : "", [isUser, message.Parts]);
-  const copyAll      = useMemo(() => {
-    if (!copyThinking) return "";
-    return copyText ? `<thinking>\n${copyThinking}\n</thinking>\n\n${copyText}` : copyThinking;
-  }, [copyText, copyThinking]);
   const hasContent   = useMemo(() => !isUser && message.Parts.some(p => ["text","tool_call","tool_result","finish"].includes(p.type)), [isUser, message.Parts]);
 
   const [editing, setEditing] = useState(false);
@@ -1616,7 +1626,6 @@ export const Message = memo(function Message({
               <AssistantHoverActions
                 message={message}
                 copyText={copyText}
-                copyAll={copyAll}
                 onEdit={handleEditOpen}
                 onDelete={handleDelete}
                 onFork={handleForkOpen}

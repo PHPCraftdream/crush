@@ -566,11 +566,23 @@ export function rerunFromMessage(messageID: string) {
 // calls and tool results are excluded — the operator wants the agent's prose,
 // not its action log.
 //
+// Accepts EITHER a user message ID (canonical) OR any assistant/tool message
+// ID belonging to that turn — the function walks backwards to find the turn's
+// user message either way. This lets a "Copy all" button live on the agent's
+// final message just as well as on the user's prompt.
+//
 // Returns "" if the user message has no agent response yet.
-export function collectTurnContent(userMessageID: string): string {
+export function collectTurnContent(anyMessageID: string): string {
   const msgs = $messages.get();
-  const startIdx = msgs.findIndex((m) => m.ID === userMessageID);
+  let startIdx = msgs.findIndex((m) => m.ID === anyMessageID);
   if (startIdx === -1) return "";
+  // If we were handed a non-user message, walk back to the turn's user message.
+  if (msgs[startIdx].Role !== "user") {
+    let walk = startIdx;
+    while (walk > 0 && msgs[walk].Role !== "user") walk--;
+    if (msgs[walk].Role !== "user") return "";
+    startIdx = walk;
+  }
 
   const chunks: string[] = [];
   for (let i = startIdx + 1; i < msgs.length; i++) {
