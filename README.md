@@ -55,6 +55,31 @@ That document is also the survival guide for merging upstream `main`
 into the fork — every divergence is annotated with a `// Fork patch:`
 comment in the code so conflicts surface at the right line.
 
+## Security — `crush run` has no permission gating at all
+
+**`crush run` (the non-interactive CLI mode this fork is built around)
+auto-approves every tool call — bash, write, edit, fetch, everything.**
+There is no dialog, no allow/deny prompt, no toggle to turn this off:
+it is how non-interactive mode works by design, because there is no
+human on the keyboard to click Allow. The model has the same file and
+process access as the OS user running `crush`.
+
+This is **not** the old per-session "YOLO" toggle (that UI feature has
+been removed entirely — see `CHANGELOG.fork.md`). It is unconditional
+for every `crush run` invocation, with no flag to restore per-request
+prompting. The interactive web UI (`crush web`) is different: it still
+shows a permission dialog (Allow / Deny / Allow-always) for each tool
+call unless the operator clicks through it manually.
+
+**Run `crush run` inside an isolated environment — Docker, Podman, a
+VM, or at minimum an OS-level sandbox/dedicated worktree** — whenever
+the prompt or the repository content is not fully trusted, or when
+model-written code will execute. Do not point it at a host you can't
+afford to have fully modified. See `--cwd` and `CRUSH_FORBID_WRITES`
+below for lighter-weight mitigations when a full container isn't
+practical, but they are not a substitute for real isolation — they
+only block specific tool-call targets, not arbitrary shell execution.
+
 ## Running Crush in this fork
 
 Two complementary entry points; pick whichever fits the job.
@@ -180,9 +205,11 @@ jq -r '.error' "$out"         # error.message if non-success
   ~3-second HTTP round-trip when the on-disk cache is fresher than
   the TTL.
 
-Permissions are auto-approved in `crush run` (non-interactive — no
-one is on the keyboard). Mirror this with `--cwd /tmp/sandbox` or a
-worktree when running model-written code against shared state.
+Permissions are unconditionally auto-approved in `crush run` — see
+"Security" above. `--cwd /tmp/sandbox` or a worktree narrows the blast
+radius somewhat, but a container (Docker/Podman) or VM is the only
+real isolation boundary; use it whenever the prompt or repo content
+isn't fully trusted.
 
 ### 3. Parallel processes against one `.crush/`
 
@@ -213,6 +240,40 @@ See [`CHANGELOG.fork.md`](./CHANGELOG.fork.md) Section 4.I for the full
 parallel-process audit and the trade-offs we explicitly kept (e.g. N
 processes still spawn N stdio children of every configured MCP server
 — use HTTP/SSE-transport MCPs in parallel runs).
+
+#### Injecting a message into a running session from another process
+
+```bash
+crush sessions inject <session-id> -m "also update the changelog"
+crush sessions inject <session-id> -f ./notes/next-step.md
+crush sessions inject <session-id> -m "stop, wrong approach" --interrupt
+crush sessions inject 8a3f0c -m "continue" --json
+```
+
+Use this when a `crush run --session X` you already launched (from an
+orchestrator, another terminal, or a `/crush` sub-agent) is mid-turn
+and you want to hand it new information without killing it. `<id>`
+accepts a full session id or the short hash printed by `sessions
+list`.
+
+- The message is persisted immediately as a normal user message —
+  Role `user`, same as if it were typed — so it renders in the web UI
+  exactly like anything the operator sends themselves.
+- By default (no `--interrupt`) it merges into the session's next
+  provider request without cancelling the in-flight turn — same
+  latency as the web UI's non-stopping inject.
+- With `--interrupt` the running turn is cancelled and immediately
+  restarted with the new message, mirroring the web UI's
+  interrupt-and-send.
+- If no process is currently running the session, the message is
+  still persisted and picked up the next time the session runs; the
+  command tells you so instead of failing.
+
+Delivery costs nothing at rest: `crush sessions inject` writes a
+signal row to a `pending_injects` table, and the running process only
+checks it at points it already visits on every turn (next provider
+step for the merge case, a lightweight 3s ticker bound to the active
+turn for `--interrupt`) — no standing poll loop, no open port.
 
 ### 4. Bootstrap helpers for an orchestrator
 

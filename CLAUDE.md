@@ -46,7 +46,7 @@ Upstream commits touching any of these MUST be skipped:
 | Removed subsystem | Upstream-coded as | Skip rule |
 |---|---|---|
 | **Bubble Tea TUI** | `internal/tui/` | Any commit under `internal/tui/**` → SKIP |
-| Upstream YOLO + permissions test files | `b46dae6c` removed them | SKIP fixes there — our web flow owns it |
+| Upstream YOLO + permissions test files | `b46dae6c` removed them | SKIP fixes there — fork has no YOLO/auto-approve UI at all (removed `5c323b55`); only non-interactive `crush run` auto-approve remains |
 | Taskfile.yaml, swagger stub, nix, playwright temp | `52bb90f8` | SKIP CI/build replays |
 | CLA bot infra | `chore(legal): @… signed CLA` commits | SKIP — fork doesn't use CLA bot |
 | Auto-update / scheduled chores | `chore: auto-update files`, cron `nightly.yml` | SKIP |
