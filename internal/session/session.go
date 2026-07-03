@@ -4,9 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/crush/internal/db"
 	"github.com/charmbracelet/crush/internal/pubsub"
@@ -142,6 +144,21 @@ type Service interface {
 	// Fork patch: ended_reason + budget persistence for operator UX.
 	SetEndedReason(ctx context.Context, sessionID, reason string) error
 	SetBudget(ctx context.Context, sessionID string, maxCost float64, maxTokens, timeoutSec int64) error
+
+	// Cross-process message inject (foundation for `crush sessions inject`).
+	// CreatePendingInject enqueues a signal row asking whichever process is
+	// currently running the session to splice messageID into its live prompt.
+	// DrainPendingInjects is called from PrepareStep to consume those rows.
+	CreatePendingInject(ctx context.Context, inject PendingInject) error
+	DrainPendingInjects(ctx context.Context, sessionID string) ([]PendingInject, bool, error)
+	// ConsumeInterruptInject reads and deletes (delete-after-read, in one
+	// transaction) the OLDEST interrupt=true pending_injects row for
+	// sessionID, returning it. Counterpart to DrainPendingInjects, which
+	// deliberately leaves interrupt rows untouched: those are owned by the
+	// coordinator's interrupt ticker, which calls this to pick one up, cancel
+	// the running turn, and requeue the already-persisted message. Returns
+	// (nil, nil) when no interrupt row is pending.
+	ConsumeInterruptInject(ctx context.Context, sessionID string) (*PendingInject, error)
 
 	// Agent tool session management
 	CreateAgentToolSessionID(messageID, toolCallID string) string
@@ -558,6 +575,148 @@ func (s *service) SetBudget(ctx context.Context, sessionID string, maxCost float
 		maxCost, maxTokens, timeoutSec, sessionID,
 	)
 	return err
+}
+
+// PendingInject is one row of the cross-process inject queue. It is a
+// signal pointing at an already-created messages row (MessageID); Content is
+// carried only for debugging/logging. Interrupt distinguishes a plain merge
+// (false) from an interrupt-style inject (true) owned by the interrupt
+// ticker.
+type PendingInject struct {
+	ID        string
+	SessionID string
+	MessageID string
+	Content   string
+	Interrupt bool
+	CreatedAt int64
+}
+
+// CreatePendingInject enqueues a cross-process inject signal for sessionID.
+// The caller (e.g. `crush sessions inject`) is responsible for having
+// already created the referenced messages row so it is immediately visible
+// in the web UI; this only records the request to splice it into the live
+// prompt of whatever process is running the session.
+func (s *service) CreatePendingInject(ctx context.Context, inject PendingInject) error {
+	if inject.ID == "" {
+		inject.ID = uuid.NewString()
+	}
+	if inject.CreatedAt == 0 {
+		inject.CreatedAt = time.Now().Unix()
+	}
+	interrupt := int64(0)
+	if inject.Interrupt {
+		interrupt = 1
+	}
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO pending_injects (id, session_id, message_id, content, interrupt, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		inject.ID, inject.SessionID, inject.MessageID, inject.Content, interrupt, inject.CreatedAt,
+	)
+	return err
+}
+
+// DrainPendingInjects consumes the non-interrupt (interrupt = 0) inject rows
+// for sessionID, deleting them in the same transaction (delete-after-read),
+// and returns them ordered oldest-first for merging into the current prompt.
+// The second return value reports whether an interrupt (interrupt = 1) row is
+// also pending; those rows are NOT returned or deleted here — they are owned
+// by the interrupt ticker, which is expected to consume them before the next
+// PrepareStep. Reporting their presence lets PrepareStep log a defensive
+// warning if one slipped through.
+//
+// SQLite serialises writers, so there is no cross-process race; the enclosing
+// transaction guards against two goroutines inside this process draining the
+// same rows concurrently.
+func (s *service) DrainPendingInjects(ctx context.Context, sessionID string) ([]PendingInject, bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, false, err
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	rows, err := tx.QueryContext(ctx,
+		`SELECT id, session_id, message_id, content, interrupt, created_at
+		 FROM pending_injects WHERE session_id = ? ORDER BY created_at ASC`,
+		sessionID,
+	)
+	if err != nil {
+		return nil, false, err
+	}
+	defer rows.Close()
+
+	var (
+		merge        []PendingInject
+		consumedIDs  []string
+		hasInterrupt bool
+	)
+	for rows.Next() {
+		var (
+			pi        PendingInject
+			interrupt int64
+		)
+		if scanErr := rows.Scan(&pi.ID, &pi.SessionID, &pi.MessageID, &pi.Content, &interrupt, &pi.CreatedAt); scanErr != nil {
+			return nil, false, scanErr
+		}
+		if interrupt != 0 {
+			pi.Interrupt = true
+			hasInterrupt = true
+			continue
+		}
+		merge = append(merge, pi)
+		consumedIDs = append(consumedIDs, pi.ID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+
+	for _, id := range consumedIDs {
+		if _, delErr := tx.ExecContext(ctx, `DELETE FROM pending_injects WHERE id = ?`, id); delErr != nil {
+			return nil, false, delErr
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, false, err
+	}
+	return merge, hasInterrupt, nil
+}
+
+// ConsumeInterruptInject — see Service interface doc. It selects the oldest
+// interrupt row, deletes it in the same transaction, and returns it. One
+// interrupt event = one cancel+requeue by the caller; consuming a single row
+// per call keeps that mapping crisp even if several interrupt rows piled up.
+func (s *service) ConsumeInterruptInject(ctx context.Context, sessionID string) (*PendingInject, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	var (
+		pi        PendingInject
+		interrupt int64
+	)
+	row := tx.QueryRowContext(ctx,
+		`SELECT id, session_id, message_id, content, interrupt, created_at
+		 FROM pending_injects
+		 WHERE session_id = ? AND interrupt = 1
+		 ORDER BY created_at ASC LIMIT 1`,
+		sessionID,
+	)
+	if scanErr := row.Scan(&pi.ID, &pi.SessionID, &pi.MessageID, &pi.Content, &interrupt, &pi.CreatedAt); scanErr != nil {
+		if errors.Is(scanErr, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, scanErr
+	}
+	pi.Interrupt = interrupt != 0
+
+	if _, delErr := tx.ExecContext(ctx, `DELETE FROM pending_injects WHERE id = ?`, pi.ID); delErr != nil {
+		return nil, delErr
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return &pi, nil
 }
 
 func marshalTodos(todos []Todo) (string, error) {

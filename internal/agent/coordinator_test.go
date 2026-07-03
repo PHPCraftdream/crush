@@ -16,6 +16,7 @@ import (
 	"charm.land/fantasy/providers/bedrock"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/message"
+	"github.com/charmbracelet/crush/internal/session"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -896,6 +897,79 @@ func TestShouldRetryTurn(t *testing.T) {
 		sess, err := env.sessions.Create(t.Context(), "empty")
 		require.NoError(t, err)
 		assert.False(t, coord.shouldRetryTurn(t.Context(), sess.ID, overloadErr))
+	})
+}
+
+// TestHandleInterruptTick exercises the interrupt-inject tick handler in
+// isolation (no live provider): it seeds an interrupt=true pending_injects row
+// referencing an already-persisted user message, then asserts the handler
+// consumes the row, queues a call that points at the EXISTING message (no
+// duplicate create), and cancels the running turn. A second tick with no
+// interrupt row must be a no-op.
+func TestHandleInterruptTick(t *testing.T) {
+	const providerID = "test-provider"
+	env := testEnv(t)
+	cfg, err := config.Init(env.workingDir, "", false)
+	require.NoError(t, err)
+	cfg.Config().Providers.Set(providerID, config.ProviderConfig{ID: providerID})
+
+	agent := newMockAgent(providerID, 4096, func(_ context.Context, _ SessionAgentCall) (*fantasy.AgentResult, error) {
+		return agentResultWithText("ok"), nil
+	})
+	coord := &coordinator{
+		cfg:          cfg,
+		sessions:     env.sessions,
+		messages:     env.messages,
+		currentAgent: agent,
+	}
+
+	ctx := t.Context()
+	sess, err := env.sessions.Create(ctx, "interrupt-tick")
+	require.NoError(t, err)
+
+	// The CLI (`crush sessions inject --interrupt`) creates the user message
+	// AND the interrupt row; simulate both here.
+	msg, err := env.messages.Create(ctx, sess.ID, message.CreateMessageParams{
+		Role:  message.User,
+		Parts: []message.ContentPart{message.TextContent{Text: "stop and do X"}},
+	})
+	require.NoError(t, err)
+	require.NoError(t, env.sessions.CreatePendingInject(ctx, session.PendingInject{
+		SessionID: sess.ID, MessageID: msg.ID, Content: "stop and do X", Interrupt: true,
+	}))
+
+	t.Run("fires on interrupt row: queues existing message + cancels", func(t *testing.T) {
+		fired, err := coord.handleInterruptTick(ctx, sess.ID)
+		require.NoError(t, err)
+		assert.True(t, fired)
+
+		require.Len(t, agent.queuedCalls, 1)
+		q := agent.queuedCalls[0]
+		assert.Equal(t, msg.ID, q.ExistingMessageID, "must reference existing message, not create a new one")
+		assert.Equal(t, "stop and do X", q.Prompt)
+		require.Len(t, agent.cancelled, 1)
+		assert.Equal(t, sess.ID, agent.cancelled[0])
+
+		// No new user message row was created — history still holds exactly
+		// the one the CLI created.
+		msgs, err := env.messages.List(ctx, sess.ID)
+		require.NoError(t, err)
+		userCount := 0
+		for _, m := range msgs {
+			if m.Role == message.User {
+				userCount++
+			}
+		}
+		assert.Equal(t, 1, userCount, "no duplicate user message in history")
+	})
+
+	t.Run("no interrupt row is a no-op", func(t *testing.T) {
+		fired, err := coord.handleInterruptTick(ctx, sess.ID)
+		require.NoError(t, err)
+		assert.False(t, fired)
+		// No additional queue/cancel activity.
+		assert.Len(t, agent.queuedCalls, 1)
+		assert.Len(t, agent.cancelled, 1)
 	})
 }
 

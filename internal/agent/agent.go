@@ -139,6 +139,14 @@ type SessionAgentCall struct {
 	// MaxTokens aborts the run if total prompt+completion tokens exceed this value
 	// (0 = no cap).
 	MaxTokens int64
+	// ExistingMessageID, when non-empty, marks this call as referencing a
+	// user message that already exists in the DB (created by another process,
+	// e.g. `crush sessions inject --interrupt`). The queue-drain path in
+	// Run's PrepareStep must then load that message by ID and splice it into
+	// the prompt WITHOUT calling createUserMessage — otherwise the operator
+	// would see the same message twice in history. Set by
+	// QueueExistingMessage on the interrupt path.
+	ExistingMessageID string
 }
 
 type SessionAgent interface {
@@ -483,10 +491,16 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	}
 	defer wg.Wait()
 
-	// Add the user message to the session.
-	_, err = a.createUserMessage(ctx, call)
-	if err != nil {
-		return nil, err
+	// Add the user message to the session. Skip creation when the call
+	// references a message that already exists in the DB (interrupt-inject
+	// path: `crush sessions inject --interrupt` created the row before
+	// signalling this process). Creating it again would duplicate it in
+	// history — the referenced message is already the newest user message.
+	if call.ExistingMessageID == "" {
+		_, err = a.createUserMessage(ctx, call)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// Add the session to the context.
@@ -728,6 +742,19 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			queuedCalls, _ := a.messageQueue.Get(call.SessionID)
 			a.messageQueue.Del(call.SessionID)
 			for _, queued := range queuedCalls {
+				// Interrupt-inject path: the message row already exists in the
+				// DB (created by `crush sessions inject --interrupt`). Load it
+				// by ID and splice it in — do NOT create a duplicate row.
+				if queued.ExistingMessageID != "" {
+					existingMsg, getErr := a.messages.Get(callContext, queued.ExistingMessageID)
+					if getErr != nil {
+						slog.Warn("queued interrupt inject references missing message, skipping",
+							"session_id", call.SessionID, "message_id", queued.ExistingMessageID, "error", getErr)
+						continue
+					}
+					prepared.Messages = append(prepared.Messages, existingMsg.ToAIMessage()...)
+					continue
+				}
 				userMessage, createErr := a.createUserMessage(callContext, queued)
 				if createErr != nil {
 					return callContext, prepared, createErr
@@ -743,6 +770,43 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			a.injectQueue.Del(call.SessionID)
 			for _, inj := range injected {
 				prepared.Messages = append(prepared.Messages, inj.ToAIMessage()...)
+			}
+
+			// Cross-process inject drain: rows written by another process
+			// (`crush sessions inject`) into pending_injects. The message
+			// row already exists in the DB (the CLI created it at inject
+			// time for immediate web-UI visibility), so we only load it by
+			// message_id and splice it in — no second Create, no dup row.
+			// DrainPendingInjects deletes the consumed non-interrupt rows in
+			// the same transaction (delete-after-read).
+			pending, hasInterrupt, drainErr := a.sessions.DrainPendingInjects(callContext, call.SessionID)
+			if drainErr != nil {
+				return callContext, prepared, drainErr
+			}
+			if hasInterrupt {
+				// Defensive: interrupt rows are meant to be consumed by the
+				// interrupt ticker before PrepareStep runs. If one is still
+				// here it is a race, not a normal path.
+				slog.Warn("pending interrupt inject present during non-interrupt PrepareStep drain",
+					"session_id", call.SessionID)
+			}
+			for _, inj := range pending {
+				injMsg, getErr := a.messages.Get(callContext, inj.MessageID)
+				if getErr != nil {
+					// The referenced message vanished (e.g. cascade delete):
+					// skip it rather than aborting the whole step.
+					slog.Warn("pending inject references missing message, skipping",
+						"session_id", call.SessionID, "message_id", inj.MessageID, "error", getErr)
+					continue
+				}
+				prepared.Messages = append(prepared.Messages, injMsg.ToAIMessage()...)
+				// The row was written by a foreign process (`crush sessions
+				// inject`), so its Create() never published through THIS
+				// process's message broker. If a web UI happens to be
+				// attached to this process for the session, Notify pushes
+				// the already-persisted message so it renders live instead
+				// of waiting for a page reload.
+				a.messages.Notify(injMsg)
 			}
 
 			// Sliding-window context management: when the context is nearly

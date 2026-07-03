@@ -133,6 +133,15 @@ const (
 	streamStalledFinishTitle = "Stream stalled"
 )
 
+// interruptInjectTick is how often the interrupt-inject ticker polls
+// pending_injects for interrupt=true rows during an active turn. 3s is a
+// deliberate middle ground: fast enough that `crush sessions inject
+// --interrupt` feels near-immediate to an operator (worst case one tick of
+// latency), slow enough that the extra SELECT is negligible even across a
+// long multi-step turn. The ticker only lives for the duration of a turn (see
+// startInterruptTicker), so there is no idle-process polling.
+const interruptInjectTick = 3 * time.Second
+
 // maxConsecutiveAutoResumes bounds Phase 4 autonomous idle-resumes per session
 // without human involvement (reset by any human message). Anti-runaway: an
 // agent that keeps backgrounding self-completing jobs cannot loop forever.
@@ -533,6 +542,17 @@ func (c *coordinator) runInternal(ctx context.Context, sessionID string, prompt 
 			MaxTokens:            maxTokensRunLimit,
 		})
 	}
+	// Interrupt-inject ticker: watches pending_injects for interrupt=true rows
+	// written by `crush sessions inject --interrupt` in another process, and
+	// (on the first hit) cancels the running turn and requeues the referenced
+	// message so it picks up immediately. Bound to this turn's lifetime via
+	// tickerCtx — stopped by the defer as soon as run() returns, so no
+	// idle-process polling. Runs for BOTH the initial turn and every retry
+	// re-run below (each run() sees a fresh ticker via this closure).
+	tickerCtx, stopTicker := context.WithCancel(ctx)
+	defer stopTicker()
+	c.startInterruptTicker(tickerCtx, sessionID)
+
 	beforeLoaded := c.skillTracker.LoadedNames()
 	var result *fantasy.AgentResult
 	originalErr := c.runWithUnauthorizedRetry(ctx, providerCfg, func() error {
@@ -1616,6 +1636,87 @@ func (c *coordinator) CancelAll() {
 
 func (c *coordinator) ClearQueue(sessionID string) {
 	c.currentAgent.ClearQueue(sessionID)
+}
+
+// startInterruptTicker launches a goroutine that polls pending_injects for an
+// interrupt=true row for sessionID every interruptInjectTick, for as long as
+// ctx is live (i.e. the duration of the owning turn). On the first interrupt
+// row it consumes it, requeues the already-persisted message via
+// requeueInterruptMessage, and returns — one interrupt event maps to exactly
+// one cancel+requeue; the turn restarts with that message and, if a new
+// interrupt arrives, the fresh turn's ticker handles it. The goroutine also
+// exits when ctx is cancelled (turn finished/aborted), so it never outlives
+// the turn.
+func (c *coordinator) startInterruptTicker(ctx context.Context, sessionID string) {
+	go func() {
+		ticker := time.NewTicker(interruptInjectTick)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				fired, err := c.handleInterruptTick(ctx, sessionID)
+				if err != nil {
+					slog.Warn("coordinator: interrupt-inject tick failed",
+						"session_id", sessionID, "err", err)
+					continue
+				}
+				if fired {
+					return
+				}
+			}
+		}
+	}()
+}
+
+// handleInterruptTick performs one poll of the interrupt-inject queue. It
+// returns fired=true when it consumed an interrupt row and issued a
+// cancel+requeue (the caller then stops ticking). Extracted from the ticker
+// goroutine so it can be unit-tested directly with a real session.Service and
+// message.Service, without a live provider. It is a no-op returning
+// (false, nil) when no interrupt row is pending.
+func (c *coordinator) handleInterruptTick(ctx context.Context, sessionID string) (bool, error) {
+	pi, err := c.sessions.ConsumeInterruptInject(ctx, sessionID)
+	if err != nil {
+		return false, err
+	}
+	if pi == nil {
+		return false, nil
+	}
+	if err := c.requeueInterruptMessage(ctx, sessionID, pi.MessageID); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// requeueInterruptMessage loads the already-persisted user message referenced
+// by messageID, queues a call that points at it (ExistingMessageID set, so the
+// agent splices it in WITHOUT creating a duplicate row), and cancels the
+// running turn — mirroring InterruptAndSend's cancel+requeue but for a message
+// the CLI already created. Notify is called so a web UI attached to THIS
+// process renders the foreign-created message live rather than on reload.
+func (c *coordinator) requeueInterruptMessage(ctx context.Context, sessionID, messageID string) error {
+	injMsg, err := c.messages.Get(ctx, messageID)
+	if err != nil {
+		return fmt.Errorf("interrupt inject references missing message %q: %w", messageID, err)
+	}
+
+	call, err := c.buildCall(ctx, sessionID, injMsg.FullText(), nil)
+	if err != nil {
+		return err
+	}
+	// Reference the existing row; the agent must not re-create it.
+	call.ExistingMessageID = messageID
+	c.currentAgent.QueueMessage(call)
+	c.currentAgent.Cancel(sessionID)
+
+	// The row was created by a foreign process (`crush sessions inject`), so
+	// its Create() never published through this process's message broker.
+	// Notify pushes the already-persisted message so an attached web UI
+	// renders it live. Idempotent — a redundant Notify does not harm the UI.
+	c.messages.Notify(injMsg)
+	return nil
 }
 
 // InterruptAndSend queues a user message and cancels the running turn.

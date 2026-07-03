@@ -155,6 +155,18 @@ func (m *mockSessionService) ListAll(context.Context) ([]session.Session, error)
 	return m.sessions, nil
 }
 
+func (m *mockSessionService) CreatePendingInject(context.Context, session.PendingInject) error {
+	return nil
+}
+
+func (m *mockSessionService) DrainPendingInjects(context.Context, string) ([]session.PendingInject, bool, error) {
+	return nil, false, nil
+}
+
+func (m *mockSessionService) ConsumeInterruptInject(context.Context, string) (*session.PendingInject, error) {
+	return nil, nil
+}
+
 func newTestApp(sessions session.Service) *App {
 	return &App{Sessions: sessions}
 }

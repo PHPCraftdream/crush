@@ -125,6 +125,15 @@ func newTestDB(t *testing.T) (*sql.DB, *db.Queries) {
 		);
 
 		CREATE INDEX idx_messages_session_id ON messages(session_id);
+
+		CREATE TABLE pending_injects (
+			id TEXT PRIMARY KEY,
+			session_id TEXT NOT NULL,
+			message_id TEXT NOT NULL,
+			content TEXT NOT NULL DEFAULT '',
+			interrupt INTEGER NOT NULL DEFAULT 0,
+			created_at INTEGER NOT NULL
+		);
 	`)
 	require.NoError(t, err)
 
