@@ -5,10 +5,27 @@
 // PATH with the freshly built artifact. Verifies by running the new
 // binary's --version.
 //
+// If NO crush exists on PATH yet, this is a first install: the binary
+// goes to the standard per-user location for the OS and the directory
+// is made reachable from the command line —
+//   Windows:      %LOCALAPPDATA%\Programs\crush\crush.exe
+//                 (dir appended to the user PATH via the registry;
+//                 new terminals pick it up, current ones need restart)
+//   Linux/macOS:  ~/.local/bin/crush
+//                 (already on PATH in most distros; if not, a ready
+//                 export line is printed — shell rc files are never
+//                 edited automatically)
+//
 // Usage:   go run deploy.go
 // On Windows the kill uses taskkill /F /IM crush.exe; on Unix it uses
 // pkill -f crush (graceful first, then -9 if anything is still around).
 // Override the destination path with CRUSH_DEPLOY_PATH=...
+//
+// The decision logic behind path/PATH handling (install location,
+// PATH-membership checks, executable-vs-shim detection, cwd-excluding
+// PATH lookup) lives in internal/deploy so it is unit-tested by
+// `go test ./...` on every OS in CI, even though this file itself is
+// go:build ignore and only ever runs via `go run`.
 
 package main
 
@@ -22,6 +39,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/charmbracelet/crush/internal/deploy"
 )
 
 func step(msg string, args ...any) { fmt.Printf("→ "+msg+"\n", args...) }
@@ -72,12 +91,24 @@ func main() {
 	//    can pick either depending on the order of npm-dir vs other
 	//    entries. Deploying to both stops "crush --version is fresh but
 	//    crush claude-init says Unknown flag --replace" puzzles.
+	//
+	//    If nothing is found, this is a FIRST INSTALL: fall back to the
+	//    standard per-user location for the OS and make sure it is
+	//    reachable from the command line (see ensureOnPath).
+	freshInstall := false
 	dsts, err := resolveDests()
 	if err != nil {
-		fatal("could not determine deploy destination: %v\n  set CRUSH_DEPLOY_PATH=/full/path/to/crush(.exe) to force one", err)
+		dst, derr := deploy.DefaultInstallPath()
+		if derr != nil {
+			fatal("could not determine an install location: %v", derr)
+		}
+		warn("no existing crush found to replace: %v", err)
+		step("First install → standard per-user location: %s", dst)
+		dsts = []string{dst}
+		freshInstall = true
 	}
 	for _, dst := range dsts {
-		if sameFile(src, dst) {
+		if deploy.SameFile(src, dst) {
 			fatal("source and destination are the same file (%s) — nothing to replace", dst)
 		}
 	}
@@ -110,6 +141,60 @@ func main() {
 			warn("--version probe failed for %s (may be fine for non-exe shim): %v", dst, err)
 		}
 	}
+
+	// 6. First install only: make sure the install dir is reachable from
+	//    the command line on this OS.
+	if freshInstall {
+		ensureOnPath(filepath.Dir(dsts[0]))
+	}
+}
+
+// ensureOnPath makes `dir` reachable from the command line.
+//
+// Windows: appends dir to the USER Path in the registry via
+// PowerShell's [Environment]::SetEnvironmentVariable — deliberately NOT
+// `setx`, which silently truncates values longer than 1024 chars and
+// has destroyed many a PATH. Only new terminals see the change; the
+// current one keeps its inherited copy.
+//
+// Unix: never edits shell rc files (too many shells, too invasive).
+// If dir is already in $PATH there is nothing to do; otherwise print a
+// ready-to-paste export line and name the usual rc file.
+//
+// The PATH-membership check and the updated-PATH-string construction
+// are pure functions in internal/deploy (unit-tested); only the actual
+// registry read/write and env inspection stay here as thin, untested
+// side effects.
+func ensureOnPath(dir string) {
+	if runtime.GOOS == "windows" {
+		out, okRun := runQuiet("powershell", "-NoProfile", "-Command",
+			"[Environment]::GetEnvironmentVariable('Path','User')")
+		if !okRun {
+			warn("could not read the user PATH: %s\n  add %s to PATH manually", strings.TrimSpace(out), dir)
+			return
+		}
+		current := strings.TrimSpace(out)
+		if deploy.PathListContains(current, dir) {
+			ok("%s is already on the user PATH", dir)
+			return
+		}
+		updated := deploy.AppendToPathList(current, dir)
+		// Single-quote for PowerShell; ' inside is doubled per PS rules.
+		psQuoted := "'" + strings.ReplaceAll(updated, "'", "''") + "'"
+		if out, okRun := runQuiet("powershell", "-NoProfile", "-Command",
+			"[Environment]::SetEnvironmentVariable('Path', "+psQuoted+", 'User')"); !okRun {
+			warn("failed to append %s to the user PATH: %s\n  add it manually (System Properties → Environment Variables)", dir, strings.TrimSpace(out))
+			return
+		}
+		ok("Added %s to the user PATH — restart the terminal to pick it up", dir)
+		return
+	}
+
+	if deploy.PathListContains(os.Getenv("PATH"), dir) {
+		ok("%s is already on PATH", dir)
+		return
+	}
+	warn("%s is not on PATH. Add this line to your shell rc (~/.profile, ~/.bashrc or ~/.zshrc):\n    export PATH=\"$PATH:%s\"", dir, dir)
 }
 
 func binaryName() string {
@@ -150,7 +235,17 @@ func resolveDests() ([]string, error) {
 	// wrong for us — we WANT the OTHER crush on PATH (the npm-installed
 	// or system one), not the local build artifact. Walk PATH ourselves,
 	// skipping anything that resolves to cwd.
-	p, err := lookPathExcludingCwd("crush")
+	cwd, err := os.Getwd()
+	if err != nil {
+		return nil, fmt.Errorf("getwd: %w", err)
+	}
+	var exts []string
+	if runtime.GOOS == "windows" {
+		exts = deploy.WindowsPathExts(os.Getenv("PATHEXT"))
+	} else {
+		exts = []string{""}
+	}
+	p, err := deploy.LookPathExcludingCwd("crush", cwd, os.Getenv("PATH"), exts)
 	if err != nil {
 		return nil, err
 	}
@@ -175,7 +270,7 @@ func resolveDests() ([]string, error) {
 	// executable (not a script/shim). On Windows that means .exe; on
 	// Unix it means no extension and an executable mode bit. We add
 	// only if not already covered.
-	if isReplaceableExe(p) {
+	if deploy.IsReplaceableExe(p) {
 		cands = append(cands, p)
 	}
 
@@ -199,105 +294,6 @@ func resolveDests() ([]string, error) {
 		return nil, fmt.Errorf("LookPath returned %s but no replaceable binary was found around it", p)
 	}
 	return out, nil
-}
-
-// lookPathExcludingCwd walks $PATH manually and returns the first
-// `name` executable found in a directory that is NOT the current
-// working directory. Mirrors exec.LookPath's semantics (uses PATHEXT
-// on Windows, the exec bit on Unix) but treats the cwd entry as
-// invisible so the local build artifact in `D:\dev\go\crush\c` cannot
-// be picked when we run `go run deploy.go` from there.
-//
-// Returns a helpful error message that names what was already
-// discarded — saves the operator from "why isn't it finding crush"
-// confusion when only the local copy exists.
-func lookPathExcludingCwd(name string) (string, error) {
-	cwd, err := os.Getwd()
-	if err != nil {
-		return "", fmt.Errorf("getwd: %w", err)
-	}
-	cwdAbs, _ := filepath.Abs(cwd)
-
-	var exts []string
-	if runtime.GOOS == "windows" {
-		if pathext := os.Getenv("PATHEXT"); pathext != "" {
-			for _, e := range filepath.SplitList(pathext) {
-				exts = append(exts, strings.ToLower(strings.TrimSpace(e)))
-			}
-		} else {
-			exts = []string{".exe", ".cmd", ".bat", ".com"}
-		}
-	} else {
-		exts = []string{""}
-	}
-
-	skippedCwdHit := ""
-	for _, dir := range filepath.SplitList(os.Getenv("PATH")) {
-		if dir == "" {
-			// On Windows an empty PATH entry historically meant cwd —
-			// skip it for the same reason exec.LookPath does.
-			continue
-		}
-		absDir, derr := filepath.Abs(dir)
-		if derr == nil && strings.EqualFold(absDir, cwdAbs) {
-			// Record what we'd have picked here so the error names it.
-			for _, ext := range exts {
-				cand := filepath.Join(dir, name+ext)
-				if fi, err := os.Stat(cand); err == nil && !fi.IsDir() {
-					skippedCwdHit = cand
-					break
-				}
-			}
-			continue
-		}
-		for _, ext := range exts {
-			cand := filepath.Join(dir, name+ext)
-			fi, err := os.Stat(cand)
-			if err != nil || fi.IsDir() {
-				continue
-			}
-			if runtime.GOOS != "windows" && fi.Mode()&0o111 == 0 {
-				continue
-			}
-			return cand, nil
-		}
-	}
-	if skippedCwdHit != "" {
-		return "", fmt.Errorf("only candidate found was %s (in current directory — deploy.go refuses to overwrite the just-built artifact with itself). Install crush via npm/winget first, or set CRUSH_DEPLOY_PATH=/full/path/to/crush.exe", skippedCwdHit)
-	}
-	return "", fmt.Errorf("%s not found on PATH (excluding current directory)", name)
-}
-
-// isReplaceableExe reports whether p is a native executable we should
-// overwrite — not a .cmd/.ps1/POSIX shim. On Windows that means a .exe
-// extension; on Unix it means an executable mode bit and no extension
-// that screams "script".
-func isReplaceableExe(p string) bool {
-	ext := strings.ToLower(filepath.Ext(p))
-	if runtime.GOOS == "windows" {
-		return ext == ".exe"
-	}
-	switch ext {
-	case ".sh", ".bash", ".py", ".js", ".cjs", ".mjs":
-		return false
-	}
-	fi, err := os.Stat(p)
-	if err != nil {
-		return false
-	}
-	return fi.Mode()&0o111 != 0
-}
-
-func sameFile(a, b string) bool {
-	ai, err := os.Stat(a)
-	if err != nil {
-		return false
-	}
-	bi, err := os.Stat(b)
-	if err != nil {
-		return false
-	}
-	return os.SameFile(ai, bi)
 }
 
 func killAllCrush() {
