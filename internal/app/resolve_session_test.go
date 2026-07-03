@@ -129,10 +129,6 @@ func (m *mockSessionService) IsAgentToolSession(sessionID string) bool {
 	return ok
 }
 
-func (m *mockSessionService) SetYolo(context.Context, string, bool) error {
-	return nil
-}
-
 func (m *mockSessionService) UpdateModels(context.Context, string, string, string, string, string) error {
 	return nil
 }

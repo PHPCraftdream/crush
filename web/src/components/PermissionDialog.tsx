@@ -1,9 +1,8 @@
 import { createPortal } from "react-dom";
 import { useStore } from "@nanostores/react";
-import { $permissions, $activeSessionID, removePermission, setYolo } from "../store";
+import { $permissions, removePermission } from "../store";
 import { ws } from "../ws";
 import type { PermissionRequest } from "../types";
-import { Zap } from "lucide-react";
 
 export function PermissionDialog() {
   const permissions = useStore($permissions);
@@ -26,8 +25,6 @@ export function PermissionDialog() {
 }
 
 function PermissionCard({ perm }: { perm: PermissionRequest }) {
-  const activeSessionID = useStore($activeSessionID);
-
   function grant(persistent: boolean) {
     ws.send(persistent ? "grant_permission_persistent" : "grant_permission", {
       permissionID: perm.ID,
@@ -38,14 +35,6 @@ function PermissionCard({ perm }: { perm: PermissionRequest }) {
   function deny() {
     ws.send("deny_permission", { permissionID: perm.ID });
     removePermission(perm.ToolCallID);
-  }
-
-  function goYolo() {
-    // Enable yolo for this session — grants current request and auto-approves all future ones
-    if (activeSessionID) {
-      setYolo(activeSessionID, true);
-    }
-    grant(false);
   }
 
   return (
@@ -83,15 +72,6 @@ function PermissionCard({ perm }: { perm: PermissionRequest }) {
           data-test-id="permission-allow-always"
         >
           Allow always
-        </button>
-        <button
-          onClick={goYolo}
-          className="flex items-center gap-1.5 bg-yellow/20 border border-yellow/40 text-yellow font-semibold rounded px-3 py-1 text-sm hover:bg-yellow/30 transition-colors"
-          title="Enable Yolo mode — all future permissions auto-approved"
-          data-test-id="permission-yolo"
-        >
-          <Zap size={13} />
-          Yolo
         </button>
       </div>
     </div>

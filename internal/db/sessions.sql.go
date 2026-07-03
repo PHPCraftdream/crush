@@ -347,23 +347,6 @@ func (q *Queries) RenameSession(ctx context.Context, arg RenameSessionParams) er
 	return err
 }
 
-const setSessionYolo = `-- name: SetSessionYolo :exec
-UPDATE sessions
-SET yolo_enabled = ?,
-    updated_at = strftime('%s', 'now')
-WHERE id = ?
-`
-
-type SetSessionYoloParams struct {
-	YoloEnabled int64  `json:"yolo_enabled"`
-	ID          string `json:"id"`
-}
-
-func (q *Queries) SetSessionYolo(ctx context.Context, arg SetSessionYoloParams) error {
-	_, err := q.exec(ctx, q.setSessionYoloStmt, setSessionYolo, arg.YoloEnabled, arg.ID)
-	return err
-}
-
 const updateSession = `-- name: UpdateSession :one
 UPDATE sessions
 SET

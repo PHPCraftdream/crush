@@ -43,7 +43,7 @@ the orchestrator-facing CLI is first-class.
 | Front-end | Bubble Tea TUI (~495 files under `internal/ui/`) | React/Tailwind SPA in `web/`, embedded via `go:embed`. Optional. |
 | Transport | REST `/v1/...` over Unix socket / Windows named pipe | WebSocket `/ws` over TCP loopback (single embedded server) |
 | Auth | None (local-socket trust) | Token-based, see `internal/server/auth.go` |
-| Sessions | One model per agent role, set globally | Per-session model overrides + per-session system prompt + per-session YOLO flag, all persisted in SQLite |
+| Sessions | One model per agent role, set globally | Per-session model overrides + per-session system prompt, all persisted in SQLite |
 | Permissions | In-memory rules during a TUI run | Persistent per-session rules in SQLite; cross-process visible |
 | Parallel runs | Not a target | First-class — flock per session, OS-level lock release on crash, atomic file writes, additive cost SQL, MCP-id flock |
 | `crush run` | Single-shot quick fire | Wrapper-friendly: `--role`, `--session` get-or-create, `--json`/`--format`/`--agents`/`--timeout`/`--stream`, JSON-envelope validation, `assistant_notes`, fallback error messages |
@@ -754,9 +754,6 @@ permissions. Use this with care.
   }
 }
 ```
-
-You can also skip all permission prompts entirely by running Crush with the
-`--yolo` flag. Be very, very careful with this feature.
 
 ### Disabling Built-In Tools
 

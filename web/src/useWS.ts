@@ -5,7 +5,6 @@ import {
   $config,
   $mcpState,
   $agentError,
-  $yolo,
   $sessions,
   $activeSessionID,
   $busySessions,
@@ -97,7 +96,7 @@ export function useWS() {
 
       ws.on("session_created", (msg: WSMessage) => {
         const s = msg.payload as Session;
-        console.log("[useWS] session_created:", s.ID, "ParentSessionID:", s.ParentSessionID, "YoloEnabled:", s.YoloEnabled);
+        console.log("[useWS] session_created:", s.ID, "ParentSessionID:", s.ParentSessionID);
         upsertSession(s);
         if (s.ParentSessionID) {
           registerSubAgentSession(s.ID, s.ParentSessionID);
@@ -110,11 +109,6 @@ export function useWS() {
       ws.on("session_updated", (msg: WSMessage) => {
         const session = msg.payload as Session;
         upsertSession(session);
-        // Sync YOLO state from backend when active session is updated
-        if ($activeSessionID.get() === session.ID && session.YoloEnabled !== undefined) {
-          console.log("[useWS] session_updated for active session, YoloEnabled:", session.YoloEnabled, "current yolo:", $yolo.get());
-          $yolo.set(session.YoloEnabled);
-        }
       }),
       ws.on("session_deleted", (msg: WSMessage) => {
         const id = (msg.payload as { ID: string }).ID;
@@ -160,10 +154,6 @@ export function useWS() {
           if (session) {
             if (activeID !== hashID) {
               setActiveSession(hashID);
-              // Sync YOLO state from backend
-              if (session.YoloEnabled !== undefined) {
-                $yolo.set(session.YoloEnabled);
-              }
               ws.send("load_messages", { sessionID: hashID });
             }
             return;
@@ -174,10 +164,6 @@ export function useWS() {
         const latest = sessions.find((s) => !s.ParentSessionID);
         if (latest && activeID !== latest.ID) {
           setActiveSession(latest.ID);
-          // Sync YOLO state from backend
-          if (latest.YoloEnabled !== undefined) {
-            $yolo.set(latest.YoloEnabled);
-          }
           ws.send("load_messages", { sessionID: latest.ID });
         }
       }),
@@ -249,13 +235,6 @@ export function useWS() {
         const p = msg.payload as PermissionRequest;
         // Only process permissions for the active session
         if (p.SessionID !== $activeSessionID.get()) return;
-        // If yolo is active — auto-grant immediately on the client side without
-        // showing the dialog. This is race-free: the server's skip flag might not
-        // be set yet when the next request arrives, but we handle it here.
-        if ($yolo.get()) {
-          ws.send("grant_permission", { permissionID: p.ID });
-          return;
-        }
         addPermission(p);
       }),
       ws.on("permission_notification", (msg: WSMessage) =>
@@ -295,7 +274,6 @@ export function useWS() {
       ws.on("config", (msg: WSMessage) => {
         const cfg = msg.payload as ConfigPayload;
         $config.set(cfg);
-        // Note: YOLO is now managed per-session, not globally via config
         // Apply theme from server (backend is source of truth)
         if (cfg.theme) {
           applyTheme(cfg.theme);

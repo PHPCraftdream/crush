@@ -83,8 +83,6 @@ func handleIncoming(ctx context.Context, a *appPkg.App, c *Client, raw []byte) {
 		go handleRenameSession(ctx, a, c, msg)
 	case CmdSetSessionModels:
 		go handleSetSessionModels(ctx, a, c, msg)
-	case CmdSetYolo:
-		go handleSetYolo(a, c, msg)
 	case CmdRemoveRecentModel:
 		go handleRemoveRecentModel(a, c, msg)
 	case CmdTrackModelUsage:
@@ -506,32 +504,6 @@ func handleTrackModelUsage(a *appPkg.App, c *Client, msg WSMessage) {
 	if wire, ok := buildConfigWire(a); ok {
 		c.hub.Broadcast(EventConfig, wire)
 	}
-	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
-}
-
-func handleSetYolo(a *appPkg.App, c *Client, msg WSMessage) {
-	var p SetYoloPayload
-	if err := json.Unmarshal(msg.Payload, &p); err != nil {
-		slog.Error("handleSetYolo: invalid payload", "err", err, "payload", string(msg.Payload))
-		c.reply(msg.ID, EventError, nil, "invalid payload")
-		return
-	}
-
-	slog.Info("handleSetYolo: received", "sessionID", p.SessionID, "enabled", p.Enabled)
-
-	// Set session-specific YOLO mode in database.
-	if p.SessionID != "" {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := a.Sessions.SetYolo(ctx, p.SessionID, p.Enabled); err != nil {
-			slog.Error("handleSetYolo: failed to set session YOLO", "err", err)
-		}
-	} else {
-		slog.Warn("handleSetYolo: empty sessionID")
-	}
-
-	// Also set global skip flag for backwards compatibility.
-	a.Permissions.SetSkipRequests(p.Enabled)
 	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
 }
 
@@ -965,7 +937,6 @@ func buildConfigWire(a *appPkg.App) (ConfigWire, bool) {
 		}
 	}
 
-	wire.Yolo = a.Permissions.SkipRequests()
 	wire.Debug = cfg.Options.Debug
 	if cfg.Options != nil {
 		wire.ContextPaths = cfg.Options.ContextPaths

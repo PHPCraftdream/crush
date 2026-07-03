@@ -1,15 +1,13 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
 import { useStore } from "@nanostores/react";
-import { Minimize2, Zap, ShieldOff, X, CheckCheck, ScrollText, Plug, Sun, Moon, Settings, ServerCog, FileText, Headphones, Eye, ChevronsDownUp } from "lucide-react";
+import { Minimize2, X, CheckCheck, ScrollText, Plug, Sun, Moon, Settings, ServerCog, FileText, Headphones, Eye, ChevronsDownUp } from "lucide-react";
 import { $sitter, stopSitter } from "../sitter";
 import {
   $sessions,
   $activeSessionID,
   $busySessions,
   $summarizeQueued,
-  $yolo,
   $config,
-  setYolo,
   summarizeSession,
   cancelQueuedSummarize,
   setTheme,
@@ -133,7 +131,6 @@ export function ChatToolbar() {
   const activeSessionID = useStore($activeSessionID);
   const busySessions = useStore($busySessions);
   const summarizeQueued = useStore($summarizeQueued);
-  const yolo = useStore($yolo);
   const config = useStore($config);
   const sitter = useStore($sitter);
 
@@ -390,18 +387,6 @@ export function ChatToolbar() {
         {/* RIGHT cluster */}
         <ModelSelector session={activeSession} modelType="large" />
         <ModelSelector session={activeSession} modelType="small" />
-
-        <div className="w-px h-4 bg-surface/50 mx-1 shrink-0" />
-
-        <button
-          onClick={() => activeSessionID && setYolo(activeSessionID, !yolo)}
-          title={yolo ? "Yolo ON — all permissions auto-approved" : "Yolo OFF — tool calls require approval"}
-          data-test-id="yolo-button"
-          className={`btn-toolbar ${yolo ? "bg-yellow/10 border-yellow/30 text-yellow hover:bg-yellow/20" : ""}`}
-        >
-          {yolo ? <Zap size={13} /> : <ShieldOff size={13} />}
-          Yolo
-        </button>
       </div>
 
       {/* Modal hosts */}

@@ -125,12 +125,6 @@ WHERE id = ?;
 DELETE FROM sessions
 WHERE id = ?;
 
--- name: SetSessionYolo :exec
-UPDATE sessions
-SET yolo_enabled = ?,
-    updated_at = strftime('%s', 'now')
-WHERE id = ?;
-
 -- name: UpdateSessionSystemPrompt :exec
 UPDATE sessions
 SET

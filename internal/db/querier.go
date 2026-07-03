@@ -67,7 +67,6 @@ type Querier interface {
 	MatchSessionPermission(ctx context.Context, arg MatchSessionPermissionParams) (string, error)
 	RecordFileRead(ctx context.Context, arg RecordFileReadParams) error
 	RenameSession(ctx context.Context, arg RenameSessionParams) error
-	SetSessionYolo(ctx context.Context, arg SetSessionYoloParams) error
 	UpdateMessage(ctx context.Context, arg UpdateMessageParams) error
 	UpdateMessagePinned(ctx context.Context, arg UpdateMessagePinnedParams) error
 	UpdatePermissionEnabled(ctx context.Context, arg UpdatePermissionEnabledParams) error

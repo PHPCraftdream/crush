@@ -38,7 +38,6 @@ func init() {
 	rootCmd.PersistentFlags().StringP("data-dir", "D", "", "Override the .crush/ data directory (sessions DB, logs, attachments). Defaults to <cwd>/.crush.")
 	rootCmd.PersistentFlags().BoolP("debug", "d", false, "Debug")
 	rootCmd.Flags().BoolP("help", "h", false, "Help")
-	rootCmd.Flags().BoolP("yolo", "y", false, "Auto-approve every permission request (dangerous)")
 	rootCmd.Flags().StringP("host", "H", "localhost", "Host to bind the web UI to")
 	rootCmd.Flags().IntP("port", "p", 0, "Port to bind the web UI to (0 = pick a free one)")
 	rootCmd.Flags().Bool("no-open", false, "Do not open the browser after the server starts")
@@ -88,9 +87,6 @@ crush --host 0.0.0.0 --port 9000
 
 # Start the server without opening the browser (useful for IDE integrations)
 crush --no-open --port 8080
-
-# Auto-approve every permission request — only use in a disposable workspace
-crush --yolo
 
 # Run with debug logging from a specific working directory
 crush --debug --cwd /path/to/project
@@ -192,7 +188,6 @@ func Execute() {
 // It returns the app instance, config, cleanup function, and any error.
 func setupApp(cmd *cobra.Command) (*app.App, error) {
 	debug, _ := cmd.Flags().GetBool("debug")
-	yolo, _ := cmd.Flags().GetBool("yolo")
 	dataDir, _ := cmd.Flags().GetString("data-dir")
 	ctx := cmd.Context()
 
@@ -207,11 +202,6 @@ func setupApp(cmd *cobra.Command) (*app.App, error) {
 	}
 
 	cfg := store.Config()
-	if cfg.Permissions == nil {
-		cfg.Permissions = &config.Permissions{}
-	}
-	cfg.Permissions.SkipRequests = yolo
-
 	if err := createDotCrushDir(cfg.Options.DataDirectory); err != nil {
 		return nil, err
 	}

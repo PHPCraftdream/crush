@@ -277,7 +277,6 @@ type MCPSnapshot struct {
 }
 
 const (
-	CmdSetYolo           = "set_yolo"
 	CmdSetProviderKey    = "set_provider_key"
 	CmdRemoveProviderKey = "remove_provider_key"
 	CmdLogClientEvent    = "log_client_event"
@@ -349,11 +348,6 @@ type TrackModelUsagePayload struct {
 	Model     string `json:"model"`
 }
 
-type SetYoloPayload struct {
-	SessionID string `json:"sessionID"`
-	Enabled   bool   `json:"enabled"`
-}
-
 type SetProviderKeyPayload struct {
 	ProviderID string `json:"providerID"`
 	APIKey     string `json:"apiKey"`
@@ -399,7 +393,6 @@ type UpdateMessageThinkingPayload struct {
 type ConfigWire struct {
 	Models            map[string]ModelEntryWire `json:"models"`
 	Providers         map[string]ProviderWire   `json:"providers"`
-	Yolo              bool                      `json:"yolo"`
 	Debug             bool                      `json:"debug"`
 	DebugLSP          bool                      `json:"debugLsp"`
 	Theme             string                    `json:"theme"`

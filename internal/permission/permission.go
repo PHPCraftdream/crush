@@ -242,18 +242,6 @@ func (s *permissionService) Request(ctx context.Context, opts CreatePermissionRe
 		return true, nil
 	}
 
-	// Check session-specific YOLO mode in database.
-	if s.q != nil {
-		session, err := s.q.GetSessionByID(ctx, opts.SessionID)
-		if err == nil && session.YoloEnabled != 0 {
-			s.notificationBroker.Publish(pubsub.CreatedEvent, PermissionNotification{
-				ToolCallID: opts.ToolCallID,
-				Granted:    true,
-			})
-			return true, nil
-		}
-	}
-
 	fileInfo, err := os.Stat(opts.Path)
 	dir := opts.Path
 	if err == nil {

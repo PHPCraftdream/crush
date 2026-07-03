@@ -112,13 +112,3 @@ export async function switchToSession(page: Page, title: string): Promise<void> 
   await page.waitForTimeout(500);
   console.log("[E2E] Switched to session:", title);
 }
-
-/**
- * Open permissions modal
- */
-export async function openPermissionsModal(page: Page): Promise<void> {
-  const yoloBtn = page.locator("button.btn-toolbar").filter({ hasText: /^Yolo$/ });
-  await yoloBtn.click();
-  await page.expect(page.getByText("YOLO Mode")).toBeVisible({ timeout: 3000 });
-  console.log("[E2E] Opened permissions modal");
-}
