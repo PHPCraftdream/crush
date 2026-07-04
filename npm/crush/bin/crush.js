@@ -1,19 +1,16 @@
 #!/usr/bin/env node
 'use strict';
 
-// Minimal platform-binary launcher for the @CRUSH_FORK_SCOPE/crush npm
+// Minimal platform-binary launcher for the @phpcraftdream/crush npm
 // package. Zero dependencies — Node builtins only. It resolves the
 // prebuilt binary shipped by the matching optional platform package, then
 // re-execs it with argv passthrough (spawnSync, argv array, never shell).
-//
-// Maintainer note: @CRUSH_FORK_SCOPE is a literal placeholder. Find-and-
-// replace it with the real npm scope before publishing.
 
 const { spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
 
-const SCOPE = '@CRUSH_FORK_SCOPE';
+const SCOPE = '@phpcraftdream';
 const platform = process.platform + '-' + process.arch;
 const pkgName = SCOPE + '/crush-' + platform;
 const binName = process.platform === 'win32' ? 'crush.exe' : 'crush';

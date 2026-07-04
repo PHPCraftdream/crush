@@ -1,4 +1,4 @@
-# `@CRUSH_FORK_SCOPE/crush`
+# `@phpcraftdream/crush`
 
 **Unofficial npm distribution of [crush](https://github.com/charmbracelet/crush),
 maintained as a fork. Not published by Charmbracelet.**
@@ -11,7 +11,7 @@ for your OS/arch is pulled in automatically as an npm optional dependency
 ## Install
 
 ```sh
-npm install -g @CRUSH_FORK_SCOPE/crush
+npm install -g @phpcraftdream/crush
 ```
 
 Then run:
@@ -25,22 +25,19 @@ crush
 
 | npm package                         | OS      | Arch |
 | ----------------------------------- | ------- | ---- |
-| `@CRUSH_FORK_SCOPE/crush-linux-x64`   | Linux   | x64  |
-| `@CRUSH_FORK_SCOPE/crush-linux-arm64` | Linux   | arm64 |
-| `@CRUSH_FORK_SCOPE/crush-darwin-x64`  | macOS   | x64  |
-| `@CRUSH_FORK_SCOPE/crush-darwin-arm64`| macOS   | arm64 (Apple Silicon) |
-| `@CRUSH_FORK_SCOPE/crush-win32-x64`   | Windows | x64  |
+| `@phpcraftdream/crush-linux-x64`   | Linux   | x64  |
+| `@phpcraftdream/crush-linux-arm64` | Linux   | arm64 |
+| `@phpcraftdream/crush-darwin-x64`  | macOS   | x64  |
+| `@phpcraftdream/crush-darwin-arm64`| macOS   | arm64 (Apple Silicon) |
+| `@phpcraftdream/crush-win32-x64`   | Windows | x64  |
 
 The launcher (`bin/crush.js`) resolves the matching package and execs its
 binary with argv passthrough. If your platform has no package, it exits with
 a clear message.
 
-## Scope placeholder
+## Scope
 
-`@CRUSH_FORK_SCOPE` is a literal placeholder. Before the first publish the
-maintainer replaces it (everywhere under `npm/` and in the workflow) with the
-real npm scope. A single find-and-replace covers package names, the launcher's
-`require.resolve`, and the meta package's `optionalDependencies`.
+Packages publish under the `@phpcraftdream` npm scope.
 
 ## Licensing & redistribution
 

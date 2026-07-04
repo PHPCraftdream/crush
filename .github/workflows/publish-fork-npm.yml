@@ -14,9 +14,8 @@
 # intentionally no way to flip this from the Actions UI. If you need a real
 # publish, push a tag — that is the only path.
 #
-# The only secret required is NPM_TOKEN. `@CRUSH_FORK_SCOPE` is a literal
-# placeholder: find-and-replace it (here and under npm/) with your own npm
-# scope before the first real publish.
+# The only secret required is NPM_TOKEN. Packages publish under the
+# @phpcraftdream npm scope.
 name: publish-fork-npm
 
 on:
@@ -40,7 +39,7 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     env:
-      SCOPE: "@CRUSH_FORK_SCOPE"
+      SCOPE: "@phpcraftdream"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
