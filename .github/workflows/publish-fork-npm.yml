@@ -1,0 +1,186 @@
+# Opt-in, Go-free npm distribution for this fork.
+#
+# This workflow is self-contained and does NOT touch the upstream goreleaser
+# config or any other workflow. It builds prebuilt crush binaries and publishes
+# them to npm using the esbuild-style optional-dependency layout in npm/, so a
+# user can `npm i -g <scope>/crush` with no Go and no pnpm.
+#
+# A REAL (non-dry-run) publish can ONLY happen as the direct result of a `v*`
+# tag push — this is a hard invariant, not a default. `workflow_dispatch` is
+# for exercising the pipeline only (web build, cross-compile, package
+# assembly, `npm publish --dry-run`); it can NEVER perform a real publish,
+# regardless of any input, because DRY_RUN below is derived solely from
+# `github.event_name` and ignores anything a manual run could set. There is
+# intentionally no way to flip this from the Actions UI. If you need a real
+# publish, push a tag — that is the only path.
+#
+# The only secret required is NPM_TOKEN. `@CRUSH_FORK_SCOPE` is a literal
+# placeholder: find-and-replace it (here and under npm/) with your own npm
+# scope before the first real publish.
+name: publish-fork-npm
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Version tag to build for a dry-run pipeline test, e.g. v1.2.3. This can NEVER trigger a real publish — see the file header."
+        required: true
+
+concurrency:
+  group: publish-fork-npm-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      SCOPE: "@CRUSH_FORK_SCOPE"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: go.mod
+
+      - name: Enable pnpm via corepack
+        run: corepack enable
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Build the embedded web UI
+        working-directory: web
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run build
+          if [ -z "$(ls -A dist 2>/dev/null | grep -v '^\.gitkeep$')" ]; then
+            echo "::error::web/dist is empty after build — the binary would ship an empty UI." >&2
+            exit 1
+          fi
+
+      - name: Resolve version and tag
+        id: ver
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            TAG="$INPUT_TAG"
+          else
+            TAG="$GITHUB_REF_NAME"
+          fi
+          # reject anything but a clean semver-ish tag before it reaches later shells
+          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+([-.+][0-9A-Za-z.-]+)?$'; then
+            echo "::error::tag '$TAG' is not a valid version tag"; exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build binaries and assemble npm packages
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          LDFLAGS="-s -w -X github.com/charmbracelet/crush/internal/version.Version=${TAG}"
+          # target triples: <node_os> <node_arch> <GOOS> <GOARCH> <bin>
+          TARGETS="
+          linux x64   linux   amd64 crush
+          linux arm64 linux   arm64 crush
+          darwin x64  darwin  amd64 crush
+          darwin arm64 darwin arm64 crush
+          win32 x64   windows amd64 crush.exe
+          "
+          mkdir -p staging
+          echo "$TARGETS" | while read -r NODE_OS NODE_ARCH GOOS GOARCH BIN; do
+            [ -z "${NODE_OS:-}" ] && continue
+            PKG="staging/crush-${NODE_OS}-${NODE_ARCH}"
+            echo "→ building ${GOOS}/${GOARCH} → ${PKG}"
+            mkdir -p "${PKG}/bin"
+            CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" \
+              go build -trimpath -ldflags "$LDFLAGS" -o "${PKG}/bin/${BIN}" .
+            sed -e "s|__SCOPE__|${SCOPE}|g" \
+                -e "s|__NODE_OS__|${NODE_OS}|g" \
+                -e "s|__NODE_ARCH__|${NODE_ARCH}|g" \
+                -e "s|__VERSION__|${VERSION}|g" \
+                -e "s|__BIN__|${BIN}|g" \
+                npm/platform/package.json.tmpl > "${PKG}/package.json"
+            cp LICENSE.md "${PKG}/LICENSE"
+          done
+          # meta package
+          cp -R npm/crush staging/crush
+          cp LICENSE.md staging/crush/LICENSE
+          node -e '
+            const fs = require("fs");
+            const p = "staging/crush/package.json";
+            const j = JSON.parse(fs.readFileSync(p, "utf8"));
+            const v = process.env.VERSION;
+            j.version = v;
+            for (const k of Object.keys(j.optionalDependencies || {})) {
+              j.optionalDependencies[k] = v;
+            }
+            fs.writeFileSync(p, JSON.stringify(j, null, 2) + "\n");
+          '
+
+          # Guard against the TARGETS list above and npm/crush/package.json's
+          # optionalDependencies silently drifting apart — a platform present
+          # in one but not the other fails loudly here instead of surfacing
+          # later as a broken `npm install` for one specific OS/arch.
+          node -e '
+            const fs = require("fs");
+            const scope = process.env.SCOPE;
+            const built = fs.readdirSync("staging")
+              .filter((d) => d.startsWith("crush-"))
+              .map((d) => scope + "/" + d)
+              .sort();
+            const declared = Object.keys(
+              JSON.parse(fs.readFileSync("staging/crush/package.json", "utf8")).optionalDependencies || {},
+            ).sort();
+            const missing = built.filter((p) => !declared.includes(p));
+            const extra = declared.filter((p) => !built.includes(p));
+            if (missing.length || extra.length) {
+              console.error("Platform list drift between the workflow TARGETS table and npm/crush/package.json optionalDependencies:");
+              if (missing.length) console.error("  built but not declared:", missing.join(", "));
+              if (extra.length) console.error("  declared but not built:", extra.join(", "));
+              process.exit(1);
+            }
+          '
+
+      - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          # Hard invariant: a real publish can only happen when this run IS
+          # the tag push itself. `workflow_dispatch` (or any other trigger)
+          # is always forced into --dry-run — there is deliberately no input
+          # that can flip this. See the file header comment.
+          DRY_RUN: ${{ github.event_name != 'push' }}
+        run: |
+          set -euo pipefail
+          FLAGS="--access public"
+          if [ "${DRY_RUN}" = "true" ]; then
+            echo "Publishing with --dry-run (not a tag push)"
+            FLAGS="$FLAGS --dry-run"
+          elif [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+            # This IS a real tag push (DRY_RUN=false) but NPM_TOKEN is missing.
+            # Fail loudly instead of silently no-op'ing as a dry run — a green
+            # checkmark here must mean the release actually went out.
+            echo "::error::NPM_TOKEN is not set. This is a real tag push (${GITHUB_REF_NAME:-unknown}) — add the secret and re-run, or delete/re-push the tag once it is configured." >&2
+            exit 1
+          fi
+          # platform packages first, meta package last (so its optional deps exist)
+          for d in staging/crush-*; do
+            echo "→ npm publish $d"
+            npm publish "$d" $FLAGS
+          done
+          echo "→ npm publish staging/crush (meta)"
+          npm publish staging/crush $FLAGS
