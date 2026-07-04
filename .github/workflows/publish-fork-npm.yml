@@ -1,0 +1,152 @@
+# Opt-in, Go-free npm distribution for this fork.
+#
+# This workflow is self-contained and does NOT touch the upstream goreleaser
+# config or any other workflow. It builds prebuilt crush binaries and publishes
+# them to npm using the esbuild-style optional-dependency layout in npm/, so a
+# user can `npm i -g <scope>/crush` with no Go and no pnpm.
+#
+# Nothing publishes unless a `v*` tag is pushed (or you run it manually).
+# The only secret required is NPM_TOKEN. `@CRUSH_FORK_SCOPE` is a literal
+# placeholder: find-and-replace it (here and under npm/) with your own npm
+# scope before the first real publish.
+name: publish-fork-npm
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Version tag to build, e.g. v1.2.3"
+        required: true
+      dry_run:
+        description: "Run npm publish with --dry-run (no upload)"
+        type: boolean
+        default: true
+
+concurrency:
+  group: publish-fork-npm-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      SCOPE: "@CRUSH_FORK_SCOPE"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Enable pnpm via corepack
+        run: corepack enable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Build the embedded web UI
+        working-directory: web
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run build
+          if [ -z "$(ls -A dist 2>/dev/null | grep -v '^\.gitkeep$')" ]; then
+            echo "::error::web/dist is empty after build — the binary would ship an empty UI." >&2
+            exit 1
+          fi
+
+      - name: Resolve version and tag
+        id: ver
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            TAG="$INPUT_TAG"
+          else
+            TAG="$GITHUB_REF_NAME"
+          fi
+          case "$TAG" in
+            v[0-9]*) ;;
+            *) echo "::error::tag '$TAG' must look like v1.2.3"; exit 1 ;;
+          esac
+          # reject anything but a clean semver-ish tag before it reaches later shells
+          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+([-.+][0-9A-Za-z.-]+)?$'; then
+            echo "::error::tag '$TAG' is not a valid version tag"; exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build binaries and assemble npm packages
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          LDFLAGS="-s -w -X github.com/charmbracelet/crush/internal/version.Version=${TAG}"
+          # target triples: <node_os> <node_arch> <GOOS> <GOARCH> <bin>
+          TARGETS="
+          linux x64   linux   amd64 crush
+          linux arm64 linux   arm64 crush
+          darwin x64  darwin  amd64 crush
+          darwin arm64 darwin arm64 crush
+          win32 x64   windows amd64 crush.exe
+          "
+          mkdir -p staging
+          echo "$TARGETS" | while read -r NODE_OS NODE_ARCH GOOS GOARCH BIN; do
+            [ -z "${NODE_OS:-}" ] && continue
+            PKG="staging/crush-${NODE_OS}-${NODE_ARCH}"
+            echo "→ building ${GOOS}/${GOARCH} → ${PKG}"
+            mkdir -p "${PKG}/bin"
+            CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" \
+              go build -trimpath -ldflags "$LDFLAGS" -o "${PKG}/bin/${BIN}" .
+            sed -e "s|__SCOPE__|${SCOPE}|g" \
+                -e "s|__NODE_OS__|${NODE_OS}|g" \
+                -e "s|__NODE_ARCH__|${NODE_ARCH}|g" \
+                -e "s|__VERSION__|${VERSION}|g" \
+                -e "s|__BIN__|${BIN}|g" \
+                npm/platform/package.json.tmpl > "${PKG}/package.json"
+            cp LICENSE.md "${PKG}/LICENSE"
+          done
+          # meta package
+          cp -R npm/crush staging/crush
+          cp LICENSE.md staging/crush/LICENSE
+          node -e '
+            const fs = require("fs");
+            const p = "staging/crush/package.json";
+            const j = JSON.parse(fs.readFileSync(p, "utf8"));
+            const v = process.env.VERSION;
+            j.version = v;
+            for (const k of Object.keys(j.optionalDependencies || {})) {
+              j.optionalDependencies[k] = v;
+            }
+            fs.writeFileSync(p, JSON.stringify(j, null, 2) + "\n");
+          '
+
+      - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
+        run: |
+          set -euo pipefail
+          FLAGS="--access public"
+          if [ "${DRY_RUN}" = "true" ] || [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "Publishing with --dry-run (dry_run=${DRY_RUN}, token set=$([ -n "${NODE_AUTH_TOKEN:-}" ] && echo yes || echo no))"
+            FLAGS="$FLAGS --dry-run"
+          fi
+          # platform packages first, meta package last (so its optional deps exist)
+          for d in staging/crush-*; do
+            echo "→ npm publish $d"
+            npm publish "$d" $FLAGS
+          done
+          echo "→ npm publish staging/crush (meta)"
+          npm publish staging/crush $FLAGS
