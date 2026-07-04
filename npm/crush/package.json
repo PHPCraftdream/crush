@@ -1,6 +1,6 @@
 {
   "name": "@CRUSH_FORK_SCOPE/crush",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Unofficial npm distribution of crush — a fork of charmbracelet/crush. Installs a prebuilt, Go-free binary via per-platform optional packages. No download step at install time.",
   "license": "FSL-1.1-MIT",
   "author": "Charmbracelet, Inc. (upstream) and fork maintainers",
@@ -30,10 +30,10 @@
     "bin/crush.js"
   ],
   "optionalDependencies": {
-    "@CRUSH_FORK_SCOPE/crush-linux-x64": "0.0.0",
-    "@CRUSH_FORK_SCOPE/crush-linux-arm64": "0.0.0",
-    "@CRUSH_FORK_SCOPE/crush-darwin-x64": "0.0.0",
-    "@CRUSH_FORK_SCOPE/crush-darwin-arm64": "0.0.0",
-    "@CRUSH_FORK_SCOPE/crush-win32-x64": "0.0.0"
+    "@CRUSH_FORK_SCOPE/crush-linux-x64": "0.1.0",
+    "@CRUSH_FORK_SCOPE/crush-linux-arm64": "0.1.0",
+    "@CRUSH_FORK_SCOPE/crush-darwin-x64": "0.1.0",
+    "@CRUSH_FORK_SCOPE/crush-darwin-arm64": "0.1.0",
+    "@CRUSH_FORK_SCOPE/crush-win32-x64": "0.1.0"
   }
 }
