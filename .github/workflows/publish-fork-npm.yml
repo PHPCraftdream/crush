@@ -188,10 +188,14 @@ jobs:
             echo "::error::NPM_TOKEN is not set. This is a real tag push (${GITHUB_REF_NAME:-unknown}) — add the secret and re-run, or delete/re-push the tag once it is configured." >&2
             exit 1
           fi
-          # platform packages first, meta package last (so its optional deps exist)
+          # platform packages first, meta package last (so its optional deps exist).
+          # The leading "./" is required: without it, npm treats a bare
+          # "staging/crush-..." argument as a <githubname>/<githubrepo>
+          # install-style specifier (it tries `git ls-remote` on it) instead
+          # of a local folder to publish.
           for d in staging/crush-*; do
             echo "→ npm publish $d"
-            npm publish "$d" $FLAGS
+            npm publish "./$d" $FLAGS
           done
           echo "→ npm publish staging/crush (meta)"
-          npm publish staging/crush $FLAGS
+          npm publish "./staging/crush" $FLAGS
