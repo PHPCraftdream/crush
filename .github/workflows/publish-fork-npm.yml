@@ -5,14 +5,20 @@
 # them to npm using the esbuild-style optional-dependency layout in npm/, so a
 # user can `npm i -g <scope>/crush` with no Go and no pnpm.
 #
-# A REAL (non-dry-run) publish can ONLY happen as the direct result of a `v*`
-# tag push — this is a hard invariant, not a default. `workflow_dispatch` is
-# for exercising the pipeline only (web build, cross-compile, package
-# assembly, `npm publish --dry-run`); it can NEVER perform a real publish,
-# regardless of any input, because DRY_RUN below is derived solely from
-# `github.event_name` and ignores anything a manual run could set. There is
-# intentionally no way to flip this from the Actions UI. If you need a real
-# publish, push a tag — that is the only path.
+# A REAL (non-dry-run) publish can ONLY happen as the direct result of an
+# `npm-v*` tag push — this is a hard invariant, not a default.
+# `workflow_dispatch` is for exercising the pipeline only (web build,
+# cross-compile, package assembly, `npm publish --dry-run`); it can NEVER
+# perform a real publish, regardless of any input, because DRY_RUN below is
+# derived solely from `github.event_name` and ignores anything a manual run
+# could set. There is intentionally no way to flip this from the Actions UI.
+# If you need a real publish, push a tag — that is the only path.
+#
+# Tag prefix note: this repo shares its full tag history with upstream
+# charmbracelet/crush (180+ existing `vX.Y.Z` tags). A bare `v*.*.*` trigger
+# would eventually collide with an upstream release tag of the same number.
+# `npm-v*.*.*` is a prefix upstream will never produce, so it can never
+# collide — e.g. push `npm-v0.1.0` to publish npm version `0.1.0`.
 #
 # The only secret required is NPM_TOKEN. Packages publish under the
 # @phpcraftdream npm scope.
@@ -21,11 +27,11 @@ name: publish-fork-npm
 on:
   push:
     tags:
-      - "v*.*.*"
+      - "npm-v*.*.*"
   workflow_dispatch:
     inputs:
       tag:
-        description: "Version tag to build for a dry-run pipeline test, e.g. v1.2.3. This can NEVER trigger a real publish — see the file header."
+        description: "Tag to build for a dry-run pipeline test, e.g. npm-v0.1.0. This can NEVER trigger a real publish — see the file header."
         required: true
 
 concurrency:
@@ -78,20 +84,26 @@ jobs:
           else
             TAG="$GITHUB_REF_NAME"
           fi
-          # reject anything but a clean semver-ish tag before it reaches later shells
-          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+([-.+][0-9A-Za-z.-]+)?$'; then
-            echo "::error::tag '$TAG' is not a valid version tag"; exit 1
+          # reject anything but a clean "npm-v<semver>" tag before it reaches later shells
+          if ! printf '%s' "$TAG" | grep -Eq '^npm-v[0-9]+\.[0-9]+\.[0-9]+([-.+][0-9A-Za-z.-]+)?$'; then
+            echo "::error::tag '$TAG' is not a valid npm-v<semver> tag"; exit 1
           fi
+          VERSION="${TAG#npm-v}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          # Clean semver-with-v-prefix for the Go binary's embedded version
+          # (internal/version.Version) — the npm-v tag prefix is a repo/CI
+          # convention, not part of the version the binary or npm package
+          # should ever display.
+          echo "go_version=v$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Build binaries and assemble npm packages
         env:
-          TAG: ${{ steps.ver.outputs.tag }}
+          GO_VERSION_STRING: ${{ steps.ver.outputs.go_version }}
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
           set -euo pipefail
-          LDFLAGS="-s -w -X github.com/charmbracelet/crush/internal/version.Version=${TAG}"
+          LDFLAGS="-s -w -X github.com/charmbracelet/crush/internal/version.Version=${GO_VERSION_STRING}"
           # target triples: <node_os> <node_arch> <GOOS> <GOARCH> <bin>
           TARGETS="
           linux x64   linux   amd64 crush
