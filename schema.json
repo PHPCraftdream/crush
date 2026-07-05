@@ -655,7 +655,7 @@
             "type": "string"
           },
           "type": "array",
-          "description": "Bash command patterns permitted in restricted run mode. Forms: 'cmd args' (word-boundary prefix, chaining-guarded), 'exact:cmd', 'glob:pat', 'regex:pat'.",
+          "description": "Bash command patterns permitted in restricted run mode. Forms: 'cmd args' (word-boundary prefix), 'exact:cmd', 'glob:pat' (only * and ? are special, cross-platform), 'regex:pat'. Every form except regex rejects compound commands (chaining, backgrounding, or substitution), so a permissive pattern cannot smuggle a second command.",
           "examples": [
             "git diff",
             "glob:ls *",

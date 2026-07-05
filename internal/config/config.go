@@ -322,7 +322,7 @@ type RunPermissions struct {
 	// When false (the default) `crush run` auto-approves every permission
 	// request as before. Must be true for the allowlists below to take
 	// effect.
-	Restrict bool `json:"restrict,omitempty" jsonschema:"description=Enable restricted permission mode for 'crush run'. When true, only allow_tools (non-bash) and allow_bash entries are approved; everything else is denied cleanly. Default false (current auto-approve behaviour).,default=false"`
+	Restrict bool `json:"restrict,omitempty" jsonschema:"description=Enable restricted permission mode for 'crush run'. When true\\, only allow_tools (non-bash) and allow_bash entries are approved; everything else is denied cleanly. Default false (current auto-approve behaviour).,default=false"`
 
 	// AllowTools lists tool (and optionally tool:action) names that are
 	// auto-approved even in restricted run mode. Entries for "bash" /
@@ -332,7 +332,7 @@ type RunPermissions struct {
 
 	// AllowBash lists bash command patterns permitted in restricted run
 	// mode. See the RunPermissions doc comment for the pattern syntax.
-	AllowBash []string `json:"allow_bash,omitempty" jsonschema:"description=Bash command patterns permitted in restricted run mode. Forms: 'cmd args' (word-boundary prefix, chaining-guarded), 'exact:cmd', 'glob:pat', 'regex:pat'.,example=git diff,example=glob:ls *,example=regex:^go (test|build)"`
+	AllowBash []string `json:"allow_bash,omitempty" jsonschema:"description=Bash command patterns permitted in restricted run mode. Forms: 'cmd args' (word-boundary prefix)\\, 'exact:cmd'\\, 'glob:pat' (only * and ? are special\\, cross-platform)\\, 'regex:pat'. Every form except regex rejects compound commands (chaining\\, backgrounding\\, or substitution)\\, so a permissive pattern cannot smuggle a second command.,example=git diff,example=glob:ls *,example=regex:^go (test|build)"`
 }
 
 type TrailerStyle string
