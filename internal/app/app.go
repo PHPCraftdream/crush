@@ -96,11 +96,14 @@ func New(ctx context.Context, conn *sql.DB, store *config.ConfigStore) (*App, er
 		events:             pubsub.NewBroker[any](),
 	}
 
-	// Arm the restricted-run allowlist from config (if any). `crush run`
-	// reads this on every permission request via the auto-approve gate;
-	// a non-restricted config produces an inert allowlist that preserves
-	// the legacy auto-approve-everything behaviour.
-	app.Permissions.SetRunAllowlist(buildRunAllowlist(cfg.Permissions))
+	// NOTE: the restricted-run allowlist is deliberately NOT armed here.
+	// app.New builds the App shared by BOTH `crush run` and the
+	// interactive web/TUI server, and the gate would then leak into
+	// interactive sessions — an auto-approved sub-agent (e.g.
+	// agentic_fetch) would be denied-by-default even though interactive
+	// mode must stay exempt. RunNonInteractive arms the gate itself from
+	// config + CLI overrides on every run, so the run path is unaffected.
+	// Fork patch (run allowlist).
 
 	// Check for updates in the background.
 	go app.checkForUpdates(ctx)
@@ -1467,17 +1470,4 @@ func runAllowlistSpecFromConfig(p *config.Permissions) permission.RunAllowlistSp
 	spec.AllowTools = append(spec.AllowTools, p.Run.AllowTools...)
 	spec.AllowBash = append(spec.AllowBash, p.Run.AllowBash...)
 	return spec
-}
-
-// buildRunAllowlist compiles the config-derived spec into the
-// queryable form stored on the permission service. Compile errors (bad
-// regex / bad glob) are logged and the offending patterns dropped; the
-// remaining valid patterns still arm so a single typo doesn't lock out
-// a run.
-func buildRunAllowlist(p *config.Permissions) permission.RunAllowlist {
-	compiled, err := permission.BuildRunAllowlist(runAllowlistSpecFromConfig(p))
-	if err != nil {
-		slog.Warn("Failed to compile restricted-run allowlist from config (skipping invalid patterns)", "err", err)
-	}
-	return compiled
 }

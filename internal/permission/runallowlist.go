@@ -10,10 +10,10 @@ package permission
 //
 //  1. No ad-hoc shell splitting. Command patterns are matched against
 //     the whole command string with well-defined semantics (exact,
-//     word-boundary prefix, filepath.Match glob, or regexp). The
-//     chaining guard is the same conservative character scan used by
-//     the bash tool's safe-read-only bypass (internal/agent/tools/safe.go)
-//     so the two surfaces agree on what counts as a "compound" command.
+//     word-boundary prefix, cross-platform glob, or regexp). The
+//     chaining guard parses the command with the same shell grammar the
+//     bash tool executes (mvdan.cc/sh/v3) so a prefix/exact pattern can
+//     never authorise a compound command — see commandIsCompound.
 //
 //  2. The matcher is total: it never panics and never blocks. A pattern
 //     that fails to compile (bad regex, bad glob) is reported once via
@@ -24,12 +24,13 @@ package permission
 //     command, or an unmatched request all fall through to "not allowed".
 
 import (
-	"path/filepath"
 	"reflect"
 	"regexp"
-	"slices"
+	"strconv"
 	"strings"
 	"sync"
+
+	"mvdan.cc/sh/v3/syntax"
 )
 
 // RunAllowlistSpec is the user-facing, pre-compilation form of a
@@ -58,7 +59,7 @@ type bashPatternKind int
 const (
 	bashPatternExact  bashPatternKind = iota // "exact:cmd" — whole-string match.
 	bashPatternPrefix                        // "cmd args" — word-boundary prefix.
-	bashPatternGlob                          // "glob:pat" — filepath.Match.
+	bashPatternGlob                          // "glob:pat" — cross-platform glob (see globToRegexp).
 	bashPatternRegex                         // "regex:pat" — regexp.MatchString.
 )
 
@@ -109,6 +110,11 @@ func (a RunAllowlist) allowsRequest(opts CreatePermissionRequest) bool {
 	// arbitrary shell command. Operators who want to approve bash
 	// wholesale must use permissions.allowed_tools (the pre-gate
 	// fast-path), not run.allow_tools.
+	//
+	// The literal "bash" must stay equal to internal/agent/tools.BashToolName
+	// (we can't import it here without an import cycle). A cross-package
+	// guard in internal/app (TestRunAllowlist_BashToolNameLiteralMatchesConstant)
+	// fails the build if the tool is ever renamed and this literal is not.
 	if opts.ToolName == "bash" {
 		cmd := extractBashCommand(opts.Params)
 		if cmd == "" {
@@ -189,13 +195,14 @@ func MergeRunAllowlistSpecs(a, b RunAllowlistSpec) RunAllowlistSpec {
 // compileBashPattern parses a single AllowBash entry. Recognised forms:
 //
 //	"regex:pat"  → regexp
-//	"glob:pat"   → filepath.Match glob
+//	"glob:pat"   → cross-platform glob (compiled to an anchored regexp)
 //	"exact:cmd"  → whole-string equality after TrimSpace
 //	anything else → word-boundary prefix (the common case, e.g. "git diff")
 //
-// The prefix and exact forms are chaining-guarded at match time, not at
-// compile time — the pattern itself is always valid even if it would
-// never match a chained command.
+// The prefix, exact, and glob forms are compound-guarded at match time,
+// not at compile time — the pattern itself is always valid even if it
+// would never match a compound command. Only regex is exempt from the
+// compound guard.
 func compileBashPattern(raw string) (compiledBashPattern, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -219,12 +226,15 @@ func compileBashPattern(raw string) (compiledBashPattern, error) {
 		if body == "" {
 			return compiledBashPattern{}, errEmptyPatternBody(raw)
 		}
-		// Validate the glob up front so a bad pattern is reported at
-		// build time rather than silently never matching.
-		if _, err := filepath.Match(body, ""); err != nil {
+		// Compile the glob to an anchored regexp so matching is
+		// cross-platform (see globToRegexp — filepath.Match's `*` was
+		// separator-aware, which made a glob behave differently on
+		// Windows vs Linux).
+		re, err := globToRegexp(body)
+		if err != nil {
 			return compiledBashPattern{}, errBadPattern(raw, err)
 		}
-		return compiledBashPattern{raw: raw, kind: bashPatternGlob, value: body}, nil
+		return compiledBashPattern{raw: raw, kind: bashPatternGlob, value: body, re: re}, nil
 
 	case strings.HasPrefix(raw, "exact:"):
 		body := strings.TrimSpace(strings.TrimPrefix(raw, "exact:"))
@@ -240,27 +250,75 @@ func compileBashPattern(raw string) (compiledBashPattern, error) {
 	}
 }
 
-// bashChainingMetacharacters lists the shell metacharacters that turn a
-// single command into a compound one. It mirrors
-// internal/agent/tools.chainingMetacharacters so the safe-read-only
-// bypass and the run allowlist agree on what is "compound". Kept local
-// (not exported across packages) to avoid an import cycle.
-var bashChainingMetacharacters = []string{
-	";",
-	"|",
-	"&&",
-	"$(",
-	"`",
+// globToRegexp translates a shell-style glob (only `*` and `?` are
+// special) into an anchored regexp matching the WHOLE command string.
+// Unlike filepath.Match, `*` matches any run of characters INCLUDING
+// `/`, so a glob behaves identically on every OS — filepath.Match's
+// separator-aware `*` made "glob:ls *" match "ls /etc" on Windows but
+// not on Linux, an OS-dependent authorization decision. Every other
+// regex metacharacter is escaped and matched literally.
+func globToRegexp(glob string) (*regexp.Regexp, error) {
+	var b strings.Builder
+	b.WriteByte('^')
+	for _, r := range glob {
+		switch r {
+		case '*':
+			b.WriteString(".*")
+		case '?':
+			b.WriteByte('.')
+		default:
+			b.WriteString(regexp.QuoteMeta(string(r)))
+		}
+	}
+	b.WriteByte('$')
+	return regexp.Compile(b.String())
 }
 
-// commandIsCompound reports whether cmd chains multiple commands or
-// performs command substitution. Prefix and exact patterns refuse to
-// match compound commands so a permissive prefix such as "ls" cannot
-// authorise "ls && rm -rf /".
+// commandIsCompound reports whether cmd is anything other than a single
+// simple command — i.e. it chains (`;`, a raw newline, `&&`, `||`, `|`),
+// backgrounds (`&`), substitutes (`$(...)`, backticks), or opens a
+// subshell / block / control structure. Prefix and exact patterns refuse
+// to match compound commands so a permissive prefix such as "ls" cannot
+// authorise "ls && rm -rf /" — or "ls\nrm -rf /", "ls & rm -rf /".
+//
+// The command is parsed with the same shell grammar the bash tool
+// actually executes (mvdan.cc/sh/v3), rather than scanning for a fixed
+// set of metacharacter substrings. This closes two gaps in the old
+// substring scan — a raw newline and a bare backgrounding `&` were not
+// in the list — while, unlike a substring scan, NOT tripping on a
+// metacharacter that appears inside quotes (`echo 'a; b'` is a single
+// command) or in a plain redirection (`ls 2>&1` operates on one
+// command). A command that fails to parse is treated as compound: we
+// refuse to auto-approve something we can't prove is a single command.
 func commandIsCompound(cmd string) bool {
-	return slices.ContainsFunc(bashChainingMetacharacters, func(m string) bool {
-		return strings.Contains(cmd, m)
+	file, err := syntax.NewParser().Parse(strings.NewReader(cmd), "")
+	if err != nil {
+		return true
+	}
+	if len(file.Stmts) != 1 {
+		return true
+	}
+	stmt := file.Stmts[0]
+	if stmt.Background {
+		return true
+	}
+	// Anything that isn't a single simple command (a pipeline/`&&`/`||`
+	// BinaryCmd, a subshell, a block, an if/for/while, …) is compound.
+	if _, ok := stmt.Cmd.(*syntax.CallExpr); !ok {
+		return true
+	}
+	// Reject command / process substitution anywhere in the words or
+	// redirections of the single command.
+	compound := false
+	syntax.Walk(stmt, func(node syntax.Node) bool {
+		switch node.(type) {
+		case *syntax.CmdSubst, *syntax.ProcSubst:
+			compound = true
+			return false
+		}
+		return true
 	})
+	return compound
 }
 
 // bashCommandAllowed reports whether cmd satisfies any of the compiled
@@ -289,7 +347,14 @@ func bashCommandAllowed(patterns []compiledBashPattern, cmd string) bool {
 				return true
 			}
 		case bashPatternGlob:
-			if ok, _ := filepath.Match(p.value, command); ok {
+			// A glob is a convenience form, so — like prefix/exact — it
+			// must not authorise a compound command (`glob:ls *` cannot
+			// approve "ls && rm -rf /"). Operators who genuinely need to
+			// match a compound command must use an explicit regex.
+			if compound {
+				continue
+			}
+			if p.re != nil && p.re.MatchString(command) {
 				return true
 			}
 		case bashPatternRegex:
@@ -387,19 +452,9 @@ type patternError string
 func (e patternError) Error() string { return string(e) }
 
 func errEmptyPatternBody(raw string) error {
-	return patternError("empty pattern body in " + strconvQuote(raw))
+	return patternError("empty pattern body in " + strconv.Quote(raw))
 }
 
 func errBadPattern(raw string, cause error) error {
-	return patternError("invalid pattern " + strconvQuote(raw) + ": " + cause.Error())
-}
-
-// strconvQuote is a tiny wrapper to avoid importing strconv just for
-// error formatting. It only quotes when the string contains characters
-// that would make an error message ambiguous.
-func strconvQuote(s string) string {
-	if strings.ContainsAny(s, ` "`+"\t\r\n") {
-		return `"` + s + `"`
-	}
-	return s
+	return patternError("invalid pattern " + strconv.Quote(raw) + ": " + cause.Error())
 }

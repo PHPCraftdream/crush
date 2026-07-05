@@ -3,12 +3,29 @@ package app
 import (
 	"testing"
 
+	"github.com/charmbracelet/crush/internal/agent/tools"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/db"
 	"github.com/charmbracelet/crush/internal/permission"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// TestRunAllowlist_BashToolNameLiteralMatchesConstant pins the string
+// literal that internal/permission/runallowlist.go hardcodes ("bash", in
+// allowsRequest) to the canonical tools.BashToolName. The permission
+// package can't import internal/agent/tools (import cycle), so it matches
+// the literal directly; this cross-package assertion — in a package that
+// CAN see both — turns a future rename of the bash tool into a failing
+// test instead of a silent bypass, where the renamed tool would fall
+// through to toolAllowed and a "bash" entry in run.allow_tools could
+// start authorising arbitrary shell commands.
+func TestRunAllowlist_BashToolNameLiteralMatchesConstant(t *testing.T) {
+	t.Parallel()
+	require.Equal(t, "bash", tools.BashToolName,
+		`internal/permission/runallowlist.go hardcodes "bash" in allowsRequest; `+
+			`if the bash tool is renamed, update that literal (and this guard) too`)
+}
 
 // TestRunAllowlistSpecFromConfig_NilPreservesLegacy is the backwards-
 // compatibility guarantee: with no permissions.run block at all, the
@@ -18,18 +35,21 @@ func TestRunAllowlistSpecFromConfig_NilPreservesLegacy(t *testing.T) {
 	t.Parallel()
 
 	t.Run("nil permissions", func(t *testing.T) {
+		t.Parallel()
 		spec := runAllowlistSpecFromConfig(nil)
 		assert.False(t, spec.Restrict, "nil Permissions => inert spec")
 		assert.Empty(t, spec.AllowTools)
 		assert.Empty(t, spec.AllowBash)
 	})
 	t.Run("nil run block", func(t *testing.T) {
+		t.Parallel()
 		spec := runAllowlistSpecFromConfig(&config.Permissions{})
 		assert.False(t, spec.Restrict, "nil Run => inert spec")
 		assert.Empty(t, spec.AllowTools)
 		assert.Empty(t, spec.AllowBash)
 	})
 	t.Run("restrict false", func(t *testing.T) {
+		t.Parallel()
 		spec := runAllowlistSpecFromConfig(&config.Permissions{
 			Run: &config.RunPermissions{
 				Restrict:   false,

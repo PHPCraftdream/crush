@@ -30,12 +30,21 @@ func TestBuildRunAllowlist_BadRegexIsDropped(t *testing.T) {
 	assert.False(t, bashCommandAllowed(a.bashPatterns, "rm -rf /"), "dropped pattern does not match anything")
 }
 
-func TestBuildRunAllowlist_BadGlobIsDropped(t *testing.T) {
+// TestBuildRunAllowlist_GlobMetacharsAreLiteral documents that the glob
+// form is intentionally minimal: only `*` and `?` are special, and every
+// other character — including `[`, which filepath.Match treated as a
+// char-class opener — is matched literally. This means no glob string is
+// ever "invalid" (there is nothing to mis-balance), and advanced matching
+// is the explicit job of the regex form.
+func TestBuildRunAllowlist_GlobMetacharsAreLiteral(t *testing.T) {
 	a, err := BuildRunAllowlist(RunAllowlistSpec{
 		Restrict:  true,
 		AllowBash: []string{"glob:[abc", "ls"},
 	})
-	require.Error(t, err)
+	require.NoError(t, err, "a minimal glob has no invalid form")
+	// "[abc" is matched as the literal command "[abc", not as a char class.
+	assert.True(t, bashCommandAllowed(a.bashPatterns, "[abc"))
+	assert.False(t, bashCommandAllowed(a.bashPatterns, "a"), "not a char class")
 	assert.True(t, bashCommandAllowed(a.bashPatterns, "ls -la"))
 	assert.False(t, bashCommandAllowed(a.bashPatterns, "rm -rf /"))
 }
@@ -59,8 +68,8 @@ func TestBashCommandAllowed_PrefixMatchesWordBoundary(t *testing.T) {
 		{"git dif", false},      // different command
 		{"ls", true},
 		{"ls -la", true},
-		{"lsof", false}, // different command
-		{"Git diff", false}, // prefix match is case-sensitive
+		{"lsof", false},      // different command
+		{"Git diff", false},  // prefix match is case-sensitive
 		{"  git diff", true}, // leading whitespace is trimmed
 		{"", false},
 	}
@@ -98,9 +107,16 @@ func TestBashCommandAllowed_GlobForm(t *testing.T) {
 	assert.True(t, bashCommandAllowed(patterns, "git status"))
 	assert.True(t, bashCommandAllowed(patterns, "ls"))
 	assert.False(t, bashCommandAllowed(patterns, "rm -rf /"))
-	// Glob is an explicit opt-in: it CAN match compound commands because
-	// the user wrote the wildcard themselves. This documents the choice.
-	assert.True(t, bashCommandAllowed(patterns, "git diff && echo hi"))
+	// `*` matches any characters including "/", identically on every OS
+	// (the old filepath.Match `*` stopped at the platform path separator,
+	// so this matched on Windows but not Linux).
+	assert.True(t, bashCommandAllowed(patterns, "git diff /etc/hosts"))
+	// Glob is a convenience form and carries the same compound guard as
+	// prefix/exact: it does NOT authorise a chained command. Operators who
+	// truly need to match a compound command must use an explicit regex.
+	assert.False(t, bashCommandAllowed(patterns, "git diff && echo hi"))
+	// glob:ls is anchored, so it matches "ls" exactly, not "lsof".
+	assert.False(t, bashCommandAllowed(patterns, "lsof"))
 }
 
 func TestBashCommandAllowed_RegexForm(t *testing.T) {
@@ -119,10 +135,10 @@ func TestPrefixWordBoundary(t *testing.T) {
 		{"ls", "ls", true},
 		{"ls", "ls -la", true},
 		{"ls", "lsof", false},
-		{"ls", "ls\t-la", true},     // tab is a boundary
-		{"ls", "ls\n-la", true},     // newline is a boundary
-		{"ls", "ls-la", false},      // hyphen is NOT a boundary
-		{"", "ls", false},           // empty pattern never matches
+		{"ls", "ls\t-la", true}, // tab is a boundary
+		{"ls", "ls\n-la", true}, // newline is a boundary
+		{"ls", "ls-la", false},  // hyphen is NOT a boundary
+		{"", "ls", false},       // empty pattern never matches
 		{"git diff", "git diff", true},
 		{"git diff", "git diff HEAD", true},
 		{"git diff", "git difftool", false},
@@ -135,18 +151,32 @@ func TestPrefixWordBoundary(t *testing.T) {
 }
 
 func TestCommandIsCompound(t *testing.T) {
+	// Chaining, substitution, backgrounding — all compound.
 	assert.True(t, commandIsCompound("a && b"))
+	assert.True(t, commandIsCompound("a || b"))
 	assert.True(t, commandIsCompound("a | b"))
 	assert.True(t, commandIsCompound("a; b"))
 	assert.True(t, commandIsCompound("a $(b)"))
 	assert.True(t, commandIsCompound("a `b`"))
+	// Regression guards for the two bypasses the old substring scan
+	// missed: a raw newline and a bare backgrounding `&`.
+	assert.True(t, commandIsCompound("git diff\nrm -rf /"))
+	assert.True(t, commandIsCompound("git diff & rm -rf /"))
+	assert.True(t, commandIsCompound("sleep 1 &"))
+	// A subshell / block is not a single simple command.
+	assert.True(t, commandIsCompound("(rm -rf /)"))
+
+	// Single simple commands — not compound.
 	assert.False(t, commandIsCompound("ls -la"))
-	// The scan is intentionally conservative: it does not parse shell
-	// quoting, so a `;` (or any chaining metacharacter) inside quotes
-	// still counts as compound. This errs toward deny, which is the safe
-	// direction — a false positive just rejects a command that looks
-	// chained, never the reverse.
-	assert.True(t, commandIsCompound("echo 'a; b'")) // conservative: quoted ; still counts
+	// A plain redirection operates on ONE command; parsing (unlike the
+	// old substring scan) correctly does not treat it as compound.
+	assert.False(t, commandIsCompound("ls -la 2>&1"))
+	assert.False(t, commandIsCompound("echo hi > out.txt"))
+	// A chaining metacharacter INSIDE quotes is a literal, not a chain —
+	// the parser recognises this where the old substring scan could not.
+	assert.False(t, commandIsCompound("echo 'a; b'"))
+	// Unparseable input errs toward compound (deny-safe).
+	assert.True(t, commandIsCompound("echo 'unterminated"))
 }
 
 func TestExtractBashCommand(t *testing.T) {
@@ -192,9 +222,9 @@ func TestToolAllowed(t *testing.T) {
 	assert.True(t, a.toolAllowed("view", ""))
 	assert.True(t, a.toolAllowed("view", "read"))
 	assert.True(t, a.toolAllowed("edit", "write"))
-	assert.False(t, a.toolAllowed("edit", ""))            // bare "edit" not in list, only "edit:write"
-	assert.False(t, a.toolAllowed("edit", "read"))        // action mismatch
-	assert.False(t, a.toolAllowed("bash", ""))            // toolAllowed never grants bash at the gate level
+	assert.False(t, a.toolAllowed("edit", ""))     // bare "edit" not in list, only "edit:write"
+	assert.False(t, a.toolAllowed("edit", "read")) // action mismatch
+	assert.False(t, a.toolAllowed("bash", ""))     // toolAllowed never grants bash at the gate level
 	assert.False(t, a.toolAllowed("download", "fetch"))
 }
 

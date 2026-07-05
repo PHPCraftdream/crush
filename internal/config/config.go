@@ -277,9 +277,15 @@ type Permissions struct {
 }
 
 // RunPermissions configures the restricted permission model for
-// `crush run`. This is the only way to scope what an unattended
-// non-interactive run is allowed to do without wrapping it in an
-// OS-level sandbox.
+// `crush run`. Short of wrapping the run in an OS-level sandbox, this is
+// the way to scope what an unattended non-interactive run may do.
+//
+// Interaction with the global skip / YOLO override: enabling skip
+// (permissions.skip / --yolo / SetSkipRequests) approves EVERY request
+// before the restricted-run gate is even consulted, so skip and
+// restrict are mutually exclusive intents and skip wins. Don't combine
+// them: if you want a scoped run, leave skip off and use restrict; if
+// you want a wide-open run, use skip and don't bother with restrict.
 //
 // Allowlist semantics (conservative — see internal/permission runallowlist.go):
 //   - AllowTools uses the same "tool" / "tool:action" syntax as
@@ -293,19 +299,24 @@ type Permissions struct {
 //   - AllowBash matches the command string of a bash tool call. Each
 //     entry is one of:
 //     "cmd args"   → prefix match on the command string with a word
-//                    boundary after the pattern (e.g. "git diff" matches
-//                    "git diff HEAD~1" but not "git difftool"). Patterns
-//                    of this form never match commands that contain
-//                    shell-chaining metacharacters (; | && $( `) so a
-//                    permissive prefix like "ls" cannot accidentally
-//                    authorise "ls && rm -rf /".
+//     boundary after the pattern (e.g. "git diff" matches
+//     "git diff HEAD~1" but not "git difftool"). Patterns
+//     of this form never match a compound command: the
+//     command is parsed with the shell grammar, and any
+//     chaining (; newline | && ||), backgrounding (&),
+//     substitution ($(...) / backticks), or subshell makes
+//     it ineligible — so a permissive prefix like "ls"
+//     cannot authorise "ls && rm -rf /".
 //     "exact:cmd"  → whole-string match (after trimming whitespace).
-//                    Same chaining guard as the prefix form.
-//     "glob:pat"   → filepath.Match against the raw command string
-//                    (e.g. "glob:git *"). No chaining guard — explicit
-//                    user choice.
+//     Same compound guard as the prefix form.
+//     "glob:pat"   → shell-style glob (only * and ? are special; *
+//     matches any characters INCLUDING "/", so matching is
+//     the same on every OS). Same compound guard as the
+//     prefix form, so a glob cannot authorise a chained
+//     command either (e.g. "glob:git *").
 //     "regex:pat"  → regexp.MatchString against the raw command string.
-//                    No chaining guard — explicit user choice.
+//     No compound guard — the full-control escape hatch for
+//     operators who need to match a compound command.
 type RunPermissions struct {
 	// Restrict enables the restricted permission model for `crush run`.
 	// When false (the default) `crush run` auto-approves every permission
