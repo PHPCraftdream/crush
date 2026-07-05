@@ -49,6 +49,14 @@ func formatFullVersion(v, buildID string) string {
 	return v
 }
 
+// Fork patch: this init() and its helpers (resolveVersion,
+// usableModuleVersion, readVCS, deriveDevVersion) diverge from upstream.
+// Upstream unconditionally overwrote Version with info.Main.Version; the
+// fork makes an ldflags-injected Version authoritative (release/npm builds
+// MUST win — see the "Verify" step in
+// .github/workflows/publish-fork-npm.yml) and only derives a value from
+// build metadata for un-injected local builds.
+//
 // A user may install crush using `go install github.com/charmbracelet/crush@latest`
 // without -ldflags, in which case the version above is unset. As a workaround
 // we use the embedded build version that *is* set when using `go install` (and

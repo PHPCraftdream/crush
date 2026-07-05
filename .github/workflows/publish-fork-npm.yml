@@ -195,10 +195,34 @@ jobs:
             echo "::error::${BIN_PATH} is missing or not executable"
             exit 1
           fi
-          OUT="$("$BIN_PATH" --version 2>&1 || true)"
+          # Run --version directly (no `|| true`): a binary that can't even
+          # print its version is a hard failure whose real error/exit code
+          # must surface, not be swallowed into a generic "version mismatch".
+          if ! OUT="$("$BIN_PATH" --version 2>&1)"; then
+            echo "::error::${BIN_PATH} --version exited non-zero:"
+            printf '%s\n' "$OUT"
+            exit 1
+          fi
           echo "linux/amd64 --version: ${OUT}"
-          printf '%s' "$OUT" | grep -F "$EXPECTED" >/dev/null \
-            || { echo "::error::${BIN_PATH} --version did not report ${EXPECTED}"; exit 1; }
+          # Require EXPECTED to appear as a whole token: split the --version
+          # output on whitespace and punctuation and compare each token for
+          # equality. This rejects v0.1.1 inside v0.1.10, and v0.1.0 inside
+          # v0.1.0-rc1 / v0.1.0+dirty, which a substring `grep -F` check would
+          # have accepted. set -f disables globbing so a token can't be
+          # expanded as a pathname.
+          matched=0
+          set -f
+          for tok in $(printf '%s' "$OUT" | tr '()[],;:' ' '); do
+            if [ "$tok" = "$EXPECTED" ]; then
+              matched=1
+              break
+            fi
+          done
+          set +f
+          if [ "$matched" -ne 1 ]; then
+            echo "::error::${BIN_PATH} --version did not report ${EXPECTED} as a distinct version token"
+            exit 1
+          fi
           echo "Binary version verified: ${EXPECTED}"
 
       - name: Publish to npm

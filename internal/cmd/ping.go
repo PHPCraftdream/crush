@@ -686,13 +686,25 @@ func stringPtr(s string) *string {
 }
 
 // resolvePingRole maps a --role value to the model slot to ping. An empty
-// role keeps the historical `crush ping` default (the large/smart model).
-// Accepted aliases mirror `crush run --role` so users can use the same
-// vocabulary across both commands; an unknown value is rejected with the
-// same error wording.
+// role keeps the historical `crush ping` default (the large/smart model);
+// any non-empty value goes through the shared resolveModelRole so ping and
+// `crush run` accept exactly the same vocabulary and reject unknown values
+// with identical wording.
 func resolvePingRole(role string) (config.SelectedModelType, error) {
+	if role == "" {
+		return config.SelectedModelTypeLarge, nil
+	}
+	return resolveModelRole(role)
+}
+
+// resolveModelRole maps a --role value (as accepted by `crush run` and
+// `crush ping`) to the model slot it selects. The empty string is rejected
+// here; callers that want to default it (e.g. `crush ping`) must handle ""
+// before calling. Keeping the vocabulary and error text in one place stops
+// the two commands' role parsing from drifting apart.
+func resolveModelRole(role string) (config.SelectedModelType, error) {
 	switch role {
-	case "", "large", "smart":
+	case "large", "smart":
 		return config.SelectedModelTypeLarge, nil
 	case "small", "fast":
 		return config.SelectedModelTypeSmall, nil

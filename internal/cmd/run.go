@@ -328,18 +328,18 @@ crush run --timeout 5m --session "long-task" "refactor the storage layer"
 		// --role is required so a `crush run` invocation always declares
 		// its intent (cheap-and-fast vs strong-and-slow), instead of
 		// silently defaulting to large and burning tokens unintentionally.
-		// "smart" / "fast" are friendly aliases for "large" / "small".
-		var roleLarge bool
-		switch role {
-		case "large", "smart":
-			roleLarge = true
-		case "small", "fast":
-			roleLarge = false
-		case "":
+		// "smart" / "fast" are friendly aliases for "large" / "small". The
+		// alias vocabulary and the invalid-value wording are shared with
+		// `crush ping` via resolveModelRole; only the empty-is-required
+		// rule is command-specific.
+		if role == "" {
 			return fmt.Errorf("--role is required: pass --role smart (large) or --role fast (small)")
-		default:
-			return fmt.Errorf("--role: invalid value %q (allowed: smart|large, fast|small)", role)
 		}
+		modelType, err := resolveModelRole(role)
+		if err != nil {
+			return err
+		}
+		roleLarge := modelType == config.SelectedModelTypeLarge
 
 		if systemPrompt != "" && systemPromptFile != "" {
 			return fmt.Errorf("--system-prompt and --system-prompt-file are mutually exclusive")
