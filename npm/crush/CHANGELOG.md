@@ -8,6 +8,22 @@ This is the npm-package changelog, not the fork's engineering decision
 log — see [`CHANGELOG.fork.md`](../../CHANGELOG.fork.md) at the repo
 root for the full per-file merge/divergence history.
 
+## [0.1.3]
+
+- New opt-in restricted permission model for `crush run`: `permissions.run`
+  config plus `--restrict-run` / `--allow-bash` / `--allow-tool` flags.
+  When armed, a non-interactive run switches from auto-approve-everything
+  to deny-by-default, gating each tool/bash call against an allowlist.
+- Bash allowlist patterns (`cmd args` prefix, `exact:`, `glob:`, `regex:`)
+  are compound-guarded via a real shell parse: a permissive pattern can
+  never authorise a chained/backgrounded/substituted command (e.g.
+  `git status && rm -rf /` or `git status\nrm -rf /`). Globs are matched
+  cross-platform.
+- Hardening of the interactive bash safe-read-only fast-path: the same
+  shell-parse compound check now gates it, closing a bypass where a
+  newline- or `&`-chained command behind a safe prefix ran without a
+  permission prompt.
+
 ## [0.1.2]
 
 - Documented `crush sessions inject` (cross-process message injection,

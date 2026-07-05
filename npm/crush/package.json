@@ -1,6 +1,6 @@
 {
   "name": "@phpcraftdream/crush",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Unofficial npm distribution of crush — a fork of charmbracelet/crush. Installs a prebuilt, Go-free binary via per-platform optional packages. No download step at install time.",
   "license": "FSL-1.1-MIT",
   "author": "Charmbracelet, Inc. (upstream) and fork maintainers",
@@ -31,10 +31,10 @@
     "CHANGELOG.md"
   ],
   "optionalDependencies": {
-    "@phpcraftdream/crush-linux-x64": "0.1.2",
-    "@phpcraftdream/crush-linux-arm64": "0.1.2",
-    "@phpcraftdream/crush-darwin-x64": "0.1.2",
-    "@phpcraftdream/crush-darwin-arm64": "0.1.2",
-    "@phpcraftdream/crush-win32-x64": "0.1.2"
+    "@phpcraftdream/crush-linux-x64": "0.1.3",
+    "@phpcraftdream/crush-linux-arm64": "0.1.3",
+    "@phpcraftdream/crush-darwin-x64": "0.1.3",
+    "@phpcraftdream/crush-darwin-arm64": "0.1.3",
+    "@phpcraftdream/crush-win32-x64": "0.1.3"
   }
 }
