@@ -172,7 +172,38 @@ jobs:
             }
           '
 
+      - name: Verify binary reports the expected version
+        # Defense-in-depth against a silent version mismatch: Go's -ldflags -X
+        # no-ops (without error) if the var path is wrong, so a renamed import
+        # path or version.Version symbol would otherwise publish binaries that
+        # report "devel"/"devel-<commit>" instead of the release tag. Fail here,
+        # before `npm publish` ever runs. The linux/x64 package is runnable on
+        # this Actions runner; the same source and LDFLAGS are used for every
+        # cross-compiled package.
+        env:
+          GO_VERSION_STRING: ${{ steps.ver.outputs.go_version }}
+        run: |
+          set -euo pipefail
+          EXPECTED="${GO_VERSION_STRING}"   # e.g. v0.1.0 (resolved from the npm-v tag)
+          if [ -z "$EXPECTED" ]; then
+            echo "::error::expected version is empty — the version-resolution step failed"
+            exit 1
+          fi
+          echo "Expected binary version: $EXPECTED"
+          BIN_PATH="staging/crush-linux-x64/bin/crush"
+          if [ ! -x "$BIN_PATH" ]; then
+            echo "::error::${BIN_PATH} is missing or not executable"
+            exit 1
+          fi
+          OUT="$("$BIN_PATH" --version 2>&1 || true)"
+          echo "linux/amd64 --version: ${OUT}"
+          printf '%s' "$OUT" | grep -F "$EXPECTED" >/dev/null \
+            || { echo "::error::${BIN_PATH} --version did not report ${EXPECTED}"; exit 1; }
+          echo "Binary version verified: ${EXPECTED}"
+
       - name: Publish to npm
+        # Runs only if the "Verify" step above passed (sequential steps in one
+        # job: a failed step halts the job before this one).
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           # Hard invariant: a real publish can only happen when this run IS
