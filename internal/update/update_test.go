@@ -37,6 +37,28 @@ func TestCheckForUpdate_Beta(t *testing.T) {
 	})
 }
 
+func TestInfo_IsDevelopment(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		current string
+		want    bool
+	}{
+		{name: "plain devel", current: "devel", want: true},
+		{name: "devel with build id", current: "devel (abc123)", want: true},
+		{name: "devel with commit", current: "devel-90c57af", want: true},
+		{name: "dirty build", current: "v0.0.0-20260705112643-90c57af7ca7a+dirty", want: true},
+		{name: "go install pseudo version", current: "v0.0.0-0.20251231235959-06c807842604", want: true},
+		{name: "release", current: "v0.1.0", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			require.Equal(t, tt.want, Info{Current: tt.current}.IsDevelopment())
+		})
+	}
+}
+
 type testClient struct{ tag string }
 
 // Latest implements Client.
