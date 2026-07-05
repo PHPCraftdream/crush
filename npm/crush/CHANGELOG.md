@@ -8,7 +8,15 @@ This is the npm-package changelog, not the fork's engineering decision
 log — see [`CHANGELOG.fork.md`](../../CHANGELOG.fork.md) at the repo
 root for the full per-file merge/divergence history.
 
-## [0.1.1]
+## [0.1.2]
+
+- Documented `crush sessions inject` (cross-process message injection,
+  merge and `--interrupt` modes) in the `/crush` slash-command guide —
+  the feature had shipped without the corresponding doc update.
+- 0.1.0 and 0.1.1 were unpublished from npm; 0.1.2 is the first
+  version to install cleanly going forward.
+
+## [0.1.1] (unpublished)
 
 - `crush models list` no longer hits the network or writes the provider
   cache by default; pass `--refresh` to force a fresh fetch.
@@ -24,7 +32,7 @@ root for the full per-file merge/divergence history.
   publish workflow verifies the packaged binary reports the expected
   version before publishing.
 
-## [0.1.0]
+## [0.1.0] (unpublished)
 
 - First release of the npm distribution: `npm install -g
   @phpcraftdream/crush` installs a prebuilt, Go-free binary via
