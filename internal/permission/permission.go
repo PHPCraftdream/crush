@@ -87,6 +87,12 @@ type Service interface {
 	AutoApproveSession(sessionID string)
 	SetSkipRequests(skip bool)
 	SkipRequests() bool
+	// SetRunAllowlist arms the restricted-run allowlist used by
+	// `crush run`. Pass the zero value (or call with IsRestricted ==
+	// false) to restore the legacy auto-approve-everything behaviour.
+	// The allowlist only governs the non-interactive auto-approve path;
+	// it never affects interactive (TUI / web) permission flows.
+	SetRunAllowlist(allowlist RunAllowlist)
 	SubscribeNotifications(ctx context.Context) <-chan pubsub.Event[PermissionNotification]
 	ListSessionPermissions(sessionID string) ([]db.SessionPermission, error)
 	UpdatePermissionEnabled(ruleID string, enabled bool) error
@@ -115,6 +121,13 @@ type permissionService struct {
 	requestMu       sync.Mutex
 	activeRequest   *PermissionRequest
 	activeRequestMu sync.Mutex
+
+	// runAllowlistGate gates the non-interactive auto-approve path. When
+	// its compiled allowlist IsRestricted, AutoApproveSession'd sessions
+	// no longer get blanket approval — each request must clear the
+	// allowlist instead, or it is denied cleanly without waiting for a
+	// UI that isn't there. See runallowlist.go.
+	runAllowlistGate runAllowlistGate
 }
 
 func (s *permissionService) GrantPersistent(permission PermissionRequest) {
@@ -235,6 +248,21 @@ func (s *permissionService) Request(ctx context.Context, opts CreatePermissionRe
 	s.autoApproveSessionsMu.RUnlock()
 
 	if autoApprove {
+		// Restricted-run gate. In a non-interactive `crush run` the
+		// session is auto-approve, but if the operator armed a
+		// restricted allowlist (--restrict-run / permissions.run.restrict)
+		// we must not blanket-grant. Consult the allowlist; unmatched
+		// requests are denied cleanly here so the agent sees a fast
+		// "no" instead of hanging on a UI that doesn't exist.
+		gate := s.runAllowlistGate.load()
+		if gate.IsRestricted() && !gate.allowsRequest(opts) {
+			s.notificationBroker.Publish(pubsub.CreatedEvent, PermissionNotification{
+				ToolCallID: opts.ToolCallID,
+				Granted:    false,
+				Denied:     true,
+			})
+			return false, nil
+		}
 		s.notificationBroker.Publish(pubsub.CreatedEvent, PermissionNotification{
 			ToolCallID: opts.ToolCallID,
 			Granted:    true,
@@ -332,6 +360,13 @@ func (s *permissionService) SetSkipRequests(skip bool) {
 
 func (s *permissionService) SkipRequests() bool {
 	return s.skip.Load()
+}
+
+// SetRunAllowlist arms or clears the restricted-run allowlist. The
+// allowlist is consulted on the auto-approve path only (see Request),
+// so interactive sessions are unaffected.
+func (s *permissionService) SetRunAllowlist(allowlist RunAllowlist) {
+	s.runAllowlistGate.store(allowlist)
 }
 
 func NewPermissionService(ctx context.Context, workingDir string, skip bool, allowedTools []string, q *db.Queries) Service {

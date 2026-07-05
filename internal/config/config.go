@@ -265,7 +265,63 @@ func (c Completions) Limits() (depth, items int) {
 
 type Permissions struct {
 	AllowedTools []string `json:"allowed_tools,omitempty" jsonschema:"description=List of tools that don't require permission prompts,example=bash,example=view"`
-	SkipRequests bool     `json:"-"`
+	// Run configures the permission model for non-interactive
+	// `crush run` invocations. When nil (the default), `crush run` keeps
+	// its current behaviour: every permission request is auto-approved
+	// because no human is on the keyboard. When Run.Restrict is true,
+	// auto-approval flips to deny-by-default and only the requests that
+	// match the allowlists below are approved. Interactive sessions
+	// (TUI / web) are never affected by this setting.
+	Run          *RunPermissions `json:"run,omitempty" jsonschema:"description=Restricted permission model for non-interactive 'crush run'. Off by default; opt in with run.restrict=true or the --restrict-run flag."`
+	SkipRequests bool            `json:"-"`
+}
+
+// RunPermissions configures the restricted permission model for
+// `crush run`. This is the only way to scope what an unattended
+// non-interactive run is allowed to do without wrapping it in an
+// OS-level sandbox.
+//
+// Allowlist semantics (conservative — see internal/permission runallowlist.go):
+//   - AllowTools uses the same "tool" / "tool:action" syntax as
+//     permissions.allowed_tools and bypasses the run gate for matching
+//     NON-BASH tool calls. Entries for "bash" or "bash:execute" are
+//     intentionally ignored by the gate — bash is governed solely by
+//     AllowBash below, so an operator can't accidentally authorise
+//     arbitrary shell commands by listing the tool name. (The global
+//     permissions.allowed_tools fast-path still wins over both and is
+//     the documented escape hatch for a full bash bypass.)
+//   - AllowBash matches the command string of a bash tool call. Each
+//     entry is one of:
+//     "cmd args"   → prefix match on the command string with a word
+//                    boundary after the pattern (e.g. "git diff" matches
+//                    "git diff HEAD~1" but not "git difftool"). Patterns
+//                    of this form never match commands that contain
+//                    shell-chaining metacharacters (; | && $( `) so a
+//                    permissive prefix like "ls" cannot accidentally
+//                    authorise "ls && rm -rf /".
+//     "exact:cmd"  → whole-string match (after trimming whitespace).
+//                    Same chaining guard as the prefix form.
+//     "glob:pat"   → filepath.Match against the raw command string
+//                    (e.g. "glob:git *"). No chaining guard — explicit
+//                    user choice.
+//     "regex:pat"  → regexp.MatchString against the raw command string.
+//                    No chaining guard — explicit user choice.
+type RunPermissions struct {
+	// Restrict enables the restricted permission model for `crush run`.
+	// When false (the default) `crush run` auto-approves every permission
+	// request as before. Must be true for the allowlists below to take
+	// effect.
+	Restrict bool `json:"restrict,omitempty" jsonschema:"description=Enable restricted permission mode for 'crush run'. When true, only allow_tools (non-bash) and allow_bash entries are approved; everything else is denied cleanly. Default false (current auto-approve behaviour).,default=false"`
+
+	// AllowTools lists tool (and optionally tool:action) names that are
+	// auto-approved even in restricted run mode. Entries for "bash" /
+	// "bash:execute" are ignored — use allow_bash for command-level
+	// control of the bash tool.
+	AllowTools []string `json:"allow_tools,omitempty" jsonschema:"description=Non-bash tools (or tool:action pairs) auto-approved in restricted run mode. Entries for 'bash' / 'bash:execute' are ignored — use allow_bash for command-level bash control.,example=view,example=edit:write"`
+
+	// AllowBash lists bash command patterns permitted in restricted run
+	// mode. See the RunPermissions doc comment for the pattern syntax.
+	AllowBash []string `json:"allow_bash,omitempty" jsonschema:"description=Bash command patterns permitted in restricted run mode. Forms: 'cmd args' (word-boundary prefix, chaining-guarded), 'exact:cmd', 'glob:pat', 'regex:pat'.,example=git diff,example=glob:ls *,example=regex:^go (test|build)"`
 }
 
 type TrailerStyle string

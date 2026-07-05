@@ -33,6 +33,8 @@ func (m *mockBashPermissionService) AutoApproveSession(sessionID string) {}
 
 func (m *mockBashPermissionService) SetSkipRequests(skip bool) {}
 
+func (m *mockBashPermissionService) SetRunAllowlist(allowlist permission.RunAllowlist) {}
+
 func (m *mockBashPermissionService) SkipRequests() bool {
 	return false
 }
@@ -114,6 +116,8 @@ func (m *recordingPermissionService) AutoApproveSession(sessionID string) {}
 
 func (m *recordingPermissionService) SetSkipRequests(skip bool) {}
 
+func (m *recordingPermissionService) SetRunAllowlist(allowlist permission.RunAllowlist) {}
+
 func (m *recordingPermissionService) SkipRequests() bool {
 	return false
 }
@@ -151,6 +155,41 @@ func newBashToolWithRecordingPerms(workingDir string, allow bool) (fantasy.Agent
 	}
 	attribution := &config.Attribution{TrailerStyle: config.TrailerStyleNone}
 	return NewBashTool(perms, workingDir, attribution, "test-model", nil), perms
+}
+
+func TestBashPermissionsParams_RunAllowlistCommandContract(t *testing.T) {
+	conn, err := db.Connect(t.Context(), t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() { conn.Close() })
+
+	svc := permission.NewPermissionService(t.Context(), "/tmp", false, nil, db.New(conn))
+	svc.AutoApproveSession("run-session")
+	allowlist, err := permission.BuildRunAllowlist(permission.RunAllowlistSpec{
+		Restrict:  true,
+		AllowBash: []string{"git diff"},
+	})
+	require.NoError(t, err)
+	svc.SetRunAllowlist(allowlist)
+
+	allowed, err := svc.Request(t.Context(), permission.CreatePermissionRequest{
+		SessionID: "run-session",
+		ToolName:  BashToolName,
+		Action:    "execute",
+		Path:      "/tmp",
+		Params:    BashPermissionsParams{Command: "git diff HEAD~1"},
+	})
+	require.NoError(t, err)
+	require.True(t, allowed)
+
+	denied, err := svc.Request(t.Context(), permission.CreatePermissionRequest{
+		SessionID: "run-session",
+		ToolName:  BashToolName,
+		Action:    "execute",
+		Path:      "/tmp",
+		Params:    BashPermissionsParams{Command: "rm -rf /"},
+	})
+	require.NoError(t, err)
+	require.False(t, denied)
 }
 
 func TestBashTool_ChainedCommandsRequirePermission(t *testing.T) {

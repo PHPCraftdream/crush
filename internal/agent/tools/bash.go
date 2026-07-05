@@ -37,6 +37,10 @@ type BashPermissionsParams struct {
 	AutoBackgroundAfter int    `json:"auto_background_after"`
 }
 
+func (p BashPermissionsParams) RunAllowlistCommand() string {
+	return p.Command
+}
+
 type BashResponseMetadata struct {
 	StartTime        int64  `json:"start_time"`
 	EndTime          int64  `json:"end_time"`

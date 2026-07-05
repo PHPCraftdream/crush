@@ -31,6 +31,8 @@ func (m *mockPermissionService) AutoApproveSession(sessionID string) {}
 
 func (m *mockPermissionService) SetSkipRequests(skip bool) {}
 
+func (m *mockPermissionService) SetRunAllowlist(allowlist permission.RunAllowlist) {}
+
 func (m *mockPermissionService) SkipRequests() bool {
 	return false
 }
