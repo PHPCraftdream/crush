@@ -150,34 +150,11 @@ func TestPrefixWordBoundary(t *testing.T) {
 	}
 }
 
-func TestCommandIsCompound(t *testing.T) {
-	// Chaining, substitution, backgrounding — all compound.
-	assert.True(t, commandIsCompound("a && b"))
-	assert.True(t, commandIsCompound("a || b"))
-	assert.True(t, commandIsCompound("a | b"))
-	assert.True(t, commandIsCompound("a; b"))
-	assert.True(t, commandIsCompound("a $(b)"))
-	assert.True(t, commandIsCompound("a `b`"))
-	// Regression guards for the two bypasses the old substring scan
-	// missed: a raw newline and a bare backgrounding `&`.
-	assert.True(t, commandIsCompound("git diff\nrm -rf /"))
-	assert.True(t, commandIsCompound("git diff & rm -rf /"))
-	assert.True(t, commandIsCompound("sleep 1 &"))
-	// A subshell / block is not a single simple command.
-	assert.True(t, commandIsCompound("(rm -rf /)"))
-
-	// Single simple commands — not compound.
-	assert.False(t, commandIsCompound("ls -la"))
-	// A plain redirection operates on ONE command; parsing (unlike the
-	// old substring scan) correctly does not treat it as compound.
-	assert.False(t, commandIsCompound("ls -la 2>&1"))
-	assert.False(t, commandIsCompound("echo hi > out.txt"))
-	// A chaining metacharacter INSIDE quotes is a literal, not a chain —
-	// the parser recognises this where the old substring scan could not.
-	assert.False(t, commandIsCompound("echo 'a; b'"))
-	// Unparseable input errs toward compound (deny-safe).
-	assert.True(t, commandIsCompound("echo 'unterminated"))
-}
+// The compound-command detection itself is exercised by
+// shell.TestIsCompoundCommand; the allowlist-integration behaviour
+// (prefix/exact/glob reject compound) is covered by
+// TestBashCommandAllowed_PrefixRefusesCompoundCommands and the glob/exact
+// tests below.
 
 func TestExtractBashCommand(t *testing.T) {
 	// The concrete bash params type lives in internal/agent/tools; the

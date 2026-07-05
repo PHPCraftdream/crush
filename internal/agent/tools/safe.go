@@ -2,8 +2,6 @@ package tools
 
 import (
 	"runtime"
-	"slices"
-	"strings"
 )
 
 var safeCommands = []string{
@@ -58,21 +56,9 @@ var safeCommands = []string{
 	"git tag",
 }
 
-var chainingMetacharacters = []string{
-	";",
-	"|",
-	"&&",
-	"$(",
-	"`",
-}
-
-// containsCommandChaining reports whether s contains shell metacharacters
-// that enable command chaining or substitution.
-func containsCommandChaining(s string) bool {
-	return slices.ContainsFunc(chainingMetacharacters, func(c string) bool {
-		return strings.Contains(s, c)
-	})
-}
+// Command-chaining detection lives in shell.IsCompoundCommand (a real
+// shell parse), used by bash.go's safe-read-only fast-path. The old
+// substring scan here missed a raw newline and a bare backgrounding `&`.
 
 func init() {
 	if runtime.GOOS == "windows" {

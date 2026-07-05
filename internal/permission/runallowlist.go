@@ -12,8 +12,8 @@ package permission
 //     the whole command string with well-defined semantics (exact,
 //     word-boundary prefix, cross-platform glob, or regexp). The
 //     chaining guard parses the command with the same shell grammar the
-//     bash tool executes (mvdan.cc/sh/v3) so a prefix/exact pattern can
-//     never authorise a compound command — see commandIsCompound.
+//     bash tool executes (shell.IsCompoundCommand) so a prefix/exact/glob
+//     pattern can never authorise a compound command.
 //
 //  2. The matcher is total: it never panics and never blocks. A pattern
 //     that fails to compile (bad regex, bad glob) is reported once via
@@ -30,7 +30,7 @@ import (
 	"strings"
 	"sync"
 
-	"mvdan.cc/sh/v3/syntax"
+	"github.com/charmbracelet/crush/internal/shell"
 )
 
 // RunAllowlistSpec is the user-facing, pre-compilation form of a
@@ -274,53 +274,6 @@ func globToRegexp(glob string) (*regexp.Regexp, error) {
 	return regexp.Compile(b.String())
 }
 
-// commandIsCompound reports whether cmd is anything other than a single
-// simple command — i.e. it chains (`;`, a raw newline, `&&`, `||`, `|`),
-// backgrounds (`&`), substitutes (`$(...)`, backticks), or opens a
-// subshell / block / control structure. Prefix and exact patterns refuse
-// to match compound commands so a permissive prefix such as "ls" cannot
-// authorise "ls && rm -rf /" — or "ls\nrm -rf /", "ls & rm -rf /".
-//
-// The command is parsed with the same shell grammar the bash tool
-// actually executes (mvdan.cc/sh/v3), rather than scanning for a fixed
-// set of metacharacter substrings. This closes two gaps in the old
-// substring scan — a raw newline and a bare backgrounding `&` were not
-// in the list — while, unlike a substring scan, NOT tripping on a
-// metacharacter that appears inside quotes (`echo 'a; b'` is a single
-// command) or in a plain redirection (`ls 2>&1` operates on one
-// command). A command that fails to parse is treated as compound: we
-// refuse to auto-approve something we can't prove is a single command.
-func commandIsCompound(cmd string) bool {
-	file, err := syntax.NewParser().Parse(strings.NewReader(cmd), "")
-	if err != nil {
-		return true
-	}
-	if len(file.Stmts) != 1 {
-		return true
-	}
-	stmt := file.Stmts[0]
-	if stmt.Background {
-		return true
-	}
-	// Anything that isn't a single simple command (a pipeline/`&&`/`||`
-	// BinaryCmd, a subshell, a block, an if/for/while, …) is compound.
-	if _, ok := stmt.Cmd.(*syntax.CallExpr); !ok {
-		return true
-	}
-	// Reject command / process substitution anywhere in the words or
-	// redirections of the single command.
-	compound := false
-	syntax.Walk(stmt, func(node syntax.Node) bool {
-		switch node.(type) {
-		case *syntax.CmdSubst, *syntax.ProcSubst:
-			compound = true
-			return false
-		}
-		return true
-	})
-	return compound
-}
-
 // bashCommandAllowed reports whether cmd satisfies any of the compiled
 // patterns. An empty pattern list denies everything (restricted mode is
 // deny-by-default).
@@ -329,7 +282,7 @@ func bashCommandAllowed(patterns []compiledBashPattern, cmd string) bool {
 	if command == "" {
 		return false
 	}
-	compound := commandIsCompound(command)
+	compound := shell.IsCompoundCommand(command)
 	for _, p := range patterns {
 		switch p.kind {
 		case bashPatternPrefix:
