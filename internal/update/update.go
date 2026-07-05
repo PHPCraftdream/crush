@@ -31,7 +31,16 @@ type Info struct {
 var goInstallRegexp = regexp.MustCompile(`^v?\d+\.\d+\.\d+-\d+\.\d{14}-[0-9a-f]{12}$`)
 
 func (i Info) IsDevelopment() bool {
-	return i.Current == "devel" || i.Current == "unknown" || strings.Contains(i.Current, "dirty") || goInstallRegexp.MatchString(i.Current)
+	// Fork patch: recognise the fork's dev-version formats. internal/version
+	// now emits "devel", "devel (buildID)", and "devel-<commit>[-dirty]" for
+	// local `go build`/`make build`; the go-install pseudo-version and any
+	// dirty marker are also treated as development. These prefixes must stay
+	// in lockstep with deriveDevVersion/formatFullVersion in internal/version.
+	return i.Current == "devel" || i.Current == "unknown" ||
+		strings.HasPrefix(i.Current, "devel ") ||
+		strings.HasPrefix(i.Current, "devel-") ||
+		strings.Contains(i.Current, "dirty") ||
+		goInstallRegexp.MatchString(i.Current)
 }
 
 // Available returns true if there's an update available.

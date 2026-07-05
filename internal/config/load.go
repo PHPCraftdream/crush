@@ -89,7 +89,11 @@ func Load(workingDir, dataDir string, debug bool) (*ConfigStore, error) {
 	if !isInsideWorktree() {
 		const depth = 2
 		const items = 100
-		slog.Warn("No git repository detected in working directory, will limit file walk operations", "depth", depth, "items", items)
+		// Fork patch (orchestrator UX): gate on cfg.Options.Debug (which
+		// already folds in the --debug flag AND options.debug from the
+		// config file) rather than the raw flag, so config-file debug users
+		// still see the notice. See logStartupNotice.
+		logStartupNotice(cfg.Options.Debug, "No git repository detected in working directory, will limit file walk operations", "depth", depth, "items", items)
 		assignIfNil(&cfg.Tools.Ls.MaxDepth, depth)
 		assignIfNil(&cfg.Tools.Ls.MaxItems, items)
 		assignIfNil(&cfg.Options.TUI.Completions.MaxDepth, depth)
@@ -97,7 +101,8 @@ func Load(workingDir, dataDir string, debug bool) (*ConfigStore, error) {
 	}
 
 	if isAppleTerminal() {
-		slog.Warn("Detected Apple Terminal, enabling transparent mode")
+		// Fork patch (orchestrator UX): see the git-repo notice above.
+		logStartupNotice(cfg.Options.Debug, "Detected Apple Terminal, enabling transparent mode")
 		assignIfNil(&cfg.Options.TUI.Transparent, true)
 	}
 
@@ -332,6 +337,45 @@ func (c *Config) configureProviders(ctx context.Context, store *ConfigStore, env
 					continue
 				}
 			}
+		case catwalk.InferenceProviderZAI:
+			// Fork patch (orchestrator UX): ZAI_API_KEY (the primary) is
+			// resolved through the configured template, which is either an
+			// explicit providers.zai.api_key override or the embedded
+			// "$ZAI_API_KEY" default. ZHIPU_API_KEY is accepted as a
+			// fallback so users coming from Zhipu AI's own tooling, which
+			// documents that variable name, don't need to set a second
+			// variable. It's only consulted when the primary resolves
+			// CLEANLY to empty, so ZAI_API_KEY always wins. Both names
+			// honour the CRUSH_ prefix via PushPopCrushEnv above.
+			v, err := resolver.ResolveValue(p.APIKey)
+			switch {
+			case err != nil:
+				// An explicitly configured api_key (e.g. a "$(...)" command)
+				// that FAILED to resolve is a real misconfiguration. Warn and
+				// skip like the default case rather than silently masking the
+				// failure with the ZHIPU fallback and then sending requests
+				// with the wrong/rotated key.
+				if configExists {
+					slog.Warn("Skipping Z.AI provider due to API key resolution error", "provider", p.ID, "error", err)
+					c.Providers.Del(string(p.ID))
+				}
+				continue
+			case v == "":
+				// Primary resolved cleanly to empty (ZAI_API_KEY unset). Fall
+				// back to ZHIPU_API_KEY if present, else warn+skip.
+				if apiKey := env.Get("ZHIPU_API_KEY"); apiKey != "" {
+					prepared.APIKey = apiKey
+					prepared.APIKeyTemplate = apiKey
+				} else {
+					if configExists {
+						slog.Warn("Skipping Z.AI provider due to missing API key", "provider", p.ID)
+						c.Providers.Del(string(p.ID))
+					}
+					continue
+				}
+			}
+			// v != "" && err == nil: the primary key resolved — keep the
+			// template unchanged so ZAI_API_KEY wins.
 		default:
 			// if the provider api or endpoint are missing we skip them
 			v, err := resolver.ResolveValue(p.APIKey)
@@ -1076,6 +1120,28 @@ func ProjectSkillsDir(workingDir string) []string {
 }
 
 func isAppleTerminal() bool { return os.Getenv("TERM_PROGRAM") == "Apple_Terminal" }
+
+// logStartupNotice emits a non-actionable startup diagnostic at Warn
+// level only when debug mode is enabled. These notices describe an
+// environment-derived default the user cannot act on from a scripted
+// invocation ("no git repo means limited walk depth", "Apple Terminal
+// means transparent mode"); the config adjustment itself still applies.
+// They fired unconditionally on every invocation, including `crush run
+// --json` and the `logs`/`sessions`/`mcp` scripting commands,
+// polluting stderr that orchestrators capture.
+//
+// Fork patch (orchestrator UX): callers pass cfg.Options.Debug (which
+// folds in both the --debug flag and options.debug from the config
+// file), so the verbose path — `crush --debug`, `crush run --debug`,
+// OR `"options": {"debug": true}` — still surfaces them while default
+// and scripted paths stay quiet. Real provider/config/auth warnings
+// elsewhere in Load are unaffected.
+func logStartupNotice(debug bool, msg string, args ...any) {
+	if !debug {
+		return
+	}
+	slog.Warn(msg, args...)
+}
 
 // normalizeHookEvent maps user-provided event names to their canonical
 // form. Matching is case-insensitive and accepts snake_case variants

@@ -219,3 +219,84 @@ func TestCatwalkSync_GetCalledMultipleTimesUsesOnce(t *testing.T) {
 	// Client should only be called once due to sync.Once.
 	require.Equal(t, 1, client.callCount)
 }
+
+// TestCatwalkSync_GetCacheOnlySkipsNetwork proves that when
+// CRUSH_PROVIDER_CACHE_ONLY=1 the syncer serves cached data without
+// calling the network client and without rewriting the cache file.
+//
+// This is the contract `crush models list` (default, no --refresh)
+// relies on so a read-only listing has no network/disk side effects.
+//
+// Not parallel: t.Setenv mutates process-global env, which the testing
+// framework forbids inside t.Parallel.
+func TestCatwalkSync_GetCacheOnlySkipsNetwork(t *testing.T) {
+	// t.Setenv restores the prior value on exit, so this does not leak
+	// into other tests in the package.
+	t.Setenv("CRUSH_PROVIDER_CACHE_ONLY", "1")
+	// Force TTL=0 in parallel with cache-only to prove cache-only wins
+	// over the "always re-fetch" TTL setting.
+	t.Setenv("CRUSH_PROVIDER_CACHE_TTL", "0")
+
+	tmpDir := t.TempDir()
+	path := tmpDir + "/providers.json"
+
+	// Seed a cache file so we can prove the syncer returns the cached
+	// payload verbatim rather than the embedded fallback.
+	cachedProviders := []catwalk.Provider{
+		{Name: "Cached Provider", ID: "cached"},
+	}
+	data, err := json.Marshal(cachedProviders)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path, data, 0o644))
+
+	infoBefore, err := os.Stat(path)
+	require.NoError(t, err)
+
+	syncer := &catwalkSync{}
+	client := &mockCatwalkClient{
+		providers: []catwalk.Provider{{Name: "should-not-be-fetched"}},
+	}
+	syncer.Init(client, path, true)
+
+	providers, err := syncer.Get(t.Context())
+	require.NoError(t, err)
+	require.Len(t, providers, 1)
+	require.Equal(t, "Cached Provider", providers[0].Name, "cache-only must serve cached payload")
+	require.Equal(t, 0, client.callCount, "network client must not be called in cache-only mode")
+
+	// Cache file must be untouched (no Store() call).
+	infoAfter, err := os.Stat(path)
+	require.NoError(t, err)
+	require.Equal(t, infoBefore.ModTime(), infoAfter.ModTime(), "cache file must not be rewritten in cache-only mode")
+	require.Equal(t, infoBefore.Size(), infoAfter.Size(), "cache file size must not change in cache-only mode")
+}
+
+// TestCatwalkSync_GetCacheOnlyFallsBackToEmbedded proves that when
+// CRUSH_PROVIDER_CACHE_ONLY=1 and no cache file exists, the syncer
+// falls back to the embedded provider list without calling the network
+// client or creating a cache file.
+//
+// Not parallel: t.Setenv mutates process-global env.
+func TestCatwalkSync_GetCacheOnlyFallsBackToEmbedded(t *testing.T) {
+	t.Setenv("CRUSH_PROVIDER_CACHE_ONLY", "1")
+	t.Setenv("CRUSH_PROVIDER_CACHE_TTL", "0")
+
+	// No cache file at this path.
+	path := t.TempDir() + "/providers.json"
+
+	syncer := &catwalkSync{}
+	client := &mockCatwalkClient{
+		providers: []catwalk.Provider{{Name: "should-not-be-fetched"}},
+	}
+	syncer.Init(client, path, true)
+
+	providers, err := syncer.Get(t.Context())
+	require.NoError(t, err)
+	require.NotEmpty(t, providers, "embedded fallback must be returned")
+	require.Greater(t, len(providers), 5, "embedded provider list has many entries")
+	require.Equal(t, 0, client.callCount, "network client must not be called in cache-only mode")
+
+	// No cache file must have been created.
+	_, statErr := os.Stat(path)
+	require.True(t, os.IsNotExist(statErr), "cache file must not be created in cache-only mode")
+}
