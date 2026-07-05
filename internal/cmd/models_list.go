@@ -2,6 +2,11 @@
 // by enabled providers + a section of raw provider/model IDs for everything
 // else available right now. Replaces the implicit "discoverability via
 // `crush models <fuzzy>` only" path.
+//
+// Fork patch (orchestrator UX): by default this command reads cached/embedded
+// provider data and does NOT trigger a network refresh or write the provider
+// cache. Pass --refresh to force a network fetch of the latest provider lists
+// before rendering.
 package cmd
 
 import (
@@ -30,10 +35,20 @@ enabled provider as a raw "provider/model" string — those are also
 accepted by ` + "`crush models use`" + ` as a fallback when a model is not in
 the atom registry.
 
+By default this command does not hit the network: it reads the on-disk
+provider cache (or the embedded provider list bundled with Crush when no
+cache exists yet) and does not write any cache files. Pass ` + "`--refresh`" + `
+to force a fresh fetch of the provider lists from Catwalk and Hyper
+before rendering. The JSON output shape is identical in both modes.
+
 ` + "`--json`" + ` emits a structured object: { "atoms": [...], "other_models": [...] }.`,
 	Example: `
 # Human-readable atom table + raw provider/model listing for enabled providers.
+# Reads the on-disk provider cache (or embedded fallback); no network.
 crush models list
+
+# Force a network refresh of the provider cache before listing.
+crush models list --refresh
 
 # Just the atoms (skip the OTHER MODELS section visually via head/sed):
 crush models list | sed '/^OTHER MODELS/,$d'
@@ -46,6 +61,13 @@ crush models list --json | jq '.other_models[] | select(.provider=="zai")'
   `,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		asJSON, _ := cmd.Flags().GetBool("json")
+		refresh, _ := cmd.Flags().GetBool("refresh")
+		// Fork patch (orchestrator UX): control provider-fetch side
+		// effects via the existing env-var seam consumed by the
+		// catwalk/hyper syncers. Default (no --refresh): cache-only,
+		// no network, no cache write. With --refresh: clear cache-only
+		// and force TTL=0 so the syncers always re-fetch.
+		applyModelsListRefreshMode(refresh)
 		a, err := setupApp(cmd)
 		if err != nil {
 			return err
@@ -61,6 +83,24 @@ crush models list --json | jq '.other_models[] | select(.provider=="zai")'
 		fmt.Print(renderOtherModelsBlock(cfg))
 		return nil
 	},
+}
+
+// applyModelsListRefreshMode configures the provider syncers' env-var seam
+// for a `crush models list` invocation. When refresh is false (the default),
+// provider data is served from the on-disk cache or the embedded fallback
+// without any network call or cache write. When refresh is true, any
+// cache-only override is cleared and CRUSH_PROVIDER_CACHE_TTL is forced to
+// zero so the syncers always perform a network fetch and update the cache.
+//
+// The mutations are process-local: `crush models list` is a short-lived
+// process, so the env vars never leak back into the user's shell.
+func applyModelsListRefreshMode(refresh bool) {
+	if refresh {
+		_ = os.Unsetenv("CRUSH_PROVIDER_CACHE_ONLY")
+		os.Setenv("CRUSH_PROVIDER_CACHE_TTL", "0")
+		return
+	}
+	os.Setenv("CRUSH_PROVIDER_CACHE_ONLY", "1")
 }
 
 type atomJSON struct {
@@ -179,5 +219,6 @@ func joinLevels(ls []string) string {
 
 func init() {
 	modelsListCmd.Flags().Bool("json", false, "Emit a structured JSON object instead of human-readable text")
+	modelsListCmd.Flags().Bool("refresh", false, "Force a network refresh of provider data before listing (default: read cache/embedded only, no network)")
 	modelsCmd.AddCommand(modelsListCmd)
 }

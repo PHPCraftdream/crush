@@ -306,10 +306,18 @@ file and strips any remaining legacy `CLAUDE.md` block.
 Three commands cover the whole surface:
 
 ```bash
-crush models list           # show available atoms + raw provider/model ids
+crush models list           # show available atoms + raw provider/model ids (reads cache; no network)
+crush models list --refresh # force a network refresh of provider data before listing
 crush models use <large> <small> [--global | --local]
 crush models state          # what's effective + per-scope breakdown (alias: `show`)
 ```
+
+> **No side effects by default:** `crush models list` reads the on-disk
+> provider cache (or the embedded provider list bundled with Crush when
+> no cache exists yet) and does NOT trigger a network fetch or write any
+> cache files. Pass `--refresh` to force a fresh fetch from Catwalk and
+> Hyper before rendering. The output shape (text and `--json`) is
+> identical in both modes.
 
 **Atoms** are short, friendly aliases. `list` prints them filtered by your
 currently-enabled providers — disabled providers' atoms are hidden so the
@@ -577,6 +585,7 @@ That said, you can also set environment variables for preferred providers.
 | `GEMINI_API_KEY`            | Google Gemini                                      |
 | `SYNTHETIC_API_KEY`         | Synthetic                                          |
 | `ZAI_API_KEY`               | Z.ai                                               |
+| `ZHIPU_API_KEY`             | Z.ai (fallback when `ZAI_API_KEY` is unset)        |
 | `MINIMAX_API_KEY`           | MiniMax                                            |
 | `HF_TOKEN`                  | Hugging Face Inference                             |
 | `CEREBRAS_API_KEY`          | Cerebras                                           |

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"charm.land/fantasy"
+	"github.com/charmbracelet/crush/internal/config"
 	"github.com/stretchr/testify/require"
 )
 
@@ -84,7 +85,7 @@ func TestPingRateLimitReset(t *testing.T) {
 func TestPingCmd_Exists(t *testing.T) {
 	t.Parallel()
 	require.NotNil(t, pingCmd)
-	require.Equal(t, "ping [--json] [--timeout 15s] [--prompt \"<custom>\"]", pingCmd.Use)
+	require.Equal(t, "ping [--role smart|fast] [--json] [--timeout 15s] [--prompt \"<custom>\"]", pingCmd.Use)
 	require.NotEmpty(t, pingCmd.Short)
 	require.NotEmpty(t, pingCmd.Long)
 }
@@ -94,6 +95,7 @@ func TestPingCmd_Flags(t *testing.T) {
 	require.NotNil(t, pingCmd.Flags().Lookup("json"))
 	require.NotNil(t, pingCmd.Flags().Lookup("timeout"))
 	require.NotNil(t, pingCmd.Flags().Lookup("prompt"))
+	require.NotNil(t, pingCmd.Flags().Lookup("role"))
 }
 
 func TestPingCmd_DefaultTimeout(t *testing.T) {
@@ -229,4 +231,59 @@ func TestPingCmd_CommandsRegistered(t *testing.T) {
 
 	require.True(t, pingFound, "ping command should be registered")
 	require.True(t, pingFastFound, "ping-fast command should be registered")
+}
+
+func TestResolvePingRole(t *testing.T) {
+	t.Parallel()
+
+	t.Run("empty defaults to large", func(t *testing.T) {
+		t.Parallel()
+		modelType, err := resolvePingRole("")
+		require.NoError(t, err)
+		require.Equal(t, config.SelectedModelTypeLarge, modelType)
+	})
+
+	t.Run("smart aliases to large", func(t *testing.T) {
+		t.Parallel()
+		modelType, err := resolvePingRole("smart")
+		require.NoError(t, err)
+		require.Equal(t, config.SelectedModelTypeLarge, modelType)
+	})
+
+	t.Run("large aliases to large", func(t *testing.T) {
+		t.Parallel()
+		modelType, err := resolvePingRole("large")
+		require.NoError(t, err)
+		require.Equal(t, config.SelectedModelTypeLarge, modelType)
+	})
+
+	t.Run("fast aliases to small", func(t *testing.T) {
+		t.Parallel()
+		modelType, err := resolvePingRole("fast")
+		require.NoError(t, err)
+		require.Equal(t, config.SelectedModelTypeSmall, modelType)
+	})
+
+	t.Run("small aliases to small", func(t *testing.T) {
+		t.Parallel()
+		modelType, err := resolvePingRole("small")
+		require.NoError(t, err)
+		require.Equal(t, config.SelectedModelTypeSmall, modelType)
+	})
+
+	t.Run("invalid role is rejected with run-consistent wording", func(t *testing.T) {
+		t.Parallel()
+		_, err := resolvePingRole("turbo")
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "--role: invalid value")
+		require.Contains(t, err.Error(), "turbo")
+		require.Contains(t, err.Error(), "smart|large")
+		require.Contains(t, err.Error(), "fast|small")
+	})
+
+	t.Run("role is case-sensitive", func(t *testing.T) {
+		t.Parallel()
+		_, err := resolvePingRole("Smart")
+		require.Error(t, err)
+	})
 }

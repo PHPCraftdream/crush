@@ -203,3 +203,82 @@ func TestHyperSync_GetCacheStoreError(t *testing.T) {
 	require.Contains(t, err.Error(), "failed to create directory for provider cache")
 	require.Equal(t, "Hyper", provider.Name) // Provider is still returned.
 }
+
+// TestHyperSync_GetCacheOnlySkipsNetwork proves that when
+// CRUSH_PROVIDER_CACHE_ONLY=1 the syncer serves cached data without
+// calling the network client and without rewriting the cache file.
+//
+// This is the contract `crush models list` (default, no --refresh)
+// relies on so a read-only listing has no network/disk side effects.
+//
+// Not parallel: t.Setenv mutates process-global env.
+func TestHyperSync_GetCacheOnlySkipsNetwork(t *testing.T) {
+	t.Setenv("CRUSH_PROVIDER_CACHE_ONLY", "1")
+	// Force TTL=0 alongside cache-only to prove cache-only wins.
+	t.Setenv("CRUSH_PROVIDER_CACHE_TTL", "0")
+
+	tmpDir := t.TempDir()
+	path := tmpDir + "/hyper.json"
+
+	// Seed a cache file.
+	cachedProvider := catwalk.Provider{
+		Name: "Cached Hyper",
+		ID:   "hyper",
+		Models: []catwalk.Model{
+			{ID: "cached-model", Name: "Cached Model"},
+		},
+	}
+	data, err := json.Marshal(cachedProvider)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path, data, 0o644))
+
+	infoBefore, err := os.Stat(path)
+	require.NoError(t, err)
+
+	syncer := &hyperSync{}
+	client := &mockHyperClient{
+		provider: catwalk.Provider{Name: "should-not-be-fetched"},
+	}
+	syncer.Init(client, path, true)
+
+	provider, err := syncer.Get(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, "Cached Hyper", provider.Name, "cache-only must serve cached payload")
+	require.Equal(t, 0, client.callCount, "network client must not be called in cache-only mode")
+
+	// Cache file must be untouched.
+	infoAfter, err := os.Stat(path)
+	require.NoError(t, err)
+	require.Equal(t, infoBefore.ModTime(), infoAfter.ModTime(), "cache file must not be rewritten in cache-only mode")
+	require.Equal(t, infoBefore.Size(), infoAfter.Size(), "cache file size must not change in cache-only mode")
+}
+
+// TestHyperSync_GetCacheOnlyFallsBackToEmbedded proves that when
+// CRUSH_PROVIDER_CACHE_ONLY=1 and no cache file exists, the syncer
+// falls back to the embedded provider without calling the network
+// client or creating a cache file.
+//
+// Not parallel: t.Setenv mutates process-global env.
+func TestHyperSync_GetCacheOnlyFallsBackToEmbedded(t *testing.T) {
+	t.Setenv("CRUSH_PROVIDER_CACHE_ONLY", "1")
+	t.Setenv("CRUSH_PROVIDER_CACHE_TTL", "0")
+
+	// No cache file at this path.
+	path := t.TempDir() + "/hyper.json"
+
+	syncer := &hyperSync{}
+	client := &mockHyperClient{
+		provider: catwalk.Provider{Name: "should-not-be-fetched"},
+	}
+	syncer.Init(client, path, true)
+
+	provider, err := syncer.Get(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, "Charm Hyper", provider.Name, "embedded fallback must be returned")
+	require.Equal(t, catwalk.InferenceProvider("hyper"), provider.ID)
+	require.Equal(t, 0, client.callCount, "network client must not be called in cache-only mode")
+
+	// No cache file must have been created.
+	_, statErr := os.Stat(path)
+	require.True(t, os.IsNotExist(statErr), "cache file must not be created in cache-only mode")
+}

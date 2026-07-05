@@ -30,9 +30,9 @@ import (
 )
 
 var pingCmd = &cobra.Command{
-	Use:   "ping [--json] [--timeout 15s] [--prompt \"<custom>\"]",
-	Short: "Ping the large model to verify connectivity and API key",
-	Long: `Send a minimal request to the configured large model to verify connectivity,
+	Use:   "ping [--role smart|fast] [--json] [--timeout 15s] [--prompt \"<custom>\"]",
+	Short: "Ping a configured model to verify connectivity and API key",
+	Long: `Send a minimal request to the configured model to verify connectivity,
 API key validity, and measure latency. Works with any provider: API-based
 (Anthropic, OpenAI, Google, …) and CLI-based (claude, gemini, codex, qwen).
 
@@ -41,10 +41,19 @@ response sets status=degraded (for CLI models, any non-empty reply counts
 as ok because the local CLI injects its own system context).
 
 Auth/quota errors set status=error with exit code 1.
-Timeouts set status=timeout with exit code 2.`,
+Timeouts set status=timeout with exit code 2.
+
+--role selects which model slot to ping: smart|large (the default, same as
+'crush ping') or fast|small (same as 'crush ping-fast').`,
 	Example: `
 # Ping whichever large model is currently configured
 crush ping
+
+# Ping the small/fast slot without switching to ping-fast
+crush ping --role fast
+
+# Ping the large/smart slot explicitly
+crush ping --role smart
 
 # Ping the small model slot
 crush ping-fast
@@ -65,7 +74,12 @@ crush ping --json
 crush ping --timeout 30s --prompt "Reply with yes or no"
   `,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return runPing(cmd, config.SelectedModelTypeLarge)
+		role, _ := cmd.Flags().GetString("role")
+		modelType, err := resolvePingRole(role)
+		if err != nil {
+			return err
+		}
+		return runPing(cmd, modelType)
 	},
 }
 
@@ -671,10 +685,27 @@ func stringPtr(s string) *string {
 	return &s
 }
 
+// resolvePingRole maps a --role value to the model slot to ping. An empty
+// role keeps the historical `crush ping` default (the large/smart model).
+// Accepted aliases mirror `crush run --role` so users can use the same
+// vocabulary across both commands; an unknown value is rejected with the
+// same error wording.
+func resolvePingRole(role string) (config.SelectedModelType, error) {
+	switch role {
+	case "", "large", "smart":
+		return config.SelectedModelTypeLarge, nil
+	case "small", "fast":
+		return config.SelectedModelTypeSmall, nil
+	default:
+		return "", fmt.Errorf("--role: invalid value %q (allowed: smart|large, fast|small)", role)
+	}
+}
+
 func init() {
 	pingCmd.Flags().Bool("json", false, "Emit JSON output instead of human-readable text")
 	pingCmd.Flags().Duration("timeout", 15*time.Second, "Request timeout")
 	pingCmd.Flags().String("prompt", "", "Custom user prompt (default: \"ping\")")
+	pingCmd.Flags().String("role", "", "Which model slot to ping: smart|large (default) or fast|small")
 
 	pingFastCmd.Flags().Bool("json", false, "Emit JSON output instead of human-readable text")
 	pingFastCmd.Flags().Duration("timeout", 15*time.Second, "Request timeout")

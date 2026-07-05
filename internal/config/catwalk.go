@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -31,6 +32,26 @@ func providerCacheTTL() time.Duration {
 		}
 	}
 	return defaultProviderCacheTTL
+}
+
+// providerCacheOnly reports whether provider syncers should operate in
+// cache-only mode: read the on-disk cache (or fall back to embedded
+// providers when no cache exists) and NEVER hit the network or write
+// the cache. Opt-in via CRUSH_PROVIDER_CACHE_ONLY=1.
+//
+// Fork patch (orchestrator UX): `crush models list` sets this so a
+// read-only listing does not produce "Fetching Hyper provider" /
+// "Fetching providers from Catwalk" log lines or provider cache writes
+// as a side effect. Use `crush models list --refresh` (which clears
+// this and forces CRUSH_PROVIDER_CACHE_TTL=0) to force a network
+// refresh.
+func providerCacheOnly() bool {
+	v := os.Getenv("CRUSH_PROVIDER_CACHE_ONLY")
+	if v == "" {
+		return false
+	}
+	b, _ := strconv.ParseBool(v)
+	return b
 }
 
 type catwalkClient interface {
@@ -72,6 +93,18 @@ func (s *catwalkSync) Get(ctx context.Context) ([]catwalk.Provider, error) {
 		if len(cached) == 0 || cachedErr != nil {
 			// if cached file is empty, default to embedded providers
 			cached = embedded.GetAll()
+		}
+
+		// Fork patch (orchestrator UX): cache-only mode short-circuits
+		// here: serve whatever the on-disk cache had (or embedded
+		// fallback populated above) without ever calling the network
+		// client or rewriting the cache. Driven by CRUSH_PROVIDER_CACHE_ONLY,
+		// set by `crush models list` so a read-only listing has no
+		// network/disk side effects.
+		if providerCacheOnly() {
+			slog.Debug("Catwalk providers cache-only mode, skipping fetch", "cached", len(cached))
+			s.result = cached
+			return
 		}
 
 		// Fork patch (orchestrator UX): skip the HTTP call when the

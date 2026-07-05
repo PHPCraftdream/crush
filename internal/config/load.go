@@ -89,7 +89,7 @@ func Load(workingDir, dataDir string, debug bool) (*ConfigStore, error) {
 	if !isInsideWorktree() {
 		const depth = 2
 		const items = 100
-		slog.Warn("No git repository detected in working directory, will limit file walk operations", "depth", depth, "items", items)
+		logStartupNotice(debug, "No git repository detected in working directory, will limit file walk operations", "depth", depth, "items", items)
 		assignIfNil(&cfg.Tools.Ls.MaxDepth, depth)
 		assignIfNil(&cfg.Tools.Ls.MaxItems, items)
 		assignIfNil(&cfg.Options.TUI.Completions.MaxDepth, depth)
@@ -97,7 +97,7 @@ func Load(workingDir, dataDir string, debug bool) (*ConfigStore, error) {
 	}
 
 	if isAppleTerminal() {
-		slog.Warn("Detected Apple Terminal, enabling transparent mode")
+		logStartupNotice(debug, "Detected Apple Terminal, enabling transparent mode")
 		assignIfNil(&cfg.Options.TUI.Transparent, true)
 	}
 
@@ -327,6 +327,28 @@ func (c *Config) configureProviders(ctx context.Context, store *ConfigStore, env
 				if v == "" || err != nil {
 					if configExists {
 						slog.Warn("Skipping Hyper provider due to missing API key", "provider", p.ID)
+						c.Providers.Del(string(p.ID))
+					}
+					continue
+				}
+			}
+		case catwalk.InferenceProviderZAI:
+			// ZAI_API_KEY (the primary) is resolved through the
+			// configured template, which is either an explicit
+			// providers.zai.api_key override or the embedded
+			// "$ZAI_API_KEY" default. ZHIPU_API_KEY is accepted as a
+			// fallback so users coming from Zhipu AI's own tooling,
+			// which documents that variable name, don't need to set a
+			// second variable. It's only consulted when the primary
+			// resolves to empty, so ZAI_API_KEY always wins. Both names
+			// honour the CRUSH_ prefix via PushPopCrushEnv above.
+			if v, err := resolver.ResolveValue(p.APIKey); v == "" || err != nil {
+				if apiKey := env.Get("ZHIPU_API_KEY"); apiKey != "" {
+					prepared.APIKey = apiKey
+					prepared.APIKeyTemplate = apiKey
+				} else {
+					if configExists {
+						slog.Warn("Skipping Z.AI provider due to missing API key", "provider", p.ID)
 						c.Providers.Del(string(p.ID))
 					}
 					continue
@@ -1076,6 +1098,25 @@ func ProjectSkillsDir(workingDir string) []string {
 }
 
 func isAppleTerminal() bool { return os.Getenv("TERM_PROGRAM") == "Apple_Terminal" }
+
+// logStartupNotice emits a non-actionable startup diagnostic at Warn
+// level only when debug mode is enabled. These notices describe an
+// environment-derived default the user cannot act on from a scripted
+// invocation ("no git repo means limited walk depth", "Apple Terminal
+// means transparent mode"); the config adjustment itself still applies.
+// They fired unconditionally on every invocation, including `crush run
+// --json` and the `logs`/`sessions`/`mcp` scripting commands,
+// polluting stderr that orchestrators capture. Gating on `debug`
+// matches the existing verbose path: `crush --debug` (and `crush run
+// --debug`) still surface them, while default and scripted paths stay
+// quiet. Real provider/config/auth warnings elsewhere in Load are
+// unaffected.
+func logStartupNotice(debug bool, msg string, args ...any) {
+	if !debug {
+		return
+	}
+	slog.Warn(msg, args...)
+}
 
 // normalizeHookEvent maps user-provided event names to their canonical
 // form. Matching is case-insensitive and accepts snake_case variants
