@@ -96,6 +96,15 @@ func New(ctx context.Context, conn *sql.DB, store *config.ConfigStore) (*App, er
 		events:             pubsub.NewBroker[any](),
 	}
 
+	// NOTE: the restricted-run allowlist is deliberately NOT armed here.
+	// app.New builds the App shared by BOTH `crush run` and the
+	// interactive web/TUI server, and the gate would then leak into
+	// interactive sessions — an auto-approved sub-agent (e.g.
+	// agentic_fetch) would be denied-by-default even though interactive
+	// mode must stay exempt. RunNonInteractive arms the gate itself from
+	// config + CLI overrides on every run, so the run path is unaffected.
+	// Fork patch (run allowlist).
+
 	// Check for updates in the background.
 	go app.checkForUpdates(ctx)
 
@@ -608,6 +617,19 @@ type RunOverrides struct {
 	// The context-level deadline is applied separately by the caller.
 	// Fork patch (operator UX).
 	Timeout time.Duration
+	// RestrictedRun enables the restricted-run permission model for
+	// this non-interactive invocation, merged with
+	// permissions.run.restrict from config. When armed, only allowlist
+	// matches are auto-approved; everything else is denied cleanly.
+	// Fork patch (run allowlist).
+	RestrictedRun bool
+	// AllowBash appends bash command patterns for this run, merged with
+	// permissions.run.allow_bash from config. Fork patch (run allowlist).
+	AllowBash []string
+	// AllowTools appends tool (or tool:action) entries for this run,
+	// merged with permissions.run.allow_tools from config.
+	// Fork patch (run allowlist).
+	AllowTools []string
 }
 
 // RunNonInteractive runs a single agent turn and writes its result to
@@ -750,6 +772,24 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt 
 	// Automatically approve all permission requests for this non-interactive
 	// session.
 	app.Permissions.AutoApproveSession(sess.ID)
+
+	// Fork patch (run allowlist): (re)arm the restricted-run allowlist
+	// by merging the config-derived spec with this invocation's CLI
+	// overrides. Even when no override is passed we rebuild from config
+	// so the gate stays consistent with whatever permissions.run was on
+	// disk at run time. SetRunAllowlist only affects the auto-approve
+	// path exercised above; interactive sessions never run this code.
+	runSpec := runAllowlistSpecFromConfig(app.config.Config().Permissions)
+	if overrides.RestrictedRun {
+		runSpec.Restrict = true
+	}
+	runSpec.AllowBash = append(runSpec.AllowBash, overrides.AllowBash...)
+	runSpec.AllowTools = append(runSpec.AllowTools, overrides.AllowTools...)
+	compiled, allowErr := permission.BuildRunAllowlist(runSpec)
+	if allowErr != nil {
+		slog.Warn("Restricted-run allowlist has invalid patterns (skipping them)", "err", allowErr)
+	}
+	app.Permissions.SetRunAllowlist(compiled)
 
 	// Fork patch: batch 8 — wire per-invocation timeout extension flags to
 	// the coordinator's agent before the run starts.
@@ -1413,4 +1453,21 @@ func (app *App) checkForUpdates(ctx context.Context) {
 	if err != nil || !info.Available() {
 		return
 	}
+}
+
+// runAllowlistSpecFromConfig reads the config-derived restricted-run
+// allowlist spec (pre-compilation). Returns an inert spec (Restrict =
+// false) when permissions.run is absent or disabled, preserving the
+// legacy `crush run` auto-approve-everything behaviour.
+func runAllowlistSpecFromConfig(p *config.Permissions) permission.RunAllowlistSpec {
+	spec := permission.RunAllowlistSpec{}
+	if p == nil || p.Run == nil {
+		return spec
+	}
+	spec.Restrict = p.Run.Restrict
+	// Defensive copies so a later config reload can't mutate the spec
+	// we hand to the compiler.
+	spec.AllowTools = append(spec.AllowTools, p.Run.AllowTools...)
+	spec.AllowBash = append(spec.AllowBash, p.Run.AllowBash...)
+	return spec
 }

@@ -825,6 +825,68 @@ permissions. Use this with care.
 }
 ```
 
+### Restricting `crush run`
+
+Non-interactive `crush run` invocations auto-approve every permission request
+by default (no human is on the keyboard). The `permissions.run` block flips
+that to deny-by-default so an unattended run can be scoped to a known-safe
+allowlist. Interactive sessions (TUI / web) are never affected.
+
+Set `permissions.run.restrict` to `true`, then list the non-bash tools
+(`allow_tools`, same `tool` / `tool:action` syntax as `allowed_tools`) and
+bash command patterns (`allow_bash`) the run may use. Anything outside those
+lists is denied cleanly.
+
+```json
+{
+  "$schema": "https://charm.land/crush.json",
+  "permissions": {
+    "run": {
+      "restrict": true,
+      "allow_tools": ["view", "edit:write"],
+      "allow_bash": [
+        "git diff",
+        "glob:ls *",
+        "regex:^go (test|build)"
+      ]
+    }
+  }
+}
+```
+
+`allow_bash` entries take one of four forms:
+
+- `cmd args` — word-boundary prefix match (e.g. `"git diff"` matches
+  `"git diff HEAD~1"` but not `"git difftool"`). Chaining metacharacters
+  (`;`, `|`, `&&`, `$(`, `` ` ``) are refused, so `"ls"` can never approve
+  `"ls && rm -rf /"`.
+- `exact:cmd` — whole-string equality after trimming whitespace; same
+  chaining guard.
+- `glob:pat` — `filepath.Match` against the raw command string. No chaining
+  guard (explicit user wildcard).
+- `regex:pat` — regexp match against the raw command string. No chaining
+  guard (explicit user pattern).
+
+`allow_tools` entries for `"bash"` / `"bash:execute"` are intentionally
+ignored by the run gate — bash is governed solely by `allow_bash`, so an
+operator can't accidentally authorise arbitrary shell commands by listing
+the tool name. To bypass the gate for bash wholesale, use the global
+`permissions.allowed_tools` (which is checked before the gate); otherwise
+leave `bash` out of `allowed_tools` and use `run.allow_bash`.
+
+The same options are available as CLI flags on `crush run`, which merge
+(union) with the config block. `--restrict-run` forces restrict on even
+when the config has it off:
+
+```sh
+crush run --restrict-run \
+  --allow-bash 'git diff' \
+  --allow-bash 'glob:ls *' \
+  --allow-tool view \
+  --allow-tool edit:write \
+  "fix the failing tests"
+```
+
 ### Disabling Built-In Tools
 
 If you'd like to prevent Crush from using certain built-in tools entirely, you

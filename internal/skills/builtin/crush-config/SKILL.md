@@ -363,6 +363,69 @@ When multiple hooks match, their decisions are aggregated:
 }
 ```
 
+### Restricted `crush run` allowlist
+
+By default `crush run` is non-interactive and auto-approves every
+permission request (no one is at the keyboard). For unattended / CI use
+you can flip to a deny-by-default model and carve out exactly what the
+run may do. This only affects `crush run`; interactive TUI / web
+sessions keep the normal permission flow.
+
+```json
+{
+  "permissions": {
+    "allowed_tools": ["view"],
+    "run": {
+      "restrict": true,
+      "allow_tools": ["view", "edit:write"],
+      "allow_bash": [
+        "git diff",
+        "glob:ls *",
+        "regex:^go (test|build)(\\s|$)"
+      ]
+    }
+  }
+}
+```
+
+- `run.restrict` arms the gate. Without it (the default), `crush run`
+  keeps auto-approving everything.
+- `run.allow_tools` uses the same `tool` / `tool:action` syntax as
+  `allowed_tools` and bypasses the run gate for matching **non-bash**
+  tool calls. Entries for `bash` / `bash:execute` are intentionally
+  ignored — bash is governed solely by `run.allow_bash` so an operator
+  can't accidentally authorise arbitrary shell commands by listing the
+  tool name.
+- `run.allow_bash` matches the bash command string. Each entry is one of:
+  - `"cmd args"` — word-boundary prefix match (e.g. `"git diff"` matches
+    `"git diff HEAD~1"` but not `"git difftool"`). This form refuses to
+    match commands that contain shell-chaining metacharacters
+    (`;`, `|`, `&&`, `$(`, `` ` ``), so `"ls"` cannot authorise
+    `"ls && rm -rf /"`.
+  - `"exact:cmd"` — whole-string equality after trimming whitespace.
+    Same chaining guard.
+  - `"glob:pat"` — `filepath.Match` against the raw command. No
+    chaining guard (the wildcard is the user's explicit choice).
+  - `"regex:pat"` — `regexp.MatchString` against the raw command. No
+    chaining guard.
+
+Precedence: `permissions.allowed_tools` is a global bypass that is
+checked **before** the run gate and still wins — if `bash` is listed
+there it is allowed unconditionally even in restricted mode. That is the
+documented escape hatch for a full bash bypass. For command-level
+control, leave `bash` out of `allowed_tools` and use `run.allow_bash`
+instead.
+
+CLI equivalents (merged with config; flags union with the lists and
+`--restrict-run` forces restrict on):
+
+```
+crush run --restrict-run \
+          --allow-bash 'git diff' --allow-bash 'glob:ls *' \
+          --allow-tool view \
+          --role fast "..."
+```
+
 ## Environment Variables
 
 - `CRUSH_GLOBAL_CONFIG` - Override global config location

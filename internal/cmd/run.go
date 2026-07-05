@@ -166,6 +166,41 @@ set with no prompting. This is fast but irreversible — only run
 "crush run" in a workspace whose contents you can afford to lose, and
 prefer --cwd /some/sandbox-or-temp-dir for one-shot scripts.
 
+Restricted-run allowlist (scoped permissions):
+  --restrict-run           flip from auto-approve-everything to
+                           deny-by-default; only allowlist matches are
+                           approved. Also armed by setting
+                           permissions.run.restrict=true in crush.json.
+  --allow-bash '<pattern>' permit a bash command in restricted mode
+                           (repeatable). Forms:
+                             cmd args    word-boundary prefix
+                                         (e.g. 'git diff' matches
+                                         'git diff HEAD~1' but refuses
+                                         'ls && rm -rf /')
+                             exact:cmd   whole-string equality
+                             glob:pat    filepath.Match glob
+                             regex:pat   regexp on the command
+  --allow-tool '<name>'    permit a non-bash tool or tool:action in
+                           restricted mode (repeatable). e.g. 'view' or
+                           'edit:write'. NOTE: 'bash' / 'bash:execute'
+                           are ignored here — use --allow-bash for
+                           command-level control of the bash tool.
+
+  Config equivalent (crush.json):
+    "permissions": {
+      "run": {
+        "restrict": true,
+        "allow_tools": ["view"],
+        "allow_bash": ["git diff", "glob:ls *"]
+      }
+    }
+  CLI flags merge with config (union); --restrict-run forces restrict on.
+  Precedence: permissions.allowed_tools is a global bypass that still
+  wins over both lists (it is checked before the gate). Listing 'bash'
+  there approves EVERY bash command; for command-level control, leave
+  allowed_tools empty for bash and use --allow-bash / run.allow_bash.
+  Restricted mode never affects interactive TUI / web sessions.
+
 Protecting harness-owned files: when the orchestrator pipes "crush run"
 output through a shell redirect, the model can pick the same path for
 its write/edit tool (e.g. it sees ".tmp-audit-D.json" in the prompt
@@ -283,6 +318,13 @@ crush run --role smart --json --agents with-agents --aggregation concat \
 # Hard time limit — partial answer is still preserved in the session
 # (and surfaced in --json's exit_reason / final_text)
 crush run --timeout 5m --session "long-task" "refactor the storage layer"
+
+# Scope an unattended CI run: only view + the listed bash commands are
+# approved; everything else is denied cleanly (no UI to hang on).
+crush run --restrict-run --role fast \
+          --allow-tool view \
+          --allow-bash 'git diff' --allow-bash 'glob:go *' \
+          --session "ci-123" "summarize the diff"
   `,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		var (
@@ -315,6 +357,12 @@ crush run --timeout 5m --session "long-task" "refactor the storage layer"
 			// Fork patch: batch 30 — runaway protection.
 			maxCostStr, _   = cmd.Flags().GetString("max-cost")
 			maxTokensStr, _ = cmd.Flags().GetString("max-tokens")
+			// Fork patch (run allowlist): opt into the restricted-run
+			// permission model and/or add one-off bash patterns for this
+			// invocation. Merged with permissions.run from config.
+			restrictRun, _ = cmd.Flags().GetBool("restrict-run")
+			allowBash, _   = cmd.Flags().GetStringSlice("allow-bash")
+			allowTool, _   = cmd.Flags().GetStringSlice("allow-tool")
 		)
 
 		if effort != "" {
@@ -559,6 +607,9 @@ crush run --timeout 5m --session "long-task" "refactor the storage layer"
 			MaxCost:                  maxCost,                  // Fork patch: batch 30
 			MaxTokens:                maxTokens,                // Fork patch: batch 30
 			Timeout:                  timeoutDur,               // Fork patch: operator UX (budget display)
+			RestrictedRun:            restrictRun,              // Fork patch: run allowlist
+			AllowBash:                allowBash,                // Fork patch: run allowlist
+			AllowTools:               allowTool,                // Fork patch: run allowlist
 		}
 		return a.RunNonInteractive(ctx, os.Stdout, prompt, overrides, hideSpinner, mode, sessionID, useLast)
 	},
@@ -596,6 +647,10 @@ func init() {
 	// Fork patch: batch 30 — runaway protection.
 	runCmd.Flags().String("max-cost", "", "Abort the run if total cost (USD) exceeds this value. e.g. 0.50, 2.00")
 	runCmd.Flags().String("max-tokens", "", "Abort the run if total prompt+completion tokens exceed this value. e.g. 100k, 1M, 500000")
+	// Fork patch (run allowlist): scope what an unattended run may do.
+	runCmd.Flags().Bool("restrict-run", false, `Opt into restricted permission mode for this run. When set (or when permissions.run.restrict is true in config), permission requests are auto-approved ONLY if they match the allowlist; everything else is denied cleanly. Default remains auto-approve-everything. Does not affect interactive TUI/web sessions.`)
+	runCmd.Flags().StringSlice("allow-bash", nil, `Bash command patterns to permit in restricted-run mode (repeatable, also comma-separated). Merged with permissions.run.allow_bash from config. Forms: 'cmd args' (word-boundary prefix, chaining-guarded) | 'exact:cmd' | 'glob:pat' | 'regex:pat'. Examples: --allow-bash 'git diff' --allow-bash 'glob:ls *' --allow-bash 'regex:^go (test|build)'`)
+	runCmd.Flags().StringSlice("allow-tool", nil, `Non-bash tools (or tool:action pairs) to permit in restricted-run mode (repeatable, also comma-separated). Merged with permissions.run.allow_tools from config. Entries for 'bash' / 'bash:execute' are ignored — use --allow-bash for command-level bash control. Examples: --allow-tool view --allow-tool edit:write`)
 	runCmd.MarkFlagsMutuallyExclusive("session", "continue")
 	runCmd.MarkFlagsMutuallyExclusive("system-prompt", "system-prompt-file")
 	runCmd.MarkFlagsMutuallyExclusive("stream", "json")

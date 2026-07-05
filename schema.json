@@ -536,6 +536,10 @@
           },
           "type": "array",
           "description": "List of tools that don't require permission prompts"
+        },
+        "run": {
+          "$ref": "#/$defs/RunPermissions",
+          "description": "Restricted permission model for non-interactive 'crush run'. Off by default; opt in with run.restrict=true or the --restrict-run flag."
         }
       },
       "additionalProperties": false,
@@ -623,6 +627,40 @@
           },
           "type": "array",
           "description": "List of models available from this provider"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "RunPermissions": {
+      "properties": {
+        "restrict": {
+          "type": "boolean",
+          "description": "Enable restricted permission mode for 'crush run'. When true, only allow_tools (non-bash) and allow_bash entries are approved; everything else is denied cleanly. Default false (current auto-approve behaviour).",
+          "default": false
+        },
+        "allow_tools": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "description": "Non-bash tools (or tool:action pairs) auto-approved in restricted run mode. Entries for 'bash' / 'bash:execute' are ignored — use allow_bash for command-level bash control.",
+          "examples": [
+            "view",
+            "edit:write"
+          ]
+        },
+        "allow_bash": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "description": "Bash command patterns permitted in restricted run mode. Forms: 'cmd args' (word-boundary prefix), 'exact:cmd', 'glob:pat' (only * and ? are special, cross-platform), 'regex:pat'. Every form except regex rejects compound commands (chaining, backgrounding, or substitution), so a permissive pattern cannot smuggle a second command.",
+          "examples": [
+            "git diff",
+            "glob:ls *",
+            "regex:^go (test|build)"
+          ]
         }
       },
       "additionalProperties": false,

@@ -37,6 +37,10 @@ type BashPermissionsParams struct {
 	AutoBackgroundAfter int    `json:"auto_background_after"`
 }
 
+func (p BashPermissionsParams) RunAllowlistCommand() string {
+	return p.Command
+}
+
 type BashResponseMetadata struct {
 	StartTime        int64  `json:"start_time"`
 	EndTime          int64  `json:"end_time"`
@@ -217,7 +221,12 @@ func NewBashTool(permissions permission.Service, workingDir string, attribution 
 			isSafeReadOnly := false
 			cmdLower := strings.ToLower(params.Command)
 
-			if !containsCommandChaining(params.Command) {
+			// Only single simple commands qualify for the safe-read-only
+			// fast-path. A compound command (chaining, backgrounding,
+			// substitution, subshell) always goes through the permission
+			// prompt, so a safe prefix can never smuggle a second command
+			// (e.g. "git status && rm -rf /", or "git status\nrm -rf /").
+			if !shell.IsCompoundCommand(params.Command) {
 				for _, safe := range safeCommands {
 					if strings.HasPrefix(cmdLower, safe) {
 						if len(cmdLower) == len(safe) || cmdLower[len(safe)] == ' ' || cmdLower[len(safe)] == '-' {
