@@ -136,6 +136,37 @@ finishes — and you are not launching a replacement and no other
 Don't keep probing `sessions locks` on an empty field; an idle
 watchdog is just noise. Re-arm it only when you launch the next run.
 
+## Steering a running session — `sessions inject`
+
+You can hand a **new message to a run that is already in flight** in
+another process, without killing and relaunching it. Use this to
+correct course, add a constraint you forgot, or answer a question the
+agent surfaced mid-run.
+
+```
+crush sessions inject <id> -m "also update the CHANGELOG"     # merge
+crush sessions inject <id> -f ./notes/next-step.md            # from a file
+crush sessions inject <id> -m "stop — wrong approach" --interrupt
+```
+
+- `<id>` is the same `--session` id you launched with (short hash ok).
+- **Default (merge):** the message is spliced into the run's **next
+  provider step** — the current turn is NOT cancelled. Cheapest way to
+  feed extra context; latency is one step.
+- **`--interrupt`:** cancels the in-flight turn and immediately restarts
+  it with the new message on top of everything produced so far. Use
+  when the current direction is wrong and you don't want it to finish.
+- The message is persisted as a normal **user** message (it shows up in
+  `sessions watch`/`last` and the web UI exactly as if you typed it).
+- If the session is **not currently running**, the message is still
+  persisted and picked up the next time that session id runs — the
+  command tells you so instead of failing.
+
+This works cross-process: it writes to the session DB and the running
+`crush run` (or web server) owning that session picks it up. Add
+`--json` for a machine-readable `{session_id, message_id, running,
+status}` result.
+
 ## Repo-wide default system prompt
 
 If `./.crush/system-prompts/default.md` exists, `crush run` auto-loads
