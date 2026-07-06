@@ -1058,12 +1058,23 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 						// (context-cancel watcher + scanner loop) without double-draining waitCh.
 						ptyKillOnce.Do(func() {
 							if ptycmd.Process != nil {
-								_ = ptycmd.Process.Kill()
+								_ = session.KillProcess(ptycmd.Process.Pid)
 							}
 						})
 					},
 					wait: func() (string, error) {
-						return "", <-waitCh
+						// Bound the wait against ctx.Done() for parity with the
+						// pipe branch: a grandchild holding the PTY's underlying
+						// handles can keep ptycmd.Wait() from returning even after
+						// the direct child exits. PTY mode merges stderr into the
+						// tty, so there is no stderrBuf to race on here.
+						select {
+						case waitErr := <-waitCh:
+							return "", waitErr
+						case <-ctx.Done():
+							slog.Warn("cliprovider: PTY wait aborted on ctx cancellation", "binary", m.spec.Binary)
+							return "", ctx.Err()
+						}
 					},
 				}
 			} else {
@@ -1133,25 +1144,44 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 			reader = pipe
 		}
 		slog.Info("cliprovider: process started", "binary", m.spec.Binary, "pid", cmd.Process.Pid)
+		waitCh := make(chan error, 1)
+		go func() { waitCh <- cmd.Wait() }()
 		proc = procHandle{
 			stdout:   reader,
 			usingPTY: false,
 			kill: func() {
 				if cmd.Process != nil {
-					_ = cmd.Process.Kill()
+					_ = session.KillProcess(cmd.Process.Pid)
 				}
 			},
 			wait: func() (string, error) {
-				// cmd.Wait() must return before reading stderrBuf: os/exec's
-				// stderr-copy goroutine writes that buffer and is only joined
-				// by Wait(), so reading earlier races with it (caught by -race,
-				// and real for npx/NoPTY specs in production).
-				waitErr := cmd.Wait()
-				stderr := strings.TrimSpace(stderrBuf.String())
-				if stderr != "" {
-					slog.Warn("cliprovider: process stderr", "binary", m.spec.Binary, "stderr", stderr)
+				// cmd.Wait() blocks until EVERY process holding the stderr
+				// write handle exits, not just the direct child — and the
+				// external CLI binaries this launches routinely spawn
+				// grandchildren (claude.cmd → cmd.exe → node.exe, MCP
+				// servers) that inherit stderr. If the direct child dies
+				// (stdout EOFs, scanner loop ends) but a grandchild is still
+				// alive holding stderr, an unbounded cmd.Wait() would block
+				// forever with no ctx check on this path. Bound it: run
+				// Wait in its own goroutine and select against ctx.Done().
+				select {
+				case waitErr := <-waitCh:
+					// Only safe to read stderrBuf after Wait truly completed;
+					// os/exec's stderr-copy goroutine is joined by Wait.
+					stderr := strings.TrimSpace(stderrBuf.String())
+					if stderr != "" {
+						slog.Warn("cliprovider: process stderr", "binary", m.spec.Binary, "stderr", stderr)
+					}
+					return stderr, waitErr
+				case <-ctx.Done():
+					// ctx cancelled before Wait returned — stderrBuf may
+					// still be written to concurrently by the not-yet-joined
+					// stderr-copy goroutine, so do NOT read it (would race).
+					// The stderr-holding grandchild is the very thing ctx
+					// cancellation (via kill()) is trying to tear down.
+					slog.Warn("cliprovider: wait aborted on ctx cancellation; stderr discarded (may be incomplete)", "binary", m.spec.Binary)
+					return "", ctx.Err()
 				}
-				return stderr, waitErr
 			},
 		}
 	}

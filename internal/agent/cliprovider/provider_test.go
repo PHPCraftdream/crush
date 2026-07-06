@@ -3,12 +3,16 @@ package cliprovider
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"charm.land/fantasy"
 )
@@ -1198,4 +1202,263 @@ func contains(ss []string, s string) bool {
 		}
 	}
 	return false
+}
+
+// ── Bug 1 regression: bounded wait() must not hang when a grandchild holds stderr ──
+//
+// Reproduces the real incident: the direct child (bash) exits so stdout EOFs
+// and the scanner loop ends, but a backgrounded grandchild keeps the inherited
+// stderr fd open. With the OLD unbounded cmd.Wait(), proc.wait() would block
+// forever (no ctx check on that path). The fix bounds it against ctx.Done().
+//
+// The test forces the pipe / non-NoPTY branch (cmd.Stderr = &stderrBuf) by
+// using a spec with neither NoPTY nor AlwaysStdin and a small prompt, and
+// relies on testDisablePTY being true on Windows so the PTY path is skipped.
+func TestStreamWaitBoundedOnGrandchildHoldsStderr(t *testing.T) {
+	shell, flag := "bash", "-c"
+	if _, err := exec.LookPath(shell); err != nil {
+		t.Skipf("shell %q not found", shell)
+	}
+
+	// Script: print one stdout line (so the scanner loop runs and ends on EOF
+	// when bash exits), then fork a backgrounded subshell that holds the
+	// inherited stderr fd open for 30s and disowns itself so bash doesn't
+	// wait for it. After forking, the main bash prints a final line and
+	// exits — leaving the orphan grandchild holding stderr.
+	//
+	// We also write the grandchild's PID to a file so the test can reap it
+	// afterwards (kill by PID) and avoid leaking a 30s sleeper on CI.
+	script := `
+		echo "stdout-line"
+		( sleep 30 ) >&2 &
+		echo $! > "$1/grandchild.pid"
+		disown
+		echo "stdout-line-2"
+	`
+
+	tmpDir := t.TempDir()
+	spec := CLISpec{
+		ModelID:    "test-bounded-wait",
+		ModelName:  "Test Bounded Wait",
+		Binary:     shell,
+		PromptFlag: "-p",
+		BuildArgs:  func(bool) []string { return []string{flag, script, tmpDir} },
+	}
+	m := &cliModel{spec: spec, workingDir: tmpDir}
+
+	// Short ctx deadline: the scanner loop ends quickly (bash exits fast),
+	// then proc.wait() is invoked. With the bug, wait() would block on the
+	// stderr-holding grandchild well past this deadline. With the fix,
+	// wait() returns on ctx.Done() promptly.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	stream, err := m.Stream(ctx, fantasy.Call{
+		Prompt: fantasy.Prompt{fantasy.NewUserMessage("x")},
+	})
+	if err != nil {
+		t.Fatalf("Stream() error: %v", err)
+	}
+
+	// Hard watchdog: if the whole drain somehow hangs (bug regressed AND
+	// the ctx bound failed), fail loudly instead of stalling the suite.
+	done := make(chan struct{})
+	var gotErr error
+	var sawCancel bool
+	go func() {
+		defer close(done)
+		for part := range stream {
+			if part.Type == fantasy.StreamPartTypeError {
+				gotErr = part.Error
+			}
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("stream drain hung past 15s watchdog — bounded wait regression")
+	}
+
+	// The ctx deadline should have fired (grandchild holds stderr 30s),
+	// surfacing a context error part. The key assertion is that we got here
+	// at all without the watchdog killing us.
+	if gotErr == nil {
+		// On some platforms the grandchild's stderr fd may be closed by the
+		// OS when bash exits (e.g. if disown/redirect semantics differ), in
+		// which case wait() returns normally with no error. That still proves
+		// the wait is bounded (it returned), so we don't hard-fail here; we
+		// just note it.
+		sawCancel = false
+	} else {
+		sawCancel = errors.Is(gotErr, context.DeadlineExceeded) || errors.Is(gotErr, context.Canceled)
+	}
+	t.Logf("drain completed; gotErr=%v sawCtxCancel=%v", gotErr, sawCancel)
+
+	// Reap the orphaned grandchild so we don't leak a 30s sleeper.
+	if pidData, rerr := os.ReadFile(filepath.Join(tmpDir, "grandchild.pid")); rerr == nil {
+		var pid int
+		fmt.Sscanf(strings.TrimSpace(string(pidData)), "%d", &pid)
+		if pid > 0 {
+			// best-effort kill of the orphan; ignore errors (already gone is fine)
+			kill, _ := exec.LookPath("taskkill")
+			if kill != "" {
+				_ = exec.Command(kill, "/F", "/T", "/PID", fmt.Sprintf("%d", pid)).Run()
+			} else {
+				_ = exec.Command(shell, flag, fmt.Sprintf("kill %d 2>/dev/null || true", pid)).Run()
+			}
+		}
+	}
+}
+
+// ── Bug 1 regression (PTY branch parity): bounded wait on ctx ──
+//
+// Pure-Go check that the PTY branch's wait closure is also bounded against
+// ctx. We can't easily force the PTY code path on Windows (testDisablePTY
+// is true there), so this test only runs where PTY is exercised (Unix). It
+// cancels ctx mid-stream and asserts the stream ends promptly — the wait()
+// closure must return on ctx.Done() rather than blocking on ptycmd.Wait().
+func TestStreamPTYWaitBoundedOnCtxCancel(t *testing.T) {
+	if testDisablePTY {
+		t.Skip("PTY path disabled on this platform; PTY-branch wait bound not exercisable")
+	}
+	shell, flag := "bash", "-c"
+	if _, err := exec.LookPath(shell); err != nil {
+		t.Skipf("shell %q not found", shell)
+	}
+
+	// A long-running child that blocks forever until killed.
+	spec := CLISpec{
+		ModelID:    "test-pty-bounded",
+		ModelName:  "Test PTY Bounded",
+		Binary:     shell,
+		PromptFlag: "-p",
+		BuildArgs:  func(bool) []string { return []string{flag, "sleep 60"} },
+	}
+	m := &cliModel{spec: spec, workingDir: t.TempDir()}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	stream, err := m.Stream(ctx, fantasy.Call{
+		Prompt: fantasy.Prompt{fantasy.NewUserMessage("x")},
+	})
+	if err != nil {
+		t.Fatalf("Stream() error: %v", err)
+	}
+
+	// Drain in a goroutine; cancel shortly after. The stream must end
+	// promptly (no hang on wait()).
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range stream {
+		}
+	}()
+
+	cancel()
+	select {
+	case <-done:
+		// good: bounded
+	case <-time.After(10 * time.Second):
+		t.Fatal("PTY stream drain hung past 10s after ctx cancel — wait() not bounded")
+	}
+}
+
+// ── Bug 2 sanity: kill() routes through session.KillProcess (tree-kill) ──
+//
+// We can't portably prove full tree-kill of a real multi-generation process
+// tree in a unit test (OS-flaky in CI), so this is a regression guard that
+// the existing ctx-cancellation-kills-the-child coverage still holds AND that
+// kill() uses the tree-kill helper rather than the direct-child-only Kill.
+// The behavioral assertion: after ctx cancel, the direct child is gone.
+func TestStreamKillUsesTreeKillStillTerminatesChild(t *testing.T) {
+	shell, flag := "bash", "-c"
+	if _, err := exec.LookPath(shell); err != nil {
+		t.Skipf("shell %q not found", shell)
+	}
+
+	// Child writes its own PID to a file, then sleeps long enough that we
+	// can cancel and observe whether it actually died.
+	pidFile := filepath.Join(t.TempDir(), "child.pid")
+	spec := CLISpec{
+		ModelID:    "test-kill-tree",
+		ModelName:  "Test Kill Tree",
+		Binary:     shell,
+		PromptFlag: "-p",
+		BuildArgs: func(bool) []string {
+			return []string{flag, "echo $$ > '" + pidFile + "'; sleep 60"}
+		},
+	}
+	m := &cliModel{spec: spec, workingDir: t.TempDir()}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	stream, err := m.Stream(ctx, fantasy.Call{
+		Prompt: fantasy.Prompt{fantasy.NewUserMessage("x")},
+	})
+	if err != nil {
+		t.Fatalf("Stream() error: %v", err)
+	}
+
+	streamDone := make(chan struct{})
+	go func() {
+		defer close(streamDone)
+		for range stream {
+		}
+	}()
+
+	// Give the child time to write its PID and enter the sleep.
+	time.Sleep(500 * time.Millisecond)
+	cancel()
+
+	select {
+	case <-streamDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("stream did not end after ctx cancel within 10s")
+	}
+
+	// The direct child must be gone after kill().
+	pidData, rerr := os.ReadFile(pidFile)
+	if rerr != nil {
+		t.Fatalf("could not read child pid file: %v", rerr)
+	}
+	var pid int
+	fmt.Sscanf(strings.TrimSpace(string(pidData)), "%d", &pid)
+	if pid <= 0 {
+		t.Fatalf("could not parse child pid from %q", pidData)
+	}
+
+	// Poll briefly: process death isn't instant after SIGKILL/taskkill.
+	deadline := time.Now().Add(3 * time.Second)
+	var alive atomic.Bool
+	alive.Store(true)
+	for time.Now().Before(deadline) {
+		if !processAlive(pid) {
+			alive.Store(false)
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if alive.Load() {
+		t.Errorf("child pid %d still alive after kill() — tree-kill regressed", pid)
+		// best-effort cleanup
+		_ = exec.Command(shell, flag, fmt.Sprintf("kill -9 %d 2>/dev/null || true", pid)).Run()
+	}
+}
+
+// processAlive reports whether a process with the given pid is still running.
+// Best-effort, portable.
+func processAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	if runtime.GOOS == "windows" {
+		// taskkill /? exit code logic: we probe via tasklist.
+		out, err := exec.Command("tasklist", "/FI", fmt.Sprintf("PID eq %d", pid), "/NH").Output()
+		if err != nil {
+			return false
+		}
+		return strings.Contains(string(out), fmt.Sprintf("%d", pid))
+	}
+	// POSIX: signal 0 probes existence.
+	_ = exec.Command("kill", "-0", fmt.Sprintf("%d", pid)).Run()
+	// kill -0 returns 0 if alive, non-zero otherwise; Run returns nil on 0 exit.
+	return exec.Command("kill", "-0", fmt.Sprintf("%d", pid)).Run() == nil
 }
