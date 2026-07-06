@@ -3,10 +3,19 @@ package version
 import (
 	"fmt"
 	"os"
+	"regexp"
 	"runtime/debug"
 	"strconv"
 	"strings"
 )
+
+// forkBaseVersion is the fork's current release-line version, mirrored by hand
+// from the "version" field in npm/crush/package.json. It is embedded into local
+// dev-build version strings so the operator can see at a glance which release
+// line a devel binary was built from. This fork bumps versions deliberately and
+// manually (see CLAUDE.md at the repo root), so this constant must be kept in
+// lockstep with npm/crush/package.json on every bump.
+const forkBaseVersion = "0.1.3"
 
 // Build-time parameters set via -ldflags. These act as overrides: when a
 // release/packaging build injects them (see .goreleaser.yml and the
@@ -110,11 +119,20 @@ func resolveVersion(defaultVersion, defaultCommit string, info *debug.BuildInfo)
 	return version, commit
 }
 
+// pseudoVersionSuffixRe matches the Go-toolchain pseudo-version suffix built on
+// top of a real prior tag, e.g. the "-0.20260628185628-e47711a0e3e4" part of
+// "v0.72.1-0.20260628185628-e47711a0e3e4" (optionally followed by "+dirty").
+// Such a string is still an unhelpful, ugly pseudo-version that should fall
+// through to deriveDevVersion rather than be shown raw.
+var pseudoVersionSuffixRe = regexp.MustCompile(`-0\.\d{14}-[0-9a-f]{12}(\+dirty)?$`)
+
 // usableModuleVersion reports whether a BuildInfo main-module version is
 // meaningful enough to expose directly. Local checkout builds can report
 // v0.0.0-<timestamp>-<commit>[+dirty], which is a Go pseudo-version, not a
 // release version users can match to a package. Those fall through to the
-// VCS-derived devel-<commit>[-dirty] format instead.
+// VCS-derived devel-<commit>[-dirty] format instead. A pseudo-version built on
+// top of a real prior tag (e.g. "v0.72.1-0.<timestamp>-<commit>[+dirty]") is
+// rejected here too for the same reason.
 func usableModuleVersion(v string) bool {
 	if v == "" || v == "(devel)" {
 		return false
@@ -123,6 +141,9 @@ func usableModuleVersion(v string) bool {
 		return false
 	}
 	if strings.Contains(v, "+dirty") {
+		return false
+	}
+	if pseudoVersionSuffixRe.MatchString(v) {
 		return false
 	}
 	return true
@@ -152,9 +173,12 @@ func readVCS(info *debug.BuildInfo) vcsInfo {
 }
 
 // deriveDevVersion builds a human-meaningful version for a development build
-// from embedded VCS metadata, e.g. "devel-06c8078" or "devel-06c8078-dirty".
-// It returns an empty string when no revision is available, signalling the
-// caller to keep the plain "devel" default.
+// from embedded VCS metadata, embedding the fork's current release-line version
+// (forkBaseVersion) next to the dirty marker, e.g. "devel-06c8078-0.1.3" for a
+// clean tree or "devel-06c8078-0.1.3-dirty" when the working tree had
+// uncommitted changes at build time. It returns an empty string when no
+// revision is available, signalling the caller to keep the plain "devel"
+// default.
 func deriveDevVersion(revision, modified string) string {
 	if revision == "" {
 		return ""
@@ -163,7 +187,7 @@ func deriveDevVersion(revision, modified string) string {
 	if len(short) > 7 {
 		short = short[:7]
 	}
-	v := "devel-" + short
+	v := "devel-" + short + "-" + forkBaseVersion
 	if modified == "true" {
 		v += "-dirty"
 	}

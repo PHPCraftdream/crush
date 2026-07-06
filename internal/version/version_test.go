@@ -25,25 +25,25 @@ func TestDeriveDevVersion(t *testing.T) {
 			name:     "clean commit is shortened",
 			revision: "06c807842604abcdef1234567890abcdef123456",
 			modified: "false",
-			want:     "devel-06c8078",
+			want:     "devel-06c8078-" + forkBaseVersion,
 		},
 		{
 			name:     "dirty commit appends marker",
 			revision: "06c807842604abcdef1234567890abcdef123456",
 			modified: "true",
-			want:     "devel-06c8078-dirty",
+			want:     "devel-06c8078-" + forkBaseVersion + "-dirty",
 		},
 		{
 			name:     "short revision is not truncated further",
 			revision: "abc1234",
 			modified: "",
-			want:     "devel-abc1234",
+			want:     "devel-abc1234-" + forkBaseVersion,
 		},
 		{
 			name:     "modified true without explicit clean flag still marks dirty",
 			revision: "deadbeef",
 			modified: "true",
-			want:     "devel-deadbee-dirty",
+			want:     "devel-deadbee-" + forkBaseVersion + "-dirty",
 		},
 	}
 	for _, tt := range tests {
@@ -150,7 +150,7 @@ func TestResolveVersion(t *testing.T) {
 					{Key: "vcs.modified", Value: "true"},
 				},
 			},
-			wantVersion: "devel-90c57af-dirty",
+			wantVersion: "devel-90c57af-" + forkBaseVersion + "-dirty",
 			wantCommit:  "90c57af7ca7a5c50d2ee959eaa1668120b4b1729",
 		},
 		{
@@ -158,14 +158,14 @@ func TestResolveVersion(t *testing.T) {
 			name:       "dev build derives clean version from vcs",
 			defaultVer: "devel", defaultCommit: "unknown",
 			info:        buildInfo("06c807842604", "false"),
-			wantVersion: "devel-06c8078",
+			wantVersion: "devel-06c8078-" + forkBaseVersion,
 			wantCommit:  "06c807842604",
 		},
 		{
 			name:       "dev build with dirty tree appends marker",
 			defaultVer: "devel", defaultCommit: "unknown",
 			info:        buildInfo("06c807842604", "true"),
-			wantVersion: "devel-06c8078-dirty",
+			wantVersion: "devel-06c8078-" + forkBaseVersion + "-dirty",
 			wantCommit:  "06c807842604",
 		},
 		{
@@ -204,6 +204,13 @@ func TestUsableModuleVersion(t *testing.T) {
 		{version: "v0.0.0-20260705112643-90c57af7ca7a", want: false},
 		{version: "v0.0.0-20260705112643-90c57af7ca7a+dirty", want: false},
 		{version: "0.0.0-20260705112643-90c57af7ca7a", want: false},
+		// Pseudo-version built on top of a real prior tag (no +dirty). This is
+		// the shape Go emits for a checkout whose nearest tag is a real release,
+		// e.g. v0.72.1-0.<timestamp>-<12-hex-commit>. Still ugly and unhelpful,
+		// so reject it and fall through to deriveDevVersion.
+		{version: "v0.72.1-0.20260628185628-e47711a0e3e4", want: false},
+		// Same shape but with a +dirty marker.
+		{version: "v0.72.1-0.20260628185628-e47711a0e3e4+dirty", want: false},
 		{version: "v0.2.0", want: true},
 		{version: "v0.2.1-rc.1", want: true},
 	}
