@@ -90,10 +90,10 @@ func explainSessionStatus(ctx context.Context, a *app.App, cwd, sessionID string
 	// sessionsLocksCmdRun, but for the single session we care about.
 	lockPath := filepath.Join(cwd, ".crush", "locks", "session-"+sanitiseSessionIDForFilename(sessionID)+".lock")
 	var (
-		hasLock   bool
-		pid       int
-		pidAlive  bool
-		heartAge  time.Duration
+		hasLock  bool
+		pid      int
+		pidAlive bool
+		heartAge time.Duration
 	)
 	if st, statErr := os.Stat(lockPath); statErr == nil {
 		hasLock = true
