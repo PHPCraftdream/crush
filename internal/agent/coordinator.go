@@ -191,6 +191,12 @@ type Coordinator interface {
 	// SetRunLimits sets cost and token caps for the next Run call.
 	// Fork patch: batch 30.
 	SetRunLimits(maxCost float64, maxTokens int64)
+	// SetAllowPeakHours arms a one-shot bypass of the peak-hours refusal
+	// for the next Run call. It exists so `crush run --allow-peak-hours`
+	// can override an operator-configured peak_hours window for a single
+	// conscious invocation without introducing a persistent "always
+	// allow" config setting. Fork patch (peak-hours bypass).
+	SetAllowPeakHours(allow bool)
 	// SetPersistentMode marks this coordinator as the long-lived web/interactive
 	// server (enables Phase 4 autonomous idle-resume eligibility). crush run
 	// leaves it false.
@@ -227,6 +233,11 @@ type coordinator struct {
 	runLimitsMu sync.Mutex
 	maxCost     float64
 	maxTokens   int64
+
+	// allowPeakHours is a one-shot bypass for the peak-hours refusal,
+	// armed by SetAllowPeakHours from `crush run --allow-peak-hours`.
+	// Reset to false after the next Run. Fork patch (peak-hours bypass).
+	allowPeakHours bool
 
 	// Phase 4 autonomous idle-resume guardrails.
 	persistentMode         bool           // true only for the long-lived web server; false for crush run.
@@ -315,6 +326,14 @@ func (c *coordinator) SetRunLimits(maxCost float64, maxTokens int64) {
 	c.runLimitsMu.Lock()
 	c.maxCost = maxCost
 	c.maxTokens = maxTokens
+	c.runLimitsMu.Unlock()
+}
+
+// SetAllowPeakHours arms a one-shot bypass of the peak-hours refusal
+// for the next Run call. Fork patch (peak-hours bypass).
+func (c *coordinator) SetAllowPeakHours(allow bool) {
+	c.runLimitsMu.Lock()
+	c.allowPeakHours = allow
 	c.runLimitsMu.Unlock()
 }
 
@@ -516,8 +535,18 @@ func (c *coordinator) runInternal(ctx context.Context, sessionID string, prompt 
 	if !ok {
 		return nil, errModelProviderNotConfigured
 	}
-	if err := checkPeakHours(providerCfg); err != nil {
-		return nil, err
+	// Fork patch (peak-hours bypass): consume the one-shot allow flag
+	// armed by SetAllowPeakHours (`crush run --allow-peak-hours`). Reset
+	// immediately so a subsequent Run on the same coordinator does not
+	// inherit the bypass.
+	c.runLimitsMu.Lock()
+	allowPeak := c.allowPeakHours
+	c.allowPeakHours = false
+	c.runLimitsMu.Unlock()
+	if !allowPeak {
+		if err := checkPeakHours(providerCfg); err != nil {
+			return nil, err
+		}
 	}
 
 	mergedOptions, temp, topP, topK, freqPenalty, presPenalty := mergeCallOptions(model, providerCfg)

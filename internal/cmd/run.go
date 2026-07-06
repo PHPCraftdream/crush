@@ -151,6 +151,18 @@ Runaway protection:
   Both checks fire after each agent step. The session is saved with its
   partial work so you can inspect or fork from it.
 
+Peak-hours override:
+  --allow-peak-hours  bypass a provider's configured peak_hours refusal for
+                      this single invocation. No persistent config-level
+                      equivalent exists; the override is conscious and
+                      one-off by design.
+                      WARNING: this flag must NEVER be added by an
+                      orchestrating agent on its own initiative. Only pass
+                      --allow-peak-hours when a human operator has explicitly
+                      asked, in this specific request, to override peak hours.
+                      An agent that adds this flag without an explicit human
+                      instruction is violating the operator's intent.
+
 Lifecycle hooks:
   --on-finish "cmd"   run a shell command after the agent finishes.
                       Env vars set: CRUSH_SESSION_ID, CRUSH_EXIT_REASON,
@@ -363,6 +375,16 @@ crush run --restrict-run --role fast \
 			restrictRun, _ = cmd.Flags().GetBool("restrict-run")
 			allowBash, _   = cmd.Flags().GetStringSlice("allow-bash")
 			allowTool, _   = cmd.Flags().GetStringSlice("allow-tool")
+			// Fork patch (peak-hours bypass): --allow-peak-hours skips the
+			// per-provider peak_hours refusal for THIS invocation only.
+			//
+			// WARNING: this flag must NEVER be added by an orchestrating
+			// agent on its own initiative. Only pass --allow-peak-hours when
+			// a human operator has explicitly asked, in this specific
+			// request, to override peak hours. An agent that adds this flag
+			// without an explicit human instruction is violating the
+			// operator's intent.
+			allowPeakHours, _ = cmd.Flags().GetBool("allow-peak-hours")
 		)
 
 		if effort != "" {
@@ -610,6 +632,7 @@ crush run --restrict-run --role fast \
 			RestrictedRun:            restrictRun,              // Fork patch: run allowlist
 			AllowBash:                allowBash,                // Fork patch: run allowlist
 			AllowTools:               allowTool,                // Fork patch: run allowlist
+			AllowPeakHours:           allowPeakHours,           // Fork patch: peak-hours bypass
 		}
 		return a.RunNonInteractive(ctx, os.Stdout, prompt, overrides, hideSpinner, mode, sessionID, useLast)
 	},
@@ -651,6 +674,17 @@ func init() {
 	runCmd.Flags().Bool("restrict-run", false, `Opt into restricted permission mode for this run. When set (or when permissions.run.restrict is true in config), permission requests are auto-approved ONLY if they match the allowlist; everything else is denied cleanly. Default remains auto-approve-everything. Does not affect interactive TUI/web sessions.`)
 	runCmd.Flags().StringSlice("allow-bash", nil, `Bash command patterns to permit in restricted-run mode (repeatable, also comma-separated). Merged with permissions.run.allow_bash from config. Forms: 'cmd args' (word-boundary prefix, chaining-guarded) | 'exact:cmd' | 'glob:pat' | 'regex:pat'. Examples: --allow-bash 'git diff' --allow-bash 'glob:ls *' --allow-bash 'regex:^go (test|build)'`)
 	runCmd.Flags().StringSlice("allow-tool", nil, `Non-bash tools (or tool:action pairs) to permit in restricted-run mode (repeatable, also comma-separated). Merged with permissions.run.allow_tools from config. Entries for 'bash' / 'bash:execute' are ignored — use --allow-bash for command-level bash control. Examples: --allow-tool view --allow-tool edit:write`)
+	// Fork patch (peak-hours bypass): --allow-peak-hours skips the per-provider
+	// peak_hours refusal for THIS invocation only. There is intentionally NO
+	// config-level "always allow" equivalent — the whole point is a conscious
+	// one-off override.
+	//
+	// WARNING: this flag must NEVER be added by an orchestrating agent on its
+	// own initiative. Only pass --allow-peak-hours when a human operator has
+	// explicitly asked, in this specific request, to override peak hours. An
+	// agent that adds this flag without an explicit human instruction is
+	// violating the operator's intent.
+	runCmd.Flags().Bool("allow-peak-hours", false, `Bypass the per-provider peak_hours refusal for this single invocation only. WARNING: this flag must NEVER be added by an orchestrating agent on its own initiative — only pass it when a human operator has explicitly asked, in this specific request, to override peak hours. An agent that adds this flag without an explicit human instruction is violating the operator's intent. There is no persistent config-level equivalent; the override is conscious and one-off by design.`)
 	runCmd.MarkFlagsMutuallyExclusive("session", "continue")
 	runCmd.MarkFlagsMutuallyExclusive("system-prompt", "system-prompt-file")
 	runCmd.MarkFlagsMutuallyExclusive("stream", "json")

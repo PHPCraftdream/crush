@@ -612,6 +612,12 @@ type RunOverrides struct {
 	// MaxTokens aborts the run if total prompt+completion tokens exceed this
 	// value. 0 = no cap. Fork patch: batch 30.
 	MaxTokens int64
+	// AllowPeakHours, when true, bypasses the per-provider peak_hours refusal
+	// for this single invocation. `crush run --allow-peak-hours` sets it.
+	// There is intentionally NO config-level "always allow" equivalent: the
+	// whole point is a conscious one-off override. Fork patch (peak-hours
+	// bypass).
+	AllowPeakHours bool
 	// Timeout is the original --timeout duration, carried for budget
 	// persistence so `sessions show` / `sessions locks` can display it.
 	// The context-level deadline is applied separately by the caller.
@@ -806,6 +812,12 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt 
 	}
 	if overrides.MaxCost > 0 || overrides.MaxTokens > 0 {
 		app.AgentCoordinator.SetRunLimits(overrides.MaxCost, overrides.MaxTokens)
+	}
+
+	// Fork patch (peak-hours bypass): arm the one-shot flag before Run so
+	// runInternal's checkPeakHours gate is skipped for this invocation.
+	if overrides.AllowPeakHours {
+		app.AgentCoordinator.SetAllowPeakHours(true)
 	}
 
 	// Fork patch (operator UX): persist budget at run start so
