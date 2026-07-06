@@ -577,6 +577,17 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	var stepMessages []fantasy.Message
 	var shouldSummarize bool
 
+	// loopDetected is set by the loop-detection StopWhen closure when the
+	// agent force-stops a turn because hasRepeatedToolCalls fired. The finish
+	// REASON stays FinishReasonEndTurn (a loop-detected stop is still a form
+	// of "done" and must not be reclassified away from it — see the comment
+	// on loopDetail in loop_detection.go); the distinction from a voluntary
+	// model finish is carried in the Finish part's message/details text so an
+	// operator/orchestrator can tell that a legitimate polling pattern may
+	// have been truncated.
+	var loopDetected bool
+	var loopDetail loopDetail
+
 	// bgSummarizeLaunched ensures we launch at most one background
 	// summarisation per Run() call (fired the first time we trim the window).
 	var bgSummarizeLaunched bool
@@ -1074,6 +1085,15 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 						largeModel.ModelCfg.Provider, largeModel.ModelCfg.Model,
 					),
 				)
+			} else if loopDetected {
+				// Loop detection force-stopped the turn. The reason stays
+				// FinishReasonEndTurn (NOT a new distinct enum value) so
+				// reclassifyCrashedAsDone / sessions-why keep treating this as
+				// "done" — but the message/details are non-empty so an operator
+				// or orchestrator can distinguish "model finished voluntarily"
+				// from "we truncated a likely loop (possibly a legitimate poll)".
+				loopMsg, loopDetails := loopDetectedFinishText(loopDetail)
+				currentAssistant.AddFinish(finishReason, loopMsg, loopDetails)
 			} else {
 				currentAssistant.AddFinish(finishReason, "", "")
 			}
@@ -1169,7 +1189,13 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 				return false
 			},
 			func(steps []fantasy.StepResult) bool {
-				return hasRepeatedToolCalls(steps, loopDetectionWindowSize, loopDetectionMaxRepeats)
+				detected, detail := hasRepeatedToolCalls(steps, loopDetectionWindowSize, loopDetectionMaxRepeats)
+				if detected {
+					loopDetected = true
+					loopDetail = detail
+					return true
+				}
+				return false
 			},
 		},
 	})

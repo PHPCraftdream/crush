@@ -2,6 +2,7 @@ package agent
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 
 	"charm.land/fantasy"
@@ -49,7 +50,7 @@ func makeEmptyStep() fantasy.StepResult {
 
 func TestHasRepeatedToolCalls(t *testing.T) {
 	t.Run("no steps", func(t *testing.T) {
-		result := hasRepeatedToolCalls(nil, 10, 5)
+		result, _ := hasRepeatedToolCalls(nil, 10, 5)
 		if result {
 			t.Error("expected false for empty steps")
 		}
@@ -60,7 +61,7 @@ func TestHasRepeatedToolCalls(t *testing.T) {
 		for i := range steps {
 			steps[i] = makeToolStep("read", `{"file":"a.go"}`, "content")
 		}
-		result := hasRepeatedToolCalls(steps, 10, 5)
+		result, _ := hasRepeatedToolCalls(steps, 10, 5)
 		if result {
 			t.Error("expected false when fewer steps than window size")
 		}
@@ -71,7 +72,7 @@ func TestHasRepeatedToolCalls(t *testing.T) {
 		for i := range steps {
 			steps[i] = makeToolStep("tool", fmt.Sprintf(`{"i":%d}`, i), fmt.Sprintf("result-%d", i))
 		}
-		result := hasRepeatedToolCalls(steps, 10, 5)
+		result, _ := hasRepeatedToolCalls(steps, 10, 5)
 		if result {
 			t.Error("expected false when all signatures are different")
 		}
@@ -86,7 +87,7 @@ func TestHasRepeatedToolCalls(t *testing.T) {
 		for i := 5; i < 10; i++ {
 			steps[i] = makeToolStep("tool", fmt.Sprintf(`{"i":%d}`, i), fmt.Sprintf("result-%d", i))
 		}
-		result := hasRepeatedToolCalls(steps, 10, 5)
+		result, _ := hasRepeatedToolCalls(steps, 10, 5)
 		if result {
 			t.Error("expected false when count equals maxRepeats (threshold is >)")
 		}
@@ -101,9 +102,20 @@ func TestHasRepeatedToolCalls(t *testing.T) {
 		for i := 6; i < 10; i++ {
 			steps[i] = makeToolStep("tool", fmt.Sprintf(`{"i":%d}`, i), fmt.Sprintf("result-%d", i))
 		}
-		result := hasRepeatedToolCalls(steps, 10, 5)
+		result, detail := hasRepeatedToolCalls(steps, 10, 5)
 		if !result {
 			t.Error("expected true when same signature appears more than maxRepeats times")
+		}
+		// Regression value: the detail must carry the tool name + count so the
+		// Finish part's message can name the offending tool specifically.
+		if detail.ToolName != "read" {
+			t.Errorf("detail.ToolName = %q, want %q", detail.ToolName, "read")
+		}
+		if detail.Count != 6 {
+			t.Errorf("detail.Count = %d, want 6", detail.Count)
+		}
+		if detail.Threshold != 5 {
+			t.Errorf("detail.Threshold = %d, want 5", detail.Threshold)
 		}
 	})
 
@@ -119,7 +131,7 @@ func TestHasRepeatedToolCalls(t *testing.T) {
 		for i := 8; i < 10; i++ {
 			steps[i] = makeToolStep("write", `{"file":"b.go"}`, "ok")
 		}
-		result := hasRepeatedToolCalls(steps, 10, 5)
+		result, _ := hasRepeatedToolCalls(steps, 10, 5)
 		if result {
 			t.Error("expected false: only 4 repeated tool calls, empty steps should be skipped")
 		}
@@ -135,7 +147,7 @@ func TestHasRepeatedToolCalls(t *testing.T) {
 				steps[i] = makeToolStep("write", `{"file":"b.go"}`, "content-b")
 			}
 		}
-		result := hasRepeatedToolCalls(steps, 10, 5)
+		result, _ := hasRepeatedToolCalls(steps, 10, 5)
 		if result {
 			t.Error("expected false: two patterns each appearing 5 times (not > 5)")
 		}
@@ -200,6 +212,58 @@ func TestGetToolInteractionSignature(t *testing.T) {
 		sig2 := getToolInteractionSignature(content2)
 		if sig1 == sig2 {
 			t.Error("expected different signatures for different inputs")
+		}
+	})
+}
+
+// TestLoopDetectedFinishText is the regression test for the loop-detection
+// finish-reason fix. Before the fix, a loop-detected stop recorded an
+// assistant message whose Finish part had EMPTY message/details —
+// indistinguishable from a model that voluntarily finished (end_turn). An
+// operator/orchestrator had no way to tell a legitimate polling pattern had
+// been truncated. This test proves loopDetectedFinishText returns non-empty,
+// specific strings (naming the offending tool + count) that get persisted on
+// the Finish part via agent.go's OnStepFinish else-if branch.
+//
+// It would fail against the old code path (which passed "", "") because the
+// helper did not exist — the only signal was a slog.Debug log line, never
+// persisted on the message.
+func TestLoopDetectedFinishText(t *testing.T) {
+	t.Run("populated detail yields non-empty message and details", func(t *testing.T) {
+		detail := loopDetail{ToolName: "job_output", Count: 6, Threshold: 5}
+		msg, details := loopDetectedFinishText(detail)
+
+		if msg == "" {
+			t.Fatal("message must be non-empty — empty message is the exact bug (loop stop looks identical to voluntary finish)")
+		}
+		if details == "" {
+			t.Fatal("details must be non-empty — empty details is the exact bug")
+		}
+		// Message must name the offending tool and the count, so it is
+		// specific rather than generic.
+		if !strings.Contains(msg, "job_output") {
+			t.Errorf("message %q should name the tool %q", msg, "job_output")
+		}
+		if !strings.Contains(msg, "6") {
+			t.Errorf("message %q should include the count 6", msg)
+		}
+		// Details must mention the legitimate-polling caveat (the operator
+		// signal that distinguishes this from a clean finish).
+		if !strings.Contains(details, "polling") {
+			t.Errorf("details %q should mention polling so operators know the task may be unfinished", details)
+		}
+	})
+
+	t.Run("empty tool name does not produce empty message", func(t *testing.T) {
+		// Even when ToolName couldn't be extracted, the message must still be
+		// non-empty (placeholder) — a loop stop must always be distinguishable.
+		detail := loopDetail{ToolName: "", Count: 6, Threshold: 5}
+		msg, details := loopDetectedFinishText(detail)
+		if msg == "" || details == "" {
+			t.Fatalf("message/details must be non-empty even with empty tool name; got msg=%q details=%q", msg, details)
+		}
+		if !strings.Contains(msg, "(unknown)") {
+			t.Errorf("message %q should contain (unknown) placeholder for empty tool name", msg)
 		}
 	})
 }
