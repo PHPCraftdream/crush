@@ -141,18 +141,29 @@ func explainSessionStatus(ctx context.Context, a *app.App, cwd, sessionID string
 		// hasLock && !pidAlive → raw signal is "crashed". Decide whether
 		// the message store contradicts that (clean end_turn → really
 		// "done") — this is the reclassifyCrashedAsDone rule.
-		fmt.Fprintf(out, "status: crashed\n")
-		fmt.Fprintf(out, "reason: lock file exists but holder PID %d is not alive.\n", pid)
+		//
+		// The FIRST-LINE verdict must match what `sessions list` shows:
+		// a clean end_turn is reclassified as "done" there, so we emit
+		// "status: done (stale lock)" — NOT "status: crashed" — otherwise
+		// any orchestrator parsing the first line gets the OPPOSITE verdict
+		// from `sessions list` for the same session. The genuinely-crashed
+		// case (no clean finish) stays "status: crashed".
 		if finish != nil && finish.Reason == message.FinishReasonEndTurn {
+			fmt.Fprintf(out, "status: done (stale lock)\n")
+			fmt.Fprintf(out, "reason: lock file exists but holder PID %d is not alive; last assistant message finished cleanly (end_turn).\n", pid)
 			fmt.Fprintf(out, "\n")
-			fmt.Fprintf(out, "NOTE: the last assistant message finished cleanly (end_turn).\n")
-			fmt.Fprintf(out, "This is likely a stale lock from a process that exited without\n")
-			fmt.Fprintf(out, "cleanup, or another process finished this session concurrently.\n")
+			fmt.Fprintf(out, "NOTE: this matches the reclassification \"sessions list\" applies via\n")
+			fmt.Fprintf(out, "reclassifyCrashedAsDone — likely a stale lock from a process that exited\n")
+			fmt.Fprintf(out, "without cleanup, or another process finished this session concurrently.\n")
 			fmt.Fprintf(out, "Treat as done.\n")
-		} else if lastAssistant == nil {
-			fmt.Fprintf(out, "no assistant message with a clean finish — likely died mid-turn.\n")
 		} else {
-			fmt.Fprintf(out, "no clean finish found (last finish: %s) — likely died mid-turn.\n", finishReasonOrUnknown(finish))
+			fmt.Fprintf(out, "status: crashed\n")
+			fmt.Fprintf(out, "reason: lock file exists but holder PID %d is not alive.\n", pid)
+			if lastAssistant == nil {
+				fmt.Fprintf(out, "no assistant message with a clean finish — likely died mid-turn.\n")
+			} else {
+				fmt.Fprintf(out, "no clean finish found (last finish: %s) — likely died mid-turn.\n", finishReasonOrUnknown(finish))
+			}
 		}
 	}
 

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/charmbracelet/crush/internal/app"
@@ -99,11 +100,14 @@ func TestExplainSessionStatus_Crashed_NoCleanFinish(t *testing.T) {
 	require.Contains(t, out, "canceled")
 }
 
-// TestExplainSessionStatus_CrashedButActuallyClean: lock file exists, holder
+// TestExplainSessionStatus_StaleLockCleanFinish: lock file exists, holder
 // PID is dead, BUT the last assistant message finished with end_turn. The raw
-// lock signal says "crashed" but the message store contradicts it → the output
-// must surface the reclassification explanation and say "Treat as done".
-func TestExplainSessionStatus_CrashedButActuallyClean(t *testing.T) {
+// lock signal says "crashed" but the message store contradicts it → the FIRST
+// LINE verdict must be "done (stale lock)" — matching what `sessions list`
+// shows after reclassifyCrashedAsDone, so orchestrators parsing the first line
+// get the same verdict from both commands. The reason must mention the clean
+// finish + stale lock, and the NOTE must still say "Treat as done".
+func TestExplainSessionStatus_StaleLockCleanFinish(t *testing.T) {
 	t.Parallel()
 
 	conn, q := newTestDB(t)
@@ -134,10 +138,13 @@ func TestExplainSessionStatus_CrashedButActuallyClean(t *testing.T) {
 	require.NoError(t, explainSessionStatus(context.Background(), a, cwd, sess.ID, &buf))
 
 	out := buf.String()
-	// Raw signal is still "crashed" (lock + dead PID)...
-	require.Contains(t, out, "status: crashed")
-	// ...but the explanation must call out the clean finish and the
-	// reclassification, matching reclassifyCrashedAsDone's behaviour.
+	// First-line verdict must say done (matching sessions list), NOT crashed.
+	firstLine := strings.SplitN(out, "\n", 2)[0]
+	require.Equal(t, "status: done (stale lock)", firstLine,
+		"first line must say done (stale lock), not crashed — must match sessions list verdict")
+	// Must NOT say crashed anywhere in the output now.
+	require.NotContains(t, out, "status: crashed")
+	// The explanation must still call out the clean finish + stale lock.
 	require.Contains(t, out, "finished cleanly (end_turn)")
 	require.Contains(t, out, "stale lock")
 	require.Contains(t, out, "Treat as done")
