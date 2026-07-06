@@ -901,7 +901,7 @@ func buildConfigWire(a *appPkg.App) (ConfigWire, bool) {
 	for _, p := range store.KnownProviders() {
 		id := string(p.ID)
 		if ep, ok := enabledIDs[id]; ok {
-			pw := ProviderWire{Name: p.Name, Enabled: true, Type: string(p.Type), APIKeySet: ep.APIKey != "", Models: make([]ModelInfoWire, len(ep.Models))}
+			pw := ProviderWire{Name: p.Name, Enabled: true, Type: string(p.Type), APIKeySet: ep.APIKey != "", PeakHours: peakHoursToWire(ep.PeakHours), Models: make([]ModelInfoWire, len(ep.Models))}
 			for i, m := range ep.Models {
 				pw.Models[i] = ModelInfoWire{ID: m.ID, Name: m.Name, ContextWindow: m.ContextWindow}
 			}
@@ -928,6 +928,7 @@ func buildConfigWire(a *appPkg.App) (ConfigWire, bool) {
 				BaseURL:   ep.BaseURL,
 				IsCustom:  isCustom,
 				APIKeySet: ep.APIKey != "",
+				PeakHours: peakHoursToWire(ep.PeakHours),
 				Models:    make([]ModelInfoWire, len(ep.Models)),
 			}
 			for i, m := range ep.Models {
@@ -1740,6 +1741,31 @@ func handleInitializeProject(ctx context.Context, a *appPkg.App, c *Client, msg 
 
 // ── Custom providers ──────────────────────────────────────────────────────────
 
+// peakHoursFromWire converts the optional WS payload into a validated
+// config.PeakHoursWindow. Returns (nil, nil) when the payload is absent
+// (feature off). Returns (nil, err) when the payload fails validation.
+// The caller is responsible for replying with EventError on err.
+func peakHoursFromWire(w *PeakHoursWirePayload) (*config.PeakHoursWindow, error) {
+	if w == nil {
+		return nil, nil
+	}
+	window := config.PeakHoursWindow{Start: w.Start, End: w.End}
+	if err := window.Validate(); err != nil {
+		return nil, err
+	}
+	return &window, nil
+}
+
+// peakHoursToWire converts a config.PeakHoursWindow pointer into the WS
+// payload shape. Returns nil when the window is absent (feature off) so
+// the JSON field is omitted.
+func peakHoursToWire(w *config.PeakHoursWindow) *PeakHoursWirePayload {
+	if w == nil {
+		return nil
+	}
+	return &PeakHoursWirePayload{Start: w.Start, End: w.End}
+}
+
 func handleAddCustomProvider(a *appPkg.App, c *Client, msg WSMessage) {
 	var p AddCustomProviderPayload
 	if err := json.Unmarshal(msg.Payload, &p); err != nil {
@@ -1748,6 +1774,11 @@ func handleAddCustomProvider(a *appPkg.App, c *Client, msg WSMessage) {
 	}
 	if p.ID == "" || p.BaseURL == "" {
 		c.reply(msg.ID, EventError, nil, "id and baseUrl are required")
+		return
+	}
+	peakHours, err := peakHoursFromWire(p.PeakHours)
+	if err != nil {
+		c.reply(msg.ID, EventError, nil, fmt.Sprintf("invalid peakHours: %v", err))
 		return
 	}
 	store := a.Store()
@@ -1771,12 +1802,13 @@ func handleAddCustomProvider(a *appPkg.App, c *Client, msg WSMessage) {
 		}
 	}
 	providerCfg := config.ProviderConfig{
-		ID:      p.ID,
-		Name:    cmp.Or(p.Name, p.ID),
-		Type:    catwalk.Type(cmp.Or(p.Type, "openai-compat")),
-		BaseURL: p.BaseURL,
-		APIKey:  p.APIKey,
-		Models:  models,
+		ID:        p.ID,
+		Name:      cmp.Or(p.Name, p.ID),
+		Type:      catwalk.Type(cmp.Or(p.Type, "openai-compat")),
+		BaseURL:   p.BaseURL,
+		APIKey:    p.APIKey,
+		Models:    models,
+		PeakHours: peakHours,
 	}
 	cfg.Providers.Set(p.ID, providerCfg)
 	if err := store.SetConfigField(config.ScopeGlobal, fmt.Sprintf("providers.%s", p.ID), providerCfg); err != nil {
@@ -1824,6 +1856,11 @@ func handleUpdateCustomProvider(a *appPkg.App, c *Client, msg WSMessage) {
 		c.reply(msg.ID, EventError, nil, "oldId, id and baseUrl are required")
 		return
 	}
+	peakHours, err := peakHoursFromWire(p.PeakHours)
+	if err != nil {
+		c.reply(msg.ID, EventError, nil, fmt.Sprintf("invalid peakHours: %v", err))
+		return
+	}
 	store := a.Store()
 	cfg := store.Config()
 	if cfg == nil {
@@ -1849,12 +1886,13 @@ func handleUpdateCustomProvider(a *appPkg.App, c *Client, msg WSMessage) {
 		}
 	}
 	providerCfg := config.ProviderConfig{
-		ID:      p.ID,
-		Name:    cmp.Or(p.Name, p.ID),
-		Type:    catwalk.Type(cmp.Or(p.Type, "openai-compat")),
-		BaseURL: p.BaseURL,
-		APIKey:  p.APIKey,
-		Models:  models,
+		ID:        p.ID,
+		Name:      cmp.Or(p.Name, p.ID),
+		Type:      catwalk.Type(cmp.Or(p.Type, "openai-compat")),
+		BaseURL:   p.BaseURL,
+		APIKey:    p.APIKey,
+		Models:    models,
+		PeakHours: peakHours,
 	}
 	cfg.Providers.Set(p.ID, providerCfg)
 	if err := store.SetConfigField(config.ScopeGlobal, fmt.Sprintf("providers.%s", p.ID), providerCfg); err != nil {

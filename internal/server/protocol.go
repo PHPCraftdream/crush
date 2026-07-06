@@ -229,14 +229,24 @@ type CustomModelPayload struct {
 	CostPer1MOut  float64 `json:"costPer1mOut,omitempty"`
 }
 
+// PeakHoursWirePayload is the wire shape of config.PeakHoursWindow. It
+// uses the same lowerCamelCase JSON keys ("start"/"end") as the config
+// type so the WS layer can marshal/unmarshal it directly without a
+// remapping step.
+type PeakHoursWirePayload struct {
+	Start string `json:"start,omitempty"`
+	End   string `json:"end,omitempty"`
+}
+
 // AddCustomProviderPayload adds a fully custom provider.
 type AddCustomProviderPayload struct {
-	ID      string               `json:"id"`
-	Name    string               `json:"name,omitempty"`
-	Type    string               `json:"type"`
-	BaseURL string               `json:"baseUrl"`
-	APIKey  string               `json:"apiKey,omitempty"`
-	Models  []CustomModelPayload `json:"models,omitempty"`
+	ID        string                `json:"id"`
+	Name      string                `json:"name,omitempty"`
+	Type      string                `json:"type"`
+	BaseURL   string                `json:"baseUrl"`
+	APIKey    string                `json:"apiKey,omitempty"`
+	Models    []CustomModelPayload  `json:"models,omitempty"`
+	PeakHours *PeakHoursWirePayload `json:"peakHours,omitempty"`
 }
 
 // RemoveCustomProviderPayload removes a custom provider by id.
@@ -245,14 +255,18 @@ type RemoveCustomProviderPayload struct {
 }
 
 // UpdateCustomProviderPayload updates an existing custom provider.
+// Update is a full replace, not a partial merge — mirroring APIKey and
+// every other field, PeakHours is taken verbatim from the payload:
+// present → set (validated), absent → cleared to nil.
 type UpdateCustomProviderPayload struct {
-	OldID   string               `json:"oldId"`
-	ID      string               `json:"id"`
-	Name    string               `json:"name,omitempty"`
-	Type    string               `json:"type"`
-	BaseURL string               `json:"baseUrl"`
-	APIKey  string               `json:"apiKey,omitempty"`
-	Models  []CustomModelPayload `json:"models,omitempty"`
+	OldID     string                `json:"oldId"`
+	ID        string                `json:"id"`
+	Name      string                `json:"name,omitempty"`
+	Type      string                `json:"type"`
+	BaseURL   string                `json:"baseUrl"`
+	APIKey    string                `json:"apiKey,omitempty"`
+	Models    []CustomModelPayload  `json:"models,omitempty"`
+	PeakHours *PeakHoursWirePayload `json:"peakHours,omitempty"`
 }
 
 // MCPServerInfo is the wire format for a single MCP server state.
@@ -417,13 +431,14 @@ type ModelEntryWire struct {
 
 // ProviderWire is a provider with its available models.
 type ProviderWire struct {
-	Name      string          `json:"name,omitempty"`
-	Enabled   bool            `json:"enabled"`
-	Type      string          `json:"type,omitempty"`
-	Models    []ModelInfoWire `json:"models,omitempty"`
-	BaseURL   string          `json:"baseUrl,omitempty"`
-	IsCustom  bool            `json:"isCustom,omitempty"`
-	APIKeySet bool            `json:"apiKeySet,omitempty"`
+	Name      string                `json:"name,omitempty"`
+	Enabled   bool                  `json:"enabled"`
+	Type      string                `json:"type,omitempty"`
+	Models    []ModelInfoWire       `json:"models,omitempty"`
+	BaseURL   string                `json:"baseUrl,omitempty"`
+	IsCustom  bool                  `json:"isCustom,omitempty"`
+	APIKeySet bool                  `json:"apiKeySet,omitempty"`
+	PeakHours *PeakHoursWirePayload `json:"peakHours,omitempty"`
 }
 
 // ModelInfoWire is a single available model from a provider.
