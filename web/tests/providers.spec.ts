@@ -1,6 +1,6 @@
 import { test, expect } from "@playwright/test";
 import { setupMockWS, sendMockWSMessage, waitForWSSend } from "./helpers/mock-ws";
-import { makeConfig } from "./helpers/fixtures";
+import { makeConfig, makeSession } from "./helpers/fixtures";
 
 test.beforeEach(async ({ page }) => {
   await setupMockWS(page);
@@ -8,6 +8,25 @@ test.beforeEach(async ({ page }) => {
     route.fulfill({ status: 200, body: "OK" })
   );
 });
+
+/**
+ * Loads the page and establishes an active session so the ChatToolbar (which
+ * returns null until $activeSessionID is set) renders its buttons. The config
+ * message is optional; omitting it just primes a session.
+ */
+async function primeSession(
+  page: Parameters<typeof sendMockWSMessage>[0],
+  config?: Record<string, unknown>
+) {
+  await page.goto("/");
+  await sendMockWSMessage(page, {
+    type: "sessions_list",
+    payload: [makeSession({ ID: "prov-sess", Title: "Providers Session" })],
+  });
+  if (config) {
+    await sendMockWSMessage(page, { type: "config", payload: config });
+  }
+}
 
 /** Config with a single custom provider. */
 function makeConfigWithProvider(overrides: Record<string, unknown> = {}) {
@@ -34,8 +53,7 @@ function makeConfigWithProvider(overrides: Record<string, unknown> = {}) {
 }
 
 async function openProvidersModal(page: Parameters<typeof sendMockWSMessage>[0]) {
-  await page.goto("/");
-  await sendMockWSMessage(page, { type: "config", payload: makeConfig() });
+  await primeSession(page, makeConfig());
   await page.getByTestId("header-providers-button").click();
   await expect(page.getByTestId("providers-modal")).toBeVisible({ timeout: 3000 });
 }
@@ -57,11 +75,7 @@ test("Providers modal closes on backdrop click", async ({ page }) => {
 // ── Provider display ─────────────────────────────────────────────────────────
 
 test("Providers modal shows provider base URL", async ({ page }) => {
-  await page.goto("/");
-  await sendMockWSMessage(page, {
-    type: "config",
-    payload: makeConfigWithProvider(),
-  });
+  await primeSession(page, makeConfigWithProvider());
   await page.getByTestId("header-providers-button").click();
   await expect(page.getByTestId("providers-modal")).toBeVisible({ timeout: 3000 });
   await expect(
@@ -70,10 +84,7 @@ test("Providers modal shows provider base URL", async ({ page }) => {
 });
 
 test("Providers modal shows model count", async ({ page }) => {
-  await page.goto("/");
-  await sendMockWSMessage(page, {
-    type: "config",
-    payload: makeConfig({
+  await primeSession(page, makeConfig({
       providers: {
         anthropic: { name: "Anthropic", enabled: true, models: [] },
         ollama: {
@@ -88,8 +99,7 @@ test("Providers modal shows model count", async ({ page }) => {
           ],
         },
       },
-    }),
-  });
+    }));
   await page.getByTestId("header-providers-button").click();
   await expect(page.getByTestId("providers-modal")).toBeVisible({ timeout: 3000 });
   // The row subtitle shows "2 models"
@@ -101,11 +111,7 @@ test("Providers modal shows model count", async ({ page }) => {
 // ── Edit provider ────────────────────────────────────────────────────────────
 
 test("Edit provider button opens edit form", async ({ page }) => {
-  await page.goto("/");
-  await sendMockWSMessage(page, {
-    type: "config",
-    payload: makeConfigWithProvider(),
-  });
+  await primeSession(page, makeConfigWithProvider());
   await page.getByTestId("header-providers-button").click();
   await expect(page.getByTestId("providers-modal")).toContainText("Ollama", { timeout: 3000 });
   await page.getByTitle("Edit provider").click();
@@ -115,11 +121,7 @@ test("Edit provider button opens edit form", async ({ page }) => {
 });
 
 test("Edit provider form has ID field disabled", async ({ page }) => {
-  await page.goto("/");
-  await sendMockWSMessage(page, {
-    type: "config",
-    payload: makeConfigWithProvider(),
-  });
+  await primeSession(page, makeConfigWithProvider());
   await page.getByTestId("header-providers-button").click();
   await expect(page.getByTestId("providers-modal")).toContainText("Ollama", { timeout: 3000 });
   await page.getByTitle("Edit provider").click();
@@ -132,11 +134,7 @@ test("Edit provider form has ID field disabled", async ({ page }) => {
 });
 
 test("Edit provider sends update_custom_provider", async ({ page }) => {
-  await page.goto("/");
-  await sendMockWSMessage(page, {
-    type: "config",
-    payload: makeConfigWithProvider(),
-  });
+  await primeSession(page, makeConfigWithProvider());
   await page.getByTestId("header-providers-button").click();
   await expect(page.getByTestId("providers-modal")).toContainText("Ollama", { timeout: 3000 });
   await page.getByTitle("Edit provider").click();
@@ -217,11 +215,7 @@ test("Add provider form with model saves correctly", async ({ page }) => {
 // ── Remove provider ──────────────────────────────────────────────────────────
 
 test("Remove provider - cancel hides confirm", async ({ page }) => {
-  await page.goto("/");
-  await sendMockWSMessage(page, {
-    type: "config",
-    payload: makeConfigWithProvider(),
-  });
+  await primeSession(page, makeConfigWithProvider());
   await page.getByTestId("header-providers-button").click();
   await expect(page.getByTestId("providers-modal")).toContainText("Ollama", { timeout: 3000 });
   await page.getByTitle("Remove provider").click();
@@ -237,13 +231,9 @@ test("Remove provider - cancel hides confirm", async ({ page }) => {
 // ── Peak-hours window ────────────────────────────────────────────────────────
 
 test("Provider with peak_hours shows window badge in row", async ({ page }) => {
-  await page.goto("/");
-  await sendMockWSMessage(page, {
-    type: "config",
-    payload: makeConfigWithProvider({
+  await primeSession(page, makeConfigWithProvider({
       peakHours: { start: "09:00", end: "18:00" },
-    }),
-  });
+    }));
   await page.getByTestId("header-providers-button").click();
   await expect(page.getByTestId("providers-modal")).toContainText("Ollama", { timeout: 3000 });
   await expect(page.getByTestId("provider-peak-badge")).toBeVisible({ timeout: 3000 });
@@ -251,11 +241,7 @@ test("Provider with peak_hours shows window badge in row", async ({ page }) => {
 });
 
 test("Provider without peak_hours shows no window badge", async ({ page }) => {
-  await page.goto("/");
-  await sendMockWSMessage(page, {
-    type: "config",
-    payload: makeConfigWithProvider(),
-  });
+  await primeSession(page, makeConfigWithProvider());
   await page.getByTestId("header-providers-button").click();
   await expect(page.getByTestId("providers-modal")).toContainText("Ollama", { timeout: 3000 });
   await expect(page.getByTestId("provider-peak-badge")).toHaveCount(0);
@@ -296,13 +282,9 @@ test("Add provider form omits window when peak-hours disabled", async ({ page })
 });
 
 test("Edit provider form prefills existing peak-hours window", async ({ page }) => {
-  await page.goto("/");
-  await sendMockWSMessage(page, {
-    type: "config",
-    payload: makeConfigWithProvider({
+  await primeSession(page, makeConfigWithProvider({
       peakHours: { start: "08:00", end: "20:00" },
-    }),
-  });
+    }));
   await page.getByTestId("header-providers-button").click();
   await expect(page.getByTestId("providers-modal")).toContainText("Ollama", { timeout: 3000 });
   await page.getByTitle("Edit provider").click();
@@ -314,13 +296,9 @@ test("Edit provider form prefills existing peak-hours window", async ({ page }) 
 });
 
 test("Edit provider clears peak-hours when toggled off", async ({ page }) => {
-  await page.goto("/");
-  await sendMockWSMessage(page, {
-    type: "config",
-    payload: makeConfigWithProvider({
+  await primeSession(page, makeConfigWithProvider({
       peakHours: { start: "08:00", end: "20:00" },
-    }),
-  });
+    }));
   await page.getByTestId("header-providers-button").click();
   await expect(page.getByTestId("providers-modal")).toContainText("Ollama", { timeout: 3000 });
   await page.getByTitle("Edit provider").click();
@@ -336,10 +314,7 @@ test("Edit provider clears peak-hours when toggled off", async ({ page }) => {
 // ── API key badge ────────────────────────────────────────────────────────────
 
 test("Provider with API key shows Key set badge", async ({ page }) => {
-  await page.goto("/");
-  await sendMockWSMessage(page, {
-    type: "config",
-    payload: makeConfig({
+  await primeSession(page, makeConfig({
       providers: {
         anthropic: { name: "Anthropic", enabled: true, models: [] },
         myapi: {
@@ -352,8 +327,7 @@ test("Provider with API key shows Key set badge", async ({ page }) => {
           models: [{ id: "model-a", name: "Model A" }],
         },
       },
-    }),
-  });
+    }));
   await page.getByTestId("header-providers-button").click();
   await expect(page.getByTestId("providers-modal")).toBeVisible({ timeout: 3000 });
   await expect(page.getByText("Key set", { exact: false })).toBeVisible({
