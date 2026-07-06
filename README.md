@@ -210,6 +210,19 @@ jq -r '.error' "$out"         # error.message if non-success
   so `crush models show` and similar read-only commands skip the
   ~3-second HTTP round-trip when the on-disk cache is fresher than
   the TTL.
+- **`CRUSH_COLOR_SCHEME`** — `light` \| `dark` \| `auto` (default
+  `auto`). Forces the CLI help/error color palette onto a light or
+  dark background, working around unreliable terminal light/dark
+  auto-detection. The auto path queries the terminal's background
+  color with an OSC 11 escape sequence and a hard 2-second timeout;
+  if the terminal doesn't reply in time (or stdin/stdout aren't both
+  real TTYs, e.g. when an orchestrator spawns `crush` with redirected
+  stdin), lipgloss's `HasDarkBackground` **falls back to assuming a
+  dark background** — so on a light-themed terminal the help renders
+  grey-on-white with low contrast. This has been reported on WezTerm
+  on Windows. Set `CRUSH_COLOR_SCHEME=light` (or pass
+  `--color-scheme light`, which is global and wins over the env var)
+  to force the light palette.
 
 Permissions are unconditionally auto-approved in `crush run` — see
 "Security" above. `--cwd /tmp/sandbox` or a worktree narrows the blast
