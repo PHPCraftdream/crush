@@ -1264,7 +1264,6 @@ func TestStreamWaitBoundedOnGrandchildHoldsStderr(t *testing.T) {
 	// the ctx bound failed), fail loudly instead of stalling the suite.
 	done := make(chan struct{})
 	var gotErr error
-	var sawCancel bool
 	go func() {
 		defer close(done)
 		for part := range stream {
@@ -1279,20 +1278,26 @@ func TestStreamWaitBoundedOnGrandchildHoldsStderr(t *testing.T) {
 		t.Fatal("stream drain hung past 15s watchdog — bounded wait regression")
 	}
 
-	// The ctx deadline should have fired (grandchild holds stderr 30s),
-	// surfacing a context error part. The key assertion is that we got here
-	// at all without the watchdog killing us.
+	// The ctx deadline MUST have fired and the bounded-wait code path MUST
+	// have surfaced a context error. This is the deterministic assertion that
+	// gives the test its regression value: with the fix reverted (unbounded
+	// cmd.Wait()), the drain hangs and we never reach here (the watchdog
+	// above fails the test at 15s). With the fix in place, the ctx-bound
+	// select returns ctx.Err() promptly and it propagates as the error part.
+	//
+	// We deliberately do NOT accept gotErr == nil: if the grandchild's stderr
+	// fd were ever closed by the OS instead of being held (different
+	// platform/shell), wait() would return normally with no error and this
+	// test would no longer prove the bounded path fired — it would have zero
+	// regression value. In that case the test should fail loudly so we know
+	// to switch to an injected-fake-process technique on that platform.
 	if gotErr == nil {
-		// On some platforms the grandchild's stderr fd may be closed by the
-		// OS when bash exits (e.g. if disown/redirect semantics differ), in
-		// which case wait() returns normally with no error. That still proves
-		// the wait is bounded (it returned), so we don't hard-fail here; we
-		// just note it.
-		sawCancel = false
-	} else {
-		sawCancel = errors.Is(gotErr, context.DeadlineExceeded) || errors.Is(gotErr, context.Canceled)
+		t.Fatal("expected ctx error from bounded wait() but got nil — the grandchild-holds-stderr premise did not hold in this environment; this test no longer proves the fix and needs a different technique for this platform")
 	}
-	t.Logf("drain completed; gotErr=%v sawCtxCancel=%v", gotErr, sawCancel)
+	if !errors.Is(gotErr, context.DeadlineExceeded) && !errors.Is(gotErr, context.Canceled) {
+		t.Fatalf("expected context.DeadlineExceeded or context.Canceled from bounded wait(), got %v", gotErr)
+	}
+	t.Logf("drain completed with ctx-bound wait; gotErr=%v", gotErr)
 
 	// Reap the orphaned grandchild so we don't leak a 30s sleeper.
 	if pidData, rerr := os.ReadFile(filepath.Join(tmpDir, "grandchild.pid")); rerr == nil {
