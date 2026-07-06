@@ -165,6 +165,14 @@ type ProviderConfig struct {
 
 	// The provider models
 	Models []catwalk.Model `json:"models,omitempty" jsonschema:"description=List of models available from this provider"`
+
+	// PeakHours, when non-nil, refuses all requests to this provider
+	// during the given local-time window. Useful for keeping a metered
+	// provider untouched during its expensive daytime band. Interpreted
+	// in the computer's LOCAL time; there is no timezone field and no
+	// weekday mask. An overnight window (start > end) wraps past
+	// midnight. Absent / null = feature off.
+	PeakHours *PeakHoursWindow `json:"peak_hours,omitempty" jsonschema:"description=Optional local-time window during which this provider is refused. Times are HH:MM in the machine local clock\\, no timezone\\, no weekday mask. Overnight window (start > end) wraps past midnight. Absent = feature off.,example={\"start\":\"09:00\",\"end\":\"18:00\"}"`
 }
 
 // ToProvider converts the [ProviderConfig] to a [catwalk.Provider].

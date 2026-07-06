@@ -92,6 +92,13 @@ var (
 	errSmallModelProviderNotConfigured = errors.New("small model provider not configured")
 	errLargeModelNotFound              = errors.New("large model not found in provider config")
 	errSmallModelNotFound              = errors.New("small model not found in provider config")
+	// errProviderPeakHours is returned when a provider's peak_hours
+	// window refuses the request. It is operator-actionable (the user
+	// configured the window on purpose) and MUST NOT be retried: the
+	// condition only clears when the wall clock leaves the window,
+	// which the backoff loop cannot accelerate. classifyProviderError
+	// pins it to classTerminal as defense-in-depth.
+	errProviderPeakHours = errors.New("provider is inside its configured peak-hours window")
 )
 
 // Copilot models that use the Responses API instead of Chat Completions.
@@ -463,6 +470,9 @@ func (c *coordinator) buildCall(ctx context.Context, sessionID, prompt string, a
 	if !ok {
 		return SessionAgentCall{}, errModelProviderNotConfigured
 	}
+	if err := checkPeakHours(providerCfg); err != nil {
+		return SessionAgentCall{}, err
+	}
 
 	mergedOptions, temp, topP, topK, freqPenalty, presPenalty := mergeCallOptions(model, providerCfg)
 	sessionSystemPrompt := c.resolveSessionSystemPrompt(ctx, sessionID)
@@ -505,6 +515,9 @@ func (c *coordinator) runInternal(ctx context.Context, sessionID string, prompt 
 	providerCfg, ok := c.cfg.Config().Providers.Get(model.ModelCfg.Provider)
 	if !ok {
 		return nil, errModelProviderNotConfigured
+	}
+	if err := checkPeakHours(providerCfg); err != nil {
+		return nil, err
 	}
 
 	mergedOptions, temp, topP, topK, freqPenalty, presPenalty := mergeCallOptions(model, providerCfg)
@@ -637,6 +650,12 @@ const (
 // a stall surfaces only as context.Canceled.
 func classifyProviderError(err error) retryClass {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return classTerminal
+	}
+	// Peak-hours refusal is operator policy, not a transient hiccup: the
+	// condition only clears when the wall clock leaves the window, so a
+	// backoff retry would just burn the backoff and fail identically.
+	if errors.Is(err, errProviderPeakHours) {
 		return classTerminal
 	}
 	var providerErr *fantasy.ProviderError
@@ -1905,6 +1924,9 @@ func (c *coordinator) Summarize(ctx context.Context, sessionID string) error {
 	if !ok {
 		return errModelProviderNotConfigured
 	}
+	if err := checkPeakHours(providerCfg); err != nil {
+		return err
+	}
 
 	if err := c.refreshTokenIfExpired(ctx, providerCfg); err != nil {
 		slog.Error("Failed to refresh OAuth2 token before summarize. Proceeding with existing token.", "error", err)
@@ -1924,6 +1946,34 @@ func (c *coordinator) refreshTokenIfExpired(ctx context.Context, providerCfg con
 	}
 	slog.Debug("Token needs to be refreshed", "provider", providerCfg.ID)
 	return c.refreshOAuth2Token(ctx, providerCfg)
+}
+
+// checkPeakHours refuses the request if providerCfg is currently inside its
+// configured peak_hours window. Returns nil (allow) when the window is absent
+// or not currently active. The returned error wraps errProviderPeakHours so
+// callers and classifyProviderError can identify it via errors.Is.
+func checkPeakHours(providerCfg config.ProviderConfig) error {
+	w := providerCfg.PeakHours
+	if w == nil {
+		return nil
+	}
+	now := time.Now()
+	if !w.InPeakHours(now) {
+		return nil
+	}
+	end := w.EndTimeToday(now)
+	slog.Warn(
+		"Refusing request: provider is inside its peak-hours window",
+		"provider", providerCfg.ID,
+		"window_start", w.Start,
+		"window_end", w.End,
+		"available_again", end.Format("15:04"),
+		"in", time.Until(end).Round(time.Minute).String(),
+	)
+	return fmt.Errorf(
+		"%w: provider %s is in peak hours (%s–%s), refusing until %s",
+		errProviderPeakHours, providerCfg.ID, w.Start, w.End, end.Format("15:04"),
+	)
 }
 
 // runWithUnauthorizedRetry executes fn. If fn returns a 401 error, it
@@ -2039,6 +2089,9 @@ func (c *coordinator) runSubAgent(ctx context.Context, params subAgentParams) (f
 	providerCfg, ok := c.cfg.Config().Providers.Get(model.ModelCfg.Provider)
 	if !ok {
 		return fantasy.ToolResponse{}, errModelProviderNotConfigured
+	}
+	if err := checkPeakHours(providerCfg); err != nil {
+		return fantasy.ToolResponse{}, err
 	}
 
 	// Run the agent

@@ -272,6 +272,7 @@ func (c *Config) configureProviders(ctx context.Context, store *ConfigStore, env
 			ExtraBody:          config.ExtraBody,
 			ExtraParams:        make(map[string]string),
 			Models:             p.Models,
+			PeakHours:          config.PeakHours,
 		}
 
 		switch {
@@ -543,6 +544,18 @@ func (c *Config) configureProviders(ctx context.Context, store *ConfigStore, env
 
 	if c.Providers.Len() == 0 && c.Options.DisableDefaultProviders {
 		return fmt.Errorf("default providers are disabled and there are no custom providers are configured")
+	}
+
+	// Validate peak_hours windows for every configured provider (known,
+	// custom, and CLI). A malformed HH:MM string is a hard config-load
+	// error, not a silent skip.
+	for id, pc := range c.Providers.Seq2() {
+		if pc.PeakHours == nil {
+			continue
+		}
+		if err := pc.PeakHours.Validate(); err != nil {
+			return fmt.Errorf("provider %s: %w", id, err)
+		}
 	}
 
 	return nil
