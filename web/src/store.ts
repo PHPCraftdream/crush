@@ -709,6 +709,7 @@ export function initializeProject(msgID?: string) {
 export function addCustomProvider(payload: {
   id: string; name?: string; type: string; baseUrl: string; apiKey?: string;
   models?: { id: string; name: string; contextWindow?: number; costPer1mIn?: number; costPer1mOut?: number }[];
+  peakHours?: { start: string; end: string } | null;
 }, msgID?: string) {
   ws.send("add_custom_provider", payload, msgID);
 }
@@ -720,6 +721,7 @@ export function removeCustomProvider(id: string, msgID?: string) {
 export function updateCustomProvider(payload: {
   oldId: string; id: string; name?: string; type: string; baseUrl: string; apiKey?: string;
   models?: { id: string; name: string; contextWindow?: number; costPer1mIn?: number; costPer1mOut?: number }[];
+  peakHours?: { start: string; end: string } | null;
 }, msgID?: string) {
   ws.send("update_custom_provider", payload, msgID);
 }

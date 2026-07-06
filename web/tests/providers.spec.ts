@@ -234,6 +234,105 @@ test("Remove provider - cancel hides confirm", async ({ page }) => {
   });
 });
 
+// ── Peak-hours window ────────────────────────────────────────────────────────
+
+test("Provider with peak_hours shows window badge in row", async ({ page }) => {
+  await page.goto("/");
+  await sendMockWSMessage(page, {
+    type: "config",
+    payload: makeConfigWithProvider({
+      peakHours: { start: "09:00", end: "18:00" },
+    }),
+  });
+  await page.getByTestId("header-providers-button").click();
+  await expect(page.getByTestId("providers-modal")).toContainText("Ollama", { timeout: 3000 });
+  await expect(page.getByTestId("provider-peak-badge")).toBeVisible({ timeout: 3000 });
+  await expect(page.getByTestId("provider-peak-badge")).toContainText("09:00–18:00");
+});
+
+test("Provider without peak_hours shows no window badge", async ({ page }) => {
+  await page.goto("/");
+  await sendMockWSMessage(page, {
+    type: "config",
+    payload: makeConfigWithProvider(),
+  });
+  await page.getByTestId("header-providers-button").click();
+  await expect(page.getByTestId("providers-modal")).toContainText("Ollama", { timeout: 3000 });
+  await expect(page.getByTestId("provider-peak-badge")).toHaveCount(0);
+});
+
+test("Add provider form sends peakHours when enabled", async ({ page }) => {
+  await openProvidersModal(page);
+  await page.getByTestId("providers-modal-add").click();
+  await page.getByPlaceholder("e.g. ollama", { exact: true }).fill("localprovider");
+  await page.getByPlaceholder("e.g. Ollama", { exact: true }).fill("Local Provider");
+  await page.getByPlaceholder("e.g. http://localhost:11434/v1/").fill("http://localhost:8080/v1/");
+  await page.getByPlaceholder("ID (e.g. qwen3:30b)").first().fill("local-model");
+  await page.getByPlaceholder("Display name").first().fill("Local Model");
+  // Enable peak hours and set a window
+  await page.getByTestId("provider-form-peak-toggle").check();
+  await expect(page.getByTestId("provider-form-peak-inputs")).toBeVisible({ timeout: 3000 });
+  await page.getByTestId("provider-form-peak-start").fill("22:00");
+  await page.getByTestId("provider-form-peak-end").fill("06:00");
+  await page.getByRole("button", { name: "Add Provider", exact: true }).click();
+  const msg = await waitForWSSend(page, "add_custom_provider");
+  const payload = msg.payload as Record<string, unknown>;
+  expect(payload.peakHours).toEqual({ start: "22:00", end: "06:00" });
+});
+
+test("Add provider form omits window when peak-hours disabled", async ({ page }) => {
+  await openProvidersModal(page);
+  await page.getByTestId("providers-modal-add").click();
+  await page.getByPlaceholder("e.g. ollama", { exact: true }).fill("localprovider");
+  await page.getByPlaceholder("e.g. Ollama", { exact: true }).fill("Local Provider");
+  await page.getByPlaceholder("e.g. http://localhost:11434/v1/").fill("http://localhost:8080/v1/");
+  await page.getByPlaceholder("ID (e.g. qwen3:30b)").first().fill("local-model");
+  await page.getByPlaceholder("Display name").first().fill("Local Model");
+  // Peak hours left disabled
+  await page.getByRole("button", { name: "Add Provider", exact: true }).click();
+  const msg = await waitForWSSend(page, "add_custom_provider");
+  const payload = msg.payload as Record<string, unknown>;
+  expect(payload.peakHours).toBeNull();
+});
+
+test("Edit provider form prefills existing peak-hours window", async ({ page }) => {
+  await page.goto("/");
+  await sendMockWSMessage(page, {
+    type: "config",
+    payload: makeConfigWithProvider({
+      peakHours: { start: "08:00", end: "20:00" },
+    }),
+  });
+  await page.getByTestId("header-providers-button").click();
+  await expect(page.getByTestId("providers-modal")).toContainText("Ollama", { timeout: 3000 });
+  await page.getByTitle("Edit provider").click();
+  await expect(page.getByText("Edit: ollama", { exact: false })).toBeVisible({ timeout: 3000 });
+  // Toggle should be checked and inputs prefilled
+  await expect(page.getByTestId("provider-form-peak-toggle")).toBeChecked();
+  await expect(page.getByTestId("provider-form-peak-start")).toHaveValue("08:00");
+  await expect(page.getByTestId("provider-form-peak-end")).toHaveValue("20:00");
+});
+
+test("Edit provider clears peak-hours when toggled off", async ({ page }) => {
+  await page.goto("/");
+  await sendMockWSMessage(page, {
+    type: "config",
+    payload: makeConfigWithProvider({
+      peakHours: { start: "08:00", end: "20:00" },
+    }),
+  });
+  await page.getByTestId("header-providers-button").click();
+  await expect(page.getByTestId("providers-modal")).toContainText("Ollama", { timeout: 3000 });
+  await page.getByTitle("Edit provider").click();
+  await expect(page.getByText("Edit: ollama", { exact: false })).toBeVisible({ timeout: 3000 });
+  // Toggle off
+  await page.getByTestId("provider-form-peak-toggle").uncheck();
+  await page.getByRole("button", { name: "Update Provider" }).click();
+  const msg = await waitForWSSend(page, "update_custom_provider");
+  const payload = msg.payload as Record<string, unknown>;
+  expect(payload.peakHours).toBeNull();
+});
+
 // ── API key badge ────────────────────────────────────────────────────────────
 
 test("Provider with API key shows Key set badge", async ({ page }) => {

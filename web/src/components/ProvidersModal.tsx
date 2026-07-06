@@ -71,6 +71,23 @@ function ModelEditor({
   );
 }
 
+// ── Peak-hours helper ────────────────────────────────────────────────────────
+
+// isPeakHoursActive returns true when the browser's local time-of-day falls
+// inside the [start, end) window. Handles overnight wrap (start > end), e.g.
+// "22:00"–"06:00". Returns false when the window is malformed/empty.
+function isPeakHoursActive(peak: { start: string; end: string } | null | undefined): boolean {
+  if (!peak || !peak.start || !peak.end) return false;
+  const now = new Date();
+  const cur = now.getHours() * 60 + now.getMinutes();
+  const [sh, sm] = peak.start.split(":").map(Number);
+  const [eh, em] = peak.end.split(":").map(Number);
+  if ([sh, sm, eh, em].some((n) => Number.isNaN(n))) return false;
+  const start = sh * 60 + sm;
+  const end = eh * 60 + em;
+  return start <= end ? cur >= start && cur < end : cur >= start || cur < end;
+}
+
 // ── Provider form ─────────────────────────────────────────────────────────────
 
 const PROVIDER_TYPES = ["openai-compat", "openai", "anthropic", "gemini"];
@@ -81,10 +98,11 @@ function ProviderForm({
   onSubmit,
   onCancel,
 }: {
-  initial?: { id: string; name: string; type: string; baseUrl: string; models: ModelDraft[] };
+  initial?: { id: string; name: string; type: string; baseUrl: string; models: ModelDraft[]; peakHours?: { start: string; end: string } | null };
   submitLabel: string;
   onSubmit: (data: {
     id: string; name: string; type: string; baseUrl: string; apiKey: string; models: ModelDraft[];
+    peakHours: { start: string; end: string } | null;
   }, msgID: string) => void;
   onCancel: () => void;
 }) {
@@ -94,6 +112,9 @@ function ProviderForm({
   const [baseUrl, setBaseUrl] = useState(initial?.baseUrl ?? "");
   const [apiKey, setApiKey] = useState("");
   const [models, setModels] = useState<ModelDraft[]>(initial?.models ?? [emptyModel()]);
+  const [peakEnabled, setPeakEnabled] = useState(!!initial?.peakHours?.start && !!initial?.peakHours?.end);
+  const [peakStart, setPeakStart] = useState(initial?.peakHours?.start ?? "09:00");
+  const [peakEnd, setPeakEnd] = useState(initial?.peakHours?.end ?? "18:00");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -106,6 +127,7 @@ function ProviderForm({
       if (!m.id.trim()) return "Each model must have an ID";
       if (!m.name.trim()) return "Each model must have a display name";
     }
+    if (peakEnabled && (!peakStart || !peakEnd)) return "Peak-hours start and end are required";
     return null;
   }
 
@@ -113,7 +135,10 @@ function ProviderForm({
     id.trim() !== "" &&
     baseUrl.trim() !== "" &&
     models.length > 0 &&
-    models.every((m) => m.id.trim() !== "" && m.name.trim() !== "");
+    models.every((m) => m.id.trim() !== "" && m.name.trim() !== "") &&
+    (!peakEnabled || (peakStart !== "" && peakEnd !== ""));
+
+  const peakHours = peakEnabled && peakStart && peakEnd ? { start: peakStart, end: peakEnd } : null;
 
   function submit() {
     const err = validate();
@@ -129,7 +154,7 @@ function ProviderForm({
         if (msg.error) setError(msg.error);
         else onCancel();
       });
-      onSubmit({ id: id.trim(), name: name.trim(), type, baseUrl: baseUrl.trim(), apiKey, models }, msgID);
+      onSubmit({ id: id.trim(), name: name.trim(), type, baseUrl: baseUrl.trim(), apiKey, models, peakHours }, msgID);
     });
   }
 
@@ -204,6 +229,48 @@ function ProviderForm({
         <ModelEditor models={models} onChange={setModels} />
       </div>
 
+      <div className="space-y-2 border-t border-surface pt-3">
+        <label className="flex items-center gap-2 text-[11px] text-text-subtle cursor-pointer select-none">
+          <input
+            type="checkbox"
+            checked={peakEnabled}
+            onChange={(e) => setPeakEnabled(e.target.checked)}
+            className="accent-accent"
+            data-test-id="provider-form-peak-toggle"
+          />
+          Restrict to hours
+        </label>
+        {peakEnabled && (
+          <div className="grid grid-cols-2 gap-2" data-test-id="provider-form-peak-inputs">
+            <div>
+              <label className="block text-[11px] text-text-subtle mb-1">Start (local)</label>
+              <input
+                type="time"
+                value={peakStart}
+                onChange={(e) => setPeakStart(e.target.value)}
+                className="w-full text-xs font-mono bg-canvas border border-surface rounded-lg px-2.5 py-1.5 outline-none focus:border-accent/50 text-text"
+                data-test-id="provider-form-peak-start"
+              />
+            </div>
+            <div>
+              <label className="block text-[11px] text-text-subtle mb-1">End (local)</label>
+              <input
+                type="time"
+                value={peakEnd}
+                onChange={(e) => setPeakEnd(e.target.value)}
+                className="w-full text-xs font-mono bg-canvas border border-surface rounded-lg px-2.5 py-1.5 outline-none focus:border-accent/50 text-text"
+                data-test-id="provider-form-peak-end"
+              />
+            </div>
+          </div>
+        )}
+        {peakEnabled && (
+          <p className="text-[10px] text-text-muted">
+            {isPeakHoursActive(peakHours) ? "Active now" : "Outside window"} · overnight windows supported
+          </p>
+        )}
+      </div>
+
       {error && (
         <p className="text-xs text-red flex items-center gap-1.5">
           <AlertCircle size={12} />
@@ -263,6 +330,7 @@ function ProviderRow({
               costPer1mIn: "",
               costPer1mOut: "",
             })),
+            peakHours: info.peakHours ?? null,
           }}
           submitLabel="Update Provider"
           onSubmit={(data, msgID) => {
@@ -280,6 +348,8 @@ function ProviderRow({
                 costPer1mIn: m.costPer1mIn ? parseFloat(m.costPer1mIn) : undefined,
                 costPer1mOut: m.costPer1mOut ? parseFloat(m.costPer1mOut) : undefined,
               })),
+              // Send null explicitly when cleared so the server clears it.
+              peakHours: data.peakHours,
             }, msgID);
           }}
           onCancel={() => setEditing(false)}
@@ -306,6 +376,18 @@ function ProviderRow({
               <span className="inline-flex items-center gap-1 text-[11px] text-green bg-green/10 border border-green/20 rounded-full px-2 py-0.5">
                 <CheckCircle2 size={10} />
                 Key set
+              </span>
+            )}
+            {info.peakHours && info.peakHours.start && info.peakHours.end && (
+              <span
+                className="inline-flex items-center gap-1 text-[11px] font-mono bg-accent/10 border border-accent/20 rounded-full px-2 py-0.5"
+                data-test-id="provider-peak-badge"
+                title={isPeakHoursActive(info.peakHours) ? "Currently in peak-hours window" : "Outside peak-hours window"}
+              >
+                {info.peakHours.start}–{info.peakHours.end}
+                {isPeakHoursActive(info.peakHours) && (
+                  <span className="inline-block w-1.5 h-1.5 rounded-full bg-accent animate-pulse" />
+                )}
               </span>
             )}
           </div>
@@ -449,6 +531,7 @@ export function ProvidersModal({ onClose }: { onClose: () => void }) {
                   costPer1mIn: m.costPer1mIn ? parseFloat(m.costPer1mIn) : undefined,
                   costPer1mOut: m.costPer1mOut ? parseFloat(m.costPer1mOut) : undefined,
                 })),
+                peakHours: data.peakHours,
               }, msgID);
             }}
             onCancel={() => setShowAdd(false)}

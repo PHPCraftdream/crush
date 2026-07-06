@@ -141,6 +141,9 @@ export interface ProviderInfo {
   baseUrl?: string;
   isCustom?: boolean;
   apiKeySet?: boolean;
+  // Peak-hours window in local browser time ("HH:MM"). null/absent means no
+  // restriction. Mirrors server PeakHoursWirePayload (lowerCamelCase keys).
+  peakHours?: { start: string; end: string } | null;
 }
 
 export interface ConfigPayload {
