@@ -27,7 +27,7 @@ func TestJobOutputTool_BoundedWaitReturnsWhileRunning(t *testing.T) {
 	bgManager := shell.GetBackgroundShellManager()
 	bgShell, err := bgManager.Start(ctx, workingDir, nil, "sleep 30", "")
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = bgManager.Kill(bgShell.ID) })
+	t.Cleanup(func() { _ = bgManager.Kill(context.Background(), bgShell.ID) })
 
 	// Shrink the bound so the test returns in well under a second.
 	originalMaxWait := jobOutputMaxWait
@@ -75,7 +75,7 @@ func TestJobOutputTool_BoundedWaitReturnsCompletedWhenJobFinishes(t *testing.T) 
 	bgManager := shell.GetBackgroundShellManager()
 	bgShell, err := bgManager.Start(ctx, workingDir, nil, "echo 'all done'", "")
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = bgManager.Kill(bgShell.ID) })
+	t.Cleanup(func() { _ = bgManager.Kill(context.Background(), bgShell.ID) })
 
 	// Give the quick command time to finish before we ask for output.
 	require.Eventually(t, bgShell.IsDone, 5*time.Second, 25*time.Millisecond)

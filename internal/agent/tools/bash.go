@@ -359,7 +359,7 @@ func NewBashTool(permissions permission.Service, workingDir string, attribution 
 				case <-ctx.Done():
 					// Incoming context was cancelled before we moved to background
 					// Kill the shell and return error
-					bgManager.Kill(bgShell.ID)
+					bgManager.Kill(ctx, bgShell.ID)
 					return fantasy.ToolResponse{}, ctx.Err()
 				}
 			}

@@ -71,7 +71,7 @@ func TestBackgroundShellManager_Get(t *testing.T) {
 	}
 
 	// Clean up
-	manager.Kill(bgShell.ID)
+	_ = manager.Kill(t.Context(), bgShell.ID)
 }
 
 func TestBackgroundShellManager_Kill(t *testing.T) {
@@ -88,7 +88,7 @@ func TestBackgroundShellManager_Kill(t *testing.T) {
 	}
 
 	// Kill it
-	err = manager.Kill(bgShell.ID)
+	err = manager.Kill(t.Context(), bgShell.ID)
 	if err != nil {
 		t.Errorf("failed to kill background shell: %v", err)
 	}
@@ -110,10 +110,64 @@ func TestBackgroundShellManager_KillNonExistent(t *testing.T) {
 
 	manager := newBackgroundShellManager()
 
-	err := manager.Kill("non-existent-id")
+	err := manager.Kill(t.Context(), "non-existent-id")
 	if err == nil {
 		t.Error("expected error when killing non-existent shell")
 	}
+}
+
+// TestBackgroundShellManager_Kill_ReturnsOnCtxDone proves Kill honours its
+// context argument and returns promptly when the underlying process ignores
+// cancellation, instead of blocking forever on <-shell.done. The OLD Kill
+// signature took no context and unconditionally blocked on <-shell.done, so
+// under this exact scenario it would hang forever — this test fails (times
+// out) against the old code and passes against the new code.
+//
+// Rather than depend on OS-specific signal-trapping behaviour (which the
+// sibling KillAll_Timeout test does, and which is unreliable on Windows where
+// mvdan/sh kills the subprocess eagerly on context cancel), we inject a
+// synthetic BackgroundShell whose done channel NEVER closes and whose cancel
+// func is a no-op. This deterministically reproduces the real-world failure
+// mode the fix targets: cancel() was called but the process didn't exit.
+//
+// We can't use synctest here for the same reason KillAll_Timeout can't: it
+// trips -race.
+func TestBackgroundShellManager_Kill_ReturnsOnCtxDone(t *testing.T) {
+	t.Parallel()
+
+	manager := newBackgroundShellManager()
+
+	// Synthetic shell: cancel is a no-op and done never closes, modelling a
+	// stuck child process tree that ignores context cancellation (the exact
+	// scenario observed with rsbuild dev / node.exe on Windows).
+	bgShell := &BackgroundShell{
+		ID:        "STUCK",
+		done:      make(chan struct{}), // never closed
+		cancel:    func() {},           // no-op: cancellation does nothing
+		ctx:       context.Background(),
+		stdout:    &syncBuffer{},
+		stderr:    &syncBuffer{},
+		StartTime: time.Now(),
+	}
+	manager.shells.Set(bgShell.ID, bgShell)
+
+	// Already-expired context so Kill must give up immediately on the
+	// ctx.Done() branch of the select.
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	start := time.Now()
+	err := manager.Kill(ctx, bgShell.ID)
+	elapsed := time.Since(start)
+
+	// Must return the context error, not nil and not hang.
+	require.ErrorIs(t, err, context.Canceled)
+	// Must return promptly — the old code would still be blocked here.
+	require.Less(t, elapsed, 2*time.Second)
+
+	// Shell must have been removed from the manager regardless.
+	_, ok := manager.Get(bgShell.ID)
+	require.False(t, ok, "shell should be removed from manager even when Kill gives up waiting")
 }
 
 func TestBackgroundShell_IsDone(t *testing.T) {
@@ -132,7 +186,7 @@ func TestBackgroundShell_IsDone(t *testing.T) {
 	require.Eventually(t, bgShell.IsDone, 5*time.Second, 50*time.Millisecond, "expected shell to be done")
 
 	// Clean up
-	manager.Kill(bgShell.ID)
+	_ = manager.Kill(t.Context(), bgShell.ID)
 }
 
 func TestBackgroundShell_WithBlockFuncs(t *testing.T) {
@@ -166,7 +220,7 @@ func TestBackgroundShell_WithBlockFuncs(t *testing.T) {
 	}
 
 	// Clean up
-	manager.Kill(bgShell.ID)
+	_ = manager.Kill(t.Context(), bgShell.ID)
 }
 
 func TestBackgroundShellManager_List(t *testing.T) {
@@ -213,8 +267,8 @@ func TestBackgroundShellManager_List(t *testing.T) {
 	}
 
 	// Clean up
-	manager.Kill(bgShell1.ID)
-	manager.Kill(bgShell2.ID)
+	_ = manager.Kill(t.Context(), bgShell1.ID)
+	_ = manager.Kill(t.Context(), bgShell2.ID)
 }
 
 func TestBackgroundShellManager_KillAll(t *testing.T) {
@@ -447,7 +501,7 @@ func TestBackgroundShell_OnDone_FiresOnCompletion(t *testing.T) {
 	}
 
 	// Clean up (no-op once already gone, but keeps the manager tidy).
-	_ = manager.Kill(bgShell.ID)
+	_ = manager.Kill(t.Context(), bgShell.ID)
 }
 
 // TestBackgroundShell_OnDone_FiresOnKill proves OnDone does NOT fire while a
@@ -475,7 +529,7 @@ func TestBackgroundShell_OnDone_FiresOnKill(t *testing.T) {
 	}
 
 	// Killing the job must release OnDone.
-	require.NoError(t, manager.Kill(bgShell.ID))
+	require.NoError(t, manager.Kill(t.Context(), bgShell.ID))
 
 	select {
 	case <-fired:

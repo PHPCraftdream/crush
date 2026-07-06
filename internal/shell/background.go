@@ -145,15 +145,26 @@ func (m *BackgroundShellManager) Remove(id string) error {
 	return nil
 }
 
-// Kill terminates a background shell by ID.
-func (m *BackgroundShellManager) Kill(id string) error {
+// Kill terminates a background shell by ID. The provided context bounds how
+// long Kill waits for the shell to actually exit after cancelling it; this
+// mirrors KillAll's bounding and prevents an unresponsive child process tree
+// (e.g. a stuck node.exe on Windows that ignores context cancellation) from
+// blocking the caller indefinitely. If ctx expires before the shell exits,
+// Kill returns ctx.Err() — the shell has still been removed from the manager
+// and its cancel func called, but the underlying OS process may live on as an
+// orphan (see CLAUDE.md residual-risk note).
+func (m *BackgroundShellManager) Kill(ctx context.Context, id string) error {
 	shell, ok := m.shells.Take(id)
 	if !ok {
 		return fmt.Errorf("background shell not found: %s", id)
 	}
 
 	shell.cancel()
-	<-shell.done
+	select {
+	case <-shell.done:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 	return nil
 }
 
