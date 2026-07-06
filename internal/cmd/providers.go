@@ -7,12 +7,36 @@ import (
 	"sort"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"charm.land/catwalk/pkg/catwalk"
 	"github.com/charmbracelet/crush/internal/app"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/spf13/cobra"
 )
+
+// parsePeakHoursWindow parses a "HH:MM-HH:MM" window string (e.g.
+// "09:00-18:00") into a *config.PeakHoursWindow, validating the HH:MM
+// values via PeakHoursWindow.Validate. An empty value or the literal
+// "off" returns nil (feature off). Returns an error for malformed input.
+func parsePeakHoursWindow(raw string) (*config.PeakHoursWindow, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || strings.EqualFold(raw, "off") {
+		return nil, nil
+	}
+	parts := strings.SplitN(raw, "-", 2)
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("invalid peak-hours %q: expected HH:MM-HH:MM", raw)
+	}
+	w := &config.PeakHoursWindow{
+		Start: strings.TrimSpace(parts[0]),
+		End:   strings.TrimSpace(parts[1]),
+	}
+	if err := w.Validate(); err != nil {
+		return nil, err
+	}
+	return w, nil
+}
 
 var providersCmd = &cobra.Command{
 	Use:   "providers",
@@ -75,7 +99,7 @@ crush providers list --json | jq 'select(.api_key_present)'
 		}
 
 		tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(tw, "ID\tNAME\tTYPE\tSTATUS\tMODELS\tAPI_KEY\tBASE_URL")
+		fmt.Fprintln(tw, "ID\tNAME\tTYPE\tSTATUS\tMODELS\tAPI_KEY\tBASE_URL\tPEAK")
 		for _, id := range ids {
 			p := providers[id]
 			if grepPattern != "" {
@@ -91,7 +115,14 @@ crush providers list --json | jq 'select(.api_key_present)'
 			if len(p.Models) > 0 {
 				modelCount = fmt.Sprintf("%d", len(p.Models))
 			}
-			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			peak := "—"
+			if p.PeakHours != nil {
+				peak = p.PeakHours.Start + "-" + p.PeakHours.End
+				if p.PeakHours.InPeakHours(time.Now()) {
+					peak += " *"
+				}
+			}
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 				id,
 				dash(p.Name),
 				dash(string(p.Type)),
@@ -99,6 +130,7 @@ crush providers list --json | jq 'select(.api_key_present)'
 				modelCount,
 				maskKey(p.APIKey),
 				dash(p.BaseURL),
+				peak,
 			)
 		}
 		return tw.Flush()
@@ -137,6 +169,13 @@ var providersShowCmd = &cobra.Command{
 		fmt.Fprintf(os.Stdout, "base_url:    %s\n", dash(item.BaseURL))
 		fmt.Fprintf(os.Stdout, "models:      %d\n", item.Models)
 		fmt.Fprintf(os.Stdout, "oauth:       %t\n", item.HasOAuth)
+		if p.PeakHours != nil {
+			state := "not in peak"
+			if p.PeakHours.InPeakHours(time.Now()) {
+				state = "in peak"
+			}
+			fmt.Fprintf(os.Stdout, "peak hours:  %s-%s (currently: %s)\n", p.PeakHours.Start, p.PeakHours.End, state)
+		}
 		return nil
 	},
 }
@@ -189,8 +228,21 @@ crush providers set hyper --disabled=true
 			v, _ := cmd.Flags().GetBool("disabled")
 			updates["providers."+id+".disable"] = v
 		}
-		if len(updates) == 0 {
-			return fmt.Errorf("no fields to set — pass at least one of --api-key/--base-url/--type/--name/--disabled")
+		clearPeakHours := false
+		if cmd.Flags().Changed("peak-hours") {
+			v, _ := cmd.Flags().GetString("peak-hours")
+			w, err := parsePeakHoursWindow(v)
+			if err != nil {
+				return fmt.Errorf("invalid --peak-hours: %w", err)
+			}
+			if w == nil {
+				clearPeakHours = true
+			} else {
+				updates["providers."+id+".peak_hours"] = w
+			}
+		}
+		if len(updates) == 0 && !clearPeakHours {
+			return fmt.Errorf("no fields to set — pass at least one of --api-key/--base-url/--type/--name/--disabled/--peak-hours")
 		}
 
 		a, err := setupApp(cmd)
@@ -199,10 +251,19 @@ crush providers set hyper --disabled=true
 		}
 		defer a.Shutdown()
 
-		if err := a.Store().SetConfigFields(scope, updates); err != nil {
-			return fmt.Errorf("failed to write provider config: %w", err)
+		if clearPeakHours {
+			if err := a.Store().RemoveConfigField(scope, "providers."+id+".peak_hours"); err != nil {
+				return fmt.Errorf("failed to clear peak_hours: %w", err)
+			}
+			fmt.Fprintf(os.Stderr, "cleared peak_hours for provider %q in %s scope\n", id, scope)
 		}
-		fmt.Fprintf(os.Stderr, "wrote %d field(s) to %s scope for provider %q\n", len(updates), scope, id)
+
+		if len(updates) > 0 {
+			if err := a.Store().SetConfigFields(scope, updates); err != nil {
+				return fmt.Errorf("failed to write provider config: %w", err)
+			}
+			fmt.Fprintf(os.Stderr, "wrote %d field(s) to %s scope for provider %q\n", len(updates), scope, id)
+		}
 		return nil
 	},
 }
@@ -236,6 +297,16 @@ crush providers add local-llm --name "Local LLM" --type openai-compat --base-url
 		baseURL, _ := cmd.Flags().GetString("base-url")
 		apiKey, _ := cmd.Flags().GetString("api-key")
 		enable, _ := cmd.Flags().GetBool("enable")
+
+		var peakHours *config.PeakHoursWindow
+		if cmd.Flags().Changed("peak-hours") {
+			phRaw, _ := cmd.Flags().GetString("peak-hours")
+			ph, err := parsePeakHoursWindow(phRaw)
+			if err != nil {
+				return fmt.Errorf("invalid --peak-hours: %w", err)
+			}
+			peakHours = ph
+		}
 
 		if name == "" {
 			return fmt.Errorf("--name is required")
@@ -299,6 +370,9 @@ crush providers add local-llm --name "Local LLM" --type openai-compat --base-url
 		}
 		if apiKey != "" {
 			fields["providers."+id+".api_key"] = apiKey
+		}
+		if peakHours != nil {
+			fields["providers."+id+".peak_hours"] = peakHours
 		}
 
 		if err := a.Store().SetConfigFields(scope, fields); err != nil {
@@ -727,6 +801,7 @@ func init() {
 	providersSetCmd.Flags().String("type", "", "Provider type: openai|openai-compat|anthropic|gemini|azure|vertexai")
 	providersSetCmd.Flags().String("name", "", "Human-readable display name shown in the WUI")
 	providersSetCmd.Flags().Bool("disabled", false, "Mark provider as disabled (kept in config, ignored at runtime)")
+	providersSetCmd.Flags().String("peak-hours", "", "Peak-hours window as HH:MM-HH:MM (local time). Pass 'off' or empty to clear.")
 
 	for _, c := range []*cobra.Command{providersEnableCmd, providersDisableCmd, providersAddCmd} {
 		c.Flags().Bool("global", false, "Target the global config (~/.local/share/crush/crush.json). Default when neither --global nor --local is given.")
@@ -739,6 +814,7 @@ func init() {
 	providersAddCmd.Flags().String("base-url", "", "Base URL for the provider's API (optional for catwalk-known providers)")
 	providersAddCmd.Flags().String("api-key", "", "API key for the provider (optional, can be set later)")
 	providersAddCmd.Flags().Bool("enable", true, "Enable the provider after creation (default: true)")
+	providersAddCmd.Flags().String("peak-hours", "", "Optional peak-hours window as HH:MM-HH:MM (local time). Provider is refused during this window.")
 
 	providersUpdateCmd.Flags().Bool("all", false, "Update all enabled providers")
 
