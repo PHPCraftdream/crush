@@ -12,8 +12,8 @@
     "dev": "rsbuild dev",
     "build": "rsbuild build",
     "preview": "rsbuild preview",
-    "test": "playwright test",
-    "test:ui": "playwright test --ui"
+    "test": "node scripts/run-tests.mjs",
+    "test:ui": "node scripts/run-tests.mjs --ui"
   },
   "dependencies": {
     "@nanostores/react": "^0.8.1",

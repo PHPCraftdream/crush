@@ -37,7 +37,11 @@ export default defineConfig({
     },
   },
   server: {
-    port: 3000,
+    // Honor PORT so Playwright (and any other orchestrator) can spin the dev
+    // server up on a freshly-discovered free port and avoid silently reusing
+    // a stray unrelated process that happens to be bound to 3000. Default to
+    // 3000 so plain `npm run dev` keeps working as before.
+    port: process.env.PORT ? Number(process.env.PORT) : 3000,
     proxy: {
       "/ws": {
         target: "ws://localhost:3030",
