@@ -658,6 +658,11 @@ or globally, with the following priority:
 2. `crush.json`
 3. `$HOME/.config/crush/crush.json`
 
+Items 1 and 2 are searched by name in the project root, walking up the
+directory tree from `cwd` — a file at `./.crush/crush.json` (inside the
+`.crush/` subdirectory) is not discovered; that directory holds ephemeral
+data, not config.
+
 Configuration itself is stored as a JSON object:
 
 ```json
