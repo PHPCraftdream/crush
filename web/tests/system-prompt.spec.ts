@@ -2,7 +2,7 @@
  * System prompt modal tests.
  *
  * Covers:
- *  - Prompt button disabled without active session
+ *  - Prompt button not rendered without active session
  *  - Prompt button visible when session active
  *  - Clicking Prompt opens modal and sends get_system_prompt
  *  - Modal shows loading state, then textarea with content
@@ -39,10 +39,10 @@ async function setupWithSession(page: import("@playwright/test").Page) {
 
 // ── Button state ─────────────────────────────────────────────────────────────
 
-test("Prompt button disabled without active session", async ({ page }) => {
+test("Prompt button not rendered without active session", async ({ page }) => {
   await page.goto("/");
   const btn = page.getByTestId("header-prompt-button");
-  await expect(btn).toBeDisabled({ timeout: 2000 });
+  await expect(btn).toHaveCount(0, { timeout: 2000 });
 });
 
 test("System prompt button visible when session active", async ({ page }) => {
