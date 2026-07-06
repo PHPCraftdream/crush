@@ -577,12 +577,24 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	var stepMessages []fantasy.Message
 	var shouldSummarize bool
 
-	// loopDetected is set by the loop-detection StopWhen closure when the
-	// agent force-stops a turn because hasRepeatedToolCalls fired. The finish
-	// REASON stays FinishReasonEndTurn (a loop-detected stop is still a form
-	// of "done" and must not be reclassified away from it — see the comment
-	// on loopDetail in loop_detection.go); the distinction from a voluntary
-	// model finish is carried in the Finish part's message/details text so an
+	// stepHistory accumulates every fantasy.StepResult seen by OnStepFinish,
+	// in arrival order. fantasy's internal Run loop calls OnStepFinish for a
+	// step BEFORE it evaluates StopWhen on that same step, so the
+	// loop-detection StopWhen closure cannot set a flag in time for that
+	// step's OnStepFinish. We therefore recompute loop detection directly in
+	// OnStepFinish from our own history (the StopWhen closure still calls
+	// hasRepeatedToolCalls independently to decide whether to break the loop
+	// — a small amount of redundant compute is simpler than sharing state
+	// across fantasy's OnStepFinish-before-StopWhen ordering boundary).
+	var stepHistory []fantasy.StepResult
+
+	// loopDetected / loopDetail are computed inside OnStepFinish (from
+	// stepHistory) so the AddFinish call in the SAME callback invocation can
+	// record a non-empty message/details. The finish REASON stays
+	// FinishReasonEndTurn (a loop-detected stop is still a form of "done" and
+	// must not be reclassified away from it — see the comment on loopDetail
+	// in loop_detection.go); the distinction from a voluntary model finish
+	// is carried in the Finish part's message/details text so an
 	// operator/orchestrator can tell that a legitimate polling pattern may
 	// have been truncated.
 	var loopDetected bool
@@ -1030,6 +1042,16 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 		},
 		OnStepFinish: func(stepResult fantasy.StepResult) error {
 			bumpActivity()
+			// Accumulate this step and recompute loop detection NOW, in this
+			// callback invocation, so the AddFinish chain below can use the
+			// result for THIS step. Fantasy calls OnStepFinish BEFORE
+			// StopWhen for the same step, so relying on the StopWhen closure
+			// to set loopDetected would read a stale (still-false) flag for
+			// the very step that trips the detector — the loop would break
+			// with empty finish text and no later OnStepFinish to fix it.
+			// See the comment on stepHistory above for the ordering rationale.
+			stepHistory = append(stepHistory, stepResult)
+			loopDetected, loopDetail = hasRepeatedToolCalls(stepHistory, loopDetectionWindowSize, loopDetectionMaxRepeats)
 			// Surface provider CallWarnings (malformed tool-call sanitization,
 			// unsupported settings, etc.) that fantasy otherwise discards
 			// silently. Visible in logs only — does not interrupt the turn.
@@ -1189,13 +1211,15 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 				return false
 			},
 			func(steps []fantasy.StepResult) bool {
-				detected, detail := hasRepeatedToolCalls(steps, loopDetectionWindowSize, loopDetectionMaxRepeats)
-				if detected {
-					loopDetected = true
-					loopDetail = detail
-					return true
-				}
-				return false
+				// StopWhen runs AFTER OnStepFinish for the same step, so by the
+				// time this executes, OnStepFinish has already appended to
+				// stepHistory and recomputed loopDetected/loopDetail. We only
+				// need to return the boolean here to tell fantasy to break the
+				// loop — do NOT mutate loopDetected/loopDetail here, OnStepFinish
+				// owns them (mutating here would race for the last step's
+				// finish text and re-introduce the stale-flag bug).
+				detected, _ := hasRepeatedToolCalls(steps, loopDetectionWindowSize, loopDetectionMaxRepeats)
+				return detected
 			},
 		},
 	})

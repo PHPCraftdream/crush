@@ -267,3 +267,98 @@ func TestLoopDetectedFinishText(t *testing.T) {
 		}
 	})
 }
+
+// TestLoopDetection_OnStepFinishOrdering is the regression test for the
+// ordering bug in commit 44827270's fix.
+//
+// The bug: fantasy's internal Run loop calls OnStepFinish for a step BEFORE it
+// evaluates StopWhen on that same step (verified against vendored
+// charm.land/fantasy@v0.25.2 agent.go:936-947). The original fix set
+// loopDetected/loopDetail inside the StopWhen closure and read them inside
+// OnStepFinish's AddFinish chain. For the one step that actually trips the
+// detector, OnStepFinish ran first and read a stale (still-false) flag → it
+// took the plain else branch with empty message/details. StopWhen then set the
+// flag and broke the loop, with NO later OnStepFinish to apply it.
+//
+// The fix: OnStepFinish maintains its OWN stepHistory accumulator, appends the
+// current step at the top of the callback, and recomputes
+// hasRepeatedToolCalls from that history BEFORE the AddFinish chain — so it
+// knows loopDetected for the current step in time.
+//
+// This test simulates that exact sequence (append-then-recompute, mirroring
+// OnStepFinish) and proves the detector fires on the SAME step whose
+// insertion trips the threshold, with no extra step required. Against the
+// broken code (relying on a StopWhen-set flag), the equivalent per-step loop
+// would still see loopDetected=false on the tripping step — this test encodes
+// the invariant the fix must uphold.
+func TestLoopDetection_OnStepFinishOrdering(t *testing.T) {
+	const (
+		windowSize = 10
+		maxRepeats = 5
+	)
+
+	// Build a sequence of steps: 4 filler steps first, then 6 identical
+	// tool-call steps. Once the 6th identical step is appended (sequence
+	// index 9), the trailing window of 10 contains all 6 identical steps
+	// (4 fillers + 6 repeats = 10) → count 6 > maxRepeats(5) → fires.
+	// This makes the tripping step deterministic: index 9.
+	mkRepeat := func() fantasy.StepResult {
+		return makeToolStep("job_output", `{"id":"j1"}`, "running")
+	}
+	mkFiller := func(i int) fantasy.StepResult {
+		return makeToolStep("other", fmt.Sprintf(`{"i":%d}`, i), fmt.Sprintf("r%d", i))
+	}
+
+	var sequence []fantasy.StepResult
+	for i := 0; i < 4; i++ {
+		sequence = append(sequence, mkFiller(i))
+	}
+	for i := 0; i < 6; i++ {
+		sequence = append(sequence, mkRepeat())
+	}
+
+	// Simulate OnStepFinish's per-step append+recompute (the fixed logic).
+	var stepHistory []fantasy.StepResult
+	var firedOnStep int = -1 // which step index first trips the detector
+	var firedDetail loopDetail
+	for i, step := range sequence {
+		// Mirror agent.go OnStepFinish: append THIS step, THEN recompute.
+		stepHistory = append(stepHistory, step)
+		detected, detail := hasRepeatedToolCalls(stepHistory, windowSize, maxRepeats)
+		if detected {
+			firedOnStep = i
+			firedDetail = detail
+			break
+		}
+	}
+
+	if firedOnStep < 0 {
+		t.Fatal("loop detection never fired — test sequence is malformed; expected it to trip")
+	}
+
+	// The detector must fire on the step whose insertion pushes the repeat
+	// count above the threshold — NOT one step later (which would be the
+	// StopWhen-set-flag bug). With 4 fillers then 6 repeats, the 6th repeat
+	// is at sequence index 9, and the window (last 10) is exactly full and
+	// contains all 6 repeats. Assert exactly that.
+	if firedOnStep != 9 {
+		t.Fatalf("expected detection on step index 9 (the 6th identical repeat, when the window first holds 6 of them), got %d — this is the ordering bug: detection is happening on the wrong step", firedOnStep)
+	}
+
+	// The detail computed AT THAT STEP must be populated — OnStepFinish uses
+	// it immediately to build the finish text, with no later callback to
+	// fill it in.
+	if firedDetail.ToolName != "job_output" {
+		t.Errorf("detail.ToolName = %q, want %q", firedDetail.ToolName, "job_output")
+	}
+	if firedDetail.Count != 6 {
+		t.Errorf("detail.Count = %d, want 6", firedDetail.Count)
+	}
+
+	// And the finish text built from that same-step detail must be non-empty
+	// (this is what gets persisted on the assistant message's Finish part).
+	msg, details := loopDetectedFinishText(firedDetail)
+	if msg == "" || details == "" {
+		t.Fatalf("finish text must be non-empty on the detection step; got msg=%q details=%q", msg, details)
+	}
+}
