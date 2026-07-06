@@ -16,9 +16,11 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"charm.land/fang/v2"
+	"charm.land/lipgloss/v2"
 	"github.com/atotto/clipboard"
 	"github.com/charmbracelet/crush/internal/app"
 	"github.com/charmbracelet/crush/internal/config"
@@ -41,6 +43,17 @@ func init() {
 	rootCmd.Flags().StringP("host", "H", "localhost", "Host to bind the web UI to")
 	rootCmd.Flags().IntP("port", "p", 0, "Port to bind the web UI to (0 = pick a free one)")
 	rootCmd.Flags().Bool("no-open", false, "Do not open the browser after the server starts")
+	// --color-scheme forces fang's help/error styling onto a light or dark
+	// palette, working around terminals (WezTerm on Windows, git-bash) where
+	// lipgloss.HasDarkBackground misdetects and renders grey-on-white. The
+	// CRUSH_COLOR_SCHEME env var does the same; the flag wins if both are set.
+	// "auto" (the default) leaves fang's built-in detection untouched.
+	rootCmd.PersistentFlags().String(
+		"color-scheme",
+		"",
+		"Force CLI help/error color palette: light, dark, or auto (default auto). "+
+			"Overrides CRUSH_COLOR_SCHEME env var when set.",
+	)
 
 	rootCmd.AddCommand(
 		runCmd,
@@ -77,7 +90,15 @@ Companion CLI subcommands for scripting and CI:
   - ` + "`crush claude-init`" + `     install 31 slash-commands + 31 sub-agents into
                           .claude/commands/ and .claude/agents/.
   - ` + "`crush system-prompt`" + `   print the system prompt that would be sent.
-  - ` + "`crush ping`" + `            health-check (verify API connectivity).`,
+  - ` + "`crush ping`" + `            health-check (verify API connectivity).
+
+Top-level flags (apply to every subcommand):
+  --color-scheme light|dark|auto   Force the CLI help/error color palette.
+                                   Use "light" on white-background terminals
+                                   where fang's auto-detection renders
+                                   grey-on-white (WezTerm on Windows, git-bash).
+                                   Env var: CRUSH_COLOR_SCHEME (same values;
+                                   flag wins if both are set). Default: auto.`,
 	Example: `
 # Start the web UI on a random free port and open the browser
 crush
@@ -174,14 +195,69 @@ func runWebMode(cmd *cobra.Command) error {
 }
 
 func Execute() {
+	options := []fang.Option{
+		fang.WithVersion(version.Version),
+		fang.WithNotifySignal(os.Interrupt),
+	}
+
+	// Resolve --color-scheme / CRUSH_COLOR_SCHEME. fang builds its help/error
+	// styles from the options we pass here, before cobra has parsed args, so
+	// we read the flag straight from os.Args (and fall back to the env var).
+	// Only force a palette when the user explicitly asked for light or dark;
+	// "auto" leaves fang's own HasDarkBackground detection untouched (exact
+	// historical behaviour — we don't even pass WithColorSchemeFunc).
+	scheme := resolveColorScheme(
+		colorSchemeFlagFromArgs(os.Args[1:]),
+		os.Getenv("CRUSH_COLOR_SCHEME"),
+	)
+	if scheme != ColorSchemeAuto {
+		isDark := isDarkColorScheme(scheme)
+		options = append(options, fang.WithColorSchemeFunc(
+			func(_ lipgloss.LightDarkFunc) fang.ColorScheme {
+				return fang.DefaultColorScheme(lipgloss.LightDark(isDark))
+			},
+		))
+	}
+
 	if err := fang.Execute(
 		context.Background(),
 		rootCmd,
-		fang.WithVersion(version.Version),
-		fang.WithNotifySignal(os.Interrupt),
+		options...,
 	); err != nil {
 		os.Exit(1)
 	}
+}
+
+// colorSchemeFlagFromArgs scans a raw arg slice for the --color-scheme flag
+// (in --color-scheme=value or --color-scheme value form, and the same with a
+// single dash) and returns its value, or "" if absent. It deliberately does
+// NOT validate the value — resolveColorScheme handles that. This is a minimal
+// scanner: it stops at the first "--" (end-of-flags sentinel) and ignores
+// values that are clearly another flag, so `--color-scheme --debug` is
+// treated as "not set" rather than "--debug".
+func colorSchemeFlagFromArgs(args []string) string {
+	const name = "--color-scheme"
+	const nameShort = "-color-scheme" // tolerate single-dash form
+
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			return ""
+		}
+		if a == name || a == nameShort {
+			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+				return args[i+1]
+			}
+			return "" // flag present but no value follows
+		}
+		if strings.HasPrefix(a, name+"=") {
+			return strings.TrimPrefix(a, name+"=")
+		}
+		if strings.HasPrefix(a, nameShort+"=") {
+			return strings.TrimPrefix(a, nameShort+"=")
+		}
+	}
+	return ""
 }
 
 // setupApp handles the common setup logic for both interactive and non-interactive modes.
