@@ -50,7 +50,11 @@ exist and crush merges them at load time, workspace overriding global:
   --local    ./.crush/crush.json               (next to the project)
 
 If --global / --local is omitted the default is --global for write
-operations and "both" for read operations.`,
+operations and "both" for read operations.
+
+Each provider entry holds: api_key, base_url, type, name, disable, and
+an optional peak_hours refusal window (local-clock HH:MM-HH:MM; see
+'crush providers set --help').`,
 }
 
 var providersListCmd = &cobra.Command{
@@ -200,6 +204,9 @@ crush providers set openai --local --base-url=http://localhost:11434/v1
 
 # Disable a provider without removing it
 crush providers set hyper --disabled=true
+
+# Refuse to run during business hours (local time); clear with "off"
+crush providers set openai --peak-hours 09:00-18:00
   `,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		scope, err := scopeFromFlags(cmd, config.ScopeGlobal)

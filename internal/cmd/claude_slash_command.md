@@ -228,6 +228,21 @@ actually done, what *you* ran, and any compromises or re-delegations.
 - `crush sessions watch <id>` — confirm the process really exited.
   Lock-alive heartbeat is the truth.
 
+## Peak-hours refusal window
+
+A provider can refuse to run during a local-time window set via
+`crush providers set <id> --peak-hours HH:MM-HH:MM` (overnight wrap
+allowed, e.g. `22:00-06:00`; `--peak-hours off` clears it). `crush run`
+then aborts if the active provider is inside its window.
+
+`crush run --allow-peak-hours` bypasses the refusal for one invocation
+only — there is no persistent config-level equivalent.
+
+**Never add `--allow-peak-hours` on your own initiative.** Only pass it
+when a human operator has explicitly asked, in this specific request,
+to override peak hours for that task. Adding it unsolicited violates
+the operator's intent.
+
 ## Task
 
 $ARGUMENTS

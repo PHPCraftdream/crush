@@ -156,6 +156,12 @@ jq -r '.error' "$out"         # error.message if non-success
   watchdog will allow even with `--timeout-extends-on-progress`.
   Without a cap a continuously-streaming response runs forever.
   Typically set to 3–4× the idle timeout.
+- **`--allow-peak-hours`** — bypasses a provider's configured
+  `peak_hours` refusal window for this single invocation only. No
+  persistent config-level equivalent exists; the override is conscious
+  and one-off by design. **Never add this flag on an orchestrating
+  agent's own initiative** — only when a human operator has explicitly
+  asked, in that specific request, to override peak hours.
 - **`--system-prompt[-file]`** — persists onto the session so follow-up
   runs inherit it.
 - **`--stream`** — streams every token to stdout for live wrappers.
