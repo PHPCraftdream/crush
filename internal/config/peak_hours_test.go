@@ -85,6 +85,35 @@ func TestPeakHoursWindow_InPeakHours_ZeroAndEqual(t *testing.T) {
 	require.False(t, PeakHoursWindow{Start: "12:00", End: "12:00"}.InPeakHours(at(t, 12, 0)))
 }
 
+func TestParseHHMM_NonDigitBytesRejected(t *testing.T) {
+	t.Parallel()
+	// Regression: parseHHMM used to do raw `s[i]-'0'` arithmetic without
+	// checking each byte was an ASCII digit. Bytes in the ':' (0x3A)–'C'
+	// (0x43) range silently mapped to 10–19 and slipped through as a
+	// plausible-but-wrong time (e.g. "09:0;" → 551, no error).
+	bad := []string{
+		"09:0;", // ';' (0x3B) - '0' = 11 → minutes 11, the original bug
+		"0::00", // ':' (0x3A) in an hour slot
+		"09:C0", // 'C' (0x43) - '0' = 19
+		"09:0:", // ':' in a minute slot
+		"1A:00", // 'A' (0x41) in an hour slot
+	}
+	for _, s := range bad {
+		t.Run(s, func(t *testing.T) {
+			t.Parallel()
+			got, err := parseHHMM(s)
+			require.Error(t, err, "%q must be rejected, got %d", s, got)
+			require.Equal(t, 0, got)
+		})
+	}
+	// Validate must surface the same rejection for the start/end fields.
+	require.Error(t, PeakHoursWindow{Start: "09:0;", End: "18:00"}.Validate())
+	require.Error(t, PeakHoursWindow{Start: "09:00", End: "18:C0"}.Validate())
+
+	// Sanity: a well-formed window is still accepted.
+	require.NoError(t, PeakHoursWindow{Start: "09:00", End: "18:00"}.Validate())
+}
+
 func TestPeakHoursWindow_EndTimeToday(t *testing.T) {
 	t.Parallel()
 	// Normal window: end is today at End.

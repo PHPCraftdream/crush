@@ -94,6 +94,14 @@ func parseHHMM(s string) (int, error) {
 	if len(s) != 5 || s[2] != ':' {
 		return 0, fmt.Errorf("invalid time %q: expected HH:MM", s)
 	}
+	// Explicit digit check: bytes in the range ':' (0x3A)–'C' (0x43) would
+	// otherwise slip through as 10–19 via the raw `c - '0'` arithmetic
+	// below, producing a plausible-but-wrong time (e.g. "09:0;" → 551).
+	for _, i := range [4]int{0, 1, 3, 4} {
+		if s[i] < '0' || s[i] > '9' {
+			return 0, fmt.Errorf("invalid time %q: expected HH:MM", s)
+		}
+	}
 	h := (int(s[0]-'0'))*10 + int(s[1]-'0')
 	mi := (int(s[3]-'0'))*10 + int(s[4]-'0')
 	if h < 0 || h > 23 || mi < 0 || mi > 59 {

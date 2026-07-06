@@ -1,17 +1,24 @@
 package cmd
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
-	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"charm.land/catwalk/pkg/catwalk"
 	"github.com/charmbracelet/crush/internal/config"
+	"github.com/charmbracelet/crush/internal/db"
+	crushlog "github.com/charmbracelet/crush/internal/log"
 	"github.com/charmbracelet/crush/internal/oauth"
+	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -829,76 +836,144 @@ func TestParsePeakHoursWindow_ReusesConfigValidate(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestProvidersShow_PeakHoursRendering(t *testing.T) {
-	t.Parallel()
-	now := time.Now()
-	tests := []struct {
-		name   string
-		window *config.PeakHoursWindow
-	}{
-		{
-			name:   "set window",
-			window: &config.PeakHoursWindow{Start: "09:00", End: "18:00"},
-		},
-		{
-			name:   "overnight window",
-			window: &config.PeakHoursWindow{Start: "22:00", End: "06:00"},
-		},
-	}
+// runProvidersCmdInIsolatedApp executes a real providers subcommand's RunE
+// against an isolated config fixture, capturing real stdout. It stands up a
+// full app via setupApp (the same path the CLI uses) in a temp data dir with
+// network/provider-discovery disabled, so the output is produced by the real
+// rendering code in providers.go — not a reimplementation.
+//
+// cmd is the real providersShowCmd/providersListCmd. providerJSON is the raw
+// JSON for the "providers" object written into the isolated global crush.json
+// before the command runs. args is the positional/flag payload parsed onto cmd
+// (e.g. "with-peak" for show, "--json" for list).
+func runProvidersCmdInIsolatedApp(t *testing.T, cmd *cobra.Command, providerJSON, args string) string {
+	t.Helper()
+	tmp := t.TempDir()
+	t.Setenv("XDG_DATA_HOME", tmp)
+	t.Setenv("CRUSH_GLOBAL_DATA", tmp)
+	// Cache-only so provider discovery makes no network calls.
+	t.Setenv("CRUSH_PROVIDER_CACHE_ONLY", "1")
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			inPeak := tt.window.InPeakHours(now)
-			state := "not in peak"
-			if inPeak {
-				state = "in peak"
-			}
-			line := fmt.Sprintf("peak hours:  %s-%s (currently: %s)", tt.window.Start, tt.window.End, state)
-			assert.Contains(t, line, tt.window.Start)
-			assert.Contains(t, line, tt.window.End)
-			assert.Contains(t, line, "currently:")
-		})
+	// Pre-initialise the once-only global logger so setupApp's log.Setup
+	// call is a no-op and does not open a lumberjack handle inside the
+	// temp dir (which would lock the file and break t.TempDir cleanup).
+	crushlog.Setup("", false)
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	workDir := t.TempDir()
+	orig, err := os.Getwd()
+	require.NoError(t, err)
+	require.NoError(t, os.Chdir(workDir))
+
+	globalDataPath := filepath.Join(tmp, "crush.json")
+	require.NoError(t, os.WriteFile(globalDataPath, []byte(providerJSON), 0o644))
+
+	// setupApp reads debug/data-dir/cwd off the command it receives. Those
+	// are normally rootCmd persistent flags; build a carrier command that
+	// carries them so we can invoke the real subcommand's RunE directly.
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(func() {
+		_ = os.Chdir(orig)
+		// setupApp opens a pooled SQLite connection under workDir and
+		// spawns background goroutines keyed on ctx; cancel ctx and force
+		// close every pooled connection so t.TempDir cleanup doesn't hit a
+		// locked crush.db / crush.log on Windows.
+		cancel()
+		db.ResetPool()
+	})
+	carrier := &cobra.Command{Use: "crush"}
+	carrier.Flags().Bool("debug", false, "")
+	carrier.Flags().String("data-dir", tmp, "")
+	carrier.Flags().String("cwd", workDir, "")
+	carrier.SetContext(ctx)
+
+	// Reset the subcommand's own flags so state from a prior invocation in
+	// the same process (e.g. a leftover --json) doesn't leak in.
+	for _, fl := range []string{"json", "grep"} {
+		if f := cmd.Flags().Lookup(fl); f != nil {
+			_ = f.Value.Set(f.DefValue)
+		}
 	}
+	cmd.SetArgs(nil)
+
+	var runArgs []string
+	if args != "" {
+		runArgs = strings.Fields(args)
+	}
+	require.NoError(t, cmd.ParseFlags(runArgs))
+
+	// Capture os.Stdout — providers list/show write there directly.
+	var buf bytes.Buffer
+	oldOut := os.Stdout
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	os.Stdout = w
+	done := make(chan struct{})
+	go func() { _, _ = io.Copy(&buf, r); close(done) }()
+
+	runErr := cmd.RunE(carrier, runArgs)
+
+	_ = w.Close()
+	os.Stdout = oldOut
+	<-done
+
+	require.NoError(t, runErr, "command RunE failed; stdout was:\n%s", buf.String())
+	return buf.String()
+}
+
+const peakFixtureJSON = `{
+  "providers": {
+    "with-peak": {
+      "name": "With Peak",
+      "type": "openai",
+      "api_key": "sk-1234567890abcdef",
+      "base_url": "https://api.openai.com/v1",
+      "models": [{"id": "gpt-4o"}],
+      "peak_hours": {"start": "09:00", "end": "18:00"}
+    },
+    "no-peak": {
+      "name": "No Peak",
+      "type": "anthropic",
+      "base_url": "https://api.anthropic.com",
+      "models": [{"id": "claude-sonnet-4"}]
+    }
+  }
+}`
+
+func TestProvidersShow_PeakHoursRendering(t *testing.T) {
+	// Regression: this previously reimplemented the peak-hours line inline
+	// and asserted the duplicate against itself. It now runs the real
+	// providersShowCmd.RunE and asserts on the actual emitted stdout.
+	out := runProvidersCmdInIsolatedApp(t, providersShowCmd, peakFixtureJSON, "with-peak")
+
+	assert.Contains(t, out, "id:          with-peak")
+	assert.Contains(t, out, "peak hours:  09:00-18:00 (currently:")
+	// The state must be one of the two real branches the command emits.
+	assert.True(t, strings.Contains(out, "(currently: in peak)") || strings.Contains(out, "(currently: not in peak)"),
+		"expected a real 'currently:' state in output:\n%s", out)
 }
 
 func TestProvidersShow_NoPeakHoursOmitsLine(t *testing.T) {
-	t.Parallel()
-	p := config.ProviderConfig{
-		ID:   "test",
-		Name: "Test",
-		Type: catwalk.TypeOpenAI,
-	}
-	// When PeakHours is nil, the show command should not print a
-	// peak-hours line.
-	assert.Nil(t, p.PeakHours)
+	// Regression: this previously only asserted p.PeakHours == nil without
+	// running the command. It now runs the real providersShowCmd.RunE on a
+	// provider without peak hours and asserts the line is absent.
+	out := runProvidersCmdInIsolatedApp(t, providersShowCmd, peakFixtureJSON, "no-peak")
+
+	assert.Contains(t, out, "id:          no-peak")
+	assert.NotContains(t, out, "peak hours", "show must omit the peak-hours line when PeakHours is nil")
 }
 
 func TestProvidersList_PeakColumn(t *testing.T) {
-	t.Parallel()
-	providers := map[string]config.ProviderConfig{
-		"with-peak": {
-			Name:      "With Peak",
-			Type:      catwalk.TypeOpenAI,
-			PeakHours: &config.PeakHoursWindow{Start: "09:00", End: "18:00"},
-		},
-		"no-peak": {
-			Name: "No Peak",
-			Type: catwalk.TypeAnthropic,
-		},
-	}
+	// Regression: this previously reimplemented the PEAK column rendering
+	// inline. It now runs the real providersListCmd.RunE and asserts on the
+	// actual table output.
+	out := runProvidersCmdInIsolatedApp(t, providersListCmd, peakFixtureJSON, "")
 
-	for id, p := range providers {
-		peak := "—"
-		if p.PeakHours != nil {
-			peak = p.PeakHours.Start + "-" + p.PeakHours.End
-			if p.PeakHours.InPeakHours(time.Now()) {
-				peak += " *"
-			}
-		}
-		if id == "with-peak" {
-			assert.Contains(t, peak, "09:00-18:00")
-		} else {
-			assert.Equal(t, "—", peak)
-		}
-	}
+	assert.Contains(t, out, "PEAK", "list header must include the PEAK column")
+	assert.Contains(t, out, "with-peak", "with-peak row must be present")
+	assert.Contains(t, out, "no-peak", "no-peak row must be present")
+	// The with-peak row must show the window; the no-peak row must show the
+	// em-dash placeholder used by the list command's real rendering.
+	assert.Contains(t, out, "09:00-18:00", "with-peak PEAK cell must show the window")
+	assert.Contains(t, out, "—", "no-peak PEAK cell must show the placeholder")
 }
