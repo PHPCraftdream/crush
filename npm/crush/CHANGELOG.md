@@ -8,6 +8,38 @@ This is the npm-package changelog, not the fork's engineering decision
 log — see [`CHANGELOG.fork.md`](../../CHANGELOG.fork.md) at the repo
 root for the full per-file merge/divergence history.
 
+## [0.1.4]
+
+- New per-provider `peak_hours` refusal window: a provider can be configured
+  with a local-time `{start, end}` window (overnight wrap supported) during
+  which `crush run` refuses to use it, with a clear text error naming the
+  provider and when it becomes available again. Manageable from `crush
+  providers set/add --peak-hours HH:MM-HH:MM`, `show`, and `list`, from the
+  web UI's provider editor, and over the WebSocket provider API.
+- New `crush run --allow-peak-hours` flag to bypass a provider's peak-hours
+  refusal for a single invocation. This is a conscious one-off override with
+  no persistent config equivalent, and its `--help` text carries an explicit
+  warning that an orchestrating agent must never add it unsolicited — only
+  on a human operator's explicit request for that specific run.
+- New `crush sessions why <id>` command: a one-shot diagnostic explaining
+  whether a session is running, crashed, done, or at rest, using only the
+  session DB and lock-file state — including reclassifying a "crashed" lock
+  as done when the last assistant message actually finished cleanly.
+- New `--color-scheme light|dark|auto` flag and `CRUSH_COLOR_SCHEME` env var
+  to force the CLI help/error color palette, working around terminals where
+  automatic light/dark background detection is unreliable or unavailable
+  (e.g. redirected stdio, or a terminal that doesn't answer the background
+  color query in time).
+- Fixed: a malformed `peak_hours` time string could previously parse into a
+  plausible-but-wrong time instead of being rejected.
+- Fixed: a background job's forceful termination could hang the whole agent
+  turn well past the configured tool-execution watchdog cap when the
+  underlying process ignored cancellation.
+- Local/development builds now report a version like
+  `devel-<commit>-0.1.4[-dirty]` instead of a bare `devel-<commit>[-dirty]`,
+  and no longer show a raw, unhelpful Go pseudo-version timestamp when one
+  leaks through from a `go install`-style build.
+
 ## [0.1.3]
 
 - New opt-in restricted permission model for `crush run`: `permissions.run`

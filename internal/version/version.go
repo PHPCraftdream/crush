@@ -15,7 +15,7 @@ import (
 // line a devel binary was built from. This fork bumps versions deliberately and
 // manually (see CLAUDE.md at the repo root), so this constant must be kept in
 // lockstep with npm/crush/package.json on every bump.
-const forkBaseVersion = "0.1.3"
+const forkBaseVersion = "0.1.4"
 
 // Build-time parameters set via -ldflags. These act as overrides: when a
 // release/packaging build injects them (see .goreleaser.yml and the
