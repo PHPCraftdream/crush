@@ -1837,8 +1837,12 @@ func handleRemoveCustomProvider(a *appPkg.App, c *Client, msg WSMessage) {
 		return
 	}
 	cfg.Providers.Del(p.ID)
+	// RemoveConfigField returns an error when there is no override to
+	// delete, which is expected for a default-provider id that only
+	// exists in the built-in catalog — benign in that case. A real
+	// failure (e.g. disk / parse error) surfaces the same way.
 	if err := store.RemoveConfigField(config.ScopeGlobal, fmt.Sprintf("providers.%s", p.ID)); err != nil {
-		slog.Warn("ws: failed to remove custom provider", "id", p.ID, "err", err)
+		slog.Warn("ws: failed to remove custom provider override (benign for default/catalog providers with no override set)", "id", p.ID, "err", err)
 	}
 	if wire, ok := buildConfigWire(a); ok {
 		c.hub.Broadcast(EventConfig, wire)

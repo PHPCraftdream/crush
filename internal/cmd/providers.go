@@ -622,7 +622,11 @@ var providersUnsetCmd = &cobra.Command{
 	Long: `Delete the providers.<id> object from the targeted config file. The
 provider may still appear in "providers list" if it is also defined in
 the other scope (workspace fallback to global, or vice versa) — run
-unset with the matching --global / --local to fully clear it.`,
+unset with the matching --global / --local to fully clear it. For a
+default/catwalk-known provider (e.g. "anthropic", "openai") unset only
+clears any override; the provider reappears from the built-in catalog on
+the next config load — use "crush providers disable <id>" to
+persistently suppress it.`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		scope, err := scopeFromFlags(cmd, config.ScopeGlobal)
