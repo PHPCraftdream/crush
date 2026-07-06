@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -162,4 +163,70 @@ func TestFormatPresetJSON_HasHardLastLine(t *testing.T) {
 func TestFormatPresetJSON_ForbidsFences(t *testing.T) {
 	assert.Contains(t, formatPresetJSON, "No markdown code fence",
 		"preset must explicitly forbid markdown fences — main failure mode")
+}
+
+// --- resolveDefaultHardTimeout -------------------------------------------
+//
+// Covers the default hard wall-clock backstop installed for `crush run` when
+// no --timeout is given (or --timeout 0). The backstop prevents a true zombie
+// (deadlock / a read that ignores ctx) from holding its session lock forever.
+// These tests exercise the pure resolver rather than waiting hours for a real
+// timer to fire.
+
+func TestResolveDefaultHardTimeout_EmptyEnvReturnsDefault(t *testing.T) {
+	// No env override → the hardcoded 6h default applies.
+	assert.Equal(t, defaultHardKillTimeout, resolveDefaultHardTimeout(""),
+		"empty env must yield the default backstop")
+	assert.Equal(t, 6*time.Hour, resolveDefaultHardTimeout(""),
+		"default backstop must be 6h (backstop-of-last-resort, not task-completion)")
+}
+
+func TestResolveDefaultHardTimeout_WhitespaceEnvReturnsDefault(t *testing.T) {
+	assert.Equal(t, defaultHardKillTimeout, resolveDefaultHardTimeout("   \t "),
+		"whitespace-only env must fall back to default")
+}
+
+func TestResolveDefaultHardTimeout_ValidOverrideHonored(t *testing.T) {
+	// Valid duration strings (same flexible syntax as --timeout) are honored.
+	cases := []struct {
+		in   string
+		want time.Duration
+	}{
+		{"900", 900 * time.Second},        // plain number = seconds
+		{"30m", 30 * time.Minute},         // Go duration
+		{"2h", 2 * time.Hour},             // longer override
+		{"90s", 90 * time.Second},         // shorter override
+		{"3600", 1 * time.Hour},           // plain seconds for 1h
+		{"10000", 10000 * time.Second},    // arbitrary plain number
+	}
+	for _, c := range cases {
+		got := resolveDefaultHardTimeout(c.in)
+		assert.Equalf(t, c.want, got, "input %q", c.in)
+	}
+}
+
+func TestResolveDefaultHardTimeout_InvalidFallsBackToDefault(t *testing.T) {
+	// Malformed values must NOT error out a run — they silently fall back.
+	invalid := []string{
+		"not-a-duration",
+		"abc",
+		"10x",
+		"---",
+		"m",
+		"h",
+	}
+	for _, in := range invalid {
+		got := resolveDefaultHardTimeout(in)
+		assert.Equalf(t, defaultHardKillTimeout, got,
+			"invalid input %q must fall back to default, not error", in)
+	}
+}
+
+func TestResolveDefaultHardTimeout_NonPositiveFallsBackToDefault(t *testing.T) {
+	// 0 or negative values are meaningless for a backstop → fall back.
+	for _, in := range []string{"0", "-1", "-30m", "-3600"} {
+		got := resolveDefaultHardTimeout(in)
+		assert.Equalf(t, defaultHardKillTimeout, got,
+			"non-positive input %q must fall back to default", in)
+	}
 }

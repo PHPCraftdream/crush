@@ -150,6 +150,10 @@ Runaway protection:
                       (supports k/M suffixes: 100k = 100000, 1M = 1000000)
   Both checks fire after each agent step. The session is saved with its
   partial work so you can inspect or fork from it.
+  Even with --timeout 0 (no graceful deadline), a 6h default hard wall-clock
+  backstop force-kills a true zombie (deadlock / a read that ignores ctx).
+  Override via CRUSH_RUN_DEFAULT_HARD_TIMEOUT (plain number = seconds, or a
+  Go duration like 30m/2h; invalid/non-positive falls back to the 6h default).
 
 Peak-hours override:
   --allow-peak-hours  bypass a provider's configured peak_hours refusal for
@@ -517,6 +521,7 @@ crush run --restrict-run --role fast \
 		// Optional hard deadline. The agent run gets context.DeadlineExceeded
 		// instead of context.Canceled, and the in-flight assistant message
 		// finishes with FinishReasonCanceled, just like an explicit cancel.
+		var installedHardKill *time.Timer
 		if timeoutDur > 0 {
 			var timeoutCancel context.CancelFunc
 			ctx, timeoutCancel = context.WithTimeout(ctx, timeoutDur)
@@ -536,14 +541,45 @@ crush run --restrict-run --role fast \
 			// zombie holding the handle. (Fork patch.)
 			const hardKillGrace = 60 * time.Second
 			hardDeadline := timeoutDur + hardKillGrace
-			killTimer := time.AfterFunc(hardDeadline, func() {
+			installedHardKill = time.AfterFunc(hardDeadline, func() {
 				fmt.Fprintf(os.Stderr,
 					"crush: run exceeded %s (timeout %s + %s grace) without exiting — force-killing\n",
 					hardDeadline, timeoutDur, hardKillGrace)
 				os.Exit(124)
 			})
-			defer killTimer.Stop()
+		} else {
+			// No --timeout (or --timeout 0). The operator's intent in passing
+			// --timeout 0 is to disable the GRACEFUL deadline so a legitimately
+			// long task isn't interrupted — NOT to disable the force-kill safety
+			// net. Without this backstop, a genuine freeze (deadlock, a
+			// provider/LSP read that ignores ctx — the same class of bug already
+			// fixed in internal/agent/cliprovider/provider.go) would zombie
+			// indefinitely holding its session lock, recoverable only via
+			// manual `crush sessions kill`. Install a generous DEFAULT hard cap.
+			//
+			// Unlike the --timeout path, NO separate grace window is added
+			// here: there's no graceful deadline to give time to wrap up
+			// (the operator deliberately disabled it), so the cap IS the
+			// deadline. The generous default value itself is the slack.
+			//
+			// Default: 6h. Rationale: this is a backstop-of-last-resort, NOT a
+			// task-completion expectation. 6h is long enough that no legitimate
+			// `crush run` (which is a single agentic turn bounded by the model's
+			// context window and tool latency) should ever approach it, yet
+			// short enough that a true zombie is reaped within a workday instead
+			// of holding its session lock across days. The observed real freeze
+			// was ~2h; 6h gives 3x headroom over that while still bounding the
+			// worst case. Override via CRUSH_RUN_DEFAULT_HARD_TIMEOUT (parsed by
+			// resolveDefaultHardTimeout).
+			hardDeadline := resolveDefaultHardTimeout(os.Getenv("CRUSH_RUN_DEFAULT_HARD_TIMEOUT"))
+			installedHardKill = time.AfterFunc(hardDeadline, func() {
+				fmt.Fprintf(os.Stderr,
+					"crush: run exceeded its default hard backstop of %s (no --timeout set; override via CRUSH_RUN_DEFAULT_HARD_TIMEOUT) without exiting — force-killing\n",
+					hardDeadline)
+				os.Exit(124)
+			})
 		}
+		defer installedHardKill.Stop()
 
 		a, err := setupApp(cmd)
 		if err != nil {
@@ -650,7 +686,7 @@ func init() {
 	runCmd.Flags().String("effort", "", "Reasoning effort for this turn: low|medium|high. Applies to whichever slot --role picked. Persisted on the session so subsequent runs inherit it.")
 	runCmd.Flags().Bool("stream", false, "Stream every assistant token to stdout. Default is terse: tool-call names on stderr + final answer on stdout.")
 	runCmd.Flags().Bool("json", false, "Emit one JSON object on stdout summarising the run (session_id, final_text, tool_calls, usage, duration, exit_reason). Mutually exclusive with --stream.")
-	runCmd.Flags().String("timeout", "60m", "Abort the run after this duration (e.g. 30s, 5m, 900 — plain number = seconds). A hard wall-clock kill force-exits the process 60s past this even on a freeze. Default 60m; pass 0 to disable both.")
+	runCmd.Flags().String("timeout", "60m", "Abort the run after this duration (e.g. 30s, 5m, 900 — plain number = seconds). A hard wall-clock kill force-exits the process 60s past this even on a freeze. Default 60m; pass 0 to disable the graceful deadline (a 6h default hard backstop still applies — override via CRUSH_RUN_DEFAULT_HARD_TIMEOUT).")
 	runCmd.Flags().StringP("model", "m", "", "Model to use. Accepts 'model' or 'provider/model' to disambiguate models with the same name across providers")
 	runCmd.Flags().String("small-model", "", "Small model to use. If not provided, uses the default small model for the provider")
 	runCmd.Flags().StringP("session", "s", "", "Session ID to continue OR create. If a session with this id exists it is continued; otherwise a new one is created with this id. Accepts a hash prefix for existing sessions only.")
@@ -734,6 +770,31 @@ func parseDurationFlexible(s string) (time.Duration, error) {
 		return time.Duration(n) * time.Second, nil
 	}
 	return time.ParseDuration(s)
+}
+
+// defaultHardKillTimeout is the default wall-clock backstop installed for
+// `crush run` when the operator does NOT pass --timeout (or passes --timeout 0).
+// It is a backstop-of-last-resort against a true zombie (deadlock / a read that
+// ignores ctx), NOT a task-completion expectation — see the comment at the
+// call site for the full rationale.
+const defaultHardKillTimeout = 6 * time.Hour
+
+// resolveDefaultHardTimeout resolves the default hard-kill backstop duration
+// from the CRUSH_RUN_DEFAULT_HARD_TIMEOUT env var, falling back to
+// defaultHardKillTimeout when the env var is unset, empty, or holds an
+// unparseable / non-positive value. It NEVER returns an error: a malformed env
+// var must not error out a run, it just silently falls back to the hardcoded
+// default. Extracted as a pure function so it is directly unit-testable.
+func resolveDefaultHardTimeout(envVal string) time.Duration {
+	envVal = strings.TrimSpace(envVal)
+	if envVal == "" {
+		return defaultHardKillTimeout
+	}
+	d, err := parseDurationFlexible(envVal)
+	if err != nil || d <= 0 {
+		return defaultHardKillTimeout
+	}
+	return d
 }
 
 // parseTokenCount parses a token count string with optional k/M suffix.
