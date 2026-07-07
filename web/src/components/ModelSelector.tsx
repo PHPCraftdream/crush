@@ -88,15 +88,14 @@ export function buildProviderGroups(config: ConfigPayload | null): ProviderGroup
         models.push({ key, providerID, providerName, providerType, modelID: m.id, name: m.name || m.id, contextWindow: m.contextWindow ?? 0, enabled });
       }
     }
-    if (models.length > 0) {
+    // Providers without an API key can't run a model yet — keep them out of
+    // model selection entirely (CLI providers don't need a key, so they're
+    // exempt). Configuring a key is done in the Providers settings modal.
+    if (models.length > 0 && (enabled || providerType === "cli")) {
       groups.push({ id: providerID, name: providerName, type: providerType, enabled, models });
     }
   }
-  // Sort: enabled providers first, then alphabetically
-  groups.sort((a, b) => {
-    if (a.enabled !== b.enabled) return a.enabled ? -1 : 1;
-    return a.name.localeCompare(b.name);
-  });
+  groups.sort((a, b) => a.name.localeCompare(b.name));
   return groups;
 }
 
@@ -168,8 +167,6 @@ function APIKeyForm({ providerID, providerName, onDone, onCancel }: {
 
 function ModelRow({ model, isSelected, onSelect }: { model: ModelItem, isSelected: boolean, onSelect: (m: ModelItem) => void }) {
   const disabled = !model.enabled;
-  const isCLI = model.providerType === "cli";
-  const canAddKey = disabled && !isCLI;
   return (
     <button
       onClick={() => onSelect(model)}
@@ -177,11 +174,9 @@ function ModelRow({ model, isSelected, onSelect }: { model: ModelItem, isSelecte
       className={`w-full text-left px-3 py-2 transition-colors border-b border-surface/30 last:border-0 ${
         disabled ? "opacity-50 hover:bg-base-overlay" : isSelected ? "bg-accent/5 hover:bg-accent/8" : "hover:bg-base-overlay"
       }`}
-      title={canAddKey ? `${model.providerName}: click to add API key` : undefined}
     >
       <div className={`text-sm font-medium truncate ${isSelected ? "text-accent" : disabled ? "text-text-subtle" : "text-text"}`}>
         {model.name}
-        {canAddKey && <span className="ml-2 text-[10px] text-accent/70 font-normal">+ add key</span>}
       </div>
     </button>
   );
@@ -315,12 +310,6 @@ export function ModelSelector({ session, modelType }: { session: Session | null;
   const title = modelType === "large" ? "Large (strong) model" : "Small (fast) model";
 
   function onSelect(m: ModelItem) {
-    if (!m.enabled && m.providerType !== "cli") {
-      // Show inline API key form for API-based providers
-      setKeyFormProvider({ id: m.providerID, name: m.providerName });
-      setSearch("");
-      return;
-    }
     if (!m.enabled) return; // CLI providers can't be selected without being enabled
     if (session) {
       const currentLargeKey = session.LargeModelProvider ? `${session.LargeModelProvider}:::${session.LargeModelID}` : getDefaultModelKey("large", config);
@@ -444,31 +433,22 @@ export function ModelSelector({ session, modelType }: { session: Session | null;
                         <div className="px-3 py-1.5 flex items-center gap-2">
                           <span className="text-[10px] font-bold text-text-muted uppercase tracking-wider">{group.name}</span>
                           {group.type !== "cli" && (
-                            group.enabled ? (
-                              <div className="flex items-center gap-1 ml-auto">
-                                <button
-                                  onClick={e => { e.stopPropagation(); setKeyFormProvider({ id: group.id, name: group.name }); }}
-                                  title="Edit API key"
-                                  className="text-[10px] text-text-subtle hover:text-accent transition-colors px-1"
-                                >
-                                  Edit key
-                                </button>
-                                <button
-                                  onClick={e => { e.stopPropagation(); removeProviderKey(group.id); }}
-                                  title="Remove API key"
-                                  className="text-[10px] text-text-subtle hover:text-red transition-colors px-1"
-                                >
-                                  Remove key
-                                </button>
-                              </div>
-                            ) : (
+                            <div className="flex items-center gap-1 ml-auto">
                               <button
                                 onClick={e => { e.stopPropagation(); setKeyFormProvider({ id: group.id, name: group.name }); }}
-                                className="text-[9px] text-accent border border-accent/40 rounded px-1.5 py-0.5 hover:bg-accent/10 transition-colors"
+                                title="Edit API key"
+                                className="text-[10px] text-text-subtle hover:text-accent transition-colors px-1"
                               >
-                                + Add API key
+                                Edit key
                               </button>
-                            )
+                              <button
+                                onClick={e => { e.stopPropagation(); removeProviderKey(group.id); }}
+                                title="Remove API key"
+                                className="text-[10px] text-text-subtle hover:text-red transition-colors px-1"
+                              >
+                                Remove key
+                              </button>
+                            </div>
                           )}
                         </div>
                         {groupModels.map(m => (
