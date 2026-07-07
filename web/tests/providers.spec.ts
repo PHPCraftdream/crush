@@ -395,6 +395,31 @@ test("Providers modal shows built-in providers, not just custom ones", async ({ 
   await expect(page.getByTestId("providers-modal")).toContainText("Ollama", { timeout: 3000 });
 });
 
+test("Configured providers (API key set) sort before unconfigured ones", async ({ page }) => {
+  // "zeta" would sort last alphabetically, but has a key set, so it must
+  // appear before "anthropic" (a built-in provider with no key set here).
+  await primeSession(page, makeConfig({
+    providers: {
+      anthropic: { name: "Anthropic", enabled: false, models: [] },
+      zeta: {
+        name: "Zeta API",
+        enabled: true,
+        isCustom: true,
+        baseUrl: "http://localhost:9000/v1/",
+        type: "openai-compat",
+        apiKeySet: true,
+        models: [{ id: "model-a", name: "Model A" }],
+      },
+    },
+  }));
+  await page.getByTestId("header-providers-button").click();
+  await expect(page.getByTestId("providers-modal")).toBeVisible({ timeout: 3000 });
+  const rows = page.getByTestId("provider-row");
+  await expect(rows).toHaveCount(2);
+  await expect(rows.nth(0)).toHaveAttribute("data-provider-id", "zeta");
+  await expect(rows.nth(1)).toHaveAttribute("data-provider-id", "anthropic");
+});
+
 test("Built-in provider has no remove button", async ({ page }) => {
   await primeSession(page, makeConfigWithProvider());
   await page.getByTestId("header-providers-button").click();

@@ -545,7 +545,7 @@ function ProviderRow({
   }
 
   return (
-    <div className="border-b border-surface last:border-0">
+    <div className="border-b border-surface last:border-0" data-test-id="provider-row" data-provider-id={id}>
       <div className="flex items-center gap-3 px-4 py-3">
         <button
           onClick={() => models.length > 0 && setExpanded((e) => !e)}
@@ -697,7 +697,14 @@ export function ProvidersModal({ onClose }: { onClose: () => void }) {
             </div>
           ) : (
             allProviders
-              .sort(([a], [b]) => a.localeCompare(b))
+              // Configured providers (API key set) first, then everything
+              // else — alphabetical within each group.
+              .sort(([a, infoA], [b, infoB]) => {
+                const configuredA = infoA.apiKeySet ? 0 : 1;
+                const configuredB = infoB.apiKeySet ? 0 : 1;
+                if (configuredA !== configuredB) return configuredA - configuredB;
+                return a.localeCompare(b);
+              })
               .map(([id, info]) => (
                 <ProviderRow
                   key={id}
