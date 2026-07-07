@@ -92,6 +92,12 @@ export function useWS() {
 
       ws.on("_disconnected", () => {
         $connected.set(false);
+        // Stop the BT keep-alive noise loop while the backend is
+        // unreachable — no point holding the audio device awake for a
+        // session that isn't running. It comes back automatically once
+        // the backend reconnects and re-sends `config` (see the "config"
+        // handler below), which re-applies the user's preference.
+        if (isKeepAliveRunning()) stopKeepAlive();
       }),
 
       ws.on("session_created", (msg: WSMessage) => {
