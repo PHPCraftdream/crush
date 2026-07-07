@@ -176,6 +176,7 @@ const (
 	CmdAddCustomProvider    = "add_custom_provider"
 	CmdRemoveCustomProvider = "remove_custom_provider"
 	CmdUpdateCustomProvider = "update_custom_provider"
+	CmdSetProviderPeakHours = "set_provider_peak_hours"
 	CmdUpdateTodos          = "update_todos"
 )
 
@@ -278,6 +279,21 @@ type UpdateCustomProviderPayload struct {
 	BaseURL   string                `json:"baseUrl"`
 	APIKey    string                `json:"apiKey,omitempty"`
 	Models    []CustomModelPayload  `json:"models,omitempty"`
+	PeakHours *PeakHoursWirePayload `json:"peakHours,omitempty"`
+	Scope     string                `json:"scope,omitempty"`
+}
+
+// SetProviderPeakHoursPayload sets or clears ONLY the peak_hours field on
+// ANY provider (built-in/catwalk-known or custom) — a targeted single-field
+// write, unlike Add/UpdateCustomProviderPayload which replace every field
+// and are therefore only safe to use on custom providers the client fully
+// owns. This mirrors what `crush providers set <id> --peak-hours` does on
+// the CLI side.
+//
+// PeakHours nil/absent clears the window. Scope is "global" or "local"
+// (workspace); empty defaults to "global".
+type SetProviderPeakHoursPayload struct {
+	ID        string                `json:"id"`
 	PeakHours *PeakHoursWirePayload `json:"peakHours,omitempty"`
 	Scope     string                `json:"scope,omitempty"`
 }

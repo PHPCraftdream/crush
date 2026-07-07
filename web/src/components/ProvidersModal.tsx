@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { useStore } from "@nanostores/react";
-import { $config, addCustomProvider, removeCustomProvider, updateCustomProvider, type ConfigScope } from "../store";
+import { $config, addCustomProvider, removeCustomProvider, updateCustomProvider, setProviderPeakHours, type ConfigScope } from "../store";
 import { X, Plus, Trash2, Pencil, AlertCircle, CheckCircle2, Loader2, ChevronDown, ChevronRight } from "lucide-react";
 import type { ProviderInfo } from "../types";
 
@@ -326,6 +326,143 @@ function ProviderForm({
   );
 }
 
+// ── Peak-hours-only editor (built-in providers) ───────────────────────────────
+//
+// Built-in/catwalk-known providers (anthropic, openai, zai, ...) have a
+// fixed type/baseUrl/model-list the client doesn't own — ProviderForm's full
+// add/edit flow (which replaces every field) is only safe for custom
+// providers. This editor sends a targeted single-field write
+// (set_provider_peak_hours) instead, so a built-in provider's peak_hours can
+// be managed without touching anything else about it.
+function PeakHoursOnlyEditor({
+  id,
+  initial,
+  onCancel,
+}: {
+  id: string;
+  initial: { start: string; end: string } | null | undefined;
+  onCancel: () => void;
+}) {
+  const [enabled, setEnabled] = useState(!!initial?.start && !!initial?.end);
+  const [start, setStart] = useState(initial?.start ?? "09:00");
+  const [end, setEnd] = useState(initial?.end ?? "18:00");
+  const [scope, setScope] = useState<ConfigScope>("global");
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const canSubmit = !busy && (!enabled || (start !== "" && end !== ""));
+
+  function submit() {
+    if (enabled && (!start || !end)) { setError("Start and end are required"); return; }
+    setError(null);
+    setBusy(true);
+    const msgID = crypto.randomUUID();
+    import("../ws").then(({ ws }) => {
+      const unsub = ws.on("*", (msg) => {
+        if (msg.id !== msgID) return;
+        unsub();
+        setBusy(false);
+        if (msg.error) setError(msg.error);
+        else onCancel();
+      });
+      setProviderPeakHours({
+        id,
+        peakHours: enabled ? { start, end } : null,
+        scope,
+      }, msgID);
+    });
+  }
+
+  return (
+    <div className="border-t border-surface bg-base-subtle/50 p-4 space-y-3" data-test-id="peak-hours-only-editor">
+      <div className="flex items-center justify-between">
+        <h3 className="text-sm font-semibold text-text">Peak hours: {id}</h3>
+        <button onClick={onCancel} className="text-text-subtle hover:text-text transition-colors">
+          <X size={15} />
+        </button>
+      </div>
+
+      <div>
+        <label className="block text-[11px] text-text-subtle mb-1">Scope</label>
+        <div className="flex gap-1 p-0.5 bg-canvas border border-surface rounded-lg w-fit" data-test-id="peak-hours-only-scope">
+          {(["global", "local"] as const).map((s) => (
+            <button
+              key={s}
+              type="button"
+              onClick={() => setScope(s)}
+              data-test-id={`peak-hours-only-scope-${s}`}
+              className={`px-3 py-1 text-xs rounded-md transition-colors capitalize ${
+                scope === s ? "bg-accent-fill text-white/90" : "text-text-subtle hover:text-text"
+              }`}
+            >
+              {s}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <label className="flex items-center gap-2 text-[11px] text-text-subtle cursor-pointer select-none">
+        <input
+          type="checkbox"
+          checked={enabled}
+          onChange={(e) => setEnabled(e.target.checked)}
+          className="accent-accent"
+          data-test-id="peak-hours-only-toggle"
+        />
+        Restrict to hours
+      </label>
+      {enabled && (
+        <div className="grid grid-cols-2 gap-2" data-test-id="peak-hours-only-inputs">
+          <div>
+            <label className="block text-[11px] text-text-subtle mb-1">Start (local)</label>
+            <input
+              type="time"
+              value={start}
+              onChange={(e) => setStart(e.target.value)}
+              className="w-full text-xs font-mono bg-canvas border border-surface rounded-lg px-2.5 py-1.5 outline-none focus:border-accent/50 text-text"
+              data-test-id="peak-hours-only-start"
+            />
+          </div>
+          <div>
+            <label className="block text-[11px] text-text-subtle mb-1">End (local)</label>
+            <input
+              type="time"
+              value={end}
+              onChange={(e) => setEnd(e.target.value)}
+              className="w-full text-xs font-mono bg-canvas border border-surface rounded-lg px-2.5 py-1.5 outline-none focus:border-accent/50 text-text"
+              data-test-id="peak-hours-only-end"
+            />
+          </div>
+        </div>
+      )}
+
+      {error && (
+        <p className="text-xs text-red flex items-center gap-1.5">
+          <AlertCircle size={12} />
+          {error}
+        </p>
+      )}
+      <div className="flex justify-end gap-2">
+        <button
+          onClick={onCancel}
+          className="px-3 py-1.5 text-xs text-text-subtle hover:text-text transition-colors rounded-lg hover:bg-base-overlay"
+        >
+          Cancel
+        </button>
+        <button
+          onClick={submit}
+          disabled={!canSubmit}
+          className="px-4 py-1.5 text-xs font-semibold bg-accent-fill text-white/90 rounded-lg hover:opacity-90 disabled:opacity-40 flex items-center gap-1.5"
+          data-test-id="peak-hours-only-save"
+        >
+          {busy ? <Loader2 size={12} className="animate-spin" /> : null}
+          {busy ? "Saving…" : "Save"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 // ── Provider row ──────────────────────────────────────────────────────────────
 
 function ProviderRow({
@@ -342,6 +479,15 @@ function ProviderRow({
   const [editing, setEditing] = useState(false);
 
   const models = info.models ?? [];
+  const isCustom = !!info.isCustom;
+
+  if (editing && !isCustom) {
+    return (
+      <div className="border-b border-surface last:border-0">
+        <PeakHoursOnlyEditor id={id} initial={info.peakHours} onCancel={() => setEditing(false)} />
+      </div>
+    );
+  }
 
   if (editing) {
     return (
@@ -431,12 +577,12 @@ function ProviderRow({
         <div className="flex items-center gap-1 shrink-0">
           <button
             onClick={() => setEditing(true)}
-            title="Edit provider"
+            title={isCustom ? "Edit provider" : "Edit peak hours"}
             className="p-1 text-text-subtle hover:text-accent transition-colors rounded"
           >
             <Pencil size={14} />
           </button>
-          {confirmRemove ? (
+          {isCustom && (confirmRemove ? (
             <div className="flex items-center gap-1 ml-1">
               <span className="text-xs text-text-subtle">Remove from:</span>
               <button
@@ -464,7 +610,7 @@ function ProviderRow({
             >
               <Trash2 size={14} />
             </button>
-          )}
+          ))}
         </div>
       </div>
 
@@ -500,9 +646,11 @@ export function ProvidersModal({ onClose }: { onClose: () => void }) {
     return () => document.removeEventListener("keydown", onKey);
   }, [onClose]);
 
-  // Only show custom providers (those with isCustom flag).
+  // Show every configured provider — built-in/catwalk-known (anthropic,
+  // openai, zai, ...) as well as custom. Built-in providers only get the
+  // peak-hours-only editor + no remove button (see ProviderRow); full
+  // add/edit/remove stays custom-provider-only.
   const allProviders = Object.entries(config?.providers ?? {});
-  const customProviders = allProviders.filter(([, info]) => info.isCustom);
 
   return (
     <div
@@ -518,11 +666,11 @@ export function ProvidersModal({ onClose }: { onClose: () => void }) {
         {/* Header */}
         <div className="flex items-center justify-between px-5 py-4 border-b border-surface shrink-0" data-test-id="providers-modal-header">
           <div>
-            <h2 className="text-base font-semibold text-text">Custom Providers</h2>
+            <h2 className="text-base font-semibold text-text">Providers</h2>
             <p className="text-xs text-text-subtle mt-0.5">
-              {customProviders.length === 0
-                ? "No custom providers configured"
-                : `${customProviders.length} custom provider${customProviders.length !== 1 ? "s" : ""}`}
+              {allProviders.length === 0
+                ? "No providers configured"
+                : `${allProviders.length} provider${allProviders.length !== 1 ? "s" : ""}`}
             </p>
           </div>
           <button onClick={onClose} className="text-text-subtle hover:text-text transition-colors p-1 rounded-lg hover:bg-base-overlay">
@@ -532,13 +680,13 @@ export function ProvidersModal({ onClose }: { onClose: () => void }) {
 
         {/* List */}
         <div className="flex-1 overflow-y-auto">
-          {customProviders.length === 0 ? (
+          {allProviders.length === 0 ? (
             <div className="flex flex-col items-center justify-center py-12 px-6 text-center">
-              <p className="text-text-muted text-sm font-medium mb-1">No custom providers</p>
+              <p className="text-text-muted text-sm font-medium mb-1">No providers</p>
               <p className="text-text-subtle text-xs">Add a provider to use Ollama, LM Studio, Deepseek, etc.</p>
             </div>
           ) : (
-            customProviders
+            allProviders
               .sort(([a], [b]) => a.localeCompare(b))
               .map(([id, info]) => (
                 <ProviderRow

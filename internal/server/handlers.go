@@ -147,6 +147,8 @@ func handleIncoming(ctx context.Context, a *appPkg.App, c *Client, raw []byte) {
 		go handleRemoveCustomProvider(a, c, msg)
 	case CmdUpdateCustomProvider:
 		go handleUpdateCustomProvider(a, c, msg)
+	case CmdSetProviderPeakHours:
+		go handleSetProviderPeakHours(a, c, msg)
 	case CmdUpdateTodos:
 		go handleUpdateTodos(ctx, a, c, msg)
 	default:
@@ -1918,6 +1920,62 @@ func handleUpdateCustomProvider(a *appPkg.App, c *Client, msg WSMessage) {
 	if err := store.SetConfigField(scope, fmt.Sprintf("providers.%s", p.ID), providerCfg); err != nil {
 		slog.Warn("ws: failed to persist updated custom provider", "id", p.ID, "err", err)
 	}
+	if wire, ok := buildConfigWire(a); ok {
+		c.hub.Broadcast(EventConfig, wire)
+	}
+	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
+}
+
+// handleSetProviderPeakHours sets or clears ONLY the peak_hours field on any
+// provider — built-in/catwalk-known (e.g. "anthropic", "zai") or custom.
+// Unlike handleUpdateCustomProvider (which replaces every field and is only
+// safe on a custom provider the client fully owns), this is a targeted
+// single-field write, mirroring `crush providers set <id> --peak-hours` on
+// the CLI side. This is what lets the web UI manage peak hours for a
+// built-in provider without needing to know/round-trip its type, base URL,
+// API key, or model list.
+func handleSetProviderPeakHours(a *appPkg.App, c *Client, msg WSMessage) {
+	var p SetProviderPeakHoursPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		c.reply(msg.ID, EventError, nil, "invalid payload")
+		return
+	}
+	if p.ID == "" {
+		c.reply(msg.ID, EventError, nil, "id is required")
+		return
+	}
+	peakHours, err := peakHoursFromWire(p.PeakHours)
+	if err != nil {
+		c.reply(msg.ID, EventError, nil, fmt.Sprintf("invalid peakHours: %v", err))
+		return
+	}
+	store := a.Store()
+	cfg := store.Config()
+	if cfg == nil {
+		c.reply(msg.ID, EventError, nil, "config not available")
+		return
+	}
+	providerCfg, ok := cfg.Providers.Get(p.ID)
+	if !ok {
+		c.reply(msg.ID, EventError, nil, fmt.Sprintf("provider %q not found", p.ID))
+		return
+	}
+	scope := scopeFromWire(p.Scope)
+	fieldKey := fmt.Sprintf("providers.%s.peak_hours", p.ID)
+	if peakHours == nil {
+		if err := store.RemoveConfigField(scope, fieldKey); err != nil {
+			slog.Warn("ws: failed to clear provider peak_hours", "id", p.ID, "err", err)
+		}
+	} else {
+		if err := store.SetConfigField(scope, fieldKey, peakHours); err != nil {
+			c.reply(msg.ID, EventError, nil, fmt.Sprintf("failed to persist peak_hours: %v", err))
+			return
+		}
+	}
+	// Update the in-memory merged map so buildConfigWire reflects the
+	// change immediately, without a full config reload.
+	providerCfg.PeakHours = peakHours
+	cfg.Providers.Set(p.ID, providerCfg)
 	if wire, ok := buildConfigWire(a); ok {
 		c.hub.Broadcast(EventConfig, wire)
 	}

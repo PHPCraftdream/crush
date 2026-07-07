@@ -732,6 +732,21 @@ export function updateCustomProvider(payload: {
   ws.send("update_custom_provider", payload, msgID);
 }
 
+// setProviderPeakHours sets/clears ONLY the peak_hours field on ANY
+// provider (built-in/catwalk-known like "anthropic"/"zai", or custom) — a
+// targeted single-field write, unlike addCustomProvider/updateCustomProvider
+// which replace every field and are only safe on a custom provider the
+// client fully owns. This is what lets the UI manage peak hours for a
+// built-in provider without knowing/round-tripping its type, base URL, API
+// key, or model list.
+export function setProviderPeakHours(payload: {
+  id: string;
+  peakHours: { start: string; end: string } | null;
+  scope?: ConfigScope;
+}, msgID?: string) {
+  ws.send("set_provider_peak_hours", payload, msgID);
+}
+
 // ── My prompts history ─────────────────────────────────────────────────────
 //
 // Derived from $messages (current active session). One entry per visible

@@ -385,3 +385,66 @@ test("Provider with API key shows Key set badge", async ({ page }) => {
     timeout: 3000,
   });
 });
+
+// ── Built-in providers (peak-hours-only editing) ──────────────────────────────
+
+test("Providers modal shows built-in providers, not just custom ones", async ({ page }) => {
+  await primeSession(page, makeConfigWithProvider());
+  await page.getByTestId("header-providers-button").click();
+  await expect(page.getByTestId("providers-modal")).toContainText("Anthropic", { timeout: 3000 });
+  await expect(page.getByTestId("providers-modal")).toContainText("Ollama", { timeout: 3000 });
+});
+
+test("Built-in provider has no remove button", async ({ page }) => {
+  await primeSession(page, makeConfigWithProvider());
+  await page.getByTestId("header-providers-button").click();
+  await expect(page.getByTestId("providers-modal")).toContainText("Anthropic", { timeout: 3000 });
+  // Two rows: Anthropic (built-in, first alphabetically) then Ollama (custom).
+  // Only the custom row's remove button should exist.
+  await expect(page.getByTitle("Remove provider")).toHaveCount(1);
+});
+
+test("Built-in provider edit opens peak-hours-only editor, not full form", async ({ page }) => {
+  await primeSession(page, makeConfigWithProvider());
+  await page.getByTestId("header-providers-button").click();
+  await expect(page.getByTestId("providers-modal")).toContainText("Anthropic", { timeout: 3000 });
+  await page.getByTitle("Edit peak hours").click();
+  await expect(page.getByTestId("peak-hours-only-editor")).toBeVisible({ timeout: 3000 });
+  await expect(page.getByTestId("peak-hours-only-editor")).toContainText("anthropic");
+  // The full ProviderForm's base-URL field must NOT be present for a
+  // built-in provider — only the peak-hours-only editor.
+  await expect(page.getByPlaceholder("e.g. http://localhost:11434/v1/")).toHaveCount(0);
+});
+
+test("Built-in provider peak-hours editor sends set_provider_peak_hours", async ({ page }) => {
+  await primeSession(page, makeConfigWithProvider());
+  await page.getByTestId("header-providers-button").click();
+  await expect(page.getByTestId("providers-modal")).toContainText("Anthropic", { timeout: 3000 });
+  await page.getByTitle("Edit peak hours").click();
+  await expect(page.getByTestId("peak-hours-only-editor")).toBeVisible({ timeout: 3000 });
+  await page.getByTestId("peak-hours-only-toggle").check();
+  await page.getByTestId("peak-hours-only-start").fill("09:00");
+  await page.getByTestId("peak-hours-only-end").fill("18:00");
+  await page.getByTestId("peak-hours-only-save").click();
+  const msg = await waitForWSSend(page, "set_provider_peak_hours");
+  const payload = msg.payload as Record<string, unknown>;
+  expect(payload.id).toBe("anthropic");
+  expect(payload.peakHours).toEqual({ start: "09:00", end: "18:00" });
+  expect(payload.scope).toBe("global");
+});
+
+test("Built-in provider peak-hours editor can target local scope", async ({ page }) => {
+  await primeSession(page, makeConfigWithProvider());
+  await page.getByTestId("header-providers-button").click();
+  await expect(page.getByTestId("providers-modal")).toContainText("Anthropic", { timeout: 3000 });
+  await page.getByTitle("Edit peak hours").click();
+  await expect(page.getByTestId("peak-hours-only-editor")).toBeVisible({ timeout: 3000 });
+  await page.getByTestId("peak-hours-only-scope-local").click();
+  await page.getByTestId("peak-hours-only-toggle").check();
+  await page.getByTestId("peak-hours-only-start").fill("22:00");
+  await page.getByTestId("peak-hours-only-end").fill("06:00");
+  await page.getByTestId("peak-hours-only-save").click();
+  const msg = await waitForWSSend(page, "set_provider_peak_hours");
+  const payload = msg.payload as Record<string, unknown>;
+  expect(payload.scope).toBe("local");
+});
