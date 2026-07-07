@@ -76,6 +76,8 @@ function ModelEditor({
 // isPeakHoursActive returns true when the browser's local time-of-day falls
 // inside the [start, end) window. Handles overnight wrap (start > end), e.g.
 // "22:00"–"06:00". Returns false when the window is malformed/empty.
+const HH_MM_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
+
 function isPeakHoursActive(peak: { start: string; end: string } | null | undefined): boolean {
   if (!peak || !peak.start || !peak.end) return false;
   const now = new Date();
@@ -135,6 +137,7 @@ function ProviderForm({
       if (!m.name.trim()) return "Each model must have a display name";
     }
     if (peakEnabled && (!peakStart || !peakEnd)) return "Peak-hours start and end are required";
+    if (peakEnabled && (!HH_MM_RE.test(peakStart) || !HH_MM_RE.test(peakEnd))) return "Peak-hours must be in 24-hour HH:MM format";
     return null;
   }
 
@@ -143,7 +146,7 @@ function ProviderForm({
     baseUrl.trim() !== "" &&
     models.length > 0 &&
     models.every((m) => m.id.trim() !== "" && m.name.trim() !== "") &&
-    (!peakEnabled || (peakStart !== "" && peakEnd !== ""));
+    (!peakEnabled || (HH_MM_RE.test(peakStart) && HH_MM_RE.test(peakEnd)));
 
   const peakHours = peakEnabled && peakStart && peakEnd ? { start: peakStart, end: peakEnd } : null;
 
@@ -274,12 +277,17 @@ function ProviderForm({
             <div>
               <label className="block text-[11px] text-text-subtle mb-1">Start (local)</label>
               <input
-                type="time"
-                // lang="en-GB" forces a 24-hour picker/display in Chromium-based
-                // browsers regardless of the OS/browser locale, which otherwise
-                // shows AM/PM on 12h-locale systems — peak_hours is always
-                // interpreted as 24h HH:MM server-side, so the picker must match.
-                lang="en-GB"
+                type="text"
+                // A plain HH:MM text field, not <input type="time"> — the
+                // native time picker's AM/PM vs 24h display follows the OS
+                // locale in most non-Chromium browsers (lang="en-GB" doesn't
+                // override it there), but peak_hours is always 24h HH:MM
+                // server-side, so we own the format instead of fighting the
+                // picker.
+                inputMode="numeric"
+                pattern="([01]\d|2[0-3]):[0-5]\d"
+                placeholder="HH:MM"
+                maxLength={5}
                 value={peakStart}
                 onChange={(e) => setPeakStart(e.target.value)}
                 className="w-full text-xs font-mono bg-canvas border border-surface rounded-lg px-2.5 py-1.5 outline-none focus:border-accent/50 text-text"
@@ -289,8 +297,11 @@ function ProviderForm({
             <div>
               <label className="block text-[11px] text-text-subtle mb-1">End (local)</label>
               <input
-                type="time"
-                lang="en-GB"
+                type="text"
+                inputMode="numeric"
+                pattern="([01]\d|2[0-3]):[0-5]\d"
+                placeholder="HH:MM"
+                maxLength={5}
                 value={peakEnd}
                 onChange={(e) => setPeakEnd(e.target.value)}
                 className="w-full text-xs font-mono bg-canvas border border-surface rounded-lg px-2.5 py-1.5 outline-none focus:border-accent/50 text-text"
@@ -356,10 +367,11 @@ function PeakHoursOnlyEditor({
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
-  const canSubmit = !busy && (!enabled || (start !== "" && end !== ""));
+  const canSubmit = !busy && (!enabled || (HH_MM_RE.test(start) && HH_MM_RE.test(end)));
 
   function submit() {
     if (enabled && (!start || !end)) { setError("Start and end are required"); return; }
+    if (enabled && (!HH_MM_RE.test(start) || !HH_MM_RE.test(end))) { setError("Must be in 24-hour HH:MM format"); return; }
     setError(null);
     setBusy(true);
     const msgID = crypto.randomUUID();
@@ -422,10 +434,13 @@ function PeakHoursOnlyEditor({
           <div>
             <label className="block text-[11px] text-text-subtle mb-1">Start (local)</label>
             <input
-              type="time"
-              // See the comment on the equivalent input in ProviderForm above:
-              // forces a 24-hour picker regardless of OS/browser locale.
-              lang="en-GB"
+              type="text"
+              // Plain HH:MM text field — see the comment on the equivalent
+              // input in ProviderForm above for why not <input type="time">.
+              inputMode="numeric"
+              pattern="([01]\d|2[0-3]):[0-5]\d"
+              placeholder="HH:MM"
+              maxLength={5}
               value={start}
               onChange={(e) => setStart(e.target.value)}
               className="w-full text-xs font-mono bg-canvas border border-surface rounded-lg px-2.5 py-1.5 outline-none focus:border-accent/50 text-text"
@@ -435,8 +450,11 @@ function PeakHoursOnlyEditor({
           <div>
             <label className="block text-[11px] text-text-subtle mb-1">End (local)</label>
             <input
-              type="time"
-              lang="en-GB"
+              type="text"
+              inputMode="numeric"
+              pattern="([01]\d|2[0-3]):[0-5]\d"
+              placeholder="HH:MM"
+              maxLength={5}
               value={end}
               onChange={(e) => setEnd(e.target.value)}
               className="w-full text-xs font-mono bg-canvas border border-surface rounded-lg px-2.5 py-1.5 outline-none focus:border-accent/50 text-text"
