@@ -192,6 +192,107 @@ func TestStringPtr(t *testing.T) {
 	require.Equal(t, s, *ptr)
 }
 
+func TestFormatPeakHoursStatus(t *testing.T) {
+	t.Parallel()
+
+	// A fixed local-time instant inside a 09:00-18:00 window.
+	noon := time.Date(2026, 6, 2, 12, 0, 0, 0, time.UTC)
+	// A fixed local-time instant outside the window (before it starts).
+	early := time.Date(2026, 6, 2, 8, 0, 0, 0, time.UTC)
+	// Instant inside an overnight 22:00-06:00 window (pre-midnight leg).
+	late := time.Date(2026, 6, 2, 23, 30, 0, 0, time.UTC)
+
+	cases := []struct {
+		name    string
+		window  *config.PeakHoursWindow
+		now     time.Time
+		want    string
+	}{
+		{
+			name:   "nil window returns empty (feature off)",
+			window: nil,
+			now:    noon,
+			want:   "",
+		},
+		{
+			name:   "zero-valued non-nil window renders empty bounds as not active",
+			window: &config.PeakHoursWindow{},
+			now:    noon,
+			want:   "- (not active)",
+		},
+		{
+			name:   "daytime window active at noon",
+			window: &config.PeakHoursWindow{Start: "09:00", End: "18:00"},
+			now:    noon,
+			want:   "09:00-18:00 (active now)",
+		},
+		{
+			name:   "daytime window not active early morning",
+			window: &config.PeakHoursWindow{Start: "09:00", End: "18:00"},
+			now:    early,
+			want:   "09:00-18:00 (not active)",
+		},
+		{
+			name:   "overnight window active pre-midnight",
+			window: &config.PeakHoursWindow{Start: "22:00", End: "06:00"},
+			now:    late,
+			want:   "22:00-06:00 (active now)",
+		},
+		{
+			name:   "overnight window not active mid-afternoon",
+			window: &config.PeakHoursWindow{Start: "22:00", End: "06:00"},
+			now:    noon,
+			want:   "22:00-06:00 (not active)",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := formatPeakHoursStatus(tc.window, tc.now)
+			require.Equal(t, tc.want, got)
+		})
+	}
+}
+
+func TestPingResult_PeakHoursField(t *testing.T) {
+	t.Parallel()
+
+	t.Run("set peak_hours renders in JSON", func(t *testing.T) {
+		t.Parallel()
+		ph := "09:00-18:00 (active now)"
+		result := PingResult{
+			Provider:  "anthropic",
+			Model:     "claude-opus",
+			PeakHours: &ph,
+			Status:    "ok",
+		}
+		data, err := json.Marshal(result)
+		require.NoError(t, err)
+
+		var parsed map[string]interface{}
+		require.NoError(t, json.Unmarshal(data, &parsed))
+		require.Equal(t, "09:00-18:00 (active now)", parsed["peak_hours"])
+	})
+
+	t.Run("nil peak_hours is omitted from JSON", func(t *testing.T) {
+		t.Parallel()
+		result := PingResult{
+			Provider:  "anthropic",
+			Model:     "claude-opus",
+			PeakHours: nil,
+			Status:    "ok",
+		}
+		data, err := json.Marshal(result)
+		require.NoError(t, err)
+
+		var parsed map[string]interface{}
+		require.NoError(t, json.Unmarshal(data, &parsed))
+		_, present := parsed["peak_hours"]
+		require.False(t, present, "peak_hours must be omitted when nil")
+	})
+}
+
 func TestPingResult_DegradedStatus(t *testing.T) {
 	t.Parallel()
 

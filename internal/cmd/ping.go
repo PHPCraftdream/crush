@@ -111,6 +111,7 @@ type PingResult struct {
 	Model            string  `json:"model"`
 	Effort           string  `json:"effort,omitempty"`
 	Atom             string  `json:"atom,omitempty"`
+	PeakHours        *string `json:"peak_hours,omitempty"`
 	Status           string  `json:"status"`
 	LatencyMs        int64   `json:"latency_ms"`
 	Response         string  `json:"response,omitempty"`
@@ -166,6 +167,14 @@ func runPing(cmd *cobra.Command, modelType config.SelectedModelType) error {
 			return json.NewEncoder(os.Stdout).Encode(result)
 		}
 		return fmt.Errorf("%s", msg)
+	}
+
+	// Display-only peak-hours indicator. Computed once here (providerCfg is
+	// now available) and attached to every PingResult built below. Ping is a
+	// diagnostic: this never gates the real network call.
+	var peakHoursLabel *string
+	if s := formatPeakHoursStatus(providerCfg.PeakHours, time.Now()); s != "" {
+		peakHoursLabel = &s
 	}
 
 	// Prepare context with timeout
@@ -243,6 +252,7 @@ func runPing(cmd *cobra.Command, modelType config.SelectedModelType) error {
 				Provider:  modelCfg.Provider,
 				Model:     modelCfg.Model,
 				Effort:    modelCfg.ReasoningEffort,
+				PeakHours: peakHoursLabel,
 				Status:    "timeout",
 				LatencyMs: latency,
 				Error:     stringPtr("request timeout"),
@@ -260,6 +270,7 @@ func runPing(cmd *cobra.Command, modelType config.SelectedModelType) error {
 			Provider:  modelCfg.Provider,
 			Model:     modelCfg.Model,
 			Effort:    modelCfg.ReasoningEffort,
+			PeakHours: peakHoursLabel,
 			Status:    "error",
 			LatencyMs: latency,
 			Error:     &msg,
@@ -279,6 +290,7 @@ func runPing(cmd *cobra.Command, modelType config.SelectedModelType) error {
 			Provider:  modelCfg.Provider,
 			Model:     modelCfg.Model,
 			Effort:    modelCfg.ReasoningEffort,
+			PeakHours: peakHoursLabel,
 			Status:    "error",
 			LatencyMs: latency,
 			Error:     &msg,
@@ -320,6 +332,7 @@ func runPing(cmd *cobra.Command, modelType config.SelectedModelType) error {
 		Model:            modelCfg.Model,
 		Effort:           modelCfg.ReasoningEffort,
 		Atom:             atom,
+		PeakHours:        peakHoursLabel,
 		Status:           status,
 		LatencyMs:        latency,
 		Response:         response,
@@ -349,6 +362,9 @@ func runPing(cmd *cobra.Command, modelType config.SelectedModelType) error {
 		} else {
 			fmt.Printf("provider:  %s / %s\n", modelCfg.Provider, modelCfg.Model)
 		}
+	}
+	if peakHoursLabel != nil {
+		fmt.Printf("peak_hours: %s\n", *peakHoursLabel)
 	}
 	fmt.Printf("status:    %s\n", status)
 	fmt.Printf("latency:   %dms\n", latency)
@@ -679,6 +695,22 @@ func parseZAIResetHint(text string) (time.Time, bool) {
 		return time.Time{}, false
 	}
 	return t, true
+}
+
+// formatPeakHoursStatus renders a human-readable summary of a provider's
+// peak-hours window for display. Returns "" when the window is nil (feature
+// off) so callers can simply skip printing. `now` is taken as an argument
+// for testability. This is display-only: it never influences whether the
+// real network call is made.
+func formatPeakHoursStatus(w *config.PeakHoursWindow, now time.Time) string {
+	if w == nil {
+		return ""
+	}
+	suffix := "not active"
+	if w.InPeakHours(now) {
+		suffix = "active now"
+	}
+	return fmt.Sprintf("%s-%s (%s)", w.Start, w.End, suffix)
 }
 
 func stringPtr(s string) *string {
