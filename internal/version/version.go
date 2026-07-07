@@ -72,14 +72,15 @@ func formatFullVersion(v, buildID string) string {
 // is only set for `go install` and not for `go build`). For plain `go build`
 // from a checkout, that main version is "(devel)", so we additionally derive a
 // meaningful version from the VCS metadata the toolchain embeds
-// (vcs.revision / vcs.modified) — this lets two local dev builds be told apart.
-// When the `go install` main version is a pseudo-version built on top of a real
+// (vcs.revision) — this lets two local dev builds be told apart. When the
+// `go install` main version is a pseudo-version built on top of a real
 // upstream tag (e.g. "v0.72.1-0.<timestamp>-<commit>"), that base tag is
-// extracted and prepended to the derived devel string, so a go-install build
-// reports e.g. "v0.72.1-devel-<hash>-<forkBaseVersion>" rather than the raw
-// ugly pseudo-version. Plain `go build .` has no base tag (its main version is
-// "(devel)") and reports the tag-less "devel-<hash>-<forkBaseVersion>".
-// Release/packaged builds inject Version via ldflags and are left untouched.
+// extracted and prepended to the derived string, so a go-install build
+// reports e.g. "v0.72.1-<hash>-<forkBaseVersion>" rather than the raw ugly
+// pseudo-version. Plain `go build .` has no base tag (its main version is
+// "(devel)") and reports the tag-less "<hash>-<forkBaseVersion>". Neither
+// path ever includes a "devel" or dirty marker in the output. Release/
+// packaged builds inject Version via ldflags and are left untouched.
 func init() {
 	info, _ := debug.ReadBuildInfo()
 	Version, Commit = resolveVersion(Version, Commit, info)
@@ -100,11 +101,12 @@ func init() {
 //   - otherwise the module version resolved by `go install pkg@version`, when
 //     it is a clean release version (not a pseudo-version and not "(devel)"),
 //     wins directly;
-//   - otherwise a VCS-derived "[<baseTag>-]devel-<commit>-<forkBaseVersion>"
-//     string for local dev builds. The optional <baseTag> prefix is the
-//     upstream release tag extracted from a `go install` pseudo-version (e.g.
-//     "v0.72.1" from "v0.72.1-0.<timestamp>-<commit>"); plain `go build .`
-//     has no such tag and produces the bare "devel-<commit>-<forkBaseVersion>".
+//   - otherwise a VCS-derived "[<baseTag>-]<commit>-<forkBaseVersion>" string
+//     for local dev builds (no "devel" marker). The optional <baseTag> prefix
+//     is the upstream release tag extracted from a `go install` pseudo-version
+//     (e.g. "v0.72.1" from "v0.72.1-0.<timestamp>-<commit>"); plain
+//     `go build .` has no such tag and produces the bare
+//     "<commit>-<forkBaseVersion>".
 //
 // Commit is filled from VCS only when the ldflags default is still "unknown".
 func resolveVersion(defaultVersion, defaultCommit string, info *debug.BuildInfo) (version, commit string) {
@@ -167,11 +169,11 @@ func extractBaseTag(v string) string {
 // meaningful enough to expose directly. Local checkout builds can report
 // v0.0.0-<timestamp>-<commit>[+dirty], which is a Go pseudo-version, not a
 // release version users can match to a package. Those fall through to the
-// VCS-derived devel-<commit>-<forkBaseVersion> format instead. A pseudo-version
+// VCS-derived <commit>-<forkBaseVersion> format instead. A pseudo-version
 // built on top of a real prior tag (e.g. "v0.72.1-0.<timestamp>-<commit>[+dirty]")
 // is rejected here too: its base tag is recovered separately by extractBaseTag
-// and prepended to the derived devel string, but the raw pseudo-version itself
-// is never shown.
+// and prepended to the derived string, but the raw pseudo-version itself is
+// never shown.
 func usableModuleVersion(v string) bool {
 	if v == "" || v == "(devel)" {
 		return false
@@ -213,13 +215,13 @@ func readVCS(info *debug.BuildInfo) vcsInfo {
 
 // deriveDevVersion builds a human-meaningful version for a development build
 // from embedded VCS metadata, embedding the fork's current release-line version
-// (forkBaseVersion), e.g. "devel-06c8078-0.1.4" for a clean checkout. When
-// baseTag is non-empty (recovered from a `go install` pseudo-version), it is
-// prepended as "<baseTag>-", yielding e.g.
-// "v0.72.1-devel-06c8078-0.1.4". It returns an empty string when no revision
-// is available, signalling the caller to keep the plain "devel" default. The
-// version string no longer distinguishes a clean checkout from one with
-// uncommitted changes (the previous "-dirty" suffix was removed).
+// (forkBaseVersion), e.g. "06c8078-0.1.4" for a clean checkout. When baseTag is
+// non-empty (recovered from a `go install` pseudo-version), it is prepended as
+// "<baseTag>-", yielding e.g. "v0.72.1-06c8078-0.1.4". It returns an empty
+// string when no revision is available, signalling the caller to keep the
+// plain "devel" default. No "devel" marker and no dirty marker are ever
+// included in the returned string — the commit hash + forkBaseVersion (and,
+// when available, the upstream base tag) are the only content.
 func deriveDevVersion(baseTag, revision string) string {
 	if revision == "" {
 		return ""
@@ -228,7 +230,7 @@ func deriveDevVersion(baseTag, revision string) string {
 	if len(short) > 7 {
 		short = short[:7]
 	}
-	v := "devel-" + short + "-" + forkBaseVersion
+	v := short + "-" + forkBaseVersion
 	if baseTag != "" {
 		v = baseTag + "-" + v
 	}
