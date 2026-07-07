@@ -8,6 +8,57 @@ This is the npm-package changelog, not the fork's engineering decision
 log — see [`CHANGELOG.fork.md`](../../CHANGELOG.fork.md) at the repo
 root for the full per-file merge/divergence history.
 
+## [0.1.5]
+
+- Web UI: the Providers settings modal is now the single place to edit every
+  provider parameter, including the API key, for both custom and built-in
+  providers (anthropic, openai, zai, ...) — previously a built-in provider's
+  key could only be set from the model-selection dropdown, and its other
+  fields weren't editable at all. The now-redundant "Edit key" / "Remove
+  key" / "+ Add API key" affordances were removed from model selection.
+- Web UI: providers without an API key configured no longer clutter the
+  model-selection dropdown (CLI-type providers, which don't need a key, are
+  unaffected).
+- Web UI: configured providers (API key set) now sort to the top of the
+  Providers settings list.
+- Web UI: peak-hours start/end are now a plain 24-hour `HH:MM` text field
+  instead of the native time picker, which showed AM/PM on some non-Chromium
+  browsers regardless of locale.
+- Web UI: a global/local scope selector on add/edit/remove for custom
+  providers, and peak-hours management for built-in providers — previously
+  only custom providers could be scoped.
+- Web UI: the background "keep Bluetooth headphones awake" noise loop now
+  stops while the backend is disconnected and resumes automatically on
+  reconnect, instead of playing pointlessly against a dead connection.
+- `crush ping` now shows a provider's peak-hours status in its output.
+- `crush run` now has a default 6-hour hard wall-clock backstop when
+  `--timeout` is unset or 0 (override via `CRUSH_RUN_DEFAULT_HARD_TIMEOUT`),
+  so a run can no longer hang indefinitely with no timeout at all.
+- `crush mcp add/remove/enable/disable/set` and `crush claude-init`/
+  `claude-del` now default to the global scope with an explicit `--local`
+  flag to opt into project-local, matching every other scoped command
+  (previously inconsistent — some defaulted to local with no way to
+  target global from the flag).
+- Per-model slash-commands installed by `cah install` (e.g. `/oxx`, `/sh`,
+  `/fl`) are no longer surfaced in crush's own skill/command discovery —
+  those pin a specific model to switch to and aren't general-purpose
+  commands.
+- Fixed: loop detection could trip on a step *after* the one that actually
+  repeated, due to an ordering mismatch between the fantasy SDK's
+  `OnStepFinish` and `StopWhen` callbacks; it now stops on the exact step
+  that trips the detector and records a distinguishable "stopped by
+  loop-detection" message.
+- Fixed: a CLI provider's background process wait could block forever if a
+  grandchild process held stderr open, and its kill only terminated the
+  direct child on Windows, orphaning `node.exe`. Both are now bounded/tree-
+  killed correctly.
+- Fixed: `crush sessions why <id>`'s verdict could disagree with `sessions
+  list` for a stale-lock-but-cleanly-finished session.
+- Local/development builds now report a version like
+  `<upstream-tag>-<commit>-0.1.5` (e.g. `v0.72.1-06c8078-0.1.5`) — the
+  upstream base tag is preserved, and neither a `devel` nor a `dirty`
+  marker is ever included.
+
 ## [0.1.4]
 
 - New per-provider `peak_hours` refusal window: a provider can be configured
