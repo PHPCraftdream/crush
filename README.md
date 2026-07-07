@@ -223,6 +223,12 @@ jq -r '.error' "$out"         # error.message if non-success
   on Windows. Set `CRUSH_COLOR_SCHEME=light` (or pass
   `--color-scheme light`, which is global and wins over the env var)
   to force the light palette.
+  > **Windows gotcha:** `setx CRUSH_COLOR_SCHEME light` only writes the
+  > variable to the registry for *future* processes — it does **not**
+  > update any terminal window that's already open. Open a new
+  > terminal tab/window (or restart the shell) before checking whether
+  > it took effect, or you'll see the old behavior and wrongly
+  > conclude the flag doesn't work.
 
 Permissions are unconditionally auto-approved in `crush run` — see
 "Security" above. `--cwd /tmp/sandbox` or a worktree narrows the blast

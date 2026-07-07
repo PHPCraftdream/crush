@@ -48,10 +48,17 @@ func init() {
 	// lipgloss.HasDarkBackground misdetects and renders grey-on-white. The
 	// CRUSH_COLOR_SCHEME env var does the same; the flag wins if both are set.
 	// "auto" (the default) leaves fang's built-in detection untouched.
+	//
+	// This description string is the ONLY place this flag is documented —
+	// cobra/fang auto-render it in every subcommand's FLAGS section, so do
+	// NOT also hand-write a duplicate explanation in rootCmd.Long or
+	// anywhere else; that drifts (it already did once — see git history).
 	rootCmd.PersistentFlags().String(
 		"color-scheme",
 		"",
 		"Force CLI help/error color palette: light, dark, or auto (default auto). "+
+			"Use light on a white-background terminal where auto-detection "+
+			"misrenders (e.g. WezTerm on Windows, git-bash). "+
 			"Overrides CRUSH_COLOR_SCHEME env var when set.",
 	)
 
@@ -92,13 +99,9 @@ Companion CLI subcommands for scripting and CI:
   - ` + "`crush system-prompt`" + `   print the system prompt that would be sent.
   - ` + "`crush ping`" + `            health-check (verify API connectivity).
 
-Top-level flags (apply to every subcommand):
-  --color-scheme light|dark|auto   Force the CLI help/error color palette.
-                                   Use "light" on white-background terminals
-                                   where fang's auto-detection renders
-                                   grey-on-white (WezTerm on Windows, git-bash).
-                                   Env var: CRUSH_COLOR_SCHEME (same values;
-                                   flag wins if both are set). Default: auto.`,
+See the FLAGS section below for every top-level flag (--color-scheme,
+--cwd, --data-dir, --debug, ...) — each is documented once, on its own
+flag registration, not duplicated here.`,
 	Example: `
 # Start the web UI on a random free port and open the browser
 crush
