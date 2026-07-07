@@ -10,8 +10,6 @@ import {
   getDefaultModelKey,
   setSessionModels,
   setSessionReasoningEffort,
-  setProviderKey,
-  removeProviderKey,
 } from "../store";
 import type { ConfigPayload, Session } from "../types";
 
@@ -104,65 +102,6 @@ export function buildModelList(config: ConfigPayload | null): ModelItem[] {
   return buildProviderGroups(config).flatMap(g => g.models);
 }
 
-// ── APIKeyForm ────────────────────────────────────────────────────────────────
-
-// APIKeyForm is the inline form shown when user clicks a disabled model or edits a provider key.
-function APIKeyForm({ providerID, providerName, onDone, onCancel }: {
-  providerID: string;
-  providerName: string;
-  onDone: () => void;
-  onCancel: () => void;
-}) {
-  const [key, setKey] = useState("");
-  const [saving, setSaving] = useState(false);
-  const inputRef = useRef<HTMLInputElement>(null);
-  useEffect(() => { inputRef.current?.focus(); }, []);
-
-  function save() {
-    const trimmed = key.trim();
-    if (!trimmed) return;
-    setSaving(true);
-    setProviderKey(providerID, trimmed);
-    // The server will broadcast an updated config — onDone will close the form
-    onDone();
-  }
-
-  function onKey(e: React.KeyboardEvent) {
-    if (e.key === "Enter") save();
-    if (e.key === "Escape") onCancel();
-  }
-
-  return (
-    <div className="p-3 border-b border-surface/40 bg-base-overlay/50" data-test-id="model-api-key-form" onClick={e => e.stopPropagation()}>
-      <div className="text-xs font-semibold text-text mb-1.5">{providerName} — Enter API key</div>
-      <div className="flex gap-2">
-        <input
-          ref={inputRef}
-          type="password"
-          value={key}
-          onChange={e => setKey(e.target.value)}
-          onKeyDown={onKey}
-          placeholder="sk-…"
-          className="flex-1 bg-canvas border border-surface rounded-lg px-2.5 py-1.5 text-sm text-text outline-none focus:border-accent transition-colors placeholder:text-text-subtle font-mono"
-        />
-        <button
-          onClick={save}
-          disabled={!key.trim() || saving}
-          className="px-3 py-1.5 bg-accent-fill text-white/90 text-xs font-medium rounded-lg disabled:opacity-40 hover:opacity-90 transition-opacity"
-        >
-          Save
-        </button>
-        <button
-          onClick={onCancel}
-          className="px-3 py-1.5 text-text-subtle text-xs rounded-lg hover:bg-base-subtle transition-colors"
-        >
-          Cancel
-        </button>
-      </div>
-    </div>
-  );
-}
-
 // ── ModelRow ──────────────────────────────────────────────────────────────────
 
 function ModelRow({ model, isSelected, onSelect }: { model: ModelItem, isSelected: boolean, onSelect: (m: ModelItem) => void }) {
@@ -192,7 +131,6 @@ export function ModelSelector({ session, modelType }: { session: Session | null;
   const [open, setOpen] = useState(false);
   const [search, setSearch] = useState("");
   // When non-null, show API key form for this provider
-  const [keyFormProvider, setKeyFormProvider] = useState<{ id: string; name: string } | null>(null);
   const ref = useRef<HTMLDivElement>(null);
   const btnRef = useRef<HTMLButtonElement>(null);
   const [dropdownPos, setDropdownPos] = useState<{ left: number; bottom: number }>({ left: 0, bottom: 0 });
@@ -295,7 +233,6 @@ export function ModelSelector({ session, modelType }: { session: Session | null;
     function handler(e: MouseEvent) {
       if (ref.current && !ref.current.contains(e.target as Node)) {
         setOpen(false);
-        setKeyFormProvider(null);
       }
     }
     document.addEventListener("mousedown", handler);
@@ -339,7 +276,7 @@ export function ModelSelector({ session, modelType }: { session: Session | null;
     <div ref={ref} className="relative">
       <button
         ref={btnRef}
-        onClick={() => { setOpen(o => !o); setSearch(""); setKeyFormProvider(null); }}
+        onClick={() => { setOpen(o => !o); setSearch(""); }}
         className="flex items-center gap-1.5 text-xs text-text bg-base-overlay border border-surface rounded-lg px-2.5 py-1.5 hover:border-accent/50 hover:bg-base-subtle transition-colors"
         title={title}
         data-test-id={modelType === "large" ? "model-selector-large" : "model-selector-small"}
@@ -385,15 +322,6 @@ export function ModelSelector({ session, modelType }: { session: Session | null;
           style={{ position: "fixed", left: dropdownPos.left, bottom: dropdownPos.bottom, width: 520, zIndex: 9999 }}
           className="bg-canvas border border-surface rounded-xl shadow-xl overflow-hidden"
         >
-          {keyFormProvider ? (
-            <APIKeyForm
-              providerID={keyFormProvider.id}
-              providerName={keyFormProvider.name}
-              onDone={() => { setKeyFormProvider(null); setOpen(false); }}
-              onCancel={() => setKeyFormProvider(null)}
-            />
-          ) : (
-            <>
             <div className="max-h-[480px] overflow-y-auto">
               {q ? (
                 searchResults.length === 0 ? (
@@ -432,24 +360,6 @@ export function ModelSelector({ session, modelType }: { session: Session | null;
                       <div key={group.id} className="py-1">
                         <div className="px-3 py-1.5 flex items-center gap-2">
                           <span className="text-[10px] font-bold text-text-muted uppercase tracking-wider">{group.name}</span>
-                          {group.type !== "cli" && (
-                            <div className="flex items-center gap-1 ml-auto">
-                              <button
-                                onClick={e => { e.stopPropagation(); setKeyFormProvider({ id: group.id, name: group.name }); }}
-                                title="Edit API key"
-                                className="text-[10px] text-text-subtle hover:text-accent transition-colors px-1"
-                              >
-                                Edit key
-                              </button>
-                              <button
-                                onClick={e => { e.stopPropagation(); removeProviderKey(group.id); }}
-                                title="Remove API key"
-                                className="text-[10px] text-text-subtle hover:text-red transition-colors px-1"
-                              >
-                                Remove key
-                              </button>
-                            </div>
-                          )}
                         </div>
                         {groupModels.map(m => (
                           <ModelRow key={m.key} model={m} isSelected={m.key === currentKey} onSelect={onSelect} />
@@ -469,8 +379,6 @@ export function ModelSelector({ session, modelType }: { session: Session | null;
                 className="w-full bg-base-overlay border border-surface rounded-lg px-2.5 py-1.5 text-sm text-text outline-none focus:border-accent transition-colors placeholder:text-text-subtle"
               />
             </div>
-            </>
-          )}
         </div>
       )}
     </div>

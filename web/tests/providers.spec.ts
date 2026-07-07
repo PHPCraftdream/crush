@@ -114,7 +114,7 @@ test("Edit provider button opens edit form", async ({ page }) => {
   await primeSession(page, makeConfigWithProvider());
   await page.getByTestId("header-providers-button").click();
   await expect(page.getByTestId("providers-modal")).toContainText("Ollama", { timeout: 3000 });
-  await page.getByTitle("Edit provider").click();
+  await page.getByTestId("provider-edit-ollama").click();
   await expect(page.getByText("Edit: ollama", { exact: false })).toBeVisible({
     timeout: 3000,
   });
@@ -124,7 +124,7 @@ test("Edit provider form has ID field disabled", async ({ page }) => {
   await primeSession(page, makeConfigWithProvider());
   await page.getByTestId("header-providers-button").click();
   await expect(page.getByTestId("providers-modal")).toContainText("Ollama", { timeout: 3000 });
-  await page.getByTitle("Edit provider").click();
+  await page.getByTestId("provider-edit-ollama").click();
   await expect(page.getByText("Edit: ollama", { exact: false })).toBeVisible({
     timeout: 3000,
   });
@@ -137,7 +137,7 @@ test("Edit provider sends update_custom_provider", async ({ page }) => {
   await primeSession(page, makeConfigWithProvider());
   await page.getByTestId("header-providers-button").click();
   await expect(page.getByTestId("providers-modal")).toContainText("Ollama", { timeout: 3000 });
-  await page.getByTitle("Edit provider").click();
+  await page.getByTestId("provider-edit-ollama").click();
   await expect(page.getByText("Edit: ollama", { exact: false })).toBeVisible({
     timeout: 3000,
   });
@@ -338,7 +338,7 @@ test("Edit provider form prefills existing peak-hours window", async ({ page }) 
     }));
   await page.getByTestId("header-providers-button").click();
   await expect(page.getByTestId("providers-modal")).toContainText("Ollama", { timeout: 3000 });
-  await page.getByTitle("Edit provider").click();
+  await page.getByTestId("provider-edit-ollama").click();
   await expect(page.getByText("Edit: ollama", { exact: false })).toBeVisible({ timeout: 3000 });
   // Toggle should be checked and inputs prefilled
   await expect(page.getByTestId("provider-form-peak-toggle")).toBeChecked();
@@ -352,7 +352,7 @@ test("Edit provider clears peak-hours when toggled off", async ({ page }) => {
     }));
   await page.getByTestId("header-providers-button").click();
   await expect(page.getByTestId("providers-modal")).toContainText("Ollama", { timeout: 3000 });
-  await page.getByTitle("Edit provider").click();
+  await page.getByTestId("provider-edit-ollama").click();
   await expect(page.getByText("Edit: ollama", { exact: false })).toBeVisible({ timeout: 3000 });
   // Toggle off
   await page.getByTestId("provider-form-peak-toggle").uncheck();
@@ -433,9 +433,9 @@ test("Built-in provider edit opens peak-hours-only editor, not full form", async
   await primeSession(page, makeConfigWithProvider());
   await page.getByTestId("header-providers-button").click();
   await expect(page.getByTestId("providers-modal")).toContainText("Anthropic", { timeout: 3000 });
-  await page.getByTitle("Edit peak hours").click();
-  await expect(page.getByTestId("peak-hours-only-editor")).toBeVisible({ timeout: 3000 });
-  await expect(page.getByTestId("peak-hours-only-editor")).toContainText("anthropic");
+  await page.getByTestId("provider-edit-anthropic").click();
+  await expect(page.getByTestId("builtin-provider-editor")).toBeVisible({ timeout: 3000 });
+  await expect(page.getByTestId("builtin-provider-editor")).toContainText("anthropic");
   // The full ProviderForm's base-URL field must NOT be present for a
   // built-in provider — only the peak-hours-only editor.
   await expect(page.getByPlaceholder("e.g. http://localhost:11434/v1/")).toHaveCount(0);
@@ -445,8 +445,8 @@ test("Built-in provider peak-hours editor sends set_provider_peak_hours", async 
   await primeSession(page, makeConfigWithProvider());
   await page.getByTestId("header-providers-button").click();
   await expect(page.getByTestId("providers-modal")).toContainText("Anthropic", { timeout: 3000 });
-  await page.getByTitle("Edit peak hours").click();
-  await expect(page.getByTestId("peak-hours-only-editor")).toBeVisible({ timeout: 3000 });
+  await page.getByTestId("provider-edit-anthropic").click();
+  await expect(page.getByTestId("builtin-provider-editor")).toBeVisible({ timeout: 3000 });
   await page.getByTestId("peak-hours-only-toggle").check();
   await page.getByTestId("peak-hours-only-start").fill("09:00");
   await page.getByTestId("peak-hours-only-end").fill("18:00");
@@ -462,8 +462,8 @@ test("Built-in provider peak-hours editor can target local scope", async ({ page
   await primeSession(page, makeConfigWithProvider());
   await page.getByTestId("header-providers-button").click();
   await expect(page.getByTestId("providers-modal")).toContainText("Anthropic", { timeout: 3000 });
-  await page.getByTitle("Edit peak hours").click();
-  await expect(page.getByTestId("peak-hours-only-editor")).toBeVisible({ timeout: 3000 });
+  await page.getByTestId("provider-edit-anthropic").click();
+  await expect(page.getByTestId("builtin-provider-editor")).toBeVisible({ timeout: 3000 });
   await page.getByTestId("peak-hours-only-scope-local").click();
   await page.getByTestId("peak-hours-only-toggle").check();
   await page.getByTestId("peak-hours-only-start").fill("22:00");
@@ -472,4 +472,44 @@ test("Built-in provider peak-hours editor can target local scope", async ({ page
   const msg = await waitForWSSend(page, "set_provider_peak_hours");
   const payload = msg.payload as Record<string, unknown>;
   expect(payload.scope).toBe("local");
+});
+
+test("Built-in provider editor sends set_provider_key when a key is entered", async ({ page }) => {
+  await primeSession(page, makeConfigWithProvider());
+  await page.getByTestId("header-providers-button").click();
+  await expect(page.getByTestId("providers-modal")).toContainText("Anthropic", { timeout: 3000 });
+  await page.getByTestId("provider-edit-anthropic").click();
+  await expect(page.getByTestId("builtin-provider-editor")).toBeVisible({ timeout: 3000 });
+  await page.getByTestId("peak-hours-only-api-key").fill("sk-test-123");
+  await page.getByTestId("peak-hours-only-save").click();
+  const msg = await waitForWSSend(page, "set_provider_key");
+  const payload = msg.payload as Record<string, unknown>;
+  expect(payload.providerID).toBe("anthropic");
+  expect(payload.apiKey).toBe("sk-test-123");
+});
+
+test("Built-in provider editor shows Remove button only when a key is already set", async ({ page }) => {
+  await primeSession(page, makeConfigWithProvider());
+  await page.getByTestId("header-providers-button").click();
+  await expect(page.getByTestId("providers-modal")).toContainText("Anthropic", { timeout: 3000 });
+  await page.getByTestId("provider-edit-anthropic").click();
+  await expect(page.getByTestId("builtin-provider-editor")).toBeVisible({ timeout: 3000 });
+  // The fixture's anthropic entry has no apiKeySet — no Remove button.
+  await expect(page.getByTestId("peak-hours-only-remove-key")).toHaveCount(0);
+});
+
+test("Built-in provider editor Remove button sends remove_provider_key", async ({ page }) => {
+  await primeSession(page, makeConfig({
+    providers: {
+      anthropic: { name: "Anthropic", enabled: true, apiKeySet: true, models: [] },
+    },
+  }));
+  await page.getByTestId("header-providers-button").click();
+  await expect(page.getByTestId("providers-modal")).toContainText("Anthropic", { timeout: 3000 });
+  await page.getByTestId("provider-edit-anthropic").click();
+  await expect(page.getByTestId("builtin-provider-editor")).toBeVisible({ timeout: 3000 });
+  await page.getByTestId("peak-hours-only-remove-key").click();
+  const msg = await waitForWSSend(page, "remove_provider_key");
+  const payload = msg.payload as Record<string, unknown>;
+  expect(payload.providerID).toBe("anthropic");
 });

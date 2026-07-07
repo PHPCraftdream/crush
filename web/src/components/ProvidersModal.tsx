@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { useStore } from "@nanostores/react";
-import { $config, addCustomProvider, removeCustomProvider, updateCustomProvider, setProviderPeakHours, type ConfigScope } from "../store";
+import { $config, addCustomProvider, removeCustomProvider, updateCustomProvider, type ConfigScope } from "../store";
 import { X, Plus, Trash2, Pencil, AlertCircle, CheckCircle2, Loader2, ChevronDown, ChevronRight } from "lucide-react";
 import type { ProviderInfo } from "../types";
 
@@ -239,9 +239,23 @@ function ProviderForm({
           <select
             value={type}
             onChange={(e) => setType(e.target.value)}
+            // Native <select>/<option> popups are rendered by the OS/browser
+            // chrome, not by our stylesheet — Tailwind's bg-canvas class
+            // alone leaves the dropdown list translucent on some platforms.
+            // Force an explicit opaque background inline so the popup
+            // itself (not just the closed control) is solid.
+            style={{ backgroundColor: "rgb(var(--color-canvas))", color: "rgb(var(--color-text))" }}
             className="w-full text-xs bg-canvas border border-surface rounded-lg px-2.5 py-1.5 outline-none focus:border-accent/50 text-text"
           >
-            {PROVIDER_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
+            {PROVIDER_TYPES.map((t) => (
+              <option
+                key={t}
+                value={t}
+                style={{ backgroundColor: "rgb(var(--color-canvas))", color: "rgb(var(--color-text))" }}
+              >
+                {t}
+              </option>
+            ))}
           </select>
         </div>
         <div>
@@ -348,60 +362,103 @@ function ProviderForm({
 // Built-in/catwalk-known providers (anthropic, openai, zai, ...) have a
 // fixed type/baseUrl/model-list the client doesn't own — ProviderForm's full
 // add/edit flow (which replaces every field) is only safe for custom
-// providers. This editor sends a targeted single-field write
-// (set_provider_peak_hours) instead, so a built-in provider's peak_hours can
-// be managed without touching anything else about it.
-function PeakHoursOnlyEditor({
+// providers. This editor sends targeted single-field writes instead
+// (set_provider_peak_hours, set_provider_key/remove_provider_key), so a
+// built-in provider's API key and peak_hours can be managed without
+// touching anything else about it (type, base URL, model list).
+function BuiltinProviderEditor({
   id,
   initial,
+  apiKeySet,
   onCancel,
 }: {
   id: string;
   initial: { start: string; end: string } | null | undefined;
+  apiKeySet?: boolean;
   onCancel: () => void;
 }) {
   const [enabled, setEnabled] = useState(!!initial?.start && !!initial?.end);
   const [start, setStart] = useState(initial?.start ?? "09:00");
   const [end, setEnd] = useState(initial?.end ?? "18:00");
   const [scope, setScope] = useState<ConfigScope>("global");
+  const [apiKey, setApiKey] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
   const canSubmit = !busy && (!enabled || (HH_MM_RE.test(start) && HH_MM_RE.test(end)));
 
-  function submit() {
+  function sendAndWait(type: string, payload: Record<string, unknown>): Promise<string | null> {
+    return new Promise((resolve) => {
+      const msgID = crypto.randomUUID();
+      import("../ws").then(({ ws }) => {
+        const unsub = ws.on("*", (msg) => {
+          if (msg.id !== msgID) return;
+          unsub();
+          resolve(msg.error ?? null);
+        });
+        ws.send(type, payload, msgID);
+      });
+    });
+  }
+
+  async function submit() {
     if (enabled && (!start || !end)) { setError("Start and end are required"); return; }
     if (enabled && (!HH_MM_RE.test(start) || !HH_MM_RE.test(end))) { setError("Must be in 24-hour HH:MM format"); return; }
     setError(null);
     setBusy(true);
-    const msgID = crypto.randomUUID();
-    import("../ws").then(({ ws }) => {
-      const unsub = ws.on("*", (msg) => {
-        if (msg.id !== msgID) return;
-        unsub();
-        setBusy(false);
-        if (msg.error) setError(msg.error);
-        else onCancel();
-      });
-      setProviderPeakHours({
-        id,
-        peakHours: enabled ? { start, end } : null,
-        scope,
-      }, msgID);
-    });
+    const errs = await Promise.all([
+      sendAndWait("set_provider_peak_hours", { id, peakHours: enabled ? { start, end } : null, scope }),
+      ...(apiKey.trim() ? [sendAndWait("set_provider_key", { providerID: id, apiKey: apiKey.trim() })] : []),
+    ]);
+    setBusy(false);
+    const err = errs.find((e) => e);
+    if (err) setError(err);
+    else onCancel();
+  }
+
+  async function removeKey() {
+    setBusy(true);
+    const err = await sendAndWait("remove_provider_key", { providerID: id });
+    setBusy(false);
+    if (err) setError(err);
   }
 
   return (
-    <div className="border-t border-surface bg-base-subtle/50 p-4 space-y-3" data-test-id="peak-hours-only-editor">
+    <div className="border-t border-surface bg-base-subtle/50 p-4 space-y-3" data-test-id="builtin-provider-editor">
       <div className="flex items-center justify-between">
-        <h3 className="text-sm font-semibold text-text">Peak hours: {id}</h3>
+        <h3 className="text-sm font-semibold text-text">Edit: {id}</h3>
         <button onClick={onCancel} className="text-text-subtle hover:text-text transition-colors">
           <X size={15} />
         </button>
       </div>
 
       <div>
-        <label className="block text-[11px] text-text-subtle mb-1">Scope</label>
+        <label className="block text-[11px] text-text-subtle mb-1">API key</label>
+        <div className="flex gap-2">
+          <input
+            type="password"
+            value={apiKey}
+            onChange={(e) => setApiKey(e.target.value)}
+            placeholder={apiKeySet ? "•••••••• (leave blank to keep)" : "sk-…"}
+            className="flex-1 text-xs font-mono bg-canvas border border-surface rounded-lg px-2.5 py-1.5 outline-none focus:border-accent/50 text-text"
+            data-test-id="peak-hours-only-api-key"
+          />
+          {apiKeySet && (
+            <button
+              onClick={removeKey}
+              disabled={busy}
+              title="Remove API key"
+              className="px-2.5 py-1.5 text-xs text-text-subtle hover:text-red transition-colors rounded-lg border border-surface disabled:opacity-40"
+              data-test-id="peak-hours-only-remove-key"
+            >
+              Remove
+            </button>
+          )}
+        </div>
+      </div>
+
+      <div>
+        <label className="block text-[11px] text-text-subtle mb-1">Peak-hours scope</label>
         <div className="flex gap-1 p-0.5 bg-canvas border border-surface rounded-lg w-fit" data-test-id="peak-hours-only-scope">
           {(["global", "local"] as const).map((s) => (
             <button
@@ -512,7 +569,7 @@ function ProviderRow({
   if (editing && !isCustom) {
     return (
       <div className="border-b border-surface last:border-0">
-        <PeakHoursOnlyEditor id={id} initial={info.peakHours} onCancel={() => setEditing(false)} />
+        <BuiltinProviderEditor id={id} initial={info.peakHours} apiKeySet={info.apiKeySet} onCancel={() => setEditing(false)} />
       </div>
     );
   }
@@ -605,7 +662,8 @@ function ProviderRow({
         <div className="flex items-center gap-1 shrink-0">
           <button
             onClick={() => setEditing(true)}
-            title={isCustom ? "Edit provider" : "Edit peak hours"}
+            title="Edit provider"
+            data-test-id={`provider-edit-${id}`}
             className="p-1 text-text-subtle hover:text-accent transition-colors rounded"
           >
             <Pencil size={14} />
