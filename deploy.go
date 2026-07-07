@@ -43,12 +43,30 @@ import (
 	"github.com/charmbracelet/crush/internal/deploy"
 )
 
-func step(msg string, args ...any) { fmt.Printf("→ "+msg+"\n", args...) }
-func ok(msg string, args ...any)   { fmt.Printf("✓ "+msg+"\n", args...) }
-func warn(msg string, args ...any) { fmt.Printf("! "+msg+"\n", args...) }
+// ts returns the current local time as an "HH:MM:SS" prefix so every line
+// this script prints carries a timestamp — useful for spotting exactly
+// where a deploy hung (e.g. a slow taskkill or a stuck build).
+func ts() string { return time.Now().Format("15:04:05") }
+
+func step(msg string, args ...any) { fmt.Printf("[%s] → "+msg+"\n", append([]any{ts()}, args...)...) }
+func ok(msg string, args ...any)   { fmt.Printf("[%s] ✓ "+msg+"\n", append([]any{ts()}, args...)...) }
+func warn(msg string, args ...any) { fmt.Printf("[%s] ! "+msg+"\n", append([]any{ts()}, args...)...) }
 func fatal(msg string, args ...any) {
-	fmt.Fprintf(os.Stderr, "✗ "+msg+"\n", args...)
+	fmt.Fprintf(os.Stderr, "[%s] ✗ "+msg+"\n", append([]any{ts()}, args...)...)
 	os.Exit(1)
+}
+
+// printRawTimestamped prints raw (possibly multi-line) external-command
+// output with a timestamp prefix on every line, so a hang or a slow
+// external process is still visible in the timeline. No-op on empty input.
+func printRawTimestamped(out string) {
+	out = strings.TrimRight(out, "\n")
+	if out == "" {
+		return
+	}
+	for _, line := range strings.Split(out, "\n") {
+		fmt.Printf("[%s]     %s\n", ts(), line)
+	}
 }
 
 func mustRun(dir, name string, args ...string) {
@@ -114,7 +132,7 @@ func main() {
 	}
 	step("Will replace %d path(s):", len(dsts))
 	for _, dst := range dsts {
-		fmt.Printf("    %s\n", dst)
+		fmt.Printf("[%s]     %s\n", ts(), dst)
 	}
 
 	// 3. Kill any running crush so the file is no longer locked (Windows)
@@ -301,11 +319,8 @@ func killAllCrush() {
 	if runtime.GOOS == "windows" {
 		// /F = force, /IM = image name. /T would also kill children;
 		// we don't need that — we're after the parent process.
-		if out, ok := runQuiet("taskkill", "/F", "/IM", "crush.exe"); ok {
-			fmt.Print(out)
-		} else {
-			fmt.Print(out) // taskkill prints "ERROR: not found" — that's fine
-		}
+		out, _ := runQuiet("taskkill", "/F", "/IM", "crush.exe")
+		printRawTimestamped(out) // taskkill prints "ERROR: not found" when idle — that's fine
 		// Best-effort second pass in case a copy of the dev binary is
 		// running under a different filename (e.g. /tmp/crush.exe used
 		// in smoke tests).
