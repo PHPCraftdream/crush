@@ -113,6 +113,15 @@ func SourceFromPath(path string) string {
 	}
 }
 
+// ErrPerModelCommand is returned by ParseCommand when the command file pins
+// a specific model to run under (a `model:` frontmatter field — the pattern
+// `cah install` uses for its per-model shortcuts like /oxx, /sh, /fl, ...).
+// Those are meant to be typed directly by the operator to switch the
+// current turn's model, not surfaced in crush's own command/skill list —
+// crush has its own model-selection UI and doesn't route slash-commands to
+// specific models.
+var ErrPerModelCommand = errors.New("per-model command, not a general-purpose command")
+
 func ParseCommand(path, source string) (*Skill, error) {
 	content, err := os.ReadFile(path)
 	if err != nil {
@@ -130,8 +139,12 @@ func ParseCommand(path, source string) (*Skill, error) {
 			var meta struct {
 				Name        string `yaml:"name"`
 				Description string `yaml:"description"`
+				Model       string `yaml:"model"`
 			}
 			if yaml.Unmarshal([]byte(fm), &meta) == nil {
+				if meta.Model != "" {
+					return nil, ErrPerModelCommand
+				}
 				if meta.Name != "" {
 					name = meta.Name
 				}
@@ -194,6 +207,9 @@ func DiscoverCommands(dirs []CommandDir) []*Skill {
 			seen[path] = true
 
 			skill, err := ParseCommand(path, dir.Source)
+			if errors.Is(err, ErrPerModelCommand) {
+				continue
+			}
 			if err != nil {
 				slog.Warn("Failed to parse command file", "path", path, "error", err)
 				continue

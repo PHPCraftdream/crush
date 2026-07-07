@@ -518,3 +518,31 @@ func TestFilter(t *testing.T) {
 		})
 	}
 }
+
+func TestParseCommand_PerModelCommandSkipped(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "oxx.md")
+	content := "---\ndescription: claude-opus-4-8 effort=max\nmodel: claude-opus-4-8\neffort: max\n---\n\nswitch model\n"
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+	_, err := ParseCommand(path, "claude")
+	require.ErrorIs(t, err, ErrPerModelCommand)
+}
+
+func TestDiscoverCommands_SkipsPerModelCommands(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "oxx.md"),
+		[]byte("---\ndescription: claude-opus-4-8 effort=max\nmodel: claude-opus-4-8\neffort: max\n---\n\nswitch model\n"),
+		0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "commit.md"),
+		[]byte("---\ndescription: Create well-formatted commits\n---\n\n# Commit\n"),
+		0o644))
+
+	result := DiscoverCommands([]CommandDir{{Path: dir, Source: "claude"}})
+	require.Len(t, result, 1)
+	require.Equal(t, "commit", result[0].Name)
+}
