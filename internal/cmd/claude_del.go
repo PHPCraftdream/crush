@@ -18,37 +18,36 @@ any crush-claude-init block from CLAUDE.md.
 Only files that carry our sentinel are removed — foreign files with the
 same name are left alone with a warning.
 
-Use --global to remove from ~/.claude/commands/ instead of the local
-.claude/commands/. --global and --cwd are mutually exclusive.
+Default is --global (~/.claude/commands/). Use --local (or --cwd, which
+implies it) to target the current project's .claude/commands/ instead.
+--global and --local/--cwd are mutually exclusive.
 
 Idempotent: running this twice is a no-op the second time.
 
 For per-model commands, agents and skills, use ` + "`cah uninstall`" + ` from the
 cc-arch-hands repo.`,
 	Example: `
-# Remove from the current workspace
+# Remove globally (from ~/.claude/commands/) — the default
 crush claude-del
 
-# Remove globally (from ~/.claude/commands/)
-crush claude-del --global
+# Remove from the current project instead
+crush claude-del --local
 
-# Scope to another project
+# Scope to another project (implies --local)
 crush claude-del --cwd /path/to/project
 `,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		global, _ := cmd.Flags().GetBool("global")
+		local, _ := cmd.Flags().GetBool("local")
+		hasCwd := cmd.Flags().Changed("cwd")
+		localMode := local || hasCwd
+
+		if global && localMode {
+			return fmt.Errorf("--global and --local/--cwd are mutually exclusive")
+		}
 
 		var cmdDir string
-		if global {
-			if cmd.Flags().Changed("cwd") {
-				return fmt.Errorf("--global and --cwd are mutually exclusive")
-			}
-			var err error
-			cmdDir, err = resolveCommandsDir("", true)
-			if err != nil {
-				return err
-			}
-		} else {
+		if localMode {
 			cwd, err := ResolveCwd(cmd)
 			if err != nil {
 				return err
@@ -59,6 +58,13 @@ crush claude-del --cwd /path/to/project
 				return err
 			}
 			cmdDir = filepath.Join(cwd, claudeCommandsDir)
+		} else {
+			// Default (no flags), or explicit --global: global mode.
+			var err error
+			cmdDir, err = resolveCommandsDir("", true)
+			if err != nil {
+				return err
+			}
 		}
 
 		return removeSlashCommandFromDir(cmdDir)
@@ -135,6 +141,7 @@ func stripClaudeMdBlocks(path string) (int, error) {
 }
 
 func init() {
-	claudeDelCmd.Flags().Bool("global", false, "Remove from ~/.claude/commands/ instead of the local .claude/commands/")
+	claudeDelCmd.Flags().Bool("global", false, "Remove from ~/.claude/commands/. Default when neither --global nor --local is given.")
+	claudeDelCmd.Flags().Bool("local", false, "Remove from the current project's .claude/commands/ instead of ~/.claude/commands/.")
 	rootCmd.AddCommand(claudeDelCmd)
 }

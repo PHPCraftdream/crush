@@ -61,20 +61,21 @@ func resolveCommandsDir(cwd string, global bool) (string, error) {
 var claudeInitCmd = &cobra.Command{
 	Use:   "claude-init",
 	Short: "Install the /crush slash-command and strip legacy CLAUDE.md block",
-	Long: `Set up the current workspace (project-local) so an operator can delegate
-tasks to crush from Claude Code via ` + "`/crush <task>`" + `.
+	Long: `Set up crush's ` + "`/crush`" + ` slash-command in Claude Code.
 
-The slash-command file is written to ` + "`.claude/commands/crush.md`" + ` inside the
-project directory (or --cwd). This is the LOCAL scope — Claude Code also
-supports a global scope at ` + "`~/.claude/commands/`" + ` (use --global).
+The slash-command file is written to ` + "`~/.claude/commands/crush.md`" + ` by
+default (the GLOBAL scope, available in every project). Use --local (or
+--cwd, which implies it) to scope it to the current project's
+` + "`.claude/commands/crush.md`" + ` instead.
 
 Concretely:
 
   1. Write ` + "`.claude/commands/crush.md`" + ` — the ` + "`/crush`" + ` delegation command.
      Skipped (with a warning) if the file exists without our sentinel.
 
-  2. Strip any pre-existing crush-claude-init block from ` + "`CLAUDE.md`" + `
-     (any version v1..vN). If the file becomes empty it is removed.
+  2. In local mode only: strip any pre-existing crush-claude-init block
+     from ` + "`CLAUDE.md`" + ` (any version v1..vN). If the file becomes empty
+     it is removed.
 
 ` + "`claude-init`" + ` no longer writes anything into ` + "`CLAUDE.md`" + `. Delegation is
 explicit-only — invoke ` + "`/crush <task>`" + ` when you want it.
@@ -82,29 +83,27 @@ explicit-only — invoke ` + "`/crush <task>`" + ` when you want it.
 For per-model commands, agents and skills, use ` + "`cah install`" + ` from the
 cc-arch-hands repo.`,
 	Example: `
-# Install / refresh the /crush slash-command in the current workspace (local)
+# Install / refresh the /crush slash-command globally — the default
 crush claude-init
 
-# Install globally for every project (~/.claude/commands/)
-crush claude-init --global
+# Install into the current project instead
+crush claude-init --local
 
-# Scope to another project
+# Scope to another project (implies --local)
 crush claude-init --cwd /path/to/project
 `,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		global, _ := cmd.Flags().GetBool("global")
+		local, _ := cmd.Flags().GetBool("local")
+		hasCwd := cmd.Flags().Changed("cwd")
+		localMode := local || hasCwd
+
+		if global && localMode {
+			return fmt.Errorf("--global and --local/--cwd are mutually exclusive")
+		}
 
 		var cmdDir string
-		if global {
-			if cmd.Flags().Changed("cwd") {
-				return fmt.Errorf("--global and --cwd are mutually exclusive")
-			}
-			var err error
-			cmdDir, err = resolveCommandsDir("", true)
-			if err != nil {
-				return err
-			}
-		} else {
+		if localMode {
 			cwd, err := ResolveCwd(cmd)
 			if err != nil {
 				return err
@@ -114,6 +113,13 @@ crush claude-init --cwd /path/to/project
 				return err
 			}
 			cmdDir = filepath.Join(cwd, claudeCommandsDir)
+		} else {
+			// Default (no flags), or explicit --global: global mode.
+			var err error
+			cmdDir, err = resolveCommandsDir("", true)
+			if err != nil {
+				return err
+			}
 		}
 
 		// Install / refresh the /crush slash-command.
@@ -191,6 +197,7 @@ func claudeSlashCommandContent() string {
 }
 
 func init() {
-	claudeInitCmd.Flags().Bool("global", false, "Install into ~/.claude/commands/ (available in every project)")
+	claudeInitCmd.Flags().Bool("global", false, "Install into ~/.claude/commands/ (available in every project). Default when neither --global nor --local is given.")
+	claudeInitCmd.Flags().Bool("local", false, "Install into the current project's .claude/commands/ instead of ~/.claude/commands/.")
 	rootCmd.AddCommand(claudeInitCmd)
 }

@@ -49,6 +49,22 @@ instead:
 The local-agent fallback is the **last resort**, not a shortcut around
 transient failures.
 
+## Never self-add `--allow-peak-hours`
+
+A provider can refuse to run during a local-time window (`crush
+providers set <id> --peak-hours HH:MM-HH:MM`, overnight wrap allowed,
+`--peak-hours off` clears it). `crush run --allow-peak-hours` bypasses
+that refusal for one invocation only — no persistent config-level
+equivalent exists.
+
+**Never add `--allow-peak-hours` on your own initiative.** Only pass it
+when a human operator has explicitly asked, in this specific request,
+to override peak hours for that task. If a run refuses this way and
+the user hasn't authorized a bypass, report the refusal and the
+retry-after time and wait for their decision — do not route around it
+by adding the flag, switching provider, or re-running until the window
+closes, unsolicited.
+
 ## Launching
 
 - `--role smart` for non-trivial, `--role fast` for one-liners.
@@ -63,25 +79,58 @@ transient failures.
   to `.crush/stdin/<task>.{out,err}`, react on the completion
   notification. Don't sleep-poll for output — do run the liveness
   watchdog below.
+- **Never background the process yourself with a trailing `&`.** The
+  Bash call must be the bare `crush run ...` command, passed with
+  `run_in_background: true` on the tool call — nothing else. `&` (plus
+  anything after it, e.g. `echo`) makes Bash track the *wrapper shell*,
+  which exits instantly on detach — so "completed" fires before
+  `crush run` finishes. That false-done signal is what causes a second
+  `crush run` into the same still-locked `--session` (`already in use`
+  / lock races / crashed sessions). One command per Bash call, no `&`:
+
+  ```
+  # Correct
+  Bash({ command: "crush run --role smart --session foo --timeout 60m --json < .crush/stdin/foo.prompt > .crush/stdin/foo.out 2> .crush/stdin/foo.err", run_in_background: true })
+
+  # Wrong — false-completes instantly, invites session-id reuse before the real process exits
+  Bash({ command: "crush run ... > out 2> err &\necho launched pid $!", run_in_background: true })
+  ```
+
 - Multi-line prompts → `Write` to `.crush/stdin/<task>.prompt`, feed
   via `< file`. Avoid positional `"…"` past one line.
 - Permissions inside `crush run` are auto-approved — run only in
   workspaces you can afford to lose.
+- **Default to one `crush run` in flight at a time per worktree.**
+  Sequential is the safe default — launch, wait for the real
+  completion notification, verify, then launch the next. Only run more
+  than one concurrently when the task genuinely decomposes into
+  independent file-sets AND the user asked for parallelism (or the
+  task explicitly calls for a fan-out).
 - **Parallel runs** MUST name the file-set each prompt may touch
   ("only edit `internal/foo/`") — two runs writing the same file race
   and corrupt silently.
-- **Parallel runs MUST forbid git writes.** With more than one `crush
-  run` in flight against the same worktree, every prompt MUST forbid
-  git write commands — no `commit`, `add`, `stash`, `reset`,
-  `checkout`/`restore`, `rebase`, `merge` — since concurrent
-  index/tree writes clobber each other (`index.lock` races, one run's
-  `checkout` reverting another's edits). Read-only git
-  (`status`/`diff`/`log`) is fine. The orchestrator stages and commits
-  **sequentially, itself**, after the runs finish and each diff is
-  verified. (A solo run may still be told not to commit per the usual
-  scope rules; this clause is about the multi-run race specifically.)
-  When edits genuinely overlap and can't be serialized, give each run
-  its own `git worktree`.
+- **Parallel runs MUST warn each agent about the others** — name the
+  sibling runs and their scopes in every prompt, e.g. "You are one of
+  N agents working concurrently on this repo. Others: `run-b` (scope:
+  `internal/server/`), `run-c` (scope: `web/src/`). Stay strictly
+  inside your own scope; don't touch files outside it even if
+  something looks related." An agent unaware it's sharing the tree
+  will "helpfully" touch a file it saw referenced elsewhere.
+- **Parallel runs MUST forbid git writes** — no `commit`, `add`,
+  `stash`, `reset`, `checkout`/`restore`, `rebase`, `merge` in any
+  prompt; concurrent index/tree writes clobber each other
+  (`index.lock` races, one run's `checkout` reverting another's
+  edits). Read-only git (`status`/`diff`/`log`) is fine. The
+  orchestrator stages and commits **sequentially, itself**, after all
+  runs finish and each diff is verified. When edits genuinely overlap,
+  give each run its own `git worktree`.
+- **Parallel runs MUST run tests isolated to their own scope, or not
+  at all** — each prompt runs tests only for its assigned package(s)
+  (e.g. `go test ./internal/foo/...`, never `./...`); concurrent test
+  runs across a module can race on shared build cache/fixtures. If a
+  run can't scope its tests narrowly, it skips them and says so in its
+  summary — the orchestrator runs the shared suite once, after all
+  runs land and are merged.
 
 ## Monitoring
 
@@ -104,7 +153,9 @@ Live-tail shows tool calls with their key arguments inline:
 
 Read-only secondaries: `sessions list` (STATUS column), `sessions
 locks` (heartbeat: `alive`/`ping`/`stopping`/`offline`), `sessions show
-<id> --with-messages`, `sessions last <id> [--n N]`.
+<id> --with-messages`, `sessions last <id> [--n N]`, and `sessions why
+<id>` (plain-language explanation of why a session has the status it
+has — reach for this before manually cross-referencing `list`/`locks`).
 
 `Ctrl+C` in `watch` prints `(interrupted — session still running)`
 without a summary — deliberate, so "I stopped watching" never reads as
@@ -122,8 +173,9 @@ This is a liveness probe, not output polling — the completion
 notification still delivers the result. But if the heartbeat reads
 `offline`/`stopping` with no completion notification, the holder died
 silently: stop waiting, inspect `.crush/stdin/<task>.{out,err}` +
-`crush sessions last <id>`, and re-launch into the same `--session`
-rather than burning the rest of the 60m on a dead process.
+`crush sessions last <id>` (or `crush sessions why <id>`), and
+re-launch into the same `--session` rather than burning the rest of
+the 60m on a dead process.
 
 **Tear the watchdog down when it has nothing left to watch.** The
 10-minute cycle exists only to babysit live runs. Once a session
@@ -227,21 +279,6 @@ actually done, what *you* ran, and any compromises or re-delegations.
   `tool_call`; fall back to `git status` + `crush sessions last <id>`.
 - `crush sessions watch <id>` — confirm the process really exited.
   Lock-alive heartbeat is the truth.
-
-## Peak-hours refusal window
-
-A provider can refuse to run during a local-time window set via
-`crush providers set <id> --peak-hours HH:MM-HH:MM` (overnight wrap
-allowed, e.g. `22:00-06:00`; `--peak-hours off` clears it). `crush run`
-then aborts if the active provider is inside its window.
-
-`crush run --allow-peak-hours` bypasses the refusal for one invocation
-only — there is no persistent config-level equivalent.
-
-**Never add `--allow-peak-hours` on your own initiative.** Only pass it
-when a human operator has explicitly asked, in this specific request,
-to override peak hours for that task. Adding it unsolicited violates
-the operator's intent.
 
 ## Task
 

@@ -154,7 +154,13 @@ func extractBaseTag(v string) string {
 	if loc == nil {
 		return ""
 	}
-	return v[:loc[0]]
+	base := v[:loc[0]]
+	// "v0.0.0"/"0.0.0" is the placeholder base Go uses when there is no real
+	// prior tag; it carries no meaningful information, so treat it as absent.
+	if base == "v0.0.0" || base == "0.0.0" {
+		return ""
+	}
+	return base
 }
 
 // usableModuleVersion reports whether a BuildInfo main-module version is
