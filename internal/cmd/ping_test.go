@@ -203,10 +203,10 @@ func TestFormatPeakHoursStatus(t *testing.T) {
 	late := time.Date(2026, 6, 2, 23, 30, 0, 0, time.UTC)
 
 	cases := []struct {
-		name    string
-		window  *config.PeakHoursWindow
-		now     time.Time
-		want    string
+		name   string
+		window *config.PeakHoursWindow
+		now    time.Time
+		want   string
 	}{
 		{
 			name:   "nil window returns empty (feature off)",

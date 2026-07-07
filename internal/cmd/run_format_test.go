@@ -192,12 +192,12 @@ func TestResolveDefaultHardTimeout_ValidOverrideHonored(t *testing.T) {
 		in   string
 		want time.Duration
 	}{
-		{"900", 900 * time.Second},        // plain number = seconds
-		{"30m", 30 * time.Minute},         // Go duration
-		{"2h", 2 * time.Hour},             // longer override
-		{"90s", 90 * time.Second},         // shorter override
-		{"3600", 1 * time.Hour},           // plain seconds for 1h
-		{"10000", 10000 * time.Second},    // arbitrary plain number
+		{"900", 900 * time.Second},     // plain number = seconds
+		{"30m", 30 * time.Minute},      // Go duration
+		{"2h", 2 * time.Hour},          // longer override
+		{"90s", 90 * time.Second},      // shorter override
+		{"3600", 1 * time.Hour},        // plain seconds for 1h
+		{"10000", 10000 * time.Second}, // arbitrary plain number
 	}
 	for _, c := range cases {
 		got := resolveDefaultHardTimeout(c.in)

@@ -1307,9 +1307,9 @@ func TestStreamWaitBoundedOnGrandchildHoldsStderr(t *testing.T) {
 			// best-effort kill of the orphan; ignore errors (already gone is fine)
 			kill, _ := exec.LookPath("taskkill")
 			if kill != "" {
-				_ = exec.Command(kill, "/F", "/T", "/PID", fmt.Sprintf("%d", pid)).Run()
+				_ = exec.CommandContext(context.Background(), kill, "/F", "/T", "/PID", fmt.Sprintf("%d", pid)).Run()
 			} else {
-				_ = exec.Command(shell, flag, fmt.Sprintf("kill %d 2>/dev/null || true", pid)).Run()
+				_ = exec.CommandContext(context.Background(), shell, flag, fmt.Sprintf("kill %d 2>/dev/null || true", pid)).Run()
 			}
 		}
 	}
@@ -1444,7 +1444,7 @@ func TestStreamKillUsesTreeKillStillTerminatesChild(t *testing.T) {
 	if alive.Load() {
 		t.Errorf("child pid %d still alive after kill() — tree-kill regressed", pid)
 		// best-effort cleanup
-		_ = exec.Command(shell, flag, fmt.Sprintf("kill -9 %d 2>/dev/null || true", pid)).Run()
+		_ = exec.CommandContext(context.Background(), shell, flag, fmt.Sprintf("kill -9 %d 2>/dev/null || true", pid)).Run()
 	}
 }
 
@@ -1456,14 +1456,14 @@ func processAlive(pid int) bool {
 	}
 	if runtime.GOOS == "windows" {
 		// taskkill /? exit code logic: we probe via tasklist.
-		out, err := exec.Command("tasklist", "/FI", fmt.Sprintf("PID eq %d", pid), "/NH").Output()
+		out, err := exec.CommandContext(context.Background(), "tasklist", "/FI", fmt.Sprintf("PID eq %d", pid), "/NH").Output()
 		if err != nil {
 			return false
 		}
 		return strings.Contains(string(out), fmt.Sprintf("%d", pid))
 	}
 	// POSIX: signal 0 probes existence.
-	_ = exec.Command("kill", "-0", fmt.Sprintf("%d", pid)).Run()
+	_ = exec.CommandContext(context.Background(), "kill", "-0", fmt.Sprintf("%d", pid)).Run()
 	// kill -0 returns 0 if alive, non-zero otherwise; Run returns nil on 0 exit.
-	return exec.Command("kill", "-0", fmt.Sprintf("%d", pid)).Run() == nil
+	return exec.CommandContext(context.Background(), "kill", "-0", fmt.Sprintf("%d", pid)).Run() == nil
 }

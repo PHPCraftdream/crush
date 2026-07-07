@@ -319,7 +319,7 @@ func TestLoopDetection_OnStepFinishOrdering(t *testing.T) {
 
 	// Simulate OnStepFinish's per-step append+recompute (the fixed logic).
 	var stepHistory []fantasy.StepResult
-	var firedOnStep int = -1 // which step index first trips the detector
+	firedOnStep := -1 // which step index first trips the detector
 	var firedDetail loopDetail
 	for i, step := range sequence {
 		// Mirror agent.go OnStepFinish: append THIS step, THEN recompute.
