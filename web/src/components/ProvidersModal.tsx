@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { useStore } from "@nanostores/react";
-import { $config, addCustomProvider, removeCustomProvider, updateCustomProvider } from "../store";
+import { $config, addCustomProvider, removeCustomProvider, updateCustomProvider, type ConfigScope } from "../store";
 import { X, Plus, Trash2, Pencil, AlertCircle, CheckCircle2, Loader2, ChevronDown, ChevronRight } from "lucide-react";
 import type { ProviderInfo } from "../types";
 
@@ -102,7 +102,7 @@ function ProviderForm({
   submitLabel: string;
   onSubmit: (data: {
     id: string; name: string; type: string; baseUrl: string; apiKey: string; models: ModelDraft[];
-    peakHours: { start: string; end: string } | null;
+    peakHours: { start: string; end: string } | null; scope: ConfigScope;
   }, msgID: string) => void;
   onCancel: () => void;
 }) {
@@ -115,6 +115,13 @@ function ProviderForm({
   const [peakEnabled, setPeakEnabled] = useState(!!initial?.peakHours?.start && !!initial?.peakHours?.end);
   const [peakStart, setPeakStart] = useState(initial?.peakHours?.start ?? "09:00");
   const [peakEnd, setPeakEnd] = useState(initial?.peakHours?.end ?? "18:00");
+  // Default global — matches every scope-aware CLI command's default
+  // (crush providers, crush mcp, crush claude-init, ...). There is no
+  // read-back of an existing provider's current scope (would require a
+  // separate per-scope config read the server doesn't expose yet), so
+  // editing always starts from "global"; pick "local" explicitly if the
+  // provider actually lives in the workspace config.
+  const [scope, setScope] = useState<ConfigScope>("global");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -154,7 +161,7 @@ function ProviderForm({
         if (msg.error) setError(msg.error);
         else onCancel();
       });
-      onSubmit({ id: id.trim(), name: name.trim(), type, baseUrl: baseUrl.trim(), apiKey, models, peakHours }, msgID);
+      onSubmit({ id: id.trim(), name: name.trim(), type, baseUrl: baseUrl.trim(), apiKey, models, peakHours, scope }, msgID);
     });
   }
 
@@ -189,6 +196,28 @@ function ProviderForm({
             className="w-full text-xs bg-canvas border border-surface rounded-lg px-2.5 py-1.5 outline-none focus:border-accent/50 text-text placeholder:text-text-muted/50"
           />
         </div>
+      </div>
+
+      <div>
+        <label className="block text-[11px] text-text-subtle mb-1">Scope</label>
+        <div className="flex gap-1 p-0.5 bg-canvas border border-surface rounded-lg w-fit" data-test-id="provider-form-scope">
+          {(["global", "local"] as const).map((s) => (
+            <button
+              key={s}
+              type="button"
+              onClick={() => setScope(s)}
+              data-test-id={`provider-form-scope-${s}`}
+              className={`px-3 py-1 text-xs rounded-md transition-colors capitalize ${
+                scope === s ? "bg-accent-fill text-white/90" : "text-text-subtle hover:text-text"
+              }`}
+            >
+              {s}
+            </button>
+          ))}
+        </div>
+        <p className="text-[10px] text-text-muted mt-1">
+          {scope === "global" ? "Available in every project (~/.local/share/crush)." : "This project only (./.crush)."}
+        </p>
       </div>
 
       <div>
@@ -306,7 +335,7 @@ function ProviderRow({
 }: {
   id: string;
   info: ProviderInfo;
-  onRemove: () => void;
+  onRemove: (scope: ConfigScope) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [confirmRemove, setConfirmRemove] = useState(false);
@@ -350,6 +379,7 @@ function ProviderRow({
               })),
               // Send null explicitly when cleared so the server clears it.
               peakHours: data.peakHours,
+              scope: data.scope,
             }, msgID);
           }}
           onCancel={() => setEditing(false)}
@@ -408,11 +438,19 @@ function ProviderRow({
           </button>
           {confirmRemove ? (
             <div className="flex items-center gap-1 ml-1">
-              <span className="text-xs text-text-subtle">Remove?</span>
+              <span className="text-xs text-text-subtle">Remove from:</span>
               <button
-                onClick={() => { onRemove(); setConfirmRemove(false); }}
+                onClick={() => { onRemove("global"); setConfirmRemove(false); }}
+                title="Remove the global (~/.local/share/crush) override"
                 className="px-2 py-0.5 text-xs font-medium bg-red-fill text-white/90 rounded hover:opacity-90"
-              >Yes</button>
+                data-test-id="provider-remove-global"
+              >Global</button>
+              <button
+                onClick={() => { onRemove("local"); setConfirmRemove(false); }}
+                title="Remove the local (./.crush) override"
+                className="px-2 py-0.5 text-xs font-medium bg-red-fill/70 text-white/90 rounded hover:opacity-90"
+                data-test-id="provider-remove-local"
+              >Local</button>
               <button
                 onClick={() => setConfirmRemove(false)}
                 className="px-2 py-0.5 text-xs text-text-subtle hover:text-text rounded"
@@ -507,7 +545,7 @@ export function ProvidersModal({ onClose }: { onClose: () => void }) {
                   key={id}
                   id={id}
                   info={info}
-                  onRemove={() => removeCustomProvider(id)}
+                  onRemove={(scope) => removeCustomProvider(id, scope)}
                 />
               ))
           )}
@@ -532,6 +570,7 @@ export function ProvidersModal({ onClose }: { onClose: () => void }) {
                   costPer1mOut: m.costPer1mOut ? parseFloat(m.costPer1mOut) : undefined,
                 })),
                 peakHours: data.peakHours,
+                scope: data.scope,
               }, msgID);
             }}
             onCancel={() => setShowAdd(false)}

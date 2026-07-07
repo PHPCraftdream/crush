@@ -1766,6 +1766,17 @@ func peakHoursToWire(w *config.PeakHoursWindow) *PeakHoursWirePayload {
 	return &PeakHoursWirePayload{Start: w.Start, End: w.End}
 }
 
+// scopeFromWire resolves a provider-config wire scope string ("global" /
+// "local", case-insensitive) into a config.Scope. Empty or unrecognised
+// values default to config.ScopeGlobal, matching every scope-aware CLI
+// command's default (crush providers, crush mcp, crush claude-init, ...).
+func scopeFromWire(s string) config.Scope {
+	if strings.EqualFold(s, "local") {
+		return config.ScopeWorkspace
+	}
+	return config.ScopeGlobal
+}
+
 func handleAddCustomProvider(a *appPkg.App, c *Client, msg WSMessage) {
 	var p AddCustomProviderPayload
 	if err := json.Unmarshal(msg.Payload, &p); err != nil {
@@ -1811,7 +1822,7 @@ func handleAddCustomProvider(a *appPkg.App, c *Client, msg WSMessage) {
 		PeakHours: peakHours,
 	}
 	cfg.Providers.Set(p.ID, providerCfg)
-	if err := store.SetConfigField(config.ScopeGlobal, fmt.Sprintf("providers.%s", p.ID), providerCfg); err != nil {
+	if err := store.SetConfigField(scopeFromWire(p.Scope), fmt.Sprintf("providers.%s", p.ID), providerCfg); err != nil {
 		slog.Warn("ws: failed to persist custom provider", "id", p.ID, "err", err)
 	}
 	if wire, ok := buildConfigWire(a); ok {
@@ -1840,8 +1851,10 @@ func handleRemoveCustomProvider(a *appPkg.App, c *Client, msg WSMessage) {
 	// RemoveConfigField returns an error when there is no override to
 	// delete, which is expected for a default-provider id that only
 	// exists in the built-in catalog — benign in that case. A real
-	// failure (e.g. disk / parse error) surfaces the same way.
-	if err := store.RemoveConfigField(config.ScopeGlobal, fmt.Sprintf("providers.%s", p.ID)); err != nil {
+	// failure (e.g. disk / parse error) surfaces the same way. Scope must
+	// match the scope the provider was added under (p.Scope), or this is
+	// a silent no-op against the wrong config file.
+	if err := store.RemoveConfigField(scopeFromWire(p.Scope), fmt.Sprintf("providers.%s", p.ID)); err != nil {
 		slog.Warn("ws: failed to remove custom provider override (benign for default/catalog providers with no override set)", "id", p.ID, "err", err)
 	}
 	if wire, ok := buildConfigWire(a); ok {
@@ -1871,10 +1884,13 @@ func handleUpdateCustomProvider(a *appPkg.App, c *Client, msg WSMessage) {
 		c.reply(msg.ID, EventError, nil, "config not available")
 		return
 	}
-	// Remove the old entry.
+	// Remove the old entry. Uses the SAME scope as the update target: a
+	// rename is expected to stay within the scope the operator picked in
+	// the edit form, not silently move between global/local.
+	scope := scopeFromWire(p.Scope)
 	cfg.Providers.Del(p.OldID)
 	if p.OldID != p.ID {
-		if err := store.RemoveConfigField(config.ScopeGlobal, fmt.Sprintf("providers.%s", p.OldID)); err != nil {
+		if err := store.RemoveConfigField(scope, fmt.Sprintf("providers.%s", p.OldID)); err != nil {
 			slog.Warn("ws: failed to remove old custom provider", "id", p.OldID, "err", err)
 		}
 	}
@@ -1899,7 +1915,7 @@ func handleUpdateCustomProvider(a *appPkg.App, c *Client, msg WSMessage) {
 		PeakHours: peakHours,
 	}
 	cfg.Providers.Set(p.ID, providerCfg)
-	if err := store.SetConfigField(config.ScopeGlobal, fmt.Sprintf("providers.%s", p.ID), providerCfg); err != nil {
+	if err := store.SetConfigField(scope, fmt.Sprintf("providers.%s", p.ID), providerCfg); err != nil {
 		slog.Warn("ws: failed to persist updated custom provider", "id", p.ID, "err", err)
 	}
 	if wire, ok := buildConfigWire(a); ok {

@@ -239,6 +239,10 @@ type PeakHoursWirePayload struct {
 }
 
 // AddCustomProviderPayload adds a fully custom provider.
+//
+// Scope is "global" or "local" (workspace); empty defaults to "global",
+// matching every scope-aware CLI command's default (crush providers,
+// crush mcp, crush claude-init, ...).
 type AddCustomProviderPayload struct {
 	ID        string                `json:"id"`
 	Name      string                `json:"name,omitempty"`
@@ -247,17 +251,25 @@ type AddCustomProviderPayload struct {
 	APIKey    string                `json:"apiKey,omitempty"`
 	Models    []CustomModelPayload  `json:"models,omitempty"`
 	PeakHours *PeakHoursWirePayload `json:"peakHours,omitempty"`
+	Scope     string                `json:"scope,omitempty"`
 }
 
 // RemoveCustomProviderPayload removes a custom provider by id.
+//
+// Scope is "global" or "local" (workspace); empty defaults to "global" —
+// must match the scope the provider was actually added under, or the
+// override won't be found and removal is a silent no-op.
 type RemoveCustomProviderPayload struct {
-	ID string `json:"id"`
+	ID    string `json:"id"`
+	Scope string `json:"scope,omitempty"`
 }
 
 // UpdateCustomProviderPayload updates an existing custom provider.
 // Update is a full replace, not a partial merge — mirroring APIKey and
 // every other field, PeakHours is taken verbatim from the payload:
 // present → set (validated), absent → cleared to nil.
+//
+// Scope is "global" or "local" (workspace); empty defaults to "global".
 type UpdateCustomProviderPayload struct {
 	OldID     string                `json:"oldId"`
 	ID        string                `json:"id"`
@@ -267,6 +279,7 @@ type UpdateCustomProviderPayload struct {
 	APIKey    string                `json:"apiKey,omitempty"`
 	Models    []CustomModelPayload  `json:"models,omitempty"`
 	PeakHours *PeakHoursWirePayload `json:"peakHours,omitempty"`
+	Scope     string                `json:"scope,omitempty"`
 }
 
 // MCPServerInfo is the wire format for a single MCP server state.

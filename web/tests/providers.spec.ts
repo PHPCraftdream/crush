@@ -219,13 +219,35 @@ test("Remove provider - cancel hides confirm", async ({ page }) => {
   await page.getByTestId("header-providers-button").click();
   await expect(page.getByTestId("providers-modal")).toContainText("Ollama", { timeout: 3000 });
   await page.getByTitle("Remove provider").click();
-  await expect(page.getByRole("button", { name: "Yes" })).toBeVisible({
+  await expect(page.getByTestId("provider-remove-global")).toBeVisible({
     timeout: 3000,
   });
   await page.getByRole("button", { name: "No" }).click();
-  await expect(page.getByRole("button", { name: "Yes" })).not.toBeVisible({
+  await expect(page.getByTestId("provider-remove-global")).not.toBeVisible({
     timeout: 3000,
   });
+});
+
+test("Remove provider - global button sends remove_custom_provider with global scope", async ({ page }) => {
+  await primeSession(page, makeConfigWithProvider());
+  await page.getByTestId("header-providers-button").click();
+  await expect(page.getByTestId("providers-modal")).toContainText("Ollama", { timeout: 3000 });
+  await page.getByTitle("Remove provider").click();
+  await page.getByTestId("provider-remove-global").click();
+  const msg = await waitForWSSend(page, "remove_custom_provider");
+  const payload = msg.payload as Record<string, unknown>;
+  expect(payload.scope).toBe("global");
+});
+
+test("Remove provider - local button sends remove_custom_provider with local scope", async ({ page }) => {
+  await primeSession(page, makeConfigWithProvider());
+  await page.getByTestId("header-providers-button").click();
+  await expect(page.getByTestId("providers-modal")).toContainText("Ollama", { timeout: 3000 });
+  await page.getByTitle("Remove provider").click();
+  await page.getByTestId("provider-remove-local").click();
+  const msg = await waitForWSSend(page, "remove_custom_provider");
+  const payload = msg.payload as Record<string, unknown>;
+  expect(payload.scope).toBe("local");
 });
 
 // ── Peak-hours window ────────────────────────────────────────────────────────
@@ -279,6 +301,35 @@ test("Add provider form omits window when peak-hours disabled", async ({ page })
   const msg = await waitForWSSend(page, "add_custom_provider");
   const payload = msg.payload as Record<string, unknown>;
   expect(payload.peakHours).toBeNull();
+});
+
+test("Add provider form defaults to global scope", async ({ page }) => {
+  await openProvidersModal(page);
+  await page.getByTestId("providers-modal-add").click();
+  await page.getByPlaceholder("e.g. ollama", { exact: true }).fill("localprovider");
+  await page.getByPlaceholder("e.g. Ollama", { exact: true }).fill("Local Provider");
+  await page.getByPlaceholder("e.g. http://localhost:11434/v1/").fill("http://localhost:8080/v1/");
+  await page.getByPlaceholder("ID (e.g. qwen3:30b)").first().fill("local-model");
+  await page.getByPlaceholder("Display name").first().fill("Local Model");
+  await page.getByRole("button", { name: "Add Provider", exact: true }).click();
+  const msg = await waitForWSSend(page, "add_custom_provider");
+  const payload = msg.payload as Record<string, unknown>;
+  expect(payload.scope).toBe("global");
+});
+
+test("Add provider form sends local scope when selected", async ({ page }) => {
+  await openProvidersModal(page);
+  await page.getByTestId("providers-modal-add").click();
+  await page.getByPlaceholder("e.g. ollama", { exact: true }).fill("localprovider");
+  await page.getByPlaceholder("e.g. Ollama", { exact: true }).fill("Local Provider");
+  await page.getByPlaceholder("e.g. http://localhost:11434/v1/").fill("http://localhost:8080/v1/");
+  await page.getByPlaceholder("ID (e.g. qwen3:30b)").first().fill("local-model");
+  await page.getByPlaceholder("Display name").first().fill("Local Model");
+  await page.getByTestId("provider-form-scope-local").click();
+  await page.getByRole("button", { name: "Add Provider", exact: true }).click();
+  const msg = await waitForWSSend(page, "add_custom_provider");
+  const payload = msg.payload as Record<string, unknown>;
+  expect(payload.scope).toBe("local");
 });
 
 test("Edit provider form prefills existing peak-hours window", async ({ page }) => {

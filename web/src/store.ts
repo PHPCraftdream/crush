@@ -706,22 +706,28 @@ export function initializeProject(msgID?: string) {
   ws.send("initialize_project", {}, msgID);
 }
 
+// Scope is "global" or "local" (workspace); omitted/undefined defaults to
+// "global" server-side, matching every scope-aware CLI command.
+export type ConfigScope = "global" | "local";
+
 export function addCustomProvider(payload: {
   id: string; name?: string; type: string; baseUrl: string; apiKey?: string;
   models?: { id: string; name: string; contextWindow?: number; costPer1mIn?: number; costPer1mOut?: number }[];
   peakHours?: { start: string; end: string } | null;
+  scope?: ConfigScope;
 }, msgID?: string) {
   ws.send("add_custom_provider", payload, msgID);
 }
 
-export function removeCustomProvider(id: string, msgID?: string) {
-  ws.send("remove_custom_provider", { id }, msgID);
+export function removeCustomProvider(id: string, scope?: ConfigScope, msgID?: string) {
+  ws.send("remove_custom_provider", { id, scope }, msgID);
 }
 
 export function updateCustomProvider(payload: {
   oldId: string; id: string; name?: string; type: string; baseUrl: string; apiKey?: string;
   models?: { id: string; name: string; contextWindow?: number; costPer1mIn?: number; costPer1mOut?: number }[];
   peakHours?: { start: string; end: string } | null;
+  scope?: ConfigScope;
 }, msgID?: string) {
   ws.send("update_custom_provider", payload, msgID);
 }

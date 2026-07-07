@@ -117,3 +117,27 @@ func TestProviderWireIncludesPeakHours(t *testing.T) {
 	require.NoError(t, err)
 	require.NotContains(t, string(out2), "peakHours")
 }
+
+// TestScopeFromWire covers the scope resolution used by
+// handleAddCustomProvider / handleUpdateCustomProvider /
+// handleRemoveCustomProvider. Empty/unrecognised values must default to
+// global, matching every scope-aware CLI command's default.
+func TestScopeFromWire(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want config.Scope
+	}{
+		{name: "empty defaults to global", in: "", want: config.ScopeGlobal},
+		{name: "local, lowercase", in: "local", want: config.ScopeWorkspace},
+		{name: "local, mixed case", in: "Local", want: config.ScopeWorkspace},
+		{name: "local, uppercase", in: "LOCAL", want: config.ScopeWorkspace},
+		{name: "global, explicit", in: "global", want: config.ScopeGlobal},
+		{name: "unrecognised value defaults to global", in: "workspace", want: config.ScopeGlobal},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, scopeFromWire(tt.in))
+		})
+	}
+}
