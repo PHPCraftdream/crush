@@ -26,7 +26,7 @@ exist and crush merges them at load time, workspace overriding global:
   --global   ~/.local/share/crush/crush.json   (or %LocalAppData%\crush on Windows)
   --local    ./.crush/crush.json               (next to the project)
 
-If --global / --local is omitted the default is --local for write
+If --global / --local is omitted the default is --global for write
 operations and "both" for read operations.`,
 }
 
@@ -184,7 +184,7 @@ crush mcp enable my-server
 crush mcp enable my-server --global
   `,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		scope, err := scopeFromFlags(cmd, config.ScopeWorkspace)
+		scope, err := scopeFromFlags(cmd, config.ScopeGlobal)
 		if err != nil {
 			return err
 		}
@@ -225,7 +225,7 @@ crush mcp disable my-server
 crush mcp disable my-server --local
   `,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		scope, err := scopeFromFlags(cmd, config.ScopeWorkspace)
+		scope, err := scopeFromFlags(cmd, config.ScopeGlobal)
 		if err != nil {
 			return err
 		}
@@ -323,7 +323,7 @@ crush mcp test my-server --timeout 30s
 var mcpAddCmd = &cobra.Command{
 	Use:   "add <id>",
 	Short: "Add a new MCP server",
-	Long: `Add a new MCP server to the chosen scope (default: local). Specify
+	Long: `Add a new MCP server to the chosen scope (default: global). Specify
 the server type (stdio, sse, or http) and the appropriate connection
 details.
 
@@ -348,7 +348,7 @@ crush mcp add my-server --type stdio --command "npx" --arg "mcp-server" --env "A
 crush mcp add auth-server --type http --url http://api.example.com/mcp --header "Authorization=Bearer $TOKEN"
   `,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		scope, err := scopeFromFlags(cmd, config.ScopeWorkspace)
+		scope, err := scopeFromFlags(cmd, config.ScopeGlobal)
 		if err != nil {
 			return err
 		}
@@ -444,7 +444,7 @@ crush mcp remove my-server --global
 crush mcp rm old-server --local
   `,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		scope, err := scopeFromFlags(cmd, config.ScopeWorkspace)
+		scope, err := scopeFromFlags(cmd, config.ScopeGlobal)
 		if err != nil {
 			return err
 		}
@@ -467,8 +467,8 @@ crush mcp rm old-server --local
 var mcpSetCmd = &cobra.Command{
 	Use:   "set <id>",
 	Short: "Update an MCP server's configuration",
-	Long: `Set one or more MCP server fields in --global (default: --local)
-scope. Only the flags you pass are written — unset fields are left
+	Long: `Set one or more MCP server fields in the chosen scope (default:
+--global). Only the flags you pass are written — unset fields are left
 untouched.
 
 Use --disabled=true to disable without removing; --disabled=false to
@@ -488,7 +488,7 @@ crush mcp set my-server --disabled=true
 crush mcp set events --url http://new-host:4000/sse
   `,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		scope, err := scopeFromFlags(cmd, config.ScopeWorkspace)
+		scope, err := scopeFromFlags(cmd, config.ScopeGlobal)
 		if err != nil {
 			return err
 		}
@@ -556,8 +556,8 @@ func init() {
 	mcpTestCmd.Flags().String("timeout", "10s", "Timeout for the connectivity test")
 
 	for _, c := range []*cobra.Command{mcpEnableCmd, mcpDisableCmd, mcpAddCmd, mcpRemoveCmd, mcpSetCmd} {
-		c.Flags().Bool("global", false, "Target the global config (~/.local/share/crush/crush.json).")
-		c.Flags().Bool("local", false, "Target the workspace config (./.crush/crush.json). Default when neither --global nor --local is given.")
+		c.Flags().Bool("global", false, "Target the global config (~/.local/share/crush/crush.json). Default when neither --global nor --local is given.")
+		c.Flags().Bool("local", false, "Target the workspace config (./.crush/crush.json).")
 		c.MarkFlagsMutuallyExclusive("global", "local")
 	}
 
