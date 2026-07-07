@@ -275,6 +275,11 @@ function ProviderForm({
               <label className="block text-[11px] text-text-subtle mb-1">Start (local)</label>
               <input
                 type="time"
+                // lang="en-GB" forces a 24-hour picker/display in Chromium-based
+                // browsers regardless of the OS/browser locale, which otherwise
+                // shows AM/PM on 12h-locale systems — peak_hours is always
+                // interpreted as 24h HH:MM server-side, so the picker must match.
+                lang="en-GB"
                 value={peakStart}
                 onChange={(e) => setPeakStart(e.target.value)}
                 className="w-full text-xs font-mono bg-canvas border border-surface rounded-lg px-2.5 py-1.5 outline-none focus:border-accent/50 text-text"
@@ -285,6 +290,7 @@ function ProviderForm({
               <label className="block text-[11px] text-text-subtle mb-1">End (local)</label>
               <input
                 type="time"
+                lang="en-GB"
                 value={peakEnd}
                 onChange={(e) => setPeakEnd(e.target.value)}
                 className="w-full text-xs font-mono bg-canvas border border-surface rounded-lg px-2.5 py-1.5 outline-none focus:border-accent/50 text-text"
@@ -417,6 +423,9 @@ function PeakHoursOnlyEditor({
             <label className="block text-[11px] text-text-subtle mb-1">Start (local)</label>
             <input
               type="time"
+              // See the comment on the equivalent input in ProviderForm above:
+              // forces a 24-hour picker regardless of OS/browser locale.
+              lang="en-GB"
               value={start}
               onChange={(e) => setStart(e.target.value)}
               className="w-full text-xs font-mono bg-canvas border border-surface rounded-lg px-2.5 py-1.5 outline-none focus:border-accent/50 text-text"
@@ -427,6 +436,7 @@ function PeakHoursOnlyEditor({
             <label className="block text-[11px] text-text-subtle mb-1">End (local)</label>
             <input
               type="time"
+              lang="en-GB"
               value={end}
               onChange={(e) => setEnd(e.target.value)}
               className="w-full text-xs font-mono bg-canvas border border-surface rounded-lg px-2.5 py-1.5 outline-none focus:border-accent/50 text-text"
