@@ -126,6 +126,14 @@ crush sessions list --json | jq 'select(.message_count > 0)'
 // computeSessionStatuses returns sessionID → status ("running" | "crashed").
 // Sessions not in the map are at rest (no lock). Cheap: one directory read +
 // one PID probe per lock file.
+//
+// A session counts as "running" if EITHER the PID it recorded is alive OR
+// its heartbeat (lock file mtime) is still fresh. The PID check alone is
+// not reliable on Windows: tryLockFile takes a mandatory, whole-file
+// LockFileEx lock for the holder's entire lifetime, so a plain read of the
+// PID from another process fails for as long as the session is alive (see
+// the Windows note on session.readLockFile) — without the heartbeat
+// fallback, every live session on Windows would misreport as "crashed".
 func computeSessionStatuses(cmd *cobra.Command) map[string]string {
 	cwd, err := ResolveCwd(cmd)
 	if err != nil {
@@ -145,7 +153,17 @@ func computeSessionStatuses(cmd *cobra.Command) map[string]string {
 		sessionID := strings.TrimSuffix(strings.TrimPrefix(name, "session-"), ".lock")
 		path := filepath.Join(locksDir, name)
 		pid := session.ReadLockPID(path)
-		if pid > 0 && session.IsProcessAlive(pid) {
+		// A CONFIRMED-dead PID (pid > 0 but not alive) is trustworthy on
+		// its own. pid <= 0 is ambiguous — "unreadable", not necessarily
+		// dead (see the Windows note on session.readLockFile) — so only
+		// then do we fall back to heartbeat freshness.
+		var alive bool
+		if pid > 0 {
+			alive = session.IsProcessAlive(pid)
+		} else if info, statErr := entry.Info(); statErr == nil {
+			alive = time.Since(info.ModTime()) <= session.LockStaleDuration
+		}
+		if alive {
 			out[sessionID] = "running"
 		} else {
 			out[sessionID] = "crashed"

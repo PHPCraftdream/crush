@@ -30,9 +30,12 @@ external log files or orchestrator redirect output — only the DB and the
 The four possible verdicts:
 
   done     — last assistant message finished with end_turn.
-  crashed  — lock file exists, holder PID is dead, and no assistant
-             message with a clean finish. Likely died mid-turn.
-  running  — lock file exists, holder PID is alive. Shows heartbeat age.
+  crashed  — lock file exists, holder is dead (PID dead AND heartbeat
+             stale), and no assistant message with a clean finish.
+             Likely died mid-turn.
+  running  — lock file exists, holder PID is alive OR the heartbeat is
+             still fresh (PID alone is not trusted — on Windows it reads
+             as unreadable for the entire lifetime of a live session).
   at rest  — no lock file. Not running, not crashed.
 
 When the raw lock signal says "crashed" but the last assistant message
@@ -98,8 +101,22 @@ func explainSessionStatus(ctx context.Context, a *app.App, cwd, sessionID string
 	if st, statErr := os.Stat(lockPath); statErr == nil {
 		hasLock = true
 		pid = session.ReadLockPID(lockPath)
-		pidAlive = pid > 0 && session.IsProcessAlive(pid)
 		heartAge = time.Since(st.ModTime())
+		// A CONFIRMED-dead PID (pid > 0 but IsProcessAlive is false) is a
+		// trustworthy signal regardless of heartbeat age — that specific
+		// process really doesn't exist. But pid <= 0 is ambiguous, not
+		// necessarily dead: on Windows, tryLockFile's mandatory, whole-file
+		// LockFileEx lock means reading the PID from another process fails
+		// for the holder's ENTIRE lifetime (session.readLockFile's Windows
+		// note), so pid == 0 is the norm for a live session there, not a
+		// sign of death. Only in that unreadable case do we fall back to
+		// heartbeat freshness.
+		switch {
+		case pid > 0:
+			pidAlive = session.IsProcessAlive(pid)
+		default:
+			pidAlive = heartAge <= session.LockStaleDuration
+		}
 	}
 
 	// Last assistant message + its finish part (if any). Same
@@ -131,7 +148,13 @@ func explainSessionStatus(ctx context.Context, a *app.App, cwd, sessionID string
 		}
 	case hasLock && pidAlive:
 		fmt.Fprintf(out, "status: running\n")
-		fmt.Fprintf(out, "reason: lock held by live PID %d (heartbeat %s old).\n", pid, formatDurationShort(heartAge))
+		if pid > 0 {
+			fmt.Fprintf(out, "reason: lock held by live PID %d (heartbeat %s old).\n", pid, formatDurationShort(heartAge))
+		} else {
+			// PID unreadable (normal on Windows while the holder is alive —
+			// see the Windows note above) but the heartbeat is fresh.
+			fmt.Fprintf(out, "reason: lock held (PID unreadable while active — normal on Windows); heartbeat %s old.\n", formatDurationShort(heartAge))
+		}
 		if finish != nil {
 			fmt.Fprintf(out, "last assistant finish: %s\n", finishReasonOrUnknown(finish))
 		} else {

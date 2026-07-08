@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/charmbracelet/crush/internal/app"
 	"github.com/charmbracelet/crush/internal/message"
@@ -209,6 +210,60 @@ func TestExplainSessionStatus_Running(t *testing.T) {
 	require.Contains(t, out, "status: running")
 	require.Contains(t, out, "heartbeat")
 	require.Contains(t, out, "tool_use")
+}
+
+// TestExplainSessionStatus_Running_PIDUnreadableFreshHeartbeat reproduces
+// the Windows scenario: tryLockFile's mandatory LockFileEx lock means the
+// PID can't be read from another process while the holder is alive, so
+// ReadLockPID returns 0 even though the session is genuinely running. A
+// fresh heartbeat (recent mtime) must still classify this as "running", not
+// "crashed" — see the Windows note on session.readLockFile.
+func TestExplainSessionStatus_Running_PIDUnreadableFreshHeartbeat(t *testing.T) {
+	t.Parallel()
+
+	conn, q := newTestDB(t)
+	s := session.NewService(q, conn)
+	m := message.NewService(q)
+
+	sess, err := s.Create(context.Background(), "live run, unreadable pid")
+	require.NoError(t, err)
+
+	// pid=0 simulates a lock file whose PID line couldn't be read.
+	cwd := writeLockFile(t, sess.ID, 0)
+
+	a := &app.App{Messages: m, Sessions: s}
+	var buf bytes.Buffer
+	require.NoError(t, explainSessionStatus(context.Background(), a, cwd, sess.ID, &buf))
+
+	out := buf.String()
+	require.Contains(t, out, "status: running")
+	require.NotContains(t, out, "status: crashed")
+}
+
+// TestExplainSessionStatus_Crashed_PIDUnreadableStaleHeartbeat: pid=0 AND a
+// stale heartbeat (old mtime) must still report "crashed" — the heartbeat
+// fallback only rescues genuinely fresh locks, not abandoned ones.
+func TestExplainSessionStatus_Crashed_PIDUnreadableStaleHeartbeat(t *testing.T) {
+	t.Parallel()
+
+	conn, q := newTestDB(t)
+	s := session.NewService(q, conn)
+	m := message.NewService(q)
+
+	sess, err := s.Create(context.Background(), "dead run, unreadable pid")
+	require.NoError(t, err)
+
+	cwd := writeLockFile(t, sess.ID, 0)
+	lockPath := filepath.Join(cwd, ".crush", "locks", "session-"+sanitiseSessionIDForFilename(sess.ID)+".lock")
+	old := time.Now().Add(-30 * time.Second)
+	require.NoError(t, os.Chtimes(lockPath, old, old))
+
+	a := &app.App{Messages: m, Sessions: s}
+	var buf bytes.Buffer
+	require.NoError(t, explainSessionStatus(context.Background(), a, cwd, sess.ID, &buf))
+
+	out := buf.String()
+	require.Contains(t, out, "status: crashed")
 }
 
 // TestExplainSessionStatus_ErrorFinishSurfacesErrorText: when the last

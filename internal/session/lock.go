@@ -16,6 +16,15 @@ const (
 	lockStaleDuration     = 20 * time.Second
 )
 
+// LockStaleDuration is the exported view of lockStaleDuration, for callers
+// outside this package that need the same "how old is too old" threshold
+// this package's own heartbeat logic uses. In particular: `crush sessions
+// why`/`sessions list` must fall back to heartbeat freshness when the PID
+// can't be read — see the Windows note on readLockFile below. A holder PID
+// of 0 does NOT mean "unreadable/dead"; on Windows it very often means
+// "actively held" (see readLockFile).
+const LockStaleDuration = lockStaleDuration
+
 // SessionLock is an inter-process exclusive lock for a single session ID.
 // Acquired around the entire `sessionAgent.Run()` call so two crush
 // processes can never write into the same session simultaneously.
@@ -283,6 +292,18 @@ func InspectSessionLock(dataDir, sessionID string, liveThreshold time.Duration) 
 
 // readLockFile returns (PID, timeoutSec) from a lock file. Both default to 0
 // on any parse error — backward compatible with old one-line files.
+//
+// Windows note: tryLockFile takes a LockFileEx exclusive lock over the
+// WHOLE file for the entire lifetime of the holder. Unlike POSIX advisory
+// locks, Windows enforces this as a MANDATORY lock — any plain read from a
+// different handle/process into that byte range (which is exactly what
+// os.ReadFile does here) fails with a sharing/lock violation for as long as
+// the holder is alive, not just during a brief write race. So on Windows,
+// (0, 0) from this function for an ACTIVELY RUNNING session is the norm,
+// not the exception — callers that gate a "crashed" verdict on `pid > 0`
+// alone will misdiagnose every live session on Windows. Always fall back to
+// heartbeat freshness (mtime age vs LockStaleDuration) before concluding a
+// session is dead; see readLockHolderPID's callers in internal/cmd.
 func readLockFile(path string) (int, int64) {
 	bts, err := os.ReadFile(path)
 	if err != nil {
