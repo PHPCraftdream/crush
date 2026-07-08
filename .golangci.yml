@@ -37,6 +37,18 @@ linters:
       - text: '(slog|log)\.\w+'
         linters:
           - noctx
+      # interp.ExecHandler is deprecated in favor of interp.ExecHandlers, but
+      # the latter always appends interp.DefaultExecHandler as the final
+      # handler, which lacks the process-group isolation this fork relies on
+      # (see internal/shell/run.go's execHandlerOption doc comment). The
+      # deprecated call is intentional. Excluded here instead of via an
+      # inline //nolint because staticcheck's SA1019 report for this line is
+      # not reproduced consistently across OS runners, which made
+      # nolintlint flag the inline directive as "unused" on some platforms.
+      - path: internal/shell/run\.go
+        linters:
+          - staticcheck
+        text: "SA1019"
 issues:
   max-issues-per-linter: 0
   max-same-issues: 0
