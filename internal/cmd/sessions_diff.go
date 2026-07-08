@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/crush/internal/message"
+	"github.com/charmbracelet/crush/internal/platform"
 	"github.com/spf13/cobra"
 )
 
@@ -224,6 +225,7 @@ func isGitAvailable() bool {
 		return false
 	}
 	cmd := exec.CommandContext(context.Background(), "git", "rev-parse", "--is-inside-work-tree")
+	platform.HideConsoleWindow(cmd)
 	cmd.Stderr = nil
 	cmd.Stdout = nil
 	return cmd.Run() == nil
@@ -232,6 +234,7 @@ func isGitAvailable() bool {
 // gitNameStatus returns the git status letter (M/A/D) for a file, or "" on error.
 func gitNameStatus(path string) string {
 	cmd := exec.CommandContext(context.Background(), "git", "diff", "--name-status", "HEAD", "--", path)
+	platform.HideConsoleWindow(cmd)
 	out, err := cmd.Output()
 	if err != nil {
 		return ""
@@ -240,6 +243,7 @@ func gitNameStatus(path string) string {
 	if line == "" {
 		// Maybe untracked.
 		cmd2 := exec.CommandContext(context.Background(), "git", "ls-files", "--error-unmatch", "--", path)
+		platform.HideConsoleWindow(cmd2)
 		if cmd2.Run() != nil {
 			return "?"
 		}
@@ -255,6 +259,7 @@ func gitNameStatus(path string) string {
 // gitDiffStat returns the git diff --stat output for a file.
 func gitDiffStat(path string) string {
 	cmd := exec.CommandContext(context.Background(), "git", "diff", "--stat", "HEAD", "--", path)
+	platform.HideConsoleWindow(cmd)
 	out, err := cmd.Output()
 	if err != nil {
 		return ""

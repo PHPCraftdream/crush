@@ -9,6 +9,7 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/crush/internal/platform"
 	"github.com/charmbracelet/crush/internal/session"
 	"github.com/spf13/cobra"
 )
@@ -108,6 +109,7 @@ func sessionsPickCmdRun(cmd *cobra.Command, args []string) error {
 	}
 
 	subCmd := exec.CommandContext(context.Background(), m.binary, cmdArgs...)
+	platform.HideConsoleWindow(subCmd)
 	subCmd.Stdin = os.Stdin
 	subCmd.Stdout = os.Stdout
 	subCmd.Stderr = os.Stderr

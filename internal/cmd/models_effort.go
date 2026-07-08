@@ -8,6 +8,8 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+
+	"github.com/charmbracelet/crush/internal/platform"
 )
 
 var defaultEffortLevels = []string{"low", "medium", "high", "xhigh", "max"}
@@ -32,7 +34,9 @@ func (s *cliEffortSource) Levels() []string {
 	if v, ok := effortCache[s.Binary]; ok {
 		return v
 	}
-	out, err := exec.CommandContext(context.Background(), s.Binary, s.HelpArg).CombinedOutput()
+	helpCmd := exec.CommandContext(context.Background(), s.Binary, s.HelpArg)
+	platform.HideConsoleWindow(helpCmd)
+	out, err := helpCmd.CombinedOutput()
 	if err != nil {
 		slog.Warn("could not detect effort levels — falling back", "binary", s.Binary, "err", err)
 		effortCache[s.Binary] = defaultEffortLevels

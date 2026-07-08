@@ -13,6 +13,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/charmbracelet/crush/internal/platform"
 	"github.com/charmbracelet/crush/internal/queue"
 	"github.com/spf13/cobra"
 )
@@ -354,6 +355,7 @@ func runQueueTask(ctx context.Context, cwd string, task queue.Task) (float64, in
 	}
 
 	execCmd := exec.CommandContext(ctx, crushBin, cmdArgs...)
+	platform.HideConsoleWindow(execCmd)
 	execCmd.Dir = cwd
 	execCmd.Stdin = strings.NewReader(task.Prompt)
 
