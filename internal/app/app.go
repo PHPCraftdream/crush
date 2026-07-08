@@ -674,6 +674,35 @@ func runFailed(finalReason string, runErr error, isCanceled bool) bool {
 	}
 }
 
+// cancelledRunError builds the runIncompleteError for the terse/--stream
+// (non-JSON) isCanceled path.
+//
+// A forced abort (peak-hours mid-turn stop, max-cost, max-tokens, a DB
+// cancel-request) cancels the run's context to unblock the in-flight
+// generation — which races the specific error each of those paths already
+// persisted onto the assistant message via AddFinish (see agent.go's
+// OnStepFinish). Depending on that race, the run's returned error can end up
+// being the generic context.Canceled instead of the specific one, so this
+// must not drop the rich detail on the floor: if the last assistant message
+// finished with FinishReasonError and carries a message/details, surface
+// THAT instead of a bare "cancelled" that gives the operator no clue why. A
+// genuine, unrecorded Ctrl+C never runs AddFinish first, so finalErrTitle
+// stays empty and this falls through to the original bare behavior
+// unchanged.
+func cancelledRunError(finalReason, finalErrTitle, finalErrDetails string) *runIncompleteError {
+	if finalReason == string(message.FinishReasonError) && (finalErrTitle != "" || finalErrDetails != "") {
+		detail := finalErrTitle
+		if finalErrDetails != "" {
+			if detail != "" {
+				detail += ": "
+			}
+			detail += finalErrDetails
+		}
+		return &runIncompleteError{reason: "cancelled", detail: detail}
+	}
+	return &runIncompleteError{reason: "cancelled"}
+}
+
 func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt string, overrides RunOverrides, hideSpinner bool, mode RunMode, continueSessionID string, useLast bool) error {
 	largeModel := overrides.LargeModel
 	smallModel := overrides.SmallModel
@@ -1048,7 +1077,7 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt 
 				if isCanceled {
 					slog.Debug("Non-interactive: agent processing cancelled", "session_id", sess.ID)
 					hookExitReason = "cancelled"
-					return &runIncompleteError{reason: "cancelled"}
+					return cancelledRunError(finalReason, finalErrTitle, finalErrDetails)
 				}
 				hookExitReason = "error"
 				return fmt.Errorf("agent processing failed: %w", runErr)

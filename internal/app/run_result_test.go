@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/crush/internal/agent"
+	"github.com/charmbracelet/crush/internal/message"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -264,4 +265,44 @@ func TestRunIncompleteError_Message(t *testing.T) {
 		(&runIncompleteError{reason: "error", detail: "Stream stalled: provider X"}).Error())
 	assert.Equal(t, "run did not complete cleanly (cancelled)",
 		(&runIncompleteError{reason: "cancelled"}).Error())
+}
+
+// TestCancelledRunError pins the terse/--stream isCanceled path: a forced
+// abort (peak-hours mid-turn stop, max-cost, max-tokens) cancels the run's
+// context, which can race the specific error into a generic
+// context.Canceled — this must not throw away the FinishReasonError detail
+// that was already persisted on the assistant message. A genuine,
+// unrecorded Ctrl+C (no FinishReasonError message) must still fall back to
+// the bare "cancelled" text.
+func TestCancelledRunError(t *testing.T) {
+	t.Run("recorded FinishReasonError detail is surfaced, not swallowed", func(t *testing.T) {
+		err := cancelledRunError(
+			string(message.FinishReasonError),
+			"Stopped: provider entered its peak-hours window mid-session",
+			"provider zai is in peak hours (08:00–12:00), refusing until 12:00",
+		)
+		require.NotNil(t, err)
+		assert.Equal(t, "cancelled", err.reason)
+		assert.Contains(t, err.detail, "peak-hours")
+		assert.Contains(t, err.detail, "refusing until 12:00")
+	})
+
+	t.Run("title only (no details) is still surfaced", func(t *testing.T) {
+		err := cancelledRunError(string(message.FinishReasonError), "Stopped: budget exceeded", "")
+		assert.Equal(t, "Stopped: budget exceeded", err.detail)
+	})
+
+	t.Run("genuine unrecorded cancel falls back to bare message", func(t *testing.T) {
+		err := cancelledRunError("", "", "")
+		assert.Empty(t, err.detail)
+		assert.Equal(t, "run did not complete cleanly (cancelled)", err.Error())
+	})
+
+	t.Run("non-error finish reason does not leak unrelated finish text", func(t *testing.T) {
+		// e.g. a clean end_turn message that happened to still be the last
+		// one tracked when the context got cancelled for an unrelated
+		// reason — must not be misattributed as the cancel's cause.
+		err := cancelledRunError(string(message.FinishReasonEndTurn), "some unrelated title", "some unrelated detail")
+		assert.Empty(t, err.detail)
+	})
 }
