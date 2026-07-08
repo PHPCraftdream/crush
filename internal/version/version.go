@@ -15,7 +15,7 @@ import (
 // line a devel binary was built from. This fork bumps versions deliberately and
 // manually (see CLAUDE.md at the repo root), so this constant must be kept in
 // lockstep with npm/crush/package.json on every bump.
-const forkBaseVersion = "0.1.5"
+const forkBaseVersion = "0.1.6"
 
 // Build-time parameters set via -ldflags. These act as overrides: when a
 // release/packaging build injects them (see .goreleaser.yml and the
@@ -215,9 +215,9 @@ func readVCS(info *debug.BuildInfo) vcsInfo {
 
 // deriveDevVersion builds a human-meaningful version for a development build
 // from embedded VCS metadata, embedding the fork's current release-line version
-// (forkBaseVersion), e.g. "06c8078-0.1.5" for a clean checkout. When baseTag is
+// (forkBaseVersion), e.g. "06c8078-0.1.6" for a clean checkout. When baseTag is
 // non-empty (recovered from a `go install` pseudo-version), it is prepended as
-// "<baseTag>-", yielding e.g. "v0.72.1-06c8078-0.1.5". It returns an empty
+// "<baseTag>-", yielding e.g. "v0.72.1-06c8078-0.1.6". It returns an empty
 // string when no revision is available, signalling the caller to keep the
 // plain "devel" default. No "devel" marker and no dirty marker are ever
 // included in the returned string — the commit hash + forkBaseVersion (and,

@@ -8,6 +8,54 @@ This is the npm-package changelog, not the fork's engineering decision
 log — see [`CHANGELOG.fork.md`](../../CHANGELOG.fork.md) at the repo
 root for the full per-file merge/divergence history.
 
+## [0.1.6]
+
+- Windows: fixed a real instant-death bug where `crush run` launched detached
+  in the background (e.g. `crush run ... > out 2> err &`) could be killed the
+  moment the wrapper shell's console closed — Windows sends `CTRL_CLOSE_EVENT`
+  to every attached process on console close, and that termination cannot be
+  prevented from inside a console-control handler. Fixed by detaching from
+  the console (`FreeConsole`) at startup whenever all three std streams are
+  redirected.
+- Windows: eliminated console-window flashing introduced by the fix above.
+  Every child process `crush` spawns (git, MCP stdio servers, ripgrep,
+  cliprovider CLI launches, docker, the `--on-finish` hook, `sessions diff`,
+  `sessions pick`, `queue`, model-effort probing, and `crush run`
+  sub-invocations from `queue`) now launches with its console window hidden
+  instead of momentarily visible.
+- `crush sessions why <id>` and `sessions list` no longer misreport a session
+  as "crashed" when its lock file's PID can't be read — a normal, expected
+  side effect of Windows' mandatory file locking for a genuinely alive
+  session, not proof of death. They now fall back to heartbeat freshness in
+  that case, while still trusting a confirmed-dead PID unconditionally.
+- `crush run`: fixed a race where a peak-hours window opening mid-turn could
+  abort the run without a `RESUME AT` explanation reaching the output — the
+  guidance is now printed to stderr and the specific peak-hours error message
+  is preserved through the whole cancel/abort path instead of being
+  overwritten by a generic "cancelled" message.
+- `crush run`: peak-hours is now re-checked mid-turn on a 10s ticker in
+  addition to step boundaries, so a long stream, a retry loop, or a
+  long-running tool call can no longer run straight through a peak-hours
+  window opening without being interrupted. The check also reloads the
+  provider config from disk when it's changed since the turn started, so a
+  `peak_hours` edit made from another process (e.g. the web UI or a second
+  `crush` invocation) while a run is mid-turn takes effect immediately
+  instead of only on the next run.
+- Windows: an interactive `crush run` (no redirected stdio) could sometimes
+  cancel with a bare "context canceled" on ordinary console events — Windows
+  maps `CTRL_CLOSE_EVENT`/`CTRL_LOGOFF_EVENT`/`CTRL_SHUTDOWN_EVENT` to the
+  same signal Go's runtime uses for a real Ctrl+C. Only a genuine Ctrl+C now
+  cancels the run.
+- `crush run`: fixed handling of busy sessions and stale locks — a
+  session already busy in-process no longer surfaces as a bare nil result,
+  and lock reclamation on a stale-but-contended heartbeat retries instead of
+  spuriously reporting "busy".
+- Web UI: sessions started or driven from the web UI now auto-approve every
+  tool permission, matching how non-interactive `crush run` already behaves.
+  The permission-request dialog can no longer appear in the web UI; the
+  now-unreachable dialog component, its WebSocket events/handlers, and the
+  backend endpoints that served it were removed.
+
 ## [0.1.5]
 
 - Web UI: the Providers settings modal is now the single place to edit every
