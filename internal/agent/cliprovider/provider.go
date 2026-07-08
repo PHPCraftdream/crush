@@ -28,6 +28,7 @@ import (
 	gopty "github.com/aymanbagabas/go-pty"
 	"github.com/charmbracelet/crush/internal/csync"
 	"github.com/charmbracelet/crush/internal/permission"
+	"github.com/charmbracelet/crush/internal/platform"
 	"github.com/charmbracelet/crush/internal/session"
 )
 
@@ -291,7 +292,8 @@ func claudeParseUsageLine(line []byte) (fantasy.Usage, bool) {
 		if inputTotal > 0 {
 			cacheHitPct = float64(ev.Usage.CacheReadInputTokens) / float64(inputTotal) * 100
 		}
-		slog.Info("cliprovider: token usage",
+		slog.Info(
+			"cliprovider: token usage",
 			"input", ev.Usage.InputTokens,
 			"cache_create", ev.Usage.CacheCreationInputTokens,
 			"cache_read", ev.Usage.CacheReadInputTokens,
@@ -887,7 +889,8 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 				allowed = append(allowed, "mcp__crush__"+ext.ServerName+"__"+ext.Name)
 			}
 		}
-		args = append(args,
+		args = append(
+			args,
 			"--allowedTools",
 			strings.Join(allowed, ","),
 			"--disallowedTools",
@@ -926,7 +929,8 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 					// permission system.
 					// Also block the native todo_write so the model uses
 					// mcp__crush__todos which persists tasks to the crush session.
-					args = append(args,
+					args = append(
+						args,
 						"--allowed-tools",
 						"mcp__"+id+"__Bash",
 						"mcp__"+id+"__Read",
@@ -1035,7 +1039,8 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 				// + prompt length + first/last 200 chars of the prompt so
 				// silent-claude-exit cases ("claude died in 68ms with empty
 				// stderr") can be reproduced post-mortem from the log.
-				slog.Info("cliprovider: using PTY",
+				slog.Info(
+					"cliprovider: using PTY",
 					"binary", binaryPath,
 					"args", strings.Join(args, " "),
 					"argsCount", len(args),
@@ -1090,10 +1095,12 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 		// Pipe fallback: large prompt (stdin required) or PTY unavailable.
 		cmd := exec.CommandContext(ctx, m.spec.Binary, args...)
 		cmd.Dir = m.workingDir
+		platform.HideConsoleWindow(cmd)
 		if useStdin {
 			cmd.Stdin = strings.NewReader(prompt)
 		}
-		slog.Info("cliprovider: launching pipe mode",
+		slog.Info(
+			"cliprovider: launching pipe mode",
 			"binary", m.spec.Binary,
 			"args", strings.Join(args, " "),
 			"argsCount", len(args),
@@ -1367,7 +1374,8 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 		// stderrLen=0" for the silent-claude-exit bug which gave the
 		// operator nothing actionable. Now they see if anything was
 		// emitted at all and what the stderr tail looked like.
-		slog.Info("cliprovider: process finished",
+		slog.Info(
+			"cliprovider: process finished",
 			"binary", m.spec.Binary,
 			"err", waitErr,
 			"stderrLen", len(stderr),

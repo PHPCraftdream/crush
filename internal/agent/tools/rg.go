@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/charmbracelet/crush/internal/log"
+	"github.com/charmbracelet/crush/internal/platform"
 )
 
 var getRg = sync.OnceValue(func() string {
@@ -38,7 +39,9 @@ func getRgCmd(ctx context.Context, globPattern string) *exec.Cmd {
 		}
 		args = append(args, "--glob", globPattern)
 	}
-	return exec.CommandContext(ctx, name, args...)
+	cmd := exec.CommandContext(ctx, name, args...)
+	platform.HideConsoleWindow(cmd)
+	return cmd
 }
 
 func getRgSearchCmd(ctx context.Context, pattern, path, include string) *exec.Cmd {
@@ -53,5 +56,7 @@ func getRgSearchCmd(ctx context.Context, pattern, path, include string) *exec.Cm
 	}
 	args = append(args, path)
 
-	return exec.CommandContext(ctx, name, args...)
+	cmd := exec.CommandContext(ctx, name, args...)
+	platform.HideConsoleWindow(cmd)
+	return cmd
 }

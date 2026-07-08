@@ -33,6 +33,7 @@ import (
 	"github.com/charmbracelet/crush/internal/agent/agentguard"
 	"github.com/charmbracelet/crush/internal/fsext"
 	"github.com/charmbracelet/crush/internal/permission"
+	"github.com/charmbracelet/crush/internal/platform"
 	"github.com/charmbracelet/crush/internal/session"
 	"github.com/google/uuid"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -562,6 +563,7 @@ func registerGrepTool(srv *mcp.Server, perms permission.Service, workingDir stri
 			args = append(args, "--include="+input.Glob)
 		}
 		cmd := exec.CommandContext(ctx, args[0], args[1:]...)
+		platform.HideConsoleWindow(cmd)
 		var buf bytes.Buffer
 		cmd.Stdout = &buf
 		cmd.Stderr = &buf
@@ -655,7 +657,8 @@ func registerTodosTool(srv *mcp.Server, sessions session.Service, sessionID stri
 		// Merge with current DB todos: protect status from regression and keep user-added tasks.
 		todos := mergeMCPTodos(sess.Todos, input.Todos)
 
-		slog.Info("cliprovider: MCP todos tool updating todos",
+		slog.Info(
+			"cliprovider: MCP todos tool updating todos",
 			"session", sessionID,
 			"prev", sess.Todos,
 			"merged", todos,
@@ -726,6 +729,7 @@ func runShell(ctx context.Context, command, dir string) (string, error) {
 		cmd = exec.CommandContext(ctx, "bash", "-c", command)
 	}
 	cmd.Dir = dir
+	platform.HideConsoleWindow(cmd)
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
