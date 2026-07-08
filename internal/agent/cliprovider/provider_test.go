@@ -1236,6 +1236,23 @@ func TestStreamWaitBoundedOnGrandchildHoldsStderr(t *testing.T) {
 		echo "stdout-line-2"
 	`
 
+	// Force the pipe branch via testDisablePTY rather than relying on the
+	// platform-dependent default (GOOS == "windows", set in TestMain). Under
+	// a real PTY (the default on non-Windows), the controlling terminal
+	// closing on bash exit sends SIGHUP to the disowned grandchild, killing
+	// it before it can hold stderr open — the premise this test depends on
+	// never materializes there, and gotErr comes back nil on Linux CI.
+	//
+	// Setting spec.NoPTY instead would be wrong: it switches Stream() to the
+	// merged-stdout/stderr StderrPipe() branch (see the `if m.spec.NoPTY`
+	// block below Stream()'s pipe fallback), not the plain
+	// `cmd.Stderr = &stderrBuf` branch this test targets (see the
+	// top-of-function comment). Only testDisablePTY selects the latter while
+	// keeping spec.NoPTY false.
+	prevDisablePTY := testDisablePTY
+	testDisablePTY = true
+	defer func() { testDisablePTY = prevDisablePTY }()
+
 	tmpDir := t.TempDir()
 	spec := CLISpec{
 		ModelID:    "test-bounded-wait",
