@@ -1128,15 +1128,12 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt 
 				// fang's ERROR box truncates at the first newline. Print
 				// the guidance to stderr separately BEFORE the ERROR box
 				// so the operator / orchestrator actually sees it.
+				// Reuses agent.PeakHoursGuidance so the stderr text stays
+				// identical to the DB finish-message details recorded by
+				// peakHoursStoppedFinishText (sessions why / diff, etc.).
 				var peakErr *agent.PeakHoursError
 				if errors.As(runErr, &peakErr) {
-					fmt.Fprintf(os.Stderr, "\nRESUME AT: %s (local time, RFC3339: %s)\n\n"+
-						"This is not a crash — crush is intentionally refusing/halting\n"+
-						"because of the provider's peak-hours window. It will not retry\n"+
-						"on its own. Schedule a resume for the time above and re-invoke\n"+
-						"crush run then.\n\n",
-						peakErr.ReopensAt.Format("2006-01-02 15:04"),
-						peakErr.ReopensAt.Format(time.RFC3339))
+					fmt.Fprintf(os.Stderr, "\n%s\n\n", agent.PeakHoursGuidance(peakErr))
 				}
 				if isCanceled {
 					slog.Debug("Non-interactive: agent processing cancelled", "session_id", sess.ID)
