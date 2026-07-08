@@ -512,7 +512,7 @@ func (c *coordinator) buildCall(ctx context.Context, sessionID, prompt string, a
 		return SessionAgentCall{}, errModelProviderNotConfigured
 	}
 	if err := checkPeakHours(providerCfg); err != nil {
-		return SessionAgentCall{}, wrapPeakHoursError(err)
+		return SessionAgentCall{}, err
 	}
 
 	mergedOptions, temp, topP, topK, freqPenalty, presPenalty := mergeCallOptions(model, providerCfg)
@@ -567,7 +567,7 @@ func (c *coordinator) runInternal(ctx context.Context, sessionID string, prompt 
 	c.runLimitsMu.Unlock()
 	if !allowPeak {
 		if err := checkPeakHours(providerCfg); err != nil {
-			return nil, wrapPeakHoursError(err)
+			return nil, err
 		}
 	}
 
@@ -1987,7 +1987,7 @@ func (c *coordinator) Summarize(ctx context.Context, sessionID string) error {
 		return errModelProviderNotConfigured
 	}
 	if err := checkPeakHours(providerCfg); err != nil {
-		return wrapPeakHoursError(err)
+		return err
 	}
 
 	if err := c.refreshTokenIfExpired(ctx, providerCfg); err != nil {
@@ -2155,7 +2155,7 @@ func (c *coordinator) runSubAgent(ctx context.Context, params subAgentParams) (f
 		return fantasy.ToolResponse{}, errModelProviderNotConfigured
 	}
 	if err := checkPeakHours(providerCfg); err != nil {
-		return fantasy.ToolResponse{}, wrapPeakHoursError(err)
+		return fantasy.ToolResponse{}, err
 	}
 
 	// Run the agent

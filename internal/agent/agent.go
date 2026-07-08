@@ -612,6 +612,15 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	// have been truncated.
 	var loopDetected bool
 	var loopDetail loopDetail
+	// peakHoursAbortErr is stashed by the OnStepFinish peak-hours check
+	// when it detects the provider entered its window mid-turn. OnStepFinish
+	// must call cancelFn() to break fantasy's agent loop (returning an error
+	// alone doesn't stop it), but cancel() makes fantasy return
+	// context.Canceled — swallowing the specific *PeakHoursError. After
+	// agent.Stream() returns, Run() checks this and replaces the generic
+	// context.Canceled with the real error so it reaches the coordinator and
+	// ultimately RunNonInteractive's stderr output.
+	var peakHoursAbortErr error
 
 	// bgSummarizeLaunched ensures we launch at most one background
 	// summarisation per Run() call (fired the first time we trim the window).
@@ -1212,9 +1221,19 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 						"session_id", call.SessionID, "error", pErr)
 					peakMsg, peakDetails := peakHoursStoppedFinishText(pErr)
 					currentAssistant.AddFinish(message.FinishReasonError, peakMsg, peakDetails)
-					if uErr := a.messages.Update(genCtx, *currentAssistant); uErr != nil {
-						return uErr
+					// Use the parent ctx (not genCtx) for the DB write —
+					// genCtx dies as soon as we cancel below.
+					if uErr := a.messages.Update(ctx, *currentAssistant); uErr != nil {
+						slog.Warn("agent: failed to persist peak-hours finish message", "error", uErr)
 					}
+					// Stash the specific error so Run() can return it
+					// AFTER fantasy's agent.Stream exits. We must call
+					// cancelFn() to break fantasy's loop (returning an
+					// error from OnStepFinish alone doesn't stop it), but
+					// cancel() makes fantasy return context.Canceled —
+					// swallowing our pErr. The stash lets Run() replace
+					// that generic error with the real one.
+					peakHoursAbortErr = pErr
 					if cancelFn, ok := a.activeRequests.Get(call.SessionID); ok {
 						cancelFn()
 					}
@@ -1259,6 +1278,14 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			},
 		},
 	})
+	// If the peak-hours mid-turn check fired, it had to call cancelFn()
+	// to break fantasy's loop (OnStepFinish errors alone don't stop it),
+	// which makes fantasy return context.Canceled — losing our specific
+	// *PeakHoursError. Swap it back in so the coordinator and
+	// RunNonInteractive see the real reason.
+	if peakHoursAbortErr != nil && errors.Is(err, context.Canceled) {
+		err = peakHoursAbortErr
+	}
 	if err != nil {
 		isHyper := largeModel.ModelCfg.Provider == hyper.Name
 		isCancelErr := errors.Is(err, context.Canceled)
