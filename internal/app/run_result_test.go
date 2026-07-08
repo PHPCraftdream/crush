@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -275,34 +276,40 @@ func TestRunIncompleteError_Message(t *testing.T) {
 // unrecorded Ctrl+C (no FinishReasonError message) must still fall back to
 // the bare "cancelled" text.
 func TestCancelledRunError(t *testing.T) {
-	t.Run("recorded FinishReasonError detail is surfaced, not swallowed", func(t *testing.T) {
-		err := cancelledRunError(
-			string(message.FinishReasonError),
-			"Stopped: provider entered its peak-hours window mid-session",
-			"provider zai is in peak hours (08:00–12:00), refusing until 12:00",
-		)
+	peakErr := fmt.Errorf("provider zai is in peak hours (08:00–12:00), refusing until 12:00")
+
+	t.Run("specific runErr is surfaced even when event-loop missed the finish detail", func(t *testing.T) {
+		// The typical race: OnStepFinish returns a specific error AND
+		// calls cancel(). runErr carries the specific error, but the
+		// event-loop (which populates finalReason/finalErrTitle) never
+		// sees the updated message because the context died first.
+		err := cancelledRunError(peakErr, "", "", "")
 		require.NotNil(t, err)
 		assert.Equal(t, "cancelled", err.reason)
-		assert.Contains(t, err.detail, "peak-hours")
+		assert.Contains(t, err.detail, "peak hours")
 		assert.Contains(t, err.detail, "refusing until 12:00")
 	})
 
-	t.Run("title only (no details) is still surfaced", func(t *testing.T) {
-		err := cancelledRunError(string(message.FinishReasonError), "Stopped: budget exceeded", "")
-		assert.Equal(t, "Stopped: budget exceeded", err.detail)
+	t.Run("context.Canceled runErr falls through to event-loop detail", func(t *testing.T) {
+		// When runErr is bare context.Canceled, use the event-loop's
+		// recorded FinishReasonError detail instead.
+		err := cancelledRunError(
+			context.Canceled,
+			string(message.FinishReasonError),
+			"Stopped: budget exceeded",
+			"cost $5.00 exceeds max $2.00",
+		)
+		assert.Contains(t, err.detail, "budget exceeded")
 	})
 
 	t.Run("genuine unrecorded cancel falls back to bare message", func(t *testing.T) {
-		err := cancelledRunError("", "", "")
+		err := cancelledRunError(context.Canceled, "", "", "")
 		assert.Empty(t, err.detail)
 		assert.Equal(t, "run did not complete cleanly (cancelled)", err.Error())
 	})
 
 	t.Run("non-error finish reason does not leak unrelated finish text", func(t *testing.T) {
-		// e.g. a clean end_turn message that happened to still be the last
-		// one tracked when the context got cancelled for an unrelated
-		// reason — must not be misattributed as the cancel's cause.
-		err := cancelledRunError(string(message.FinishReasonEndTurn), "some unrelated title", "some unrelated detail")
+		err := cancelledRunError(context.Canceled, string(message.FinishReasonEndTurn), "some unrelated title", "some unrelated detail")
 		assert.Empty(t, err.detail)
 	})
 }

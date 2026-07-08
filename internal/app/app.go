@@ -689,7 +689,24 @@ func runFailed(finalReason string, runErr error, isCanceled bool) bool {
 // genuine, unrecorded Ctrl+C never runs AddFinish first, so finalErrTitle
 // stays empty and this falls through to the original bare behavior
 // unchanged.
-func cancelledRunError(finalReason, finalErrTitle, finalErrDetails string) *runIncompleteError {
+func cancelledRunError(runErr error, finalReason, finalErrTitle, finalErrDetails string) *runIncompleteError {
+	// 1. Check the raw runErr first: a forced mid-turn abort (peak-hours,
+	//    max-cost, max-tokens) returns a specific error via OnStepFinish
+	//    and THEN calls cancel(). Because cancel() races the event-loop
+	//    that populates finalReason/finalErrTitle, the event-loop may
+	//    never see the FinishReasonError message — but the specific error
+	//    is always available in runErr. Use it when it's richer than a
+	//    bare context.Canceled.
+	if runErr != nil {
+		errText := runErr.Error()
+		if !errors.Is(runErr, context.Canceled) && !errors.Is(runErr, context.DeadlineExceeded) && errText != "" {
+			return &runIncompleteError{reason: "cancelled", detail: errText}
+		}
+	}
+	// 2. Fallback: check the finish detail from the event-loop (works when
+	//    the event-loop DID catch the updated message before the context
+	//    died). A genuine unrecorded Ctrl+C (no FinishReasonError persisted)
+	//    still falls through to bare "cancelled".
 	if finalReason == string(message.FinishReasonError) && (finalErrTitle != "" || finalErrDetails != "") {
 		detail := finalErrTitle
 		if finalErrDetails != "" {
@@ -1077,7 +1094,7 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt 
 				if isCanceled {
 					slog.Debug("Non-interactive: agent processing cancelled", "session_id", sess.ID)
 					hookExitReason = "cancelled"
-					return cancelledRunError(finalReason, finalErrTitle, finalErrDetails)
+					return cancelledRunError(runErr, finalReason, finalErrTitle, finalErrDetails)
 				}
 				hookExitReason = "error"
 				return fmt.Errorf("agent processing failed: %w", runErr)
