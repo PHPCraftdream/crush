@@ -514,6 +514,16 @@ crush run --restrict-run --role fast \
 			}
 		}
 
+		// On Windows, filter out console-close/logoff/shutdown events so
+		// only a genuine Ctrl+C cancels the run — otherwise a plain
+		// `crush run --session X "message"` typed directly in a terminal
+		// can abort with "Context canceled" from an ordinary console event
+		// that has nothing to do with the user asking to stop. No-op on
+		// other platforms. See console_ctrl_windows.go for the full
+		// rationale.
+		uninstallConsoleCtrlFilter := installConsoleCtrlFilter()
+		defer uninstallConsoleCtrlFilter()
+
 		// Cancel on SIGINT or SIGTERM.
 		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, os.Kill)
 		defer cancel()
