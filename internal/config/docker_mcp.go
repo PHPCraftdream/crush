@@ -6,10 +6,13 @@ import (
 	"os/exec"
 	"sync"
 	"time"
+
+	"github.com/charmbracelet/crush/internal/platform"
 )
 
 var dockerMCPVersionRunner = func(ctx context.Context) error {
 	cmd := exec.CommandContext(ctx, "docker", "mcp", "version")
+	platform.HideConsoleWindow(cmd)
 	return cmd.Run()
 }
 

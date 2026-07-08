@@ -8,6 +8,8 @@ import (
 	"os/exec"
 	"runtime"
 	"time"
+
+	"github.com/charmbracelet/crush/internal/platform"
 )
 
 // Fork patch: batch 24 (run --on-finish hook), review-fix (30s timeout to prevent hangs).
@@ -28,7 +30,9 @@ func runOnFinishHook(hook, sessionID, exitReason string, cost float64, tokens in
 		cmd = exec.CommandContext(ctx, "bash", "-c", hook)
 	}
 
-	cmd.Env = append(os.Environ(),
+	platform.HideConsoleWindow(cmd)
+	cmd.Env = append(
+		os.Environ(),
 		"CRUSH_SESSION_ID="+sessionID,
 		"CRUSH_EXIT_REASON="+exitReason,
 		fmt.Sprintf("CRUSH_COST_USD=%.6f", cost),
