@@ -689,6 +689,25 @@ func runFailed(finalReason string, runErr error, isCanceled bool) bool {
 // genuine, unrecorded Ctrl+C never runs AddFinish first, so finalErrTitle
 // stays empty and this falls through to the original bare behavior
 // unchanged.
+func sessionBusyGuidance(sessionID string, err error) string {
+	var busyErr *session.SessionLockBusyError
+	holder := ""
+	switch {
+	case errors.As(err, &busyErr):
+		holder = "another live crush process"
+		if busyErr.HolderPID > 0 {
+			holder = fmt.Sprintf("crush process PID %d", busyErr.HolderPID)
+		}
+	case errors.Is(err, agent.ErrSessionBusy):
+		holder = "this crush process"
+	default:
+		return ""
+	}
+	return fmt.Sprintf(
+		"session %q is already running in %s. `crush run --session %s ...` starts a new turn and cannot attach to an active one. To push a message into the running turn, use: crush sessions inject %s -m <message>",
+		sessionID, holder, sessionID, sessionID,
+	)
+}
 func cancelledRunError(runErr error, finalReason, finalErrTitle, finalErrDetails string) *runIncompleteError {
 	// 1. Check the raw runErr first: a forced mid-turn abort (peak-hours,
 	//    max-cost, max-tokens) returns a specific error via OnStepFinish
@@ -937,10 +956,16 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt 
 	done := make(chan response, 1)
 
 	go func(ctx context.Context, sessionID, prompt string) {
-		result, err := app.AgentCoordinator.Run(ctx, sess.ID, prompt)
+		result, err := app.AgentCoordinator.Run(ctx, sessionID, prompt)
 		if err != nil {
 			done <- response{
 				err: fmt.Errorf("failed to start agent processing stream: %w", err),
+			}
+			return
+		}
+		if result == nil {
+			done <- response{
+				err: fmt.Errorf("failed to start agent processing stream: %w", agent.ErrSessionBusy),
 			}
 			return
 		}
@@ -1091,6 +1116,13 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt 
 			}
 
 			if runErr != nil {
+				if guidance := sessionBusyGuidance(sess.ID, runErr); guidance != "" {
+					slog.Warn("Non-interactive run rejected because session is already locked",
+						"session_id", sess.ID,
+						"guidance", guidance,
+						"err", runErr)
+					fmt.Fprintf(os.Stderr, "\n%s\n\n", guidance)
+				}
 				// Peak-hours refusal carries multiline orchestrator
 				// guidance (RESUME AT + don't-retry instructions) that
 				// fang's ERROR box truncates at the first newline. Print

@@ -1,6 +1,7 @@
 package session
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -98,6 +99,34 @@ func TryAcquireSessionLock(dataDir, sessionID string) (*SessionLock, error) {
 		return nil, err
 	}
 
+	lk, err := acquireSessionLockFile(path)
+	if err == nil {
+		return lk, nil
+	}
+
+	var busyErr *SessionLockBusyError
+	if !errors.As(err, &busyErr) {
+		return nil, err
+	}
+
+	// The pre-open stale check can race with another process whose heartbeat
+	// expires just after we checked but before tryLockFile reports contention.
+	// If the heartbeat is stale now, reclaim the file and try once more.
+	reclaimed, reclaimErr := reclaimStaleLock(path, "lock_contention")
+	if reclaimErr != nil {
+		return nil, reclaimErr
+	}
+	if !reclaimed {
+		return nil, busyErr
+	}
+	lk, err = acquireSessionLockFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return lk, nil
+}
+
+func acquireSessionLockFile(path string) (*SessionLock, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("TryAcquireSessionLock: open lock file: %w", err)
@@ -189,14 +218,8 @@ func removeIfStale(path string) error {
 	}
 	age := time.Since(info.ModTime())
 	if age > lockStaleDuration {
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("removeIfStale: remove stale lock %s: %w", path, err)
-		}
-		slog.Info("reclaimed stale session lock",
-			"reason", "mtime_expired",
-			"path", path,
-			"age_seconds", int(age.Seconds()))
-		return nil
+		_, err := reclaimStaleLock(path, "mtime_expired")
+		return err
 	}
 	// Fork patch (orchestrator UX, round 2 #12): PID-based fast-path. If
 	// the holder PID is dead, snap the lock immediately instead of making
@@ -217,6 +240,27 @@ func removeIfStale(path string) error {
 	return nil
 }
 
+func reclaimStaleLock(path, reason string) (bool, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("reclaimStaleLock: stat %s: %w", path, err)
+	}
+	age := time.Since(info.ModTime())
+	if age <= lockStaleDuration {
+		return false, nil
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return false, fmt.Errorf("reclaimStaleLock: remove stale lock %s: %w", path, err)
+	}
+	slog.Info("reclaimed stale session lock",
+		"reason", reason,
+		"path", path,
+		"age_seconds", int(age.Seconds()))
+	return true, nil
+}
 func sanitiseSessionID(id string) string {
 	r := strings.NewReplacer(
 		"/", "_",

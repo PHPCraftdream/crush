@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/session"
@@ -110,4 +111,32 @@ func TestSessionsInject_InterruptFlag(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, hasInterrupt)
 	require.Empty(t, drained)
+}
+
+func TestIsSessionLockAlive_FreshHeartbeatWithoutReadablePID(t *testing.T) {
+	t.Parallel()
+
+	dataDir := t.TempDir()
+	locksDir := filepath.Join(dataDir, "locks")
+	require.NoError(t, os.MkdirAll(locksDir, 0o755))
+
+	lockPath := filepath.Join(locksDir, "session-running.lock")
+	require.NoError(t, os.WriteFile(lockPath, []byte(""), 0o644))
+
+	require.True(t, isSessionLockAlive(dataDir, "running"))
+}
+
+func TestIsSessionLockAlive_StaleHeartbeat(t *testing.T) {
+	t.Parallel()
+
+	dataDir := t.TempDir()
+	locksDir := filepath.Join(dataDir, "locks")
+	require.NoError(t, os.MkdirAll(locksDir, 0o755))
+
+	lockPath := filepath.Join(locksDir, "session-stale.lock")
+	require.NoError(t, os.WriteFile(lockPath, []byte("12345\n"), 0o644))
+	stale := time.Now().Add(-25 * time.Second)
+	require.NoError(t, os.Chtimes(lockPath, stale, stale))
+
+	require.False(t, isSessionLockAlive(dataDir, "stale"))
 }

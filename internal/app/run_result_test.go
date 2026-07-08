@@ -10,6 +10,7 @@ import (
 
 	"github.com/charmbracelet/crush/internal/agent"
 	"github.com/charmbracelet/crush/internal/message"
+	"github.com/charmbracelet/crush/internal/session"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -268,10 +269,22 @@ func TestRunIncompleteError_Message(t *testing.T) {
 		(&runIncompleteError{reason: "cancelled"}).Error())
 }
 
+func TestSessionBusyGuidance(t *testing.T) {
+	queued := sessionBusyGuidance("s1", fmt.Errorf("outer: %w", agent.ErrSessionBusy))
+	assert.Contains(t, queued, "this crush process")
+	assert.Contains(t, queued, "crush sessions inject s1 -m <message>")
+
+	locked := sessionBusyGuidance("s2", fmt.Errorf("outer: %w", &session.SessionLockBusyError{HolderPID: 1234, Path: "lock"}))
+	assert.Contains(t, locked, "crush process PID 1234")
+	assert.Contains(t, locked, "crush run --session s2")
+
+	assert.Empty(t, sessionBusyGuidance("s3", errors.New("other")))
+}
+
 // TestCancelledRunError pins the terse/--stream isCanceled path: a forced
 // abort (peak-hours mid-turn stop, max-cost, max-tokens) cancels the run's
 // context, which can race the specific error into a generic
-// context.Canceled — this must not throw away the FinishReasonError detail
+// context.Canceled - this must not throw away the FinishReasonError detail
 // that was already persisted on the assistant message. A genuine,
 // unrecorded Ctrl+C (no FinishReasonError message) must still fall back to
 // the bare "cancelled" text.

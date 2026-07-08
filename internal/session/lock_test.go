@@ -213,6 +213,25 @@ func TestTryAcquireSessionLock_LiveOrphanPIDStillBusy(t *testing.T) {
 	assert.NoError(t, statErr, "lock for a live PID must survive removeIfStale")
 }
 
+func TestReclaimStaleLock(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "locks", "session-stale.lock")
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+
+	require.NoError(t, os.WriteFile(path, []byte("12345\n"), 0o644))
+	fresh, err := reclaimStaleLock(path, "test")
+	require.NoError(t, err)
+	assert.False(t, fresh)
+	require.FileExists(t, path)
+
+	staleTime := time.Now().Add(-(lockStaleDuration + time.Second))
+	require.NoError(t, os.Chtimes(path, staleTime, staleTime))
+	reclaimed, err := reclaimStaleLock(path, "test")
+	require.NoError(t, err)
+	assert.True(t, reclaimed)
+	_, err = os.Stat(path)
+	assert.True(t, os.IsNotExist(err))
+}
 func TestTryAcquireSessionLock_FreshLockIsRespected(t *testing.T) {
 	dir := t.TempDir()
 	// Acquire a real lock so the file is fresh and OS-locked.

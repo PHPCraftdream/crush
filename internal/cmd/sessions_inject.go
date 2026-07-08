@@ -93,7 +93,7 @@ func sessionsInjectCmdRun(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	running := isSessionLockAlive(cmd, sess.ID)
+	running := isSessionLockAlive(a.Config().Options.DataDirectory, sess.ID)
 
 	status := "injected"
 	switch {
@@ -187,23 +187,17 @@ func doInject(
 }
 
 // isSessionLockAlive reports whether a live process currently holds this
-// session's lock. It reuses the same heartbeat model as `sessions locks`:
-// a lock whose mtime is within the stale window ("offline" threshold) and
-// whose PID is alive counts as running. Returns false when the lock is
-// absent, stale, or held by a dead PID.
-func isSessionLockAlive(cmd *cobra.Command, sessionID string) bool {
-	cwd, err := ResolveCwd(cmd)
-	if err != nil {
+// session's lock. The heartbeat mtime is authoritative: on Windows the
+// exclusive lock prevents reading the PID while the holder is alive, so a
+// fresh lock with PID 0 still means "running".
+func isSessionLockAlive(dataDir, sessionID string) bool {
+	if dataDir == "" || sessionID == "" {
 		return false
 	}
-	lockPath := filepath.Join(cwd, ".crush", "locks", "session-"+sanitiseSessionIDForFilename(sessionID)+".lock")
+	lockPath := filepath.Join(dataDir, "locks", "session-"+sanitiseSessionIDForFilename(sessionID)+".lock")
 	info, err := os.Stat(lockPath)
 	if err != nil {
 		return false
 	}
-	if lockPulseStatus(int64(time.Since(info.ModTime()).Seconds())) == "offline" {
-		return false
-	}
-	pid := session.ReadLockPID(lockPath)
-	return pid > 0 && session.IsProcessAlive(pid)
+	return lockPulseStatus(int64(time.Since(info.ModTime()).Seconds())) != "offline"
 }
