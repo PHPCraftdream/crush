@@ -1279,11 +1279,16 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 		},
 	})
 	// If the peak-hours mid-turn check fired, it had to call cancelFn()
-	// to break fantasy's loop (OnStepFinish errors alone don't stop it),
-	// which makes fantasy return context.Canceled — losing our specific
-	// *PeakHoursError. Swap it back in so the coordinator and
-	// RunNonInteractive see the real reason.
-	if peakHoursAbortErr != nil && errors.Is(err, context.Canceled) {
+	// to break fantasy's loop (OnStepFinish errors alone don't stop it).
+	// Depending on exactly when fantasy notices the cancellation relative
+	// to finishing the in-flight step, agent.Stream can come back with
+	// context.Canceled OR — if the step's own work had already fully
+	// completed by the time cancelFn() fired — a nil error, as if the
+	// turn ended cleanly. Either way, once peakHoursAbortErr is set it is
+	// authoritative for this Run() call: force it in unconditionally so
+	// the coordinator and RunNonInteractive never mistake this abort for
+	// a successful completion or a bare, unexplained cancellation.
+	if peakHoursAbortErr != nil {
 		err = peakHoursAbortErr
 	}
 	if err != nil {
@@ -1364,6 +1369,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 		}
 		var fantasyErr *fantasy.Error
 		var providerErr *fantasy.ProviderError
+		var peakErr *PeakHoursError
 		const defaultTitle = "Provider Error"
 		if isWatchdogStall {
 			// Close the observability loop: the watchdog goroutine already
@@ -1414,6 +1420,16 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			}
 		} else if errors.As(err, &fantasyErr) {
 			currentAssistant.AddFinish(message.FinishReasonError, cmp.Or(stringext.Capitalize(fantasyErr.Title), defaultTitle), fantasyErr.Message)
+		} else if errors.As(err, &peakErr) {
+			// Re-derive the same (msg, details) OnStepFinish's peak-hours
+			// check already wrote (with the RESUME AT guidance) — this
+			// path (err forced to peakHoursAbortErr) ALSO reaches here,
+			// and AddFinish always replaces the prior finish part, so
+			// without this branch the generic `else` below would
+			// overwrite the useful message with a bare "Provider Error:
+			// <terse text>" that drops the resume-time guidance entirely.
+			peakMsg, peakDetails := peakHoursStoppedFinishText(err)
+			currentAssistant.AddFinish(message.FinishReasonError, peakMsg, peakDetails)
 		} else {
 			currentAssistant.AddFinish(message.FinishReasonError, defaultTitle, err.Error())
 		}
