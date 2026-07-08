@@ -5,38 +5,55 @@ package cmd
 import (
 	"os"
 
+	"golang.org/x/sys/windows"
 	"golang.org/x/term"
 )
 
-var procFreeConsole = kernel32DLL.NewProc("FreeConsole")
+var (
+	procFreeConsole      = kernel32DLL.NewProc("FreeConsole")
+	procAllocConsole     = kernel32DLL.NewProc("AllocConsole")
+	procGetConsoleWindow = kernel32DLL.NewProc("GetConsoleWindow")
 
-// maybeDetachConsole detaches `crush run` from its console when ALL THREE
-// standard streams are redirected (not a terminal) — the orchestrator
-// launch pattern (`crush run < prompt > out 2> err`, often backgrounded
-// with `&` from a wrapper shell that exits immediately).
+	user32DLL      = windows.NewLazySystemDLL("user32.dll")
+	procShowWindow = user32DLL.NewProc("ShowWindow")
+)
+
+const swHide = 0
+
+// maybeDetachConsole gives `crush run` its OWN hidden console when ALL
+// THREE standard streams are redirected (not a terminal) — the
+// orchestrator launch pattern (`crush run < prompt > out 2> err`, often
+// backgrounded with `&` from a wrapper shell that exits instantly).
 //
-// Why: when the wrapper shell exits and its console goes away, Windows
-// sends CTRL_CLOSE_EVENT to every process attached to that console — and
-// for CTRL_CLOSE_EVENT the process is ALWAYS terminated after the handler
-// chain returns. Handling the event (see installConsoleCtrlFilter) only
-// suppresses the confirmation UI; the kill itself cannot be prevented from
-// inside a handler. Observed as: a detached `crush run` dying silently
-// ~5-15s after its wrapper exited, with an orphan session lock, zero
-// stderr output, and no log entries — the OS TerminateProcess()'d it
-// mid-boot or mid-stream.
+// Why FreeConsole+AllocConsole, not just FreeConsole: when the wrapper
+// shell exits and ITS console goes away, Windows sends CTRL_CLOSE_EVENT to
+// every process still attached to that console — and for CTRL_CLOSE_EVENT
+// the process is ALWAYS terminated once the handler chain returns; handling
+// the event (installConsoleCtrlFilter) only suppresses the confirmation
+// UI, the kill itself cannot be prevented from inside a handler. Observed
+// in the wild: SessionAgent.Run started, lock created, dead before the
+// first heartbeat tick, zero stderr, zero log entries — the OS
+// TerminateProcess()'d it mid-boot.
 //
-// The only real escape is to not be attached to the dying console at all:
-// FreeConsole(). With no console there is no CTRL_CLOSE_EVENT, no console
-// ctrl anything — the process lives until it finishes or is killed
-// explicitly (taskkill / `crush sessions kill`), which is exactly the
-// contract a detached orchestrator run wants. --timeout and the hard-kill
-// backstop still bound the runtime. The redirect-target file handles are
-// not console handles, so they survive FreeConsole untouched and output
-// keeps flowing into the redirect files.
+// A bare FreeConsole() (no console at all) fixes the kill, but has a side
+// effect: mvdan.cc/sh's DefaultExecHandler (which runs every bash-tool
+// command) spawns children via a bare exec.Cmd with no SysProcAttr set —
+// upstream code we don't control. With no console to inherit, Windows
+// allocates a FRESH, visible console for every single tool invocation,
+// which flashes on screen and off again per command. AllocConsole() right
+// after FreeConsole() gives crush its own console — owned by crush, not
+// the dying wrapper, so CTRL_CLOSE_EVENT from the wrapper's death can't
+// reach it — which child processes then inherit instead of each spawning
+// their own. Hiding that console's window (ShowWindow SW_HIDE) keeps it
+// invisible throughout.
+//
+// The redirect-target file handles are not console handles, so they
+// survive both calls untouched and output keeps flowing into the redirect
+// files.
 //
 // When any stream IS a terminal (an operator typed `crush run ...`
-// interactively), we stay attached: Ctrl+C must keep working, and dying
-// with the terminal tab is the expected interactive behavior.
+// interactively), we do none of this: Ctrl+C must keep working normally,
+// and closing your own terminal tab ending the run is expected behavior.
 func maybeDetachConsole() {
 	if term.IsTerminal(int(os.Stdin.Fd())) ||
 		term.IsTerminal(int(os.Stdout.Fd())) ||
@@ -44,4 +61,14 @@ func maybeDetachConsole() {
 		return
 	}
 	_, _, _ = procFreeConsole.Call()
+	if r1, _, _ := procAllocConsole.Call(); r1 == 0 {
+		// AllocConsole failed (rare) — nothing more we can do; the run
+		// proceeds console-less, same as the earlier bare-FreeConsole
+		// behavior (still immune to CTRL_CLOSE_EVENT, just with the
+		// per-tool-call window flash this function otherwise avoids).
+		return
+	}
+	if hwnd, _, _ := procGetConsoleWindow.Call(); hwnd != 0 {
+		_, _, _ = procShowWindow.Call(hwnd, swHide)
+	}
 }
