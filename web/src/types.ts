@@ -100,33 +100,6 @@ export interface Message {
   BackgroundJobNotice: boolean;
 }
 
-export interface PermissionRequest {
-  ID: string;
-  SessionID: string;
-  ToolCallID: string;
-  ToolName: string;
-  Description: string;
-  Action: string;
-  Path: string;
-  Params: unknown;
-}
-
-export interface PermissionRule {
-  ID: string;
-  SessionID: string;
-  ToolName: string;
-  Action: string;
-  Path: string;
-  CreatedAt: number;
-  Enabled: boolean;
-}
-
-export interface PermissionNotification {
-  ToolCallID: string;
-  Granted: boolean;
-  Denied: boolean;
-}
-
 export interface ModelInfo {
   id: string;
   name: string;

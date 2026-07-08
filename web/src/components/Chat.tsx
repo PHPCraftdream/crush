@@ -20,7 +20,6 @@ import {
 import { ws } from "../ws";
 import { Message, ToolActivityGroup, IntermediateAssistantMessage } from "./Message";
 import { ChatInput } from "./ChatInput";
-import { PermissionDialog } from "./PermissionDialog";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { ChatToolbar } from "./ChatToolbar";
 import { TodoList } from "./TodoList";
@@ -511,7 +510,6 @@ export function Chat() {
       {activeSessionID && <TodoList sessionID={activeSessionID} todos={todos} />}
 
       <ChatToolbar />
-      <PermissionDialog />
       <ChatInput />
 
       {confirm && (

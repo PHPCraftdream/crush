@@ -19,7 +19,6 @@ import (
 	appPkg "github.com/charmbracelet/crush/internal/app"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/message"
-	"github.com/charmbracelet/crush/internal/permission"
 	"github.com/charmbracelet/crush/internal/session"
 	"github.com/charmbracelet/crush/internal/skills"
 	"github.com/charmbracelet/crush/internal/version"
@@ -59,18 +58,6 @@ func handleIncoming(ctx context.Context, a *appPkg.App, c *Client, raw []byte) {
 		go handleListSessions(ctx, a, c, msg)
 	case CmdLoadMessages:
 		go handleLoadMessages(ctx, a, c, msg)
-	case CmdGrantPermission:
-		go handleGrantPermission(a, c, msg, false)
-	case CmdGrantPermissionPersistent:
-		go handleGrantPermission(a, c, msg, true)
-	case CmdDenyPermission:
-		go handleDenyPermission(a, c, msg)
-	case CmdListSessionPermissions:
-		go handleListSessionPermissions(ctx, a, c, msg)
-	case CmdUpdatePermissionRule:
-		go handleUpdatePermissionRule(a, c, msg)
-	case CmdDeletePermissionRule:
-		go handleDeletePermissionRule(a, c, msg)
 	case CmdGetConfig:
 		go handleGetConfig(a, c, msg)
 	case CmdGetLogs:
@@ -173,6 +160,20 @@ func saveAttachmentToDisk(workingDir, fileName string, data []byte) (string, err
 	return path, nil
 }
 
+// autoApproveWebSession marks a session for blanket permission auto-approval.
+// In the web UI there is no permission dialog — the agent must never block
+// waiting for a user to grant/deny a tool call. This mirrors the
+// non-interactive `crush run` path (app.RunNonInteractive →
+// Permissions.AutoApproveSession). It is idempotent: re-arming an
+// already-approved session is a no-op. The restricted-run allowlist is NOT
+// armed here (unlike `crush run`), so approval is unconditional.
+func autoApproveWebSession(a *appPkg.App, sessionID string) {
+	if a == nil || a.Permissions == nil || sessionID == "" {
+		return
+	}
+	a.Permissions.AutoApproveSession(sessionID)
+}
+
 func handleSendMessage(ctx context.Context, a *appPkg.App, c *Client, msg WSMessage) {
 	var p SendMessagePayload
 	if err := json.Unmarshal(msg.Payload, &p); err != nil {
@@ -210,6 +211,7 @@ func handleSendMessage(ctx context.Context, a *appPkg.App, c *Client, msg WSMess
 	}
 
 	// A human re-entering the loop re-arms Phase 4 autonomy for this session.
+	autoApproveWebSession(a, p.SessionID)
 	a.AgentCoordinator.ResetAutoResumeCounter(p.SessionID)
 
 	// Priority:
@@ -296,6 +298,7 @@ func handleInterruptAndSend(ctx context.Context, a *appPkg.App, c *Client, msg W
 	}
 
 	// A human re-entering the loop re-arms Phase 4 autonomy for this session.
+	autoApproveWebSession(a, p.SessionID)
 	a.AgentCoordinator.ResetAutoResumeCounter(p.SessionID)
 
 	// Same attachments path as handleSendMessage: save to disk, append paths
@@ -369,6 +372,7 @@ func handleInjectMessage(ctx context.Context, a *appPkg.App, c *Client, msg WSMe
 	}
 
 	// A human re-entering the loop re-arms Phase 4 autonomy for this session.
+	autoApproveWebSession(a, p.SessionID)
 	a.AgentCoordinator.ResetAutoResumeCounter(p.SessionID)
 
 	// Same attachments path as handleSendMessage.
@@ -539,6 +543,8 @@ func handleCreateSession(ctx context.Context, a *appPkg.App, c *Client, msg WSMe
 		c.reply(msg.ID, EventError, nil, err.Error())
 		return
 	}
+	// Web sessions never prompt for permissions — arm auto-approve at birth.
+	autoApproveWebSession(a, sess.ID)
 
 	// Set default models from config for the new session immediately
 	cfg := a.Config()
@@ -603,6 +609,8 @@ func handleForkSession(ctx context.Context, a *appPkg.App, c *Client, msg WSMess
 		c.reply(msg.ID, EventError, nil, err.Error())
 		return
 	}
+	// Web sessions never prompt for permissions — arm auto-approve at birth.
+	autoApproveWebSession(a, fork.ID)
 
 	// Copy models from source
 	if src.LargeModelProvider != "" || src.SmallModelProvider != "" {
@@ -804,78 +812,6 @@ func handleLoadMessages(ctx context.Context, a *appPkg.App, c *Client, msg WSMes
 		"SessionID": p.SessionID,
 		"Messages":  toMessagesWire(msgs),
 	}, "")
-}
-
-func handleGrantPermission(a *appPkg.App, c *Client, msg WSMessage, persistent bool) {
-	var p PermissionResponsePayload
-	if err := json.Unmarshal(msg.Payload, &p); err != nil {
-		c.reply(msg.ID, EventError, nil, "invalid payload")
-		return
-	}
-	req := permission.PermissionRequest{ID: p.PermissionID}
-	if persistent {
-		a.Permissions.GrantPersistent(req)
-	} else {
-		a.Permissions.Grant(req)
-	}
-}
-
-func handleDenyPermission(a *appPkg.App, c *Client, msg WSMessage) {
-	var p PermissionResponsePayload
-	if err := json.Unmarshal(msg.Payload, &p); err != nil {
-		c.reply(msg.ID, EventError, nil, "invalid payload")
-		return
-	}
-	a.Permissions.Deny(permission.PermissionRequest{ID: p.PermissionID})
-}
-
-func handleListSessionPermissions(ctx context.Context, a *appPkg.App, c *Client, msg WSMessage) {
-	var p ListSessionPermissionsPayload
-	if err := json.Unmarshal(msg.Payload, &p); err != nil {
-		c.reply(msg.ID, EventError, nil, "invalid payload")
-		return
-	}
-
-	permissions, err := a.Permissions.ListSessionPermissions(p.SessionID)
-	if err != nil {
-		slog.Warn("ws: failed to query session permissions", "err", err)
-		c.reply(msg.ID, EventError, nil, "failed to query permissions")
-		return
-	}
-
-	c.reply(msg.ID, "session_permissions", permissions, "")
-}
-
-func handleUpdatePermissionRule(a *appPkg.App, c *Client, msg WSMessage) {
-	var p UpdatePermissionRulePayload
-	if err := json.Unmarshal(msg.Payload, &p); err != nil {
-		c.reply(msg.ID, EventError, nil, "invalid payload")
-		return
-	}
-
-	if err := a.Permissions.UpdatePermissionEnabled(p.RuleID, p.Enabled); err != nil {
-		slog.Warn("ws: failed to update permission rule", "err", err)
-		c.reply(msg.ID, EventError, nil, "failed to update rule")
-		return
-	}
-
-	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
-}
-
-func handleDeletePermissionRule(a *appPkg.App, c *Client, msg WSMessage) {
-	var p DeletePermissionRulePayload
-	if err := json.Unmarshal(msg.Payload, &p); err != nil {
-		c.reply(msg.ID, EventError, nil, "invalid payload")
-		return
-	}
-
-	if err := a.Permissions.DeletePermission(p.RuleID); err != nil {
-		slog.Warn("ws: failed to delete permission rule", "err", err)
-		c.reply(msg.ID, EventError, nil, "failed to delete rule")
-		return
-	}
-
-	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
 }
 
 func buildConfigWire(a *appPkg.App) (ConfigWire, bool) {
@@ -2085,6 +2021,9 @@ func handleRerunMessage(ctx context.Context, a *appPkg.App, c *Client, msg WSMes
 		c.reply(msg.ID, EventError, nil, "agent not configured")
 		return
 	}
+
+	// Web sessions never prompt for permissions.
+	autoApproveWebSession(a, sessionID)
 
 	// 1. Cancel + clear queue if busy, then poll until idle (up to 10s).
 	a.AgentCoordinator.Cancel(sessionID)

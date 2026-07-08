@@ -1,5 +1,5 @@
 import { atom, computed } from "nanostores";
-import type { Session, Message, ContentPart, PermissionRequest, PermissionRule, ConfigPayload, MCPState, Todo, SkillInfo } from "./types";
+import type { Session, Message, ContentPart, ConfigPayload, MCPState, Todo, SkillInfo } from "./types";
 
 // ── Connection state ─────────────────────────────────────────────────────────
 export const $connected = atom(false);
@@ -10,8 +10,6 @@ export const $skills = atom<SkillInfo[]>([]);
 export const $sessions = atom<Session[]>([]);
 export const $activeSessionID = atom<string | null>(null);
 export const $messages = atom<Message[]>([]);
-export const $permissions = atom<PermissionRequest[]>([]);
-export const $permissionRules = atom<Map<string, PermissionRule[]>>(new Map()); // sessionID -> rules
 export const $config = atom<ConfigPayload | null>(null);
 export const $mcpState = atom<MCPState | null>(null);
 export const $busySessions = atom<Set<string>>(new Set());
@@ -116,7 +114,6 @@ export function removeSession(id: string) {
 export function setActiveSession(id: string | null) {
   $activeSessionID.set(id);
   $messages.set([]);
-  $permissions.set([]);  // Clear permission dialogs when switching sessions
   $agentError.set(null);
   if (id) {
     window.location.hash = `#/${id}`;
@@ -247,57 +244,6 @@ export function upsertMessage(msg: Message) {
 
 export function removeMessage(id: string) {
   $messages.set($messages.get().filter((m) => m.ID !== id));
-}
-
-export function addPermission(p: PermissionRequest) {
-  $permissions.set([...$permissions.get(), p]);
-}
-
-export function removePermission(toolCallID: string) {
-  $permissions.set(
-    $permissions.get().filter((p) => p.ToolCallID !== toolCallID)
-  );
-}
-
-// ── Permission Rules (persistent permissions) ─────────────────────────────
-
-export function setPermissionRules(sessionID: string, rules: PermissionRule[]) {
-  const map = new Map($permissionRules.get());
-  map.set(sessionID, rules);
-  $permissionRules.set(map);
-}
-
-export function getPermissionRules(sessionID: string): PermissionRule[] {
-  return $permissionRules.get().get(sessionID) || [];
-}
-
-export function togglePermissionRule(sessionID: string, ruleID: string) {
-  const map = new Map($permissionRules.get());
-  const rules = (map.get(sessionID) || []).map((r) =>
-    r.ID === ruleID ? { ...r, Enabled: !r.Enabled } : r
-  );
-  map.set(sessionID, rules);
-  $permissionRules.set(map);
-
-  // Sync to backend
-  const rule = rules.find((r) => r.ID === ruleID);
-  if (rule) {
-    ws.send("update_permission_rule", { ruleID, enabled: rule.Enabled });
-  }
-}
-
-export function deletePermissionRule(sessionID: string, ruleID: string) {
-  const map = new Map($permissionRules.get());
-  const rules = (map.get(sessionID) || []).filter((r) => r.ID !== ruleID);
-  map.set(sessionID, rules);
-  $permissionRules.set(map);
-
-  // Sync to backend
-  ws.send("delete_permission_rule", { ruleID });
-}
-
-export function fetchPermissionRules(sessionID: string) {
-  ws.send("list_session_permissions", { sessionID });
 }
 
 export function registerSubAgentSession(subSessionID: string, parentSessionID: string) {

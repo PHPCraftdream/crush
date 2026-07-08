@@ -20,8 +20,6 @@ const (
 	EventSessionCreated         = "session_created"
 	EventSessionUpdated         = "session_updated"
 	EventSessionDeleted         = "session_deleted"
-	EventPermissionRequest      = "permission_request"
-	EventPermissionNotification = "permission_notification"
 	EventFileUpdated            = "file_updated"
 	EventMCPState               = "mcp_state"
 	EventLSPState               = "lsp_state"
@@ -51,12 +49,6 @@ const (
 	CmdDeleteOtherSessions       = "delete_other_sessions"
 	CmdListSessions              = "list_sessions"
 	CmdLoadMessages              = "load_messages"
-	CmdGrantPermission           = "grant_permission"
-	CmdGrantPermissionPersistent = "grant_permission_persistent"
-	CmdDenyPermission            = "deny_permission"
-	CmdListSessionPermissions    = "list_session_permissions"
-	CmdUpdatePermissionRule      = "update_permission_rule"
-	CmdDeletePermissionRule      = "delete_permission_rule"
 	CmdGetConfig                 = "get_config"
 	CmdGetLogs                   = "get_logs"
 	CmdSetTheme                  = "set_theme"
@@ -134,11 +126,6 @@ type DeleteOtherSessionsPayload struct {
 
 type LoadMessagesPayload struct {
 	SessionID string `json:"sessionID"`
-}
-
-// PermissionResponsePayload is sent by the client when granting or denying a permission.
-type PermissionResponsePayload struct {
-	PermissionID string `json:"permissionID"`
 }
 
 type SetThemePayload struct {
@@ -406,19 +393,6 @@ type DeleteMessagePayload struct {
 
 type DeleteMessagesPayload struct {
 	MessageIDs []string `json:"messageIDs"`
-}
-
-type ListSessionPermissionsPayload struct {
-	SessionID string `json:"sessionID"`
-}
-
-type UpdatePermissionRulePayload struct {
-	RuleID  string `json:"ruleID"`
-	Enabled bool   `json:"enabled"`
-}
-
-type DeletePermissionRulePayload struct {
-	RuleID string `json:"ruleID"`
 }
 
 type UpdateMessageContentPayload struct {

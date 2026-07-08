@@ -10,7 +10,6 @@ import (
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/history"
 	"github.com/charmbracelet/crush/internal/message"
-	"github.com/charmbracelet/crush/internal/permission"
 	"github.com/charmbracelet/crush/internal/pubsub"
 	"github.com/charmbracelet/crush/internal/session"
 )
@@ -94,38 +93,6 @@ func subscribeAndBroadcast(ctx context.Context, a *appPkg.App, h *Hub) {
 		}
 	}()
 
-	// Permission requests
-	go func() {
-		ch := a.Permissions.Subscribe(ctx)
-		for {
-			select {
-			case ev, ok := <-ch:
-				if !ok {
-					return
-				}
-				h.Broadcast(EventPermissionRequest, ev.Payload)
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-
-	// Permission notifications
-	go func() {
-		ch := a.Permissions.SubscribeNotifications(ctx)
-		for {
-			select {
-			case ev, ok := <-ch:
-				if !ok {
-					return
-				}
-				h.Broadcast(EventPermissionNotification, ev.Payload)
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-
 	// File history
 	go func() {
 		ch := a.History.Subscribe(ctx)
@@ -164,7 +131,6 @@ func subscribeAndBroadcast(ctx context.Context, a *appPkg.App, h *Hub) {
 	// Unused imports guard ΓÇö referenced through the generic channels above.
 	_ = session.Session{}
 	_ = message.Message{}
-	_ = permission.PermissionRequest{}
 	_ = history.File{}
 }
 

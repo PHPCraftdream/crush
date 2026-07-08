@@ -14,11 +14,8 @@ import {
   setMessages,
   upsertMessage,
   removeMessage,
-  addPermission,
-  removePermission,
   setSessionBusy,
   setActiveSession,
-  setPermissionRules,
   $recentLargeModels,
   $recentSmallModels,
   trackModelUsage,
@@ -33,7 +30,7 @@ import {
   setSubAgentMessages,
   trackMessageParts,
 } from "./store";
-import type { WSMessage, Session, Message, PermissionRequest, ConfigPayload, MCPState, AgentBusyPayload, SkillsSnapshot, SummarizeQueuedPayload } from "./types";
+import type { WSMessage, Session, Message, ConfigPayload, MCPState, AgentBusyPayload, SkillsSnapshot, SummarizeQueuedPayload } from "./types";
 import { isKeepAliveRunning, startKeepAlive, stopKeepAlive, installKeepAliveAutoResume } from "./keepAlive";
 import { installSitterAutoRestore } from "./sitter";
 
@@ -235,46 +232,6 @@ export function useWS() {
         const activeID = $activeSessionID.get();
         if (sid && activeID && sid !== activeID) return;
         setMessages(msgs);
-      }),
-
-      ws.on("permission_request", (msg: WSMessage) => {
-        const p = msg.payload as PermissionRequest;
-        // Only process permissions for the active session
-        if (p.SessionID !== $activeSessionID.get()) return;
-        addPermission(p);
-      }),
-      ws.on("permission_notification", (msg: WSMessage) =>
-        removePermission((msg.payload as { ToolCallID: string }).ToolCallID)
-      ),
-
-      ws.on("session_permissions", (msg: WSMessage) => {
-        const rules = msg.payload as Array<{
-          id: string;
-          session_id: string;
-          tool_name: string;
-          action: string;
-          path: string;
-          created_at: number;
-          enabled: number;
-        }>;
-
-        if (!rules || rules.length === 0) {
-          setPermissionRules($activeSessionID.get() || "", []);
-          return;
-        }
-
-        // Convert to frontend format
-        const permissionRules = rules.map(r => ({
-          ID: r.id,
-          SessionID: r.session_id,
-          ToolName: r.tool_name,
-          Action: r.action,
-          Path: r.path,
-          CreatedAt: r.created_at,
-          Enabled: r.enabled !== 0,
-        }));
-
-        setPermissionRules($activeSessionID.get() || "", permissionRules);
       }),
 
       ws.on("config", (msg: WSMessage) => {
