@@ -256,6 +256,14 @@ type sessionAgent struct {
 	// summarizeQueue holds a pending manual-summarise request per session,
 	// queued while the session was busy.
 	summarizeQueue *csync.Map[string, fantasy.ProviderOptions]
+	// peakHoursCheck, when non-nil, is called once per step from
+	// OnStepFinish to re-check whether the large model's provider has
+	// entered its peak_hours refusal window mid-turn. Returns nil while
+	// outside the window. Plumbed from coordinator.buildAgent, which is
+	// the only layer with access to config.ProviderConfig — sessionAgent
+	// itself only knows about Model (SelectedModel + catwalk metadata),
+	// not the provider's peak_hours setting.
+	peakHoursCheck func() error
 }
 
 type SessionAgentOptions struct {
@@ -303,6 +311,10 @@ type SessionAgentOptions struct {
 	// built-in toolExecutionMaxDefault (15m). Plumbed from
 	// Options.StreamToolTimeoutSeconds in the coordinator.
 	ToolMaxDuration time.Duration
+	// PeakHoursCheck, when non-nil, is called once per step to re-check
+	// whether the large model's provider has entered its peak_hours
+	// window mid-turn. See the field doc on sessionAgent.peakHoursCheck.
+	PeakHoursCheck func() error
 }
 
 func NewSessionAgent(
@@ -330,6 +342,7 @@ func NewSessionAgent(
 		timeoutExtendsOnProgress: opts.TimeoutExtendsOnProgress,
 		timeoutHardCap:           opts.TimeoutHardCap,
 		toolMaxDuration:          opts.ToolMaxDuration,
+		peakHoursCheck:           opts.PeakHoursCheck,
 	}
 }
 
@@ -1184,6 +1197,29 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 				}
 				return fmt.Errorf("session %s aborted: %d tokens exceeds max %d",
 					call.SessionID, totalTokens, call.MaxTokens)
+			}
+
+			// Fork patch: peak-hours is normally only checked once, at the
+			// START of a turn (coordinator.buildCall/runInternal) — an
+			// already-in-flight turn was never re-checked, so a long turn
+			// that started before the window opened ran straight through
+			// it. Re-check here, once per step, so a turn stops as soon as
+			// the provider enters its peak-hours window, not just on the
+			// next NEW invocation.
+			if a.peakHoursCheck != nil {
+				if pErr := a.peakHoursCheck(); pErr != nil {
+					slog.Warn("agent: aborting — provider entered peak-hours mid-turn",
+						"session_id", call.SessionID, "error", pErr)
+					peakMsg, peakDetails := peakHoursStoppedFinishText(pErr)
+					currentAssistant.AddFinish(message.FinishReasonError, peakMsg, peakDetails)
+					if uErr := a.messages.Update(genCtx, *currentAssistant); uErr != nil {
+						return uErr
+					}
+					if cancelFn, ok := a.activeRequests.Get(call.SessionID); ok {
+						cancelFn()
+					}
+					return pErr
+				}
 			}
 
 			return a.messages.Update(genCtx, *currentAssistant)

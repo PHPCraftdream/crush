@@ -101,6 +101,28 @@ var (
 	errProviderPeakHours = errors.New("provider is inside its configured peak-hours window")
 )
 
+// PeakHoursError is the concrete error checkPeakHours returns while a
+// provider is inside its configured peak_hours window. It carries the exact
+// reopen time as a time.Time (not just formatted into the error string) so
+// callers that need to act on it precisely — e.g. an orchestrating agent
+// scheduling a resume — don't have to parse Error()'s text.
+type PeakHoursError struct {
+	ProviderID string
+	Start, End string // HH:MM, as configured
+	ReopensAt  time.Time
+}
+
+func (e *PeakHoursError) Error() string {
+	return fmt.Sprintf(
+		"provider %s is in peak hours (%s–%s), refusing until %s",
+		e.ProviderID, e.Start, e.End, e.ReopensAt.Format("15:04"),
+	)
+}
+
+// Unwrap lets errors.Is(err, errProviderPeakHours) keep working for callers
+// that only care about the error class, not the structured detail.
+func (e *PeakHoursError) Unwrap() error { return errProviderPeakHours }
+
 // Copilot models that use the Responses API instead of Chat Completions.
 var copilotResponsesModels = map[string]bool{
 	"gpt-5.2":       true,
@@ -490,7 +512,7 @@ func (c *coordinator) buildCall(ctx context.Context, sessionID, prompt string, a
 		return SessionAgentCall{}, errModelProviderNotConfigured
 	}
 	if err := checkPeakHours(providerCfg); err != nil {
-		return SessionAgentCall{}, err
+		return SessionAgentCall{}, wrapPeakHoursError(err)
 	}
 
 	mergedOptions, temp, topP, topK, freqPenalty, presPenalty := mergeCallOptions(model, providerCfg)
@@ -545,7 +567,7 @@ func (c *coordinator) runInternal(ctx context.Context, sessionID string, prompt 
 	c.runLimitsMu.Unlock()
 	if !allowPeak {
 		if err := checkPeakHours(providerCfg); err != nil {
-			return nil, err
+			return nil, wrapPeakHoursError(err)
 		}
 	}
 
@@ -1133,6 +1155,17 @@ func (c *coordinator) buildAgent(ctx context.Context, prompt *prompt.Prompt, age
 		ToolMaxDuration:      toolMaxDuration,
 		DataDirectory:        c.cfg.Config().Options.DataDirectory,
 		CheckpointInterval:   checkpointInterval, // Fork patch: batch 8
+		// Fork patch: peak-hours mid-turn re-check. Re-reads the provider
+		// config live (not the largeProviderCfg captured above) so a
+		// peak_hours edit made while this turn is running still takes
+		// effect on the very next step.
+		PeakHoursCheck: func() error {
+			pc, ok := c.cfg.Config().Providers.Get(large.ModelCfg.Provider)
+			if !ok {
+				return nil
+			}
+			return checkPeakHours(pc)
+		},
 	})
 
 	c.readyWg.Go(func() error {
@@ -1954,7 +1987,7 @@ func (c *coordinator) Summarize(ctx context.Context, sessionID string) error {
 		return errModelProviderNotConfigured
 	}
 	if err := checkPeakHours(providerCfg); err != nil {
-		return err
+		return wrapPeakHoursError(err)
 	}
 
 	if err := c.refreshTokenIfExpired(ctx, providerCfg); err != nil {
@@ -1999,10 +2032,12 @@ func checkPeakHours(providerCfg config.ProviderConfig) error {
 		"available_again", end.Format("15:04"),
 		"in", time.Until(end).Round(time.Minute).String(),
 	)
-	return fmt.Errorf(
-		"%w: provider %s is in peak hours (%s–%s), refusing until %s",
-		errProviderPeakHours, providerCfg.ID, w.Start, w.End, end.Format("15:04"),
-	)
+	return &PeakHoursError{
+		ProviderID: providerCfg.ID,
+		Start:      w.Start,
+		End:        w.End,
+		ReopensAt:  end,
+	}
 }
 
 // runWithUnauthorizedRetry executes fn. If fn returns a 401 error, it
@@ -2120,7 +2155,7 @@ func (c *coordinator) runSubAgent(ctx context.Context, params subAgentParams) (f
 		return fantasy.ToolResponse{}, errModelProviderNotConfigured
 	}
 	if err := checkPeakHours(providerCfg); err != nil {
-		return fantasy.ToolResponse{}, err
+		return fantasy.ToolResponse{}, wrapPeakHoursError(err)
 	}
 
 	// Run the agent
