@@ -261,6 +261,7 @@ func reclaimStaleLock(path, reason string) (bool, error) {
 		"age_seconds", int(age.Seconds()))
 	return true, nil
 }
+
 func sanitiseSessionID(id string) string {
 	r := strings.NewReplacer(
 		"/", "_",

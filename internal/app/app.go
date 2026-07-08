@@ -708,6 +708,7 @@ func sessionBusyGuidance(sessionID string, err error) string {
 		sessionID, holder, sessionID, sessionID,
 	)
 }
+
 func cancelledRunError(runErr error, finalReason, finalErrTitle, finalErrDetails string) *runIncompleteError {
 	// 1. Check the raw runErr first: a forced mid-turn abort (peak-hours,
 	//    max-cost, max-tokens) returns a specific error via OnStepFinish

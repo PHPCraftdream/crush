@@ -232,6 +232,7 @@ func TestReclaimStaleLock(t *testing.T) {
 	_, err = os.Stat(path)
 	assert.True(t, os.IsNotExist(err))
 }
+
 func TestTryAcquireSessionLock_FreshLockIsRespected(t *testing.T) {
 	dir := t.TempDir()
 	// Acquire a real lock so the file is fresh and OS-locked.
