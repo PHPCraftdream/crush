@@ -343,6 +343,12 @@ crush run --restrict-run --role fast \
           --session "ci-123" "summarize the diff"
   `,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		// FIRST, before any slow boot work (config load, MCP init): if all
+		// three std streams are redirected (detached orchestrator launch),
+		// drop the console so the parent shell's exit can't hard-kill us
+		// via CTRL_CLOSE_EVENT. See console_detach_windows.go — this kill
+		// is unavoidable from a ctrl handler and has hit runs mid-boot.
+		maybeDetachConsole()
 		var (
 			quiet, _            = cmd.Flags().GetBool("quiet")
 			verbose, _          = cmd.Flags().GetBool("verbose")
