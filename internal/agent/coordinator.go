@@ -1156,15 +1156,11 @@ func (c *coordinator) buildAgent(ctx context.Context, prompt *prompt.Prompt, age
 		DataDirectory:        c.cfg.Config().Options.DataDirectory,
 		CheckpointInterval:   checkpointInterval, // Fork patch: batch 8
 		// Fork patch: peak-hours mid-turn re-check. Re-reads the provider
-		// config live (not the largeProviderCfg captured above) so a
-		// peak_hours edit made while this turn is running still takes
-		// effect on the very next step.
+		// config live, and reloads from disk when tracked config files change,
+		// so a peak_hours edit made by another process while this turn is
+		// running still takes effect.
 		PeakHoursCheck: func() error {
-			pc, ok := c.cfg.Config().Providers.Get(large.ModelCfg.Provider)
-			if !ok {
-				return nil
-			}
-			return checkPeakHours(pc)
+			return c.checkLivePeakHours(large.ModelCfg.Provider)
 		},
 	})
 
@@ -2008,6 +2004,32 @@ func (c *coordinator) refreshTokenIfExpired(ctx context.Context, providerCfg con
 	}
 	slog.Debug("Token needs to be refreshed", "provider", providerCfg.ID)
 	return c.refreshOAuth2Token(ctx, providerCfg)
+}
+
+// checkLivePeakHours returns the current peak-hours decision for providerID.
+// It reloads the config first when a tracked config file changed on disk, so
+// long-running agents in one process can observe peak_hours edits made by the
+// web UI or CLI in another process.
+func (c *coordinator) checkLivePeakHours(providerID string) error {
+	if c == nil || c.cfg == nil || providerID == "" {
+		return nil
+	}
+	if staleness := c.cfg.ConfigStaleness(); staleness.Dirty {
+		reloadCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := c.cfg.ReloadFromDisk(reloadCtx); err != nil {
+			slog.Warn("Failed to reload config before peak-hours check", "provider", providerID, "err", err)
+		}
+		cancel()
+	}
+	cfg := c.cfg.Config()
+	if cfg == nil || cfg.Providers == nil {
+		return nil
+	}
+	pc, ok := cfg.Providers.Get(providerID)
+	if !ok {
+		return nil
+	}
+	return checkPeakHours(pc)
 }
 
 // checkPeakHours refuses the request if providerCfg is currently inside its

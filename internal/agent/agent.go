@@ -103,6 +103,11 @@ const (
 	// SessionAgentOptions.CheckpointInterval.
 	// Fork patch: batch 8.
 	defaultCheckpointInterval = 2 * time.Second
+
+	// peakHoursPollInterval is the mid-turn safety check cadence. The
+	// OnStepFinish check catches normal step boundaries; this ticker catches
+	// long streams, retries, and tool execution.
+	peakHoursPollInterval = 10 * time.Second
 )
 
 var userAgent = fmt.Sprintf("Charm-Crush/%s (https://charm.land/crush)", version.Version)
@@ -612,15 +617,30 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	// have been truncated.
 	var loopDetected bool
 	var loopDetail loopDetail
-	// peakHoursAbortErr is stashed by the OnStepFinish peak-hours check
-	// when it detects the provider entered its window mid-turn. OnStepFinish
-	// must call cancelFn() to break fantasy's agent loop (returning an error
-	// alone doesn't stop it), but cancel() makes fantasy return
-	// context.Canceled — swallowing the specific *PeakHoursError. After
-	// agent.Stream() returns, Run() checks this and replaces the generic
-	// context.Canceled with the real error so it reaches the coordinator and
-	// ultimately RunNonInteractive's stderr output.
+	// peakHoursAbortErr is stashed by the peak-hours checks when they detect
+	// the provider entered its window mid-turn. The checks must call
+	// cancelFn() to break fantasy's agent loop (returning an error alone
+	// doesn't stop it), but cancel() makes fantasy return context.Canceled —
+	// swallowing the specific *PeakHoursError. After agent.Stream() returns,
+	// Run() checks this and replaces the generic context.Canceled with the
+	// real error so it reaches the coordinator and ultimately
+	// RunNonInteractive's stderr output.
+	var peakHoursAbortMu sync.Mutex
 	var peakHoursAbortErr error
+	setPeakHoursAbortErr := func(err error) bool {
+		peakHoursAbortMu.Lock()
+		defer peakHoursAbortMu.Unlock()
+		if peakHoursAbortErr != nil {
+			return false
+		}
+		peakHoursAbortErr = err
+		return true
+	}
+	getPeakHoursAbortErr := func() error {
+		peakHoursAbortMu.Lock()
+		defer peakHoursAbortMu.Unlock()
+		return peakHoursAbortErr
+	}
 
 	// bgSummarizeLaunched ensures we launch at most one background
 	// summarisation per Run() call (fired the first time we trim the window).
@@ -752,6 +772,49 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	// logging. Set to true on each tool boundary; OnTextDelta checks and
 	// resets it to emit at most once per step.
 	sawToolBoundary := true
+
+	peakHoursWatchDone := make(chan struct{})
+	if a.peakHoursCheck != nil {
+		go func() {
+			defer close(peakHoursWatchDone)
+			ticker := time.NewTicker(peakHoursPollInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-genCtx.Done():
+					return
+				case <-ticker.C:
+					pErr := a.peakHoursCheck()
+					if pErr == nil {
+						continue
+					}
+					if !setPeakHoursAbortErr(pErr) {
+						return
+					}
+					slog.Warn("agent: aborting — provider entered peak-hours mid-turn",
+						"session_id", call.SessionID, "error", pErr)
+					peakMsg, peakDetails := peakHoursStoppedFinishText(pErr)
+					sessionLock.Lock()
+					if currentAssistant != nil {
+						currentAssistant.AddFinish(message.FinishReasonError, peakMsg, peakDetails)
+						flushCtx, flushCancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+						if uErr := a.messages.Update(flushCtx, *currentAssistant); uErr != nil {
+							slog.Warn("agent: failed to persist peak-hours finish message", "error", uErr)
+						}
+						flushCancel()
+					}
+					sessionLock.Unlock()
+					if cancelFn, ok := a.activeRequests.Get(call.SessionID); ok {
+						cancelFn()
+					}
+					return
+				}
+			}
+		}()
+		defer func() { cancel(); <-peakHoursWatchDone }()
+	} else {
+		close(peakHoursWatchDone)
+	}
 
 	// Don't send MaxOutputTokens if 0 — some providers (e.g. LM Studio) reject it
 	var maxOutputTokens *int64
@@ -1217,14 +1280,19 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			// next NEW invocation.
 			if a.peakHoursCheck != nil {
 				if pErr := a.peakHoursCheck(); pErr != nil {
-					slog.Warn("agent: aborting — provider entered peak-hours mid-turn",
-						"session_id", call.SessionID, "error", pErr)
-					peakMsg, peakDetails := peakHoursStoppedFinishText(pErr)
-					currentAssistant.AddFinish(message.FinishReasonError, peakMsg, peakDetails)
-					// Use the parent ctx (not genCtx) for the DB write —
-					// genCtx dies as soon as we cancel below.
-					if uErr := a.messages.Update(ctx, *currentAssistant); uErr != nil {
-						slog.Warn("agent: failed to persist peak-hours finish message", "error", uErr)
+					if setPeakHoursAbortErr(pErr) {
+						slog.Warn("agent: aborting — provider entered peak-hours mid-turn",
+							"session_id", call.SessionID, "error", pErr)
+						peakMsg, peakDetails := peakHoursStoppedFinishText(pErr)
+						currentAssistant.AddFinish(message.FinishReasonError, peakMsg, peakDetails)
+						// Use the parent ctx (not genCtx) for the DB write —
+						// genCtx dies as soon as we cancel below.
+						if uErr := a.messages.Update(ctx, *currentAssistant); uErr != nil {
+							slog.Warn("agent: failed to persist peak-hours finish message", "error", uErr)
+						}
+						if cancelFn, ok := a.activeRequests.Get(call.SessionID); ok {
+							cancelFn()
+						}
 					}
 					// Stash the specific error so Run() can return it
 					// AFTER fantasy's agent.Stream exits. We must call
@@ -1233,10 +1301,6 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 					// cancel() makes fantasy return context.Canceled —
 					// swallowing our pErr. The stash lets Run() replace
 					// that generic error with the real one.
-					peakHoursAbortErr = pErr
-					if cancelFn, ok := a.activeRequests.Get(call.SessionID); ok {
-						cancelFn()
-					}
 					return pErr
 				}
 			}
@@ -1288,8 +1352,8 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	// authoritative for this Run() call: force it in unconditionally so
 	// the coordinator and RunNonInteractive never mistake this abort for
 	// a successful completion or a bare, unexplained cancellation.
-	if peakHoursAbortErr != nil {
-		err = peakHoursAbortErr
+	if peakErr := getPeakHoursAbortErr(); peakErr != nil {
+		err = peakErr
 	}
 	if err != nil {
 		isHyper := largeModel.ModelCfg.Provider == hyper.Name

@@ -2,6 +2,9 @@ package agent
 
 import (
 	"context"
+	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -143,4 +146,45 @@ func TestSetAllowPeakHours_OneShotReset(t *testing.T) {
 	allow2 := coord.allowPeakHours
 	coord.runLimitsMu.Unlock()
 	assert.False(t, allow2, "after consume the flag is reset")
+}
+
+func TestCheckLivePeakHours_ReloadsDirtyConfig(t *testing.T) {
+	t.Parallel()
+
+	workDir := t.TempDir()
+	configPath := filepath.Join(workDir, "crush.json")
+	initial := `{
+		"options": {"disable_default_providers": true},
+		"providers": {
+			"custom": {
+				"api_key": "test-key",
+				"base_url": "https://api.example.test/v1",
+				"models": [{"id": "model"}]
+			}
+		}
+	}`
+	require.NoError(t, os.WriteFile(configPath, []byte(initial), 0o600))
+
+	store, err := config.Init(workDir, workDir, false)
+	require.NoError(t, err)
+	coord := &coordinator{cfg: store}
+	require.NoError(t, coord.checkLivePeakHours("custom"))
+
+	w := peakWindowAroundNow()
+	updated := fmt.Sprintf(`{
+		"options": {"disable_default_providers": true},
+		"providers": {
+			"custom": {
+				"api_key": "test-key",
+				"base_url": "https://api.example.test/v1",
+				"models": [{"id": "model"}],
+				"peak_hours": {"start": %q, "end": %q}
+			}
+		}
+	}`, w.Start, w.End)
+	require.NoError(t, os.WriteFile(configPath, []byte(updated), 0o600))
+
+	err = coord.checkLivePeakHours("custom")
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errProviderPeakHours)
 }
