@@ -386,6 +386,52 @@ func TestConfig_configureProvidersWithOverride(t *testing.T) {
 	require.Equal(t, "Updated", pc.Models[0].Name)
 }
 
+// TestConfig_configureProviders_PreservesLocalCLICustomFields is a regression
+// test for a bug where the built-in "local-cli" provider entry was rebuilt
+// from a bare literal on every configureProviders call (called on both
+// initial Load() and every ReloadFromDisk()), silently discarding any
+// user-set field — peak_hours, disable, a custom display name — because only
+// ID/Type/Models are meant to be auto-derived from the detected CLI specs.
+// Found via a live test of the peak-hours mid-turn cross-process reload
+// feature: a peak_hours window set on local-cli never took effect because it
+// was wiped back to nil on the very next config load.
+func TestConfig_configureProviders_PreservesLocalCLICustomFields(t *testing.T) {
+	origAvailable := cliprovider.AvailableFunc
+	cliprovider.AvailableFunc = func() []cliprovider.CLISpec {
+		return []cliprovider.CLISpec{{ModelID: "cli-claude-sonnet", ModelName: "Claude Sonnet"}}
+	}
+	t.Cleanup(func() { cliprovider.AvailableFunc = origAvailable })
+
+	cfg := &Config{
+		Providers: csync.NewMap[string, ProviderConfig](),
+	}
+	peakHours := &PeakHoursWindow{Start: "09:00", End: "18:00"}
+	cfg.Providers.Set(cliprovider.ProviderID, ProviderConfig{
+		Name:      "My Local CLI",
+		PeakHours: peakHours,
+		Disable:   true,
+	})
+	cfg.setDefaults("/tmp", "")
+
+	e := env.NewFromMap(map[string]string{})
+	resolver := NewShellVariableResolver(e)
+	err := cfg.configureProviders(context.Background(), testStore(cfg), e, resolver, []catwalk.Provider{})
+	require.NoError(t, err)
+
+	pc, ok := cfg.Providers.Get(cliprovider.ProviderID)
+	require.True(t, ok)
+	require.Equal(t, "My Local CLI", pc.Name, "custom display name must survive re-synthesis")
+	require.True(t, pc.Disable, "disable flag must survive re-synthesis")
+	require.NotNil(t, pc.PeakHours, "peak_hours must survive re-synthesis")
+	require.Equal(t, "09:00", pc.PeakHours.Start)
+	require.Equal(t, "18:00", pc.PeakHours.End)
+	// The auto-derived fields still refresh to the newly detected specs.
+	require.Equal(t, cliprovider.ProviderID, pc.ID)
+	require.EqualValues(t, cliprovider.ProviderType, pc.Type)
+	require.Len(t, pc.Models, 1)
+	require.Equal(t, "cli-claude-sonnet", pc.Models[0].ID)
+}
+
 func TestConfig_configureProvidersWithNewProvider(t *testing.T) {
 	knownProviders := []catwalk.Provider{
 		{

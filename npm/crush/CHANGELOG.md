@@ -41,6 +41,14 @@ root for the full per-file merge/divergence history.
   `peak_hours` edit made from another process (e.g. the web UI or a second
   `crush` invocation) while a run is mid-turn takes effect immediately
   instead of only on the next run.
+- Fixed: the built-in `local-cli` provider (the local `claude`/`gemini`/
+  `codex`/`qwen` CLI models) silently lost `peak_hours`, `disable`, and any
+  custom display name on every single config load and reload — it was being
+  rebuilt from a bare template each time instead of preserving the existing
+  entry. This meant `crush providers set local-cli --peak-hours ...` was
+  accepted and persisted to disk but never actually took effect. Found via a
+  live test of the peak-hours mid-turn refresh above; predates that feature
+  entirely.
 - Windows: an interactive `crush run` (no redirected stdio) could sometimes
   cancel with a bare "context canceled" on ordinary console events — Windows
   maps `CTRL_CLOSE_EVENT`/`CTRL_LOGOFF_EVENT`/`CTRL_SHUTDOWN_EVENT` to the

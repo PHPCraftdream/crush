@@ -404,12 +404,23 @@ func (c *Config) configureProviders(ctx context.Context, store *ConfigStore, env
 				DefaultMaxTokens: 32768,
 			})
 		}
-		c.Providers.Set(cliprovider.ProviderID, ProviderConfig{
-			ID:     cliprovider.ProviderID,
-			Name:   "Local CLI",
-			Type:   cliprovider.ProviderType,
-			Models: models,
-		})
+		// Start from whatever is already in c.Providers for this ID (loaded
+		// from crush.json on this same pass) rather than a bare literal, so
+		// user-set fields — peak_hours, disable, a custom display name,
+		// system_prompt_prefix, etc. — survive being re-synthesized here on
+		// every config load/reload. Only ID/Type/Models are ever
+		// auto-derived; everything else is user-owned and must round-trip.
+		// This block used to always overwrite with a fresh literal, which
+		// silently discarded peak_hours (and any other custom field) for
+		// this provider on every single load.
+		provider, existed := c.Providers.Get(cliprovider.ProviderID)
+		if !existed {
+			provider = ProviderConfig{Name: "Local CLI"}
+		}
+		provider.ID = cliprovider.ProviderID
+		provider.Type = cliprovider.ProviderType
+		provider.Models = models
+		c.Providers.Set(cliprovider.ProviderID, provider)
 		knownProviderNames[cliprovider.ProviderID] = true // skip custom-provider validation
 	}
 
