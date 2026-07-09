@@ -20,9 +20,10 @@ root for the full per-file merge/divergence history.
 - Windows: eliminated console-window flashing introduced by the fix above.
   Every child process `crush` spawns (git, MCP stdio servers, ripgrep,
   cliprovider CLI launches, docker, the `--on-finish` hook, `sessions diff`,
-  `sessions pick`, `queue`, model-effort probing, and `crush run`
-  sub-invocations from `queue`) now launches with its console window hidden
-  instead of momentarily visible.
+  `sessions pick`, `queue`, model-effort probing, `crush run` sub-invocations
+  from `queue`, and the `taskkill` used by `sessions kill`/`reap` and stale-
+  lock reclamation) now launches with its console window hidden instead of
+  momentarily visible.
 - `crush sessions why <id>` and `sessions list` no longer misreport a session
   as "crashed" when its lock file's PID can't be read — a normal, expected
   side effect of Windows' mandatory file locking for a genuinely alive

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os/exec"
 
+	"github.com/charmbracelet/crush/internal/platform"
 	"golang.org/x/sys/windows"
 )
 
@@ -34,7 +35,9 @@ func KillProcess(pid int) error {
 		return nil
 	}
 	if path, lookErr := exec.LookPath("taskkill"); lookErr == nil {
-		out, err := exec.CommandContext(context.Background(), path, "/F", "/T", "/PID", fmt.Sprintf("%d", pid)).CombinedOutput()
+		cmd := exec.CommandContext(context.Background(), path, "/F", "/T", "/PID", fmt.Sprintf("%d", pid))
+		platform.HideConsoleWindow(cmd)
+		out, err := cmd.CombinedOutput()
 		if err == nil {
 			return nil
 		}
