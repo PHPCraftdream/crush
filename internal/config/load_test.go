@@ -1785,6 +1785,77 @@ func TestConfig_configureSelectedModels(t *testing.T) {
 		require.Equal(t, "openai", large.Provider)
 		require.Equal(t, int64(100), large.MaxTokens)
 	})
+
+	t.Run("should not leak reasoning effort from a previous provider", func(t *testing.T) {
+		knownProviders := []catwalk.Provider{
+			{
+				ID:                  "anthropic",
+				APIKey:              "abc",
+				DefaultLargeModelID: "a-large-model",
+				DefaultSmallModelID: "a-small-model",
+				Models: []catwalk.Model{
+					{
+						ID:                     "a-large-model",
+						DefaultMaxTokens:       1000,
+						DefaultReasoningEffort: "high",
+					},
+					{
+						ID:               "a-small-model",
+						DefaultMaxTokens: 200,
+					},
+				},
+			},
+			{
+				ID:                  "openai",
+				APIKey:              "abc",
+				DefaultLargeModelID: "large-model",
+				DefaultSmallModelID: "small-model",
+				Models: []catwalk.Model{
+					{
+						ID:               "large-model",
+						DefaultMaxTokens: 1000,
+						// No default reasoning effort for this provider/model.
+					},
+					{
+						ID:               "small-model",
+						DefaultMaxTokens: 500,
+					},
+				},
+			},
+		}
+
+		// Simulate a stale user preference carrying the reasoning effort
+		// from a previously selected provider (anthropic's "high") while
+		// switching to a provider/model that defines no reasoning effort.
+		cfg := &Config{
+			Models: map[SelectedModelType]SelectedModel{
+				"large": {
+					Provider:        "openai",
+					Model:           "large-model",
+					ReasoningEffort: "",
+				},
+				"small": {
+					Provider:        "openai",
+					Model:           "small-model",
+					ReasoningEffort: "",
+				},
+			},
+		}
+		cfg.setDefaults("/tmp", "")
+		env := env.NewFromMap(map[string]string{})
+		resolver := NewShellVariableResolver(env)
+		err := cfg.configureProviders(context.Background(), testStore(cfg), env, resolver, knownProviders)
+		require.NoError(t, err)
+
+		err = configureSelectedModels(testStore(cfg), knownProviders, true)
+		require.NoError(t, err)
+		large := cfg.Models[SelectedModelTypeLarge]
+		small := cfg.Models[SelectedModelTypeSmall]
+		require.Equal(t, "openai", large.Provider)
+		require.Empty(t, large.ReasoningEffort, "large model must not inherit stale reasoning effort")
+		require.Equal(t, "openai", small.Provider)
+		require.Empty(t, small.ReasoningEffort, "small model must not inherit stale reasoning effort")
+	})
 }
 
 func TestConfig_configureProviders_HyperAPIKeyFromEnv(t *testing.T) {
