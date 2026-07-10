@@ -39,13 +39,21 @@ func main() {
 		out = "crush.exe"
 	}
 
-	fmt.Println("→ Building crush binary...")
+	fmt.Println("→ Building crush binary (production flags)...")
 	// Fork merge note (origin/main 2026-05-16): upstream renamed BuildTime to
 	// BuildID (commit 9e126c27). We keep the timestamp value — it satisfies
 	// BuildID's "unique per build" contract — but write it into the new field.
 	buildTime := time.Now().Format("2006-01-02_15-04-05")
-	ldflags := fmt.Sprintf("-X=github.com/charmbracelet/crush/internal/version.BuildID=%s", buildTime)
-	run(root, "go", "build", "-ldflags", ldflags, "-o", out, ".")
+	// -s -w and -trimpath match the flags the real release build uses
+	// (.github/workflows/publish-fork-npm.yml, .goreleaser.yml) — strips
+	// the symbol table/DWARF debug info and local filesystem paths, so a
+	// `go run deploy.go` binary is structurally the same as what actually
+	// ships. version.Version is deliberately left uninjected: the binary
+	// should still report itself as a local dev build (commit hash +
+	// fork base version, see internal/version/version.go), not spoof a
+	// numbered release.
+	ldflags := fmt.Sprintf("-s -w -X=github.com/charmbracelet/crush/internal/version.BuildID=%s", buildTime)
+	run(root, "go", "build", "-trimpath", "-ldflags", ldflags, "-o", out, ".")
 
 	fmt.Printf("✓ Done → %s\n", out)
 }
