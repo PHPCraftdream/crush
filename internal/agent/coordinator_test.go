@@ -14,6 +14,7 @@ import (
 	"charm.land/fantasy"
 	"charm.land/fantasy/providers/anthropic"
 	"charm.land/fantasy/providers/bedrock"
+	"charm.land/fantasy/providers/openai"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/session"
@@ -598,6 +599,37 @@ func TestGetProviderOptionsReasoningEffort(t *testing.T) {
 			assert.Equal(t, anthropic.Effort("max"), *parsed.Effort)
 		})
 	}
+}
+
+// Ported from upstream f75435a2: when a reasoning-capable model has no
+// default_reasoning_effort configured and the user hasn't selected one,
+// getProviderOptions must fall back to the first configured reasoning
+// level instead of silently disabling reasoning. Uses the openai branch,
+// the same path f75435a2 itself exercises upstream — the fork's own
+// ZAI/GLM openaicompat mapping (a fork-owned block, not part of this
+// upstream commit) intentionally keeps its prior behavior and is not
+// wired through effectiveReasoningEffort's fallback.
+func TestGetProviderOptionsReasoningEffortFallback(t *testing.T) {
+	model := Model{
+		CatwalkCfg: catwalk.Model{
+			ID:              "gpt-5-test",
+			CanReason:       true,
+			ReasoningLevels: []string{"high", "max"},
+		},
+		ModelCfg: config.SelectedModel{
+			Provider: "openai",
+		},
+	}
+	providerCfg := config.ProviderConfig{ID: "openai", Type: openai.Name}
+
+	opts := getProviderOptions(model, providerCfg)
+
+	raw, ok := opts[openai.Name]
+	require.True(t, ok)
+	parsed, ok := raw.(*openai.ProviderOptions)
+	require.True(t, ok)
+	require.NotNil(t, parsed.ReasoningEffort)
+	assert.Equal(t, "high", string(*parsed.ReasoningEffort))
 }
 
 // Pins the contract of shouldRetryStalledMessage: a watchdog-stalled turn
