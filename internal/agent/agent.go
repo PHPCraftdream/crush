@@ -1096,6 +1096,12 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			bumpActivity()
 			slog.Warn("Provider request failed, retrying", providerRetryLogFields(err, delay)...)
 		},
+		OnWarnings: func(warnings []fantasy.CallWarning) error {
+			for _, w := range warnings {
+				slog.Warn("Provider warning", "type", w.Type, "message", w.Message)
+			}
+			return nil
+		},
 		OnToolCall: func(tc fantasy.ToolCallContent) error {
 			bumpActivity()
 			// A tool is about to execute — pause the stall watchdog until its
