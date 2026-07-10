@@ -1142,13 +1142,39 @@ func ProjectSkillsDir(workingDir string) []string {
 
 	// When the working directory is inside a git repository, also look at
 	// the repository root so monorepo-level .agents/skills are found.
-	if root := worktreeRoot(workingDir); root != "" && root != workingDir {
+	//
+	// Compare canonical paths rather than raw strings: git rev-parse
+	// --show-toplevel returns a symlink-resolved path (e.g. macOS reports
+	// /private/var/... for a working dir passed in as /var/...), so a plain
+	// string comparison would treat the repo root as distinct from the
+	// working dir even when they are the same directory, duplicating every
+	// entry. Fall back to the raw path if EvalSymlinks fails (e.g. the path
+	// does not exist).
+	if root := worktreeRoot(workingDir); root != "" && !sameDir(root, workingDir) {
 		for _, sub := range projectSkillSubdirs {
 			dirs = append(dirs, filepath.Join(root, sub))
 		}
 	}
 
 	return dirs
+}
+
+// sameDir reports whether a and b refer to the same directory, accounting
+// for symbolic links. Paths are canonicalised with filepath.EvalSymlinks
+// before comparison so that a symlinked path (macOS /var) and its resolved
+// target (/private/var) compare equal. If either path cannot be resolved
+// (e.g. it does not exist), the raw value is used as a best-effort fallback.
+func sameDir(a, b string) bool {
+	if a == b {
+		return true
+	}
+	if ra, err := filepath.EvalSymlinks(a); err == nil {
+		a = ra
+	}
+	if rb, err := filepath.EvalSymlinks(b); err == nil {
+		b = rb
+	}
+	return a == b
 }
 
 func isAppleTerminal() bool { return os.Getenv("TERM_PROGRAM") == "Apple_Terminal" }
