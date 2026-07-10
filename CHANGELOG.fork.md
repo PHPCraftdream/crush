@@ -1835,3 +1835,99 @@ internal/cmd/models_atoms.go    short-code table top opus → 4.8; atom struct
                                 gofmt realign
 CHANGELOG.fork.md               this entry
 ```
+
+### Batch 32 — upstream triage v0.72.0 → v0.84.0, selective port (2026-07-10)
+
+Triaged all 237 non-merge commits between the fork's last merge-base
+(`61e40556`, v0.72.0) and upstream `origin/main` (`355fb647`, v0.84.0).
+Full triage recorded in `docs/plans/2026-07-10-upstream-port-plan.md`.
+Bucketed into: already covered by prior forks work (10 commits, verified
+by reading the fork's code, not by commit title), ported this session (9
+commits below), and ~210 SKIP (all TUI, the multi-client server model,
+CLA bot noise, deps-only bumps, and upstream's own `internal/lock`
+package — none apply, per the fork's OWNED/REMOVED tables in this file).
+
+**Ported, one commit per upstream hash, cherry-picked-by-hand (not
+`git cherry-pick` — the fork's `agent.go`/`coordinator.go`/`load.go` have
+diverged too far for a literal patch to apply):**
+
+- `21a457d5` → `fc55a67a` — malformed tool-call JSON is sanitized to `{}`
+  before being persisted, with the matching tool result flipped to an
+  explicit error. Previously a broken JSON tool-call from the model stuck
+  a session forever (re-read from the DB every subsequent turn).
+- `d3d68045` → `b353cf63` — `workaroundProviderMediaLimitations` now
+  checks `CatwalkCfg.SupportsImages` before converting tool-result media
+  into a `FilePart`; a text-only model no longer bricks on media it can't
+  process.
+- `1535ebb7` → `8e00fa59` — `configureSelectedModels` now resets
+  `ReasoningEffort` to the newly selected model's own default instead of
+  silently keeping the previous provider's effort level.
+- `f75435a2` → `50d7034a` — `effectiveReasoningEffort()` falls back
+  user-effort → model-default → first `ReasoningLevels` entry, applied
+  everywhere `getProviderOptions` previously read
+  `ModelCfg.ReasoningEffort` directly, **except** the fork's own ZAI/GLM
+  mapping — deliberately left untouched in this port because wiring it in
+  would flip Z.AI's default reasoning state, a real behavior change
+  requiring its own sign-off (see next entry).
+- Follow-up → `28ec4145` — asked the operator, got an explicit "yes, add
+  an off switch, default to high": GLM via Z.AI now defaults to thinking
+  enabled at `high` (Z.AI recommends max/high for coding; GLM-5.x only
+  exposes high/max, no lower tier to "fall back" to). Explicit opt-out via
+  `ReasoningEffort == "off"`, reachable today through the existing
+  unvalidated `provider/model@effort` CLI syntax
+  (`crush models use zai/glm-5.2@off <small>`).
+- `188dea64` → `754f2075` — `fsext.DirTrim` took the first *byte* of a
+  directory name when abbreviating a path, mangling Cyrillic/CJK/emoji
+  names. Now takes the first grapheme cluster via
+  `ansi.FirstGraphemeCluster` (no dependency bump — `x/ansi` was already
+  pinned at a version that has it).
+- `78a205cd` → `f3d98850` — `copilot.initiatorTransport.RoundTrip` now
+  guards `req.Body == nil` (valid for GET) alongside the existing
+  `== http.NoBody` check; ported byte-for-byte, confirmed identical to
+  upstream by diff.
+- `ebd845c0` → `e7a554ed` — every outbound LLM stream call in `agent.go`
+  (`Run`, `runSummarize`, `runSummarizeSilent`, `generateTitle`) now
+  sends a deterministic, opaque `x-session-id`/`x-session-affinity`
+  header pair (`session.HashID`, xxh3) for provider-side cache affinity.
+  Extended one call site beyond upstream's three (`runSummarizeSilent`,
+  fork-specific) — safe to extend since the header is purely additive and
+  doesn't change request semantics.
+- `4be77c56` → `e519fa52` — provider warnings are now logged
+  (`slog.Warn("Provider warning", ...)`). Adapted, not ported literally:
+  upstream reads a `stepResult.Warnings` field that doesn't exist on the
+  fork's pinned `fantasy v0.25.2`; used the equivalent `OnWarnings`
+  callback instead.
+- `c1a48226` → `5d3edc09` — new llama.cpp model enricher in
+  `internal/discover/`, following the fork's `omlx.go` base-URL pattern
+  (raw `cfg.BaseURL` + relative path) rather than upstream's literal path
+  construction — the fork's `cfg.BaseURL` for OpenAI-compat providers
+  already includes `/v1`, so upstream's approach would have produced
+  `/v1/v1/models`.
+- `363ffec9` → `4eca5d1b` — turned out to already be ported (`7372eecd`,
+  predates this session); added the missing test coverage for
+  `ProjectSkillsDir`'s git-worktree-root discovery.
+- `6242e4f4` — also already ported before this session, verified present
+  end-to-end (config field, `loadContextFiles` refactor, `PromptDat`
+  field, and a fork-styled `<user_preferences>` template section, not a
+  copy of upstream's markdown section) — no diff needed.
+
+**EVAL wave verdicts** (full detail in the plan file, § Волна 5): two
+real, non-urgent gaps identified for **future** follow-up, not ported in
+this session — (1) `de679203`: the fork's disk-recheck heuristic in
+`RefreshOAuthToken` covers most token-refresh races but lacks an
+in-process `singleflight.Group`; (2) `67f50014`: the ripgrep-unavailable
+glob fallback (`fsext.globWithDoubleStar`) follows symlinks and has no
+per-call timeout, unlike the rg fast-path. Everything else in the EVAL
+wave (401-retry centralization, child-process isolation, schema
+reflection for provider options) was already covered by prior fork work;
+provider-specific fixes for providers the fork doesn't use (baseten,
+fireworks) or that require a fantasy/catwalk version bump (bedrock-eu,
+gpt-5.6, alibaba-US) were left for a deliberate later decision.
+
+Every commit above: `go build ./...` clean, tests for the touched
+package(s) green, reviewed by an independent agent before landing (per
+`docs/plans/2026-07-10-upstream-port-plan.md`'s stated process).
+
+Files: too many to list per-commit here — see the individual commit
+messages (`git log --oneline fc55a67a^..4eeb72c3`) and the plan file for
+the full per-item detail.
