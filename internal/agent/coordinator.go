@@ -1068,7 +1068,7 @@ func getProviderOptions(model Model, providerCfg config.ProviderConfig) fantasy.
 					extraBody["reasoning"] = map[string]string{"effort": "none"}
 				}
 			}
-		case string(catwalk.InferenceProviderZAI), string(catwalk.InferenceProviderDeepSeek):
+		case string(catwalk.InferenceProviderZAI):
 			// GLM-5.x exposes two thinking-effort levels (high / max) and no
 			// "unset" state on z.ai's side — reasoning is either on at some
 			// level or off. Z.AI recommends max for hard coding/math tasks,
@@ -1097,6 +1097,34 @@ func getProviderOptions(model Model, providerCfg config.ProviderConfig) fantasy.
 					"type": "enabled",
 				}
 				switch effort {
+				case "xhigh", "max", "ultracode":
+					extraBody["reasoning_effort"] = "max"
+				default:
+					extraBody["reasoning_effort"] = "high"
+				}
+			}
+		case string(catwalk.InferenceProviderDeepSeek):
+			// DeepSeek keeps the fork's original "unset reasoning = thinking
+			// off" default. Reasoning is only enabled when the user opts in
+			// (via Think or an explicit ReasoningEffort); the ZAI-only default
+			// of turning thinking ON at "high" for an unset effort deliberately
+			// does NOT apply here.
+			if model.ModelCfg.Think || model.ModelCfg.ReasoningEffort != "" {
+				extraBody["thinking"] = map[string]any{
+					"type": "enabled",
+				}
+			} else {
+				extraBody["thinking"] = map[string]any{
+					"type": "disabled",
+				}
+			}
+			// When reasoning is enabled, map the selected effort onto the two
+			// effort levels the endpoint exposes (high / max). Mirrors the ZAI
+			// table above:
+			//   low, medium, high (default) → high
+			//   xhigh, max, ultracode       → max
+			if model.ModelCfg.ReasoningEffort != "" {
+				switch strings.ToLower(model.ModelCfg.ReasoningEffort) {
 				case "xhigh", "max", "ultracode":
 					extraBody["reasoning_effort"] = "max"
 				default:

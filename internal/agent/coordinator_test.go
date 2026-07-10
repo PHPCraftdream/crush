@@ -690,6 +690,71 @@ func TestGetProviderOptionsZAIReasoningDefault(t *testing.T) {
 	})
 }
 
+// DeepSeek must keep the fork's ORIGINAL default: an unset ReasoningEffort
+// leaves thinking OFF. The ZAI-only "unset → thinking on at high" default
+// (added in 28ec4145) deliberately does not apply to DeepSeek — this test
+// pins that separation so the two providers can't drift back together.
+func TestGetProviderOptionsDeepSeekReasoningDefault(t *testing.T) {
+	newModel := func(effort string, think bool) Model {
+		return Model{
+			CatwalkCfg: catwalk.Model{
+				ID:        "deepseek-reasoner",
+				CanReason: true,
+			},
+			ModelCfg: config.SelectedModel{
+				Provider:        "deepseek",
+				ReasoningEffort: effort,
+				Think:           think,
+			},
+		}
+	}
+	providerCfg := config.ProviderConfig{ID: string(catwalk.InferenceProviderDeepSeek), Type: openaicompat.Name}
+
+	extraBody := func(t *testing.T, effort string, think bool) map[string]any {
+		t.Helper()
+		opts := getProviderOptions(newModel(effort, think), providerCfg)
+		raw, ok := opts[openaicompat.Name]
+		require.True(t, ok)
+		parsed, ok := raw.(*openaicompat.ProviderOptions)
+		require.True(t, ok)
+		return parsed.ExtraBody
+	}
+
+	t.Run("unset leaves thinking disabled (old behavior)", func(t *testing.T) {
+		eb := extraBody(t, "", false)
+		thinking, ok := eb["thinking"].(map[string]any)
+		require.True(t, ok)
+		assert.Equal(t, "disabled", thinking["type"])
+		_, hasEffort := eb["reasoning_effort"]
+		assert.False(t, hasEffort, "reasoning_effort must not be set when effort is unset")
+	})
+
+	t.Run("Think enables thinking without explicit effort", func(t *testing.T) {
+		eb := extraBody(t, "", true)
+		thinking, ok := eb["thinking"].(map[string]any)
+		require.True(t, ok)
+		assert.Equal(t, "enabled", thinking["type"])
+		_, hasEffort := eb["reasoning_effort"]
+		assert.False(t, hasEffort, "reasoning_effort stays unset when only Think is set")
+	})
+
+	t.Run("explicit effort enables thinking and maps high", func(t *testing.T) {
+		eb := extraBody(t, "high", false)
+		thinking, ok := eb["thinking"].(map[string]any)
+		require.True(t, ok)
+		assert.Equal(t, "enabled", thinking["type"])
+		assert.Equal(t, "high", eb["reasoning_effort"])
+	})
+
+	t.Run("xhigh maps to max", func(t *testing.T) {
+		eb := extraBody(t, "xhigh", false)
+		thinking, ok := eb["thinking"].(map[string]any)
+		require.True(t, ok)
+		assert.Equal(t, "enabled", thinking["type"])
+		assert.Equal(t, "max", eb["reasoning_effort"])
+	})
+}
+
 // Pins the contract of shouldRetryStalledMessage: a watchdog-stalled turn
 // is only worth re-running when the assistant message is genuinely empty.
 // ANY content reaching the assistant — text, reasoning, even a half-emitted
