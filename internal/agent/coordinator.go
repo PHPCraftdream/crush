@@ -1069,26 +1069,34 @@ func getProviderOptions(model Model, providerCfg config.ProviderConfig) fantasy.
 				}
 			}
 		case string(catwalk.InferenceProviderZAI), string(catwalk.InferenceProviderDeepSeek):
-			if model.ModelCfg.Think || model.ModelCfg.ReasoningEffort != "" {
-				extraBody["thinking"] = map[string]any{
-					"type": "enabled",
-				}
-			} else {
-				extraBody["thinking"] = map[string]any{
-					"type": "disabled",
-				}
-			}
-			// GLM-5.x exposes two thinking-effort levels (high / max).
+			// GLM-5.x exposes two thinking-effort levels (high / max) and no
+			// "unset" state on z.ai's side — reasoning is either on at some
+			// level or off. Z.AI recommends max for hard coding/math tasks,
+			// so an unset effort defaults to thinking ON at "high" rather
+			// than silently disabling reasoning. Explicitly opt out with
+			// ReasoningEffort == "off" (e.g. `crush models use
+			// zai/glm-5.2@off <small>` — the raw provider/model@effort
+			// syntax accepts any suffix, unvalidated against ReasoningLevels).
+			//
 			// We forward via `extra_body.reasoning_effort` — the
 			// OpenAI-compat field z.ai already accepts on its Anthropic-
 			// compatible coding endpoint. Mapping mirrors z.ai's own
 			// "Claude Code selected effort → GLM-5.2 actual mapped effort"
 			// table from docs.z.ai/devpack/latest-model:
-			//   low, medium, high (default) → high
-			//   xhigh, max, ultracode       → max
+			//   (unset), low, medium, high (default) → high
+			//   xhigh, max, ultracode                → max
+			//   off                                  → thinking disabled
 			// Older GLM-4.x ignore the field harmlessly.
-			if model.ModelCfg.ReasoningEffort != "" {
-				switch strings.ToLower(model.ModelCfg.ReasoningEffort) {
+			effort := strings.ToLower(model.ModelCfg.ReasoningEffort)
+			if effort == "off" {
+				extraBody["thinking"] = map[string]any{
+					"type": "disabled",
+				}
+			} else {
+				extraBody["thinking"] = map[string]any{
+					"type": "enabled",
+				}
+				switch effort {
 				case "xhigh", "max", "ultracode":
 					extraBody["reasoning_effort"] = "max"
 				default:

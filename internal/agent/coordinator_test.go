@@ -15,6 +15,7 @@ import (
 	"charm.land/fantasy/providers/anthropic"
 	"charm.land/fantasy/providers/bedrock"
 	"charm.land/fantasy/providers/openai"
+	"charm.land/fantasy/providers/openaicompat"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/session"
@@ -607,8 +608,8 @@ func TestGetProviderOptionsReasoningEffort(t *testing.T) {
 // level instead of silently disabling reasoning. Uses the openai branch,
 // the same path f75435a2 itself exercises upstream — the fork's own
 // ZAI/GLM openaicompat mapping (a fork-owned block, not part of this
-// upstream commit) intentionally keeps its prior behavior and is not
-// wired through effectiveReasoningEffort's fallback.
+// upstream commit) has its own analogous default-on behavior, covered
+// separately below.
 func TestGetProviderOptionsReasoningEffortFallback(t *testing.T) {
 	model := Model{
 		CatwalkCfg: catwalk.Model{
@@ -630,6 +631,63 @@ func TestGetProviderOptionsReasoningEffortFallback(t *testing.T) {
 	require.True(t, ok)
 	require.NotNil(t, parsed.ReasoningEffort)
 	assert.Equal(t, "high", string(*parsed.ReasoningEffort))
+}
+
+// The fork's ZAI/GLM mapping (getProviderOptions, InferenceProviderZAI case)
+// has no "unset" state on z.ai's own API — thinking is either on at some
+// level or off. An unset ReasoningEffort now defaults thinking ON at "high"
+// (z.ai recommends max/high for coding tasks) instead of silently disabling
+// reasoning; "off" is the explicit opt-out.
+func TestGetProviderOptionsZAIReasoningDefault(t *testing.T) {
+	newModel := func(effort string) Model {
+		return Model{
+			CatwalkCfg: catwalk.Model{
+				ID:              "glm-5.2",
+				CanReason:       true,
+				ReasoningLevels: []string{"high", "max"},
+			},
+			ModelCfg: config.SelectedModel{
+				Provider:        "zai",
+				ReasoningEffort: effort,
+			},
+		}
+	}
+	providerCfg := config.ProviderConfig{ID: string(catwalk.InferenceProviderZAI), Type: openaicompat.Name}
+
+	extraBody := func(t *testing.T, effort string) map[string]any {
+		t.Helper()
+		opts := getProviderOptions(newModel(effort), providerCfg)
+		raw, ok := opts[openaicompat.Name]
+		require.True(t, ok)
+		parsed, ok := raw.(*openaicompat.ProviderOptions)
+		require.True(t, ok)
+		return parsed.ExtraBody
+	}
+
+	t.Run("unset defaults to thinking enabled at high", func(t *testing.T) {
+		eb := extraBody(t, "")
+		thinking, ok := eb["thinking"].(map[string]any)
+		require.True(t, ok)
+		assert.Equal(t, "enabled", thinking["type"])
+		assert.Equal(t, "high", eb["reasoning_effort"])
+	})
+
+	t.Run("xhigh maps to max", func(t *testing.T) {
+		eb := extraBody(t, "xhigh")
+		thinking, ok := eb["thinking"].(map[string]any)
+		require.True(t, ok)
+		assert.Equal(t, "enabled", thinking["type"])
+		assert.Equal(t, "max", eb["reasoning_effort"])
+	})
+
+	t.Run("off explicitly disables thinking", func(t *testing.T) {
+		eb := extraBody(t, "off")
+		thinking, ok := eb["thinking"].(map[string]any)
+		require.True(t, ok)
+		assert.Equal(t, "disabled", thinking["type"])
+		_, hasEffort := eb["reasoning_effort"]
+		assert.False(t, hasEffort, "reasoning_effort should not be set when thinking is off")
+	})
 }
 
 // Pins the contract of shouldRetryStalledMessage: a watchdog-stalled turn
