@@ -144,6 +144,80 @@ func TestLookupConfigs_BoundedByProject(t *testing.T) {
 	})
 }
 
+func TestProjectSkillsDir_MonorepoGitRoot(t *testing.T) {
+	t.Parallel()
+
+	t.Run("includes git worktree root skills dirs after working-dir dirs", func(t *testing.T) {
+		if _, err := exec.LookPath("git"); err != nil {
+			t.Skip("git not available")
+		}
+
+		root := t.TempDir()
+		gitInit := exec.CommandContext(t.Context(), "git", "init", "-q")
+		gitInit.Dir = root
+		require.NoError(t, gitInit.Run())
+
+		// Repo-root-level skills (monorepo-wide).
+		require.NoError(t, os.MkdirAll(filepath.Join(root, ".agents", "skills"), 0o755))
+
+		// Subdirectory the user is actually working in, with its own
+		// local skills dir.
+		subDir := filepath.Join(root, "packages", "app")
+		require.NoError(t, os.MkdirAll(filepath.Join(subDir, ".agents", "skills"), 0o755))
+
+		got := ProjectSkillsDir(subDir)
+
+		rootEval, err := filepath.EvalSymlinks(root)
+		require.NoError(t, err)
+		subEval, err := filepath.EvalSymlinks(subDir)
+		require.NoError(t, err)
+
+		wantWorkingDir := filepath.Join(subEval, ".agents", "skills")
+		wantGitRoot := filepath.Join(rootEval, ".agents", "skills")
+
+		var idxWorking, idxRoot = -1, -1
+		for i, p := range got {
+			pEval, err := filepath.EvalSymlinks(p)
+			if err != nil {
+				// Non-.agents/skills entries may not exist on disk; compare
+				// the literal path instead.
+				pEval = p
+			}
+			if pEval == wantWorkingDir && idxWorking == -1 {
+				idxWorking = i
+			}
+			if pEval == wantGitRoot && idxRoot == -1 {
+				idxRoot = i
+			}
+		}
+
+		require.NotEqual(t, -1, idxWorking, "expected working-dir skills path in result: %v", got)
+		require.NotEqual(t, -1, idxRoot, "expected git-root skills path in result: %v", got)
+		require.Less(t, idxWorking, idxRoot, "working-dir paths must come before git-root paths (local precedence): %v", got)
+	})
+
+	t.Run("does not duplicate paths when working dir is the git root", func(t *testing.T) {
+		if _, err := exec.LookPath("git"); err != nil {
+			t.Skip("git not available")
+		}
+
+		root := t.TempDir()
+		gitInit := exec.CommandContext(t.Context(), "git", "init", "-q")
+		gitInit.Dir = root
+		require.NoError(t, gitInit.Run())
+
+		got := ProjectSkillsDir(root)
+		require.Len(t, got, len(projectSkillSubdirs), "must not append git-root dirs a second time when workingDir already is the root")
+	})
+
+	t.Run("falls back to working-dir-only paths outside a git repo", func(t *testing.T) {
+		nonGit := t.TempDir()
+
+		got := ProjectSkillsDir(nonGit)
+		require.Len(t, got, len(projectSkillSubdirs))
+	})
+}
+
 func TestLoadFromConfigPaths_InvalidJSON(t *testing.T) {
 	t.Parallel()
 
