@@ -838,6 +838,30 @@ func TestProviderRetryLogFields(t *testing.T) {
 	})
 }
 
+// TestSanitizeToolInput pins the JSON validation guard that prevents
+// malformed tool call arguments from a provider (e.g. truncated or garbled
+// JSON) from getting persisted verbatim and bricking the session on replay.
+func TestSanitizeToolInput(t *testing.T) {
+	t.Run("valid JSON is returned unchanged", func(t *testing.T) {
+		input := `{"path":"foo.go","limit":10}`
+		out, sanitized := sanitizeToolInput("view", "call_1", input)
+		require.Equal(t, input, out)
+		require.False(t, sanitized)
+	})
+
+	t.Run("malformed JSON is replaced with empty object", func(t *testing.T) {
+		out, sanitized := sanitizeToolInput("view", "call_2", `{"path":"foo.go"`)
+		require.Equal(t, "{}", out)
+		require.True(t, sanitized)
+	})
+
+	t.Run("empty string is sanitized", func(t *testing.T) {
+		out, sanitized := sanitizeToolInput("view", "call_3", "")
+		require.Equal(t, "{}", out)
+		require.True(t, sanitized)
+	})
+}
+
 // TestSetTimeoutOptions verifies that SetTimeoutOptions populates the internal
 // fields on the sessionAgent. Fork patch: batch 8.
 func TestSetTimeoutOptions(t *testing.T) {

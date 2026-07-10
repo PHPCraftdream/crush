@@ -12,6 +12,7 @@ import (
 	"context"
 	_ "embed"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -594,6 +595,12 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	var currentAssistant *message.Message
 	var stepMessages []fantasy.Message
 	var shouldSummarize bool
+	// sanitizedToolCalls tracks tool call IDs whose input JSON was malformed
+	// and got replaced with "{}" by sanitizeToolInput, so OnToolResult can
+	// surface a clear error to the model instead of letting it silently
+	// operate on empty args (or, worse, get stuck resending unparsable input
+	// on every subsequent turn).
+	sanitizedToolCalls := make(map[string]bool)
 
 	// stepHistory accumulates every fantasy.StepResult seen by OnStepFinish,
 	// in arrival order. fantasy's internal Run loop calls OnStepFinish for a
@@ -1096,10 +1103,14 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			// the whole executeTools window.
 			toolStarted()
 			sawToolBoundary = true // Fork patch: batch 8
+			input, wasSanitized := sanitizeToolInput(tc.ToolName, tc.ToolCallID, tc.Input)
+			if wasSanitized {
+				sanitizedToolCalls[tc.ToolCallID] = true
+			}
 			toolCall := message.ToolCall{
 				ID:               tc.ToolCallID,
 				Name:             tc.ToolName,
-				Input:            tc.Input,
+				Input:            input,
 				ProviderExecuted: false,
 				Finished:         true,
 			}
@@ -1115,6 +1126,10 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			toolFinished()
 			sawToolBoundary = true // Fork patch: batch 8
 			toolResult := a.convertToToolResult(result)
+			if sanitizedToolCalls[result.ToolCallID] {
+				toolResult.Content = "Tool call failed: arguments were not valid JSON. Please check your tool call format and try again."
+				toolResult.IsError = true
+			}
 			// Use parent ctx instead of genCtx to ensure the message is created
 			// even if the request is canceled mid-stream
 			_, createMsgErr := a.messages.Create(ctx, currentAssistant.SessionID, message.CreateMessageParams{
@@ -2769,4 +2784,20 @@ func providerRetryLogFields(err *fantasy.ProviderError, delay time.Duration) []a
 		fields = append(fields, "message", err.Message)
 	}
 	return fields
+}
+
+// sanitizeToolInput validates tool call JSON from the provider.
+// Malformed input is replaced with an empty object to prevent
+// stuck conversations from truncated or malformed model output.
+// The second return value indicates whether sanitization occurred.
+func sanitizeToolInput(toolName, toolCallID, input string) (string, bool) {
+	if !json.Valid([]byte(input)) {
+		slog.Warn("Malformed tool call JSON from provider, replacing with empty object",
+			"tool", toolName,
+			"id", toolCallID,
+			"input_len", len(input),
+		)
+		return "{}", true
+	}
+	return input, false
 }
