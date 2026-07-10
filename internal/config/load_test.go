@@ -148,6 +148,7 @@ func TestProjectSkillsDir_MonorepoGitRoot(t *testing.T) {
 	t.Parallel()
 
 	t.Run("includes git worktree root skills dirs after working-dir dirs", func(t *testing.T) {
+		t.Parallel()
 		if _, err := exec.LookPath("git"); err != nil {
 			t.Skip("git not available")
 		}
@@ -175,7 +176,7 @@ func TestProjectSkillsDir_MonorepoGitRoot(t *testing.T) {
 		wantWorkingDir := filepath.Join(subEval, ".agents", "skills")
 		wantGitRoot := filepath.Join(rootEval, ".agents", "skills")
 
-		var idxWorking, idxRoot = -1, -1
+		idxWorking, idxRoot := -1, -1
 		for i, p := range got {
 			pEval, err := filepath.EvalSymlinks(p)
 			if err != nil {
@@ -197,6 +198,7 @@ func TestProjectSkillsDir_MonorepoGitRoot(t *testing.T) {
 	})
 
 	t.Run("does not duplicate paths when working dir is the git root", func(t *testing.T) {
+		t.Parallel()
 		if _, err := exec.LookPath("git"); err != nil {
 			t.Skip("git not available")
 		}
@@ -211,6 +213,7 @@ func TestProjectSkillsDir_MonorepoGitRoot(t *testing.T) {
 	})
 
 	t.Run("falls back to working-dir-only paths outside a git repo", func(t *testing.T) {
+		t.Parallel()
 		nonGit := t.TempDir()
 
 		got := ProjectSkillsDir(nonGit)
