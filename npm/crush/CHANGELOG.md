@@ -8,6 +8,41 @@ This is the npm-package changelog, not the fork's engineering decision
 log — see [`CHANGELOG.fork.md`](../../CHANGELOG.fork.md) at the repo
 root for the full per-file merge/divergence history.
 
+## [0.1.7]
+
+- Fixed: a tool call with malformed JSON arguments from the model used to be
+  persisted as-is and re-read from the DB every subsequent turn, sticking the
+  session forever. Malformed input is now sanitized before storage and the
+  matching tool result is turned into an explicit "arguments were not valid
+  JSON" error the model can react to.
+- Fixed: a non-vision model receiving media (an image) back from a tool call
+  could brick the session instead of continuing. It now gets a text
+  placeholder in place of the media it can't process.
+- Fixed: switching to a different provider/model with no reasoning effort of
+  its own could silently keep the previous provider's effort level instead of
+  resetting to the new model's own default.
+- `crush`'s reasoning-capable API providers now fall back to the first
+  available reasoning level instead of silently running without reasoning
+  when neither the user nor the model config specifies an effort.
+- Z.AI/GLM: an unset reasoning effort now defaults to thinking **on** at
+  `high` instead of off (Z.AI recommends max/high for coding tasks, and
+  GLM-5.x only exposes high/max — no lower tier to "fall back" to). Opt out
+  explicitly with an effort of `off`. DeepSeek is unaffected and keeps its
+  original "unset = no reasoning" default.
+- Fixed: abbreviated directory names (e.g. in `~/.../p/file`-style paths)
+  took the first *byte* of a non-ASCII name instead of the first character,
+  mangling Cyrillic/CJK/emoji directory names.
+- New: a `llama.cpp` model enricher auto-detects context window size from
+  the server's `/v1/models` metadata, matching the existing Ollama/LM
+  Studio/LiteLLM/oMLX enrichers.
+- Every outbound request to the model provider now carries a deterministic,
+  opaque session-affinity header, and provider-reported warnings are now
+  logged instead of silently dropped.
+- Fixed (macOS): project-level skills discovery could duplicate every
+  monorepo-root skills directory when the working directory was itself the
+  git repository root, because of a symlink-unaware path comparison
+  (`/var` vs macOS's real `/private/var`).
+
 ## [0.1.6]
 
 - Windows: fixed a real instant-death bug where `crush run` launched detached
