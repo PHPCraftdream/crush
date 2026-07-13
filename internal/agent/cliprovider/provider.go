@@ -1198,6 +1198,49 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 		parsePart = m.spec.NewPartParser()
 	}
 
+	// scanResult carries one scanner event: a raw line, or a terminal
+	// signal with any scanner error.
+	type scanResult struct {
+		raw  []byte
+		done bool
+		err  error
+	}
+	// Start reading proc.stdout SYNCHRONOUSLY here — before Stream() returns
+	// and regardless of when (or whether) the caller starts ranging over the
+	// returned iterator. This closes a structural race: the wait goroutine
+	// tears down the child's output the instant it exits (PTY branch:
+	// p.Close() discards buffered PTY output; pipe branch: cmd.Wait() closes
+	// the StdoutPipe read end), and a fast-exiting child (echo / cat of a
+	// small file) can finish before a lazily-started scanner reads a single
+	// byte, yielding an empty stream. Draining into a buffered channel from
+	// the moment the process starts guarantees the output is captured up
+	// front. The channel is sized generously so short outputs never block the
+	// scanner before a consumer arrives; larger outputs stream over time and
+	// backpressure safely (data stays in the OS pipe/PTY buffer, not lost).
+	scanCh := make(chan scanResult, 64)
+	go func() {
+		scanner := bufio.NewScanner(proc.stdout)
+		scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+		for scanner.Scan() {
+			b := scanner.Bytes()
+			cp := make([]byte, len(b))
+			copy(cp, b)
+			select {
+			case scanCh <- scanResult{raw: cp}:
+			case <-ctx.Done():
+				return
+			}
+		}
+		// Guard the terminal signal against ctx.Done() as well: the goroutine
+		// now runs eagerly (before any consumer), so if the caller abandons
+		// the iterator without draining, an unguarded send on a full channel
+		// would leak this goroutine.
+		select {
+		case scanCh <- scanResult{done: true, err: scanner.Err()}:
+		case <-ctx.Done():
+		}
+	}()
+
 	return func(yield func(fantasy.StreamPart) bool) {
 		// Cleanup MCP resources when the stream ends (cannot use defer in
 		// Stream() because that fires before the closure executes).
@@ -1237,30 +1280,6 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 			proc.kill()
 			return
 		}
-
-		// scanResult carries one scanner event: a raw line, or a terminal
-		// signal with any scanner error.
-		type scanResult struct {
-			raw  []byte
-			done bool
-			err  error
-		}
-		scanCh := make(chan scanResult, 64)
-		go func() {
-			scanner := bufio.NewScanner(proc.stdout)
-			scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
-			for scanner.Scan() {
-				b := scanner.Bytes()
-				cp := make([]byte, len(b))
-				copy(cp, b)
-				select {
-				case scanCh <- scanResult{raw: cp}:
-				case <-ctx.Done():
-					return
-				}
-			}
-			scanCh <- scanResult{done: true, err: scanner.Err()}
-		}()
 
 		// toolCh is the read side of the MCP tool-event channel.
 		// When nil (no MCP server), selecting on it never fires.
@@ -1358,7 +1377,17 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 			}
 		}
 
-		if scanErr != nil && !errors.Is(scanErr, io.EOF) {
+		// os.ErrClosed ("read |0: file already closed") is a benign
+		// end-of-stream signal, not a real I/O failure: the scanner now runs
+		// eagerly (started in Stream() before the consumer arrives), so on a
+		// fast-exiting child the wait goroutine's cmd.Wait() can close the
+		// StdoutPipe read end at the exact instant the scanner is mid-read on
+		// that same fd, surfacing os.ErrClosed. The process has already exited
+		// by definition, so treat this like EOF and fall through to the normal
+		// proc.wait() path, which still surfaces a genuine error if the child
+		// exited non-zero. Without this, a rare scheduling race turned a
+		// successful run into a spurious StreamPartTypeError (CI flake).
+		if scanErr != nil && !errors.Is(scanErr, io.EOF) && !errors.Is(scanErr, os.ErrClosed) {
 			// PTY master returns EIO (Unix) or similar when child exits.
 			// Treat any scanner error in PTY mode as normal end-of-stream.
 			if !proc.usingPTY {
