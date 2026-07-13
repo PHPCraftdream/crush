@@ -3,11 +3,13 @@ package prompt
 import (
 	"cmp"
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"text/template"
 	"time"
@@ -162,6 +164,49 @@ func loadContextFiles(paths []string, store *config.ConfigStore) map[string][]Co
 	return files
 }
 
+// flattenContextFiles collects a path-keyed context-file map into a single
+// slice, sorted by path key for deterministic ordering — map iteration order
+// in Go is randomized, and dedupeContextFiles below needs a stable "first
+// occurrence wins" rule to produce the same result on every run.
+func flattenContextFiles(byPath map[string][]ContextFile) []ContextFile {
+	keys := make([]string, 0, len(byPath))
+	for k := range byPath {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var out []ContextFile
+	for _, k := range keys {
+		out = append(out, byPath[k]...)
+	}
+	return out
+}
+
+// dedupeContextFiles drops files whose content is byte-identical to a file
+// already kept. Popular coding agents each look for their own instruction
+// file (CLAUDE.md, AGENTS.md, GEMINI.md, ...; see defaultContextPaths in
+// internal/config/config.go), so a project that keeps several of them in
+// sync — often literal copies or symlinks of one another — would otherwise
+// have the same instructions injected into the prompt multiple times,
+// wasting context for no benefit. The first occurrence, in the deterministic
+// order produced by flattenContextFiles, wins; later duplicates are dropped
+// entirely (not just blanked), so their <file path="..."> wrapper doesn't
+// appear either.
+func dedupeContextFiles(files []ContextFile) []ContextFile {
+	seen := make(map[[sha256.Size]byte]bool, len(files))
+	out := make([]ContextFile, 0, len(files))
+	for _, f := range files {
+		hash := sha256.Sum256([]byte(f.Content))
+		if seen[hash] {
+			slog.Debug("prompt: skipping duplicate context file content", "path", f.Path)
+			continue
+		}
+		seen[hash] = true
+		out = append(out, f)
+	}
+	return out
+}
+
 func (p *Prompt) promptData(ctx context.Context, provider, model string, store *config.ConfigStore) (PromptDat, error) {
 	workingDir := cmp.Or(p.workingDir, store.WorkingDir())
 	platform := cmp.Or(p.platform, runtime.GOOS)
@@ -223,12 +268,8 @@ func (p *Prompt) promptData(ctx context.Context, provider, model string, store *
 		}
 	}
 
-	for _, files := range contextFiles {
-		data.ContextFiles = append(data.ContextFiles, files...)
-	}
-	for _, files := range globalContextFiles {
-		data.GlobalContextFiles = append(data.GlobalContextFiles, files...)
-	}
+	data.ContextFiles = dedupeContextFiles(flattenContextFiles(contextFiles))
+	data.GlobalContextFiles = dedupeContextFiles(flattenContextFiles(globalContextFiles))
 	return data, nil
 }
 
