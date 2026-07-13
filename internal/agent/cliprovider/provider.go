@@ -1050,15 +1050,42 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 					"promptHead", clipString(prompt, 200),
 					"promptTail", tailString(prompt, 200),
 				)
+				// go-pty's unixPty.Start() (cmd_unix.go) sets cmd.Stdin/Stdout/
+				// Stderr = pty.slave directly — our own process keeps its own
+				// open handle to the slave end in addition to the child's
+				// inherited copy. Unless we close OUR copy, the master read
+				// NEVER sees EOF, even after the child (and any grandchildren)
+				// exit and close theirs: as long as any open slave fd exists
+				// anywhere, the kernel keeps the master side alive. This is not
+				// a corner case — it is unconditional on this library, and
+				// without this close the scanner blocks forever on every normal
+				// (non-cancelled) exit (confirmed by a CI hang: TestStreamExitError
+				// timed out after 10m with the scanner parked in Read()).
+				//
+				// Closing our slave copy immediately after Start() is the
+				// standard Unix PTY pattern: it lets the master reach genuine
+				// EOF once every *other* holder (the direct child, and any
+				// legitimate grandchild that inherited the tty) has also
+				// closed its copy — which is exactly the natural-EOF signal
+				// the scanner needs, and still respects a grandchild
+				// legitimately holding the tty open (mirrors the pipe branch's
+				// stderr-holding-grandchild protection). Windows ConPTY has no
+				// separate slave fd (UnixPty type assertion fails there), so
+				// this is a no-op on Windows and the existing eager-close
+				// goroutine below remains the correct mechanism there.
+				if up, ok := p.(gopty.UnixPty); ok {
+					_ = up.Slave().Close()
+				}
+
 				// ptycmd.Wait() runs eagerly in a background goroutine for zombie
-				// reaping. But p.Close() is deliberately deferred to wait() — NOT
-				// called eagerly here. On Unix, the scanner gets natural EOF from
-				// the PTY slave closure (child exit); calling p.Close() before the
-				// scanner drains the last buffered line races with the active read,
-				// discarding data (the CI failure: linesSeen=4 instead of 5, the
-				// final usage page lost). On Windows ConPTY, the child exit does
-				// NOT deliver EOF on the master read pipe, so a separate goroutine
-				// closes the PTY after the process exits to unblock the scanner.
+				// reaping. p.Close() (closing the master too) is deliberately
+				// deferred to wait() — NOT called eagerly here — so a
+				// fast-exiting child's already-buffered output can still be
+				// drained via the natural EOF above before the master itself
+				// is torn down. On Windows ConPTY, the child exit does NOT
+				// deliver EOF on the master read pipe at all, so a separate
+				// goroutine closes the PTY after the process exits to unblock
+				// the scanner.
 				var ptyWaitErr error
 				ptyWaitDone := make(chan struct{})
 				go func() {
