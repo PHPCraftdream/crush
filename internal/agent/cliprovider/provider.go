@@ -20,6 +20,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 
@@ -1049,18 +1050,46 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 					"promptHead", clipString(prompt, 200),
 					"promptTail", tailString(prompt, 200),
 				)
-				waitCh := make(chan error, 1)
+				// ptycmd.Wait() runs eagerly in a background goroutine for zombie
+				// reaping. But p.Close() is deliberately deferred to wait() — NOT
+				// called eagerly here. On Unix, the scanner gets natural EOF from
+				// the PTY slave closure (child exit); calling p.Close() before the
+				// scanner drains the last buffered line races with the active read,
+				// discarding data (the CI failure: linesSeen=4 instead of 5, the
+				// final usage page lost). On Windows ConPTY, the child exit does
+				// NOT deliver EOF on the master read pipe, so a separate goroutine
+				// closes the PTY after the process exits to unblock the scanner.
+				var ptyWaitErr error
+				ptyWaitDone := make(chan struct{})
 				go func() {
-					waitCh <- ptycmd.Wait()
-					_ = p.Close() // EOF for scanner (required on Windows ConPTY)
+					ptyWaitErr = ptycmd.Wait()
+					close(ptyWaitDone)
 				}()
+
+				var closeOnce sync.Once
+				closePTY := func() { closeOnce.Do(func() { _ = p.Close() }) }
+
+				if runtime.GOOS == "windows" {
+					// ConPTY: child exit alone does not signal EOF on the master
+					// read pipe. Close the PTY as soon as the process exits so
+					// the scanner sees EOF. (Not exercised by the test suite —
+					// testDisablePTY=true on Windows forces pipe mode.)
+					go func() {
+						select {
+						case <-ptyWaitDone:
+						case <-ctx.Done():
+						}
+						closePTY()
+					}()
+				}
+
 				var ptyKillOnce sync.Once
 				proc = procHandle{
 					stdout:   p,
 					usingPTY: true,
 					kill: func() {
 						// Use sync.Once so this is safe to call from multiple goroutines
-						// (context-cancel watcher + scanner loop) without double-draining waitCh.
+						// (context-cancel watcher + scanner loop) without double-killing.
 						ptyKillOnce.Do(func() {
 							if ptycmd.Process != nil {
 								_ = session.KillProcess(ptycmd.Process.Pid)
@@ -1073,10 +1102,16 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 						// handles can keep ptycmd.Wait() from returning even after
 						// the direct child exits. PTY mode merges stderr into the
 						// tty, so there is no stderrBuf to race on here.
+						// closePTY() is idempotent (sync.Once): on Unix it cleans
+						// up the master fd after the scanner has drained; on
+						// Windows it may have already been called by the eager
+						// goroutine above (which is fine — Do is a no-op).
 						select {
-						case waitErr := <-waitCh:
-							return "", waitErr
+						case <-ptyWaitDone:
+							closePTY()
+							return "", ptyWaitErr
 						case <-ctx.Done():
+							closePTY()
 							slog.Warn("cliprovider: PTY wait aborted on ctx cancellation", "binary", m.spec.Binary)
 							return "", ctx.Err()
 						}
@@ -1151,8 +1186,21 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 			reader = pipe
 		}
 		slog.Info("cliprovider: process started", "binary", m.spec.Binary, "pid", cmd.Process.Pid)
-		waitCh := make(chan error, 1)
-		go func() { waitCh <- cmd.Wait() }()
+		// Do NOT start cmd.Wait() eagerly. Per Go docs on StdoutPipe:
+		//   "it is incorrect to call Wait before all reads from the pipe have
+		//   completed."
+		// Wait() closes the StdoutPipe read end; starting it eagerly races with
+		// the scanner — on a fast-exiting child (echo/cat of a small file) the
+		// pipe can be closed before the scanner reads the last buffered line,
+		// losing data (the CI failure: final usage line lost). Instead, Wait()
+		// is started lazily inside the wait() closure below, which is only
+		// called after scanDone (the scanner has drained stdout to EOF). The
+		// wait() closure is idempotent via sync.Once so it can be safely
+		// deferred for cleanup on early-return paths.
+		var pipeWaitOnce sync.Once
+		var pipeWaitStderr string
+		var pipeWaitErr error
+		pipeWaitCh := make(chan error, 1)
 		proc = procHandle{
 			stdout:   reader,
 			usingPTY: false,
@@ -1162,33 +1210,37 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 				}
 			},
 			wait: func() (string, error) {
-				// cmd.Wait() blocks until EVERY process holding the stderr
-				// write handle exits, not just the direct child — and the
-				// external CLI binaries this launches routinely spawn
-				// grandchildren (claude.cmd → cmd.exe → node.exe, MCP
-				// servers) that inherit stderr. If the direct child dies
-				// (stdout EOFs, scanner loop ends) but a grandchild is still
-				// alive holding stderr, an unbounded cmd.Wait() would block
-				// forever with no ctx check on this path. Bound it: run
-				// Wait in its own goroutine and select against ctx.Done().
-				select {
-				case waitErr := <-waitCh:
-					// Only safe to read stderrBuf after Wait truly completed;
-					// os/exec's stderr-copy goroutine is joined by Wait.
-					stderr := strings.TrimSpace(stderrBuf.String())
-					if stderr != "" {
-						slog.Warn("cliprovider: process stderr", "binary", m.spec.Binary, "stderr", stderr)
+				pipeWaitOnce.Do(func() {
+					// cmd.Wait() blocks until EVERY process holding the stderr
+					// write handle exits, not just the direct child — and the
+					// external CLI binaries this launches routinely spawn
+					// grandchildren (claude.cmd → cmd.exe → node.exe, MCP
+					// servers) that inherit stderr. If the direct child dies
+					// (stdout EOFs, scanner loop ends) but a grandchild is still
+					// alive holding stderr, an unbounded cmd.Wait() would block
+					// forever with no ctx check on this path. Bound it: run
+					// Wait in its own goroutine and select against ctx.Done().
+					go func() { pipeWaitCh <- cmd.Wait() }()
+					select {
+					case waitErr := <-pipeWaitCh:
+						// Only safe to read stderrBuf after Wait truly completed;
+						// os/exec's stderr-copy goroutine is joined by Wait.
+						pipeWaitStderr = strings.TrimSpace(stderrBuf.String())
+						if pipeWaitStderr != "" {
+							slog.Warn("cliprovider: process stderr", "binary", m.spec.Binary, "stderr", pipeWaitStderr)
+						}
+						pipeWaitErr = waitErr
+					case <-ctx.Done():
+						// ctx cancelled before Wait returned — stderrBuf may
+						// still be written to concurrently by the not-yet-joined
+						// stderr-copy goroutine, so do NOT read it (would race).
+						// The stderr-holding grandchild is the very thing ctx
+						// cancellation (via kill()) is trying to tear down.
+						slog.Warn("cliprovider: wait aborted on ctx cancellation; stderr discarded (may be incomplete)", "binary", m.spec.Binary)
+						pipeWaitErr = ctx.Err()
 					}
-					return stderr, waitErr
-				case <-ctx.Done():
-					// ctx cancelled before Wait returned — stderrBuf may
-					// still be written to concurrently by the not-yet-joined
-					// stderr-copy goroutine, so do NOT read it (would race).
-					// The stderr-holding grandchild is the very thing ctx
-					// cancellation (via kill()) is trying to tear down.
-					slog.Warn("cliprovider: wait aborted on ctx cancellation; stderr discarded (may be incomplete)", "binary", m.spec.Binary)
-					return "", ctx.Err()
-				}
+				})
+				return pipeWaitStderr, pipeWaitErr
 			},
 		}
 	}
@@ -1259,6 +1311,15 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 		if geminiMCPName != "" {
 			defer deregisterGeminiMCP(geminiMCPName)
 		}
+
+		// Ensure the child process is reaped and its output fds are cleaned up
+		// on EVERY exit path — including early returns from ctx-cancel and
+		// yield-false. proc.wait() is idempotent (sync.Once internally), so
+		// calling it here in addition to the explicit calls in the normal and
+		// scanErr paths below is safe: the second call is a no-op. Without
+		// this defer, the ctx-cancel and yield-false paths would skip Wait()
+		// entirely, leaving a zombie process and leaking the StdoutPipe/PTY fd.
+		defer func() { _, _ = proc.wait() }()
 
 		// Kill the subprocess immediately when ctx is cancelled, even while
 		// scanner.Scan() is blocking between CLI output lines (e.g. during a
@@ -1378,15 +1439,15 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 		}
 
 		// os.ErrClosed ("read |0: file already closed") is a benign
-		// end-of-stream signal, not a real I/O failure: the scanner now runs
-		// eagerly (started in Stream() before the consumer arrives), so on a
-		// fast-exiting child the wait goroutine's cmd.Wait() can close the
-		// StdoutPipe read end at the exact instant the scanner is mid-read on
-		// that same fd, surfacing os.ErrClosed. The process has already exited
-		// by definition, so treat this like EOF and fall through to the normal
-		// proc.wait() path, which still surfaces a genuine error if the child
-		// exited non-zero. Without this, a rare scheduling race turned a
-		// successful run into a spurious StreamPartTypeError (CI flake).
+		// end-of-stream signal, not a real I/O failure. cmd.Wait() is no
+		// longer started eagerly (it now runs lazily from proc.wait(), only
+		// after the scanner itself reaches scanDone), so this can no longer be
+		// caused by a concurrent Wait() racing the scanner's read. It is kept
+		// as a defensive, platform-agnostic classification: some OS/exec
+		// implementations can still surface a "file already closed" read
+		// error as part of normal teardown once the child has exited. Treat
+		// it like EOF and fall through to the normal proc.wait() path, which
+		// still surfaces a genuine error if the child exited non-zero.
 		if scanErr != nil && !errors.Is(scanErr, io.EOF) && !errors.Is(scanErr, os.ErrClosed) {
 			// PTY master returns EIO (Unix) or similar when child exits.
 			// Treat any scanner error in PTY mode as normal end-of-stream.

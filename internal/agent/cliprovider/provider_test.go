@@ -1106,6 +1106,103 @@ func TestStreamWithGeminiParser(t *testing.T) {
 	}
 }
 
+// ── Bug 3 regression: last line must not be lost on a fast-exiting child ──
+//
+// Before the fix, cmd.Wait() (pipe branch) or p.Close() (PTY branch) was
+// started eagerly in a goroutine that ran concurrently with the scanner.
+// On a fast-exiting child (cat of a small JSONL file), the wait goroutine
+// could close the output fd before the scanner read the final buffered
+// line — the usage/result line — losing it. On CI this surfaced as
+// linesSeen=4 instead of 5 with TotalTokens=0 instead of 15.
+//
+// The fix defers Wait()/Close() to proc.wait(), which is only called after
+// the scanner has drained stdout to natural EOF. This test reproduces the
+// scenario (cat of a 5-line file, fast exit) and asserts every line —
+// especially the last — is received. We run many iterations because the
+// race is timing-dependent; a single green iteration proves nothing.
+func TestStreamFastExitNoLastLineLoss(t *testing.T) {
+	shell, flag := "bash", "-c"
+	if _, err := exec.LookPath(shell); err != nil {
+		t.Skipf("shell %q not found", shell)
+	}
+
+	// 5 lines: 3 text deltas + init + final result (usage). The last line
+	// is the one that gets lost in the race.
+	jsonLines := strings.Join([]string{
+		`{"type":"init","session_id":"s","model":"m"}`,
+		`{"type":"message","role":"assistant","content":"A","delta":true}`,
+		`{"type":"message","role":"assistant","content":"B","delta":true}`,
+		`{"type":"message","role":"assistant","content":"C","delta":true}`,
+		`{"type":"result","status":"success","stats":{"total_tokens":42,"input_tokens":30,"output_tokens":12}}`,
+	}, "\n") + "\n"
+
+	tmpDir := t.TempDir()
+	tmpFile := filepath.Join(tmpDir, "fast.jsonl")
+	if err := os.WriteFile(tmpFile, []byte(jsonLines), 0o644); err != nil {
+		t.Fatalf("write temp file: %v", err)
+	}
+
+	readCmd := "cat " + strings.ReplaceAll(tmpFile, "\\", "/")
+	spec := CLISpec{
+		ModelID:        "test-fast-exit",
+		ModelName:      "Test Fast Exit",
+		Binary:         shell,
+		PromptFlag:     "-p",
+		BuildArgs:      func(bool) []string { return []string{flag, readCmd} },
+		NewPartParser:  geminiPartParser,
+		ParseUsageLine: geminiParseUsageLine,
+	}
+
+	const iterations = 100
+	for i := 0; i < iterations; i++ {
+		m := &cliModel{spec: spec, workingDir: tmpDir}
+		stream, err := m.Stream(context.Background(), fantasy.Call{
+			Prompt: fantasy.Prompt{fantasy.NewUserMessage("x")},
+		})
+		if err != nil {
+			t.Fatalf("iter %d: Stream() error: %v", i, err)
+		}
+
+		var text strings.Builder
+		var finalUsage fantasy.Usage
+		var finished bool
+		var errPart error
+		for part := range stream {
+			switch part.Type {
+			case fantasy.StreamPartTypeTextDelta:
+				text.WriteString(part.Delta)
+			case fantasy.StreamPartTypeFinish:
+				finished = true
+				finalUsage = part.Usage
+			case fantasy.StreamPartTypeError:
+				errPart = part.Error
+			}
+		}
+
+		if errPart != nil {
+			t.Fatalf("iter %d: unexpected error: %v", i, errPart)
+		}
+		if !finished {
+			t.Fatalf("iter %d: expected finish part", i)
+		}
+		// The critical assertion: the LAST line (usage) must not be lost.
+		// With the race bug, finalUsage.TotalTokens was 0 on some iterations.
+		if finalUsage.TotalTokens != 42 {
+			t.Errorf("iter %d: TotalTokens = %d, want 42 (last line lost — race bug)", i, finalUsage.TotalTokens)
+		}
+		if finalUsage.InputTokens != 30 {
+			t.Errorf("iter %d: InputTokens = %d, want 30", i, finalUsage.InputTokens)
+		}
+		if finalUsage.OutputTokens != 12 {
+			t.Errorf("iter %d: OutputTokens = %d, want 12", i, finalUsage.OutputTokens)
+		}
+		// All 3 text deltas must be present.
+		if text.String() != "ABC" {
+			t.Errorf("iter %d: text = %q, want %q", i, text.String(), "ABC")
+		}
+	}
+}
+
 // ── Spec invariants ──────────────────────────────────────────────────────────
 
 func TestAllSpecsHaveUniqueIDs(t *testing.T) {
