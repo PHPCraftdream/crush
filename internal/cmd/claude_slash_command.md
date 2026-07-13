@@ -183,6 +183,17 @@ finishes — and you're not launching a replacement and no other
 `/crush` runs are in flight — drop the liveness loop; an idle watchdog
 is just noise. Re-arm it only when you launch the next run.
 
+**Never re-launch `crush run --session <id>` into a session that's already
+busy** — a fresh `crush run` against a live lock either queues confusingly
+or fails fast, and a background-tool "completed" notification then only
+reflects that rejected/duplicate launch, not the real session's progress.
+Before treating a session as idle or stuck, confirm with `crush sessions
+locks <id>` (alive/offline) or `crush sessions show <id> --with-messages`
+— never infer state from a completion notification alone. To nudge a live
+session, use `crush sessions inject <id> -m "<msg>"` (`--interrupt` to cut
+in), not another `crush run`. Only relaunch once the lock is confirmed
+gone or genuinely stale (`sessions locks`/`reap`).
+
 ## Steering a running session — `sessions inject`
 
 Hand a **new message to a run already in flight** in another process,
