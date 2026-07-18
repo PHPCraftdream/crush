@@ -5,12 +5,12 @@ package shell
 import (
 	"context"
 	"fmt"
-	"os"
 	"os/exec"
 	"syscall"
 	"time"
 
 	"github.com/charmbracelet/crush/internal/platform"
+	"github.com/charmbracelet/crush/internal/session"
 	"mvdan.cc/sh/v3/interp"
 )
 
@@ -57,10 +57,25 @@ func processGroupExecHandler(killTimeout time.Duration) interp.ExecHandlerFunc {
 		err = cmd.Start()
 		if err == nil {
 			stopf := context.AfterFunc(ctx, func() {
-				// Go doesn't support sending Interrupt on Windows — kill
-				// immediately, matching upstream DefaultExecHandler's own
-				// Windows behavior regardless of killTimeout.
-				_ = cmd.Process.Signal(os.Kill)
+				// cmd.Stdout/Stderr here are plain io.Writers (our
+				// syncBuffer, not *os.File), so os/exec backs them with an
+				// OS pipe and a copy-goroutine that cmd.Wait() joins. That
+				// goroutine only sees EOF once EVERY process holding the
+				// pipe's write end closes it. A plain Process.Signal —
+				// Go doesn't support sending Interrupt on Windows anyway,
+				// so this was always a hard kill — only terminates this
+				// DIRECT child; any grandchild it spawned (a dev-server or
+				// proxy forking a worker process is a common real case)
+				// keeps its inherited copy of the handle open, so
+				// cmd.Wait() then hangs indefinitely instead of returning
+				// once the direct child is gone. Tree-kill via taskkill /T
+				// instead, matching session.KillProcess's approach to the
+				// exact same class of problem in `crush sessions kill` —
+				// it kills the direct process AND everything Windows
+				// recorded as its descendant.
+				if cmd.Process != nil {
+					_ = session.KillProcess(cmd.Process.Pid)
+				}
 			})
 			defer stopf()
 			err = cmd.Wait()
