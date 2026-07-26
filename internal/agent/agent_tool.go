@@ -16,7 +16,15 @@ import (
 var agentToolDescription string
 
 type AgentParams struct {
-	Prompt string `json:"prompt" description:"The task for the agent to perform"`
+	Prompt string `json:"prompt" description:"The task for the agent to perform. When resume_session_id is set, this is instead the answer/instruction to send to the paused sub-agent — it is appended to that sub-agent's existing conversation, not a new task."`
+	// ResumeSessionID, when set, continues an existing sub-agent session
+	// instead of starting a new one. Use this to answer a sub-agent that
+	// stopped with a "SUB-AGENT QUESTION" tool result: the sub-agent's full
+	// prior context (files it already read, work already done) is preserved,
+	// so the task does not have to be restarted from scratch. Must be the
+	// exact session id from that tool result, and must be a child of the
+	// current session — resuming any other session id is rejected.
+	ResumeSessionID string `json:"resume_session_id,omitempty" description:"Optional: the child session id of a paused sub-agent to resume (from a prior \"SUB-AGENT QUESTION (session ...)\" result), instead of starting a new sub-agent. The sub-agent's context is preserved."`
 }
 
 const (
@@ -56,12 +64,13 @@ func (c *coordinator) agentTool(ctx context.Context) (fantasy.AgentTool, error) 
 			}
 
 			return c.runSubAgent(ctx, subAgentParams{
-				Agent:          agent,
-				SessionID:      sessionID,
-				AgentMessageID: agentMessageID,
-				ToolCallID:     call.ID,
-				Prompt:         params.Prompt,
-				SessionTitle:   "New Agent Session",
+				Agent:           agent,
+				SessionID:       sessionID,
+				AgentMessageID:  agentMessageID,
+				ToolCallID:      call.ID,
+				Prompt:          params.Prompt,
+				SessionTitle:    "New Agent Session",
+				ResumeSessionID: params.ResumeSessionID,
 			})
 		},
 	), nil

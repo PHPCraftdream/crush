@@ -789,15 +789,12 @@ func resolveAllowedTools(allTools []string, disabledTools []string) []string {
 }
 
 func resolveReadOnlyTools(tools []string) []string {
-	// Deliberately excludes "ask_question": this list feeds the read-only
-	// task sub-agent, and a sub-agent's ask_question call is currently
-	// collapsed by runSubAgent's error path into a generic "Failed to
-	// generate response: ..." text error (internal/agent/coordinator.go) --
-	// a confusing degraded UX with no working round-trip back to the
-	// caller. Giving the sub-agent ask_question belongs together with a
-	// proper worker toolset and a fix that frames a sub-agent question
-	// correctly for its caller; granting it here would ship the broken
-	// interim behavior for no benefit. See
+	// Deliberately excludes "ask_question", which keeps the plain
+	// search-and-context sub-agent (the interactive path, where no worker is
+	// involved) unable to pause a turn on a question nobody is waiting to
+	// answer. A sub-agent acting as a *worker* does get it, layered on top of
+	// this list by buildToolsAgentConfig in internal/agent/coordinator.go,
+	// together with the question round-trip that makes it useful. See
 	// docs/plans/2026-07-26-orchestrator-worker-e2e.md (BUG-2, phase 3).
 	readOnlyTools := []string{"glob", "grep", "ls", "sourcegraph", "view"}
 	// filter to only include tools that are in allowedtools (include mode)

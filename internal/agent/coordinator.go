@@ -1313,15 +1313,15 @@ func (c *coordinator) buildAgent(ctx context.Context, prompt *prompt.Prompt, age
 // own — recursion guard, keeps the delegation tree exactly two levels deep
 // (orchestrator -> worker).
 //
-// Deliberately excludes "ask_question" too, even though it would otherwise
-// be a safe (no side effects) addition: a sub-agent's question is currently
-// collapsed by runSubAgent's generic error path into a plain text error with
-// no round-trip back to the caller (see the comment on resolveReadOnlyTools
-// in internal/config/config.go). Wiring that round-trip is a separate,
-// already-planned follow-up (docs/plans/2026-07-26-orchestrator-worker-e2e.md,
-// phase 3); granting the tool ahead of that fix would just ship a confusing
-// dead end.
-var workerToolNames = []string{"edit", "multiedit", "write", "bash", "todos", "download", "fetch"}
+// Includes "ask_question": runSubAgent now recognizes AwaitingAnswerError
+// before its generic error branch and returns a question-shaped SUCCESSFUL
+// tool response (see subAgentQuestionText in question_stop.go) instead of
+// collapsing it into "Failed to generate response: ...". The orchestrator
+// answers via AgentParams.ResumeSessionID, which continues the same
+// sub-session rather than starting a fresh one. See
+// docs/plans/2026-07-26-orchestrator-worker-e2e.md, phase 3, for the full
+// round-trip design and why a synchronous blocking version is impossible.
+var workerToolNames = []string{"edit", "multiedit", "write", "bash", "todos", "download", "fetch", tools.AskQuestionToolName}
 
 // buildToolsAgentConfig returns the config.Agent buildTools should use to
 // resolve AllowedTools for this build. For a sub-agent acting as a worker
@@ -2351,17 +2351,51 @@ type subAgentParams struct {
 	// SessionSetup is an optional callback invoked after session creation
 	// but before agent execution, for custom session configuration.
 	SessionSetup func(sessionID string)
+	// ResumeSessionID, when non-empty, continues an existing sub-agent
+	// session instead of creating a new one — see AgentParams.ResumeSessionID
+	// for the model-facing contract. Must name a session whose
+	// ParentSessionID equals SessionID; runSubAgent verifies this before
+	// touching it (see the ownership check in runSubAgent).
+	ResumeSessionID string
 }
 
 // runSubAgent runs a sub-agent and handles session management and cost accumulation.
-// It creates a sub-session, runs the agent with the given prompt, and propagates
-// the cost to the parent session.
+// It creates a sub-session (or resumes an existing one, see ResumeSessionID),
+// runs the agent with the given prompt, and propagates the cost to the parent
+// session.
 func (c *coordinator) runSubAgent(ctx context.Context, params subAgentParams) (fantasy.ToolResponse, error) {
-	// Create sub-session
-	agentToolSessionID := c.sessions.CreateAgentToolSessionID(params.AgentMessageID, params.ToolCallID)
-	session, err := c.sessions.CreateTaskSession(ctx, agentToolSessionID, params.SessionID, params.SessionTitle)
-	if err != nil {
-		return fantasy.ToolResponse{}, fmt.Errorf("create session: %w", err)
+	var session session.Session
+	if params.ResumeSessionID != "" {
+		// Resume path (Gap 2 / phase 3.2): reuse the existing sub-session so
+		// the sub-agent's prior context (files read, work already done) is
+		// preserved instead of thrown away. SECURITY: verify the session
+		// being resumed is genuinely a child of the CURRENT parent session
+		// before touching it — otherwise a model could pass an arbitrary
+		// session id (someone else's session, or an unrelated top-level
+		// session) and read/append to it. A bad id here is a model mistake,
+		// not a crash: return a normal tool error (nil Go error) so the
+		// caller can retry rather than aborting the parent's turn.
+		existing, err := c.sessions.Get(ctx, params.ResumeSessionID)
+		if err != nil {
+			return fantasy.NewTextErrorResponse(fmt.Sprintf(
+				"resume_session_id %q not found: %s", params.ResumeSessionID, err,
+			)), nil
+		}
+		if existing.ParentSessionID != params.SessionID {
+			return fantasy.NewTextErrorResponse(fmt.Sprintf(
+				"resume_session_id %q is not a child of the current session; refusing to resume a session that does not belong to this agent call",
+				params.ResumeSessionID,
+			)), nil
+		}
+		session = existing
+	} else {
+		// Create sub-session
+		agentToolSessionID := c.sessions.CreateAgentToolSessionID(params.AgentMessageID, params.ToolCallID)
+		created, err := c.sessions.CreateTaskSession(ctx, agentToolSessionID, params.SessionID, params.SessionTitle)
+		if err != nil {
+			return fantasy.ToolResponse{}, fmt.Errorf("create session: %w", err)
+		}
+		session = created
 	}
 
 	// Call session setup function if provided
@@ -2400,7 +2434,7 @@ func (c *coordinator) runSubAgent(ctx context.Context, params subAgentParams) (f
 		})
 	}
 	var result *fantasy.AgentResult
-	err = c.runWithUnauthorizedRetry(ctx, providerCfg, func() error {
+	err := c.runWithUnauthorizedRetry(ctx, providerCfg, func() error {
 		var runErr error
 		result, runErr = run()
 		return runErr
@@ -2411,6 +2445,26 @@ func (c *coordinator) runSubAgent(ctx context.Context, params subAgentParams) (f
 			Type:       notify.TypeReAuthenticate,
 			ProviderID: model.ModelCfg.Provider,
 		})
+	}
+	// A sub-agent that called ask_question stops its turn via
+	// AwaitingAnswerError (see question_stop.go), not a genuine failure —
+	// letting it fall into the generic branch below would tell the parent
+	// model "the sub-agent FAILED", and it would likely redo the work itself
+	// instead of answering. Recognize this case first and return a normal
+	// SUCCESSFUL tool response shaped as a question, still costing whatever
+	// the sub-agent spent before it paused. The generic error branch below
+	// is unchanged for genuine failures.
+	var awaitingAnswer *AwaitingAnswerError
+	if errors.As(err, &awaitingAnswer) {
+		if costErr := c.updateParentSessionCost(ctx, session.ID, params.SessionID); costErr != nil {
+			slog.Warn(
+				"Failed to update parent session cost",
+				"child_session", session.ID,
+				"parent_session", params.SessionID,
+				"error", costErr,
+			)
+		}
+		return fantasy.NewTextResponse(subAgentQuestionText(session.ID, awaitingAnswer)), nil
 	}
 	if err != nil {
 		return fantasy.NewTextErrorResponse(fmt.Sprintf("Failed to generate response: %s", err)), nil

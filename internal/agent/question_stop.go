@@ -39,6 +39,32 @@ func AwaitingAnswerGuidance(question string, options []string, sessionID string)
 	)
 }
 
+// subAgentQuestionText builds the tool-result text runSubAgent returns when
+// a sub-agent (the `agent` tool) stops on AwaitingAnswerError instead of
+// finishing normally. Sibling to AwaitingAnswerGuidance above: that function
+// is for the top-level session stopping crush run itself (nobody left to
+// answer, process must exit); this one is for a sub-agent stopping while its
+// orchestrator is still alive and mid-turn — the orchestrator can decide the
+// answer itself and keep going without its own turn ending. Wording matters
+// here: this is read by a model, and the whole point of the "return and
+// resume" design (see docs/plans/2026-07-26-orchestrator-worker-e2e.md,
+// section 3) is that a generic-looking error would make the parent think the
+// sub-agent crashed and redo the work itself instead of answering — so this
+// must read unambiguously as "the sub-agent is fine and paused, not failed".
+func subAgentQuestionText(childSessionID string, ae *AwaitingAnswerError) string {
+	optsLine := ""
+	if len(ae.Options) > 0 {
+		optsLine = "\nSuggested options: " + strings.Join(ae.Options, " | ")
+	}
+	return fmt.Sprintf(
+		"SUB-AGENT QUESTION (session %s): %s%s\n"+
+			"The sub-agent is paused with its context intact. To answer, call the "+
+			"`agent` tool again with resume_session_id=\"%s\" and your answer as the "+
+			"prompt. To abandon it instead, just continue on your own.",
+		childSessionID, ae.Question, optsLine, childSessionID,
+	)
+}
+
 // awaitingAnswerStoppedFinishText builds the (msg, details) pair recorded as
 // the Finish part when a session is force-stopped because the agent called
 // the question tool. Mirrors peakHoursStoppedFinishText in

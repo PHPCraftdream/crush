@@ -315,6 +315,285 @@ func TestRunSubAgent(t *testing.T) {
 		assert.Equal(t, "Failed to generate response: provider request failed", resp.Content)
 	})
 
+	// Gap 1 (docs/plans/2026-07-26-orchestrator-worker-e2e.md, section
+	// "Фаза 3"): a worker calling ask_question stops its turn via
+	// AwaitingAnswerError (see agent.go's errors.As normalization of
+	// tools.AskQuestionError), not a genuine failure. runSubAgent must
+	// recognize this BEFORE the generic error branch and return a normal
+	// SUCCESSFUL tool response shaped as a question, so the orchestrator
+	// doesn't mistake a paused sub-agent for a crashed one and redo its
+	// work. mockSessionAgent.Run returning *AwaitingAnswerError directly is
+	// the lightest way to simulate what agent.Run would have normalized
+	// tools.AskQuestionError into.
+	t.Run("worker question produces a question-shaped SUCCESSFUL response, not a failure", func(t *testing.T) {
+		env := testEnv(t)
+		coord := newTestCoordinator(t, env, providerID, providerCfg)
+
+		parentSession, err := env.sessions.Create(t.Context(), "Parent")
+		require.NoError(t, err)
+
+		var capturedChildSessionID string
+		agent := newMockAgent(providerID, 4096, func(_ context.Context, call SessionAgentCall) (*fantasy.AgentResult, error) {
+			capturedChildSessionID = call.SessionID
+			return nil, &AwaitingAnswerError{
+				Question:  "What timeout value should I use?",
+				Options:   []string{"30s", "60s"},
+				SessionID: call.SessionID,
+			}
+		})
+
+		resp, err := coord.runSubAgent(t.Context(), subAgentParams{
+			Agent:          agent,
+			SessionID:      parentSession.ID,
+			AgentMessageID: "msg-1",
+			ToolCallID:     "call-1",
+			Prompt:         "fix the config",
+			SessionTitle:   "Test",
+		})
+		require.NoError(t, err, "runSubAgent must not return a Go error for a worker question")
+		require.False(t, resp.IsError, "the tool response must be SUCCESSFUL, not an error, otherwise the orchestrator reads it as a crash and redoes the work")
+		assert.NotContains(t, resp.Content, "Failed to generate response", "must not be framed as a failure")
+		assert.Contains(t, resp.Content, "SUB-AGENT QUESTION")
+		assert.Contains(t, resp.Content, capturedChildSessionID, "the child session id must appear so the orchestrator can resume it")
+		assert.Contains(t, resp.Content, "What timeout value should I use?", "the question text must appear")
+		assert.Contains(t, resp.Content, "Suggested options: 30s | 60s", "options must render when present")
+		assert.Contains(t, resp.Content, "resume_session_id", "guidance must mention how to resume")
+	})
+
+	t.Run("worker question with no options omits the Suggested options line", func(t *testing.T) {
+		env := testEnv(t)
+		coord := newTestCoordinator(t, env, providerID, providerCfg)
+
+		parentSession, err := env.sessions.Create(t.Context(), "Parent")
+		require.NoError(t, err)
+
+		agent := newMockAgent(providerID, 4096, func(_ context.Context, call SessionAgentCall) (*fantasy.AgentResult, error) {
+			return nil, &AwaitingAnswerError{
+				Question:  "Should I proceed?",
+				SessionID: call.SessionID,
+			}
+		})
+
+		resp, err := coord.runSubAgent(t.Context(), subAgentParams{
+			Agent:          agent,
+			SessionID:      parentSession.ID,
+			AgentMessageID: "msg-1",
+			ToolCallID:     "call-1",
+			Prompt:         "fix the config",
+			SessionTitle:   "Test",
+		})
+		require.NoError(t, err)
+		assert.False(t, resp.IsError)
+		assert.NotContains(t, resp.Content, "Suggested options", "must not print an options line when there are none")
+	})
+
+	// Regression guard (required test (b)): a genuine sub-agent failure (any
+	// error that is NOT an *AwaitingAnswerError) must still produce the old
+	// generic error response.
+	t.Run("genuine failure (not a question) still produces the generic error response", func(t *testing.T) {
+		env := testEnv(t)
+		coord := newTestCoordinator(t, env, providerID, providerCfg)
+
+		parentSession, err := env.sessions.Create(t.Context(), "Parent")
+		require.NoError(t, err)
+
+		agent := newMockAgent(providerID, 4096, func(_ context.Context, _ SessionAgentCall) (*fantasy.AgentResult, error) {
+			return nil, errors.New("connection reset by peer")
+		})
+
+		resp, err := coord.runSubAgent(t.Context(), subAgentParams{
+			Agent:          agent,
+			SessionID:      parentSession.ID,
+			AgentMessageID: "msg-1",
+			ToolCallID:     "call-1",
+			Prompt:         "test",
+			SessionTitle:   "Test",
+		})
+		require.NoError(t, err)
+		assert.True(t, resp.IsError, "a genuine failure must still be reported as a tool error")
+		assert.Equal(t, "Failed to generate response: connection reset by peer", resp.Content)
+		assert.NotContains(t, resp.Content, "SUB-AGENT QUESTION")
+	})
+
+	// Gap 2 (Phase 3.2): resume_session_id must continue the SAME session -
+	// the session id passed to Agent.Run must match the existing child
+	// session, and the prior conversation persisted by the first call must
+	// still be there afterward (proving no fresh session was minted).
+	t.Run("resume_session_id continues the same session with prior context intact", func(t *testing.T) {
+		env := testEnv(t)
+		coord := newTestCoordinator(t, env, providerID, providerCfg)
+
+		parentSession, err := env.sessions.Create(t.Context(), "Parent")
+		require.NoError(t, err)
+
+		var firstCallSessionID string
+		firstAgent := newMockAgent(providerID, 4096, func(ctx context.Context, call SessionAgentCall) (*fantasy.AgentResult, error) {
+			firstCallSessionID = call.SessionID
+			// Simulate the sub-agent doing some work and persisting a
+			// message in its own session before it pauses on a question.
+			_, msgErr := env.messages.Create(ctx, call.SessionID, message.CreateMessageParams{
+				Role:  message.Assistant,
+				Parts: []message.ContentPart{message.TextContent{Text: "already did step 1"}},
+			})
+			require.NoError(t, msgErr)
+			return nil, &AwaitingAnswerError{Question: "which port?", SessionID: call.SessionID}
+		})
+
+		firstResp, err := coord.runSubAgent(t.Context(), subAgentParams{
+			Agent:          firstAgent,
+			SessionID:      parentSession.ID,
+			AgentMessageID: "msg-1",
+			ToolCallID:     "call-1",
+			Prompt:         "configure the server",
+			SessionTitle:   "Test",
+		})
+		require.NoError(t, err)
+		require.False(t, firstResp.IsError)
+		require.Contains(t, firstResp.Content, firstCallSessionID)
+
+		var secondCallSessionID string
+		secondAgent := newMockAgent(providerID, 4096, func(_ context.Context, call SessionAgentCall) (*fantasy.AgentResult, error) {
+			secondCallSessionID = call.SessionID
+			assert.Equal(t, "8080", call.Prompt, "the answer must be forwarded as the prompt")
+			return agentResultWithText("configured port 8080"), nil
+		})
+
+		resumeResp, err := coord.runSubAgent(t.Context(), subAgentParams{
+			Agent:           secondAgent,
+			SessionID:       parentSession.ID,
+			AgentMessageID:  "msg-2",
+			ToolCallID:      "call-2",
+			Prompt:          "8080",
+			SessionTitle:    "Test",
+			ResumeSessionID: firstCallSessionID,
+		})
+		require.NoError(t, err)
+		assert.False(t, resumeResp.IsError)
+		assert.Equal(t, firstCallSessionID, secondCallSessionID, "resume must reuse the SAME session id, not mint a new one")
+
+		// The prior conversation from before the pause must still be there.
+		msgs, err := env.messages.List(t.Context(), firstCallSessionID)
+		require.NoError(t, err)
+		found := false
+		for _, m := range msgs {
+			if m.Content().Text == "already did step 1" {
+				found = true
+			}
+		}
+		assert.True(t, found, "resuming must preserve the sub-agent's prior conversation, not discard it")
+	})
+
+	// Gap 2 security check (required test (d)): resuming a session that is
+	// not a child of the CURRENT parent session must be rejected with a
+	// tool error, and must not touch that unrelated session (no new message
+	// appended to it).
+	t.Run("resume_session_id that is not a child of the current session is rejected", func(t *testing.T) {
+		env := testEnv(t)
+		coord := newTestCoordinator(t, env, providerID, providerCfg)
+
+		parentSession, err := env.sessions.Create(t.Context(), "Parent")
+		require.NoError(t, err)
+		otherParent, err := env.sessions.Create(t.Context(), "Unrelated parent")
+		require.NoError(t, err)
+		unrelatedChild, err := env.sessions.CreateTaskSession(t.Context(), "unrelated-child", otherParent.ID, "Unrelated child")
+		require.NoError(t, err)
+
+		var runInvoked bool
+		agent := newMockAgent(providerID, 4096, func(_ context.Context, _ SessionAgentCall) (*fantasy.AgentResult, error) {
+			runInvoked = true
+			return agentResultWithText("should not happen"), nil
+		})
+
+		resp, err := coord.runSubAgent(t.Context(), subAgentParams{
+			Agent:           agent,
+			SessionID:       parentSession.ID,
+			AgentMessageID:  "msg-1",
+			ToolCallID:      "call-1",
+			Prompt:          "answer",
+			SessionTitle:    "Test",
+			ResumeSessionID: unrelatedChild.ID,
+		})
+		require.NoError(t, err, "a bad resume id is a retryable tool error, not a Go error/crash")
+		assert.True(t, resp.IsError)
+		assert.False(t, runInvoked, "the sub-agent must never run against a session that doesn't belong to this caller")
+
+		msgs, err := env.messages.List(t.Context(), unrelatedChild.ID)
+		require.NoError(t, err)
+		assert.Empty(t, msgs, "the unrelated session must not be touched")
+	})
+
+	t.Run("resume_session_id that does not exist is rejected", func(t *testing.T) {
+		env := testEnv(t)
+		coord := newTestCoordinator(t, env, providerID, providerCfg)
+
+		parentSession, err := env.sessions.Create(t.Context(), "Parent")
+		require.NoError(t, err)
+
+		var runInvoked bool
+		agent := newMockAgent(providerID, 4096, func(_ context.Context, _ SessionAgentCall) (*fantasy.AgentResult, error) {
+			runInvoked = true
+			return agentResultWithText("should not happen"), nil
+		})
+
+		resp, err := coord.runSubAgent(t.Context(), subAgentParams{
+			Agent:           agent,
+			SessionID:       parentSession.ID,
+			AgentMessageID:  "msg-1",
+			ToolCallID:      "call-1",
+			Prompt:          "answer",
+			SessionTitle:    "Test",
+			ResumeSessionID: "does-not-exist",
+		})
+		require.NoError(t, err)
+		assert.True(t, resp.IsError)
+		assert.False(t, runInvoked)
+	})
+
+	t.Run("cost accounting is not skipped on the resume path", func(t *testing.T) {
+		env := testEnv(t)
+		coord := newTestCoordinator(t, env, providerID, providerCfg)
+
+		parentSession, err := env.sessions.Create(t.Context(), "Parent")
+		require.NoError(t, err)
+
+		var childSessionID string
+		firstAgent := newMockAgent(providerID, 4096, func(_ context.Context, call SessionAgentCall) (*fantasy.AgentResult, error) {
+			childSessionID = call.SessionID
+			return nil, &AwaitingAnswerError{Question: "q?", SessionID: call.SessionID}
+		})
+		_, err = coord.runSubAgent(t.Context(), subAgentParams{
+			Agent:          firstAgent,
+			SessionID:      parentSession.ID,
+			AgentMessageID: "msg-1",
+			ToolCallID:     "call-1",
+			Prompt:         "start",
+			SessionTitle:   "Test",
+		})
+		require.NoError(t, err)
+
+		resumeAgent := newMockAgent(providerID, 4096, func(ctx context.Context, call SessionAgentCall) (*fantasy.AgentResult, error) {
+			// Simulate cost accruing on the resumed turn.
+			if _, err := env.sessions.IncrementCost(ctx, call.SessionID, 0.02); err != nil {
+				return nil, err
+			}
+			return agentResultWithText("done"), nil
+		})
+		_, err = coord.runSubAgent(t.Context(), subAgentParams{
+			Agent:           resumeAgent,
+			SessionID:       parentSession.ID,
+			AgentMessageID:  "msg-2",
+			ToolCallID:      "call-2",
+			Prompt:          "answer",
+			SessionTitle:    "Test",
+			ResumeSessionID: childSessionID,
+		})
+		require.NoError(t, err)
+
+		updatedParent, err := env.sessions.Get(t.Context(), parentSession.ID)
+		require.NoError(t, err)
+		assert.InDelta(t, 0.02, updatedParent.Cost, 1e-9, "cost accrued on the resumed turn must still reach the parent")
+	})
+
 	t.Run("session setup callback is invoked", func(t *testing.T) {
 		env := testEnv(t)
 		coord := newTestCoordinator(t, env, providerID, providerCfg)
@@ -1439,7 +1718,7 @@ func TestBuildTools_WorkerToolset(t *testing.T) {
 				assert.Contains(t, names, name, "read-only tool %q must still be present for the worker", name)
 			}
 			assert.NotContains(t, names, AgentToolName, "worker must not get the agent tool: recursion guard against sub-workers spawning sub-workers")
-			assert.NotContains(t, names, tools.AskQuestionToolName, "worker must not get ask_question yet: runSubAgent's error path doesn't frame it as a question round-trip (see resolveReadOnlyTools comment in internal/config/config.go)")
+			assert.Contains(t, names, tools.AskQuestionToolName, "worker must get ask_question now that runSubAgent frames a sub-agent question as a successful, resumable tool result instead of a generic error (see subAgentQuestionText in question_stop.go and the resume_session_id path in runSubAgent)")
 		})
 	}
 
