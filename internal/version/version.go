@@ -17,6 +17,22 @@ import (
 // lockstep with npm/crush/package.json on every bump.
 const forkBaseVersion = "0.1.7"
 
+// UpstreamTriagedVersion is the highest charmbracelet/crush release whose
+// commits have been triaged into this fork — every commit up to that tag has
+// been ported, evaluated, or explicitly skipped with a recorded reason (see
+// the merge workflow and the SKIP-note convention in CLAUDE.md, plus the
+// per-batch plans under docs/plans/).
+//
+// It is NOT a claim that the fork contains upstream's code up to that tag —
+// the fork diverges heavily and most upstream commits are deliberately
+// skipped. It answers a different question: how far has anyone actually
+// LOOKED at upstream. That is the number that goes stale silently, so it is
+// surfaced in `crush --version` output rather than living only in a plan
+// document.
+//
+// Bumped by hand at the end of an upstream triage pass, never automatically.
+const UpstreamTriagedVersion = "v0.87.0"
+
 // Build-time parameters set via -ldflags. These act as overrides: when a
 // release/packaging build injects them (see .goreleaser.yml and the
 // publish-fork-npm workflow), the values below are replaced and treated as

@@ -10,6 +10,37 @@ root for the full per-file merge/divergence history.
 
 ## [0.1.7]
 
+- New: **four model roles instead of two.** Alongside `large`/`smart` and
+  `small`/`fast` there are now two optional slots — `worker` (a cheap slot for
+  delegated hands-on work) and `reviewer` (the strongest slot, for explicit
+  review invocations). Both are optional and neither is ever auto-selected:
+  with neither configured everything behaves exactly as before. Set them with
+  `crush models use <large> <small> --worker <m> --reviewer <m>`, inspect them
+  with `crush models state`, clear them with `crush models unset`. Short codes
+  (`fl`, `glm4_7`, …) work for the new slots too. Previously `--role worker`
+  and `--role reviewer` parsed but silently resolved to the *small* model.
+- New: **orchestrator mode.** When a worker model is configured and a run uses
+  `--role smart`, that run stops being the implementer and becomes an
+  orchestrator: sub-agents spawned by the `agent` tool run on the cheap worker
+  slot, get a work-capable toolset instead of the read-only one, and `crush
+  run`'s default sub-agent ban is lifted so delegation is possible at all. The
+  smart agent's system prompt gains a matching instruction to plan and
+  delegate in worker-context-sized chunks rather than implementing inline. An
+  explicit `--agents single` still overrides the whole thing.
+- New: a worker sub-agent can **ask its orchestrator a question and be
+  resumed**. Its question comes back as a normal tool result ("SUB-AGENT
+  QUESTION …") rather than looking like a crash, and the orchestrator answers
+  by calling the `agent` tool again with `resume_session_id`, which continues
+  the same sub-session with the worker's context intact instead of restarting
+  the task from scratch.
+- Fixed: the `ask_question` tool was **unreachable since it was introduced**.
+  It was constructed for every agent and then immediately discarded by the
+  allowed-tools filter, because its name was never registered. No model could
+  ever call it, `exit_reason: "awaiting_answer"` could not occur, and both the
+  web UI's answer chips and the documented resume flow described behaviour
+  that could not fire.
+- `crush --version` now also reports how far upstream has actually been
+  triaged, so that review watermark cannot go stale unnoticed.
 - Fixed: a tool call with malformed JSON arguments from the model used to be
   persisted as-is and re-read from the DB every subsequent turn, sticking the
   session forever. Malformed input is now sanitized before storage and the
