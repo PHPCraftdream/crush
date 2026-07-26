@@ -248,6 +248,15 @@ type Coordinator interface {
 	// SetRunLimits sets cost and token caps for the next Run call.
 	// Fork patch: batch 30.
 	SetRunLimits(maxCost float64, maxTokens int64)
+	// SetActiveModelRole records which named model slot (large, small,
+	// worker, reviewer) is driving the CURRENT top-level run, so sub-agent
+	// spawns can decide whether to prefer the cheaper Worker slot instead of
+	// blindly inheriting the parent's Large model. An empty/unset value
+	// means "unknown — treat as smart": the interactive TUI/web path never
+	// calls this, and for those the default behavior — use Large for
+	// everything, i.e. exactly today's behavior — is correct, since
+	// "Smart = large/default". Fork patch (reviewer/worker roles).
+	SetActiveModelRole(role config.SelectedModelType)
 	// SetAllowPeakHours arms a one-shot bypass of the peak-hours refusal
 	// for the next Run call. It exists so `crush run --allow-peak-hours`
 	// can override an operator-configured peak_hours window for a single
@@ -295,6 +304,16 @@ type coordinator struct {
 	// armed by SetAllowPeakHours from `crush run --allow-peak-hours`.
 	// Reset to false after the next Run. Fork patch (peak-hours bypass).
 	allowPeakHours bool
+
+	// activeModelRole records which named model slot is driving the current
+	// top-level run, set via SetActiveModelRole. Static per-process (unlike
+	// maxCost/maxTokens above, there is no reset-after-use — `crush run` is
+	// single-shot). Mutex guards the same race shape as runLimitsMu:
+	// SetActiveModelRole is called from RunNonInteractive before the agent
+	// goroutine starts, and buildAgentModels reads it from the agent
+	// goroutine. Fork patch (reviewer/worker roles).
+	activeModelRoleMu sync.Mutex
+	activeModelRole   config.SelectedModelType
 
 	// Phase 4 autonomous idle-resume guardrails.
 	persistentMode         bool           // true only for the long-lived web server; false for crush run.
@@ -384,6 +403,14 @@ func (c *coordinator) SetRunLimits(maxCost float64, maxTokens int64) {
 	c.maxCost = maxCost
 	c.maxTokens = maxTokens
 	c.runLimitsMu.Unlock()
+}
+
+// SetActiveModelRole records which named model slot is driving the current
+// top-level run. Fork patch (reviewer/worker roles).
+func (c *coordinator) SetActiveModelRole(role config.SelectedModelType) {
+	c.activeModelRoleMu.Lock()
+	c.activeModelRole = role
+	c.activeModelRoleMu.Unlock()
 }
 
 // SetAllowPeakHours arms a one-shot bypass of the peak-hours refusal
@@ -1411,6 +1438,28 @@ func (c *coordinator) buildAgentModels(ctx context.Context, isSubAgent bool) (Mo
 	if !ok {
 		return Model{}, Model{}, errSmallModelNotSelected
 	}
+
+	// Fork patch (reviewer/worker roles): when spawning a sub-agent and the
+	// parent run is driven by the Large ("smart") slot — or the active role
+	// is unknown, which for the interactive TUI/web path is equivalent to
+	// smart — prefer the cheaper Worker slot for the sub-agent's large-model
+	// slot, if one is configured. This never touches the small-model slot,
+	// and falls through to today's behavior (Large for everything) when
+	// Worker isn't configured, or when the operator explicitly chose a
+	// non-large role (fast/worker/reviewer) for the whole run — we don't
+	// second-guess that choice by force-upgrading/downgrading sub-agents.
+	if isSubAgent {
+		c.activeModelRoleMu.Lock()
+		activeRole := c.activeModelRole
+		c.activeModelRoleMu.Unlock()
+
+		if activeRole == "" || activeRole == config.SelectedModelTypeLarge {
+			if workerModelCfg, ok := c.cfg.Config().Models[config.SelectedModelTypeWorker]; ok && workerModelCfg.Model != "" {
+				largeModelCfg = workerModelCfg
+			}
+		}
+	}
+
 	return c.buildModelsFromCfg(ctx, largeModelCfg, smallModelCfg, isSubAgent)
 }
 

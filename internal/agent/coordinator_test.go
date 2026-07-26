@@ -1227,3 +1227,108 @@ func TestResetAutoResumeCounter(t *testing.T) {
 	coord.ResetAutoResumeCounter(sid)
 	assert.Equal(t, 0, coord.consecutiveResume(sid))
 }
+
+// newRoleModelTestCoordinator builds a coordinator wired with distinct Large,
+// Small, and (optionally) Worker model slots, each backed by its own
+// offline-safe openai-type provider (building an openai.Provider only
+// constructs a client, it never makes a network call, so this is safe to run
+// without a real API key/network — see buildOpenaiProvider). Used by
+// TestBuildAgentModels_WorkerPreference to exercise buildAgentModels' new
+// Worker-substitution branch end to end.
+func newRoleModelTestCoordinator(t *testing.T, env fakeEnv, includeWorker bool) *coordinator {
+	t.Helper()
+	cfg, err := config.Init(env.workingDir, "", false)
+	require.NoError(t, err)
+
+	registerProvider := func(providerID, modelID string) config.SelectedModel {
+		cfg.Config().Providers.Set(providerID, config.ProviderConfig{
+			ID:   providerID,
+			Type: openai.Name,
+			Models: []catwalk.Model{
+				{ID: modelID},
+			},
+		})
+		return config.SelectedModel{Provider: providerID, Model: modelID}
+	}
+
+	cfg.Config().Models[config.SelectedModelTypeLarge] = registerProvider("large-provider", "large-model")
+	cfg.Config().Models[config.SelectedModelTypeSmall] = registerProvider("small-provider", "small-model")
+	if includeWorker {
+		cfg.Config().Models[config.SelectedModelTypeWorker] = registerProvider("worker-provider", "worker-model")
+	}
+
+	return &coordinator{
+		cfg:      cfg,
+		sessions: env.sessions,
+	}
+}
+
+// TestBuildAgentModels_WorkerPreference pins the "prefer Worker for
+// sub-agents when parent is Smart" behavior added alongside
+// SetActiveModelRole: buildAgentModels must swap in the Worker model config
+// as the sub-agent's large slot only when (a) this is a sub-agent build, (b)
+// the active role is unset/"large" (parent running smart, or unknown which
+// is treated as smart), and (c) a Worker model is actually configured. Every
+// other combination must fall through to today's behavior (Large for
+// everything) unchanged.
+func TestBuildAgentModels_WorkerPreference(t *testing.T) {
+	t.Run("worker configured + isSubAgent + role unset uses Worker for large slot", func(t *testing.T) {
+		env := testEnv(t)
+		coord := newRoleModelTestCoordinator(t, env, true)
+		// activeModelRole left at zero value ("") deliberately: unset must be
+		// treated the same as "large" (smart).
+
+		large, small, err := coord.buildAgentModels(t.Context(), true)
+		require.NoError(t, err)
+		assert.Equal(t, "worker-provider", large.ModelCfg.Provider, "sub-agent large slot must come from Worker")
+		assert.Equal(t, "worker-model", large.ModelCfg.Model)
+		assert.Equal(t, "small-provider", small.ModelCfg.Provider, "small slot must be unaffected")
+	})
+
+	t.Run("worker configured + isSubAgent + role explicitly large uses Worker for large slot", func(t *testing.T) {
+		env := testEnv(t)
+		coord := newRoleModelTestCoordinator(t, env, true)
+		coord.SetActiveModelRole(config.SelectedModelTypeLarge)
+
+		large, _, err := coord.buildAgentModels(t.Context(), true)
+		require.NoError(t, err)
+		assert.Equal(t, "worker-provider", large.ModelCfg.Provider)
+	})
+
+	t.Run("worker NOT configured + isSubAgent falls back to Large (backward compat)", func(t *testing.T) {
+		env := testEnv(t)
+		coord := newRoleModelTestCoordinator(t, env, false)
+
+		large, _, err := coord.buildAgentModels(t.Context(), true)
+		require.NoError(t, err)
+		assert.Equal(t, "large-provider", large.ModelCfg.Provider, "must fall back to Large when Worker isn't configured")
+		assert.Equal(t, "large-model", large.ModelCfg.Model)
+	})
+
+	for _, role := range []config.SelectedModelType{
+		config.SelectedModelTypeSmall,
+		config.SelectedModelTypeWorker,
+		config.SelectedModelTypeReviewer,
+	} {
+		t.Run("worker configured + isSubAgent + active role "+string(role)+" does not force Worker", func(t *testing.T) {
+			env := testEnv(t)
+			coord := newRoleModelTestCoordinator(t, env, true)
+			coord.SetActiveModelRole(role)
+
+			large, _, err := coord.buildAgentModels(t.Context(), true)
+			require.NoError(t, err)
+			assert.Equal(t, "large-provider", large.ModelCfg.Provider, "an explicit non-large role for the whole run must not be second-guessed for sub-agents")
+		})
+	}
+
+	t.Run("top-level agent (isSubAgent=false) always uses Large regardless of Worker config or active role", func(t *testing.T) {
+		env := testEnv(t)
+		coord := newRoleModelTestCoordinator(t, env, true)
+		coord.SetActiveModelRole(config.SelectedModelTypeLarge)
+
+		large, _, err := coord.buildAgentModels(t.Context(), false)
+		require.NoError(t, err)
+		assert.Equal(t, "large-provider", large.ModelCfg.Provider)
+		assert.Equal(t, "large-model", large.ModelCfg.Model)
+	})
+}

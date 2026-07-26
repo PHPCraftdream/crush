@@ -617,18 +617,18 @@ crush run --restrict-run --role fast \
 			return fmt.Errorf("no providers configured - please run 'crush' to set up a provider interactively")
 		}
 
-		// Fold --role into largeModel. When the user picked "fast" without
-		// also passing an explicit --model, we point the agent at whatever
-		// the config has saved as the small model — that's the user's
-		// pre-declared "cheap/quick" choice. The agent always uses its
-		// `large` slot for the turn; --role just decides which catalog
-		// entry fills it.
-		if !roleLarge && largeModel == "" {
-			small, ok := a.Config().Models[config.SelectedModelTypeSmall]
-			if !ok || small.Model == "" {
-				return fmt.Errorf("--role fast: no small model configured (run \"crush models set small <model>\" first)")
+		// Fold --role into largeModel. When the user picked a role other than
+		// "smart"/"large" without also passing an explicit --model, we point
+		// the agent at whatever the config has saved for that role's slot
+		// (small/worker/reviewer) — that's the user's pre-declared choice for
+		// that role. The agent always uses its `large` slot for the turn;
+		// --role just decides which catalog entry fills it.
+		if modelType != config.SelectedModelTypeLarge && largeModel == "" {
+			roleModel, ok := a.Config().Models[modelType]
+			if !ok || roleModel.Model == "" {
+				return fmt.Errorf("--role %s: no %s model configured (run \"crush models set %s <model>\" first)", role, modelType, modelType)
 			}
-			largeModel = small.Provider + "/" + small.Model
+			largeModel = roleModel.Provider + "/" + roleModel.Model
 		}
 
 		if verbose {
@@ -672,6 +672,7 @@ crush run --restrict-run --role fast \
 			SystemPrompt:             systemPrompt,
 			ReasoningEffort:          effort,
 			RoleLarge:                roleLarge,
+			ModelRole:                modelType,
 			DisableSubAgents:         agentsDisable,
 			StripJSONFences:          formatFlag == "json" || strings.HasPrefix(formatFlag, "json-schema:"),
 			AggregationMode:          aggregationMode,

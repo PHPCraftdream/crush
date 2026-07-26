@@ -606,6 +606,14 @@ type RunOverrides struct {
 	// via Sessions.UpdateReasoningEffort.
 	ReasoningEffort string
 	RoleLarge       bool
+	// ModelRole is the resolved --role slot for this invocation (large,
+	// small, worker, reviewer). "" (e.g. non-`crush run` paths) is treated
+	// as smart/large by the coordinator. Threaded through to
+	// AgentCoordinator.SetActiveModelRole so sub-agent spawns can decide
+	// whether to prefer the cheaper Worker slot instead of blindly
+	// inheriting the parent's Large model. Fork patch (reviewer/worker
+	// roles).
+	ModelRole config.SelectedModelType
 	// Fork patch (orchestrator UX): DisableSubAgents drops the `agent`
 	// and `agentic_fetch` tools from the coder agent for this run so a
 	// `crush run --agents single` invocation cannot fan out. Mutation
@@ -836,6 +844,14 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt 
 	if overrides.DisableSubAgents {
 		app.disableSubAgentToolsInConfig()
 	}
+
+	// Fork patch (reviewer/worker roles): record which named model slot is
+	// driving this top-level run so sub-agent spawns (coordinator's
+	// buildAgentModels) can decide whether to prefer the cheaper Worker
+	// slot. Called unconditionally (even for ModelRole == "") so a resumed
+	// session without going through this code path again still gets a
+	// defined value.
+	app.AgentCoordinator.SetActiveModelRole(overrides.ModelRole)
 
 	// force update of agent models before running so mcp tools are loaded
 	app.AgentCoordinator.UpdateModels(ctx)
