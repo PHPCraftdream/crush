@@ -172,6 +172,21 @@ the shared-workspace git-safety clause already in your prompt:
   `//go:embed all:dist` for CI builds. (It is currently deleted in
   the working tree; user knows; do not commit the deletion either
   way without explicit instruction.)
+- **Never exercise `crush models`/`crush providers`/anything that
+  writes config against the machine's real global config**, even
+  when told to "isolate" via `--cwd`. `--cwd` only affects
+  *workspace*-scope config; it does nothing for *global*-scope writes
+  (`crush models use` defaults to global scope). The only thing that
+  isolates global scope is setting the `CRUSH_GLOBAL_DATA` env var to
+  a throwaway directory for that invocation — confirmed necessary the
+  hard way multiple times in one session, when "isolated" manual
+  verification in an agent's own report turned out to have silently
+  overwritten the operator's real, in-use model configuration anyway.
+  If your task instructions say "isolate manual CLI exercising" and
+  don't spell out `CRUSH_GLOBAL_DATA` explicitly, set it yourself
+  before running anything that writes — don't assume `--cwd` alone is
+  enough, and don't trust your own past invocation was isolated
+  without re-checking the real global config file afterward.
 
 ## Quick Reference — Where Things Live
 
