@@ -58,10 +58,11 @@ Four roles exist:
   reviewer           optional, no alias; the strongest slot, for explicit
                       review invocations. Never auto-selected anywhere —
                       reachable only via --role reviewer.
-worker/reviewer are configured via the web UI or crush.json's
-models.worker / models.reviewer ("crush models use" only manages
-smart/fast today). The actual model id behind each role comes from
-"crush models show"; --model overrides it for one invocation.
+worker/reviewer are configured with "crush models use <large> <small>
+--worker <model> --reviewer <model>" (or the web UI / crush.json's
+models.worker / models.reviewer directly). The actual model id behind
+each role comes from "crush models show"; --model overrides it for one
+invocation.
 
 Prompt sources (combined as "<stdin>\n\n<args>"):
   - positional args:   crush run "your prompt"
