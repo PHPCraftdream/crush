@@ -4,14 +4,23 @@
 // getProviderOptions switch:
 //
 //   - There are two syntaxes for setting effort: the short codes (o47x,
-//     h45l, ...) and the raw "provider/model@effort" suffix.
-//   - Effort-bearing short codes exist ONLY for the local-cli/Claude atoms
-//     (see atomRegistry's EffortSource field in models_atoms.go). A Z.AI
-//     model's effort can only be set with the raw "@effort" form — there is
-//     no "glm5_2xx".
-//   - The raw "@effort" suffix (splitModelEffort in models_set.go) is a
-//     blind string split with no validation against the model's
-//     ReasoningLevels. A typo silently yields a wrong or ignored effort.
+//     h45l, ...) / long-form atom suffix (opus-high, glm5_2-max, ...) and the
+//     raw "provider/model@effort" suffix.
+//   - Effort-bearing letter short codes (o47x, h45l, ...) exist ONLY for the
+//     local-cli/Claude atoms (see atomRegistry's EffortSource field in
+//     models_atoms.go) — there is no "glm5_2xx". Z.AI atoms instead carry a
+//     static ReasoningLevels array ({"off","high","max"}, see
+//     zaiReasoningLevels in models_atoms.go) and accept the long-form
+//     "<atom>-<level>" suffix, e.g. "glm5_2-max" (added alongside this
+//     comment — previously any "-level" suffix on a Z.AI atom was rejected
+//     outright).
+//   - The raw "@effort" suffix (splitModelEffort in models_set.go) used to be
+//     a blind string split with NO validation against the model's
+//     ReasoningLevels anywhere. It is now validated (validateEffortForModel
+//     in models_atoms.go) whenever the target (provider, model) resolves to
+//     a known atom with a non-nil Levels() — a typo is rejected with an
+//     error instead of silently yielding a wrong or ignored effort. Models
+//     outside the atom registry still accept any string, unvalidated.
 //   - What an effort actually DOES is provider-specific and sometimes
 //     collapses distinct levels together (e.g. Z.AI: low/medium/high/unset
 //     all map to the same "high" wire value; only xhigh/max/ultracode reach
@@ -66,15 +75,35 @@ var providerEffortDocs = []providerEffortDoc{
 		Key:   string(catwalk.InferenceProviderZAI),
 		Title: "Z.AI (all GLM models, e.g. glm5_2, glm5_1, glm4_7)",
 		Body: []string{
-			"Z.AI exposes only THREE actual wire states: off / high / max.",
+			"CROSS-CHECKED against Z.AI's own API reference (docs.z.ai/api-reference/",
+			"llm/chat-completion): reasoning_effort is officially documented as",
+			"\"Only supported by GLM-5.2\" among current models — every other GLM",
+			"model (5.1, 5, 5-turbo, 4.7, 4.7-flash, 4.6) is documented as boolean",
+			"thinking-toggle only, no graduated effort.",
+			"",
+			"The FORK's coordinator.go, however, currently still sends the same",
+			"reasoning_effort wire value to every zai-routed model uniformly",
+			"(collapsed to THREE actual wire states: off / high / max):",
 			"  off                          -> thinking disabled",
 			"  unset, low, medium, high     -> reasoning_effort: \"high\"",
 			"  xhigh, max, ultracode        -> reasoning_effort: \"max\"",
 			"low and medium are indistinguishable from high — setting them does",
 			"nothing beyond what unset already gives you. Older GLM-4.x models",
-			"ignore the effort field entirely (harmlessly).",
-			"No short codes exist for Z.AI models — effort can only be set with",
-			"the raw `zai/<model>@<level>` syntax, e.g. `zai/glm-5.2@max`.",
+			"presumably ignore the field harmlessly (undocumented as meaningful",
+			"for them). This is a fork-level simplification, unchanged by this",
+			"validation work — see the atom-level detail below for what's now",
+			"actually validated per model.",
+			"",
+			"No letter short codes exist for Z.AI models (no `glm5_2xx`), but every",
+			"Z.AI atom now declares a real, validated ReasoningLevels array — set",
+			"with the long-form atom suffix (e.g. `glm5_2-max`) or the raw",
+			"`zai/<model>@<level>` syntax (e.g. `zai/glm-5.2@max`); both are",
+			"validated against that atom's specific list. glm5_2 validates against",
+			"the documented 7-value reasoning_effort enum (none/minimal/low/medium/",
+			"high/xhigh/max) plus \"off\" (a fork-level addition for fully disabling",
+			"thinking, not part of Z.AI's reasoning_effort enum itself); every other",
+			"Z.AI atom validates against boolean off/on only, matching Z.AI's",
+			"documented per-model support matrix above.",
 		},
 	},
 	{
@@ -212,18 +241,26 @@ func renderEffortsOverview() string {
 
 	b.WriteString("SYNTAX (two ways to set effort):\n")
 	b.WriteString("  1. Short codes    e.g. `crush models use o47x h45l`  (atom+level, one token)\n")
+	b.WriteString("                    Long-form atom suffix also works for any atom with a\n")
+	b.WriteString("                    known levels array, e.g. `crush models use glm5_2-max`.\n")
 	b.WriteString("  2. Raw @effort    e.g. `crush models use zai/glm-5.2@max glm4_7`\n")
-	b.WriteString("     The @effort suffix is UNVALIDATED — it is a blind string split\n")
-	b.WriteString("     (splitModelEffort), not checked against the model's supported\n")
-	b.WriteString("     levels. A typo silently produces a wrong or ignored effort\n")
-	b.WriteString("     instead of an error.\n\n")
+	b.WriteString("     For a model NOT in the atom registry, @effort is UNVALIDATED — it\n")
+	b.WriteString("     is a blind string split (splitModelEffort), not checked against\n")
+	b.WriteString("     the model's supported levels. A typo silently produces a wrong or\n")
+	b.WriteString("     ignored effort instead of an error. For a KNOWN atom (e.g. any\n")
+	b.WriteString("     glm5_2/opus/... atom), both syntaxes above ARE now validated\n")
+	b.WriteString("     against that atom's real levels array and reject an unsupported\n")
+	b.WriteString("     or typo'd level with a clear error.\n\n")
 
-	b.WriteString("ASYMMETRY: effort-bearing short codes exist ONLY for the local-cli/\n")
-	b.WriteString("Claude atoms (opus, opus46, opus47, opus48, sonnet, haiku, fable).\n")
-	b.WriteString("Every other provider has no short code for effort — e.g. there is no\n")
-	b.WriteString("`glm5_2xx`. Z.AI, DeepSeek, io.net, Alibaba Singapore, and hyper models\n")
-	b.WriteString("can only have their effort set with the raw `provider/model@effort`\n")
-	b.WriteString("syntax above.\n\n")
+	b.WriteString("ASYMMETRY: effort-bearing LETTER short codes (o47x, h45l, ...) exist\n")
+	b.WriteString("ONLY for the local-cli/Claude atoms (opus, opus46, opus47, opus48,\n")
+	b.WriteString("sonnet, haiku, fable). Every other provider has no letter short code for effort\n")
+	b.WriteString(" — e.g. there is no `glm5_2xx`. Z.AI models instead declare a\n")
+	b.WriteString("real ReasoningLevels array and accept the long-form atom suffix\n")
+	b.WriteString("(`glm5_2-max`) or the raw `provider/model@effort` syntax above, both\n")
+	b.WriteString("validated. DeepSeek, io.net, Alibaba Singapore, and hyper models still\n")
+	b.WriteString("have no atom-level validation and can only have their effort set with\n")
+	b.WriteString("the unvalidated raw `provider/model@effort` syntax.\n\n")
 
 	b.WriteString("PER-PROVIDER SEMANTICS (what a level actually does):\n\n")
 	for _, d := range providerEffortDocs {
@@ -341,14 +378,59 @@ func renderEffortsForModel(arg string) (string, error) {
 	// levels from provider docs where we know them; otherwise show the
 	// generic form only.
 	fmt.Fprintf(&b, "  crush models use %s/%s@<level> <small>\n\n", target.Provider, target.Model)
+
+	// Z.AI atoms additionally now support the long-form "<atom>-<level>"
+	// suffix (validated against ReasoningLevels), same mechanism Claude
+	// atoms already use for their EffortSource-detected levels.
+	if a, ok := atomRegistry[target.AtomKey]; ok && a.ReasoningLevels != nil && providerDocKeyFor(target.Provider) == string(catwalk.InferenceProviderZAI) {
+		fmt.Fprintf(&b, "  Or the validated long-form atom suffix: crush models use %s-<level> <small>\n\n", target.AtomKey)
+	}
+
 	switch providerDocKeyFor(target.Provider) {
 	case string(catwalk.InferenceProviderZAI):
-		b.WriteString("  Meaningful levels for this provider (others collapse into these):\n")
-		tw := tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
-		fmt.Fprintf(tw, "  off\t crush models use %s/%s@off <small>\t(thinking disabled)\n", target.Provider, target.Model)
-		fmt.Fprintf(tw, "  high\t crush models use %s/%s@high <small>\t(also: unset, low, medium)\n", target.Provider, target.Model)
-		fmt.Fprintf(tw, "  max\t crush models use %s/%s@max <small>\t(also: xhigh, ultracode)\n", target.Provider, target.Model)
-		tw.Flush()
+		// SYNC WARNING: which levels apply to which Z.AI model restates
+		// zaiReasoningLevels / zaiBooleanThinkingLevels in models_atoms.go
+		// (themselves paired, via their own SYNC WARNING, with the
+		// coordinator.go switch this whole doc restates). Only GLM-5.2 has
+		// real graduated reasoning_effort support per Z.AI's own API docs;
+		// render straight from the resolved atom's real array instead of a
+		// hardcoded copy. For a raw, non-atom zai/<model> the registry
+		// doesn't know, fall back to the graduated list as the most
+		// generically useful default — it's a documentation aid at that
+		// point, not a validation source (validateEffortForModel only
+		// validates known atoms).
+		levels := zaiReasoningLevels
+		isGraduated := true
+		if a, ok := atomRegistry[target.AtomKey]; ok && a.ReasoningLevels != nil {
+			levels = a.ReasoningLevels
+			isGraduated = target.AtomKey == "glm5_2"
+		}
+		if isGraduated {
+			b.WriteString("  GLM-5.2 is the ONLY Z.AI model with real graduated reasoning_effort\n")
+			b.WriteString("  support (per Z.AI's own API docs). Default when thinking is enabled\n")
+			b.WriteString("  but no effort is given is \"max\" (Z.AI's native default) — note the\n")
+			b.WriteString("  fork's own coordinator.go instead defaults an unset effort to its\n")
+			b.WriteString("  \"high\" wire value, a deliberate fork-level choice, not a Z.AI default.\n")
+			tw := tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
+			for _, l := range levels {
+				fmt.Fprintf(tw, "  %s\t crush models use %s/%s@%s <small>\n", l, target.Provider, target.Model, l)
+			}
+			tw.Flush()
+		} else {
+			b.WriteString("  This Z.AI model has NO documented graduated reasoning_effort support —\n")
+			b.WriteString("  only GLM-5.2 does. It only exposes the boolean thinking toggle:\n")
+			tw := tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
+			fmt.Fprintf(tw, "  off\t crush models use %s/%s@off <small>\t(thinking disabled)\n", target.Provider, target.Model)
+			fmt.Fprintf(tw, "  on\t crush models use %s/%s@on <small>\t(thinking enabled)\n", target.Provider, target.Model)
+			tw.Flush()
+			b.WriteString("  (coordinator.go currently still forwards a reasoning_effort value to\n")
+			b.WriteString("  this model too — undocumented by Z.AI as meaningful here, presumably\n")
+			b.WriteString("  harmless; that runtime behavior is unchanged by this validation.)\n")
+		}
+		if target.AtomKey != "" {
+			fmt.Fprintf(&b, "  (These %d levels are validated — see `crush models use %s-<level>` above,\n", len(levels), target.AtomKey)
+			b.WriteString("  or the raw @effort form below, which is validated against this same list.)\n")
+		}
 	case string(catwalk.InferenceProviderDeepSeek):
 		b.WriteString("  Meaningful levels for this provider (others collapse into these):\n")
 		tw := tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
@@ -369,8 +451,16 @@ func renderEffortsForModel(arg string) (string, error) {
 		b.WriteString("  Valid levels are whatever this model's ReasoningLevels advertises;\n")
 		b.WriteString("  see `crush models list` (\"reason:\" column) for this specific model.\n")
 	}
-	b.WriteString("\n  Remember: @effort is unvalidated — an unsupported level is accepted\n")
-	b.WriteString("  syntactically and either ignored or silently mismapped.\n")
+	if a, ok := atomRegistry[target.AtomKey]; ok && a.Levels() != nil {
+		b.WriteString("\n  This model is a known atom, so @effort (and the atom-suffix form\n")
+		b.WriteString("  above, if shown) IS validated against the levels listed above —\n")
+		b.WriteString("  an unsupported level is now rejected with an error, not silently\n")
+		b.WriteString("  accepted.\n")
+	} else {
+		b.WriteString("\n  Remember: this model isn't in the atom registry, so @effort is\n")
+		b.WriteString("  unvalidated here — an unsupported level is accepted syntactically\n")
+		b.WriteString("  and either ignored or silently mismapped by the provider.\n")
+	}
 
 	return b.String(), nil
 }

@@ -183,6 +183,130 @@ func TestModelsUse_UnknownWorkerAtomFailsCleanly(t *testing.T) {
 	assert.Contains(t, runErr.Error(), "worker:")
 }
 
+// TestModelsUse_RawZAIEffort_ValidSucceeds covers the new validated raw
+// "provider/model@effort" path for a Z.AI atom: a level that IS one of the
+// real declared levels (off/on, for a boolean-thinking-only model like
+// glm-4.7-flash) must still be accepted and written.
+//
+// Uses glm-4.7-flash rather than glm-5.2 here because this isolated test
+// harness's cached provider catalog (CRUSH_PROVIDER_CACHE_ONLY=1, shared
+// ambient cache under the user's data dir) resolves "zai/glm-4.7-flash"
+// reliably via a.ResolveModel but not every zai model id — an environmental
+// quirk of the shared cache, unrelated to this task's validation logic
+// (which is exercised precisely, atom-by-atom, by the
+// TestValidateEffortForModel_* unit tests below instead).
+func TestModelsUse_RawZAIEffort_ValidSucceeds(t *testing.T) {
+	globalPath := isolatedModelsEnv(t)
+
+	resetModelsUseFlags(t)
+	_, runErr := runModelsCmd(t, modelsUseCmd,
+		"zai/glm-4.7-flash@on", "glm5_turbo")
+	require.NoError(t, runErr)
+
+	data, err := os.ReadFile(globalPath)
+	require.NoError(t, err)
+	content := string(data)
+	assert.Contains(t, content, `"glm-4.7-flash"`)
+	assert.Contains(t, content, `"on"`)
+}
+
+// TestModelsUse_RawZAIEffort_TypoNowFailsCleanly is the load-bearing
+// before/after test for this task: before adding a real, validated
+// ReasoningLevels array for Z.AI atoms, ANY string after "@" in the raw
+// "provider/model@effort" syntax (splitModelEffort) was accepted silently —
+// a typo like "hgih" would have been written to config as-is and either
+// ignored or mismapped by the wire-level provider code, with no error at
+// all. Confirm that gap is now closed: an unsupported/typo'd level for a
+// model that resolves to a KNOWN atom (glm-4.7-flash -> glm4_7_flash, which
+// declares {"off","on"}) must now be rejected with a clear error.
+func TestModelsUse_RawZAIEffort_TypoNowFailsCleanly(t *testing.T) {
+	isolatedModelsEnv(t)
+
+	resetModelsUseFlags(t)
+	_, runErr := runModelsCmd(t, modelsUseCmd,
+		"zai/glm-4.7-flash@hgih", "glm5_turbo")
+	require.Error(t, runErr, "a typo'd effort level for a known atom must now be rejected, not silently accepted")
+	assert.Contains(t, runErr.Error(), "hgih")
+	assert.Contains(t, runErr.Error(), "not a valid effort level")
+	assert.Contains(t, runErr.Error(), "off|on")
+}
+
+// TestModelsUse_RawZAIEffort_TypoRejectedForWorkerSlot proves the same
+// validation applies uniformly to the --worker/--reviewer role slots added
+// in task #68, not just the two positional large/small args.
+func TestModelsUse_RawZAIEffort_TypoRejectedForWorkerSlot(t *testing.T) {
+	isolatedModelsEnv(t)
+
+	resetModelsUseFlags(t)
+	_, runErr := runModelsCmd(t, modelsUseCmd,
+		"glm5_1", "glm5_turbo", "--worker", "zai/glm-4.7-flash@ultramega")
+	require.Error(t, runErr)
+	assert.Contains(t, runErr.Error(), "worker:")
+	assert.Contains(t, runErr.Error(), "not a valid effort level")
+}
+
+// TestValidateEffortForModel_NonAtomStillUnvalidated is a regression guard,
+// exercised directly against validateEffortForModel (models_atoms.go) rather
+// than the full `models use` CLI path (which additionally requires the
+// model to resolve against a real provider catalog — orthogonal to effort
+// validation and awkward to fake in this isolated-config test harness): a
+// (provider, model) pair that ISN'T in the atom registry at all has no
+// levels array to validate against, so any effort string must still be
+// accepted. This task closes the validation gap only for known atoms, not
+// for arbitrary models outside the registry.
+func TestValidateEffortForModel_NonAtomStillUnvalidated(t *testing.T) {
+	err := validateEffortForModel("openai", "gpt-5", "totally-not-a-real-level")
+	assert.NoError(t, err, "models outside the atom registry remain unvalidated by design")
+}
+
+// TestValidateEffortForModel_KnownAtomRejectsTypo is the direct-unit-test
+// counterpart to TestModelsUse_RawZAIEffort_TypoNowFailsCleanly above: same
+// fact, asserted without going through the full CLI/config-write path.
+// Uses glm-4.7-flash (boolean off/on levels — see zaiBooleanThinkingLevels)
+// rather than glm-5.2, whose graduated 8-value set is covered separately by
+// TestValidateEffortForModel_GLM52AcceptsGraduatedLevel below.
+func TestValidateEffortForModel_KnownAtomRejectsTypo(t *testing.T) {
+	err := validateEffortForModel("zai", "glm-4.7-flash", "hgih")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "hgih")
+	assert.Contains(t, err.Error(), "not a valid effort level")
+	assert.Contains(t, err.Error(), "off|on")
+}
+
+// TestValidateEffortForModel_KnownAtomAcceptsRealLevel confirms every level
+// in a Z.AI atom's real declared array validates successfully, for a
+// boolean-thinking-only model (glm-4.7-flash: only off/on, per Z.AI's docs —
+// no documented graduated reasoning_effort outside GLM-5.2).
+func TestValidateEffortForModel_KnownAtomAcceptsRealLevel(t *testing.T) {
+	for _, level := range []string{"off", "on"} {
+		assert.NoError(t, validateEffortForModel("zai", "glm-4.7-flash", level), "level %q", level)
+	}
+}
+
+// TestValidateEffortForModel_GLM52AcceptsGraduatedLevel confirms GLM-5.2
+// specifically validates against its OWN, larger documented vocabulary
+// (per Z.AI's API docs, it is the only Z.AI model with real graduated
+// reasoning_effort support) — including "off" (a fork-level addition for
+// fully disabling thinking, not part of Z.AI's reasoning_effort enum itself;
+// see the comment on zaiReasoningLevels in models_atoms.go).
+func TestValidateEffortForModel_GLM52AcceptsGraduatedLevel(t *testing.T) {
+	for _, level := range []string{"off", "none", "minimal", "low", "medium", "high", "xhigh", "max"} {
+		assert.NoError(t, validateEffortForModel("zai", "glm-5.2", level), "level %q", level)
+	}
+	// "on" is a glm4_7_flash-style boolean value, not part of glm-5.2's
+	// graduated vocabulary — must still be rejected for glm-5.2.
+	err := validateEffortForModel("zai", "glm-5.2", "on")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not a valid effort level")
+}
+
+// TestValidateEffortForModel_EmptyEffortAlwaysOK confirms omitting an
+// effort suffix entirely (the common case) is always valid, atom or not.
+func TestValidateEffortForModel_EmptyEffortAlwaysOK(t *testing.T) {
+	assert.NoError(t, validateEffortForModel("zai", "glm-5.2", ""))
+	assert.NoError(t, validateEffortForModel("openai", "gpt-5", ""))
+}
+
 func TestModelsState_ReportsWorkerAndReviewer(t *testing.T) {
 	isolatedModelsEnv(t)
 

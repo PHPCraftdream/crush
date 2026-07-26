@@ -20,7 +20,86 @@ type atom struct {
 	GroupNote    string
 	Vision       bool
 	EffortSource *cliEffortSource
+
+	// ReasoningLevels is a static, non-CLI-shelled declaration of which
+	// effort levels are meaningful for this atom. It is deliberately a
+	// separate mechanism from EffortSource: EffortSource.Levels() shells out
+	// to a local binary (`claude --help`) to detect what THAT binary
+	// supports, which makes no sense for a remote HTTP provider like Z.AI.
+	// ReasoningLevels is nil for every Claude/local-cli atom (they use
+	// EffortSource instead) and non-nil for Z.AI atoms — see
+	// zaiReasoningLevels below. An atom should set at most one of
+	// EffortSource / ReasoningLevels; Levels() below prefers EffortSource.
+	ReasoningLevels []string
 }
+
+// Levels returns the effort levels this atom actually supports, from
+// whichever of EffortSource (CLI-detected) or ReasoningLevels (static)
+// is populated. Returns nil if the atom supports no effort levels at all.
+func (a atom) Levels() []string {
+	if a.EffortSource != nil {
+		return a.EffortSource.Levels()
+	}
+	return a.ReasoningLevels
+}
+
+// zaiReasoningLevels is the real, meaningful effort-levels array for
+// GLM-5.2 specifically — the ONLY Z.AI model that officially supports the
+// `reasoning_effort` parameter at all, per Z.AI's own API reference
+// (docs.z.ai/api-reference/llm/chat-completion): "Controls the model's
+// reasoning effort level, takes effect when `thinking` is enabled. Default
+// is `max`. Only supported by `GLM-5.2`." The documented accepted values
+// for that parameter are exactly: max, xhigh, high, medium, low, minimal,
+// none. "off" is ADDED on top of that documented enum — it is not a
+// `reasoning_effort` value at all, it is the fork's own ReasoningEffort
+// vocabulary for fully disabling thinking (`thinking: {"type":"disabled"}`
+// in coordinator.go, a separate code path from reasoning_effort entirely).
+// It's included here because it's the only way, in the fork's own
+// vocabulary, to turn thinking off for GLM-5.2 — omitting it would make
+// `crush models efforts`/parseAtom wrongly reject a perfectly valid,
+// already-supported fork-level setting.
+//
+// SYNC WARNING: this list restates the `case string(catwalk.InferenceProviderZAI):`
+// branch of internal/agent/coordinator.go's getProviderOptions (~line 1140)
+// — the SAME fact already documented in prose by providerEffortDocs in
+// models_efforts.go (SYNC WARNING there too). All three of these — the wire
+// mapping in coordinator.go, the prose in models_efforts.go, and this array
+// — must describe the same behavior. If you change coordinator.go's
+// mapping, update both of the other two.
+//
+// IMPORTANT ASYMMETRY vs. coordinator.go's current runtime behavior: the
+// fork's coordinator.go code (deliberately out of scope for this task —
+// see CLAUDE.md/the task spec, not touched here) sends `reasoning_effort`
+// to EVERY zai-routed model uniformly, collapsing the fork's own
+// ReasoningEffort vocabulary (low/medium/high/xhigh/max/off/ultracode) down
+// to just "high"/"max"/disabled on the wire, regardless of which specific
+// GLM model is targeted. That is a fork-level simplification, not a
+// contradiction of Z.AI's docs — coordinator.go's comment even notes
+// "Older GLM-4.x ignore the field harmlessly" (i.e. it's sent but not
+// documented as meaningful for those models). This array intentionally
+// tracks Z.AI's DOCUMENTED per-model support matrix (glm5_2 real, others
+// boolean-only — see zaiBooleanThinkingLevels below) rather than
+// coordinator.go's simplified "same wire payload for every zai model"
+// behavior, since the documented atom-level validation added by this task
+// should reflect API truth, not just "what coordinator.go happens to also
+// accept without erroring."
+var zaiReasoningLevels = []string{"off", "none", "minimal", "low", "medium", "high", "xhigh", "max"}
+
+// zaiBooleanThinkingLevels is the levels array for every Z.AI (GLM) atom
+// OTHER than GLM-5.2. Per Z.AI's docs, these models only expose the boolean
+// `thinking: {"type": "enabled"|"disabled"}` toggle — there is no graduated
+// `reasoning_effort` support documented for them at all. "off"/"on" here
+// stand in for that boolean, not for genuine effort gradations; validating
+// against this array mainly serves to reject a graduated level (e.g. "max")
+// that would silently do nothing useful on these models per the docs, while
+// still allowing users to explicitly toggle thinking on/off.
+//
+// coordinator.go's current code still forwards reasoning_effort=high/max to
+// these models too (see the SYNC WARNING above on zaiReasoningLevels) — that
+// runtime behavior is unchanged by this task; this array only affects what
+// `crush models efforts`/parseAtom/validateEffortForModel consider a valid,
+// documented-as-meaningful level for THESE models specifically.
+var zaiBooleanThinkingLevels = []string{"off", "on"}
 
 var atomRegistry = map[string]atom{
 	"opus":   {Provider: "local-cli", Model: "cli-claude-opus-4-8", DisplayName: "Claude Opus 4.8", CtxLabel: "1M", Group: "anthropic", GroupNote: "via local `claude` CLI", EffortSource: claudeEffortSource},
@@ -41,10 +120,16 @@ var atomRegistry = map[string]atom{
 	// no effort-bearing SHORT CODE (see the Claude-only asymmetry documented
 	// in `crush models efforts`) — effort is set via the raw
 	// `zai/glm-5.2@max` syntax instead.
-	"glm5_2":     {Provider: "zai", Model: "glm-5.2", DisplayName: "GLM 5.2", CtxLabel: "1M", Group: "zai"},
-	"glm5_1":     {Provider: "zai", Model: "glm-5.1", DisplayName: "GLM 5.1", CtxLabel: "200k", Group: "zai"},
-	"glm5":       {Provider: "zai", Model: "glm-5", DisplayName: "GLM 5", CtxLabel: "200k", Group: "zai"},
-	"glm5_turbo": {Provider: "zai", Model: "glm-5-turbo", DisplayName: "GLM 5 turbo", CtxLabel: "200k", Group: "zai"},
+	//
+	// Only glm5_2 gets the real graduated zaiReasoningLevels array — per
+	// Z.AI's own API docs, `reasoning_effort` is "Only supported by GLM-5.2"
+	// among current Z.AI models; glm5_1/glm5/glm5_turbo below get
+	// zaiBooleanThinkingLevels (documented as boolean thinking-toggle only,
+	// no graduated effort) instead. See the SYNC WARNING on zaiReasoningLevels.
+	"glm5_2":     {Provider: "zai", Model: "glm-5.2", DisplayName: "GLM 5.2", CtxLabel: "1M", Group: "zai", ReasoningLevels: zaiReasoningLevels},
+	"glm5_1":     {Provider: "zai", Model: "glm-5.1", DisplayName: "GLM 5.1", CtxLabel: "200k", Group: "zai", ReasoningLevels: zaiBooleanThinkingLevels},
+	"glm5":       {Provider: "zai", Model: "glm-5", DisplayName: "GLM 5", CtxLabel: "200k", Group: "zai", ReasoningLevels: zaiBooleanThinkingLevels},
+	"glm5_turbo": {Provider: "zai", Model: "glm-5-turbo", DisplayName: "GLM 5 turbo", CtxLabel: "200k", Group: "zai", ReasoningLevels: zaiBooleanThinkingLevels},
 	// GLM-4.7-FlashX is deliberately NOT an atom. Its model id
 	// ("glm-4.7-flashx") is real — verified by pinging it directly: it
 	// returned "Insufficient balance or no resource package" (an
@@ -56,10 +141,10 @@ var atomRegistry = map[string]atom{
 	//
 	// GLM-4.5.x (glm-4.5, glm-4.5-air, glm-4.5v) and older are intentionally
 	// not carried as atoms — 4.6 is the oldest generation kept.
-	"glm4_7":       {Provider: "zai", Model: "glm-4.7", DisplayName: "GLM 4.7", CtxLabel: "200k", Group: "zai"},
-	"glm4_7_flash": {Provider: "zai", Model: "glm-4.7-flash", DisplayName: "GLM 4.7 flash", CtxLabel: "200k", Group: "zai"},
-	"glm4_6":       {Provider: "zai", Model: "glm-4.6", DisplayName: "GLM 4.6", CtxLabel: "200k", Group: "zai"},
-	"glm4_6v":      {Provider: "zai", Model: "glm-4.6v", DisplayName: "GLM 4.6v", CtxLabel: "204.8k", Group: "zai", Vision: true},
+	"glm4_7":       {Provider: "zai", Model: "glm-4.7", DisplayName: "GLM 4.7", CtxLabel: "200k", Group: "zai", ReasoningLevels: zaiBooleanThinkingLevels},
+	"glm4_7_flash": {Provider: "zai", Model: "glm-4.7-flash", DisplayName: "GLM 4.7 flash", CtxLabel: "200k", Group: "zai", ReasoningLevels: zaiBooleanThinkingLevels},
+	"glm4_6":       {Provider: "zai", Model: "glm-4.6", DisplayName: "GLM 4.6", CtxLabel: "200k", Group: "zai", ReasoningLevels: zaiBooleanThinkingLevels},
+	"glm4_6v":      {Provider: "zai", Model: "glm-4.6v", DisplayName: "GLM 4.6v", CtxLabel: "204.8k", Group: "zai", Vision: true, ReasoningLevels: zaiBooleanThinkingLevels},
 }
 
 var atomGroupOrder = []string{"anthropic", "zai"}
@@ -438,39 +523,46 @@ func parseAtom(name string) (config.SelectedModel, error) {
 	a := atomRegistry[matchedKey]
 	rem := name[len(matchedKey):]
 
-	if a.EffortSource != nil {
-		if rem == "" {
-			return config.SelectedModel{}, fmt.Errorf("%s requires explicit level (e.g. %s-low, %s-high) — see `crush models list`", matchedKey, matchedKey, matchedKey)
-		}
-		if !strings.HasPrefix(rem, "-") {
-			return config.SelectedModel{}, fmt.Errorf("%q is not a recognized atom — see `crush models list`", name)
-		}
-		level := rem[1:]
-		levels := a.EffortSource.Levels()
-		valid := false
-		for _, l := range levels {
-			if l == level {
-				valid = true
-				break
-			}
-		}
-		if !valid {
-			return config.SelectedModel{}, fmt.Errorf("%q is not a valid level for %s (valid: %s)", level, matchedKey, strings.Join(levels, "|"))
-		}
+	// EffortSource-backed atoms (Claude/local-cli) REQUIRE an explicit level
+	// suffix — there is no meaningful "unset" effort for those, the CLI
+	// always sends one. Z.AI/other ReasoningLevels-backed atoms make the
+	// suffix OPTIONAL: omitting it means "let the provider default apply"
+	// (see the coordinator's unset-defaults-to-high behavior for Z.AI).
+	if a.EffortSource != nil && rem == "" {
+		return config.SelectedModel{}, fmt.Errorf("%s requires explicit level (e.g. %s-low, %s-high) — see `crush models list`", matchedKey, matchedKey, matchedKey)
+	}
+
+	if rem == "" {
 		return config.SelectedModel{
-			Provider:        a.Provider,
-			Model:           a.Model,
-			ReasoningEffort: level,
+			Provider: a.Provider,
+			Model:    a.Model,
 		}, nil
 	}
 
-	if rem != "" {
+	if !strings.HasPrefix(rem, "-") {
+		return config.SelectedModel{}, fmt.Errorf("%q is not a recognized atom — see `crush models list`", name)
+	}
+	level := rem[1:]
+
+	levels := a.Levels()
+	if levels == nil {
 		return config.SelectedModel{}, fmt.Errorf("%s does not support effort levels (provider %s) — unexpected suffix %q", matchedKey, a.Provider, rem)
 	}
 
+	valid := false
+	for _, l := range levels {
+		if l == level {
+			valid = true
+			break
+		}
+	}
+	if !valid {
+		return config.SelectedModel{}, fmt.Errorf("%q is not a valid level for %s (valid: %s)", level, matchedKey, strings.Join(levels, "|"))
+	}
 	return config.SelectedModel{
-		Provider: a.Provider,
-		Model:    a.Model,
+		Provider:        a.Provider,
+		Model:           a.Model,
+		ReasoningEffort: level,
 	}, nil
 }
 
@@ -481,6 +573,9 @@ func parseAtomOrRaw(name string, resolveFunc func(string) (string, string, error
 		modelPart, effort := splitModelEffort(name)
 		provider, modelID, err := resolveFunc(modelPart)
 		if err != nil {
+			return config.SelectedModel{}, err
+		}
+		if err := validateEffortForModel(provider, modelID, effort); err != nil {
 			return config.SelectedModel{}, err
 		}
 		return config.SelectedModel{
@@ -504,11 +599,44 @@ func parseAtomOrRaw(name string, resolveFunc func(string) (string, string, error
 	if rerr != nil {
 		return config.SelectedModel{}, fmt.Errorf("%q is not a known atom or provider/model — see `crush models list`", name)
 	}
+	if err := validateEffortForModel(provider, modelID, effort); err != nil {
+		return config.SelectedModel{}, err
+	}
 	return config.SelectedModel{
 		Provider:        provider,
 		Model:           modelID,
 		ReasoningEffort: effort,
 	}, nil
+}
+
+// validateEffortForModel checks a raw "@effort" suffix (from
+// splitModelEffort) against the target (provider, model)'s real levels
+// array, when one exists in the atom registry. This closes the exact gap
+// `crush models efforts`'s help text warns about: previously, splitModelEffort
+// was a blind string split with NO validation anywhere, so a typo like
+// "zai/glm-5.2@hihg" was silently accepted and either ignored or mismapped
+// by the wire-level provider code. If (provider, model) isn't a known atom
+// at all (e.g. a raw openai/gpt-5), there is no levels array to validate
+// against, so any effort string is still accepted — that's an existing,
+// intentional escape hatch for models outside the atom registry.
+func validateEffortForModel(provider, model, effort string) error {
+	if effort == "" {
+		return nil
+	}
+	key := lookupAtomForModel(config.SelectedModel{Provider: provider, Model: model})
+	if key == "" {
+		return nil
+	}
+	levels := atomRegistry[key].Levels()
+	if levels == nil {
+		return nil
+	}
+	for _, l := range levels {
+		if l == effort {
+			return nil
+		}
+	}
+	return fmt.Errorf("%q is not a valid effort level for %s/%s (valid: %s) — see `crush models efforts %s`", effort, provider, model, strings.Join(levels, "|"), key)
 }
 
 func renderAtomsBlockToStdout() {

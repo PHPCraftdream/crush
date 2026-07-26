@@ -16,6 +16,45 @@ func noopResolve(s string) (string, string, error) {
 	return "", "", errStubResolve
 }
 
+// TestAtom_ZAIHasReasoningLevels verifies every Z.AI atom carries a real,
+// declared levels array (not just prose describing them) — the core of this
+// task. Per Z.AI's own API docs (docs.z.ai/api-reference/llm/chat-completion),
+// reasoning_effort is "Only supported by GLM-5.2" — so glm5_2 alone gets the
+// full graduated 8-value set (the documented 7-value reasoning_effort enum
+// plus "off", a fork-level addition for fully disabling thinking), and
+// every other Z.AI atom gets the boolean thinking-toggle-only array. Also
+// checks atom.Levels() surfaces each.
+func TestAtom_ZAIHasReasoningLevels(t *testing.T) {
+	a, ok := atomRegistry["glm5_2"]
+	require.True(t, ok)
+	assert.Equal(t, []string{"off", "none", "minimal", "low", "medium", "high", "xhigh", "max"}, a.ReasoningLevels)
+	assert.Nil(t, a.EffortSource, "Z.AI atom glm5_2 must not use the CLI-shelling EffortSource")
+	assert.Equal(t, a.ReasoningLevels, a.Levels())
+
+	for _, key := range []string{"glm5_1", "glm5", "glm5_turbo", "glm4_7", "glm4_7_flash", "glm4_6", "glm4_6v"} {
+		a, ok := atomRegistry[key]
+		require.True(t, ok, "expected atom %q in registry", key)
+		assert.Equal(t, []string{"off", "on"}, a.ReasoningLevels, "atom %q — only GLM-5.2 has graduated effort per Z.AI docs", key)
+		assert.Nil(t, a.EffortSource, "Z.AI atom %q must not use the CLI-shelling EffortSource", key)
+		assert.Equal(t, []string{"off", "on"}, a.Levels(), "atom %q .Levels()", key)
+	}
+}
+
+// TestAtom_ClaudeUnaffectedByReasoningLevels is a regression check: adding
+// ReasoningLevels to the atom struct must not change Claude/local-cli atoms,
+// which continue to source their levels exclusively from EffortSource (the
+// CLI-shelling mechanism) and carry no static ReasoningLevels of their own.
+func TestAtom_ClaudeUnaffectedByReasoningLevels(t *testing.T) {
+	defer setMockEffortLevels([]string{"low", "medium", "high", "xhigh", "max"})()
+	for _, key := range []string{"opus", "opus46", "opus47", "opus48", "sonnet", "haiku", "fable"} {
+		a, ok := atomRegistry[key]
+		require.True(t, ok, "expected atom %q in registry", key)
+		assert.Nil(t, a.ReasoningLevels, "Claude atom %q should not carry a static ReasoningLevels", key)
+		require.NotNil(t, a.EffortSource, "Claude atom %q must use EffortSource", key)
+		assert.Equal(t, []string{"low", "medium", "high", "xhigh", "max"}, a.Levels(), "atom %q .Levels()", key)
+	}
+}
+
 func TestParseAtom_AnthropicWithLevel(t *testing.T) {
 	defer setMockEffortLevels([]string{"low", "medium", "high"})()
 	sm, err := parseAtom("opus-high")
@@ -51,10 +90,65 @@ func TestParseAtom_ZAINoLevel(t *testing.T) {
 	assert.Empty(t, sm.ReasoningEffort)
 }
 
+// TestParseAtom_ZAIRejectsLevel previously asserted that ANY "-level" suffix
+// on a Z.AI atom was rejected outright ("does not support effort levels"),
+// because Z.AI atoms carried no machine-readable levels array at all — only
+// the raw, unvalidated "provider/model@effort" syntax could set a Z.AI
+// model's effort.
+//
+// That contract has deliberately changed (task: give every atom a real
+// ReasoningLevels array). glm5_1 (like every non-glm5_2 Z.AI atom) declares
+// {"off", "on"} — Z.AI's own docs only document a boolean thinking toggle
+// for this model, not graduated reasoning_effort — and the long-form
+// "<atom>-<level>" suffix is validated against that array exactly like
+// Claude atoms are validated against EffortSource.Levels(). "low" is not one
+// of glm5_1's two valid values, so it is still rejected — but now with the
+// more precise "not a valid level" error (listing the real off|on
+// vocabulary) instead of the old blanket "does not support effort levels"
+// message. See TestParseAtom_ZAIAcceptsKnownLevel below for the
+// now-succeeding case this test used to make impossible, and
+// TestParseAtom_ZAI52AcceptsGraduatedLevel for glm5_2's distinct, larger
+// vocabulary.
 func TestParseAtom_ZAIRejectsLevel(t *testing.T) {
 	_, err := parseAtom("glm5_1-low")
 	require.Error(t, err)
-	assert.Contains(t, strings.ToLower(err.Error()), "does not support effort")
+	assert.Contains(t, strings.ToLower(err.Error()), "not a valid level")
+	assert.Contains(t, err.Error(), "off|on")
+}
+
+// TestParseAtom_ZAIAcceptsKnownLevel is the new behavior enabled by giving
+// Z.AI atoms a real ReasoningLevels array: a level that IS one of glm5_1's
+// two valid boolean-toggle values (off/on) is now accepted via the same
+// "<atom>-<level>" long-form suffix Claude atoms already use, instead of
+// requiring the raw unvalidated "zai/glm-5.1@on" syntax.
+func TestParseAtom_ZAIAcceptsKnownLevel(t *testing.T) {
+	sm, err := parseAtom("glm5_1-on")
+	require.NoError(t, err)
+	assert.Equal(t, "zai", sm.Provider)
+	assert.Equal(t, "glm-5.1", sm.Model)
+	assert.Equal(t, "on", sm.ReasoningEffort)
+}
+
+// TestParseAtom_ZAI52AcceptsGraduatedLevel proves glm5_2 specifically
+// validates against its own, larger documented vocabulary (per Z.AI's docs,
+// GLM-5.2 is the only model with real graduated reasoning_effort) — a level
+// like "xhigh" that would be invalid for glm5_1 is valid here.
+func TestParseAtom_ZAI52AcceptsGraduatedLevel(t *testing.T) {
+	sm, err := parseAtom("glm5_2-xhigh")
+	require.NoError(t, err)
+	assert.Equal(t, "zai", sm.Provider)
+	assert.Equal(t, "glm-5.2", sm.Model)
+	assert.Equal(t, "xhigh", sm.ReasoningEffort)
+}
+
+// TestParseAtom_ZAITypoRejected proves the exact gap the task description
+// calls out: a typo'd effort level (here "hgih" instead of "high") is now
+// rejected with a clear error, instead of silently succeeding the way the
+// unvalidated raw "@effort" suffix does (see splitModelEffort/models_use.go).
+func TestParseAtom_ZAITypoRejected(t *testing.T) {
+	_, err := parseAtom("glm5_2-hgih")
+	require.Error(t, err)
+	assert.Contains(t, strings.ToLower(err.Error()), "not a valid level")
 }
 
 func TestParseAtom_LongestMatchWins(t *testing.T) {

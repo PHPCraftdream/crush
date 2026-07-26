@@ -20,16 +20,22 @@ func TestRenderEffortsOverview_NoArg(t *testing.T) {
 	assert.Contains(t, out, "@effort")
 	assert.Contains(t, out, "UNVALIDATED")
 
-	// Claude-only short-code asymmetry.
+	// Claude-only LETTER short-code asymmetry (o47x, h45l, ...) — Z.AI atoms
+	// now have their OWN validated levels array + long-form atom suffix
+	// (glm5_2-max), so the assertion here is scoped to "no letter short
+	// code", not "no way at all to set effort with validation".
 	assert.Contains(t, out, "ASYMMETRY")
 	assert.Contains(t, out, "local-cli/")
 	assert.Contains(t, out, "`glm5_2xx`")
-	assert.Contains(t, out, "has no short code for effort")
+	assert.Contains(t, out, "has no letter short code for effort")
 
 	// Z.AI collapsing — the single most surprising fact.
 	assert.Contains(t, out, "Z.AI")
 	assert.Contains(t, out, `unset, low, medium, high     -> reasoning_effort: "high"`)
 	assert.Contains(t, out, "indistinguishable from high")
+	// Z.AI now has a real, validated levels array + long-form atom suffix.
+	assert.Contains(t, out, "glm5_2-max")
+	assert.Contains(t, out, "validated")
 
 	// DeepSeek's differing unset default should also be documented.
 	assert.Contains(t, out, "DeepSeek")
@@ -54,10 +60,31 @@ func TestRenderEffortsForModel_ZAI(t *testing.T) {
 	assert.Contains(t, out, `unset, low, medium, high     -> reasoning_effort: "high"`)
 	assert.Contains(t, out, "xhigh, max, ultracode        -> reasoning_effort: \"max\"")
 
-	// Must show the raw @effort command form, not a short code (none exist).
+	// Must show the raw @effort command form, not a letter short code (none exist).
 	assert.Contains(t, out, "crush models use zai/glm-5.2@<level> <small>")
 	assert.Contains(t, out, "crush models use zai/glm-5.2@off <small>")
 	assert.Contains(t, out, "crush models use zai/glm-5.2@max <small>")
+
+	// New behavior for this task: the long-form atom suffix (validated,
+	// same mechanism as Claude atoms) is now also offered and the output
+	// says both forms are validated against the real levels array — not
+	// left as an unvalidated blind string split.
+	assert.Contains(t, out, "crush models use glm5_2-<level> <small>")
+	assert.Contains(t, out, "validated")
+	assert.Contains(t, out, "known atom")
+}
+
+// TestRenderEffortsForModel_ZAI_LevelsFromRealArray proves the rendered
+// levels for a Z.AI atom come from the real zaiReasoningLevels array (used
+// for validation), not merely restated as prose that could drift from it.
+func TestRenderEffortsForModel_ZAI_LevelsFromRealArray(t *testing.T) {
+	out, err := renderEffortsForModel("glm5_2")
+	require.NoError(t, err)
+	a := atomRegistry["glm5_2"]
+	require.NotNil(t, a.ReasoningLevels)
+	for _, level := range a.ReasoningLevels {
+		assert.Contains(t, out, "crush models use zai/glm-5.2@"+level, "level %q from the real array must be rendered", level)
+	}
 }
 
 // TestRenderEffortsForModel_ZAI_RawProviderModel verifies the same lookup
