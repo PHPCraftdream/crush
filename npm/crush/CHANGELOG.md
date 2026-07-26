@@ -39,8 +39,41 @@ root for the full per-file merge/divergence history.
   ever call it, `exit_reason: "awaiting_answer"` could not occur, and both the
   web UI's answer chips and the documented resume flow described behaviour
   that could not fire.
+- Fixed: a legitimate worker delegation taking longer than 15 minutes used to
+  be killed by the same watchdog meant for catching genuinely hung tools.
+  Orchestrator-mode delegations now get a 45-minute allowance; an operator's
+  own `stream_tool_timeout_seconds` always wins over either default, in
+  either direction.
+- The orchestrator's own system prompt now requires treating every worker's
+  report as an unverified claim, not a receipt — re-check the file it says it
+  changed or the test it says passed before counting the work done, the same
+  standard already applied elsewhere in the prompt.
+- New: **`crush models efforts [model]`** explains what reasoning-effort
+  levels a model actually supports and what each one does — per provider,
+  since the same word means different things depending on where the model
+  runs. New: **`crush models bump <role> up|down`** steps a role's effort one
+  level without retyping the model name, and reports plainly when there's
+  nowhere left to move instead of erroring.
+- Fixed: **GLM-5.2 was documented as accepting 8 distinct effort levels**,
+  sourced from Z.AI's own API reference. This fork's own code only ever
+  produces 3 distinct behaviours regardless of which of the 8 you picked
+  (`off`, `high`, `max`) — the other 5 silently did nothing beyond the
+  default. Only the 3 real levels are accepted now; the same audit also
+  corrected several Z.AI atoms' displayed context-window sizes (were
+  `204.8k`, are `200k`) and dropped short codes for models this fork doesn't
+  currently support well.
+- Fixed: `crush models use` used to write `large`/`small` to disk *before*
+  validating `--worker`/`--reviewer`, so a bad value in either of the latter
+  could leave the former silently changed even though the command reported
+  failure. Every slot is now validated before anything is written.
+- `crush models use`/`state`/`efforts`/`bump` now validate any
+  `<atom>-<level>` or `provider/model@level` effort suffix against that
+  model's real supported levels instead of silently accepting a typo, and
+  `crush models state` shows what an *unset* effort actually resolves to
+  (e.g. Z.AI defaults unset to `"high"`) instead of showing nothing.
 - `crush --version` now also reports how far upstream has actually been
-  triaged, so that review watermark cannot go stale unnoticed.
+  triaged, so that review watermark cannot go stale unnoticed, and no longer
+  shows a second, unrelated version-shaped number next to it.
 - Fixed: a tool call with malformed JSON arguments from the model used to be
   persisted as-is and re-read from the DB every subsequent turn, sticking the
   session forever. Malformed input is now sanitized before storage and the

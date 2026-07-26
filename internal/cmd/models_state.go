@@ -26,6 +26,8 @@ var modelsStateCmd = &cobra.Command{
   2. SCOPES — what each scope (global, local) says about each slot, with
      "(effective)" / "(overridden by local)" / "(not set)" annotations.
   3. The atom name in parens when the effective model matches a known atom.
+  4. For a slot with no explicit effort, the known unset-default (e.g.
+     "unset -> thinking on, high" for Z.AI) — silent when undocumented.
 
 Set worker/reviewer with ` + "`crush models use <large> <small> --worker <m> --reviewer <m>`" + `
 and clear them with ` + "`crush models unset worker`" + ` / ` + "`crush models unset reviewer`" + `.
@@ -82,14 +84,18 @@ crush models show
 		if asJSON {
 			payload := map[string]any{
 				"effective": map[string]any{
-					"large":          nilOrModel(hasLarge, effLarge),
-					"small":          nilOrModel(hasSmall, effSmall),
-					"worker":         nilOrModel(hasWorker, effWorker),
-					"reviewer":       nilOrModel(hasReviewer, effReviewer),
-					"large_scope":    largeScope,
-					"small_scope":    smallScope,
-					"worker_scope":   workerScope,
-					"reviewer_scope": reviewerScope,
+					"large":                   nilOrModel(hasLarge, effLarge),
+					"small":                   nilOrModel(hasSmall, effSmall),
+					"worker":                  nilOrModel(hasWorker, effWorker),
+					"reviewer":                nilOrModel(hasReviewer, effReviewer),
+					"large_scope":             largeScope,
+					"small_scope":             smallScope,
+					"worker_scope":            workerScope,
+					"reviewer_scope":          reviewerScope,
+					"large_effort_default":    nilOrEffortDefault(hasLarge, effLarge),
+					"small_effort_default":    nilOrEffortDefault(hasSmall, effSmall),
+					"worker_effort_default":   nilOrEffortDefault(hasWorker, effWorker),
+					"reviewer_effort_default": nilOrEffortDefault(hasReviewer, effReviewer),
 				},
 				"global": map[string]any{
 					"large":    globalLarge,
@@ -145,6 +151,22 @@ func nilOrModel(has bool, m config.SelectedModel) any {
 	return m
 }
 
+// nilOrEffortDefault is the JSON counterpart of effortEffectiveNote: null
+// when the slot is unset, when the slot's effort is explicitly set (nothing
+// to report — the model's own reasoning_effort field already says so), or
+// when the provider's unset-default behavior isn't documented. Otherwise the
+// same short fact effortEffectiveNote renders in text (without the
+// parens/leading space, since JSON consumers don't need the human framing).
+func nilOrEffortDefault(has bool, m config.SelectedModel) any {
+	if !has || m.ReasoningEffort != "" {
+		return nil
+	}
+	if note := unsetEffortNote(m.Provider); note != "" {
+		return note
+	}
+	return nil
+}
+
 func printEffectiveLine(label string, has bool, m config.SelectedModel, scope string) {
 	if !has {
 		fmt.Printf("  %s:  (not set in any scope)\n", label)
@@ -167,8 +189,26 @@ func printEffectiveLine(label string, has bool, m config.SelectedModel, scope st
 	default:
 		src = "scope unknown"
 	}
-	fmt.Printf("  %s:  %s/%s%s%s   (%s)\n",
-		label, m.Provider, m.Model, effortSuffix(m.ReasoningEffort), atomLabel, src)
+	fmt.Printf("  %s:  %s/%s%s%s%s   (%s)\n",
+		label, m.Provider, m.Model, effortSuffix(m.ReasoningEffort), atomLabel, effortEffectiveNote(m), src)
+}
+
+// effortEffectiveNote returns a terse parenthetical (with a leading space,
+// or "" when there's nothing to add) for a slot's effort state: nothing
+// when an effort is explicitly set (effortSuffix above already shows that),
+// and the documented unset-default fact — reusing unsetEffortNote from
+// models_efforts.go so this can never drift from `crush models efforts`'s
+// prose or coordinator.go's actual switch — when the effort is unset and
+// that provider's default is known. Silent ("") for unset effort on a
+// provider whose default isn't documented; never guesses.
+func effortEffectiveNote(m config.SelectedModel) string {
+	if m.ReasoningEffort != "" {
+		return ""
+	}
+	if note := unsetEffortNote(m.Provider); note != "" {
+		return "  (" + note + ")"
+	}
+	return ""
 }
 
 func printScopeLine(tw *tabwriter.Writer, scopeName, slot string, value, other *config.SelectedModel, ownScope string) {
@@ -185,8 +225,8 @@ func printScopeLine(tw *tabwriter.Writer, scopeName, slot string, value, other *
 	case ownScope == "local":
 		annotation = "(effective)"
 	}
-	fmt.Fprintf(tw, "  %s\t%s = %s/%s%s\t%s\n",
-		scopeName, slot, value.Provider, value.Model, effortSuffix(value.ReasoningEffort), annotation)
+	fmt.Fprintf(tw, "  %s\t%s = %s/%s%s%s\t%s\n",
+		scopeName, slot, value.Provider, value.Model, effortSuffix(value.ReasoningEffort), effortEffectiveNote(*value), annotation)
 }
 
 func init() {

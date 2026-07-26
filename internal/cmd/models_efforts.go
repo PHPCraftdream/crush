@@ -291,6 +291,36 @@ func providerDocKeyFor(provider string) string {
 	}
 }
 
+// unsetEffortDefaults maps a providerEffortDocs key to the terse fact of
+// what an UNSET ReasoningEffort resolves to at the wire level, for providers
+// where that fact is a single, unambiguous sentence (see the SYNC WARNING on
+// providerEffortDocs above — this restates the same coordinator.go switch,
+// so it must be updated in lockstep with providerEffortDocs and
+// coordinator.go's getProviderOptions if either changes).
+//
+// Deliberately omitted: io.net and hyper never read ReasoningEffort at all
+// (only the boolean Think field), so "unset" isn't a meaningful state to
+// report here; Alibaba Singapore branches on the model's provider type, so
+// there's no single fact to state without picking the wrong branch; and
+// local-cli/Claude's default is whatever the `claude` binary itself picks
+// when no --effort flag is passed — not something coordinator.go decides.
+// For all of those, callers should show nothing rather than guess.
+var unsetEffortDefaults = map[string]string{
+	string(catwalk.InferenceProviderZAI):      "unset -> thinking on, high",
+	string(catwalk.InferenceProviderDeepSeek): "unset -> thinking off",
+}
+
+// unsetEffortNote returns a short parenthetical-ready fact describing what an
+// UNSET ReasoningEffort resolves to for (provider, model), reusing
+// providerDocKeyFor so this can never describe a provider differently than
+// `crush models efforts` does. Returns "" when the provider's unset-default
+// behavior isn't one of the documented, unambiguous cases (see
+// unsetEffortDefaults) — callers must treat "" as "say nothing", not fall
+// back to a guess.
+func unsetEffortNote(provider string) string {
+	return unsetEffortDefaults[providerDocKeyFor(provider)]
+}
+
 func renderEffortsForModel(arg string) (string, error) {
 	target, ok := resolveEffortTarget(arg)
 	if !ok {
