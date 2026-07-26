@@ -7,7 +7,6 @@ import (
 	"slices"
 	"strings"
 
-	"mvdan.cc/sh/moreinterp/coreutils"
 	"mvdan.cc/sh/v3/expand"
 	"mvdan.cc/sh/v3/interp"
 	"mvdan.cc/sh/v3/syntax"
@@ -156,6 +155,11 @@ func withNonInteractiveEnv(env []string) []string {
 	return append(result, nonInteractiveEnvVars...)
 }
 
+// execMiddleware wraps a base [interp.ExecHandlerFunc], composing like HTTP
+// middleware: each layer either handles a command itself or delegates to the
+// next handler in the chain.
+type execMiddleware = func(next interp.ExecHandlerFunc) interp.ExecHandlerFunc
+
 // standardHandlers returns the exec-handler middleware chain used by both
 // [Run] and [Shell]. Order matters:
 //  1. builtins first (so Crush's in-process jq wins over any PATH binary);
@@ -165,21 +169,21 @@ func withNonInteractiveEnv(env []string) []string {
 //     script exec's rather than the outer path-prefixed wrapper;
 //  3. block list;
 //  4. optional Go coreutils (only when useGoCoreUtils is on).
-func standardHandlers(blockFuncs []BlockFunc) []func(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
-	handlers := []func(next interp.ExecHandlerFunc) interp.ExecHandlerFunc{
+func standardHandlers(blockFuncs []BlockFunc) []execMiddleware {
+	handlers := []execMiddleware{
 		builtinHandler(),
 		scriptDispatchHandler(blockFuncs),
 		blockHandler(blockFuncs),
 	}
-	if useGoCoreUtils {
-		handlers = append(handlers, coreutils.ExecHandler)
+	if useGoCoreUtils && coreUtilsExecHandler != nil {
+		handlers = append(handlers, coreUtilsExecHandler)
 	}
 	return handlers
 }
 
 // builtinHandler returns middleware that dispatches recognized Crush
 // builtins to their in-process Go implementations. Currently: jq.
-func builtinHandler() func(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
+func builtinHandler() execMiddleware {
 	return func(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
 		return func(ctx context.Context, args []string) error {
 			if len(args) == 0 {
