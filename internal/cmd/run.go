@@ -371,6 +371,14 @@ crush run --restrict-run --role fast \
 			formatFlag, _      = cmd.Flags().GetString("format")
 			agentsMode, _      = cmd.Flags().GetString("agents")
 			aggregationMode, _ = cmd.Flags().GetString("aggregation")
+			// Fork patch (orchestrator UX, plan phase 2): distinguishes "operator
+			// explicitly wrote --agents single" from "flag left unset" —
+			// both currently resolve agentsMode to "" / "single" and set
+			// agentsDisable below, but only the unset case is eligible for
+			// the smart+worker bypass in app.RunNonInteractive
+			// (shouldBypassSubAgentBan). An explicit --agents single must
+			// always be honoured.
+			agentsExplicit = cmd.Flags().Changed("agents")
 			// Fork patch: batch 8 — timeout extension flags.
 			timeoutExtendsOnProgress, _ = cmd.Flags().GetBool("timeout-extends-on-progress")
 			timeoutHardCap, _           = cmd.Flags().GetString("timeout-hard-cap")
@@ -674,6 +682,7 @@ crush run --restrict-run --role fast \
 			RoleLarge:                roleLarge,
 			ModelRole:                modelType,
 			DisableSubAgents:         agentsDisable,
+			AgentsModeExplicit:       agentsExplicit,
 			StripJSONFences:          formatFlag == "json" || strings.HasPrefix(formatFlag, "json-schema:"),
 			AggregationMode:          aggregationMode,
 			TimeoutExtendsOnProgress: timeoutExtendsOnProgress, // Fork patch: batch 8

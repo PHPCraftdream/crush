@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -141,16 +142,35 @@ func New(ctx context.Context, conn *sql.DB, store *config.ConfigStore) (*App, er
 }
 
 // Config returns the pure-data configuration.
-// disableSubAgentToolsInConfig drops the "agent" and "agentic_fetch"
-// tools from the coder agent's AllowedTools list in the in-memory
-// config. Used by RunNonInteractive when overrides.DisableSubAgents
-// (`crush run --agents single`) is set. Mutation does not touch the
-// on-disk config and only outlives this process if a future caller
-// reloads the in-memory config from disk — `crush run` exits
-// immediately after the agent turn so this is moot in practice.
+// subAgentToolNames lists every tool name that the default `crush run`
+// sub-agent ban strips from the coder agent's AllowedTools. Split out so
+// callers that want to restore a subset (see the smart+worker bypass in
+// RunNonInteractive) can strip everything EXCEPT that subset instead of
+// duplicating the loop in disableSubAgentToolsInConfig.
+var subAgentToolNames = []string{"agent", "agentic_fetch"}
+
+// disableSubAgentToolsInConfig drops the given tool names from the coder
+// agent's AllowedTools list in the in-memory config. Used by
+// RunNonInteractive when overrides.DisableSubAgents (`crush run --agents
+// single`, or the implicit default when --agents is unset) is set.
+// Mutation does not touch the on-disk config and only outlives this
+// process if a future caller reloads the in-memory config from disk —
+// `crush run` exits immediately after the agent turn so this is moot in
+// practice.
 //
 // Fork patch (orchestrator UX): see CHANGELOG.fork.md (Section 4.J).
 func (app *App) disableSubAgentToolsInConfig() {
+	app.disableToolsInConfig(subAgentToolNames)
+}
+
+// disableToolsInConfig drops exactly the named tools from the coder
+// agent's AllowedTools list in the in-memory config. Extracted so the
+// smart+worker bypass (see shouldBypassSubAgentBan) can restore just the
+// `agent` tool while keeping `agentic_fetch` stripped, without
+// duplicating the filter loop.
+//
+// Fork patch (orchestrator UX, plan phase 2): bypass restores `agent` only.
+func (app *App) disableToolsInConfig(toolNames []string) {
 	cfg := app.config.Config()
 	if cfg == nil {
 		return
@@ -161,13 +181,53 @@ func (app *App) disableSubAgentToolsInConfig() {
 	}
 	filtered := coder.AllowedTools[:0:0]
 	for _, t := range coder.AllowedTools {
-		if t == "agent" || t == "agentic_fetch" {
+		if slices.Contains(toolNames, t) {
 			continue
 		}
 		filtered = append(filtered, t)
 	}
 	coder.AllowedTools = filtered
 	cfg.Agents[config.AgentCoder] = coder
+}
+
+// shouldBypassSubAgentBan decides whether the `crush run` default
+// sub-agent ban (DisableSubAgents) should be bypassed for the `agent`
+// tool specifically, restoring it to the coder's AllowedTools even
+// though the ban is otherwise in effect.
+//
+// Fork patch (orchestrator UX, plan phase 2): the orchestrator design (a smart
+// parent delegating hands-on work to cheap worker sub-agents) depends on
+// the `agent` tool being available. The ban exists to stop an
+// unsupervised `crush run` from silently fanning out — but when the
+// operator asked for the strong/smart role AND configured a worker
+// model, that fan-out IS the point, so the ban would otherwise block the
+// very feature it was configured for.
+//
+// Bypasses only when ALL of:
+//   - agentsExplicit is false: the operator did NOT pass --agents
+//     explicitly. An explicit `--agents single` is a direct instruction
+//     and always wins — see the agentsExplicit guard below.
+//   - role == SelectedModelTypeLarge: the run declared --role smart.
+//     --role fast (or worker/reviewer) never bypasses; we don't
+//     second-guess an explicit non-large role choice.
+//   - a Worker model slot is configured with a non-empty Model. No
+//     worker means there is nothing productive for the `agent` tool to
+//     delegate to, so the historical (safe) default — sub-agents off —
+//     stands. This is the single most important case: worker NOT
+//     configured + role smart + flags unset must keep sub-agents
+//     disabled exactly as today.
+func shouldBypassSubAgentBan(agentsExplicit bool, role config.SelectedModelType, cfg *config.Config) bool {
+	if agentsExplicit {
+		return false
+	}
+	if role != config.SelectedModelTypeLarge {
+		return false
+	}
+	if cfg == nil {
+		return false
+	}
+	workerModelCfg, ok := cfg.Models[config.SelectedModelTypeWorker]
+	return ok && workerModelCfg.Model != ""
 }
 
 func (app *App) Config() *config.Config {
@@ -623,7 +683,16 @@ type RunOverrides struct {
 	// (markdown fence + prose preamble removal); the unstripped
 	// original is preserved in runResult.AssistantNotes.
 	DisableSubAgents bool
-	StripJSONFences  bool
+	// AgentsModeExplicit records whether the operator passed --agents
+	// explicitly on this invocation, as opposed to DisableSubAgents
+	// being true only because --agents was left unset (the implicit
+	// default). The two produce the same DisableSubAgents=true today,
+	// but only the implicit case is eligible for the smart+worker
+	// bypass in RunNonInteractive (shouldBypassSubAgentBan) — an
+	// explicit `--agents single` is a direct instruction from the
+	// operator and always wins. Fork patch (orchestrator UX, plan phase 2).
+	AgentsModeExplicit bool
+	StripJSONFences    bool
 	// AggregationMode controls how sub-agent fan-out output reaches
 	// the orchestrator. "" / "summary" = upstream default (parent
 	// composes a wrap-up, sub-agent details live in the DB only).
@@ -841,8 +910,22 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt 
 	// fan out. Mutation is in-process only (crush run is a single-shot
 	// process — exit drops the change), so this is safe even though
 	// it touches the global config. See run.go and run_format.go.
+	//
+	// Plan phase 2 exception: when the ban is only in effect because --agents
+	// was left unset (not an explicit `--agents single`), and this run
+	// is --role smart with a Worker model configured, restore ONLY the
+	// `agent` tool — see shouldBypassSubAgentBan. `agentic_fetch` stays
+	// stripped either way: it's a separate concern (web-fetch
+	// delegation that always runs on the small model, see
+	// internal/agent/agentic_fetch_tool.go's "Use small model for both"
+	// comment) and has nothing to do with delegating hands-on work to a
+	// worker.
 	if overrides.DisableSubAgents {
-		app.disableSubAgentToolsInConfig()
+		if shouldBypassSubAgentBan(overrides.AgentsModeExplicit, overrides.ModelRole, app.config.Config()) {
+			app.disableToolsInConfig([]string{"agentic_fetch"})
+		} else {
+			app.disableSubAgentToolsInConfig()
+		}
 	}
 
 	// Fork patch (reviewer/worker roles): record which named model slot is
