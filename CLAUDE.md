@@ -52,6 +52,7 @@ Upstream commits touching any of these MUST be skipped:
 | Auto-update / scheduled chores | `chore: auto-update files`, cron `nightly.yml` | SKIP |
 | `--effort high` thinking model variants (deprecated) | `8b3707dd` | SKIP attempts to re-add |
 | localStorage settings (we use backend) | `8868dced` | SKIP UI commits that re-introduce client-side persistence |
+| LSP integration | `internal/lsp/` (manager, client, all LSP-backed agent tools) | Fully removed, no `internal/lsp` package exists in the fork at all — confirmed no import of it anywhere. SKIP every upstream `fix(lsp)`/`feat(lsp)` commit, including ones that also touch shared files like `internal/agent/tools/*` (e.g. new `lsp_definition`/`lsp_rename`/`lsp_call_hierarchy`/`lsp_symbols` tools) — don't port the LSP-specific pieces even when they ride along in a commit that also changes non-LSP code. |
 
 ## What This Fork OWNS — Touch Upstream Only With Extreme Care
 
@@ -68,6 +69,24 @@ are almost always wrong for us:
   (10s touch, 20s expiry, auto-clear stale locks > 60s, `kill`
   enforces taskkill /F /T on Windows). This is intentional and
   battle-tested.
+- **Fork's multi-session engine predates upstream's and is the more
+  mature design for our use case** — it shipped before upstream even
+  had a multi-client concept, was built for N truly concurrent
+  `crush run` sessions from the start (see `coordinator.go`'s own
+  "drives N concurrent web sessions" note), and doesn't share
+  upstream's "one shared workspace across simultaneous UI clients"
+  problem space at all. Do not treat upstream's session/concurrency
+  fixes as a naturally superior reference just because they're newer.
+- **This caution extends beyond files literally under
+  `internal/server`/`internal/workspace`/`internal/client`.** Upstream
+  occasionally fixes session-dispatch races in code we DO share
+  (e.g. `internal/agent/coordinator.go`, `internal/agent/agent.go`) —
+  even when such a commit isn't tagged `fix(server)`, treat it as
+  **EVAL, not PORT**: first verify the same race is actually
+  reachable through *our* session model (lock-file + heartbeat, N
+  independent sessions) before assuming their fix — shaped for their
+  shared-workspace-across-clients problem — applies to us at all, or
+  applies in the same shape.
 
 ### Web UI / WebSocket
 - **Upstream** has no web UI — they own the TUI.
@@ -167,6 +186,5 @@ the shared-workspace git-safety clause already in your prompt:
 | Agent guard rails | `internal/agent/agentguard/` |
 | Stream watchdog | `internal/agent/stream_watchdog.go` |
 | Loop detection | `internal/agent/loop_detection.go` |
-| LSP manager (circuit-breaker) | `internal/lsp/manager.go` |
 | Web UI | `web/` |
 | Pre-push hook | `.githooks/pre-push` |
