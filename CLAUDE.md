@@ -187,6 +187,20 @@ the shared-workspace git-safety clause already in your prompt:
   before running anything that writes — don't assume `--cwd` alone is
   enough, and don't trust your own past invocation was isolated
   without re-checking the real global config file afterward.
+- **`CRUSH_GLOBAL_DATA` isolates only ONE of two real config paths.**
+  This machine (and likely any dev machine that's run `crush` outside
+  a container) also has a SEPARATE real config file reached via
+  `GlobalConfig()` (gated by `CRUSH_GLOBAL_CONFIG`/`XDG_CONFIG_HOME`,
+  not `CRUSH_GLOBAL_DATA`) — found to hold the live provider API key
+  and MCP server definitions, distinct from the `GlobalConfigData()`
+  path the bullet above covers. Setting `CRUSH_GLOBAL_DATA` alone
+  still leaks real credentials/MCP config into a "manually isolated"
+  run. For genuine isolation, set BOTH `CRUSH_GLOBAL_DATA` and
+  `CRUSH_GLOBAL_CONFIG` to throwaway directories, or better, put test
+  config in a project-local `crush.json` instead of relying on either
+  global path — `GlobalConfigData()`'s target behaves as an
+  app-managed scratch file the app itself can rewrite/clear between
+  runs, not a stable place to seed test state.
 
 ## Quick Reference — Where Things Live
 
