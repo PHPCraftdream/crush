@@ -16,6 +16,7 @@ import (
 	"charm.land/fantasy/providers/bedrock"
 	"charm.land/fantasy/providers/openai"
 	"charm.land/fantasy/providers/openaicompat"
+	"github.com/charmbracelet/crush/internal/agent/tools"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/session"
@@ -1331,4 +1332,113 @@ func TestBuildAgentModels_WorkerPreference(t *testing.T) {
 		assert.Equal(t, "large-provider", large.ModelCfg.Provider)
 		assert.Equal(t, "large-model", large.ModelCfg.Model)
 	})
+}
+
+// TestBuildTools_CoderHasAskQuestion is a regression test for a wiring bug
+// where tools.NewAskQuestionTool() was constructed in buildTools but
+// "ask_question" was never added to allToolNames(), so the AllowedTools
+// filter in buildTools silently dropped it for every agent (including the
+// top-level coder). The tool object existed and its own unit tests passed,
+// and the exit_reason "awaiting_answer" plumbing tested fine in isolation,
+// but the two were never wired together end to end — the model could never
+// see the tool. This test goes through the real buildTools/AllowedTools
+// path (unlike ask_question_test.go, which only constructs the tool
+// directly) so it fails if the wiring regresses again.
+func TestBuildTools_CoderHasAskQuestion(t *testing.T) {
+	env := testEnv(t)
+	cfg, err := config.Init(env.workingDir, "", false)
+	require.NoError(t, err)
+
+	registerProvider := func(providerID, modelID string) config.SelectedModel {
+		cfg.Config().Providers.Set(providerID, config.ProviderConfig{
+			ID:   providerID,
+			Type: openai.Name,
+			Models: []catwalk.Model{
+				{ID: modelID},
+			},
+		})
+		return config.SelectedModel{Provider: providerID, Model: modelID}
+	}
+	cfg.Config().Models[config.SelectedModelTypeLarge] = registerProvider("large-provider", "large-model")
+	cfg.Config().Models[config.SelectedModelTypeSmall] = registerProvider("small-provider", "small-model")
+
+	coord := &coordinator{
+		cfg:         cfg,
+		sessions:    env.sessions,
+		messages:    env.messages,
+		permissions: env.permissions,
+		history:     env.history,
+		filetracker: *env.filetracker,
+	}
+
+	coderCfg, ok := cfg.Config().Agents[config.AgentCoder]
+	require.True(t, ok, "coder agent must be configured")
+	require.Contains(t, coderCfg.AllowedTools, tools.AskQuestionToolName,
+		"allToolNames() must include ask_question or the coder agent will never be allowed to use it")
+
+	built, err := coord.buildTools(t.Context(), coderCfg, false)
+	require.NoError(t, err)
+
+	names := make([]string, 0, len(built))
+	for _, tool := range built {
+		names = append(names, tool.Info().Name)
+	}
+	assert.Contains(t, names, tools.AskQuestionToolName,
+		"buildTools must return ask_question for the top-level coder agent, not silently drop it in the AllowedTools filter")
+}
+
+// TestAllToolNames_CoversUnconditionallyBuiltTools is a guard against this
+// entire class of bug in the future: buildTools constructs a fixed slice of
+// tools unconditionally (everything except the "agent" and "agentic_fetch"
+// tools, which are gated on AllowedTools before construction), and then
+// filters ALL of allTools through slices.Contains(agent.AllowedTools, ...).
+// If a tool is added to that unconditional-construction list in buildTools
+// but its name is never added to allToolNames() (internal/config/config.go),
+// it is built and then silently discarded for every agent, exactly like
+// ask_question was. This test enumerates the same set of tool names
+// buildTools unconditionally constructs and asserts each one is present in
+// the coder agent's resolved AllowedTools, which -- with no DisabledTools
+// configured -- is exactly allToolNames() (see
+// resolveAllowedTools/SetupAgents in internal/config/config.go). We go
+// through Agents[AgentCoder].AllowedTools rather than calling allToolNames()
+// directly because that function is unexported to internal/config.
+func TestAllToolNames_CoversUnconditionallyBuiltTools(t *testing.T) {
+	// Mirrors the unconditional append(...) block in coordinator.go's
+	// buildTools (currently lines ~1358-1377) that runs regardless of
+	// agent.AllowedTools. Keep in sync with that block: if a tool is added
+	// there, add its name here too, and this test will catch the case
+	// where allToolNames() itself wasn't updated to match.
+	unconditionallyBuilt := []string{
+		tools.AskQuestionToolName,
+		"bash",
+		"crush_info",
+		"crush_logs",
+		"job_output",
+		"job_kill",
+		"download",
+		"edit",
+		"multiedit",
+		"fetch",
+		"glob",
+		"grep",
+		"ls",
+		"sourcegraph",
+		"todos",
+		"view",
+		"write",
+	}
+
+	env := testEnv(t)
+	cfg, err := config.Init(env.workingDir, "", false)
+	require.NoError(t, err)
+
+	coderCfg, ok := cfg.Config().Agents[config.AgentCoder]
+	require.True(t, ok, "coder agent must be configured")
+	require.Empty(t, cfg.Config().Options.DisabledTools,
+		"test assumes no DisabledTools so AllowedTools == allToolNames() verbatim")
+
+	for _, name := range unconditionallyBuilt {
+		assert.Contains(t, coderCfg.AllowedTools, name,
+			"tool %q is unconditionally constructed by buildTools but missing from allToolNames(); it will be silently dropped by the AllowedTools filter for every agent", name)
+	}
 }

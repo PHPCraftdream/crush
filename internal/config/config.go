@@ -757,6 +757,7 @@ const maxRecentModelsPerType = 5
 func allToolNames() []string {
 	return []string{
 		"agent",
+		"ask_question",
 		"bash",
 		"crush_info",
 		"crush_logs",
@@ -788,6 +789,16 @@ func resolveAllowedTools(allTools []string, disabledTools []string) []string {
 }
 
 func resolveReadOnlyTools(tools []string) []string {
+	// Deliberately excludes "ask_question": this list feeds the read-only
+	// task sub-agent, and a sub-agent's ask_question call is currently
+	// collapsed by runSubAgent's error path into a generic "Failed to
+	// generate response: ..." text error (internal/agent/coordinator.go) --
+	// a confusing degraded UX with no working round-trip back to the
+	// caller. Giving the sub-agent ask_question belongs together with a
+	// proper worker toolset and a fix that frames a sub-agent question
+	// correctly for its caller; granting it here would ship the broken
+	// interim behavior for no benefit. See
+	// docs/plans/2026-07-26-orchestrator-worker-e2e.md (BUG-2, phase 3).
 	readOnlyTools := []string{"glob", "grep", "ls", "sourcegraph", "view"}
 	// filter to only include tools that are in allowedtools (include mode)
 	return filterSlice(tools, readOnlyTools, true)
