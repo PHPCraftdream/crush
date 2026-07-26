@@ -1377,6 +1377,26 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	if peakErr := getPeakHoursAbortErr(); peakErr != nil {
 		err = peakErr
 	}
+	// The ask_question tool reports "agent asked a question" as the Go
+	// error its Run() returns; fantasy's executeSingleTool treats a
+	// non-nil tool error as critical and propagates it as the whole
+	// Stream() call's error, so it surfaces here exactly like the
+	// peak-hours abort err normalized just above. tools.AskQuestionError
+	// (package tools) exists only because package tools cannot import
+	// this package back (this package already imports tools — see the
+	// comment on AskQuestionError in ask_question.go for the full import
+	// cycle rationale); normalize it into AwaitingAnswerError here so
+	// every downstream consumer — the errors.As(err, &awaitingErr) branch
+	// immediately below, RunNonInteractive's exit_reason mapping, sessions
+	// why/diff, … — only ever has to know about the one agent-level type.
+	var askErr *tools.AskQuestionError
+	if errors.As(err, &askErr) {
+		err = &AwaitingAnswerError{
+			Question:  askErr.Question,
+			Options:   askErr.Options,
+			SessionID: askErr.SessionID,
+		}
+	}
 	if err != nil {
 		isHyper := largeModel.ModelCfg.Provider == hyper.Name
 		isCancelErr := errors.Is(err, context.Canceled)

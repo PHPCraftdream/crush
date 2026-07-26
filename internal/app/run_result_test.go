@@ -93,6 +93,77 @@ func TestBuildRunResult_AgentErrRequestCancelledIsHandledByCaller(t *testing.T) 
 	assert.Empty(t, r.Error)
 }
 
+// TestBuildRunResult_AwaitingAnswer verifies that an *agent.AwaitingAnswerError
+// (the ask_question tool's turn-stop error, surfaced as runErr) maps to
+// exit_reason "awaiting_answer" — NOT the generic "error" that
+// message.FinishReasonError would otherwise produce — and that the Error
+// field carries the already-recorded title+details (question + full
+// AwaitingAnswerGuidance, including the resume command) verbatim rather
+// than the terser err.Error().
+func TestBuildRunResult_AwaitingAnswer(t *testing.T) {
+	awaitingErr := &agent.AwaitingAnswerError{
+		Question:  "Which environment should I deploy to?",
+		Options:   []string{"staging", "production"},
+		SessionID: "sess-1",
+	}
+	title := "Stopped: agent asked a question and is awaiting an answer"
+	details := awaitingErr.Error() + "\n\nQUESTION: Which environment should I deploy to?\n\ncrush run --session sess-1 \"<your answer>\""
+
+	// finalReason mirrors what agent.go's AddFinish actually records for
+	// this path: message.FinishReasonError, because there is no dedicated
+	// FinishReason for "awaiting answer" — see AddFinish in the awaitingErr
+	// branch of agent.go.
+	r := buildRunResult(
+		"sess-1", "", "", "error", awaitingErr, false,
+		nil, 0, 0, 0,
+		title, details,
+		0, "", "",
+		nil, "",
+	)
+	assert.Equal(t, "awaiting_answer", r.ExitReason, "must not fall through to the generic error reason")
+	assert.Contains(t, r.Error, title)
+	assert.Contains(t, r.Error, "Which environment should I deploy to?")
+	assert.Contains(t, r.Error, "crush run --session sess-1")
+}
+
+// TestBuildRunResult_AwaitingAnswer_NoFanoutOrEmptyWarning verifies the
+// awaiting_answer path is excluded from the "final_text is empty" warnings,
+// same as "error" and "canceled" — asking a question and stopping the turn
+// is a deliberate, successful stop, not a fan-out-without-composition bug.
+func TestBuildRunResult_AwaitingAnswer_NoFanoutOrEmptyWarning(t *testing.T) {
+	awaitingErr := &agent.AwaitingAnswerError{Question: "Proceed?", SessionID: "s"}
+	r := buildRunResult(
+		"s", "", "", "error", awaitingErr, false,
+		map[string]int{"agent": 2},
+		0, 0, 0,
+		"Stopped: agent asked a question and is awaiting an answer", "details",
+		0, "", "",
+		nil, "",
+	)
+	assert.Equal(t, "awaiting_answer", r.ExitReason)
+	for _, w := range r.Warnings {
+		assert.NotContains(t, w, "final_text is empty")
+	}
+}
+
+// TestBuildRunResult_AwaitingAnswer_FallsBackToErrErrorWhenFinishTextMissing
+// covers the defensive default branch: if for some reason finalErrTitle and
+// finalErrDetails are both empty (shouldn't happen given agent.go always
+// populates them via awaitingAnswerStoppedFinishText, but buildRunResult
+// must not silently produce an empty Error field either way).
+func TestBuildRunResult_AwaitingAnswer_FallsBackToErrErrorWhenFinishTextMissing(t *testing.T) {
+	awaitingErr := &agent.AwaitingAnswerError{Question: "Proceed?", SessionID: "s"}
+	r := buildRunResult(
+		"s", "", "", "error", awaitingErr, false,
+		nil, 0, 0, 0,
+		"", "",
+		0, "", "",
+		nil, "",
+	)
+	assert.Equal(t, "awaiting_answer", r.ExitReason)
+	assert.Equal(t, awaitingErr.Error(), r.Error)
+}
+
 // --- batch-7 additions: reduction warning + sub_agent_outputs --------
 
 // TestBuildRunResult_ReductionWarningAppended verifies the always-on

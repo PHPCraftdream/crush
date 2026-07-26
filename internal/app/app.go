@@ -352,6 +352,24 @@ func buildRunResult(sessionID, finalText, assistantNotes, finalReason string, er
 			reason = "unknown"
 		}
 	}
+	// Fork patch (orchestrator UX): the ask_question tool force-finishes
+	// the turn with message.FinishReasonError (see AddFinish in agent.go's
+	// awaitingErr branch) — there is no separate FinishReason for it, so
+	// finalReason/reason land on the generic "error" above just like a
+	// provider hiccup would. That is misleading: an orchestrator scripting
+	// against exit_reason needs to tell "the agent is waiting on you" apart
+	// from "the run genuinely broke" so it doesn't retry a question as if
+	// it were a transient failure — same rationale that could justify a
+	// dedicated "peak_hours" value, which does not exist yet either; this
+	// is intentionally the first such carve-out. Re-derive it from the
+	// underlying err (not from parsing the Finish text) so this stays
+	// correct even if the wording in question_stop.go changes later.
+	isAwaitingAnswer := false
+	var awaitingErr *agent.AwaitingAnswerError
+	if errors.As(err, &awaitingErr) {
+		reason = "awaiting_answer"
+		isAwaitingAnswer = true
+	}
 	calls := make([]toolCallStat, 0, len(toolCounts))
 	for name, count := range toolCounts {
 		calls = append(calls, toolCallStat{Name: name, Count: count})
@@ -369,7 +387,7 @@ func buildRunResult(sessionID, finalText, assistantNotes, finalReason string, er
 	// the actual content sits in the sub-session DB rows the orchestrator
 	// can't easily see. Telling them to either prompt for a wrap-up
 	// summary or fetch the sub-session data explicitly.
-	if reason != "error" && reason != "canceled" && strings.TrimSpace(finalText) == "" {
+	if reason != "error" && reason != "canceled" && reason != "awaiting_answer" && strings.TrimSpace(finalText) == "" {
 		fanoutCalls := toolCounts["agent"] + toolCounts["agentic_fetch"]
 		if fanoutCalls > 0 {
 			warnings = append(warnings, fmt.Sprintf(
@@ -392,6 +410,26 @@ func buildRunResult(sessionID, finalText, assistantNotes, finalReason string, er
 	}
 	errMsg := ""
 	switch {
+	case isAwaitingAnswer:
+		// finalErrTitle/finalErrDetails are exactly what agent.go's
+		// awaitingErr branch already wrote onto the Finish part via
+		// awaitingAnswerStoppedFinishText — title is the short headline,
+		// details is err.Error() plus the full AwaitingAnswerGuidance
+		// (question, options, and the ready-to-run `crush run --session
+		// <id> "<answer>"` resume command). Reuse it verbatim instead of
+		// falling through to the bare err.Error() the next case would use,
+		// so the orchestrator sees the resume command without having to
+		// re-query the session.
+		switch {
+		case finalErrTitle != "" && finalErrDetails != "":
+			errMsg = finalErrTitle + ": " + finalErrDetails
+		case finalErrTitle != "":
+			errMsg = finalErrTitle
+		case finalErrDetails != "":
+			errMsg = finalErrDetails
+		default:
+			errMsg = err.Error()
+		}
 	case err != nil && !canceled:
 		errMsg = err.Error()
 	case reason == "error":
