@@ -431,18 +431,16 @@ ATOMS (combine as `crush models use <large> <small>`):
 ```
 
 Anthropic atoms require a level suffix (`opus-high`, `sonnet-low`, etc.) —
-the level list comes from parsing `claude --help` at first use, so it stays
-correct as Anthropic adds tiers.
+the level list comes from parsing `claude --help` at first use (falls back
+to a static `low/medium/high/xhigh/max` list if parsing fails).
 
-Z.AI atoms are **not** all effort-less: per Z.AI's own API docs, only
-**GLM-5.2** (`glm5_2`) has real graduated `reasoning_effort` support — a
-7-value scale (`none|minimal|low|medium|high|xhigh|max`, plus a fork-added
-`off` to fully disable thinking) settable via the long-form suffix
-(`glm5_2-max`) or raw `zai/glm-5.2@max`. Every *other* Z.AI/GLM model
-(5.1, 5, 5-turbo, 4.7, 4.6, ...) only exposes a boolean thinking toggle
-(`off`/`on`) — not "no effort concept at all", just not graduated. Both
-forms are validated against the atom's real levels; `crush models efforts
-<model>` prints the exact list and commands for any specific model.
+Z.AI atoms are **not** all effort-less: **GLM-5.2** (`glm5_2`) has 3 real
+wire states (`off`/`high`/`max`) settable via the long-form suffix
+(`glm5_2-max`) or raw `zai/glm-5.2@max` — one more than every *other*
+Z.AI/GLM model (5.1, 5, 5-turbo, 4.7, 4.6, ...), which exposes only a
+boolean thinking toggle (`off`/`on`). Both forms are validated against the
+atom's real levels; `crush models efforts <model>` prints the exact list
+and commands for any specific model.
 
 ```bash
 crush models use opus-high glm5_turbo                # mixed Anthropic large + Z.AI small

@@ -404,18 +404,26 @@ func TestValidateEffortForModel_KnownAtomAcceptsRealLevel(t *testing.T) {
 }
 
 // TestValidateEffortForModel_GLM52AcceptsGraduatedLevel confirms GLM-5.2
-// specifically validates against its OWN, larger documented vocabulary
-// (per Z.AI's API docs, it is the only Z.AI model with real graduated
-// reasoning_effort support) — including "off" (a fork-level addition for
-// fully disabling thinking, not part of Z.AI's reasoning_effort enum itself;
-// see the comment on zaiReasoningLevels in models_atoms.go).
+// specifically validates against its OWN, larger vocabulary (3 real wire
+// states: off/high/max — one more than every other Z.AI atom's off/on).
+// A wider Z.AI-documented value like "xhigh" is deliberately NOT accepted:
+// this fork's coordinator.go collapses it to the same "max" wire value as
+// an explicit "max", so it isn't a meaningful, distinct level to expose.
+// See the comment on zaiReasoningLevels in models_atoms.go.
 func TestValidateEffortForModel_GLM52AcceptsGraduatedLevel(t *testing.T) {
-	for _, level := range []string{"off", "none", "minimal", "low", "medium", "high", "xhigh", "max"} {
+	for _, level := range []string{"off", "high", "max"} {
 		assert.NoError(t, validateEffortForModel("zai", "glm-5.2", level), "level %q", level)
 	}
 	// "on" is a glm4_7_flash-style boolean value, not part of glm-5.2's
-	// graduated vocabulary — must still be rejected for glm-5.2.
+	// vocabulary — must still be rejected for glm-5.2.
 	err := validateEffortForModel("zai", "glm-5.2", "on")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not a valid effort level")
+
+	// "xhigh" is part of Z.AI's own documented reasoning_effort enum but
+	// collapses to "max" on the wire — no longer accepted as a distinct
+	// glm5_2 level (deliberately stricter than before this task).
+	err = validateEffortForModel("zai", "glm-5.2", "xhigh")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not a valid effort level")
 }

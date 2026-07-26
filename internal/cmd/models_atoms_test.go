@@ -18,16 +18,16 @@ func noopResolve(s string) (string, string, error) {
 
 // TestAtom_ZAIHasReasoningLevels verifies every Z.AI atom carries a real,
 // declared levels array (not just prose describing them) — the core of this
-// task. Per Z.AI's own API docs (docs.z.ai/api-reference/llm/chat-completion),
-// reasoning_effort is "Only supported by GLM-5.2" — so glm5_2 alone gets the
-// full graduated 8-value set (the documented 7-value reasoning_effort enum
-// plus "off", a fork-level addition for fully disabling thinking), and
-// every other Z.AI atom gets the boolean thinking-toggle-only array. Also
-// checks atom.Levels() surfaces each.
+// task. coordinator.go only ever sends one of THREE wire values for any
+// Z.AI model (thinking disabled, reasoning_effort="high", or "max"), so
+// glm5_2 gets exactly those three real states ("off","high","max") rather
+// than Z.AI's wider documented-but-unproduced 7-value reasoning_effort
+// enum, and every other Z.AI atom gets the boolean thinking-toggle-only
+// array. Also checks atom.Levels() surfaces each.
 func TestAtom_ZAIHasReasoningLevels(t *testing.T) {
 	a, ok := atomRegistry["glm5_2"]
 	require.True(t, ok)
-	assert.Equal(t, []string{"off", "none", "minimal", "low", "medium", "high", "xhigh", "max"}, a.ReasoningLevels)
+	assert.Equal(t, []string{"off", "high", "max"}, a.ReasoningLevels)
 	assert.Nil(t, a.EffortSource, "Z.AI atom glm5_2 must not use the CLI-shelling EffortSource")
 	assert.Equal(t, a.ReasoningLevels, a.Levels())
 
@@ -130,15 +130,32 @@ func TestParseAtom_ZAIAcceptsKnownLevel(t *testing.T) {
 }
 
 // TestParseAtom_ZAI52AcceptsGraduatedLevel proves glm5_2 specifically
-// validates against its own, larger documented vocabulary (per Z.AI's docs,
-// GLM-5.2 is the only model with real graduated reasoning_effort) — a level
-// like "xhigh" that would be invalid for glm5_1 is valid here.
+// validates against its own, larger vocabulary — a level like "max" that
+// would be invalid for glm5_1 (off/on only) is valid here.
 func TestParseAtom_ZAI52AcceptsGraduatedLevel(t *testing.T) {
-	sm, err := parseAtom("glm5_2-xhigh")
+	sm, err := parseAtom("glm5_2-max")
 	require.NoError(t, err)
 	assert.Equal(t, "zai", sm.Provider)
 	assert.Equal(t, "glm-5.2", sm.Model)
-	assert.Equal(t, "xhigh", sm.ReasoningEffort)
+	assert.Equal(t, "max", sm.ReasoningEffort)
+}
+
+// TestParseAtom_ZAI52RejectsWiderVendorVocabulary proves the deliberate,
+// stricter-than-before behavior this task introduces: "xhigh" (and
+// similarly none/minimal/low/medium) is part of Z.AI's own documented
+// reasoning_effort enum, but this fork's coordinator.go collapses all of
+// those to the same "high" wire value as an unset effort — so they are no
+// longer accepted as distinct glm5_2 levels. Only the three levels that
+// produce genuinely different wire behavior (off/high/max) are valid now.
+func TestParseAtom_ZAI52RejectsWiderVendorVocabulary(t *testing.T) {
+	for _, level := range []string{"xhigh", "none", "minimal", "low", "medium"} {
+		t.Run(level, func(t *testing.T) {
+			_, err := parseAtom("glm5_2-" + level)
+			require.Error(t, err)
+			assert.Contains(t, strings.ToLower(err.Error()), "not a valid level")
+			assert.Contains(t, err.Error(), "off|high|max")
+		})
+	}
 }
 
 // TestParseAtom_ZAITypoRejected proves the exact gap the task description

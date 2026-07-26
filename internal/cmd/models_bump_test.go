@@ -66,7 +66,7 @@ func TestModelsBump_GLM52FullStepUp(t *testing.T) {
 	_, runErr := runModelsCmd(t, modelsUseCmd, "glm4_7_flash-off", "glm5_turbo", "--reviewer", "glm5_2-off")
 	require.NoError(t, runErr)
 
-	levels := []string{"off", "none", "minimal", "low", "medium", "high", "xhigh", "max"}
+	levels := []string{"off", "high", "max"}
 	for i := 1; i < len(levels); i++ {
 		resetModelsBumpFlags(t)
 		_, runErr := runModelsCmd(t, modelsBumpCmd, "reviewer", "up")
@@ -106,7 +106,7 @@ func TestModelsBump_GLM52FullStepDown(t *testing.T) {
 	_, runErr := runModelsCmd(t, modelsUseCmd, "glm4_7_flash-on", "glm5_turbo", "--reviewer", "glm5_2-max")
 	require.NoError(t, runErr)
 
-	levels := []string{"off", "none", "minimal", "low", "medium", "high", "xhigh", "max"}
+	levels := []string{"off", "high", "max"}
 	for i := len(levels) - 2; i >= 0; i-- {
 		resetModelsBumpFlags(t)
 		_, runErr := runModelsCmd(t, modelsBumpCmd, "reviewer", "down")
@@ -257,9 +257,9 @@ func TestModelsBump_NonAtomModel_ReportsCleanly(t *testing.T) {
 // works uniformly across all four role slots. large/small use
 // glm4_7_flash (boolean off/on — resolves reliably in this harness, see the
 // note on TestModelsBump_GLM52FullStepUp); worker/reviewer use glm5_2's
-// graduated low->medium step, since worker/reviewer are read directly from
-// cfg.Models without going through the large/small default-substitution path
-// that makes glm-5.2 unreliable for THOSE two slots specifically in this
+// high->max step, since worker/reviewer are read directly from cfg.Models
+// without going through the large/small default-substitution path that
+// makes glm-5.2 unreliable for THOSE two slots specifically in this
 // harness.
 func TestModelsBump_AllFourRoles(t *testing.T) {
 	tests := []struct {
@@ -269,8 +269,8 @@ func TestModelsBump_AllFourRoles(t *testing.T) {
 	}{
 		{"large", "glm4_7_flash-off", `"on"`},
 		{"small", "glm4_7_flash-off", `"on"`},
-		{"worker", "glm5_2-low", `"medium"`},
-		{"reviewer", "glm5_2-low", `"medium"`},
+		{"worker", "glm5_2-high", `"max"`},
+		{"reviewer", "glm5_2-high", `"max"`},
 	}
 	for _, tc := range tests {
 		t.Run(tc.role, func(t *testing.T) {
@@ -316,7 +316,7 @@ func TestModelsBump_WritePersists_RawFileContent(t *testing.T) {
 	globalPath := setupBumpEnv(t)
 
 	resetModelsUseFlags(t)
-	_, runErr := runModelsCmd(t, modelsUseCmd, "glm4_7_flash-off", "glm5_turbo", "--reviewer", "glm5_2-low")
+	_, runErr := runModelsCmd(t, modelsUseCmd, "glm4_7_flash-off", "glm5_turbo", "--reviewer", "glm5_2-high")
 	require.NoError(t, runErr)
 
 	resetModelsBumpFlags(t)
@@ -328,8 +328,8 @@ func TestModelsBump_WritePersists_RawFileContent(t *testing.T) {
 	content := string(data)
 	assert.Contains(t, content, `"reviewer"`)
 	assert.Contains(t, content, `"glm-5.2"`)
-	assert.Contains(t, content, `"medium"`)
-	assert.NotContains(t, content, `"low"`, "the old effort value should no longer be present for reviewer after the bump")
+	assert.Contains(t, content, `"max"`)
+	assert.NotContains(t, content, `"high"`, "the old effort value should no longer be present for reviewer after the bump")
 }
 
 // TestModelsBump_InvalidRole_RejectedCleanly confirms cobra-level arg

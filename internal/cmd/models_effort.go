@@ -12,6 +12,10 @@ import (
 	"github.com/charmbracelet/crush/internal/platform"
 )
 
+// defaultEffortLevels is the fallback used when the regex below fails to
+// match `claude --help` output (binary missing, or Anthropic changes the
+// help format again). With the current regex, these 5 values also match
+// what the real CLI's --help documents today — this is not just a guess.
 var defaultEffortLevels = []string{"low", "medium", "high", "xhigh", "max"}
 
 type cliEffortSource struct {
@@ -65,10 +69,19 @@ func (s *cliEffortSource) FormatLevels() string {
 	return strings.Join(levels, "|")
 }
 
+// Regex note: the real `claude --help` output (confirmed live, this fork's
+// dev session) wraps the value list onto its own line, e.g.:
+//
+//	--effort <level>                      Effort level for the current session
+//	                                      (low, medium, high, xhigh, max)
+//
+// The `(?s)` flag lets `.` cross that line break; `.*?` is non-greedy so it
+// stops at the FIRST `)` rather than bleeding into a later flag's own
+// parenthesized text.
 var claudeEffortSource = &cliEffortSource{
 	Binary:  "claude",
 	HelpArg: "--help",
-	Regex:   `--effort\s+\S+\s+\S.*?\(([^)]+)\)`,
+	Regex:   `(?s)--effort\s+<level>.*?\(([^)]+)\)`,
 }
 
 func resetEffortCache() {

@@ -27,12 +27,11 @@ func TestRenderEffortsOverview_NoArg(t *testing.T) {
 	assert.Contains(t, out, "ASYMMETRY")
 	assert.Contains(t, out, "local-cli/")
 	assert.Contains(t, out, "`glm5_2xx`")
-	assert.Contains(t, out, "has no letter short code for effort")
+	assert.Contains(t, out, "no letter\nshort code for effort")
 
 	// Z.AI collapsing — the single most surprising fact.
 	assert.Contains(t, out, "Z.AI")
 	assert.Contains(t, out, `unset, low, medium, high     -> reasoning_effort: "high"`)
-	assert.Contains(t, out, "indistinguishable from high")
 	// Z.AI now has a real, validated levels array + long-form atom suffix.
 	assert.Contains(t, out, "glm5_2-max")
 	assert.Contains(t, out, "validated")
@@ -56,7 +55,6 @@ func TestRenderEffortsForModel_ZAI(t *testing.T) {
 
 	assert.Contains(t, out, "GLM 5.2")
 	assert.Contains(t, out, "zai/glm-5.2")
-	assert.Contains(t, out, "indistinguishable from high")
 	assert.Contains(t, out, `unset, low, medium, high     -> reasoning_effort: "high"`)
 	assert.Contains(t, out, "xhigh, max, ultracode        -> reasoning_effort: \"max\"")
 
@@ -64,14 +62,18 @@ func TestRenderEffortsForModel_ZAI(t *testing.T) {
 	assert.Contains(t, out, "crush models use zai/glm-5.2@<level> <small>")
 	assert.Contains(t, out, "crush models use zai/glm-5.2@off <small>")
 	assert.Contains(t, out, "crush models use zai/glm-5.2@max <small>")
+	// "high" is glm5_2's third real state — must be rendered too, and no
+	// wider vendor-only vocabulary (e.g. "xhigh") should appear as a settable row.
+	assert.Contains(t, out, "crush models use zai/glm-5.2@high <small>")
+	assert.NotContains(t, out, "crush models use zai/glm-5.2@xhigh <small>")
 
 	// New behavior for this task: the long-form atom suffix (validated,
 	// same mechanism as Claude atoms) is now also offered and the output
 	// says both forms are validated against the real levels array — not
 	// left as an unvalidated blind string split.
 	assert.Contains(t, out, "crush models use glm5_2-<level> <small>")
-	assert.Contains(t, out, "validated")
-	assert.Contains(t, out, "known atom")
+	assert.Contains(t, out, "Validated")
+	assert.Contains(t, out, "3 real states")
 }
 
 // TestRenderEffortsForModel_ZAI_LevelsFromRealArray proves the rendered
@@ -93,7 +95,7 @@ func TestRenderEffortsForModel_ZAI_RawProviderModel(t *testing.T) {
 	out, err := renderEffortsForModel("zai/glm-5.2")
 	require.NoError(t, err)
 	assert.Contains(t, out, "atom: glm5_2")
-	assert.Contains(t, out, "indistinguishable from high")
+	assert.Contains(t, out, `unset, low, medium, high     -> reasoning_effort: "high"`)
 }
 
 // TestRenderEffortsForModel_Claude verifies a Claude/local-cli model lookup

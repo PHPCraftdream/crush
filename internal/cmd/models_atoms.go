@@ -43,47 +43,24 @@ func (a atom) Levels() []string {
 	return a.ReasoningLevels
 }
 
-// zaiReasoningLevels is the real, meaningful effort-levels array for
-// GLM-5.2 specifically — the ONLY Z.AI model that officially supports the
-// `reasoning_effort` parameter at all, per Z.AI's own API reference
-// (docs.z.ai/api-reference/llm/chat-completion): "Controls the model's
-// reasoning effort level, takes effect when `thinking` is enabled. Default
-// is `max`. Only supported by `GLM-5.2`." The documented accepted values
-// for that parameter are exactly: max, xhigh, high, medium, low, minimal,
-// none. "off" is ADDED on top of that documented enum — it is not a
-// `reasoning_effort` value at all, it is the fork's own ReasoningEffort
-// vocabulary for fully disabling thinking (`thinking: {"type":"disabled"}`
-// in coordinator.go, a separate code path from reasoning_effort entirely).
-// It's included here because it's the only way, in the fork's own
-// vocabulary, to turn thinking off for GLM-5.2 — omitting it would make
-// `crush models efforts`/parseAtom wrongly reject a perfectly valid,
-// already-supported fork-level setting.
+// zaiReasoningLevels is GLM-5.2's effort-levels array. Z.AI's API docs
+// (docs.z.ai/api-reference/llm/chat-completion) document a 7-value
+// reasoning_effort enum for GLM-5.2, but this fork's coordinator.go (the
+// `case string(catwalk.InferenceProviderZAI):` branch of getProviderOptions,
+// ~line 1140) only ever sends one of THREE wire values for any Z.AI model:
+// thinking disabled, reasoning_effort="high", or reasoning_effort="max".
+// This array is deliberately restricted to those three real, distinct
+// outcomes ("off", "high", "max") rather than the wider vendor-documented
+// vocabulary — a level this fork can't actually produce on the wire isn't a
+// meaningful thing to let a user select. GLM-5.2 still has one more real
+// state than the other Z.AI atoms (zaiBooleanThinkingLevels' off/on): "max"
+// as a distinct target from "high".
 //
-// SYNC WARNING: this list restates the `case string(catwalk.InferenceProviderZAI):`
-// branch of internal/agent/coordinator.go's getProviderOptions (~line 1140)
-// — the SAME fact already documented in prose by providerEffortDocs in
-// models_efforts.go (SYNC WARNING there too). All three of these — the wire
-// mapping in coordinator.go, the prose in models_efforts.go, and this array
-// — must describe the same behavior. If you change coordinator.go's
-// mapping, update both of the other two.
-//
-// IMPORTANT ASYMMETRY vs. coordinator.go's current runtime behavior: the
-// fork's coordinator.go code (deliberately out of scope for this task —
-// see CLAUDE.md/the task spec, not touched here) sends `reasoning_effort`
-// to EVERY zai-routed model uniformly, collapsing the fork's own
-// ReasoningEffort vocabulary (low/medium/high/xhigh/max/off/ultracode) down
-// to just "high"/"max"/disabled on the wire, regardless of which specific
-// GLM model is targeted. That is a fork-level simplification, not a
-// contradiction of Z.AI's docs — coordinator.go's comment even notes
-// "Older GLM-4.x ignore the field harmlessly" (i.e. it's sent but not
-// documented as meaningful for those models). This array intentionally
-// tracks Z.AI's DOCUMENTED per-model support matrix (glm5_2 real, others
-// boolean-only — see zaiBooleanThinkingLevels below) rather than
-// coordinator.go's simplified "same wire payload for every zai model"
-// behavior, since the documented atom-level validation added by this task
-// should reflect API truth, not just "what coordinator.go happens to also
-// accept without erroring."
-var zaiReasoningLevels = []string{"off", "none", "minimal", "low", "medium", "high", "xhigh", "max"}
+// SYNC WARNING: kept in sync with coordinator.go's switch and with
+// providerEffortDocs in models_efforts.go — all three must describe the
+// same three wire states. If you change coordinator.go's mapping, update
+// both of the other two.
+var zaiReasoningLevels = []string{"off", "high", "max"}
 
 // zaiBooleanThinkingLevels is the levels array for every Z.AI (GLM) atom
 // OTHER than GLM-5.2. Per Z.AI's docs, these models only expose the boolean
@@ -121,11 +98,11 @@ var atomRegistry = map[string]atom{
 	// in `crush models efforts`) — effort is set via the raw
 	// `zai/glm-5.2@max` syntax instead.
 	//
-	// Only glm5_2 gets the real graduated zaiReasoningLevels array — per
-	// Z.AI's own API docs, `reasoning_effort` is "Only supported by GLM-5.2"
-	// among current Z.AI models; glm5_1/glm5/glm5_turbo below get
-	// zaiBooleanThinkingLevels (documented as boolean thinking-toggle only,
-	// no graduated effort) instead. See the SYNC WARNING on zaiReasoningLevels.
+	// Only glm5_2 gets zaiReasoningLevels (off/high/max); glm5_1/glm5/
+	// glm5_turbo below get zaiBooleanThinkingLevels (off/on toggle) instead
+	// — coordinator.go sends the same reasoning_effort wire value to every
+	// Z.AI model uniformly, but only GLM-5.2 is documented by Z.AI as acting
+	// on it. See the SYNC WARNING on zaiReasoningLevels.
 	"glm5_2":     {Provider: "zai", Model: "glm-5.2", DisplayName: "GLM 5.2", CtxLabel: "1M", Group: "zai", ReasoningLevels: zaiReasoningLevels},
 	"glm5_1":     {Provider: "zai", Model: "glm-5.1", DisplayName: "GLM 5.1", CtxLabel: "200k", Group: "zai", ReasoningLevels: zaiBooleanThinkingLevels},
 	"glm5":       {Provider: "zai", Model: "glm-5", DisplayName: "GLM 5", CtxLabel: "200k", Group: "zai", ReasoningLevels: zaiBooleanThinkingLevels},
