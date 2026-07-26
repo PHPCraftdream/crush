@@ -11,45 +11,29 @@ func TestDeriveDevVersion(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name     string
-		baseTag  string
 		revision string
 		want     string
 	}{
 		{
 			name:     "no vcs info keeps default",
-			baseTag:  "",
 			revision: "",
 			want:     "",
 		},
 		{
-			name:     "clean commit is shortened without base tag",
-			baseTag:  "",
+			name:     "clean commit is shortened",
 			revision: "06c807842604abcdef1234567890abcdef123456",
 			want:     "06c8078-" + forkBaseVersion,
 		},
 		{
-			name:     "base tag is prepended when present",
-			baseTag:  "v0.72.1",
-			revision: "06c807842604abcdef1234567890abcdef123456",
-			want:     "v0.72.1-06c8078-" + forkBaseVersion,
-		},
-		{
 			name:     "short revision is not truncated further",
-			baseTag:  "",
 			revision: "abc1234",
 			want:     "abc1234-" + forkBaseVersion,
-		},
-		{
-			name:     "base tag prepended even with short revision",
-			baseTag:  "v0.80.0",
-			revision: "deadbeef",
-			want:     "v0.80.0-deadbee-" + forkBaseVersion,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			require.Equal(t, tt.want, deriveDevVersion(tt.baseTag, tt.revision))
+			require.Equal(t, tt.want, deriveDevVersion(tt.revision))
 		})
 	}
 }
@@ -64,33 +48,11 @@ func TestDeriveDevVersionNoDevelOrDirtyMarker(t *testing.T) {
 	// deriveDevVersion no longer takes a modified flag at all; the only way to
 	// distinguish clean vs dirty would be a separate parameter, which we do not
 	// pass. Both cases must produce the exact same string.
-	clean := deriveDevVersion("", "06c807842604abcdef1234567890abcdef123456")
+	clean := deriveDevVersion("06c807842604abcdef1234567890abcdef123456")
 	require.Equal(t, "06c8078-"+forkBaseVersion, clean)
 	require.NotContains(t, clean, "dirty")
 	require.NotContains(t, clean, "modified")
 	require.NotContains(t, clean, "devel")
-}
-
-func TestExtractBaseTag(t *testing.T) {
-	t.Parallel()
-	tests := []struct {
-		name string
-		in   string
-		want string
-	}{
-		{name: "real base tag pseudo-version", in: "v0.72.1-0.20260628185628-e47711a0e3e4", want: "v0.72.1"},
-		{name: "real base tag pseudo-version with dirty", in: "v0.72.1-0.20260628185628-e47711a0e3e4+dirty", want: "v0.72.1"},
-		{name: "v0.0.0 local pseudo-version has no recoverable base tag", in: "v0.0.0-20260705112643-90c57af7ca7a", want: ""},
-		{name: "plain devel string has no base tag", in: "(devel)", want: ""},
-		{name: "clean release version is not a pseudo-version", in: "v0.2.0", want: ""},
-		{name: "empty string", in: "", want: ""},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			require.Equal(t, tt.want, extractBaseTag(tt.in))
-		})
-	}
 }
 
 func TestReadVCS(t *testing.T) {
@@ -178,9 +140,10 @@ func TestResolveVersion(t *testing.T) {
 		{
 			// `go install pkg@version` where the module resolves to a
 			// pseudo-version built on top of a real upstream tag: the raw
-			// pseudo-version is rejected, but its base tag is extracted and
-			// prepended to the derived string.
-			name:       "go install pseudo-version extracts base tag prefix",
+			// pseudo-version is rejected, and no base-tag prefix is recovered
+			// or prepended — the derived string is always the bare
+			// "<hash>-<forkBaseVersion>" form.
+			name:       "go install pseudo-version produces bare derived version",
 			defaultVer: "devel", defaultCommit: "unknown",
 			info: &debug.BuildInfo{
 				Main: debug.Module{Version: "v0.72.1-0.20260628185628-e47711a0e3e4"},
@@ -189,12 +152,12 @@ func TestResolveVersion(t *testing.T) {
 					{Key: "vcs.modified", Value: "false"},
 				},
 			},
-			wantVersion: "v0.72.1-e47711a-" + forkBaseVersion,
+			wantVersion: "e47711a-" + forkBaseVersion,
 			wantCommit:  "e47711a0e3e4abcdef1234567890abcdef123456",
 		},
 		{
-			// Same path but the working tree was dirty at build time: the base
-			// tag is still extracted, and no "-dirty" marker is appended.
+			// Same path but the working tree was dirty at build time: still no
+			// base-tag prefix, and no "-dirty" marker is appended.
 			name:       "go install pseudo-version with dirty tree has no dirty marker",
 			defaultVer: "devel", defaultCommit: "unknown",
 			info: &debug.BuildInfo{
@@ -204,13 +167,14 @@ func TestResolveVersion(t *testing.T) {
 					{Key: "vcs.modified", Value: "true"},
 				},
 			},
-			wantVersion: "v0.72.1-e47711a-" + forkBaseVersion,
+			wantVersion: "e47711a-" + forkBaseVersion,
 			wantCommit:  "e47711a0e3e4abcdef1234567890abcdef123456",
 		},
 		{
 			// Local checkout builds can expose a v0.0.0 pseudo-version through
-			// BuildInfo. That pseudo-version has no recoverable base tag, so the
-			// derived dev string is tag-less, and no dirty marker is appended.
+			// BuildInfo. That pseudo-version never had a meaningful base tag
+			// anyway, so the derived dev string is tag-less, and no dirty
+			// marker is appended.
 			name:       "local v0.0.0 pseudo module version is treated as tagless dev",
 			defaultVer: "devel", defaultCommit: "unknown",
 			info: &debug.BuildInfo{
@@ -280,8 +244,8 @@ func TestUsableModuleVersion(t *testing.T) {
 		// Pseudo-version built on top of a real prior tag (no +dirty). This is
 		// the shape Go emits for a checkout whose nearest tag is a real release,
 		// e.g. v0.72.1-0.<timestamp>-<12-hex-commit>. Still ugly and unhelpful,
-		// so reject it from direct display — its base tag is recovered by
-		// extractBaseTag and prepended to the derived string instead.
+		// so reject it from direct display; its base tag is deliberately never
+		// recovered or shown (see deriveDevVersion).
 		{version: "v0.72.1-0.20260628185628-e47711a0e3e4", want: false},
 		// Same shape but with a +dirty marker.
 		{version: "v0.72.1-0.20260628185628-e47711a0e3e4+dirty", want: false},

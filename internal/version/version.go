@@ -75,28 +75,30 @@ func formatFullVersion(v, buildID string) string {
 }
 
 // Fork patch: this init() and its helpers (resolveVersion,
-// usableModuleVersion, extractBaseTag, readVCS, deriveDevVersion) diverge from
-// upstream. Upstream unconditionally overwrote Version with info.Main.Version;
-// the fork makes an ldflags-injected Version authoritative (release/npm builds
-// MUST win — see the "Verify" step in
-// .github/workflows/publish-fork-npm.yml) and only derives a value from
-// build metadata for un-injected local builds.
+// usableModuleVersion, readVCS, deriveDevVersion) diverge from upstream.
+// Upstream unconditionally overwrote Version with info.Main.Version; the fork
+// makes an ldflags-injected Version authoritative (release/npm builds MUST
+// win — see the "Verify" step in .github/workflows/publish-fork-npm.yml) and
+// only derives a value from build metadata for un-injected local builds.
 //
 // A user may install crush using `go install github.com/charmbracelet/crush@latest`
 // without -ldflags, in which case the version above is unset. As a workaround
 // we use the embedded build version that *is* set when using `go install` (and
 // is only set for `go install` and not for `go build`). For plain `go build`
-// from a checkout, that main version is "(devel)", so we additionally derive a
-// meaningful version from the VCS metadata the toolchain embeds
-// (vcs.revision) — this lets two local dev builds be told apart. When the
-// `go install` main version is a pseudo-version built on top of a real
-// upstream tag (e.g. "v0.72.1-0.<timestamp>-<commit>"), that base tag is
-// extracted and prepended to the derived string, so a go-install build
-// reports e.g. "v0.72.1-<hash>-<forkBaseVersion>" rather than the raw ugly
-// pseudo-version. Plain `go build .` has no base tag (its main version is
-// "(devel)") and reports the tag-less "<hash>-<forkBaseVersion>". Neither
-// path ever includes a "devel" or dirty marker in the output. Release/
-// packaged builds inject Version via ldflags and are left untouched.
+// from a checkout, that main version may still be "(devel)" or a pseudo-
+// version depending on the toolchain, so we additionally derive a meaningful
+// version from the VCS metadata the toolchain embeds (vcs.revision) — this
+// lets two local dev builds be told apart. The derived string is always the
+// bare "<hash>-<forkBaseVersion>" (e.g. "141ac19-0.1.7"): no upstream-tag-
+// shaped prefix is ever recovered or prepended here, even when
+// info.Main.Version happens to be a pseudo-version built on top of a real
+// upstream tag. That upstream signal is deliberately surfaced elsewhere, as
+// the hand-maintained UpstreamTriagedVersion appended by root.go's Execute()
+// — showing two differently-sourced "upstream version" numbers in one line
+// (one incidental, one deliberate) is more confusing than showing only the
+// deliberate one. Neither path ever includes a "devel" or dirty marker in the
+// output. Release/packaged builds inject Version via ldflags and are left
+// untouched.
 func init() {
 	info, _ := debug.ReadBuildInfo()
 	Version, Commit = resolveVersion(Version, Commit, info)
@@ -117,12 +119,9 @@ func init() {
 //   - otherwise the module version resolved by `go install pkg@version`, when
 //     it is a clean release version (not a pseudo-version and not "(devel)"),
 //     wins directly;
-//   - otherwise a VCS-derived "[<baseTag>-]<commit>-<forkBaseVersion>" string
-//     for local dev builds (no "devel" marker). The optional <baseTag> prefix
-//     is the upstream release tag extracted from a `go install` pseudo-version
-//     (e.g. "v0.72.1" from "v0.72.1-0.<timestamp>-<commit>"); plain
-//     `go build .` has no such tag and produces the bare
-//     "<commit>-<forkBaseVersion>".
+//   - otherwise a VCS-derived "<commit>-<forkBaseVersion>" string for local dev
+//     builds (no "devel" marker, no upstream-tag-shaped prefix — see
+//     deriveDevVersion).
 //
 // Commit is filled from VCS only when the ldflags default is still "unknown".
 func resolveVersion(defaultVersion, defaultCommit string, info *debug.BuildInfo) (version, commit string) {
@@ -139,11 +138,7 @@ func resolveVersion(defaultVersion, defaultCommit string, info *debug.BuildInfo)
 		commit = vcs.revision
 	}
 	if version == "devel" {
-		baseTag := ""
-		if info.Main.Version != "(devel)" {
-			baseTag = extractBaseTag(info.Main.Version)
-		}
-		if dv := deriveDevVersion(baseTag, vcs.revision); dv != "" {
+		if dv := deriveDevVersion(vcs.revision); dv != "" {
 			version = dv
 		}
 	}
@@ -153,33 +148,9 @@ func resolveVersion(defaultVersion, defaultCommit string, info *debug.BuildInfo)
 // pseudoVersionSuffixRe matches the Go-toolchain pseudo-version suffix built on
 // top of a real prior tag, e.g. the "-0.20260628185628-e47711a0e3e4" part of
 // "v0.72.1-0.20260628185628-e47711a0e3e4" (optionally followed by "+dirty").
-// Such a string is an ugly pseudo-version; extractBaseTag uses this regex to
-// peel the suffix off and recover the underlying real base tag ("v0.72.1"),
-// while usableModuleVersion uses it to reject the raw pseudo-version from being
+// usableModuleVersion uses it to reject the raw pseudo-version from being
 // shown directly.
 var pseudoVersionSuffixRe = regexp.MustCompile(`-0\.\d{14}-[0-9a-f]{12}(\+dirty)?$`)
-
-// extractBaseTag recovers the upstream base tag embedded inside a Go
-// pseudo-version. For a `go install pkg@version` build, info.Main.Version is a
-// pseudo-version of the form "<baseTag>-0.<14-digit-timestamp>-<12-hex-commit>
-// [+dirty]", e.g. "v0.72.1-0.20260628185628-e47711a0e3e4". This returns the
-// "<baseTag>" portion ("v0.72.1"); it returns "" when v is not a
-// pseudo-version or has no base tag to recover (e.g. plain "(devel)" from
-// `go build .`, or a bare "v0.0.0-..." local-build pseudo-version whose base
-// tag is meaningless).
-func extractBaseTag(v string) string {
-	loc := pseudoVersionSuffixRe.FindStringIndex(v)
-	if loc == nil {
-		return ""
-	}
-	base := v[:loc[0]]
-	// "v0.0.0"/"0.0.0" is the placeholder base Go uses when there is no real
-	// prior tag; it carries no meaningful information, so treat it as absent.
-	if base == "v0.0.0" || base == "0.0.0" {
-		return ""
-	}
-	return base
-}
 
 // usableModuleVersion reports whether a BuildInfo main-module version is
 // meaningful enough to expose directly. Local checkout builds can report
@@ -187,9 +158,8 @@ func extractBaseTag(v string) string {
 // release version users can match to a package. Those fall through to the
 // VCS-derived <commit>-<forkBaseVersion> format instead. A pseudo-version
 // built on top of a real prior tag (e.g. "v0.72.1-0.<timestamp>-<commit>[+dirty]")
-// is rejected here too: its base tag is recovered separately by extractBaseTag
-// and prepended to the derived string, but the raw pseudo-version itself is
-// never shown.
+// is rejected here too — it is just as unhelpful as the v0.0.0 case, and its
+// base tag is deliberately NOT recovered or shown (see deriveDevVersion).
 func usableModuleVersion(v string) bool {
 	if v == "" || v == "(devel)" {
 		return false
@@ -230,15 +200,26 @@ func readVCS(info *debug.BuildInfo) vcsInfo {
 }
 
 // deriveDevVersion builds a human-meaningful version for a development build
-// from embedded VCS metadata, embedding the fork's current release-line version
-// (forkBaseVersion), e.g. "06c8078-0.1.7" for a clean checkout. When baseTag is
-// non-empty (recovered from a `go install` pseudo-version), it is prepended as
-// "<baseTag>-", yielding e.g. "v0.72.1-06c8078-0.1.7". It returns an empty
-// string when no revision is available, signalling the caller to keep the
-// plain "devel" default. No "devel" marker and no dirty marker are ever
-// included in the returned string — the commit hash + forkBaseVersion (and,
-// when available, the upstream base tag) are the only content.
-func deriveDevVersion(baseTag, revision string) string {
+// from embedded VCS metadata, embedding the fork's current release-line
+// version (forkBaseVersion), e.g. "06c8078-0.1.7" for a clean checkout. It
+// returns an empty string when no revision is available, signalling the
+// caller to keep the plain "devel" default. No "devel" marker and no dirty
+// marker are ever included in the returned string — the commit hash +
+// forkBaseVersion are the only content.
+//
+// This deliberately never prepends an upstream-tag-shaped prefix, even when
+// one could be recovered from a Go pseudo-version (e.g. "v0.72.1" from
+// "v0.72.1-0.<timestamp>-<commit>"). That recovery previously existed
+// (extractBaseTag, removed) on the assumption that a plain `go build .`
+// always produces info.Main.Version == "(devel)" with no base tag at all —
+// but that assumption does not hold for every Go toolchain: a local `go
+// build .` can embed a real pseudo-version with a recoverable base tag,
+// which produced a confusing "v0.72.1-<hash>-0.1.7" that looked like it
+// carried a deliberate upstream-tracking signal but didn't. That role is
+// now filled by the deliberately hand-maintained UpstreamTriagedVersion
+// (appended separately by root.go's Execute()), which is the one and only
+// upstream-version signal shown to the user.
+func deriveDevVersion(revision string) string {
 	if revision == "" {
 		return ""
 	}
@@ -246,11 +227,7 @@ func deriveDevVersion(baseTag, revision string) string {
 	if len(short) > 7 {
 		short = short[:7]
 	}
-	v := short + "-" + forkBaseVersion
-	if baseTag != "" {
-		v = baseTag + "-" + v
-	}
-	return v
+	return short + "-" + forkBaseVersion
 }
 
 // deriveBuildID uses the running executable's modification time as a unique
