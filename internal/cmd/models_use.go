@@ -12,7 +12,7 @@ import (
 
 var modelsUseCmd = &cobra.Command{
 	Use:   "use <large> <small>",
-	Short: "Set the large and small slots in one shot from atom names",
+	Short: "Set the large and small slots (and optionally worker/reviewer) from atom names",
 	Long: `Activate a (large, small) pair using the atom syntax. Each argument is
 either an atom name (e.g. "opus-high", "glm5_turbo") OR a raw
 "provider/model[@level]" string for models not in the atom registry.
@@ -24,11 +24,11 @@ The chosen scope is written to crush.json:
 The current value in the OTHER scope is preserved; effective resolution
 remains "local if set, else global".
 
-This command only sets the large ("smart") and small ("fast") slots. The
-optional worker and reviewer slots (see ` + "`crush models --help`" + ` for what
-each is for) are not settable here yet — configure them by editing the
-"models.worker" / "models.reviewer" keys in crush.json directly, or from the
-web UI's model picker.
+The two positional args always set the large ("smart") and small ("fast")
+slots. The optional worker and reviewer slots (see ` + "`crush models --help`" + `
+for what each is for) are set with ` + "`--worker`" + ` / ` + "`--reviewer`" + ` — same atom
+or "provider/model[@level]" syntax, resolved and written independently of
+large/small. Omit a flag to leave that slot untouched.
 
 See ` + "`crush models list`" + ` for the full atom table.`,
 	Args: cobra.ExactArgs(2),
@@ -51,6 +51,15 @@ crush models use o47x glm5_turbo
 # Long-form atom syntax still works
 crush models use opus-high sonnet-low
 
+# Also set the worker slot (cheap sub-agent model) in the same call
+crush models use o47x h45l --worker glm5_turbo
+
+# Also set the reviewer slot (strongest model, --role reviewer only)
+crush models use o47x h45l --reviewer oxx
+
+# Set worker and reviewer together with large/small
+crush models use o47x h45l --worker fl --reviewer oxx
+
 # Workspace-only override (writes ./.crush/crush.json, leaves global untouched).
 crush models use --local o47x h45l
 
@@ -65,6 +74,9 @@ crush models state
 		if err != nil {
 			return err
 		}
+		workerArg, _ := cmd.Flags().GetString("worker")
+		reviewerArg, _ := cmd.Flags().GetString("reviewer")
+
 		a, err := setupApp(cmd)
 		if err != nil {
 			return err
@@ -96,6 +108,31 @@ crush models state
 			largeSel.Provider, largeSel.Model, effortSuffix(largeSel.ReasoningEffort), scope)
 		fmt.Fprintf(os.Stderr, "set small = %s/%s%s in %s scope\n",
 			smallSel.Provider, smallSel.Model, effortSuffix(smallSel.ReasoningEffort), scope)
+
+		if workerArg != "" {
+			workerSel, werr := parseAtomOrRaw(workerArg, resolve)
+			if werr != nil {
+				return fmt.Errorf("worker: %w", werr)
+			}
+			if err := a.Store().UpdatePreferredModel(scope, config.SelectedModelTypeWorker, workerSel); err != nil {
+				return fmt.Errorf("write worker: %w", err)
+			}
+			fmt.Fprintf(os.Stderr, "set worker = %s/%s%s in %s scope\n",
+				workerSel.Provider, workerSel.Model, effortSuffix(workerSel.ReasoningEffort), scope)
+		}
+
+		if reviewerArg != "" {
+			reviewerSel, rerr := parseAtomOrRaw(reviewerArg, resolve)
+			if rerr != nil {
+				return fmt.Errorf("reviewer: %w", rerr)
+			}
+			if err := a.Store().UpdatePreferredModel(scope, config.SelectedModelTypeReviewer, reviewerSel); err != nil {
+				return fmt.Errorf("write reviewer: %w", err)
+			}
+			fmt.Fprintf(os.Stderr, "set reviewer = %s/%s%s in %s scope\n",
+				reviewerSel.Provider, reviewerSel.Model, effortSuffix(reviewerSel.ReasoningEffort), scope)
+		}
+
 		return nil
 	},
 }
@@ -111,5 +148,7 @@ func init() {
 	modelsUseCmd.Flags().Bool("global", false, "Target the global config (default when neither --global nor --local is given)")
 	modelsUseCmd.Flags().Bool("local", false, "Target the workspace config (./.crush/crush.json)")
 	modelsUseCmd.MarkFlagsMutuallyExclusive("global", "local")
+	modelsUseCmd.Flags().String("worker", "", "Also set the optional worker slot (atom or provider/model[@level])")
+	modelsUseCmd.Flags().String("reviewer", "", "Also set the optional reviewer slot (atom or provider/model[@level])")
 	modelsCmd.AddCommand(modelsUseCmd)
 }

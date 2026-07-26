@@ -19,15 +19,16 @@ var modelsStateCmd = &cobra.Command{
 	Aliases: []string{"show"}, // backwards-compat: `crush models show` used to exist.
 	Short:   "Show what's currently effective and from which scope",
 	Long: `Print three things:
-  1. EFFECTIVE — the (large, small) pair that ` + "`crush run --role smart/fast`" + `
-     will actually use, and which scope each came from.
+  1. EFFECTIVE — the (large, small, worker, reviewer) values that
+     ` + "`crush run --role smart/fast/worker/reviewer`" + ` will actually use, and
+     which scope each came from. worker and reviewer are optional; when unset
+     in both scopes they print "(not set in any scope)".
   2. SCOPES — what each scope (global, local) says about each slot, with
      "(effective)" / "(overridden by local)" / "(not set)" annotations.
   3. The atom name in parens when the effective model matches a known atom.
 
-This command reports the large and small slots only. The optional worker and
-reviewer slots (see ` + "`crush models --help`" + `) aren't shown here — check
-` + "`crush_info`" + ` or the raw crush.json "models" object for their current values.
+Set worker/reviewer with ` + "`crush models use <large> <small> --worker <m> --reviewer <m>`" + `
+and clear them with ` + "`crush models unset worker`" + ` / ` + "`crush models unset reviewer`" + `.
 
 ` + "`--json`" + ` emits a structured object for orchestrators.`,
 	Example: `
@@ -54,36 +55,53 @@ crush models show
 		cfg := a.Config()
 		store := a.Store()
 
-		globalLarge, globalSmall, gerr := store.ReadModelsAtScope(config.ScopeGlobal)
+		globalAll, gerr := store.ReadAllModelsAtScope(config.ScopeGlobal)
 		if gerr != nil {
 			return fmt.Errorf("read global scope: %w", gerr)
 		}
-		localLarge, localSmall, lerr := store.ReadModelsAtScope(config.ScopeWorkspace)
+		localAll, lerr := store.ReadAllModelsAtScope(config.ScopeWorkspace)
 		if lerr != nil {
 			return fmt.Errorf("read local scope: %w", lerr)
 		}
 
+		globalLarge, globalSmall := globalAll[config.SelectedModelTypeLarge], globalAll[config.SelectedModelTypeSmall]
+		localLarge, localSmall := localAll[config.SelectedModelTypeLarge], localAll[config.SelectedModelTypeSmall]
+		globalWorker, globalReviewer := globalAll[config.SelectedModelTypeWorker], globalAll[config.SelectedModelTypeReviewer]
+		localWorker, localReviewer := localAll[config.SelectedModelTypeWorker], localAll[config.SelectedModelTypeReviewer]
+
 		effLarge, hasLarge := cfg.Models[config.SelectedModelTypeLarge]
 		effSmall, hasSmall := cfg.Models[config.SelectedModelTypeSmall]
+		effWorker, hasWorker := cfg.Models[config.SelectedModelTypeWorker]
+		effReviewer, hasReviewer := cfg.Models[config.SelectedModelTypeReviewer]
 
 		largeScope := whichScope(localLarge, globalLarge)
 		smallScope := whichScope(localSmall, globalSmall)
+		workerScope := whichScope(localWorker, globalWorker)
+		reviewerScope := whichScope(localReviewer, globalReviewer)
 
 		if asJSON {
 			payload := map[string]any{
 				"effective": map[string]any{
-					"large":       nilOrModel(hasLarge, effLarge),
-					"small":       nilOrModel(hasSmall, effSmall),
-					"large_scope": largeScope,
-					"small_scope": smallScope,
+					"large":          nilOrModel(hasLarge, effLarge),
+					"small":          nilOrModel(hasSmall, effSmall),
+					"worker":         nilOrModel(hasWorker, effWorker),
+					"reviewer":       nilOrModel(hasReviewer, effReviewer),
+					"large_scope":    largeScope,
+					"small_scope":    smallScope,
+					"worker_scope":   workerScope,
+					"reviewer_scope": reviewerScope,
 				},
 				"global": map[string]any{
-					"large": globalLarge,
-					"small": globalSmall,
+					"large":    globalLarge,
+					"small":    globalSmall,
+					"worker":   globalWorker,
+					"reviewer": globalReviewer,
 				},
 				"local": map[string]any{
-					"large": localLarge,
-					"small": localSmall,
+					"large":    localLarge,
+					"small":    localSmall,
+					"worker":   localWorker,
+					"reviewer": localReviewer,
 				},
 			}
 			return json.NewEncoder(os.Stdout).Encode(payload)
@@ -92,13 +110,19 @@ crush models show
 		fmt.Println("EFFECTIVE")
 		printEffectiveLine("large", hasLarge, effLarge, largeScope)
 		printEffectiveLine("small", hasSmall, effSmall, smallScope)
+		printEffectiveLine("worker", hasWorker, effWorker, workerScope)
+		printEffectiveLine("reviewer", hasReviewer, effReviewer, reviewerScope)
 		fmt.Println()
 		fmt.Println("SCOPES")
 		tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 		printScopeLine(tw, "global", "large", globalLarge, localLarge, "global")
 		printScopeLine(tw, "global", "small", globalSmall, localSmall, "global")
+		printScopeLine(tw, "global", "worker", globalWorker, localWorker, "global")
+		printScopeLine(tw, "global", "reviewer", globalReviewer, localReviewer, "global")
 		printScopeLine(tw, "local", "large", localLarge, globalLarge, "local")
 		printScopeLine(tw, "local", "small", localSmall, globalSmall, "local")
+		printScopeLine(tw, "local", "worker", localWorker, globalWorker, "local")
+		printScopeLine(tw, "local", "reviewer", localReviewer, globalReviewer, "local")
 		tw.Flush()
 		return nil
 	},

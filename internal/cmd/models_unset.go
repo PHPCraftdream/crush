@@ -12,19 +12,18 @@ import (
 )
 
 var modelsUnsetCmd = &cobra.Command{
-	Use:   "unset [large|small|both]",
-	Short: "Remove a model override from the chosen scope (defaults to both slots, global scope)",
-	Long: `Delete the models.large and/or models.small entry from the chosen
-scope's crush.json so the OTHER scope's value becomes effective again.
-
-This command covers the large and small slots only; it does not touch the
-optional worker/reviewer slots (see ` + "`crush models --help`" + `) — remove
-"models.worker" / "models.reviewer" from crush.json directly if needed.
+	Use:   "unset [large|small|worker|reviewer|both|all]",
+	Short: "Remove a model override from the chosen scope (defaults to large+small, global scope)",
+	Long: `Delete the models.<slot> entry (or entries) from the chosen scope's
+crush.json so the OTHER scope's value becomes effective again.
 
 Positional arg (optional):
-  large  — only the large slot
-  small  — only the small slot
-  both   — both slots (default if omitted)
+  large     — only the large slot
+  small     — only the small slot
+  worker    — only the optional worker slot
+  reviewer  — only the optional reviewer slot
+  both      — large + small (default if omitted; matches ` + "`crush models use`" + `'s scope)
+  all       — all four slots, including worker/reviewer
 
 Scope flags (mutually exclusive):
   --global  (default) ~/.local/share/crush/crush.json
@@ -33,12 +32,12 @@ Scope flags (mutually exclusive):
 Missing keys are a no-op (exit 0). After the deletion, an empty
 "models" object is also stripped so the file stays clean.`,
 	Args:      cobra.MaximumNArgs(1),
-	ValidArgs: []string{"large", "small", "both"},
+	ValidArgs: []string{"large", "small", "worker", "reviewer", "both", "all"},
 	Example: `
-# Clear the entire workspace override so the global config takes effect again.
+# Clear the large+small workspace override so the global config takes effect again.
 crush models unset --local
 
-# Same but globally — wipes both slots from ~/.local/share/crush/crush.json.
+# Same but globally — wipes large+small from ~/.local/share/crush/crush.json.
 crush models unset --global
 
 # Drop just the large slot in the workspace; keep the small one.
@@ -46,6 +45,15 @@ crush models unset large --local
 
 # Drop just the small slot globally.
 crush models unset small --global
+
+# Clear the worker slot globally (falls back to no worker — sub-agents use large).
+crush models unset worker --global
+
+# Clear the reviewer slot in the workspace.
+crush models unset reviewer --local
+
+# Clear all four slots (large, small, worker, reviewer) globally.
+crush models unset all --global
 
 # Confirm what survived:
 crush models state
@@ -56,10 +64,10 @@ crush models state
 			which = args[0]
 		}
 		switch which {
-		case "large", "small", "both":
+		case "large", "small", "worker", "reviewer", "both", "all":
 			// ok
 		default:
-			return fmt.Errorf("unexpected positional %q — expected large|small|both", which)
+			return fmt.Errorf("unexpected positional %q — expected large|small|worker|reviewer|both|all", which)
 		}
 
 		scope, err := scopeFromFlags(cmd, config.ScopeGlobal)
@@ -75,20 +83,35 @@ crush models state
 		store := a.Store()
 
 		// Snapshot prior values so we can show what was unset.
-		priorLarge, priorSmall, _ := store.ReadModelsAtScope(scope)
+		priorAll, _ := store.ReadAllModelsAtScope(scope)
 
 		targets := []struct {
 			label string
 			key   string
 			prior *config.SelectedModel
 		}{
-			{"large", "models.large", priorLarge},
-			{"small", "models.small", priorSmall},
+			{"large", "models.large", priorAll[config.SelectedModelTypeLarge]},
+			{"small", "models.small", priorAll[config.SelectedModelTypeSmall]},
+			{"worker", "models.worker", priorAll[config.SelectedModelTypeWorker]},
+			{"reviewer", "models.reviewer", priorAll[config.SelectedModelTypeReviewer]},
+		}
+
+		// "both" (the default) only ever touched large+small; "all" is the new
+		// spelling for every slot including worker/reviewer.
+		selected := func(label string) bool {
+			switch which {
+			case "both":
+				return label == "large" || label == "small"
+			case "all":
+				return true
+			default:
+				return which == label
+			}
 		}
 
 		didDelete := false
 		for _, t := range targets {
-			if which != "both" && which != t.label {
+			if !selected(t.label) {
 				continue
 			}
 			if t.prior == nil {
@@ -108,8 +131,8 @@ crush models state
 		// fails, do not surface the error — the field-level unset already
 		// succeeded and that's what the user asked for.
 		if didDelete {
-			postLarge, postSmall, perr := store.ReadModelsAtScope(scope)
-			if perr == nil && postLarge == nil && postSmall == nil {
+			postAll, perr := store.ReadAllModelsAtScope(scope)
+			if perr == nil && len(postAll) == 0 {
 				_ = store.RemoveConfigField(scope, "models")
 			}
 		}

@@ -30,7 +30,9 @@ Crush resolves models through four named slots (` + "`config.SelectedModelType`"
 
 worker and reviewer are both optional: with neither configured, everything
 behaves exactly as if only large/small existed. See ` + "`crush models use --help`" + `
-to set slots and ` + "`crush models state --help`" + ` to see what's effective.`,
+to set slots — including worker/reviewer via the ` + "`--worker`" + `/` + "`--reviewer`" + ` flags —
+and ` + "`crush models state --help`" + ` to see what's effective. ` + "`crush models unset --help`" + `
+clears slots, worker/reviewer included.`,
 	Example: `# List all available models
 crush models
 

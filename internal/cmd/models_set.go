@@ -20,7 +20,8 @@ var modelsSetCmd = &cobra.Command{
 	Run: func(cmd *cobra.Command, args []string) {
 		fmt.Fprintln(os.Stderr,
 			"`crush models set` was removed in batch 11.\n"+
-				"Use `crush models use <large> <small>` instead. See `crush models list` for atoms.")
+				"Use `crush models use <large> <small>` instead (add --worker/--reviewer to set\n"+
+				"those optional slots too). See `crush models list` for atoms.")
 		os.Exit(2)
 	},
 }

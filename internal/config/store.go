@@ -227,32 +227,48 @@ func (s *ConfigStore) RemoveConfigField(scope Scope, key string) error {
 //
 // Fork patch: batch 11 — `crush models state` needs per-scope visibility.
 func (s *ConfigStore) ReadModelsAtScope(scope Scope) (large, small *SelectedModel, err error) {
+	all, err := s.ReadAllModelsAtScope(scope)
+	if err != nil {
+		return nil, nil, err
+	}
+	return all[SelectedModelTypeLarge], all[SelectedModelTypeSmall], nil
+}
+
+// ReadAllModelsAtScope reads the per-scope `models.*` entries for all four
+// slots (large, small, worker, reviewer) directly from the on-disk file for
+// the given scope, ignoring any merge with the other scope. Missing slots are
+// absent from the returned map; returns an error only on read/parse failure.
+//
+// Fork patch: worker/reviewer CLI settability — `crush models state` needs
+// per-scope visibility into all four slots, not just large/small.
+func (s *ConfigStore) ReadAllModelsAtScope(scope Scope) (map[SelectedModelType]*SelectedModel, error) {
 	path, perr := s.configPath(scope)
 	if perr != nil {
 		// No path for this scope (e.g. workspace not initialised) — treat as
 		// "nothing set". Not an error.
-		return nil, nil, nil
+		return map[SelectedModelType]*SelectedModel{}, nil
 	}
 	data, rerr := os.ReadFile(path)
 	if rerr != nil {
 		if os.IsNotExist(rerr) {
-			return nil, nil, nil
+			return map[SelectedModelType]*SelectedModel{}, nil
 		}
-		return nil, nil, fmt.Errorf("read %s: %w", path, rerr)
+		return nil, fmt.Errorf("read %s: %w", path, rerr)
 	}
 	var sm struct {
 		Models map[SelectedModelType]SelectedModel `json:"models"`
 	}
 	if err := json.Unmarshal(data, &sm); err != nil {
-		return nil, nil, fmt.Errorf("parse %s: %w", path, err)
+		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
-	if v, ok := sm.Models[SelectedModelTypeLarge]; ok {
-		large = &v
+	out := make(map[SelectedModelType]*SelectedModel, len(sm.Models))
+	for _, slot := range []SelectedModelType{SelectedModelTypeLarge, SelectedModelTypeSmall, SelectedModelTypeWorker, SelectedModelTypeReviewer} {
+		if v, ok := sm.Models[slot]; ok {
+			v := v
+			out[slot] = &v
+		}
 	}
-	if v, ok := sm.Models[SelectedModelTypeSmall]; ok {
-		small = &v
-	}
-	return large, small, nil
+	return out, nil
 }
 
 // UpdatePreferredModel updates the preferred model for the given type and
