@@ -149,7 +149,7 @@ func coderAgent(r *vcr.Recorder, env fakeEnv, large, small fantasy.LanguageModel
 	cfg.Config().Options.ContextPaths = nil
 	cfg.Config().Options.GlobalContextPaths = nil
 
-	systemPrompt, err := prompt.Build(context.TODO(), large.Provider(), large.Model(), cfg)
+	systemPrompt, err := prompt.Build(context.TODO(), large.Provider(), large.Model(), cfg, false)
 	if err != nil {
 		return nil, err
 	}

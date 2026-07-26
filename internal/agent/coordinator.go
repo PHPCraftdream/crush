@@ -514,7 +514,7 @@ func (c *coordinator) applyModelOverrides(ctx context.Context, large, small *Mod
 		c.currentAgent.SetSystemPromptPrefix(largeProviderCfg.SystemPromptPrefix)
 	}
 	if c.prompt != nil {
-		newSystemPrompt, err := c.prompt.Build(ctx, largeModel.ModelCfg.Provider, largeModel.ModelCfg.Model, c.cfg)
+		newSystemPrompt, err := c.prompt.Build(ctx, largeModel.ModelCfg.Provider, largeModel.ModelCfg.Model, c.cfg, c.workerSubAgentActive())
 		if err != nil {
 			slog.Error("applyModelOverrides: failed to rebuild system prompt", "err", err)
 		} else {
@@ -538,7 +538,7 @@ func (c *coordinator) resolveSessionSystemPrompt(ctx context.Context, sessionID 
 	if c.prompt == nil {
 		return ""
 	}
-	built, buildErr := c.prompt.Build(ctx, c.currentAgent.Model().ModelCfg.Provider, c.currentAgent.Model().ModelCfg.Model, c.cfg)
+	built, buildErr := c.prompt.Build(ctx, c.currentAgent.Model().ModelCfg.Provider, c.currentAgent.Model().ModelCfg.Model, c.cfg, c.workerSubAgentActive())
 	if buildErr != nil || built == "" {
 		return ""
 	}
@@ -1285,7 +1285,12 @@ func (c *coordinator) buildAgent(ctx context.Context, prompt *prompt.Prompt, age
 	})
 
 	c.readyWg.Go(func() error {
-		systemPrompt, err := prompt.Build(ctx, large.Model.Provider(), large.Model.Model(), c.cfg)
+		// Orchestrator block only ever applies to the top-level coder prompt
+		// (isSubAgent false) — a sub-agent renders task.md.tpl via
+		// taskPrompt, which doesn't reference WorkerAvailable, but guarding
+		// on !isSubAgent here keeps this call's intent explicit rather than
+		// relying on the template to ignore the field.
+		systemPrompt, err := prompt.Build(ctx, large.Model.Provider(), large.Model.Model(), c.cfg, !isSubAgent && c.workerSubAgentActive())
 		if err != nil {
 			return err
 		}
@@ -2134,7 +2139,7 @@ func (c *coordinator) BuildSystemPrompt(ctx context.Context) (string, error) {
 		return "", nil
 	}
 	model := c.currentAgent.Model()
-	return c.prompt.Build(ctx, model.ModelCfg.Provider, model.ModelCfg.Model, c.cfg)
+	return c.prompt.Build(ctx, model.ModelCfg.Provider, model.ModelCfg.Model, c.cfg, c.workerSubAgentActive())
 }
 
 func (c *coordinator) UpdateSessionSystemPrompt(ctx context.Context, sessionID, prompt string) error {

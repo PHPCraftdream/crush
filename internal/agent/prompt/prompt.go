@@ -42,6 +42,29 @@ type PromptDat struct {
 	ContextFiles       []ContextFile
 	GlobalContextFiles []ContextFile
 	AvailSkillXML      string
+
+	// WorkerAvailable is true when this run is driven by the Large ("smart")
+	// model slot AND a Worker model is configured — i.e. exactly the
+	// condition coordinator.workerSubAgentActive checks for sub-agents,
+	// reused here (not re-derived) for the top-level coder prompt so the
+	// two decisions ("does the sub-agent get worker tools/model" and "does
+	// the coder get told to delegate") can never disagree. When false, the
+	// orchestrator block in coder.md.tpl is entirely absent and the
+	// rendered prompt is byte-identical to before this field existed.
+	WorkerAvailable bool
+	// WorkerContextWindowText is a human-readable size for the configured
+	// worker model's context window (e.g. "200k tokens", "1M tokens"),
+	// preformatted here rather than in the template because Go's
+	// text/template has no arithmetic/formatting pipeline worth the
+	// complexity for this. Empty when WorkerAvailable is false, or when
+	// it's true but the size is unknown/zero — notably CLI-backed worker
+	// models (claude/gemini/qwen via cliprovider) only get a catwalk entry,
+	// and therefore a non-zero ContextWindow, when config.Load ran with the
+	// CLI binary present on PATH; when the binary wasn't found at load
+	// time, GetModel returns nil and this stays "". The template must never
+	// render a fabricated number — an empty string here means "omit the
+	// number, keep the chunking guidance."
+	WorkerContextWindowText string
 }
 
 type ContextFile struct {
@@ -81,13 +104,18 @@ func NewPrompt(name, promptTemplate string, opts ...Option) (*Prompt, error) {
 	return p, nil
 }
 
-func (p *Prompt) Build(ctx context.Context, provider, model string, store *config.ConfigStore) (string, error) {
+// Build renders the prompt template. workerActive should be the caller's
+// already-computed "is this run a smart orchestrator with a worker
+// configured" predicate (coordinator.workerSubAgentActive for the top-level
+// coder; always false for sub-agent/other prompt builds) — Build does not
+// re-derive it, so there is exactly one place that decision is made.
+func (p *Prompt) Build(ctx context.Context, provider, model string, store *config.ConfigStore, workerActive bool) (string, error) {
 	t, err := template.New(p.name).Parse(p.template)
 	if err != nil {
 		return "", fmt.Errorf("parsing template: %w", err)
 	}
 	var sb strings.Builder
-	d, err := p.promptData(ctx, provider, model, store)
+	d, err := p.promptData(ctx, provider, model, store, workerActive)
 	if err != nil {
 		return "", err
 	}
@@ -207,7 +235,7 @@ func dedupeContextFiles(files []ContextFile) []ContextFile {
 	return out
 }
 
-func (p *Prompt) promptData(ctx context.Context, provider, model string, store *config.ConfigStore) (PromptDat, error) {
+func (p *Prompt) promptData(ctx context.Context, provider, model string, store *config.ConfigStore, workerActive bool) (PromptDat, error) {
 	workingDir := cmp.Or(p.workingDir, store.WorkingDir())
 	platform := cmp.Or(p.platform, runtime.GOOS)
 
@@ -251,14 +279,22 @@ func (p *Prompt) promptData(ctx context.Context, provider, model string, store *
 
 	isGit := isGitRepo(store.WorkingDir())
 	data := PromptDat{
-		Provider:      provider,
-		Model:         model,
-		Config:        *cfg,
-		WorkingDir:    filepath.ToSlash(workingDir),
-		IsGitRepo:     isGit,
-		Platform:      platform,
-		Date:          p.now().Format("1/2/2006"),
-		AvailSkillXML: availSkillXML,
+		Provider:        provider,
+		Model:           model,
+		Config:          *cfg,
+		WorkingDir:      filepath.ToSlash(workingDir),
+		IsGitRepo:       isGit,
+		Platform:        platform,
+		Date:            p.now().Format("1/2/2006"),
+		AvailSkillXML:   availSkillXML,
+		WorkerAvailable: workerActive,
+	}
+	if workerActive {
+		if workerModelCfg, ok := cfg.Models[config.SelectedModelTypeWorker]; ok {
+			if m := cfg.GetModel(workerModelCfg.Provider, workerModelCfg.Model); m != nil && m.ContextWindow > 0 {
+				data.WorkerContextWindowText = formatTokenCount(m.ContextWindow)
+			}
+		}
 	}
 	if isGit {
 		var err error
@@ -271,6 +307,28 @@ func (p *Prompt) promptData(ctx context.Context, provider, model string, store *
 	data.ContextFiles = dedupeContextFiles(flattenContextFiles(contextFiles))
 	data.GlobalContextFiles = dedupeContextFiles(flattenContextFiles(globalContextFiles))
 	return data, nil
+}
+
+// formatTokenCount renders a token count the way a model expects to read it
+// in prose ("200k tokens", "1M tokens") rather than a raw integer. Only
+// exact, evenly-divisible thousands/millions get the short suffix so we
+// never silently round away precision the model might reasonably want;
+// anything else falls back to a plain decimal count. No reusable formatter
+// for this existed in a package internal/agent can import (internal/cmd has
+// the inverse parser, parseTokenCount, but internal/agent must not import
+// internal/cmd), so this is a small local helper rather than a new shared
+// dependency.
+func formatTokenCount(n int64) string {
+	switch {
+	case n <= 0:
+		return ""
+	case n%1_000_000 == 0:
+		return fmt.Sprintf("%dM tokens", n/1_000_000)
+	case n%1_000 == 0:
+		return fmt.Sprintf("%dk tokens", n/1_000)
+	default:
+		return fmt.Sprintf("%d tokens", n)
+	}
 }
 
 func isGitRepo(dir string) bool {
