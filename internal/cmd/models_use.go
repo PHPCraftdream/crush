@@ -24,6 +24,12 @@ The chosen scope is written to crush.json:
 The current value in the OTHER scope is preserved; effective resolution
 remains "local if set, else global".
 
+This command only sets the large ("smart") and small ("fast") slots. The
+optional worker and reviewer slots (see ` + "`crush models --help`" + ` for what
+each is for) are not settable here yet — configure them by editing the
+"models.worker" / "models.reviewer" keys in crush.json directly, or from the
+web UI's model picker.
+
 See ` + "`crush models list`" + ` for the full atom table.`,
 	Args: cobra.ExactArgs(2),
 	Example: `

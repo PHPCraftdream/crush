@@ -17,6 +17,10 @@ var modelsUnsetCmd = &cobra.Command{
 	Long: `Delete the models.large and/or models.small entry from the chosen
 scope's crush.json so the OTHER scope's value becomes effective again.
 
+This command covers the large and small slots only; it does not touch the
+optional worker/reviewer slots (see ` + "`crush models --help`" + `) — remove
+"models.worker" / "models.reviewer" from crush.json directly if needed.
+
 Positional arg (optional):
   large  — only the large slot
   small  — only the small slot

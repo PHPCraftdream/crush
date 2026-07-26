@@ -16,7 +16,21 @@ import (
 var modelsCmd = &cobra.Command{
 	Use:   "models",
 	Short: "List all available models from known providers",
-	Long:  `List all available models from known providers. Shows provider name and model IDs. Unconfigured providers are marked with (not configured).`,
+	Long: `List all available models from known providers. Shows provider name and model IDs. Unconfigured providers are marked with (not configured).
+
+Crush resolves models through four named slots (` + "`config.SelectedModelType`" + `):
+
+  large     the strong default slot; the top-level agent runs on it ("smart").
+  small     the cheap slot for trivial work ("fast").
+  worker    optional. A cheap slot for delegated hands-on sub-task work. Never
+            auto-selected as a top-level model. When configured and the run
+            uses --role smart, sub-agents spawned by the agent tool run on it.
+  reviewer  optional. The strongest slot, for explicit review invocations.
+            Never auto-selected anywhere — reachable only via --role reviewer.
+
+worker and reviewer are both optional: with neither configured, everything
+behaves exactly as if only large/small existed. See ` + "`crush models use --help`" + `
+to set slots and ` + "`crush models state --help`" + ` to see what's effective.`,
 	Example: `# List all available models
 crush models
 

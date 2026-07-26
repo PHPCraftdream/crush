@@ -92,6 +92,13 @@ func writeConfigStaleness(b *strings.Builder, cfg *config.ConfigStore) {
 	b.WriteString("\n")
 }
 
+// writeModels prints the [model] section, one line per configured slot.
+// Crush resolves models through four named slots: "large" (smart, the
+// top-level default) and "small" (fast, cheap trivial work) are always
+// meaningful; "worker" (cheap sub-task delegation target) and "reviewer"
+// (strongest slot, explicit --role reviewer only) are optional — they are
+// skipped below via `if !ok { continue }` when unconfigured, so their
+// absence from the dump means "not set", not "broken".
 func writeModels(b *strings.Builder, cfg *config.ConfigStore) {
 	c := cfg.Config()
 	if len(c.Models) == 0 {

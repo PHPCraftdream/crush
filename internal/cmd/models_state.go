@@ -25,6 +25,10 @@ var modelsStateCmd = &cobra.Command{
      "(effective)" / "(overridden by local)" / "(not set)" annotations.
   3. The atom name in parens when the effective model matches a known atom.
 
+This command reports the large and small slots only. The optional worker and
+reviewer slots (see ` + "`crush models --help`" + `) aren't shown here — check
+` + "`crush_info`" + ` or the raw crush.json "models" object for their current values.
+
 ` + "`--json`" + ` emits a structured object for orchestrators.`,
 	Example: `
 # Plain text: effective pair + scope breakdown.
