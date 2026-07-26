@@ -32,7 +32,13 @@ worker and reviewer are both optional: with neither configured, everything
 behaves exactly as if only large/small existed. See ` + "`crush models use --help`" + `
 to set slots — including worker/reviewer via the ` + "`--worker`" + `/` + "`--reviewer`" + ` flags —
 and ` + "`crush models state --help`" + ` to see what's effective. ` + "`crush models unset --help`" + `
-clears slots, worker/reviewer included.`,
+clears slots, worker/reviewer included.
+
+Any slot can pin a reasoning-effort level (low/medium/high/xhigh/max, though
+what a level actually does — and whether it does anything at all — is
+provider-specific). See ` + "`crush models efforts --help`" + ` for the two syntaxes
+that set it, the per-provider semantics (e.g. Z.AI collapses low/medium/high
+into one wire value), and per-model command examples.`,
 	Example: `# List all available models
 crush models
 

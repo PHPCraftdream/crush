@@ -1119,6 +1119,13 @@ func getProviderOptions(model Model, providerCfg config.ProviderConfig) fantasy.
 		// Setting it in the right way for each provider.
 		// TODO: Abstract this in Fantasy somehow?
 		// TODO: Allow custom providers to specify how to set this?
+		//
+		// SYNC WARNING: the per-provider effort/thinking mapping below (ZAI,
+		// DeepSeek, io.net, Alibaba Singapore, hyper) is restated in prose for
+		// users by `crush models efforts` (providerEffortDocs in
+		// internal/cmd/models_efforts.go). That prose is NOT derived from this
+		// switch — if you change a mapping here, update the matching entry
+		// there too, or the CLI help will describe stale behavior.
 		switch providerCfg.ID {
 		case hyper.Name:
 			extraBody["thinking"] = model.ModelCfg.Think
