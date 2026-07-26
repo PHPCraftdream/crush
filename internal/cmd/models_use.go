@@ -30,6 +30,12 @@ for what each is for) are set with ` + "`--worker`" + ` / ` + "`--reviewer`" + `
 or "provider/model[@level]" syntax, resolved and written independently of
 large/small. Omit a flag to leave that slot untouched.
 
+Every one of the four slots accepts an effort suffix right here — either
+"<atom>-<level>" (e.g. "glm5_2-max") or "provider/model@level" — no separate
+step needed. See ` + "`crush models efforts [model]`" + ` to list the levels a model
+supports, and ` + "`crush models bump <role> up|down`" + ` to nudge an already-set
+effort later.
+
 See ` + "`crush models list`" + ` for the full atom table.`,
 	Args: cobra.ExactArgs(2),
 	Example: `
@@ -56,6 +62,9 @@ crush models use o47x h45l --worker glm5_turbo
 
 # Also set the reviewer slot (strongest model, --role reviewer only)
 crush models use o47x h45l --reviewer oxx
+
+# Set effort on a role slot in the same call: "<atom>-<level>" or "provider/model@level"
+crush models use o47x h45l --reviewer glm5_2-max
 
 # Set worker and reviewer together with large/small
 crush models use o47x h45l --worker fl --reviewer oxx

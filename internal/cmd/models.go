@@ -30,9 +30,10 @@ Crush resolves models through four named slots (` + "`config.SelectedModelType`"
 
 worker and reviewer are both optional: with neither configured, everything
 behaves exactly as if only large/small existed. See ` + "`crush models use --help`" + `
-to set slots — including worker/reviewer via the ` + "`--worker`" + `/` + "`--reviewer`" + ` flags —
-and ` + "`crush models state --help`" + ` to see what's effective. ` + "`crush models unset --help`" + `
-clears slots, worker/reviewer included.
+to set any slot — including worker/reviewer via the ` + "`--worker`" + `/` + "`--reviewer`" + `
+flags, with effort settable in that same call — and ` + "`crush models state --help`" + `
+to see what's effective. ` + "`crush models unset --help`" + ` clears slots, worker/reviewer
+included.
 
 Any slot can pin a reasoning-effort level (low/medium/high/xhigh/max, though
 what a level actually does — and whether it does anything at all — is
