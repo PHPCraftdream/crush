@@ -1518,6 +1518,12 @@ func TestResetAutoResumeCounter(t *testing.T) {
 // Worker-substitution branch end to end.
 func newRoleModelTestCoordinator(t *testing.T, env fakeEnv, includeWorker bool) *coordinator {
 	t.Helper()
+	// Isolate from the host machine's real global config (e.g. ~/.local/share/crush
+	// or %LocalAppData%\crush): without this, config.Init falls back to
+	// GlobalConfigData(), which reads the real machine-wide crush.json and can
+	// leak a real models.worker entry into "worker NOT configured" scenarios.
+	// See isolatedModelsEnv in internal/cmd/models_use_test.go for the same pattern.
+	t.Setenv("CRUSH_GLOBAL_DATA", t.TempDir())
 	cfg, err := config.Init(env.workingDir, "", false)
 	require.NoError(t, err)
 
@@ -1705,6 +1711,9 @@ func TestBuildAgent_OrchestratorActiveWiring(t *testing.T) {
 // buildTools) and TestBuildTools_CoderHasAskQuestion's inline fixture.
 func newWorkerToolTestCoordinator(t *testing.T, env fakeEnv, includeWorker bool) *coordinator {
 	t.Helper()
+	// Isolate from the host machine's real global config — see the identical
+	// comment in newRoleModelTestCoordinator above for why this is required.
+	t.Setenv("CRUSH_GLOBAL_DATA", t.TempDir())
 	cfg, err := config.Init(env.workingDir, "", false)
 	require.NoError(t, err)
 
@@ -1920,6 +1929,9 @@ func TestBuildToolsAgentConfig_UnconditionalApplicationWouldBreakBackwardCompat(
 // directly) so it fails if the wiring regresses again.
 func TestBuildTools_CoderHasAskQuestion(t *testing.T) {
 	env := testEnv(t)
+	// Isolate from the host machine's real global config — see the identical
+	// comment in newRoleModelTestCoordinator above for why this is required.
+	t.Setenv("CRUSH_GLOBAL_DATA", t.TempDir())
 	cfg, err := config.Init(env.workingDir, "", false)
 	require.NoError(t, err)
 
