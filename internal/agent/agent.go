@@ -1456,6 +1456,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 		var fantasyErr *fantasy.Error
 		var providerErr *fantasy.ProviderError
 		var peakErr *PeakHoursError
+		var awaitingErr *AwaitingAnswerError
 		const defaultTitle = "Provider Error"
 		if isWatchdogStall {
 			// Close the observability loop: the watchdog goroutine already
@@ -1516,6 +1517,12 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			// <terse text>" that drops the resume-time guidance entirely.
 			peakMsg, peakDetails := peakHoursStoppedFinishText(err)
 			currentAssistant.AddFinish(message.FinishReasonError, peakMsg, peakDetails)
+		} else if errors.As(err, &awaitingErr) {
+			// Same rationale as the peakErr branch above: without this,
+			// the generic `else` below would overwrite the question/options/
+			// resume-command guidance with a bare "Provider Error: <text>".
+			awaitingMsg, awaitingDetails := awaitingAnswerStoppedFinishText(err)
+			currentAssistant.AddFinish(message.FinishReasonError, awaitingMsg, awaitingDetails)
 		} else {
 			currentAssistant.AddFinish(message.FinishReasonError, defaultTitle, err.Error())
 		}

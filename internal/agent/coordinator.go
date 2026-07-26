@@ -123,6 +123,41 @@ func (e *PeakHoursError) Error() string {
 // that only care about the error class, not the structured detail.
 func (e *PeakHoursError) Unwrap() error { return errProviderPeakHours }
 
+// errAwaitingAnswer classifies AwaitingAnswerError the same way
+// errProviderPeakHours classifies PeakHoursError: it lets callers that only
+// care about the error class (not the structured question/options/session
+// detail) use errors.Is without knowing the concrete type.
+var errAwaitingAnswer = errors.New("agent asked a question and is awaiting an operator/orchestrator answer")
+
+// AwaitingAnswerError is the sentinel error the (forthcoming) question tool
+// returns to force-stop the current turn instead of blocking on a synchronous
+// answer — this fork's `crush run` has no code path that can wait mid-turn
+// for operator input (both headless and web sessions auto-approve
+// permissions unconditionally, see internal/server/handlers.go:163-171), so
+// "ask a question" has to mean "stop the turn cleanly and hand the operator
+// an unambiguous resume command" rather than "block until answered".
+//
+// Structurally this mirrors PeakHoursError: a concrete, typed error carrying
+// exactly what the orchestrator-facing guidance needs (the question, any
+// suggested answer options, and the session id to resume), so callers don't
+// have to parse Error()'s prose to act on it.
+type AwaitingAnswerError struct {
+	Question  string
+	Options   []string
+	SessionID string
+}
+
+func (e *AwaitingAnswerError) Error() string {
+	return fmt.Sprintf(
+		"agent asked a question and is awaiting an answer (session %s): %s",
+		e.SessionID, e.Question,
+	)
+}
+
+// Unwrap lets errors.Is(err, errAwaitingAnswer) keep working for callers
+// that only care about the error class, not the structured detail.
+func (e *AwaitingAnswerError) Unwrap() error { return errAwaitingAnswer }
+
 // Copilot models that use the Responses API instead of Chat Completions.
 var copilotResponsesModels = map[string]bool{
 	"gpt-5.2":       true,
