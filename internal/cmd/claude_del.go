@@ -67,7 +67,10 @@ crush claude-del --cwd /path/to/project
 			}
 		}
 
-		return removeSlashCommandFromDir(cmdDir)
+		if err := removeSlashCommandFromDir(cmdDir); err != nil {
+			return err
+		}
+		return removeFallbackCommandFromDir(cmdDir)
 	},
 }
 
@@ -78,7 +81,10 @@ func runClaudeDel(cwd string) error {
 		return err
 	}
 	cmdDir := filepath.Join(cwd, claudeCommandsDir)
-	return removeSlashCommandFromDir(cmdDir)
+	if err := removeSlashCommandFromDir(cmdDir); err != nil {
+		return err
+	}
+	return removeFallbackCommandFromDir(cmdDir)
 }
 
 func removeSlashCommand(cwd string) error {
@@ -87,6 +93,26 @@ func removeSlashCommand(cwd string) error {
 
 func removeSlashCommandFromDir(dir string) error {
 	path := filepath.Join(dir, "crush.md")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read %s: %w", path, err)
+	}
+	if !strings.Contains(string(data), claudeSlashCommandSentinel) {
+		fmt.Fprintf(os.Stderr, "refusing to delete %s — does not look like ours (missing sentinel)\n", path)
+		return nil
+	}
+	if err := os.Remove(path); err != nil {
+		return fmt.Errorf("failed to remove %s: %w", path, err)
+	}
+	fmt.Fprintf(os.Stderr, "removed %s\n", path)
+	return nil
+}
+
+func removeFallbackCommandFromDir(dir string) error {
+	path := filepath.Join(dir, "crush-fallback.md")
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {

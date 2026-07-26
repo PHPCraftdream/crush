@@ -30,6 +30,15 @@ import (
 //go:embed claude_slash_command.md
 var claudeSlashCommandTemplate string
 
+// claudeFallbackCommandTemplate is the canonical /crush-fallback slash-command
+// body minus the sentinel marker. Same rationale as claudeSlashCommandTemplate
+// above: kept in a sibling .md file so edits don't need Go string escaping,
+// and reuses the shared claudeSlashCommandSentinel since ownership checks are
+// already scoped per specific filename (crush-fallback.md here).
+//
+//go:embed claude_crush_fallback_command.md
+var claudeFallbackCommandTemplate string
+
 // claudeInitBlockPattern matches any version of the legacy inserted block —
 // `<!-- crush-claude-init:v1 --> … <!-- /crush-claude-init -->`.
 // Kept around because `claude-init` still runs it on existing CLAUDE.md
@@ -126,6 +135,10 @@ crush claude-init --cwd /path/to/project
 		if err := writeSlashCommandToDir(cmdDir); err != nil {
 			return fmt.Errorf("slash command: %w", err)
 		}
+		// Install / refresh the /crush-fallback slash-command.
+		if err := writeFallbackCommandToDir(cmdDir); err != nil {
+			return fmt.Errorf("fallback slash command: %w", err)
+		}
 		return nil
 	},
 }
@@ -194,6 +207,35 @@ func writeSlashCommandToDir(dir string) error {
 // from the operator.
 func claudeSlashCommandContent() string {
 	return claudeSlashCommandSentinel + "\n" + claudeSlashCommandTemplate
+}
+
+func writeFallbackCommandToDir(dir string) error {
+	path := filepath.Join(dir, "crush-fallback.md")
+	if data, err := os.ReadFile(path); err == nil {
+		if !strings.Contains(string(data), claudeSlashCommandSentinel) {
+			fmt.Fprintf(os.Stderr, "warning: %s exists but does not contain our sentinel — skipping (someone else owns that file)\n", path)
+			return nil
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("read %s: %w", path, err)
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", dir, err)
+	}
+	if err := os.WriteFile(path, []byte(claudeFallbackCommandContent()), 0o644); err != nil {
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	fmt.Fprintf(os.Stderr, "wrote %s\n", path)
+	return nil
+}
+
+// claudeFallbackCommandContent returns the body of
+// `.claude/commands/crush-fallback.md`. Sentinel marker is prepended so
+// claude-del can recognise files we own without parsing content. Triggered
+// ONLY by an explicit `/crush-fallback <agent>` from the operator, right
+// after a peak-hours refusal.
+func claudeFallbackCommandContent() string {
+	return claudeSlashCommandSentinel + "\n" + claudeFallbackCommandTemplate
 }
 
 func init() {

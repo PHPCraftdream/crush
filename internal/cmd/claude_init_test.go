@@ -268,6 +268,49 @@ func TestClaudeDel_RemovesEmptyFile(t *testing.T) {
 	assert.Contains(t, stderr, "removed empty CLAUDE.md")
 }
 
+func TestClaudeInit_CreatesFallbackCommand(t *testing.T) {
+	dir := t.TempDir()
+	runClaudeInitInDir(t, dir)
+
+	fallbackPath := filepath.Join(dir, ".claude", "commands", "crush-fallback.md")
+	bts, err := os.ReadFile(fallbackPath)
+	require.NoError(t, err)
+	got := string(bts)
+	assert.Contains(t, got, claudeSlashCommandSentinel)
+	assert.Contains(t, got, "$ARGUMENTS")
+	assert.Contains(t, got, "CronCreate")
+	assert.Contains(t, got, "TaskCreate")
+}
+
+func TestClaudeInit_FallbackCommandOverwritesWithSentinel(t *testing.T) {
+	dir := t.TempDir()
+	runClaudeInitInDir(t, dir)
+	fallbackPath := filepath.Join(dir, ".claude", "commands", "crush-fallback.md")
+	first, err := os.ReadFile(fallbackPath)
+	require.NoError(t, err)
+
+	runClaudeInitInDir(t, dir)
+	second, err := os.ReadFile(fallbackPath)
+	require.NoError(t, err)
+	assert.Equal(t, string(first), string(second))
+}
+
+func TestClaudeInit_FallbackCommandSkipsWithoutSentinel(t *testing.T) {
+	dir := t.TempDir()
+	fallbackPath := filepath.Join(dir, ".claude", "commands", "crush-fallback.md")
+	require.NoError(t, os.MkdirAll(filepath.Dir(fallbackPath), 0o755))
+	require.NoError(t, os.WriteFile(fallbackPath, []byte("someone else's file"), 0o644))
+
+	stderr := captureStderr(t, func() {
+		runClaudeInitInDir(t, dir)
+	})
+
+	assert.Contains(t, stderr, "does not contain our sentinel")
+	bts, err := os.ReadFile(fallbackPath)
+	require.NoError(t, err)
+	assert.Equal(t, "someone else's file", string(bts))
+}
+
 func TestClaudeDel_RemovesSlashCommandWithSentinel(t *testing.T) {
 	dir := t.TempDir()
 	slashPath := filepath.Join(dir, ".claude", "commands", "crush.md")
@@ -300,6 +343,42 @@ func TestClaudeDel_RefusesSlashCommandWithoutSentinel(t *testing.T) {
 	assert.Contains(t, stderr, "missing sentinel")
 
 	bts, err := os.ReadFile(slashPath)
+	require.NoError(t, err)
+	assert.Equal(t, "not ours", string(bts))
+}
+
+func TestClaudeDel_RemovesFallbackCommandWithSentinel(t *testing.T) {
+	dir := t.TempDir()
+	fallbackPath := filepath.Join(dir, ".claude", "commands", "crush-fallback.md")
+	require.NoError(t, os.MkdirAll(filepath.Dir(fallbackPath), 0o755))
+	require.NoError(t, os.WriteFile(fallbackPath, []byte("<!-- crush-slash-command:v1 -->\nsome content\n"), 0o644))
+
+	claudeMdPath := filepath.Join(dir, claudeMdFile)
+	require.NoError(t, os.WriteFile(claudeMdPath, []byte("# Notes\n"), 0o644))
+
+	runClaudeDelInDir(t, dir)
+
+	_, err := os.Stat(fallbackPath)
+	assert.True(t, os.IsNotExist(err), "fallback command file should be removed when it has our sentinel")
+}
+
+func TestClaudeDel_RefusesFallbackCommandWithoutSentinel(t *testing.T) {
+	dir := t.TempDir()
+	fallbackPath := filepath.Join(dir, ".claude", "commands", "crush-fallback.md")
+	require.NoError(t, os.MkdirAll(filepath.Dir(fallbackPath), 0o755))
+	require.NoError(t, os.WriteFile(fallbackPath, []byte("not ours"), 0o644))
+
+	claudeMdPath := filepath.Join(dir, claudeMdFile)
+	require.NoError(t, os.WriteFile(claudeMdPath, []byte("# Notes\n"), 0o644))
+
+	stderr := captureStderr(t, func() {
+		runClaudeDelInDir(t, dir)
+	})
+
+	assert.Contains(t, stderr, "refusing to delete")
+	assert.Contains(t, stderr, "missing sentinel")
+
+	bts, err := os.ReadFile(fallbackPath)
 	require.NoError(t, err)
 	assert.Equal(t, "not ours", string(bts))
 }
