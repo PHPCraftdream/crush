@@ -65,6 +65,51 @@ retry-after time and wait for their decision — do not route around it
 by adding the flag, switching provider, or re-running until the window
 closes, unsolicited.
 
+## Resuming after `exit_reason: "awaiting_answer"`
+
+A `crush run --json` session can force-finish its turn with
+`"exit_reason": "awaiting_answer"` because the sub-agent called its
+`ask_question` tool. **This is not a crash, and it is a different
+situation from the rate-limit / peak-hours refusal above** — the
+agent didn't fail or get blocked by a provider, it deliberately
+stopped because it needs an answer to something it can't decide on
+its own.
+
+The question — and the exact resume command — live in `.error`, not
+`.final_text` (final_text is typically empty for this stop reason;
+that's expected, not a bug):
+
+```
+jq -r '.error' .crush/stdin/<task>.out
+```
+
+`.error` carries the question, any suggested options, and a
+ready-to-run resume line with the session id already filled in:
+
+```
+crush run --session <id> "<your answer>"
+```
+
+Use that command as-is — don't invent your own syntax for resuming.
+
+Decide who answers, same judgment call as `--allow-peak-hours` above:
+
+- **Answerable from context you already have** (the task as given,
+  decisions already made this chat, files already read) → answer it
+  yourself and resume immediately. Don't stall on something you
+  already know.
+- **Genuinely the operator's call** (a real product/design/risk
+  decision, not something implied by the task) → surface the question
+  to the human verbatim and wait for their answer before resuming. Do
+  not guess on their behalf.
+
+Resume with a **fresh `crush run --session <id> "<answer>"`, not
+`sessions inject`** — the process that asked the question already
+exited when the turn force-finished (that's what "exiting now" in the
+guidance text means), so there is no live holder left to inject a
+message into. A fresh `crush run` against the same `--session` id
+picks the conversation back up exactly where `ask_question` left off.
+
 ## Launching
 
 - `--role smart` for non-trivial, `--role fast` for one-liners.
