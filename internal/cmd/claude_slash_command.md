@@ -110,9 +110,63 @@ guidance text means), so there is no live holder left to inject a
 message into. A fresh `crush run` against the same `--session` id
 picks the conversation back up exactly where `ask_question` left off.
 
+## Orchestrator mode — and why a worker's question is NOT your problem
+
+When `--role smart` is used, a `worker` model is configured (`crush
+models use ... --worker <model>`), and `--agents` was left unset (not
+explicitly passed), the launched `crush run` auto-lifts its default
+sub-agent ban for the `agent` tool specifically — `agentic_fetch` stays
+banned either way, that's an unrelated concern. Crush's own coder model
+is then instructed (an "Orchestrator mode" rule in its system prompt) to
+delegate hands-on work — editing, writing, running commands — to worker
+sub-agents via the `agent` tool in chunks sized to fit the worker's
+context window, rather than editing everything itself, and to treat
+every worker's report as a CLAIM: re-check the actual diff/test result
+zero-trust, not just trust the worker's "done".
+
+**An explicit `--agents single` always overrides this and wins**,
+regardless of whether a worker is configured — sub-agent fan-out stays
+off. Orchestrator mode only ever auto-activates when you leave
+`--agents` unset.
+
+**The one distinction you must never blur:** a worker sub-agent calling
+`ask_question` mid-delegation is completely different from the
+top-level question flow documented above, and it does **not** surface
+to you at all.
+
+- **Top-level question** (documented above): the `crush run` process
+  you launched calls `ask_question` itself. There is nobody left inside
+  the process to answer it, so the process force-finishes its turn and
+  **exits** with `exit_reason: "awaiting_answer"`. You see this as your
+  background command completing, and you must resume it yourself with
+  a fresh `crush run --session <id> "<answer>"`.
+- **Worker sub-agent's question**: a worker delegated to via the
+  `agent` tool calls `ask_question` on its own turn. This does **not**
+  make the `crush run` process exit — it stays alive. Crush's own
+  orchestrating model receives the pause as a normal (successful) tool
+  result telling it to resume the worker via `resume_session_id`, and —
+  driven by its own orchestrator-mode instructions — answers it and
+  keeps going automatically, inside the still-running process. You
+  never see this happen, your background command keeps running, and
+  there is nothing for you to resume or answer.
+
+Do not try to `sessions inject` into a worker's child sub-session
+directly to answer its question — it isn't meant to be addressed
+externally; crush's own orchestrating model already owns that resume.
+
 ## Launching
 
-- `--role smart` for non-trivial, `--role fast` for one-liners.
+- `--role smart` for non-trivial, `--role fast` for one-liners. Two more
+  roles exist, both optional and never auto-selected: `--role worker`
+  (the cheap slot for delegated hands-on sub-task work — reachable
+  directly, or indirectly when `--role smart` triggers orchestrator
+  mode, see below) and `--role reviewer` (the strongest configured
+  slot, for an explicit one-off strong-review invocation, e.g. `--role
+  reviewer --session "pr-42-review" "review this diff"`). Configure
+  them with `crush models use <large> <small> --worker <model>
+  --reviewer <model>` (the two positional args are still required;
+  `--worker`/`--reviewer` are additive flags on the same command) —
+  not the plain two-positional form, which only touches smart/fast.
 - Stable, task-meaningful `--session` id (issue/branch/topic slug) —
   same id continues across runs and is recognisable in `sessions watch`.
 - `--timeout 60m` as the standard ceiling, on every run. It's generous
@@ -182,6 +236,13 @@ picks the conversation back up exactly where `ask_question` left off.
 `crush sessions watch` is the primary monitor — auto-detects end and
 prints a summary (duration, tokens, cost); unlike `sessions tail
 --follow` it never hangs on a dead lock.
+
+With orchestrator mode active (see above), `sessions watch`/`sessions
+tree` may show child sessions (worker delegations) appearing and
+disappearing over the course of a single `crush run` invocation — that
+is expected, not a sign of something wrong. Don't try to `sessions
+inject` into one of those child sessions directly; it isn't meant to be
+addressed externally.
 
 ```
 crush sessions watch              # interactive picker → live-tail
@@ -276,6 +337,11 @@ it as the system prompt when neither `--system-prompt` nor
 apply" rules per repo (stay in scope, end with a final assistant
 message, never commit/push, run the tests, surface ambiguity). Explicit
 `--system-prompt-file` always wins.
+
+`crush models efforts [model]` (list/validate reasoning-effort levels a
+model supports) and `crush models bump <large|small|worker|reviewer>
+<up|down>` (step a role's effort one level) also exist — see README.md's
+`crush models` section for the full picture, not repeated here.
 
 ## When the lock is stuck
 
