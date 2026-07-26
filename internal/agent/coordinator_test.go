@@ -1973,6 +1973,60 @@ func TestBuildTools_CoderHasAskQuestion(t *testing.T) {
 		"buildTools must return ask_question for the top-level coder agent, not silently drop it in the AllowedTools filter")
 }
 
+// TestBuildTools_CoderHasAskQuestion_AllRoles pins the claim that
+// ask_question's presence in the TOP-LEVEL coder's tool set is
+// role-independent: buildToolsAgentConfig (coordinator.go) only ever
+// modifies AllowedTools when isSubAgent is true (see the early
+// `if !isSubAgent || !c.workerSubAgentActive() { return agent }` guard), so
+// for the top-level coder (isSubAgent=false, as buildTools is always called
+// for the coder agent) the AllowedTools passed through is always
+// allToolNames() verbatim (modulo DisabledTools, unset here) regardless of
+// SetActiveModelRole. This test exercises buildTools for the coder under
+// every SetActiveModelRole value (large, small, worker, reviewer, and the
+// unset/"" case that TestBuildTools_CoderHasAskQuestion already covered
+// without a role) and asserts ask_question survives the AllowedTools filter
+// in every single one -- a regression guard one level more specific than
+// TestBuildTools_CoderHasAskQuestion (which only ever tested the unset-role
+// case).
+func TestBuildTools_CoderHasAskQuestion_AllRoles(t *testing.T) {
+	roles := []config.SelectedModelType{
+		config.SelectedModelTypeLarge,
+		config.SelectedModelTypeSmall,
+		config.SelectedModelTypeWorker,
+		config.SelectedModelTypeReviewer,
+		"", // unset -- treated as smart by workerSubAgentActive/buildAgentModels
+	}
+
+	for _, role := range roles {
+		name := string(role)
+		if name == "" {
+			name = "unset"
+		}
+		t.Run("role="+name, func(t *testing.T) {
+			env := testEnv(t)
+			coord := newWorkerToolTestCoordinator(t, env, true) // Worker configured too, to stress the sub-agent-only gate
+			if role != "" {
+				coord.SetActiveModelRole(role)
+			}
+
+			coderCfg, ok := coord.cfg.Config().Agents[config.AgentCoder]
+			require.True(t, ok, "coder agent must be configured")
+			require.Contains(t, coderCfg.AllowedTools, tools.AskQuestionToolName,
+				"allToolNames() must include ask_question or the coder agent will never be allowed to use it")
+
+			built, err := coord.buildTools(t.Context(), coderCfg, false)
+			require.NoError(t, err)
+
+			names := make([]string, 0, len(built))
+			for _, tool := range built {
+				names = append(names, tool.Info().Name)
+			}
+			assert.Contains(t, names, tools.AskQuestionToolName,
+				"buildTools must return ask_question for the top-level coder agent under active role %q -- role must never gate ask_question at the top level, only isSubAgent+workerSubAgentActive does (see buildToolsAgentConfig)", role)
+		})
+	}
+}
+
 // TestAllToolNames_CoversUnconditionallyBuiltTools is a guard against this
 // entire class of bug in the future: buildTools constructs a fixed slice of
 // tools unconditionally (everything except the "agent" and "agentic_fetch"
