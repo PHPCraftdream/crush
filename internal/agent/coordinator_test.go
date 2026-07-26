@@ -16,6 +16,7 @@ import (
 	"charm.land/fantasy/providers/bedrock"
 	"charm.land/fantasy/providers/openai"
 	"charm.land/fantasy/providers/openaicompat"
+	"github.com/charmbracelet/crush/internal/agent/prompt"
 	"github.com/charmbracelet/crush/internal/agent/tools"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/message"
@@ -1610,6 +1611,89 @@ func TestBuildAgentModels_WorkerPreference(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, "large-provider", large.ModelCfg.Provider)
 		assert.Equal(t, "large-model", large.ModelCfg.Model)
+	})
+}
+
+// TestBuildAgent_OrchestratorActiveWiring pins how buildAgent wires
+// SessionAgentOptions.OrchestratorActive (the stream watchdog's
+// never-freeze-backstop hook, see effectiveToolMaxDuration in agent.go):
+// only the top-level (isSubAgent=false) agent gets a non-nil hook, and that
+// hook must track workerSubAgentActive()'s live value rather than a snapshot
+// taken at build time — because SetActiveModelRole is called AFTER the
+// top-level agent is constructed in the real app.RunNonInteractive path
+// (coordinator construction happens before role resolution), so a value
+// baked in at buildAgent time would see the wrong (pre-role) state for
+// runs where the operator picked an explicit --role.
+func TestBuildAgent_OrchestratorActiveWiring(t *testing.T) {
+	agentCfgFor := func(t *testing.T, coord *coordinator, name string) config.Agent {
+		t.Helper()
+		cfg, ok := coord.cfg.Config().Agents[name]
+		require.True(t, ok, "%s agent must be configured", name)
+		return cfg
+	}
+	testPrompt := func(t *testing.T) *prompt.Prompt {
+		t.Helper()
+		p, err := coderPrompt()
+		require.NoError(t, err)
+		return p
+	}
+
+	t.Run("sub-agent build gets a nil OrchestratorActive hook", func(t *testing.T) {
+		env := testEnv(t)
+		coord := newWorkerToolTestCoordinator(t, env, true)
+
+		built, err := coord.buildAgent(t.Context(), testPrompt(t), agentCfgFor(t, coord, config.AgentTask), true)
+		require.NoError(t, err)
+		sa := built.(*sessionAgent)
+		assert.Nil(t, sa.orchestratorActive,
+			"sub-agents must never get an orchestrator-aware watchdog backstop: they cannot spawn further sub-workers (agent tool excluded from workerToolNames), so there is no legitimate long delegation to accommodate")
+	})
+
+	t.Run("top-level agent build gets a non-nil OrchestratorActive hook that tracks live role state", func(t *testing.T) {
+		env := testEnv(t)
+		coord := newWorkerToolTestCoordinator(t, env, true)
+		// activeModelRole intentionally left unset at buildAgent time — this
+		// reproduces the real app.RunNonInteractive ordering where
+		// SetActiveModelRole runs AFTER the coordinator (and its top-level
+		// agent) is already constructed.
+
+		built, err := coord.buildAgent(t.Context(), testPrompt(t), agentCfgFor(t, coord, config.AgentCoder), false)
+		require.NoError(t, err)
+		sa := built.(*sessionAgent)
+		require.NotNil(t, sa.orchestratorActive, "the top-level agent must get a non-nil OrchestratorActive hook when a Worker model is configured")
+
+		// Unset/large role + Worker configured => orchestrating.
+		assert.True(t, sa.orchestratorActive(), "unset role must be treated as smart, matching workerSubAgentActive's own semantics")
+
+		// Now simulate the operator explicitly picking a non-smart role
+		// AFTER buildAgent already ran (the real ordering). Because the
+		// hook is a live closure over the coordinator rather than a value
+		// snapshotted at build time, it must immediately reflect the change.
+		coord.SetActiveModelRole(config.SelectedModelTypeWorker)
+		assert.False(t, sa.orchestratorActive(),
+			"an explicit non-smart role set after buildAgent must still be observed by the hook — proves the hook is evaluated live, not baked in at construction time")
+
+		coord.SetActiveModelRole(config.SelectedModelTypeLarge)
+		assert.True(t, sa.orchestratorActive(), "switching back to large/smart must flip the hook back to true")
+	})
+
+	t.Run("top-level agent build with no Worker configured never orchestrates", func(t *testing.T) {
+		env := testEnv(t)
+		coord := newWorkerToolTestCoordinator(t, env, false)
+		// newWorkerToolTestCoordinator(..., false) only skips EXPLICITLY
+		// setting the Worker slot — it does not guarantee the slot is
+		// actually absent, since config.Init may populate Models[Worker]
+		// with an environment-derived default (e.g. an embedded Z.AI
+		// default provider) before this helper runs. Delete it explicitly
+		// so this test's "no Worker configured" premise holds regardless
+		// of the host environment's config/env vars.
+		delete(coord.cfg.Config().Models, config.SelectedModelTypeWorker)
+
+		built, err := coord.buildAgent(t.Context(), testPrompt(t), agentCfgFor(t, coord, config.AgentCoder), false)
+		require.NoError(t, err)
+		sa := built.(*sessionAgent)
+		require.NotNil(t, sa.orchestratorActive, "the hook itself is still wired for the top-level agent even without a Worker configured")
+		assert.False(t, sa.orchestratorActive(), "no Worker model configured means this run can never be orchestrating a delegation")
 	})
 }
 

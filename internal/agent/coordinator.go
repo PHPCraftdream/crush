@@ -1266,6 +1266,22 @@ func (c *coordinator) buildAgent(ctx context.Context, prompt *prompt.Prompt, age
 			checkpointInterval = defaultCheckpointInterval
 		}
 	}
+	// OrchestratorActive is only wired for the top-level (non-sub) agent:
+	// it's the top-level agent's OWN "agent" tool call — dispatched to a
+	// worker sub-agent — whose wall-clock the watchdog's tool-pause bounds.
+	// Sub-agents never spawn further sub-workers (the "agent" tool is
+	// excluded from workerToolNames as a recursion guard), so a sub-agent's
+	// own watchdog has no orchestrator-style long tool call to accommodate
+	// and should keep the plain toolExecutionMaxDefault backstop. The
+	// closure re-checks c.workerSubAgentActive() fresh on every Run() call
+	// (not baked in at buildAgent time) because activeModelRole is set via
+	// SetActiveModelRole AFTER the coordinator/top-level agent is
+	// constructed (see app.RunNonInteractive) — a value captured here at
+	// build time would still see the pre-role-resolution default.
+	var orchestratorActive func() bool
+	if !isSubAgent {
+		orchestratorActive = c.workerSubAgentActive
+	}
 	result := NewSessionAgent(SessionAgentOptions{
 		LargeModel:           large,
 		SmallModel:           small,
@@ -1280,6 +1296,7 @@ func (c *coordinator) buildAgent(ctx context.Context, prompt *prompt.Prompt, age
 		Notify:               c.notify,
 		StreamIdleTimeout:    streamIdleTimeout,
 		ToolMaxDuration:      toolMaxDuration,
+		OrchestratorActive:   orchestratorActive,
 		DataDirectory:        c.cfg.Config().Options.DataDirectory,
 		CheckpointInterval:   checkpointInterval, // Fork patch: batch 8
 		// Fork patch: peak-hours mid-turn re-check. Re-reads the provider
@@ -1500,6 +1517,16 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubA
 // operator explicitly chose a non-large role (fast/worker/reviewer) for the
 // whole run — we don't second-guess that choice by force-upgrading/
 // downgrading sub-agents. Fork patch (reviewer/worker roles).
+//
+// Also reused (unchanged) as the top-level coder agent's
+// SessionAgentOptions.OrchestratorActive predicate in buildAgent: the same
+// role/config gate that decides "will a spawned sub-agent behave like a
+// worker" is exactly "will THIS run's own agent tool call route to a worker
+// doing real hands-on work", which is what the stream watchdog's
+// never-freeze backstop needs to know to avoid false-firing on a legitimate
+// long delegation (see orchestratorToolExecutionMaxDefault in agent.go).
+// The function body below never inspects isSubAgent, so calling it for the
+// top-level (non-sub) agent is safe despite the doc framing above.
 func (c *coordinator) workerSubAgentActive() bool {
 	c.activeModelRoleMu.Lock()
 	activeRole := c.activeModelRole
