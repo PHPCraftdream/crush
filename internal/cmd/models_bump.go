@@ -26,46 +26,26 @@ import (
 var modelsBumpCmd = &cobra.Command{
 	Use:   "bump <large|small|worker|reviewer> <up|down>",
 	Short: "Step a role's reasoning effort up or down by one level",
-	Long: `Move a role's (large/small/worker/reviewer) reasoning effort exactly one
-step in its model's own ordered effort-levels list, and print the before/after
-effort. This is DIFFERENT from ` + "`crush models efforts [model]`" + ` (plural) — that
-command only explains what levels a model supports and how to set one
-manually; it never changes anything. ` + "`models bump`" + ` is the one that writes
-a new value, one step at a time, without you having to know or retype the
-model's full level name.
+	Long: `Step a role's effort one level up or down and print the before/after
+value. Unlike ` + "`crush models efforts [model]`" + ` (which only shows what levels
+are available), ` + "`bump`" + ` writes the new value.
 
-Resolution:
-  1. Reads the role's currently effective (provider, model, effort) — the
-     same resolution ` + "`crush models state`" + ` uses.
-  2. Looks the model up in the atom registry to get its ordered Levels()
-     array (see ` + "`crush models efforts <model>`" + ` to inspect that array
-     directly). If the model isn't a known atom, stepping isn't supported —
-     use the manual ` + "`<model>@<level>`" + ` syntax via ` + "`crush models use`" + ` instead.
-  3. An UNSET effort is treated as conceptually one step BELOW the lowest
-     defined level: ` + "`up`" + ` from unset lands on the lowest level;
-     ` + "`down`" + ` from unset reports "already at the lowest (unset)" and changes
-     nothing.
-  4. At either end of the array, the command prints an informational
-     message and exits 0 — this is an expected outcome, not an error.
+` + "`up`" + ` from unset lands on the lowest level; ` + "`down`" + ` from unset reports
+nothing to lower. At either end of the list, the command prints a message
+and exits 0 (not an error).
 
-The write goes through the same batched, validate-then-write config
-mechanism as ` + "`crush models use`" + `, scoped like it (` + "`--global`" + `/` + "`--local`" + `).`,
+Scoped like ` + "`crush models use`" + ` (` + "`--global`" + `/` + "`--local`" + `).`,
 	Args: cobra.ExactArgs(2),
 	Example: `
-# Raise the reviewer's effort by one level (e.g. high -> xhigh).
-crush models bump reviewer up
+# Step by step through a GLM-5.2 role: off -> high -> max.
+crush models bump reviewer up    # off -> high
+crush models bump reviewer up    # high -> max
+crush models bump reviewer up    # already at max, prints a message, exits 0
 
-# Lower the worker's effort by one level.
-crush models bump worker down
+crush models bump worker down    # one level down
+crush models bump --local large down   # workspace-scoped
 
-# Already at the top? Prints a message, exits 0 — not an error.
-crush models bump reviewer up
-
-# Workspace-scoped instead of global.
-crush models bump --local large down
-
-# See the full picture afterward.
-crush models state
+crush models state   # see the full picture afterward
   `,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		roleArg, dirArg := args[0], args[1]
