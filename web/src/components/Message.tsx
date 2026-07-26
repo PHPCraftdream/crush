@@ -5,8 +5,9 @@ import remarkGfm from "remark-gfm";
 import remarkBreaks from "remark-breaks";
 import rehypeHighlight from "rehype-highlight";
 import type { Message as Msg, ContentPart } from "../types";
-import { BrainCircuit, Check, Copy, GitFork, Pencil, RotateCcw, Star, Trash2, BookMarked, ChevronDown, ChevronUp } from "lucide-react";
+import { BrainCircuit, Check, Copy, GitFork, Pencil, RotateCcw, Star, Trash2, BookMarked, ChevronDown, ChevronUp, HelpCircle, X } from "lucide-react";
 import { SubAgentBlock } from "./SubAgentBlock";
+import { ws } from "../ws";
 import {
   $busySessions,
   $activeSessionID,
@@ -1248,7 +1249,7 @@ function groupPartsIntoBlocks(parts: ContentPart[], breaks: Set<number>): Visual
 
 // ── Part router ───────────────────────────────────────────────────────────────
 
-const Part = memo(function Part({ part, index, isUser, messageID, thinkingDone, partialWorkDone, model, effort }: { part: ContentPart; index: number; isUser: boolean; messageID: string; thinkingDone: boolean; partialWorkDone: boolean; model?: string; effort?: string }) {
+const Part = memo(function Part({ part, index, isUser, messageID, thinkingDone, partialWorkDone, model, effort, sessionID }: { part: ContentPart; index: number; isUser: boolean; messageID: string; thinkingDone: boolean; partialWorkDone: boolean; model?: string; effort?: string; sessionID?: string }) {
   switch (part.type) {
     case "text":     return <TextBlock text={part.Text} isUser={isUser} />;
     case "thinking": return <ThinkingPart thinking={part.Thinking} messageID={messageID} partIndex={index} done={thinkingDone} model={model} effort={effort} />;
@@ -1275,6 +1276,10 @@ const Part = memo(function Part({ part, index, isUser, messageID, thinkingDone, 
       if (part.Reason === "error" && part.Message === "Stream stalled" && partialWorkDone) {
         return <StreamPausedBlock details={part.Details} />;
       }
+      const asked = parseAwaitingAnswer(part.Reason, part.Message, part.Details);
+      if (asked) {
+        return <AskQuestionBlock question={asked.question} options={asked.options} sessionID={sessionID ?? ""} />;
+      }
       if (part.Reason === "error" || part.Reason === "canceled") {
         return <FinishErrorBlock reason={part.Reason} message={part.Message} details={part.Details} />;
       }
@@ -1282,6 +1287,153 @@ const Part = memo(function Part({ part, index, isUser, messageID, thinkingDone, 
     }
     default: return null;
   }
+});
+
+// ── ask_question rendering ────────────────────────────────────────────────
+//
+// The `ask_question` agent tool (internal/agent/tools/ask_question.go)
+// force-finishes the turn instead of blocking mid-stream for an answer —
+// this fork's web sessions have no separate blocking channel for that (see
+// internal/agent/question_stop.go). The question ends up as an ordinary
+// FinishReasonError part on the assistant message, and the "answer" is just
+// the next normal chat message. This block is a pure convenience layer on
+// top of that plain flow: it adds clickable option chips and an explicit
+// free-text box, both of which funnel into the exact same `send_message`
+// WS call ChatInput's `send()` uses.
+//
+// Detection caveat: there is currently NO structural signal for "this
+// finish is a question, not a real error" on the wire — `crush run --json`
+// computes exit_reason: "awaiting_answer" (internal/app/app.go
+// buildRunResult), but that's CLI-only and never reaches the web socket.
+// FinishPart only carries {Reason, Message, Details} and Reason is the
+// generic "error" here, same as any other failure. So the only thing to
+// key off is TEXT: the fixed title string awaitingAnswerStoppedFinishText
+// always uses, plus the "QUESTION: " marker AwaitingAnswerGuidance always
+// prefixes Details with. Both are internal/agent/question_stop.go string
+// constants that this file has no compile-time link to — if that wording
+// ever changes, parseAwaitingAnswer silently stops matching and the finish
+// part just falls back to the plain FinishErrorBlock rendering (safe
+// degradation, not a crash). The correct long-term fix is a dedicated
+// structural field (e.g. Finish.Kind == "awaiting_answer") threaded through
+// internal/server → the WS payload → FinishPart in types.ts; that's out of
+// scope for this pass (pure frontend polish on top of the existing stream).
+const AWAITING_ANSWER_TITLE = "Stopped: agent asked a question and is awaiting an answer";
+
+interface ParsedQuestion {
+  question: string;
+  options: string[];
+}
+
+// parseAwaitingAnswer mirrors the exact string shape built by
+// awaitingAnswerStoppedFinishText + AwaitingAnswerGuidance in
+// internal/agent/question_stop.go:
+//
+//   Details = "<err.Error() line>\n\nQUESTION: <question>[\n\nSuggested options: a | b | c]\n\nThis is not a crash — …"
+//
+// Exported for reuse (e.g. tests); returns null for anything that doesn't
+// match, which the caller treats as "not a question, render normally".
+export function parseAwaitingAnswer(reason: string, msg: string, details: string): ParsedQuestion | null {
+  if (reason !== "error" || msg !== AWAITING_ANSWER_TITLE) return null;
+  const match = details.match(/QUESTION: ([\s\S]*?)\n\nThis is not a crash/);
+  if (!match) return null;
+  let body = match[1];
+  const optMarker = "\n\nSuggested options: ";
+  const optIdx = body.indexOf(optMarker);
+  let options: string[] = [];
+  if (optIdx !== -1) {
+    options = body.slice(optIdx + optMarker.length).split(" | ").map(s => s.trim()).filter(Boolean);
+    body = body.slice(0, optIdx);
+  }
+  const question = body.trim();
+  if (!question) return null;
+  return { question, options };
+}
+
+// AskQuestionBlock — the agent is waiting for an answer. Renders the
+// question as plain text (matches how a normal reply reads), a row of
+// clickable chips for any suggested options, and an ALWAYS-VISIBLE inline
+// free-text input + send button (explicitly requested: don't rely on the
+// operator noticing they can just type in the chat box below). Both paths
+// send through the normal chat pipeline — no new backend state, no special
+// "answered" flag. "Dismiss" only hides this block locally; it sends
+// nothing and does not mark anything answered server-side.
+const AskQuestionBlock = memo(function AskQuestionBlock({ question, options, sessionID }: { question: string; options: string[]; sessionID: string }) {
+  const [dismissed, setDismissed] = useState(false);
+  const [answer, setAnswer] = useState("");
+
+  const answerWith = useCallback((text: string) => {
+    const trimmed = text.trim();
+    if (!trimmed || !sessionID) return;
+    ws.send("send_message", { sessionID, content: trimmed });
+    setDismissed(true);
+  }, [sessionID]);
+
+  const onChipClick = useCallback((opt: string) => answerWith(opt), [answerWith]);
+
+  const onSubmit = useCallback((e: React.FormEvent) => {
+    e.preventDefault();
+    answerWith(answer);
+  }, [answer, answerWith]);
+
+  const onAnswerChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => setAnswer(e.target.value), []);
+  const onDismiss = useCallback(() => setDismissed(true), []);
+
+  if (dismissed) return null;
+
+  return (
+    <div data-test-id="ask-question-block" className="tool-block my-2 border-accent/40 bg-accent/[6%]">
+      <div className="flex items-center justify-between gap-2 mb-2">
+        <div className="flex items-center gap-2">
+          <HelpCircle size={15} className="text-accent shrink-0" />
+          <span className="text-accent font-semibold text-sm">Agent is waiting for your answer</span>
+        </div>
+        <button
+          type="button"
+          onClick={onDismiss}
+          title="Dismiss — does not send anything"
+          className="text-text-subtle hover:text-text transition-colors shrink-0"
+        >
+          <X size={15} />
+        </button>
+      </div>
+
+      <p className="text-text text-sm leading-relaxed mb-3 whitespace-pre-wrap">{question}</p>
+
+      {options.length > 0 && (
+        <div data-test-id="ask-question-options" className="flex flex-wrap gap-2 mb-3">
+          {options.map((opt, i) => (
+            <button
+              key={i}
+              type="button"
+              onClick={() => onChipClick(opt)}
+              className="px-3 py-1.5 text-sm rounded-full border border-accent/40 text-accent hover:bg-accent/15 active:scale-[0.97] transition-all"
+            >
+              {opt}
+            </button>
+          ))}
+        </div>
+      )}
+
+      <form onSubmit={onSubmit} className="flex items-center gap-2">
+        <input
+          type="text"
+          value={answer}
+          onChange={onAnswerChange}
+          placeholder="Type your answer…"
+          data-test-id="ask-question-answer-input"
+          className="flex-1 bg-base-subtle border border-surface rounded-lg px-3 py-2 text-sm text-text outline-none focus:border-accent"
+        />
+        <button
+          type="submit"
+          disabled={!answer.trim()}
+          data-test-id="ask-question-answer-submit"
+          className="px-3 py-2 text-sm btn-primary disabled:opacity-30"
+        >
+          Send
+        </button>
+      </form>
+    </div>
+  );
 });
 
 // Fork patch: visible block for error / canceled finish parts (replaces the
@@ -1347,7 +1499,7 @@ const UserContent = memo(function UserContent({
           ↻ auto-resumed
         </span>
       )}
-      {message.Parts.map((part, i) => <Part key={i} part={part} index={i} isUser messageID={message.ID} thinkingDone={false} />)}
+      {message.Parts.map((part, i) => <Part key={i} part={part} index={i} isUser messageID={message.ID} thinkingDone={false} sessionID={message.SessionID} />)}
     </div>
   );
 });
@@ -1432,7 +1584,7 @@ const AssistantContent = memo(function AssistantContent({
             <ToolActivityGroup items={block.items.map((it) => ({ ...it, messageID: message.ID }))} live={isLive} model={message.Model} effort={message.ReasoningEffort} />
           ) : (
             block.items.map(({ part, idx }) => (
-              <Part key={idx} part={part} index={idx} isUser={false} messageID={message.ID} thinkingDone={block.thinkingDone} partialWorkDone={partialWorkDone} model={message.Model} effort={message.ReasoningEffort} />
+              <Part key={idx} part={part} index={idx} isUser={false} messageID={message.ID} thinkingDone={block.thinkingDone} partialWorkDone={partialWorkDone} model={message.Model} effort={message.ReasoningEffort} sessionID={message.SessionID} />
             ))
           )}
         </div>
