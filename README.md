@@ -113,8 +113,19 @@ jq -r '.error' "$out"         # error.message if non-success
 
 #### Flags
 
-- **`--role smart|fast` (required)** — no silent default to the
-  expensive model.
+- **`--role` (required)** — four slots exist: `smart`/`large` (the
+  strong default; combined with a configured worker model this also
+  triggers orchestrator mode — see below), `fast`/`small` (the cheap
+  slot), `worker` (optional, no alias, cheap slot for delegated
+  hands-on sub-task work — reachable directly via `--role worker`, or
+  indirectly when a worker is configured and a `--role smart` run
+  dispatches a sub-agent via the `agent` tool), and `reviewer`
+  (optional, no alias, the strongest slot, for explicit review
+  invocations — never auto-selected). `worker`/`reviewer` are
+  configured via the web UI or `crush.json`'s `models.worker` /
+  `models.reviewer` (`crush models use` manages smart/fast; see
+  `--worker`/`--reviewer` flags below for the other two). No silent
+  default to the expensive model either way.
 - **`--session <id>`** — get-or-create. Pass the same id again to
   continue, or a new id to start fresh. Works as a stable key for CI
   matrices and orchestrator wrappers.
@@ -132,10 +143,19 @@ jq -r '.error' "$out"         # error.message if non-success
   a `json.SyntaxError` with a byte offset. Wrappers can branch on
   `exit_reason` instead of trusting the model's optimistic `"stop"`.
 - **`--agents single | with-agents | agent-allow`** — sub-agent fan-out
-  policy. `single` removes the `agent` and `agentic_fetch` tools from
-  the toolset entirely so the model literally cannot dispatch
-  sub-agents. `with-agents` nudges the model to fan out. `agent-allow`
-  (default) leaves the choice to the model.
+  policy. Leaving the flag **unset is the default and disables
+  fan-out** — the `agent` and `agentic_fetch` tools are removed from
+  the toolset entirely, same as passing `single` explicitly (a
+  non-interactive run has no UI to surface sub-agent work). `with-agents`
+  nudges the model to fan out. `agent-allow` opts in without a nudge,
+  leaving the choice to the model. **Automatic exception:** when
+  `--agents` is left unset (not explicitly `single`) AND `--role smart`
+  AND a `worker` model is configured, the ban on the `agent` tool
+  specifically is lifted automatically — this is "orchestrator mode"
+  (see below); `agentic_fetch` stays banned regardless, since it always
+  runs on the small model and isn't part of hands-on delegation. An
+  explicit `--agents single` always overrides this and keeps both tools
+  banned.
 - **`--aggregation summary | concat | attach`** — how sub-agent fan-out
   output reaches the orchestrator. `summary` (default) lets the parent
   compose a wrap-up; detail lives in the DB only. `concat` adds a
@@ -187,7 +207,9 @@ jq -r '.error' "$out"         # error.message if non-success
 - `error` — present whenever `exit_reason` is non-success. If the
   provider's Finish part had no message (some providers emit a bare
   error finish), a fallback names the most likely causes (provider
-  HTTP error, stream stall, OOM, context overflow).
+  HTTP error, stream stall, OOM, context overflow). One `exit_reason`
+  value is a **deliberate stop, not a failure**: `"awaiting_answer"`,
+  set when the model called `ask_question` — see below.
 - `recovered_partial` — present when the session had an orphaned
   partial assistant message from a previous interrupted run (detected
   by `Finish{Partial: true}` on an unfinished row). Shape:
@@ -196,6 +218,43 @@ jq -r '.error' "$out"         # error.message if non-success
   of partial assistant text — model run was interrupted"*. The text
   may be incomplete but is usually the bulk of what the model produced
   before the kill.
+
+#### Pausing mid-turn: `ask_question` and orchestrator mode
+
+The model has an `ask_question` tool it can call when it genuinely
+needs input to proceed (ambiguous scope, a destructive choice, missing
+info) instead of guessing. Because `crush run` has no synchronous way
+to block mid-turn for an answer, calling it **force-finishes the turn
+cleanly**:
+
+```bash
+crush run --role smart --session "deploy-1" "deploy the release" > out.json
+jq -r '.exit_reason' out.json   # "awaiting_answer"
+jq -r '.error'       out.json   # question + suggested options + resume command
+```
+
+- `exit_reason: "awaiting_answer"` is **not a failure** — treat it like
+  a normal continuation point, not something to retry.
+- The question, suggested options, and the exact resume command live in
+  `.error` (not `.final_text`).
+- Resume with `crush run --session <id> "<your answer>"` — **not**
+  `crush sessions inject`, since the process already exited.
+
+**Orchestrator mode:** when `--role smart` is used and a `worker` model
+is configured, the smart agent's system prompt gains an "Orchestrator
+mode" instruction: understand the task's shape, but delegate hands-on
+work (editing, writing, running commands) to the `agent` tool in
+worker-context-sized chunks instead of implementing inline — one file
+or logical change per delegation, with enough standalone context since
+the worker doesn't see the parent conversation.
+
+A worker sub-agent can itself call `ask_question` and pause. That
+does **not** end the orchestrator's turn (unlike the top-level case
+above) — it surfaces as a normal, non-error tool result along the
+lines of `SUB-AGENT QUESTION (session <id>): <question>`. The
+orchestrator answers by calling the `agent` tool again with
+`resume_session_id="<id>"` and the answer as the prompt, continuing
+the same sub-session instead of starting a fresh one.
 
 #### Env-vars to know
 
@@ -328,13 +387,19 @@ file and strips any remaining legacy `CLAUDE.md` block.
 
 ### 5. `crush models` — picking and inspecting models
 
-Three commands cover the whole surface:
+Four model slots exist: `large`/`small` (the smart/fast pair every
+`crush run` uses by default) plus two optional ones, `worker` (cheap
+slot for delegated sub-task work — see orchestrator mode above) and
+`reviewer` (strongest slot, explicit-only). Commands covering the surface:
 
 ```bash
-crush models list           # show available atoms + raw provider/model ids (reads cache; no network)
-crush models list --refresh # force a network refresh of provider data before listing
-crush models use <large> <small> [--global | --local]
-crush models state          # what's effective + per-scope breakdown (alias: `show`)
+crush models list             # show available atoms + raw provider/model ids (reads cache; no network)
+crush models list --refresh   # force a network refresh of provider data before listing
+crush models use <large> <small> [--worker <atom>] [--reviewer <atom>] [--global | --local]
+crush models state             # what's effective + per-scope breakdown (alias: `show`)
+crush models efforts [model]   # explain reasoning-effort levels and how to set them
+crush models bump <role> up|down  # step a role's effort by one level
+crush models unset [large|small|worker|reviewer|both|all] [--global|--local]
 ```
 
 > **No side effects by default:** `crush models list` reads the on-disk
@@ -358,35 +423,56 @@ ATOMS (combine as `crush models use <large> <small>`):
     haiku-low, haiku-medium, haiku-high, haiku-xhigh, haiku-max       Claude Haiku   (200k ctx)
 
   Zai:
-    openai-compat, no effort
-    glm5_1        GLM 5.1      (204.8k ctx)
-    glm5          GLM 5        (204.8k ctx)
+    glm5_2        GLM 5.2      (1M ctx)
+    glm5_1        GLM 5.1      (200k ctx)
+    glm5          GLM 5        (200k ctx)
     glm5_turbo    GLM 5 turbo  (200k ctx)
     ...
 ```
 
 Anthropic atoms require a level suffix (`opus-high`, `sonnet-low`, etc.) —
 the level list comes from parsing `claude --help` at first use, so it stays
-correct as Anthropic adds tiers. Z.AI atoms do not accept levels because
-Z.AI via openai-compat doesn't expose an effort parameter.
+correct as Anthropic adds tiers.
+
+Z.AI atoms are **not** all effort-less: per Z.AI's own API docs, only
+**GLM-5.2** (`glm5_2`) has real graduated `reasoning_effort` support — a
+7-value scale (`none|minimal|low|medium|high|xhigh|max`, plus a fork-added
+`off` to fully disable thinking) settable via the long-form suffix
+(`glm5_2-max`) or raw `zai/glm-5.2@max`. Every *other* Z.AI/GLM model
+(5.1, 5, 5-turbo, 4.7, 4.6, ...) only exposes a boolean thinking toggle
+(`off`/`on`) — not "no effort concept at all", just not graduated. Both
+forms are validated against the atom's real levels; `crush models efforts
+<model>` prints the exact list and commands for any specific model.
 
 ```bash
 crush models use opus-high glm5_turbo                # mixed Anthropic large + Z.AI small
 crush models use --local glm5_1 glm5_turbo           # workspace-only override
 crush models use openai/gpt-5@high zai/glm-5-turbo   # raw provider/model fallback for anything not in the atom list
+
+# Also set worker/reviewer in the same call (independent of large/small)
+crush models use opus-high haiku-low --worker glm5_turbo --reviewer opus-max
+
+# Discover effort levels for a specific model (or run with no arg for the
+# full per-provider overview, including the Z.AI graduated-vs-boolean split)
+crush models efforts glm5_2
+
+# Step a role's effort by one level instead of retyping the full atom name
+crush models bump reviewer up
+crush models bump worker down --local
 ```
 
-`models state` shows the currently-effective pair and the per-scope
-breakdown so you always know whether your `--local` workspace overrides
-your global default or vice versa.
+`models state` shows the currently-effective values for all four slots and
+the per-scope breakdown so you always know whether your `--local` workspace
+overrides your global default or vice versa.
 
 > **Removed in batch 11:** `crush models set --large X --small Y` and the
 > entire `crush models preset` subtree (save/use/list/delete). Both
 > commands now print a redirect notice pointing at `crush models use`.
 
 To clear an override and fall back to the other scope: `crush models unset
-[large|small|both] [--local|--global]`. Defaults to clearing both slots in
-the global scope. Missing keys are a no-op.
+[large|small|worker|reviewer|both|all] [--local|--global]`. `both` (the
+default when the arg is omitted) clears large+small only; `all` clears all
+four slots. Missing keys are a no-op.
 
 ## When NOT to use this fork
 
