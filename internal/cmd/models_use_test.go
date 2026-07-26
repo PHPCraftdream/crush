@@ -183,6 +183,126 @@ func TestModelsUse_UnknownWorkerAtomFailsCleanly(t *testing.T) {
 	assert.Contains(t, runErr.Error(), "worker:")
 }
 
+// TestModelsUse_InvalidReviewerEffort_ZeroWrites is the core regression test
+// for the partial-write bug: a valid large/small combined with an invalid
+// --reviewer effort suffix must result in NO fields written at all — not
+// large/small silently persisted while only the reviewer write is rejected.
+// Before the fix, RunE wrote large and small to disk (and printed "set
+// large = ..." / "set small = ...") BEFORE it ever parsed/validated
+// --reviewer, so a typo'd effort like "glm5_2-hihg" left large/small durably
+// changed even though the overall command reported failure. This asserts the
+// raw on-disk bytes are byte-identical to the pre-command state (the seed
+// `{}` isolatedModelsEnv wrote), not just crush state's "effective" view,
+// which could misleadingly inherit a prior write.
+//
+// Uses the atom form "glm5_2-hihg" rather than the raw "zai/glm-5.2@hihg"
+// string from the live bug report, because raw provider/model resolution
+// goes through a.ResolveModel against the (cached) provider catalog, which
+// this isolated test harness doesn't reliably resolve for every zai model id
+// (see the comment on TestModelsUse_RawZAIEffort_ValidSucceeds above) — an
+// environmental quirk, unrelated to the ordering bug under test. The atom
+// path exercises the identical validateEffortForModel call without that
+// dependency.
+func TestModelsUse_InvalidReviewerEffort_ZeroWrites(t *testing.T) {
+	globalPath := isolatedModelsEnv(t)
+
+	before, err := os.ReadFile(globalPath)
+	require.NoError(t, err)
+
+	resetModelsUseFlags(t)
+	_, runErr := runModelsCmd(t, modelsUseCmd,
+		"glm5_1", "glm5_turbo", "--reviewer", "glm5_2-hihg")
+	require.Error(t, runErr)
+	assert.Contains(t, runErr.Error(), "reviewer:")
+	assert.Contains(t, runErr.Error(), "not a valid level")
+
+	after, err := os.ReadFile(globalPath)
+	require.NoError(t, err)
+	assert.Equal(t, string(before), string(after),
+		"config file must be byte-identical after a failed `models use` call — zero writes expected, got: %s", after)
+}
+
+// TestModelsUse_InvalidReviewerEffort_WorkerAlsoNotWritten is the same
+// scenario as above but with a valid --worker present too, confirming the
+// batch-write covers ALL provided slots, not just large/small: an invalid
+// --reviewer must prevent --worker from being written as well.
+func TestModelsUse_InvalidReviewerEffort_WorkerAlsoNotWritten(t *testing.T) {
+	globalPath := isolatedModelsEnv(t)
+
+	before, err := os.ReadFile(globalPath)
+	require.NoError(t, err)
+
+	resetModelsUseFlags(t)
+	_, runErr := runModelsCmd(t, modelsUseCmd,
+		"glm5_1", "glm5_turbo",
+		"--worker", "glm4_7_flash",
+		"--reviewer", "glm5_2-hihg")
+	require.Error(t, runErr)
+	assert.Contains(t, runErr.Error(), "reviewer:")
+
+	after, err := os.ReadFile(globalPath)
+	require.NoError(t, err)
+	assert.Equal(t, string(before), string(after),
+		"worker must not be written either when reviewer validation fails, got: %s", after)
+}
+
+// TestModelsUse_InvalidLargePositional_ShortCircuitsBeforeWorkerReviewer
+// covers the reverse direction: an invalid large positional arg must fail
+// before even attempting to parse/touch worker/reviewer, with the same
+// zero-write guarantee. This also guards against a regression where pass 1
+// validation order changes and worker/reviewer get parsed (and their errors
+// surface) before large/small, masking the actual first failure.
+func TestModelsUse_InvalidLargePositional_ShortCircuitsBeforeWorkerReviewer(t *testing.T) {
+	globalPath := isolatedModelsEnv(t)
+
+	before, err := os.ReadFile(globalPath)
+	require.NoError(t, err)
+
+	resetModelsUseFlags(t)
+	_, runErr := runModelsCmd(t, modelsUseCmd,
+		"not-a-real-atom-xyz", "glm5_turbo",
+		"--worker", "glm4_7_flash", "--reviewer", "glm5_2")
+	require.Error(t, runErr)
+	assert.Contains(t, runErr.Error(), "large:")
+
+	after, err := os.ReadFile(globalPath)
+	require.NoError(t, err)
+	assert.Equal(t, string(before), string(after),
+		"an invalid large positional must result in zero writes, got: %s", after)
+}
+
+// TestModelsUse_AllFourValid_StillWritesAll is the regression guard for the
+// fully-valid four-argument case: restructuring RunE into a validate-then-
+// write two-pass flow must not break the working case where every argument
+// is valid — all four slots must still end up written.
+func TestModelsUse_AllFourValid_StillWritesAll(t *testing.T) {
+	globalPath := isolatedModelsEnv(t)
+
+	resetModelsUseFlags(t)
+	_, runErr := runModelsCmd(t, modelsUseCmd,
+		"glm5_1", "glm5_turbo",
+		"--worker", "glm4_7_flash", "--reviewer", "glm5_2")
+	require.NoError(t, runErr)
+
+	data, err := os.ReadFile(globalPath)
+	require.NoError(t, err)
+	var doc struct {
+		Models map[string]json.RawMessage `json:"models"`
+	}
+	require.NoError(t, json.Unmarshal(data, &doc))
+
+	assert.Contains(t, doc.Models, "large")
+	assert.Contains(t, doc.Models, "small")
+	assert.Contains(t, doc.Models, "worker")
+	assert.Contains(t, doc.Models, "reviewer")
+
+	content := string(data)
+	assert.Contains(t, content, `"glm-5.1"`)
+	assert.Contains(t, content, `"glm-5-turbo"`)
+	assert.Contains(t, content, `"glm-4.7-flash"`)
+	assert.Contains(t, content, `"glm-5.2"`)
+}
+
 // TestModelsUse_RawZAIEffort_ValidSucceeds covers the new validated raw
 // "provider/model@effort" path for a Z.AI atom: a level that IS one of the
 // real declared levels (off/on, for a boolean-thinking-only model like

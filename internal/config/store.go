@@ -274,12 +274,35 @@ func (s *ConfigStore) ReadAllModelsAtScope(scope Scope) (map[SelectedModelType]*
 // UpdatePreferredModel updates the preferred model for the given type and
 // persists it to the config file at the given scope.
 func (s *ConfigStore) UpdatePreferredModel(scope Scope, modelType SelectedModelType, model SelectedModel) error {
-	s.config.Models[modelType] = model
-	if err := s.SetConfigField(scope, fmt.Sprintf("models.%s", modelType), model); err != nil {
-		return fmt.Errorf("failed to update preferred model: %w", err)
+	return s.UpdatePreferredModels(scope, map[SelectedModelType]SelectedModel{modelType: model})
+}
+
+// UpdatePreferredModels updates and persists multiple model slots (e.g.
+// large/small/worker/reviewer) in a single write via SetConfigFields, so
+// callers that need to set several slots at once (like `crush models use`)
+// get one atomic on-disk write instead of one write per slot. Callers are
+// responsible for validating every entry in models BEFORE calling this —
+// this function assumes all inputs are already valid and only performs
+// writes; it does not partially apply on error, but nor does it need to,
+// since validation is expected to have already happened.
+func (s *ConfigStore) UpdatePreferredModels(scope Scope, models map[SelectedModelType]SelectedModel) error {
+	if len(models) == 0 {
+		return nil
 	}
-	if err := s.recordRecentModel(scope, modelType, model); err != nil {
-		return err
+	fields := make(map[string]any, len(models))
+	for modelType, model := range models {
+		fields[fmt.Sprintf("models.%s", modelType)] = model
+	}
+	if err := s.SetConfigFields(scope, fields); err != nil {
+		return fmt.Errorf("failed to update preferred models: %w", err)
+	}
+	for modelType, model := range models {
+		s.config.Models[modelType] = model
+	}
+	for modelType, model := range models {
+		if err := s.recordRecentModel(scope, modelType, model); err != nil {
+			return err
+		}
 	}
 	return nil
 }

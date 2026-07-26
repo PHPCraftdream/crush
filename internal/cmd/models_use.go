@@ -88,6 +88,15 @@ crush models state
 			return provider, modelID, rerr
 		}
 
+		// Pass 1: parse + validate EVERY provided argument before writing
+		// anything. This must have zero side effects — no config writes —
+		// so that a validation failure on a later field (e.g. --reviewer)
+		// can never leave an earlier field (large/small/--worker) already
+		// persisted. See CLAUDE.md task tracking / bug report: previously
+		// large and small were written immediately after being parsed, so a
+		// bad --reviewer value failed the command AFTER large/small (and
+		// worker) were already durably written to disk — a silent partial
+		// write masquerading as a no-op failure.
 		largeSel, lerr := parseAtomOrRaw(args[0], resolve)
 		if lerr != nil {
 			return fmt.Errorf("large: %w", lerr)
@@ -97,38 +106,57 @@ crush models state
 			return fmt.Errorf("small: %w", serr)
 		}
 
-		if err := a.Store().UpdatePreferredModel(scope, config.SelectedModelTypeLarge, largeSel); err != nil {
-			return fmt.Errorf("write large: %w", err)
+		var workerSel config.SelectedModel
+		if workerArg != "" {
+			var werr error
+			workerSel, werr = parseAtomOrRaw(workerArg, resolve)
+			if werr != nil {
+				return fmt.Errorf("worker: %w", werr)
+			}
 		}
-		if err := a.Store().UpdatePreferredModel(scope, config.SelectedModelTypeSmall, smallSel); err != nil {
-			return fmt.Errorf("write small: %w", err)
+
+		var reviewerSel config.SelectedModel
+		if reviewerArg != "" {
+			var rerr error
+			reviewerSel, rerr = parseAtomOrRaw(reviewerArg, resolve)
+			if rerr != nil {
+				return fmt.Errorf("reviewer: %w", rerr)
+			}
+		}
+
+		// Pass 2: every provided argument validated successfully — now, and
+		// only now, write. All slots are written in a single call to
+		// UpdatePreferredModels, which batches them into one SetConfigFields
+		// write (one atomicWriteFile) instead of one write per slot — so
+		// there's no window, even for an I/O-level failure, where only some
+		// of the provided slots landed on disk. This reuses the same
+		// batch-write primitive `crush providers patch` already relies on
+		// (config.ConfigStore.SetConfigFields), rather than inventing a new
+		// mechanism.
+		toWrite := map[config.SelectedModelType]config.SelectedModel{
+			config.SelectedModelTypeLarge: largeSel,
+			config.SelectedModelTypeSmall: smallSel,
+		}
+		if workerArg != "" {
+			toWrite[config.SelectedModelTypeWorker] = workerSel
+		}
+		if reviewerArg != "" {
+			toWrite[config.SelectedModelTypeReviewer] = reviewerSel
+		}
+
+		if err := a.Store().UpdatePreferredModels(scope, toWrite); err != nil {
+			return fmt.Errorf("write models: %w", err)
 		}
 
 		fmt.Fprintf(os.Stderr, "set large = %s/%s%s in %s scope\n",
 			largeSel.Provider, largeSel.Model, effortSuffix(largeSel.ReasoningEffort), scope)
 		fmt.Fprintf(os.Stderr, "set small = %s/%s%s in %s scope\n",
 			smallSel.Provider, smallSel.Model, effortSuffix(smallSel.ReasoningEffort), scope)
-
 		if workerArg != "" {
-			workerSel, werr := parseAtomOrRaw(workerArg, resolve)
-			if werr != nil {
-				return fmt.Errorf("worker: %w", werr)
-			}
-			if err := a.Store().UpdatePreferredModel(scope, config.SelectedModelTypeWorker, workerSel); err != nil {
-				return fmt.Errorf("write worker: %w", err)
-			}
 			fmt.Fprintf(os.Stderr, "set worker = %s/%s%s in %s scope\n",
 				workerSel.Provider, workerSel.Model, effortSuffix(workerSel.ReasoningEffort), scope)
 		}
-
 		if reviewerArg != "" {
-			reviewerSel, rerr := parseAtomOrRaw(reviewerArg, resolve)
-			if rerr != nil {
-				return fmt.Errorf("reviewer: %w", rerr)
-			}
-			if err := a.Store().UpdatePreferredModel(scope, config.SelectedModelTypeReviewer, reviewerSel); err != nil {
-				return fmt.Errorf("write reviewer: %w", err)
-			}
 			fmt.Fprintf(os.Stderr, "set reviewer = %s/%s%s in %s scope\n",
 				reviewerSel.Provider, reviewerSel.Model, effortSuffix(reviewerSel.ReasoningEffort), scope)
 		}
