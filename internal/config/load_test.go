@@ -2,6 +2,7 @@ package config
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"os"
@@ -51,6 +52,47 @@ func TestConfig_LoadFromBytes(t *testing.T) {
 	pc, _ := loadedConfig.Providers.Get("openai")
 	require.Equal(t, "key2", pc.APIKey)
 	require.Equal(t, "https://api.openai.com/v2", pc.BaseURL)
+}
+
+func TestConfig_LoadFromBytes_WorkerAndReviewerModels(t *testing.T) {
+	data := []byte(`{
+		"models": {
+			"large": {"model": "gpt-4o", "provider": "openai"},
+			"small": {"model": "gpt-4o-mini", "provider": "openai"},
+			"worker": {"model": "gpt-4o-mini", "provider": "openai"},
+			"reviewer": {"model": "o1", "provider": "openai"}
+		}
+	}`)
+
+	loadedConfig, err := loadFromBytes([][]byte{data})
+
+	require.NoError(t, err)
+	require.NotNil(t, loadedConfig)
+	require.Len(t, loadedConfig.Models, 4)
+
+	large, ok := loadedConfig.Models[SelectedModelTypeLarge]
+	require.True(t, ok)
+	require.Equal(t, "gpt-4o", large.Model)
+
+	small, ok := loadedConfig.Models[SelectedModelTypeSmall]
+	require.True(t, ok)
+	require.Equal(t, "gpt-4o-mini", small.Model)
+
+	worker, ok := loadedConfig.Models[SelectedModelTypeWorker]
+	require.True(t, ok)
+	require.Equal(t, "gpt-4o-mini", worker.Model)
+	require.Equal(t, "openai", worker.Provider)
+
+	reviewer, ok := loadedConfig.Models[SelectedModelTypeReviewer]
+	require.True(t, ok)
+	require.Equal(t, "o1", reviewer.Model)
+	require.Equal(t, "openai", reviewer.Provider)
+
+	// Round-trip: marshal back to JSON and confirm the new keys survive.
+	marshaled, err := json.Marshal(loadedConfig.Models)
+	require.NoError(t, err)
+	require.Contains(t, string(marshaled), `"worker":`)
+	require.Contains(t, string(marshaled), `"reviewer":`)
 }
 
 func TestLookupConfigs_BoundedByProject(t *testing.T) {

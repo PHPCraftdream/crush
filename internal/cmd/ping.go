@@ -734,14 +734,23 @@ func resolvePingRole(role string) (config.SelectedModelType, error) {
 // here; callers that want to default it (e.g. `crush ping`) must handle ""
 // before calling. Keeping the vocabulary and error text in one place stops
 // the two commands' role parsing from drifting apart.
+//
+// "reviewer" is the strongest model slot and is never selected
+// automatically — it must be requested explicitly via --role reviewer by
+// an operator or a senior agent. "worker" is a cheap slot intended for
+// manual sub-task delegation.
 func resolveModelRole(role string) (config.SelectedModelType, error) {
 	switch role {
 	case "large", "smart":
 		return config.SelectedModelTypeLarge, nil
 	case "small", "fast":
 		return config.SelectedModelTypeSmall, nil
+	case "worker":
+		return config.SelectedModelTypeWorker, nil
+	case "reviewer":
+		return config.SelectedModelTypeReviewer, nil
 	default:
-		return "", fmt.Errorf("--role: invalid value %q (allowed: smart|large, fast|small)", role)
+		return "", fmt.Errorf("--role: invalid value %q (allowed: smart|large, fast|small, worker, reviewer)", role)
 	}
 }
 

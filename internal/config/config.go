@@ -69,6 +69,14 @@ func (s SelectedModelType) String() string {
 const (
 	SelectedModelTypeLarge SelectedModelType = "large"
 	SelectedModelTypeSmall SelectedModelType = "small"
+	// SelectedModelTypeWorker is a cheap model slot used for manual
+	// sub-task delegation (e.g. by an orchestrator dispatching work to a
+	// worker agent). Never selected automatically.
+	SelectedModelTypeWorker SelectedModelType = "worker"
+	// SelectedModelTypeReviewer is the strongest available model slot.
+	// It is invoked only when explicitly requested by an operator or a
+	// senior agent — never selected automatically.
+	SelectedModelTypeReviewer SelectedModelType = "reviewer"
 )
 
 const (
@@ -577,7 +585,7 @@ type Agent struct {
 	// This is the id of the system prompt used by the agent
 	Disabled bool `json:"disabled,omitempty"`
 
-	Model SelectedModelType `json:"model" jsonschema:"required,description=The model type to use for this agent,enum=large,enum=small,default=large"`
+	Model SelectedModelType `json:"model" jsonschema:"required,description=The model type to use for this agent,enum=large,enum=small,enum=worker,enum=reviewer,default=large"`
 
 	// The available tools for the agent
 	//  if this is nil, all tools are available
@@ -654,8 +662,9 @@ func (h *HookConfig) TimeoutDuration() time.Duration {
 type Config struct {
 	Schema string `json:"$schema,omitempty"`
 
-	// We currently only support large/small as values here.
-	Models map[SelectedModelType]SelectedModel `json:"models,omitempty" jsonschema:"description=Model configurations for different model types,example={\"large\":{\"model\":\"gpt-4o\",\"provider\":\"openai\"}}"`
+	// Supported keys: large (aka smart, default), small (aka fast), worker,
+	// reviewer. See SelectedModelType.
+	Models map[SelectedModelType]SelectedModel `json:"models,omitempty" jsonschema:"description=Model configurations for different model types (large\\, small\\, worker\\, reviewer),example={\"large\":{\"model\":\"gpt-4o\",\"provider\":\"openai\"}}"`
 
 	// Recently used models stored in the data directory config.
 	RecentModels map[SelectedModelType][]SelectedModel `json:"recent_models,omitempty" jsonschema:"-"`

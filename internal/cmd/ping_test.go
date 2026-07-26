@@ -372,6 +372,20 @@ func TestResolvePingRole(t *testing.T) {
 		require.Equal(t, config.SelectedModelTypeSmall, modelType)
 	})
 
+	t.Run("worker resolves to worker", func(t *testing.T) {
+		t.Parallel()
+		modelType, err := resolvePingRole("worker")
+		require.NoError(t, err)
+		require.Equal(t, config.SelectedModelTypeWorker, modelType)
+	})
+
+	t.Run("reviewer resolves to reviewer", func(t *testing.T) {
+		t.Parallel()
+		modelType, err := resolvePingRole("reviewer")
+		require.NoError(t, err)
+		require.Equal(t, config.SelectedModelTypeReviewer, modelType)
+	})
+
 	t.Run("invalid role is rejected with run-consistent wording", func(t *testing.T) {
 		t.Parallel()
 		_, err := resolvePingRole("turbo")
@@ -386,5 +400,65 @@ func TestResolvePingRole(t *testing.T) {
 		t.Parallel()
 		_, err := resolvePingRole("Smart")
 		require.Error(t, err)
+	})
+}
+
+func TestResolveModelRole(t *testing.T) {
+	t.Parallel()
+
+	t.Run("large", func(t *testing.T) {
+		t.Parallel()
+		modelType, err := resolveModelRole("large")
+		require.NoError(t, err)
+		require.Equal(t, config.SelectedModelTypeLarge, modelType)
+	})
+
+	t.Run("smart aliases to large", func(t *testing.T) {
+		t.Parallel()
+		modelType, err := resolveModelRole("smart")
+		require.NoError(t, err)
+		require.Equal(t, config.SelectedModelTypeLarge, modelType)
+	})
+
+	t.Run("small", func(t *testing.T) {
+		t.Parallel()
+		modelType, err := resolveModelRole("small")
+		require.NoError(t, err)
+		require.Equal(t, config.SelectedModelTypeSmall, modelType)
+	})
+
+	t.Run("fast aliases to small", func(t *testing.T) {
+		t.Parallel()
+		modelType, err := resolveModelRole("fast")
+		require.NoError(t, err)
+		require.Equal(t, config.SelectedModelTypeSmall, modelType)
+	})
+
+	t.Run("worker", func(t *testing.T) {
+		t.Parallel()
+		modelType, err := resolveModelRole("worker")
+		require.NoError(t, err)
+		require.Equal(t, config.SelectedModelTypeWorker, modelType)
+	})
+
+	t.Run("reviewer", func(t *testing.T) {
+		t.Parallel()
+		modelType, err := resolveModelRole("reviewer")
+		require.NoError(t, err)
+		require.Equal(t, config.SelectedModelTypeReviewer, modelType)
+	})
+
+	t.Run("empty string is rejected (role is required, unlike resolvePingRole)", func(t *testing.T) {
+		t.Parallel()
+		_, err := resolveModelRole("")
+		require.Error(t, err)
+	})
+
+	t.Run("invalid role is rejected", func(t *testing.T) {
+		t.Parallel()
+		_, err := resolveModelRole("turbo")
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "--role: invalid value")
+		require.Contains(t, err.Error(), "turbo")
 	})
 }
