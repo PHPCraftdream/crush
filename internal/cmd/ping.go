@@ -44,7 +44,10 @@ Auth/quota errors set status=error with exit code 1.
 Timeouts set status=timeout with exit code 2.
 
 --role selects which model slot to ping: smart|large (the default, same as
-'crush ping') or fast|small (same as 'crush ping-fast').`,
+'crush ping') | fast|small (same as 'crush ping-fast') | worker (the
+optional cheap delegated-work slot) | reviewer (the optional strongest
+slot). worker/reviewer ping as "not configured" unless already set via
+the web UI or crush.json's models.worker / models.reviewer.`,
 	Example: `
 # Ping whichever large model is currently configured
 crush ping
@@ -54,6 +57,10 @@ crush ping --role fast
 
 # Ping the large/smart slot explicitly
 crush ping --role smart
+
+# Ping the optional worker/reviewer slots (if configured)
+crush ping --role worker
+crush ping --role reviewer
 
 # Ping the small model slot
 crush ping-fast
@@ -758,7 +765,7 @@ func init() {
 	pingCmd.Flags().Bool("json", false, "Emit JSON output instead of human-readable text")
 	pingCmd.Flags().Duration("timeout", 15*time.Second, "Request timeout")
 	pingCmd.Flags().String("prompt", "", "Custom user prompt (default: \"ping\")")
-	pingCmd.Flags().String("role", "", "Which model slot to ping: smart|large (default) or fast|small")
+	pingCmd.Flags().String("role", "", "Which model slot to ping: smart|large (default) | fast|small | worker | reviewer (worker/reviewer are optional slots configured via the web UI or crush.json)")
 
 	pingFastCmd.Flags().Bool("json", false, "Emit JSON output instead of human-readable text")
 	pingFastCmd.Flags().Duration("timeout", 15*time.Second, "Request timeout")

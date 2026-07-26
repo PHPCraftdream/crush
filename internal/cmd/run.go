@@ -37,11 +37,31 @@ var runCmd = &cobra.Command{
   sessions (TUI / web) keep the normal permission flow — this WARNING
   applies only to ` + "`crush run`" + `.
 
---role is REQUIRED: every invocation must declare whether it wants the
-strong/slow model ("--role smart" or "--role large") or the cheap/fast
-one ("--role fast" or "--role small"). The actual model id behind each
-role comes from "crush models show"; --model overrides it for one
-invocation. This avoids silently burning premium tokens on a one-liner.
+--role is REQUIRED: every invocation must declare which model slot it
+wants. This avoids silently burning premium tokens on a one-liner.
+Four roles exist:
+  smart | large      the strong default slot (top-level agent runs here)
+  fast  | small      the cheap slot, for trivial work
+  worker             optional, no alias; cheap slot for delegated
+                      hands-on sub-task work. Never auto-selected — only
+                      reachable via --role worker directly, OR indirectly
+                      when a worker model is configured and this run uses
+                      --role smart: sub-agents spawned by the "agent" tool
+                      then run on worker, get a work-capable toolset
+                      (edit/multiedit/write/bash/todos/download/fetch/
+                      ask_question), and the default sub-agent ban below
+                      is lifted so the orchestrator can delegate at all
+                      (an explicit --agents single still wins). The smart
+                      agent's system prompt also gains an "Orchestrator
+                      mode" nudge to delegate in context-sized chunks
+                      instead of implementing inline.
+  reviewer           optional, no alias; the strongest slot, for explicit
+                      review invocations. Never auto-selected anywhere —
+                      reachable only via --role reviewer.
+worker/reviewer are configured via the web UI or crush.json's
+models.worker / models.reviewer ("crush models use" only manages
+smart/fast today). The actual model id behind each role comes from
+"crush models show"; --model overrides it for one invocation.
 
 Prompt sources (combined as "<stdin>\n\n<args>"):
   - positional args:   crush run "your prompt"
@@ -327,6 +347,17 @@ crush run --role smart --agents with-agents --session "parallel-audit" "..."
 crush run --role smart --json --agents with-agents --aggregation attach \
           --session "structured-audit" < /tmp/p.txt > /tmp/audit.json
 
+# Orchestrator mode: with a worker model configured (models.worker in
+# crush.json / web UI), --role smart on its own is enough — the default
+# sub-agent ban is lifted, sub-agents get a work-capable toolset and run
+# on the cheap worker slot, and the smart agent's system prompt is
+# nudged to delegate hands-on work instead of doing it inline.
+crush run --role smart --session "orchestrated-refactor" "..."
+
+# Bypass the strongest slot for an explicit one-off review (never picked
+# automatically — must be requested by role name).
+crush run --role reviewer --session "pr-42-review" "review this diff"
+
 # Fan-out but keep everything in final_text verbatim (one big string).
 crush run --role smart --json --agents with-agents --aggregation concat \
           --session "flat-audit" < /tmp/p.txt > /tmp/audit.json
@@ -421,7 +452,7 @@ crush run --restrict-run --role fast \
 		// `crush ping` via resolveModelRole; only the empty-is-required
 		// rule is command-specific.
 		if role == "" {
-			return fmt.Errorf("--role is required: pass --role smart (large) or --role fast (small)")
+			return fmt.Errorf("--role is required: pass --role smart (large), --role fast (small), or, if configured, --role worker / --role reviewer")
 		}
 		modelType, err := resolveModelRole(role)
 		if err != nil {
@@ -708,7 +739,7 @@ func init() {
 	runCmd.SilenceUsage = true
 	runCmd.Flags().BoolP("quiet", "q", false, "Hide spinner")
 	runCmd.Flags().BoolP("verbose", "v", false, "Show logs")
-	runCmd.Flags().String("role", "", "REQUIRED. Which preselected model to use: smart|large (the strong one) or fast|small (the cheap one). The actual model id comes from `crush models show`; override with --model.")
+	runCmd.Flags().String("role", "", "REQUIRED. Which preselected model slot to use: smart|large (the strong default; --role smart + a configured worker also enables orchestrator-mode sub-agent delegation) | fast|small (the cheap slot) | worker (cheap slot for delegated sub-task work, never auto-selected) | reviewer (the strongest slot, for explicit review invocations, never auto-selected). The actual model id comes from `crush models show`; override with --model.")
 	runCmd.Flags().String("effort", "", "Reasoning effort for this turn: low|medium|high. Applies to whichever slot --role picked. Persisted on the session so subsequent runs inherit it.")
 	runCmd.Flags().Bool("stream", false, "Stream every assistant token to stdout. Default is terse: tool-call names on stderr + final answer on stdout.")
 	runCmd.Flags().Bool("json", false, "Emit one JSON object on stdout summarising the run (session_id, final_text, tool_calls, usage, duration, exit_reason). Mutually exclusive with --stream.")

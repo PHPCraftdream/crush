@@ -381,7 +381,7 @@ func runQueueTask(ctx context.Context, cwd string, task queue.Task) (float64, in
 
 func init() {
 	queueAddCmd.Flags().String("session", "", "Session ID for the run (default: auto-generated from task ID)")
-	queueAddCmd.Flags().String("role", "", "Model role: smart|fast (default: smart)")
+	queueAddCmd.Flags().String("role", "", "Model role forwarded verbatim to the spawned `crush run --role <role>` (queue run): smart|large | fast|small | worker | reviewer (default: smart)")
 	queueAddCmd.Flags().Float64("max-cost", 0, "Abort if cost exceeds this value (USD)")
 	queueAddCmd.Flags().Int64("max-tokens", 0, "Abort if tokens exceed this value")
 	queueAddCmd.Flags().Duration("timeout", 0, "Timeout for the run (e.g. 10m)")
