@@ -23,24 +23,43 @@ type atom struct {
 }
 
 var atomRegistry = map[string]atom{
-	"opus":         {Provider: "local-cli", Model: "cli-claude-opus-4-8", DisplayName: "Claude Opus 4.8", CtxLabel: "1M", Group: "anthropic", GroupNote: "via local `claude` CLI", EffortSource: claudeEffortSource},
-	"opus46":       {Provider: "local-cli", Model: "cli-claude-opus-4-6", DisplayName: "Claude Opus 4.6", CtxLabel: "1M", Group: "anthropic", GroupNote: "via local `claude` CLI", EffortSource: claudeEffortSource},
-	"opus47":       {Provider: "local-cli", Model: "cli-claude-opus-4-7", DisplayName: "Claude Opus 4.7", CtxLabel: "1M", Group: "anthropic", GroupNote: "via local `claude` CLI", EffortSource: claudeEffortSource},
-	"opus48":       {Provider: "local-cli", Model: "cli-claude-opus-4-8", DisplayName: "Claude Opus 4.8", CtxLabel: "1M", Group: "anthropic", GroupNote: "via local `claude` CLI", EffortSource: claudeEffortSource},
-	"sonnet":       {Provider: "local-cli", Model: "cli-claude-sonnet", DisplayName: "Claude Sonnet 4.6", CtxLabel: "1M", Group: "anthropic", GroupNote: "via local `claude` CLI", EffortSource: claudeEffortSource},
-	"haiku":        {Provider: "local-cli", Model: "cli-claude-haiku", DisplayName: "Claude Haiku 4.5", CtxLabel: "200k", Group: "anthropic", GroupNote: "via local `claude` CLI", EffortSource: claudeEffortSource},
-	"fable":        {Provider: "local-cli", Model: "cli-claude-fable", DisplayName: "Claude Fable 5", CtxLabel: "1M", Group: "anthropic", EffortSource: claudeEffortSource},
-	"glm5_2":       {Provider: "zai", Model: "glm-5.2", DisplayName: "GLM 5.2", CtxLabel: "1M", Group: "zai", GroupNote: "openai-compat, no effort"},
-	"glm5_1":       {Provider: "zai", Model: "glm-5.1", DisplayName: "GLM 5.1", CtxLabel: "204.8k", Group: "zai"},
-	"glm5":         {Provider: "zai", Model: "glm-5", DisplayName: "GLM 5", CtxLabel: "204.8k", Group: "zai"},
-	"glm5_turbo":   {Provider: "zai", Model: "glm-5-turbo", DisplayName: "GLM 5 turbo", CtxLabel: "200k", Group: "zai"},
-	"glm4_7":       {Provider: "zai", Model: "glm-4.7", DisplayName: "GLM 4.7", CtxLabel: "204.8k", Group: "zai"},
-	"glm4_7_flash": {Provider: "zai", Model: "glm-4.7-flash", DisplayName: "GLM 4.7 flash", CtxLabel: "204.8k", Group: "zai"},
-	"glm4_6":       {Provider: "zai", Model: "glm-4.6", DisplayName: "GLM 4.6", CtxLabel: "204.8k", Group: "zai"},
+	"opus":   {Provider: "local-cli", Model: "cli-claude-opus-4-8", DisplayName: "Claude Opus 4.8", CtxLabel: "1M", Group: "anthropic", GroupNote: "via local `claude` CLI", EffortSource: claudeEffortSource},
+	"opus46": {Provider: "local-cli", Model: "cli-claude-opus-4-6", DisplayName: "Claude Opus 4.6", CtxLabel: "1M", Group: "anthropic", GroupNote: "via local `claude` CLI", EffortSource: claudeEffortSource},
+	"opus47": {Provider: "local-cli", Model: "cli-claude-opus-4-7", DisplayName: "Claude Opus 4.7", CtxLabel: "1M", Group: "anthropic", GroupNote: "via local `claude` CLI", EffortSource: claudeEffortSource},
+	"opus48": {Provider: "local-cli", Model: "cli-claude-opus-4-8", DisplayName: "Claude Opus 4.8", CtxLabel: "1M", Group: "anthropic", GroupNote: "via local `claude` CLI", EffortSource: claudeEffortSource},
+	"sonnet": {Provider: "local-cli", Model: "cli-claude-sonnet", DisplayName: "Claude Sonnet 4.6", CtxLabel: "1M", Group: "anthropic", GroupNote: "via local `claude` CLI", EffortSource: claudeEffortSource},
+	"haiku":  {Provider: "local-cli", Model: "cli-claude-haiku", DisplayName: "Claude Haiku 4.5", CtxLabel: "200k", Group: "anthropic", GroupNote: "via local `claude` CLI", EffortSource: claudeEffortSource},
+	"fable":  {Provider: "local-cli", Model: "cli-claude-fable", DisplayName: "Claude Fable 5", CtxLabel: "1M", Group: "anthropic", EffortSource: claudeEffortSource},
+	// CtxLabel values below are from docs.z.ai/guides/llm/<model> (fetched
+	// 2026-07-26): every current-generation GLM model (4.6, 4.7, 4.7-flash,
+	// 4.7-flashx, 5, 5-turbo, 5.1) has a 200K context / 128K max-output
+	// window; GLM-5.2 is the only one at 1M. The previous "204.8k"/"131.1k"
+	// figures here were unverified guesses.
+	//
+	// GroupNote "openai-compat, no effort" on glm5_2 was also wrong: Z.AI
+	// accepts reasoning_effort=max on GLM-5.2 (confirmed live), it just has
+	// no effort-bearing SHORT CODE (see the Claude-only asymmetry documented
+	// in `crush models efforts`) — effort is set via the raw
+	// `zai/glm-5.2@max` syntax instead.
+	"glm5_2":     {Provider: "zai", Model: "glm-5.2", DisplayName: "GLM 5.2", CtxLabel: "1M", Group: "zai"},
+	"glm5_1":     {Provider: "zai", Model: "glm-5.1", DisplayName: "GLM 5.1", CtxLabel: "200k", Group: "zai"},
+	"glm5":       {Provider: "zai", Model: "glm-5", DisplayName: "GLM 5", CtxLabel: "200k", Group: "zai"},
+	"glm5_turbo": {Provider: "zai", Model: "glm-5-turbo", DisplayName: "GLM 5 turbo", CtxLabel: "200k", Group: "zai"},
+	// GLM-4.7-FlashX is deliberately NOT an atom. Its model id
+	// ("glm-4.7-flashx") is real — verified by pinging it directly: it
+	// returned "Insufficient balance or no resource package" (an
+	// account-provisioning error z.ai returns for a real but unprovisioned
+	// model), not "Unknown Model, please check the model code." (the
+	// distinct error confirmed for a genuinely invalid id). But since this
+	// account can't actually call it, there's no point offering a short
+	// code for it. Use glm4_7_flash instead.
+	//
+	// GLM-4.5.x (glm-4.5, glm-4.5-air, glm-4.5v) and older are intentionally
+	// not carried as atoms — 4.6 is the oldest generation kept.
+	"glm4_7":       {Provider: "zai", Model: "glm-4.7", DisplayName: "GLM 4.7", CtxLabel: "200k", Group: "zai"},
+	"glm4_7_flash": {Provider: "zai", Model: "glm-4.7-flash", DisplayName: "GLM 4.7 flash", CtxLabel: "200k", Group: "zai"},
+	"glm4_6":       {Provider: "zai", Model: "glm-4.6", DisplayName: "GLM 4.6", CtxLabel: "200k", Group: "zai"},
 	"glm4_6v":      {Provider: "zai", Model: "glm-4.6v", DisplayName: "GLM 4.6v", CtxLabel: "204.8k", Group: "zai", Vision: true},
-	"glm4_5":       {Provider: "zai", Model: "glm-4.5", DisplayName: "GLM 4.5", CtxLabel: "131.1k", Group: "zai"},
-	"glm4_5_air":   {Provider: "zai", Model: "glm-4.5-air", DisplayName: "GLM 4.5 air", CtxLabel: "204.8k", Group: "zai"},
-	"glm4_5v":      {Provider: "zai", Model: "glm-4.5v", DisplayName: "GLM 4.5v", CtxLabel: "?", Group: "zai", Vision: true},
 }
 
 var atomGroupOrder = []string{"anthropic", "zai"}
@@ -55,7 +74,6 @@ var atomDisplayOrder = map[string][]string{
 		"glm5_2", "glm5_1", "glm5", "glm5_turbo",
 		"glm4_7", "glm4_7_flash",
 		"glm4_6", "glm4_6v",
-		"glm4_5", "glm4_5_air", "glm4_5v",
 	},
 }
 
