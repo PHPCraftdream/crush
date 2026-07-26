@@ -1305,7 +1305,51 @@ func (c *coordinator) buildAgent(ctx context.Context, prompt *prompt.Prompt, age
 	return result, nil
 }
 
+// workerToolNames are added on top of the sub-agent's existing (read-only)
+// AllowedTools when it is acting as a worker (see workerSubAgentActive):
+// enough hands to actually do delegated work, not just look around.
+//
+// Deliberately excludes "agent": a worker must not spawn sub-workers of its
+// own — recursion guard, keeps the delegation tree exactly two levels deep
+// (orchestrator -> worker).
+//
+// Deliberately excludes "ask_question" too, even though it would otherwise
+// be a safe (no side effects) addition: a sub-agent's question is currently
+// collapsed by runSubAgent's generic error path into a plain text error with
+// no round-trip back to the caller (see the comment on resolveReadOnlyTools
+// in internal/config/config.go). Wiring that round-trip is a separate,
+// already-planned follow-up (docs/plans/2026-07-26-orchestrator-worker-e2e.md,
+// phase 3); granting the tool ahead of that fix would just ship a confusing
+// dead end.
+var workerToolNames = []string{"edit", "multiedit", "write", "bash", "todos", "download", "fetch"}
+
+// buildToolsAgentConfig returns the config.Agent buildTools should use to
+// resolve AllowedTools for this build. For a sub-agent acting as a worker
+// (see workerSubAgentActive), it returns a copy of agent with the worker
+// toolset layered on top of whatever was already allowed (today's read-only
+// set, in practice, since this only affects the AgentTask sub-agent). In
+// every other case — including the top-level coder, and the sub-agent when
+// no Worker is configured or the active role isn't smart — it returns agent
+// unchanged, so behavior is byte-identical to before this method existed.
+func (c *coordinator) buildToolsAgentConfig(agent config.Agent, isSubAgent bool) config.Agent {
+	if !isSubAgent || !c.workerSubAgentActive() {
+		return agent
+	}
+
+	allowed := make([]string, len(agent.AllowedTools), len(agent.AllowedTools)+len(workerToolNames))
+	copy(allowed, agent.AllowedTools)
+	for _, name := range workerToolNames {
+		if !slices.Contains(allowed, name) {
+			allowed = append(allowed, name)
+		}
+	}
+	agent.AllowedTools = allowed
+	return agent
+}
+
 func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubAgent bool) ([]fantasy.AgentTool, error) {
+	agent = c.buildToolsAgentConfig(agent, isSubAgent)
+
 	var allTools []fantasy.AgentTool
 	if slices.Contains(agent.AllowedTools, AgentToolName) {
 		agentTool, err := c.agentTool(ctx)
@@ -1428,6 +1472,35 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubA
 	return filteredTools, nil
 }
 
+// workerSubAgentActive reports whether a sub-agent being built right now is
+// acting as a "worker": the parent run is driven by the Large ("smart") slot
+// — or the active role is unknown, which for the interactive TUI/web path is
+// equivalent to smart — AND a Worker model is actually configured. This is
+// the single shared predicate for "the sub-agent should behave like a
+// worker", used both to pick the sub-agent's model (buildAgentModels, below)
+// and to pick its tool set (buildTools): a sub-agent that gets the Worker
+// model but stays read-only, or vice versa, would defeat the point of the
+// feature. isSubAgent must be checked by the caller first — this method
+// assumes it's already true and only re-checks the role/config gate.
+//
+// Mirrors the semantics documented on buildAgentModels below: falls through
+// to false (today's behavior) when Worker isn't configured, or when the
+// operator explicitly chose a non-large role (fast/worker/reviewer) for the
+// whole run — we don't second-guess that choice by force-upgrading/
+// downgrading sub-agents. Fork patch (reviewer/worker roles).
+func (c *coordinator) workerSubAgentActive() bool {
+	c.activeModelRoleMu.Lock()
+	activeRole := c.activeModelRole
+	c.activeModelRoleMu.Unlock()
+
+	if activeRole != "" && activeRole != config.SelectedModelTypeLarge {
+		return false
+	}
+
+	workerModelCfg, ok := c.cfg.Config().Models[config.SelectedModelTypeWorker]
+	return ok && workerModelCfg.Model != ""
+}
+
 // TODO: when we support multiple agents we need to change this so that we pass in the agent specific model config
 func (c *coordinator) buildAgentModels(ctx context.Context, isSubAgent bool) (Model, Model, error) {
 	largeModelCfg, ok := c.cfg.Config().Models[config.SelectedModelTypeLarge]
@@ -1439,25 +1512,13 @@ func (c *coordinator) buildAgentModels(ctx context.Context, isSubAgent bool) (Mo
 		return Model{}, Model{}, errSmallModelNotSelected
 	}
 
-	// Fork patch (reviewer/worker roles): when spawning a sub-agent and the
-	// parent run is driven by the Large ("smart") slot — or the active role
-	// is unknown, which for the interactive TUI/web path is equivalent to
-	// smart — prefer the cheaper Worker slot for the sub-agent's large-model
-	// slot, if one is configured. This never touches the small-model slot,
-	// and falls through to today's behavior (Large for everything) when
-	// Worker isn't configured, or when the operator explicitly chose a
-	// non-large role (fast/worker/reviewer) for the whole run — we don't
-	// second-guess that choice by force-upgrading/downgrading sub-agents.
-	if isSubAgent {
-		c.activeModelRoleMu.Lock()
-		activeRole := c.activeModelRole
-		c.activeModelRoleMu.Unlock()
-
-		if activeRole == "" || activeRole == config.SelectedModelTypeLarge {
-			if workerModelCfg, ok := c.cfg.Config().Models[config.SelectedModelTypeWorker]; ok && workerModelCfg.Model != "" {
-				largeModelCfg = workerModelCfg
-			}
-		}
+	// Fork patch (reviewer/worker roles): when spawning a sub-agent acting as
+	// a worker (see workerSubAgentActive), prefer the cheaper Worker slot for
+	// the sub-agent's large-model slot. This never touches the small-model
+	// slot, and falls through to today's behavior (Large for everything)
+	// otherwise.
+	if isSubAgent && c.workerSubAgentActive() {
+		largeModelCfg = c.cfg.Config().Models[config.SelectedModelTypeWorker]
 	}
 
 	return c.buildModelsFromCfg(ctx, largeModelCfg, smallModelCfg, isSubAgent)

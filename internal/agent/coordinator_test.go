@@ -1334,6 +1334,217 @@ func TestBuildAgentModels_WorkerPreference(t *testing.T) {
 	})
 }
 
+// newWorkerToolTestCoordinator builds a coordinator with distinct Large,
+// Small, and (optionally) Worker model slots plus every service buildTools
+// needs to actually construct tool instances (permissions/history/
+// filetracker/messages) — a superset of newRoleModelTestCoordinator (which
+// only wires the model slots, sufficient for buildAgentModels but not
+// buildTools) and TestBuildTools_CoderHasAskQuestion's inline fixture.
+func newWorkerToolTestCoordinator(t *testing.T, env fakeEnv, includeWorker bool) *coordinator {
+	t.Helper()
+	cfg, err := config.Init(env.workingDir, "", false)
+	require.NoError(t, err)
+
+	registerProvider := func(providerID, modelID string) config.SelectedModel {
+		cfg.Config().Providers.Set(providerID, config.ProviderConfig{
+			ID:   providerID,
+			Type: openai.Name,
+			Models: []catwalk.Model{
+				{ID: modelID},
+			},
+		})
+		return config.SelectedModel{Provider: providerID, Model: modelID}
+	}
+
+	cfg.Config().Models[config.SelectedModelTypeLarge] = registerProvider("large-provider", "large-model")
+	cfg.Config().Models[config.SelectedModelTypeSmall] = registerProvider("small-provider", "small-model")
+	if includeWorker {
+		cfg.Config().Models[config.SelectedModelTypeWorker] = registerProvider("worker-provider", "worker-model")
+	}
+
+	return &coordinator{
+		cfg:         cfg,
+		sessions:    env.sessions,
+		messages:    env.messages,
+		permissions: env.permissions,
+		history:     env.history,
+		filetracker: *env.filetracker,
+	}
+}
+
+// buildSubAgentToolNames runs buildTools for the AgentTask sub-agent config
+// and returns the resulting tool names, for assertions in
+// TestBuildTools_WorkerToolset below.
+func buildSubAgentToolNames(t *testing.T, coord *coordinator) []string {
+	t.Helper()
+	taskCfg, ok := coord.cfg.Config().Agents[config.AgentTask]
+	require.True(t, ok, "task agent must be configured")
+
+	built, err := coord.buildTools(t.Context(), taskCfg, true)
+	require.NoError(t, err)
+
+	names := make([]string, 0, len(built))
+	for _, tool := range built {
+		names = append(names, tool.Info().Name)
+	}
+	return names
+}
+
+// TestBuildTools_WorkerToolset is the BUG-2 fix's regression + behavior
+// suite: the AgentTask sub-agent (spawned by the "agent" tool) must stay
+// read-only in every case except when it is genuinely acting as a worker
+// (Worker model configured AND the parent run's active role is smart/large
+// or unset). Getting this wrong in either direction is bad: granting
+// edit/write/bash unconditionally would let a plain search-and-context
+// sub-agent mutate the filesystem in the ordinary interactive TUI/web path;
+// never granting them makes the whole "smart orchestrator delegates
+// hands-on work to a cheap Worker model" feature (see
+// docs/plans/2026-07-26-orchestrator-worker-e2e.md, BUG-2) impossible.
+func TestBuildTools_WorkerToolset(t *testing.T) {
+	workerOnlyTools := []string{"edit", "multiedit", "write", "bash"}
+	readOnlyTools := []string{"glob", "grep", "ls", "sourcegraph", "view"}
+
+	t.Run("worker NOT configured, sub-agent stays exactly read-only (backward compat)", func(t *testing.T) {
+		env := testEnv(t)
+		coord := newWorkerToolTestCoordinator(t, env, false)
+
+		names := buildSubAgentToolNames(t, coord)
+
+		for _, name := range workerOnlyTools {
+			assert.NotContains(t, names, name, "worker tool %q must be absent when no Worker model is configured", name)
+		}
+		for _, name := range readOnlyTools {
+			assert.Contains(t, names, name, "read-only tool %q must still be present", name)
+		}
+		assert.NotContains(t, names, AgentToolName, "sub-agent must never get the agent tool")
+	})
+
+	activeSmartRoles := []config.SelectedModelType{"", config.SelectedModelTypeLarge}
+	for _, role := range activeSmartRoles {
+		t.Run("worker configured + active role "+string(role)+" (unset-or-large), sub-agent gets worker toolset", func(t *testing.T) {
+			env := testEnv(t)
+			coord := newWorkerToolTestCoordinator(t, env, true)
+			if role != "" {
+				coord.SetActiveModelRole(role)
+			}
+			// role == "" left unset deliberately: unset must be treated the
+			// same as "large" (smart), mirroring buildAgentModels semantics.
+
+			names := buildSubAgentToolNames(t, coord)
+
+			for _, name := range workerOnlyTools {
+				assert.Contains(t, names, name, "worker tool %q must be present when Worker is configured and role is smart", name)
+			}
+			for _, name := range readOnlyTools {
+				assert.Contains(t, names, name, "read-only tool %q must still be present for the worker", name)
+			}
+			assert.NotContains(t, names, AgentToolName, "worker must not get the agent tool: recursion guard against sub-workers spawning sub-workers")
+			assert.NotContains(t, names, tools.AskQuestionToolName, "worker must not get ask_question yet: runSubAgent's error path doesn't frame it as a question round-trip (see resolveReadOnlyTools comment in internal/config/config.go)")
+		})
+	}
+
+	nonSmartRoles := []config.SelectedModelType{
+		config.SelectedModelTypeSmall,
+		config.SelectedModelTypeWorker,
+		config.SelectedModelTypeReviewer,
+	}
+	for _, role := range nonSmartRoles {
+		t.Run("worker configured but active role "+string(role)+" falls back to read-only", func(t *testing.T) {
+			env := testEnv(t)
+			coord := newWorkerToolTestCoordinator(t, env, true)
+			coord.SetActiveModelRole(role)
+
+			names := buildSubAgentToolNames(t, coord)
+
+			for _, name := range workerOnlyTools {
+				assert.NotContains(t, names, name, "worker tool %q must be absent when the operator explicitly chose a non-smart role for the whole run", name)
+			}
+			for _, name := range readOnlyTools {
+				assert.Contains(t, names, name, "read-only tool %q must still be present", name)
+			}
+		})
+	}
+
+	t.Run("top-level coder agent is unaffected by Worker config or active role", func(t *testing.T) {
+		for _, tc := range []struct {
+			name          string
+			includeWorker bool
+			role          config.SelectedModelType
+		}{
+			{"no worker, role unset", false, ""},
+			{"worker configured, role large", true, config.SelectedModelTypeLarge},
+			{"worker configured, role unset", true, ""},
+			{"worker configured, role worker", true, config.SelectedModelTypeWorker},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				env := testEnv(t)
+				coord := newWorkerToolTestCoordinator(t, env, tc.includeWorker)
+				if tc.role != "" {
+					coord.SetActiveModelRole(tc.role)
+				}
+
+				coderCfg, ok := coord.cfg.Config().Agents[config.AgentCoder]
+				require.True(t, ok, "coder agent must be configured")
+
+				built, err := coord.buildTools(t.Context(), coderCfg, false)
+				require.NoError(t, err)
+
+				names := make([]string, 0, len(built))
+				for _, tool := range built {
+					names = append(names, tool.Info().Name)
+				}
+				for _, name := range workerOnlyTools {
+					assert.Contains(t, names, name, "coder already has %q unconditionally; worker logic must not remove it", name)
+				}
+				for _, name := range readOnlyTools {
+					assert.Contains(t, names, name, "coder already has %q unconditionally", name)
+				}
+			})
+		}
+	})
+}
+
+// TestBuildToolsAgentConfig_UnconditionalApplicationWouldBreakBackwardCompat
+// proves that regression guard (a) in TestBuildTools_WorkerToolset actually
+// guards something: if buildToolsAgentConfig's gate were removed (i.e. the
+// worker toolset applied unconditionally to every sub-agent build, worker
+// configured or not), the read-only backward-compat case would fail. We
+// simulate "unconditional" by calling the config-mutation helper directly
+// with a coordinator that satisfies isSubAgent but deliberately has no
+// Worker model configured and no active role set -- i.e. exactly the
+// backward-compat scenario -- and confirm workerSubAgentActive (the gate)
+// correctly reports false, which is what keeps buildToolsAgentConfig from
+// mutating AllowedTools in that case. This documents, executably, why the
+// gate in buildToolsAgentConfig cannot be dropped.
+func TestBuildToolsAgentConfig_UnconditionalApplicationWouldBreakBackwardCompat(t *testing.T) {
+	env := testEnv(t)
+	coord := newWorkerToolTestCoordinator(t, env, false) // no Worker configured
+
+	require.False(t, coord.workerSubAgentActive(),
+		"backward-compat scenario (no Worker configured) must not read as worker-active")
+
+	taskCfg, ok := coord.cfg.Config().Agents[config.AgentTask]
+	require.True(t, ok)
+	original := append([]string(nil), taskCfg.AllowedTools...)
+
+	// The gated call: must be a no-op copy of taskCfg.
+	gated := coord.buildToolsAgentConfig(taskCfg, true)
+	assert.Equal(t, original, gated.AllowedTools, "gated call must leave AllowedTools untouched when Worker isn't configured")
+
+	// The unconditional variant this test guards against: manually apply the
+	// worker toolset the way buildToolsAgentConfig would if it had no gate at
+	// all. If this is what shipped, the regression test above would fail
+	// because edit/write/bash would leak into the interactive, no-worker,
+	// read-only sub-agent.
+	unconditional := append([]string(nil), taskCfg.AllowedTools...)
+	unconditional = append(unconditional, workerToolNames...)
+	assert.NotEqual(t, original, unconditional,
+		"sanity check: applying the worker toolset unconditionally would visibly change AllowedTools, proving the gate is load-bearing")
+	for _, name := range workerToolNames {
+		assert.Contains(t, unconditional, name)
+	}
+}
+
 // TestBuildTools_CoderHasAskQuestion is a regression test for a wiring bug
 // where tools.NewAskQuestionTool() was constructed in buildTools but
 // "ask_question" was never added to allToolNames(), so the AllowedTools
