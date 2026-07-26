@@ -865,6 +865,7 @@ func configureSelectedModels(store *ConfigStore, knownProviders []catwalk.Provid
 func lookupConfigs(cwd string) []string {
 	// prepend default config paths
 	configPaths := []string{
+		systemConfigPath,
 		GlobalConfig(),
 		GlobalConfigData(),
 	}
