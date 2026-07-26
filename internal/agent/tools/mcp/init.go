@@ -587,6 +587,12 @@ func createTransport(ctx context.Context, m config.MCPConfig, resolver config.Va
 		cmd := exec.CommandContext(ctx, home.Long(command), args...)
 		cmd.Env = append(os.Environ(), envs...)
 		platform.HideConsoleWindow(cmd)
+		// Run the child in its own process group and kill the whole group when
+		// the session context is cancelled. A stdio server often spawns its own
+		// children (signal-mcp launches signal-cli); os/exec's default
+		// cancellation kills only the direct child, orphaning the rest with
+		// PPID 1 — production accumulated 15+ such zombies over two days.
+		configureStdioProcess(cmd)
 		return &mcp.CommandTransport{
 			Command: cmd,
 		}, nil
