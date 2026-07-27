@@ -30,7 +30,7 @@ import (
 )
 
 var pingCmd = &cobra.Command{
-	Use:   "ping [--role smart|fast] [--json] [--timeout 15s] [--prompt \"<custom>\"]",
+	Use:   "ping [--role smart|fast] [--json] [--timeout 1m] [--prompt \"<custom>\"]",
 	Short: "Ping a configured model to verify connectivity and API key",
 	Long: `Send a minimal request to the configured model to verify connectivity,
 API key validity, and measure latency. Works with any provider: API-based
@@ -92,7 +92,7 @@ crush ping --timeout 30s --prompt "Reply with yes or no"
 }
 
 var pingFastCmd = &cobra.Command{
-	Use:   "ping-fast [--json] [--timeout 15s] [--prompt \"<custom>\"]",
+	Use:   "ping-fast [--json] [--timeout 1m] [--prompt \"<custom>\"]",
 	Short: "Ping the small model to verify connectivity and API key",
 	Long: `Same as 'crush ping' but for the configured small (fast) model slot.
 Works with any provider type — API or CLI.`,
@@ -135,7 +135,7 @@ func runPing(cmd *cobra.Command, modelType config.SelectedModelType) error {
 	customPrompt, _ := cmd.Flags().GetString("prompt")
 
 	if timeout <= 0 {
-		timeout = 15 * time.Second
+		timeout = time.Minute
 	}
 
 	a, err := setupApp(cmd)
@@ -764,12 +764,12 @@ func resolveModelRole(role string) (config.SelectedModelType, error) {
 
 func init() {
 	pingCmd.Flags().Bool("json", false, "Emit JSON output instead of human-readable text")
-	pingCmd.Flags().Duration("timeout", 15*time.Second, "Request timeout")
+	pingCmd.Flags().Duration("timeout", time.Minute, "Request timeout")
 	pingCmd.Flags().String("prompt", "", "Custom user prompt (default: \"ping\")")
 	pingCmd.Flags().String("role", "", "Which model slot to ping: smart|large (default) | fast|small | worker | reviewer (worker/reviewer are optional, set via `crush models use --worker/--reviewer`)")
 
 	pingFastCmd.Flags().Bool("json", false, "Emit JSON output instead of human-readable text")
-	pingFastCmd.Flags().Duration("timeout", 15*time.Second, "Request timeout")
+	pingFastCmd.Flags().Duration("timeout", time.Minute, "Request timeout")
 	pingFastCmd.Flags().String("prompt", "", "Custom user prompt (default: \"ping\")")
 
 	rootCmd.AddCommand(pingCmd)

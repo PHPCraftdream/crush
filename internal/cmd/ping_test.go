@@ -85,7 +85,7 @@ func TestPingRateLimitReset(t *testing.T) {
 func TestPingCmd_Exists(t *testing.T) {
 	t.Parallel()
 	require.NotNil(t, pingCmd)
-	require.Equal(t, "ping [--role smart|fast] [--json] [--timeout 15s] [--prompt \"<custom>\"]", pingCmd.Use)
+	require.Equal(t, "ping [--role smart|fast] [--json] [--timeout 1m] [--prompt \"<custom>\"]", pingCmd.Use)
 	require.NotEmpty(t, pingCmd.Short)
 	require.NotEmpty(t, pingCmd.Long)
 }
@@ -102,18 +102,18 @@ func TestPingCmd_DefaultTimeout(t *testing.T) {
 	t.Parallel()
 	flag := pingCmd.Flags().Lookup("timeout")
 	require.NotNil(t, flag)
-	require.Equal(t, "15s", flag.DefValue)
+	require.Equal(t, "1m0s", flag.DefValue)
 
 	// Verify it parses as a duration
 	duration, err := time.ParseDuration(flag.DefValue)
 	require.NoError(t, err)
-	require.Equal(t, 15*time.Second, duration)
+	require.Equal(t, time.Minute, duration)
 }
 
 func TestPingFastCmd_Exists(t *testing.T) {
 	t.Parallel()
 	require.NotNil(t, pingFastCmd)
-	require.Equal(t, "ping-fast [--json] [--timeout 15s] [--prompt \"<custom>\"]", pingFastCmd.Use)
+	require.Equal(t, "ping-fast [--json] [--timeout 1m] [--prompt \"<custom>\"]", pingFastCmd.Use)
 	require.NotEmpty(t, pingFastCmd.Short)
 	require.NotEmpty(t, pingFastCmd.Long)
 }

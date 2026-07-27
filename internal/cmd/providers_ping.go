@@ -39,7 +39,7 @@ crush providers test ollama   # works with a local openai-compat server too
 		asJSON, _ := cmd.Flags().GetBool("json")
 		timeout, _ := cmd.Flags().GetDuration("timeout")
 		if timeout <= 0 {
-			timeout = 15 * time.Second
+			timeout = time.Minute
 		}
 
 		a, err := setupApp(cmd)
@@ -83,7 +83,7 @@ crush providers test ollama   # works with a local openai-compat server too
 
 func init() {
 	providersTestCmd.Flags().Bool("json", false, "Emit a JSON object instead of human-readable lines")
-	providersTestCmd.Flags().Duration("timeout", 0, "HTTP timeout (default 15s)")
+	providersTestCmd.Flags().Duration("timeout", 0, "HTTP timeout (default 1m)")
 	providersCmd.AddCommand(providersTestCmd)
 }
 
