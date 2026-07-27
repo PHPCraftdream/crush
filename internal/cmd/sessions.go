@@ -488,6 +488,7 @@ crush sessions last myid-123 --format ndjson | jq '.role'
 func sessionsLastCmdRun(cmd *cobra.Command, args []string) error {
 	n, _ := cmd.Flags().GetInt("n")
 	format, _ := cmd.Flags().GetString("format")
+	withSubagents, _ := cmd.Flags().GetBool("with-subagents")
 	if format != "text" && format != "ndjson" {
 		return fmt.Errorf("invalid format: %s (must be text or ndjson)", format)
 	}
@@ -528,6 +529,14 @@ func sessionsLastCmdRun(cmd *cobra.Command, args []string) error {
 		printMessageWithTime(os.Stdout, msg, format, now, callCtx, i < len(messages)-1)
 	}
 
+	// Opt-in (--with-subagents): after the parent's own stream, render each
+	// sub-agent delegation's full transcript as a demarcated, indented block.
+	// Default-hidden — without the flag we print only the parent rows (plus
+	// the one-line pulse note below), never a child's message content inline.
+	if withSubagents {
+		printSubAgentTranscripts(cmd.Context(), os.Stdout, a, sess.ID, format, now)
+	}
+
 	// Sub-agent pulse: `last` shows only the TOP-LEVEL session's rows, so an
 	// in-flight `agent` delegation (which writes to a child session) is
 	// invisible here. Append a one-line note when the freshest activity in
@@ -550,6 +559,7 @@ func init() {
 	sessionsShowCmd.Flags().Bool("json", false, "Emit structured JSON instead of text")
 	sessionsShowCmd.Flags().Bool("with-messages", false, "Include all messages in the output")
 	sessionsShowCmd.Flags().Bool("full", false, "Show full message content (implies --with-messages)")
+	sessionsShowCmd.Flags().Bool("with-subagents", false, "Also render each sub-agent delegation's transcript as a demarcated block (implies --with-messages; text output)")
 
 	sessionsLocksCmd.Flags().Bool("json", false, "Emit NDJSON (one JSON object per line)")
 	sessionsLocksCmd.Flags().Bool("stale-only", false, "Filter to locks older than 10 minutes or for dead processes")
@@ -557,9 +567,11 @@ func init() {
 	sessionsTailCmd.Flags().Bool("follow", false, "Keep polling for new messages until session finishes")
 	sessionsTailCmd.Flags().String("from-message", "", "Resume from this message ID (skip earlier)")
 	sessionsTailCmd.Flags().String("format", "text", "Output format: text or ndjson")
+	sessionsTailCmd.Flags().Bool("with-subagents", false, "After the parent stream, render each sub-agent delegation's transcript as a demarcated block (snapshot; not re-emitted while --follow)")
 
 	sessionsLastCmd.Flags().IntP("n", "n", 10, "Number of messages to show")
 	sessionsLastCmd.Flags().String("format", "text", "Output format: text or ndjson")
+	sessionsLastCmd.Flags().Bool("with-subagents", false, "After the parent messages, render each sub-agent delegation's transcript as a demarcated block")
 
 	sessionsCmd.AddCommand(sessionsListCmd, sessionsDeleteCmd, sessionsResetCmd, sessionsShowCmd, sessionsLocksCmd, sessionsTailCmd, sessionsLastCmd, sessionsWhyCmd, sessionsGcCmd, sessionsPurgeCmd, sessionsKillCmd, sessionsReapCmd, sessionsWatchCmd, sessionsPickCmd, sessionsGrepCmd, sessionsCostCmd, sessionsDiffCmd, sessionsCancelCmd, sessionsForkCmd, sessionsTreeCmd)
 	rootCmd.AddCommand(sessionsCmd)
@@ -636,7 +648,14 @@ func sessionsShowCmdRun(cmd *cobra.Command, args []string) error {
 	asJSON, _ := cmd.Flags().GetBool("json")
 	withMessages, _ := cmd.Flags().GetBool("with-messages")
 	full, _ := cmd.Flags().GetBool("full")
+	withSubagents, _ := cmd.Flags().GetBool("with-subagents")
 	if full {
+		withMessages = true
+	}
+	// --with-subagents renders child delegation transcripts, which only makes
+	// sense alongside the parent's own message thread; imply --with-messages so
+	// `show <id> --with-subagents` on its own does the obviously-intended thing.
+	if withSubagents {
 		withMessages = true
 	}
 
@@ -857,6 +876,16 @@ func sessionsShowCmdRun(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Opt-in (--with-subagents): after the parent's message summary, render
+	// each sub-agent delegation's full transcript as a demarcated, indented
+	// block. Default-hidden: without the flag, `show` never prints a child
+	// session's message content (only the one-line pulse note above).
+	if withSubagents {
+		fmt.Println()
+		fmt.Println("Sub-agent delegations:")
+		printSubAgentTranscripts(cmd.Context(), os.Stdout, a, sess.ID, "text", time.Now())
+	}
+
 	return nil
 }
 
@@ -1047,6 +1076,7 @@ func sessionsTailCmdRun(cmd *cobra.Command, args []string) error {
 	follow, _ := cmd.Flags().GetBool("follow")
 	fromMsgID, _ := cmd.Flags().GetString("from-message")
 	format, _ := cmd.Flags().GetString("format")
+	withSubagents, _ := cmd.Flags().GetBool("with-subagents")
 
 	if format != "text" && format != "ndjson" {
 		return fmt.Errorf("invalid format: %s (must be text or ndjson)", format)
@@ -1101,6 +1131,14 @@ func sessionsTailCmdRun(cmd *cobra.Command, args []string) error {
 	for i, msg := range messages {
 		printMessageWithTime(os.Stdout, msg, format, now, callCtx, i < len(messages)-1)
 		lastPrinted = msg.ID
+	}
+
+	// Opt-in (--with-subagents): render each sub-agent delegation's transcript
+	// as a demarcated block after the parent stream. Rendered once (for the
+	// snapshot at this point) rather than re-emitted on every follow tick, so
+	// --follow doesn't repeat the whole child transcript each second.
+	if withSubagents {
+		printSubAgentTranscripts(cmd.Context(), os.Stdout, a, sessionID, format, now)
 	}
 
 	if !follow {

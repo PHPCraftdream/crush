@@ -2081,6 +2081,7 @@ func TestAllToolNames_CoversUnconditionallyBuiltTools(t *testing.T) {
 		"glob",
 		"grep",
 		"ls",
+		tools.ReadDelegationTranscriptToolName,
 		"sourcegraph",
 		"todos",
 		"view",
