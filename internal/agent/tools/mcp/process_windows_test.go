@@ -142,7 +142,21 @@ func TestConfigureStdioProcess_CancelTreeKillsOrphanedGrandchild_Windows(t *test
 	_ = cmd.Wait() // Cancel makes Wait return a non-nil error; that's expected.
 	elapsed := time.Since(start)
 
-	require.Less(t, elapsed, 10*time.Second,
+	// The kill path itself (configureStdioProcess's cmd.Cancel) is a single
+	// synchronous `taskkill /F /T /PID` subprocess call — no polling loop,
+	// no retries, no artificial sleep before it fires. On an idle machine
+	// this whole test (spawn two helper levels, observe both alive, cancel,
+	// Wait) completes in well under a second. The bound below is therefore
+	// about host scheduling latency, not kill-path correctness: under a full
+	// `go test ./...` run with dozens of subprocess-heavy packages executing
+	// in parallel (including cliprovider's own high-volume subprocess stress
+	// tests), spawning and waiting on the taskkill helper process can itself
+	// be delayed by CPU/scheduler contention, observed once at ~15.2s. 25s
+	// keeps real regressions caught fast (a broken kill path degrades to the
+	// grandchild's 60s sleep, ~4x this bound) while giving headroom for
+	// CPU-starved full-suite runs; it is not a "just in case" bump to a
+	// large fixed ceiling.
+	require.Less(t, elapsed, 25*time.Second,
 		"Wait must return promptly once the process tree is killed")
 
 	require.Eventually(t, func() bool {

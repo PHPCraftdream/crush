@@ -10,6 +10,26 @@
 # golangci-lint is used from PATH when present, otherwise `go run` fetches the
 # pinned version (downloaded once into the module cache, then reused).
 #
+# -p (package-level test parallelism) is capped, and -parallel (t.Parallel()
+# subtest concurrency within a single package binary) is fully SERIALIZED
+# (=1), rather than left at Go's default (GOMAXPROCS, e.g. 16-way on a
+# 16-thread box, for BOTH knobs independently). Root-caused this session:
+# several packages (agent/cliprovider, agent/tools/mcp, internal/cmd) spawn
+# real OS subprocesses / open sqlite handles as part of their own tests, and
+# Windows lags on releasing process/file handles under load. At full 16-way
+# parallelism that lag can exceed even generous bounded-wait retries in the
+# affected tests (t.TempDir() cleanup racing a just-killed process's handle
+# release; a job-object tree-kill taking >10s under CPU starvation).
+# `-parallel 4` was tried first and was NOT enough — three different
+# internal/cmd tests (all sharing one setup helper already hardened with a
+# 30s bounded-retry RemoveAll) each failed on a separate `-parallel 4` run in
+# a row, a new specific test each time — whack-a-mole evidence that the
+# underlying contention, not any one test's bound, is the actual problem.
+# `-parallel 1` removes t.Parallel()-driven contention entirely as the more
+# defensible fix over an unbounded chase of individual test budgets. Costs
+# real wall-clock; does not skip or weaken any check. CI (ubuntu-latest)
+# does not have this problem and is intentionally left at its own default.
+#
 # Bypass in an emergency with:  git push --no-verify
 set -uo pipefail
 
@@ -32,7 +52,7 @@ else
 		|| fail "lint failed (ran via 'go run'; install golangci-lint for speed)"
 fi
 
-step "go test -short -failfast ./..."
-go test -short -failfast ./... || fail "tests failed"
+step "go test -short -failfast -p 4 -parallel 1 ./..."
+go test -short -failfast -p 4 -parallel 1 ./... || fail "tests failed"
 
 printf '\033[32m✓ pre-push checks passed\033[0m\n'

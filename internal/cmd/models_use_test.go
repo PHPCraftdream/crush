@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/db"
@@ -62,6 +63,37 @@ func isolatedModelsEnv(t *testing.T) (globalPath string) {
 		_ = os.Chdir(orig)
 		cancel()
 		db.ResetPool()
+
+		// Root-caused Windows-only flake (testing.go's TempDir
+		// RemoveAll cleanup): db.ResetPool() above is synchronous —
+		// it calls sql.DB.Close() directly under a mutex, which in
+		// turn drives modernc.org/sqlite's conn.Close() ->
+		// sqlite3_close_v2() -> a synchronous Win32 CloseHandle on
+		// the db/-wal/-shm files (modernc's Windows VFS opens files
+		// via raw CreateFileW, no goroutines or runtime.SetFinalizer
+		// anywhere in modernc.org/sqlite or modernc.org/libc). There
+		// is no Go-controlled handle leak here: by the time this
+		// Cleanup runs, the DB was already closed once via
+		// db.Release in app.Shutdown's cleanup wg (awaited
+		// synchronously by "defer a.Shutdown()" in every models_*
+		// RunE before runModelsCmd returns), and ResetPool above is
+		// just a belt-and-suspenders no-op repeat of that.
+		//
+		// The actual failure is the OS/kernel not finishing the
+		// handle release before t.TempDir()'s own registered
+		// cleanup (which runs AFTER this one — t.Cleanup is LIFO and
+		// this closure is registered after both t.TempDir() calls
+		// above) does its os.RemoveAll. Go's testing package already
+		// retries ERROR_SHARING_VIOLATION/ERROR_ACCESS_DENIED for up
+		// to a hardcoded 2s (see testing_windows.go's
+		// isWindowsRetryable + removeAll's arbitraryTimeout), which
+		// is normally plenty but was observed to be exceeded once
+		// under full-parallel-suite (-failfast ./...) system load.
+		// Actively probe for the sqlite files becoming removable
+		// here, bounded well past that 2s window, so this test's own
+		// cleanup absorbs the OS lag instead of racing t.TempDir()'s
+		// fixed budget.
+		waitForSQLiteHandleRelease(t, tmp)
 	})
 
 	for _, cmd := range []*cobra.Command{modelsUseCmd, modelsStateCmd, modelsUnsetCmd} {
@@ -69,6 +101,56 @@ func isolatedModelsEnv(t *testing.T) (globalPath string) {
 		cmd.SetContext(ctx)
 	}
 	return globalPath
+}
+
+// waitForSQLiteHandleRelease polls (bounded) for dataDir to become fully
+// removable, absorbing Windows' OS-level lag in finishing a CloseHandle
+// after sqlite3_close_v2() returns — Go's stdlib testing package only
+// tolerates ERROR_SHARING_VIOLATION/ERROR_ACCESS_DENIED for a fixed 2s (see
+// testing_windows.go's isWindowsRetryable + removeAll's arbitraryTimeout),
+// which was repeatedly observed exceeded under real concurrent-test load on
+// this machine (both across packages and across this package's own
+// t.Parallel() subtests).
+//
+// A prior version of this helper only probed specific named files
+// (crush.db/-wal/-shm/-journal) via a rename-in-place check. That missed at
+// least one real failure (TestModelsBump_RoleNotSet_ReportsCleanly) where
+// something else under dataDir was still locked — the named-file allowlist
+// can't be kept exhaustive as isolatedModelsEnv/setupBumpEnv's callers grow
+// (config files, lock files, whatever a future command under test happens
+// to create). This version instead retries the REAL os.RemoveAll(dataDir)
+// directly, mirroring the equivalent fix in
+// internal/agent/cliprovider/provider_test.go's waitForRemovable: if this
+// preemptive removal succeeds, t.TempDir()'s own later os.RemoveAll simply
+// finds nothing to do (RemoveAll on an already-missing path is a no-op
+// success), so doing the real deletion here rather than merely probing is
+// safe and catches any locked file regardless of name.
+func waitForSQLiteHandleRelease(t *testing.T, dataDir string) {
+	t.Helper()
+
+	// 30s, not 10s: observed TestModelsBump_GLM52FullStepUp (which cycles
+	// the DB open/close path multiple times, stepping a role through
+	// several effort levels in one test) exceed a 10s budget under a cold
+	// `go test` cache (every test binary recompiling at once — far heavier
+	// transient CPU/IO load than a typical warm pre-push run).
+	deadline := time.Now().Add(30 * time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		if err := os.RemoveAll(dataDir); err == nil {
+			return
+		} else {
+			lastErr = err
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if lastErr != nil {
+		// Give up silently: t.TempDir()'s own cleanup will make one more
+		// attempt (with its own 2s retry) and report the real error itself
+		// if the handle is truly still held. We don't want to fail the
+		// test here for a condition Go's own cleanup already surfaces
+		// clearly.
+		t.Logf("waitForSQLiteHandleRelease: %s still not removable after budget (%v); proceeding anyway", dataDir, lastErr)
+	}
 }
 
 // ensureRootFlagStandIns registers debug/data-dir flags directly on cmd if

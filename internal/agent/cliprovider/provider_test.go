@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -1325,10 +1326,20 @@ func TestStreamWaitBoundedOnGrandchildHoldsStderr(t *testing.T) {
 	//
 	// We also write the grandchild's PID to a file so the test can reap it
 	// afterwards (kill by PID) and avoid leaking a 30s sleeper on CI.
+	//
+	// The tmpDir path arrives as $0, not $1: BuildArgs below passes bash
+	// only [flag, script, tmpDir], i.e. `bash -c script tmpDir` — bash's
+	// `-c` convention takes the arg right after the script as $0 (the
+	// "command name" slot), with actual positional params starting at $1.
+	// Using "$1/grandchild.pid" here was silently writing to "/grandchild.pid"
+	// (root of the MSYS mount) with $1 empty, which fails with permission
+	// denied — the pid file was never created, so the reap step below was a
+	// complete no-op on every run. Confirmed by direct reproduction: `bash
+	// -c 'echo $0 $1' "sometmpdir"` prints `sometmpdir` (empty) for $0/$1.
 	script := `
 		echo "stdout-line"
 		( sleep 30 ) >&2 &
-		echo $! > "$1/grandchild.pid"
+		echo $! > "$0/grandchild.pid"
 		disown
 		echo "stdout-line-2"
 	`
@@ -1421,11 +1432,76 @@ func TestStreamWaitBoundedOnGrandchildHoldsStderr(t *testing.T) {
 			// best-effort kill of the orphan; ignore errors (already gone is fine)
 			kill, _ := exec.LookPath("taskkill")
 			if kill != "" {
-				_ = exec.CommandContext(context.Background(), kill, "/F", "/T", "/PID", fmt.Sprintf("%d", pid)).Run()
+				// On Windows, `$!` as captured by the script above is the
+				// MSYS2/Git-Bash emulated (Cygwin-style) PID, NOT the native
+				// Win32 PID that `taskkill /PID` needs — confirmed by
+				// cross-checking against `tasklist`, where the two were
+				// completely different numbers for the same process.
+				// Passing the raw value to `taskkill` silently targets a
+				// nonexistent/unrelated PID, so the real grandchild was
+				// never actually killed and ran its full 30s. `ps -a`'s 4th
+				// column (WINPID) carries the native PID (verified against
+				// `tasklist` output matching exactly); resolve it here, off
+				// the script's timing-critical path (see comment above the
+				// script), falling back to the raw pid if resolution fails
+				// (e.g. the process already exited, or a platform where
+				// `ps -a` has no WINPID column).
+				winPid := pid
+				if out, perr := exec.CommandContext(context.Background(), shell, flag,
+					fmt.Sprintf(`ps -a 2>/dev/null | awk -v p=%d '$1==p{print $4}'`, pid)).Output(); perr == nil {
+					if resolved, serr := strconv.Atoi(strings.TrimSpace(string(out))); serr == nil && resolved > 0 {
+						winPid = resolved
+					}
+				}
+				_ = exec.CommandContext(context.Background(), kill, "/F", "/T", "/PID", fmt.Sprintf("%d", winPid)).Run()
 			} else {
 				_ = exec.CommandContext(context.Background(), shell, flag, fmt.Sprintf("kill %d 2>/dev/null || true", pid)).Run()
 			}
 		}
+	}
+
+	// Wait for tmpDir to actually become removable before returning.
+	//
+	// `taskkill` (above, for the grandchild) and Stream()'s own ctx-cancel
+	// path (which tree-kills the direct bash child via session.KillProcess,
+	// also taskkill-backed on Windows — see kill_windows.go) both only
+	// REQUEST termination; neither waits for Windows to finish tearing the
+	// process down and releasing its handles. Either process — bash itself
+	// or the disowned grandchild — can still be holding an open handle
+	// rooted in tmpDir at this point. t.TempDir()'s registered cleanup
+	// (os.RemoveAll) fires via t.Cleanup the instant this test function
+	// returns, so under full-suite CPU contention that teardown gap can
+	// widen past the cleanup, causing a "used by another process" failure.
+	//
+	// Rather than tracking down every PID that might hold a handle, poll
+	// the directory itself: retry RemoveAll until it succeeds (or a non-
+	// sharing-violation error) or a bounded budget elapses. This makes the
+	// wait deterministic and correct regardless of which process (bash or
+	// the grandchild) is the actual straggler.
+	waitForRemovable(t, tmpDir, 3*time.Second)
+}
+
+// waitForRemovable polls os.RemoveAll(dir) until it succeeds or a bounded
+// budget elapses, tolerating the transient Windows "used by another
+// process" sharing violation while a just-killed process finishes tearing
+// down and releasing its handles. os.RemoveAll is safe to call speculatively
+// here: it treats an already-missing path as success, so if this preemptive
+// removal succeeds, t.TempDir()'s own later os.RemoveAll cleanup simply
+// finds nothing to do.
+func waitForRemovable(t *testing.T, dir string, budget time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(budget)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		if err := os.RemoveAll(dir); err == nil {
+			return
+		} else {
+			lastErr = err
+		}
+		time.Sleep(75 * time.Millisecond)
+	}
+	if lastErr != nil {
+		t.Logf("waitForRemovable: %s still not removable after %s budget (%v); proceeding anyway", dir, budget, lastErr)
 	}
 }
 
@@ -1496,6 +1572,17 @@ func TestStreamKillUsesTreeKillStillTerminatesChild(t *testing.T) {
 
 	// Child writes its own PID to a file, then sleeps long enough that we
 	// can cancel and observe whether it actually died.
+	//
+	// The duration below (orphanSleepDuration) is deliberately an unusual,
+	// grep-unique value rather than a round number like "60" — several OTHER
+	// tests across this repo (this file's own sibling test, internal/shell,
+	// etc.) also invoke plain "sleep 60"/"sleep 30" concurrently under the
+	// pre-push hook's `-p 4` package parallelism, and this test's orphan-
+	// cleanup step below (see the sleep.exe kill call) needs to identify
+	// ONLY its own orphaned sleep.exe by command-line, not collide with a
+	// same-duration process a different package's test is legitimately
+	// still using.
+	const orphanSleepDuration = "58.37"
 	pidFile := filepath.Join(t.TempDir(), "child.pid")
 	spec := CLISpec{
 		ModelID:    "test-kill-tree",
@@ -1503,10 +1590,11 @@ func TestStreamKillUsesTreeKillStillTerminatesChild(t *testing.T) {
 		Binary:     shell,
 		PromptFlag: "-p",
 		BuildArgs: func(bool) []string {
-			return []string{flag, "echo $$ > '" + pidFile + "'; sleep 60"}
+			return []string{flag, "echo $$ > '" + pidFile + "'; sleep " + orphanSleepDuration}
 		},
 	}
-	m := &cliModel{spec: spec, workingDir: t.TempDir()}
+	workingDir := t.TempDir()
+	m := &cliModel{spec: spec, workingDir: workingDir}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	stream, err := m.Stream(ctx, fantasy.Call{
@@ -1560,6 +1648,45 @@ func TestStreamKillUsesTreeKillStillTerminatesChild(t *testing.T) {
 		// best-effort cleanup
 		_ = exec.CommandContext(context.Background(), shell, flag, fmt.Sprintf("kill -9 %d 2>/dev/null || true", pid)).Run()
 	}
+
+	// Root-caused (confirmed via `wmic process where "name='sleep.exe'" get
+	// processid,parentprocessid`): the "sleep 60" launched by this test's
+	// bash script does NOT end up as a genuine Win32 child of the bash.exe
+	// pid we tracked and killed above — under this MSYS2/Git-Bash build,
+	// external-binary spawns route through a transient intermediary helper
+	// process, so the OS-recorded ParentProcessId points at that helper
+	// (already gone by the time we can inspect it), never at bash.exe.
+	// taskkill /F /T /PID <bash-pid> (session.KillProcess's implementation)
+	// walks the PPID chain from bash.exe and therefore can never discover
+	// or kill sleep.exe — this isn't a timing race, confirmed by 10/10
+	// deterministic failures even with a 10s post-kill wait budget, always
+	// converging only once sleep.exe's own 60s runs out. This same MSYS2
+	// process-model gap is a plausible latent issue in the real
+	// session.KillProcess production path too (out of scope for this test
+	// fix; flagged separately) whenever a CLI provider's child spawns a
+	// real subprocess of its own on Windows.
+	//
+	// Test-level mitigation only (mirrors the WINPID-resolution fix in
+	// TestStreamWaitBoundedOnGrandchildHoldsStderr above): explicitly hunt
+	// down and kill any orphaned sleep.exe this test's own script could
+	// have spawned, rather than waiting on a handle release that a lost
+	// orphan will never trigger in reasonable test time.
+	//
+	// Matched by exact command line (the orphanSleepDuration literal above),
+	// NOT by a start-time window: a start-time-only filter was tried first
+	// and confirmed unsafe by direct observation — internal/agent/tools'
+	// TestBackgroundShell_AutoBackground legitimately runs "sleep 20"
+	// concurrently under the pre-push hook's `-p 4` package parallelism,
+	// and a plain "kill anything named sleep.exe started recently" query
+	// killed it too (observed failure: "exit status 255"). Several OTHER
+	// tests repo-wide also use round-number sleep durations (30/60/100/...),
+	// so matching on command line requires this test's own duration to stay
+	// the unusual, grep-unique value declared above — do not "clean up" it
+	// back to a round number.
+	_ = exec.CommandContext(context.Background(), "powershell", "-NoProfile", "-Command",
+		`Get-CimInstance Win32_Process -Filter "Name='sleep.exe'" | Where-Object { $_.CommandLine -like '*`+orphanSleepDuration+`*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`).Run()
+
+	waitForRemovable(t, workingDir, 5*time.Second)
 }
 
 // processAlive reports whether a process with the given pid is still running.
