@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -10,6 +12,37 @@ import (
 	"github.com/charmbracelet/crush/internal/session"
 	"github.com/stretchr/testify/assert"
 )
+
+// TestWatchInterrupted_CancelledContextExits proves the Ctrl+C exit contract
+// at the loop-decision level without needing to send a real OS signal: fang
+// wraps the command context with signal.NotifyContext(os.Interrupt), so a
+// single Ctrl+C cancels ctx. The watch loop calls watchInterrupted at the top
+// of every iteration; a cancelled context must make it return true (→ the loop
+// returns nil, i.e. the process exits) after printing the distinguishing
+// interrupted notice.
+func TestWatchInterrupted_CancelledContextExits(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // simulate the single Ctrl+C fang delivers via context cancel
+	assert.True(t, watchInterrupted(ctx), "cancelled context must signal exit")
+}
+
+// TestWatchInterrupted_LiveContextContinues guards the other side: a live
+// (uncancelled) context must NOT trip the interrupt path, otherwise the watch
+// would exit on its very first tick.
+func TestWatchInterrupted_LiveContextContinues(t *testing.T) {
+	assert.False(t, watchInterrupted(context.Background()), "live context must not signal exit")
+}
+
+// TestPrintWatchInterrupted_Message pins the exact interrupted wording. It is
+// deliberately NOT the end-of-session summary block ("--- session ended ---"),
+// so "I stopped watching" never reads as "the session ended".
+func TestPrintWatchInterrupted_Message(t *testing.T) {
+	var buf bytes.Buffer
+	printWatchInterrupted(&buf)
+	out := buf.String()
+	assert.Contains(t, out, "(interrupted — session still running)")
+	assert.NotContains(t, out, "--- session ended ---", "interrupt notice must not look like the end summary")
+}
 
 // In the tests below, the last lockAlive argument follows the new
 // semantics: it's true ONLY when the lock heartbeat is fresh (process

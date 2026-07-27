@@ -140,6 +140,18 @@ func liveTailSession(ctx context.Context, a *app.App, sessionID, locksDir string
 	defer ticker.Stop()
 
 	for {
+		// Ctrl+C wins over everything. fang wraps the root command's
+		// context with signal.NotifyContext(os.Interrupt), so a single
+		// Ctrl+C cancels ctx. Check it at the very top of every iteration
+		// — BEFORE the isSessionFinished I/O below — so an interrupt that
+		// lands mid-tick (or while the loop is about to do a DB read on a
+		// now-cancelled ctx) always exits promptly with the interrupted
+		// message, never a spurious "database error: context canceled" or
+		// a false end-of-session summary.
+		if watchInterrupted(ctx) {
+			return nil
+		}
+
 		// Check for end first so we print a summary even when there are
 		// no new messages to emit on this tick.
 		if done, reason := isSessionFinished(ctx, a, sessionID, locksDir); done {
@@ -149,13 +161,21 @@ func liveTailSession(ctx context.Context, a *app.App, sessionID, locksDir string
 
 		select {
 		case <-ctx.Done():
-			fmt.Fprintln(os.Stderr, "\n(interrupted — session still running)")
+			printWatchInterrupted(os.Stderr)
 			return nil
 		case <-ticker.C:
 		}
 
 		msgs, err := a.Messages.List(ctx, sessionID)
 		if err != nil {
+			// A cancelled context surfaces here as context.Canceled when
+			// the interrupt raced the ticker branch of the select above
+			// (both channels ready → Go picks pseudo-randomly). Treat it
+			// as the interrupt it really is, not a database failure.
+			if ctx.Err() != nil {
+				printWatchInterrupted(os.Stderr)
+				return nil
+			}
 			return fmt.Errorf("database error: %w", err)
 		}
 		callCtx = buildToolCallContext(msgs)
@@ -174,6 +194,26 @@ func liveTailSession(ctx context.Context, a *app.App, sessionID, locksDir string
 			}
 		}
 	}
+}
+
+// watchInterrupted reports whether the watch's context has been cancelled
+// (a single Ctrl+C, via fang's signal.NotifyContext(os.Interrupt)). When it
+// has, it prints the distinguishing interrupted message and returns true so
+// the caller can exit immediately. Kept as a tiny, app-free seam so the
+// interrupt-exit path is unit-testable without spinning up a real app / DB.
+func watchInterrupted(ctx context.Context) bool {
+	if ctx.Err() == nil {
+		return false
+	}
+	printWatchInterrupted(os.Stderr)
+	return true
+}
+
+// printWatchInterrupted emits the "stopped watching, session not ended"
+// notice. Deliberately distinct from the end-of-session summary block so
+// "I stopped watching" is never misread as "the session ended".
+func printWatchInterrupted(w io.Writer) {
+	fmt.Fprintln(w, "\n(interrupted — session still running)")
 }
 
 // liveLockMaxAge is the threshold for considering a lock file "alive".
