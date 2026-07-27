@@ -131,8 +131,8 @@ func liveTailSession(ctx context.Context, a *app.App, sessionID, locksDir string
 
 	now := time.Now()
 	lastPrinted := ""
-	for _, msg := range messages {
-		printMessageWithTime(os.Stdout, msg, "text", now, callCtx)
+	for i, msg := range messages {
+		printMessageWithTime(os.Stdout, msg, "text", now, callCtx, i < len(messages)-1)
 		lastPrinted = msg.ID
 	}
 
@@ -201,7 +201,7 @@ func liveTailSession(ctx context.Context, a *app.App, sessionID, locksDir string
 				continue
 			}
 			if lastPrinted == "" || isAfter(&msgs[i], anchor) {
-				printMessageWithTime(os.Stdout, msgs[i], "text", tickNow, callCtx)
+				printMessageWithTime(os.Stdout, msgs[i], "text", tickNow, callCtx, i < len(msgs)-1)
 				lastPrinted = msgs[i].ID
 				printedThisTick = true
 			}

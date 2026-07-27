@@ -520,8 +520,12 @@ func sessionsLastCmdRun(cmd *cobra.Command, args []string) error {
 	// look up its matching ToolCall that may have been emitted earlier.
 	callCtx := buildToolCallContext(messages)
 	now := time.Now()
-	for _, msg := range messages {
-		printMessageWithTime(os.Stdout, msg, format, now, callCtx)
+	// The window always ends at the true tail of the session (we trim from
+	// the front), so a row is "followed by a later message" iff it isn't the
+	// last one in the window. That's the signal finishReasonLabel uses to
+	// tell a transient, auto-retried error from a terminal one.
+	for i, msg := range messages {
+		printMessageWithTime(os.Stdout, msg, format, now, callCtx, i < len(messages)-1)
 	}
 
 	// Sub-agent pulse: `last` shows only the TOP-LEVEL session's rows, so an
@@ -652,6 +656,10 @@ func sessionsShowCmdRun(cmd *cobra.Command, args []string) error {
 		Role         string `json:"role"`
 		Preview      string `json:"preview"`
 		FinishReason string `json:"finish_reason,omitempty"`
+		// Retried mirrors printMessage's ndjson field: a finish_reason="error"
+		// row that was followed by more messages was transiently retried, not
+		// a terminal death. Separate boolean so consumers keep the raw enum.
+		Retried bool `json:"retried,omitempty"`
 	}
 
 	type sessionShowOutput struct {
@@ -755,8 +763,13 @@ func sessionsShowCmdRun(cmd *cobra.Command, args []string) error {
 			}
 
 			finishReason := ""
+			retried := false
 			if f := msg.FinishPart(); f != nil {
 				finishReason = string(f.Reason)
+				// A followed-by-later error row is a transient, auto-retried
+				// failure — the session went on. messages is the full list in
+				// order, so any row but the last has a later message.
+				retried = f.Reason == message.FinishReasonError && i < len(messages)-1
 			}
 
 			output.Messages[i] = msgItem{
@@ -764,6 +777,7 @@ func sessionsShowCmdRun(cmd *cobra.Command, args []string) error {
 				Role:         string(msg.Role),
 				Preview:      preview,
 				FinishReason: finishReason,
+				Retried:      retried,
 			}
 		}
 	}
@@ -838,7 +852,7 @@ func sessionsShowCmdRun(cmd *cobra.Command, args []string) error {
 		for i, msg := range output.Messages {
 			fmt.Printf("  %d. [%s] %s\n", i+1, msg.Role, truncate(msg.Preview, 60))
 			if msg.FinishReason != "" {
-				fmt.Printf("     (finished: %s)\n", msg.FinishReason)
+				fmt.Printf("     (finished: %s)\n", finishReasonLabel(message.FinishReason(msg.FinishReason), msg.Retried))
 			}
 		}
 	}
@@ -1079,10 +1093,13 @@ func sessionsTailCmdRun(cmd *cobra.Command, args []string) error {
 	// follow loop below extends it as new ToolCall parts arrive.
 	callCtx := buildToolCallContext(messages)
 
-	// Print messages
+	// Print messages. This batch ends at the session tail, so a row is
+	// "followed by a later message" iff it isn't the last in the slice —
+	// which is how finishReasonLabel distinguishes an auto-retried error
+	// from a terminal one.
 	now := time.Now()
-	for _, msg := range messages {
-		printMessageWithTime(os.Stdout, msg, format, now, callCtx)
+	for i, msg := range messages {
+		printMessageWithTime(os.Stdout, msg, format, now, callCtx, i < len(messages)-1)
 		lastPrinted = msg.ID
 	}
 
@@ -1121,7 +1138,7 @@ func sessionsTailCmdRun(cmd *cobra.Command, args []string) error {
 		now := time.Now()
 		for i := range messages {
 			if messages[i].ID != lastPrinted && (lastPrinted == "" || isAfter(&messages[i], findByID(messages, lastPrinted))) {
-				printMessageWithTime(os.Stdout, messages[i], format, now, callCtx)
+				printMessageWithTime(os.Stdout, messages[i], format, now, callCtx, i < len(messages)-1)
 				lastPrinted = messages[i].ID
 			}
 		}
@@ -1231,22 +1248,48 @@ func lookupToolCallOrigin(ctx map[string]toolCallOrigin, toolCallID string) (str
 // (optional, may be nil) maps ToolCallID to the originating ToolCall's
 // name and JSON input — when present, ToolResult rendering uses it to
 // show the call's most useful argument next to the result.
-func printMessageWithTime(w io.Writer, msg message.Message, format string, now time.Time, callCtx map[string]toolCallOrigin) {
+//
+// followedByLater reports whether a newer message exists in the same
+// session after this one. It only affects how a FinishReasonError row is
+// labelled: a bare "(finished: error)" reads like the process died there,
+// but if the session went on to produce more rows the error was transient
+// and the turn was re-run (coordinator transient-retry, an orchestrator
+// re-invocation, or a Phase-4 auto-resume) — see finishReasonLabel.
+func printMessageWithTime(w io.Writer, msg message.Message, format string, now time.Time, callCtx map[string]toolCallOrigin, followedByLater bool) {
 	if format == "text" && msg.CreatedAt != 0 {
 		ts := time.Unix(msg.CreatedAt, 0)
 		ago := now.Sub(ts)
 		fmt.Fprintf(w, "[%s] (%s)\n", ts.Format("2006-01-02 15:04:05"), formatAgo(ago))
 	}
-	printMessage(w, msg, format, callCtx)
+	printMessage(w, msg, format, callCtx, followedByLater)
 }
 
-func printMessage(w io.Writer, msg message.Message, format string, callCtx map[string]toolCallOrigin) {
+// finishReasonLabel renders the "(finished: …)" suffix for a message row.
+// For a FinishReasonError that is NOT the session's final row, it appends a
+// note that the turn was retried — the same underlying finish_reason="error"
+// means "the process died here" only when nothing came after it. Without
+// this, a transient, auto-retried failure is indistinguishable from a
+// terminal one in `sessions last` / `sessions show`.
+func finishReasonLabel(reason message.FinishReason, followedByLater bool) string {
+	if reason == message.FinishReasonError && followedByLater {
+		return string(reason) + " — retried, session continued"
+	}
+	return string(reason)
+}
+
+func printMessage(w io.Writer, msg message.Message, format string, callCtx map[string]toolCallOrigin, followedByLater bool) {
 	if format == "ndjson" {
 		type msgJSON struct {
 			ID           string `json:"id"`
 			Role         string `json:"role"`
 			Preview      string `json:"preview"`
 			FinishReason string `json:"finish_reason,omitempty"`
+			// Retried is true for a finish_reason="error" row that was
+			// followed by more messages in the session — i.e. the error was
+			// transient and the turn was re-run, not a terminal death. Kept
+			// as a separate boolean so consumers can still switch on the raw
+			// finish_reason enum. Omitted (false) for every non-error row.
+			Retried bool `json:"retried,omitempty"`
 		}
 		preview := ""
 		for _, part := range msg.Parts {
@@ -1256,8 +1299,10 @@ func printMessage(w io.Writer, msg message.Message, format string, callCtx map[s
 			}
 		}
 		finishReason := ""
+		retried := false
 		if f := msg.FinishPart(); f != nil {
 			finishReason = string(f.Reason)
+			retried = f.Reason == message.FinishReasonError && followedByLater
 		}
 		enc := json.NewEncoder(w)
 		_ = enc.Encode(msgJSON{
@@ -1265,6 +1310,7 @@ func printMessage(w io.Writer, msg message.Message, format string, callCtx map[s
 			Role:         string(msg.Role),
 			Preview:      preview,
 			FinishReason: finishReason,
+			Retried:      retried,
 		})
 	} else {
 		// text format
@@ -1318,7 +1364,7 @@ func printMessage(w io.Writer, msg message.Message, format string, callCtx map[s
 			fmt.Fprintf(w, "(no content yet)\n")
 		}
 		if f := msg.FinishPart(); f != nil && f.Reason != "" {
-			fmt.Fprintf(w, "(finished: %s)\n", f.Reason)
+			fmt.Fprintf(w, "(finished: %s)\n", finishReasonLabel(f.Reason, followedByLater))
 		}
 		fmt.Fprintf(w, "\n")
 	}
