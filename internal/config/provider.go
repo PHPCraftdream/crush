@@ -33,6 +33,39 @@ var (
 	providerErr  error
 )
 
+// ResetProviderCacheForTests clears the process-wide provider/hyper sync
+// singletons (providerOnce/providerList/providerErr, catwalkSyncer,
+// hyperSyncer). Test-only: production code must never call this — a real
+// crush process deliberately has exactly one of these caches for its whole
+// lifetime (see Providers' doc comment).
+//
+// Every sync.Once-guarded singleton here only ever runs its populate-once
+// closure on the FIRST call within a process. Go test binaries run all of
+// one package's tests in a single process, so without a reset, whichever
+// test happens to call into provider resolution first freezes the result
+// for every other test in that binary — including ones with completely
+// different CRUSH_PROVIDER_CACHE_ONLY/CRUSH_GLOBAL_DATA env vars, since
+// those are only consulted inside the once-guarded closure. This package's
+// own tests already avoid the problem (see resetProviderState in
+// provider_test.go); this exported twin exists so tests in OTHER packages
+// that indirectly trigger provider resolution via config.Init/LoadConfig
+// (internal/cmd, internal/agent) can isolate themselves the same way.
+//
+// Safe to call from a SERIAL test's own setup (no other test can be
+// touching this shared state concurrently at that point — see the
+// package-level comment on t.Parallel() scheduling in isolatedModelsEnv).
+// Do NOT call this from a test that itself runs under t.Parallel(): it
+// would race with any other parallel sibling's in-flight resolution the
+// same way db.ResetPool() used to race other tests' live connections
+// (see internal/db/connect.go's Release for that fix's shape).
+func ResetProviderCacheForTests() {
+	providerOnce = sync.Once{}
+	providerList = nil
+	providerErr = nil
+	catwalkSyncer = &catwalkSync{}
+	hyperSyncer = &hyperSync{}
+}
+
 // file to cache provider data
 func cachePathFor(name string) string {
 	xdgDataHome := os.Getenv("XDG_DATA_HOME")

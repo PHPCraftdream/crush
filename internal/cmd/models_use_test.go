@@ -42,6 +42,15 @@ import (
 // subcommand instance, so this matches production behavior more closely.
 func isolatedModelsEnv(t *testing.T) (globalPath string) {
 	t.Helper()
+	// config.ResetProviderCacheForTests: internal/config's provider/hyper
+	// catalog resolution is memoized process-wide via sync.Once — whichever
+	// test in this binary calls it FIRST freezes the result (embedded vs.
+	// on-disk cache vs. network) for every other test, regardless of their
+	// own CRUSH_PROVIDER_CACHE_ONLY/CRUSH_GLOBAL_DATA. Safe here because
+	// these tests are serial (no t.Parallel()) — see the exported func's
+	// own doc comment for why this must never be called from a parallel
+	// test.
+	config.ResetProviderCacheForTests()
 	tmp := t.TempDir()
 	t.Setenv("XDG_DATA_HOME", tmp)
 	t.Setenv("CRUSH_GLOBAL_DATA", tmp)
