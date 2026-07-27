@@ -90,6 +90,14 @@ crush sessions list --json | jq 'select(.message_count > 0)'
 		// lock actually hit the message store.
 		statusByID = reclassifyCrashedAsDone(cmd.Context(), a, sessions, statusByID)
 
+		// Sub-agent awareness: a "running" session that is currently blocked
+		// inside an `agent` delegation gets promoted to "delegating" so the
+		// STATUS column distinguishes "top-level agent is working" from "top-
+		// level agent is waiting on a sub-agent". The freshness signal comes
+		// from the shared call-tree walk (sessions_activity.go), NOT from the
+		// lock mtime, so it reflects the sub-agent actually making progress.
+		statusByID = markDelegatingSessions(cmd.Context(), a, sessions, statusByID)
+
 		if asJSON {
 			enc := json.NewEncoder(os.Stdout)
 			for _, s := range sessions {
@@ -205,6 +213,41 @@ func reclassifyCrashedAsDone(
 				statusByID[s.ID] = "done"
 			}
 			break
+		}
+	}
+	return statusByID
+}
+
+// markDelegatingSessions promotes a "running" status to "delegating" when
+// the session's freshest activity is coming from an in-flight sub-agent
+// delegation rather than the top-level agent itself. This is the STATUS-
+// column consumer of the shared call-tree activity signal: it lets an
+// operator scanning `sessions list` see at a glance which running sessions
+// are currently blocked on (and being kept alive by) a sub-agent.
+//
+// Only sessions already flagged "running" are probed — at-rest / crashed /
+// done sessions are left untouched — so the extra call-tree walks are
+// bounded by the number of live sessions (usually one or two).
+func markDelegatingSessions(
+	ctx context.Context,
+	a *app.App,
+	sessions []session.Session,
+	statusByID map[string]string,
+) map[string]string {
+	if statusByID == nil || a == nil {
+		return statusByID
+	}
+	for _, s := range sessions {
+		if statusByID[s.ID] != "running" {
+			continue
+		}
+		// Baseline = the session's own updated_at. A descendant sub-agent
+		// message newer than that means the live edge of work is inside a
+		// delegation. (The session row's updated_at is NOT bumped by child
+		// message inserts — see the DB triggers — so this comparison is
+		// meaningful.)
+		if act, fresher := callTreeActivityFresherThan(ctx, a, s.ID, s.UpdatedAt); fresher && act.SubAgentActive {
+			statusByID[s.ID] = "delegating"
 		}
 	}
 	return statusByID
@@ -480,6 +523,18 @@ func sessionsLastCmdRun(cmd *cobra.Command, args []string) error {
 	for _, msg := range messages {
 		printMessageWithTime(os.Stdout, msg, format, now, callCtx)
 	}
+
+	// Sub-agent pulse: `last` shows only the TOP-LEVEL session's rows, so an
+	// in-flight `agent` delegation (which writes to a child session) is
+	// invisible here. Append a one-line note when the freshest activity in
+	// the call tree is a sub-agent's, so `last` doesn't look frozen while a
+	// delegation is actively running. Text format only — ndjson consumers
+	// get the structured signal from `sessions locks --json` / `show --json`.
+	if format == "text" {
+		if note := subAgentActivityNote(cmd.Context(), a, sess.ID, sess.UpdatedAt, now); note != "" {
+			fmt.Fprintf(os.Stdout, "[%s]\n\n", note)
+		}
+	}
 	return nil
 }
 
@@ -600,24 +655,29 @@ func sessionsShowCmdRun(cmd *cobra.Command, args []string) error {
 	}
 
 	type sessionShowOutput struct {
-		ID               string    `json:"id"`
-		Hash             string    `json:"hash"`
-		Title            string    `json:"title"`
-		Purpose          string    `json:"purpose,omitempty"` // first user prompt excerpt
-		ParentID         string    `json:"parent_id,omitempty"`
-		Provider         string    `json:"provider,omitempty"`
-		Model            string    `json:"model,omitempty"`
-		Effort           string    `json:"effort,omitempty"`
-		CreatedAt        int64     `json:"created_at"`
-		UpdatedAt        int64     `json:"updated_at"`
-		MessageCount     int64     `json:"message_count"`
-		PromptTokens     int64     `json:"prompt_tokens"`
-		CompletionTokens int64     `json:"completion_tokens"`
-		CostUSD          float64   `json:"cost_usd"`
-		EndedReason      string    `json:"ended_reason,omitempty"`
-		BudgetMaxCost    float64   `json:"budget_max_cost,omitempty"`
-		BudgetMaxTokens  int64     `json:"budget_max_tokens,omitempty"`
-		BudgetTimeoutSec int64     `json:"budget_timeout_sec,omitempty"`
+		ID               string  `json:"id"`
+		Hash             string  `json:"hash"`
+		Title            string  `json:"title"`
+		Purpose          string  `json:"purpose,omitempty"` // first user prompt excerpt
+		ParentID         string  `json:"parent_id,omitempty"`
+		Provider         string  `json:"provider,omitempty"`
+		Model            string  `json:"model,omitempty"`
+		Effort           string  `json:"effort,omitempty"`
+		CreatedAt        int64   `json:"created_at"`
+		UpdatedAt        int64   `json:"updated_at"`
+		MessageCount     int64   `json:"message_count"`
+		PromptTokens     int64   `json:"prompt_tokens"`
+		CompletionTokens int64   `json:"completion_tokens"`
+		CostUSD          float64 `json:"cost_usd"`
+		EndedReason      string  `json:"ended_reason,omitempty"`
+		BudgetMaxCost    float64 `json:"budget_max_cost,omitempty"`
+		BudgetMaxTokens  int64   `json:"budget_max_tokens,omitempty"`
+		BudgetTimeoutSec int64   `json:"budget_timeout_sec,omitempty"`
+		// SubAgentActivity, when non-empty, describes an in-flight sub-agent
+		// delegation whose activity is fresher than this session's own —
+		// e.g. "assistant activity 3s ago (session abc12345)". Computed from
+		// the shared call-tree walk (sessions_activity.go).
+		SubAgentActivity string    `json:"sub_agent_activity,omitempty"`
 		SystemPrompt     string    `json:"system_prompt,omitempty"`
 		Messages         []msgItem `json:"messages,omitempty"`
 	}
@@ -663,6 +723,12 @@ func sessionsShowCmdRun(cmd *cobra.Command, args []string) error {
 		BudgetTimeoutSec: sess.BudgetTimeoutSec,
 		SystemPrompt:     sess.SystemPrompt,
 	}
+
+	// Sub-agent pulse: surface an in-flight delegation's own last activity
+	// so `sessions show` on a session that's blocked waiting on a sub-agent
+	// isn't misread as idle. Baseline = the session's own updated_at; the
+	// note only appears when a descendant sub-agent session is fresher.
+	output.SubAgentActivity = subAgentActivityNote(cmd.Context(), a, sess.ID, sess.UpdatedAt, time.Now())
 
 	if withMessages {
 		if msgErr != nil {
@@ -741,6 +807,9 @@ func sessionsShowCmdRun(cmd *cobra.Command, args []string) error {
 	}
 	if output.EndedReason != "" {
 		fmt.Printf("Ended:        %s\n", output.EndedReason)
+	}
+	if output.SubAgentActivity != "" {
+		fmt.Printf("Delegating:   %s\n", output.SubAgentActivity)
 	}
 	if output.Purpose != "" {
 		fmt.Printf("Purpose:      %s\n", output.Purpose)
@@ -834,6 +903,12 @@ func sessionsLocksCmdRun(cmd *cobra.Command, args []string) error {
 		DurationSec int64  `json:"duration_seconds"`
 		Stale       bool   `json:"stale"`
 		BudgetSec   int64  `json:"budget_sec,omitempty"` // --timeout seconds, 0 if not set
+		// SubAgent, when non-empty, means the freshest activity in this
+		// session's call tree came from an in-flight sub-agent delegation,
+		// NOT the top-level heartbeat — so PulseSec/Pulse below are the
+		// sub-agent's activity age, which is the honest "is anything actually
+		// making progress" signal an operator wants during a long delegation.
+		SubAgent string `json:"sub_agent,omitempty"`
 	}
 
 	var locks []lockItem
@@ -866,6 +941,22 @@ func sessionsLocksCmdRun(cmd *cobra.Command, args []string) error {
 		pulse := lockPulseStatus(pulseSec)
 		stale := pulse == "offline"
 
+		// Sub-agent pulse override: the lock mtime only tracks the top-level
+		// heartbeat. If this session is blocked inside an `agent` delegation,
+		// the freshest real activity lives on the sub-agent's child-session
+		// message rows (see sessions_activity.go). When that activity is newer
+		// than the heartbeat, report ITS age as the pulse — otherwise a hung
+		// sub-agent and a working one look identical (heartbeat always fresh).
+		var subAgentLabel string
+		if act, fresher := callTreeActivityFresherThan(cmd.Context(), a, sessionID, info.ModTime().Unix()); fresher && act.SubAgentActive {
+			if subAge, ok := act.Age(now); ok {
+				pulseSec = int64(subAge.Seconds())
+				pulse = lockPulseStatus(pulseSec)
+				stale = pulse == "offline"
+				subAgentLabel = short(session.HashID(act.DeepestSessionID))
+			}
+		}
+
 		if staleOnly && !stale {
 			continue
 		}
@@ -890,6 +981,7 @@ func sessionsLocksCmdRun(cmd *cobra.Command, args []string) error {
 			DurationSec: duration,
 			Stale:       stale,
 			BudgetSec:   budgetSec,
+			SubAgent:    subAgentLabel,
 		})
 	}
 
@@ -913,20 +1005,25 @@ func sessionsLocksCmdRun(cmd *cobra.Command, args []string) error {
 	}
 
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "SESSION_ID\tPID\tPULSE\tPULSE_AGE\tELAPSED\tBUDGET")
+	fmt.Fprintln(tw, "SESSION_ID\tPID\tPULSE\tPULSE_AGE\tELAPSED\tBUDGET\tSUB-AGENT")
 	for _, lock := range locks {
 		budget := "∞"
 		if lock.BudgetSec > 0 {
 			budget = formatDurationShort(time.Duration(lock.BudgetSec) * time.Second)
 		}
+		subAgent := "-"
+		if lock.SubAgent != "" {
+			subAgent = lock.SubAgent
+		}
 		fmt.Fprintf(
-			tw, "%s\t%d\t%s\t%ds ago\t%s\t%s\n",
+			tw, "%s\t%d\t%s\t%ds ago\t%s\t%s\t%s\n",
 			truncate(lock.SessionID, 28),
 			lock.PID,
 			lock.Pulse,
 			lock.PulseSec,
 			formatDurationShort(time.Duration(lock.DurationSec)*time.Second),
 			budget,
+			subAgent,
 		)
 	}
 	return tw.Flush()

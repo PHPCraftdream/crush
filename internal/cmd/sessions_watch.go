@@ -139,6 +139,17 @@ func liveTailSession(ctx context.Context, a *app.App, sessionID, locksDir string
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
+	// Sub-agent pulse throttling: the live-tail only sees the TOP-LEVEL
+	// session's message rows, so an in-flight `agent` delegation (which
+	// writes to a child session) would otherwise make watch look frozen for
+	// minutes. We emit a "sub-agent active …" heartbeat line at most every
+	// subAgentPulseEvery, and only when there were no new top-level messages
+	// this tick (so it never crowds out real output), and only when the note
+	// actually changed (so a stuck sub-agent doesn't spam identical lines).
+	const subAgentPulseEvery = 5 * time.Second
+	var lastSubAgentPulse time.Time
+	var lastSubAgentNote string
+
 	for {
 		// Ctrl+C wins over everything. fang wraps the root command's
 		// context with signal.NotifyContext(os.Interrupt), so a single
@@ -184,6 +195,7 @@ func liveTailSession(ctx context.Context, a *app.App, sessionID, locksDir string
 		if lastPrinted != "" {
 			anchor = findByID(msgs, lastPrinted)
 		}
+		printedThisTick := false
 		for i := range msgs {
 			if msgs[i].ID == lastPrinted {
 				continue
@@ -191,9 +203,39 @@ func liveTailSession(ctx context.Context, a *app.App, sessionID, locksDir string
 			if lastPrinted == "" || isAfter(&msgs[i], anchor) {
 				printMessageWithTime(os.Stdout, msgs[i], "text", tickNow, callCtx)
 				lastPrinted = msgs[i].ID
+				printedThisTick = true
+			}
+		}
+
+		// When the top-level stream is quiet, show the sub-agent pulse so the
+		// operator can tell a live delegation from a hang. Baseline = the
+		// newest top-level message time (or session created time as a floor)
+		// so the note only fires while a CHILD session is the fresher edge.
+		if !printedThisTick {
+			baseline := newestMessageUnix(msgs)
+			if note := subAgentActivityNote(ctx, a, sessionID, baseline, tickNow); note != "" {
+				if note != lastSubAgentNote || tickNow.Sub(lastSubAgentPulse) >= subAgentPulseEvery {
+					fmt.Fprintf(os.Stdout, "[%s] %s\n\n", tickNow.Format("2006-01-02 15:04:05"), note)
+					lastSubAgentPulse = tickNow
+					lastSubAgentNote = note
+				}
 			}
 		}
 	}
+}
+
+// newestMessageUnix returns the newest activity timestamp among a session's
+// own messages (max of created_at / updated_at). Used by the watch loop as
+// the baseline for the sub-agent pulse: a descendant session's activity only
+// counts as "the fresher edge" when it is newer than every top-level row.
+func newestMessageUnix(msgs []message.Message) int64 {
+	var newest int64
+	for i := range msgs {
+		if ts := latestMessageUnix(msgs[i]); ts > newest {
+			newest = ts
+		}
+	}
+	return newest
 }
 
 // watchInterrupted reports whether the watch's context has been cancelled

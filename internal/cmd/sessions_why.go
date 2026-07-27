@@ -155,6 +155,17 @@ func explainSessionStatus(ctx context.Context, a *app.App, cwd, sessionID string
 			// see the Windows note above) but the heartbeat is fresh.
 			fmt.Fprintf(out, "reason: lock held (PID unreadable while active — normal on Windows); heartbeat %s old.\n", formatDurationShort(heartAge))
 		}
+		// Sub-agent pulse: the lock heartbeat only proves the orchestrator
+		// process is alive — if it's blocked inside an `agent` delegation the
+		// heartbeat keeps ticking whether the sub-agent is working or hung.
+		// Surface the call tree's freshest activity (baseline = heartbeat
+		// mtime) so "working" vs "stuck" is distinguishable. See
+		// sessions_activity.go.
+		now := time.Now()
+		lockMtimeUnix := now.Add(-heartAge).Unix()
+		if note := subAgentActivityNote(ctx, a, sessionID, lockMtimeUnix, now); note != "" {
+			fmt.Fprintf(out, "%s\n", note)
+		}
 		if finish != nil {
 			fmt.Fprintf(out, "last assistant finish: %s\n", finishReasonOrUnknown(finish))
 		} else {
