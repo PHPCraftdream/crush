@@ -91,7 +91,7 @@ func TestAwaitingAnswerErrorClassification(t *testing.T) {
 		t.Error("errors.Is(err, errAwaitingAnswer) must hold via Unwrap, mirroring PeakHoursError/errProviderPeakHours")
 	}
 
-	var wrapped error = errors.Join(errors.New("context"), err)
+	wrapped := errors.Join(errors.New("context"), err)
 	var ae *AwaitingAnswerError
 	if !errors.As(wrapped, &ae) {
 		t.Fatal("errors.As must find the AwaitingAnswerError through wrapping")

@@ -147,10 +147,10 @@ func TestModelsUse_WorkerAndReviewerFlags(t *testing.T) {
 	require.NoError(t, err)
 	content := string(data)
 
-	assert.Contains(t, content, `"glm-5.1"`)   // large
-	assert.Contains(t, content, `"glm-5-turbo"`) // small
+	assert.Contains(t, content, `"glm-5.1"`)       // large
+	assert.Contains(t, content, `"glm-5-turbo"`)   // small
 	assert.Contains(t, content, `"glm-4.7-flash"`) // worker
-	assert.Contains(t, content, `"glm-5.2"`)   // reviewer
+	assert.Contains(t, content, `"glm-5.2"`)       // reviewer
 }
 
 func TestModelsUse_WorkerViaShortCode(t *testing.T) {
@@ -727,4 +727,3 @@ func resetModelsStateFlags(t *testing.T) {
 	}
 	modelsStateCmd.SetArgs(nil)
 }
-
