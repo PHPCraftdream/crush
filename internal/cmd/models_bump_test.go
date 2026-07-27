@@ -8,6 +8,7 @@ package cmd
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/charmbracelet/crush/internal/db"
@@ -78,7 +79,15 @@ func TestModelsBump_GLM52FullStepUp(t *testing.T) {
 		// observed to trigger a Windows-only file-lock race in
 		// t.TempDir()'s cleanup (WAL/SHM handles not always released
 		// immediately after the LAST Close() at the very end of the test).
-		db.ResetPool()
+		//
+		// db.Release(dataDir), not db.ResetPool(): the former only touches
+		// THIS test's own data dir's ref-counted entry; ResetPool used to
+		// nuke the entire process-wide pool, including any other test's
+		// still-open connection to a different data dir if it happened to
+		// be running concurrently (t.Parallel()) elsewhere in this package's
+		// test binary — a real source of cross-test "process cannot access
+		// the file" flakiness, not just OS handle-release lag.
+		_ = db.Release(filepath.Dir(globalPath))
 
 		// Assert against the raw config file directly — cheaper than
 		// another `crush models state` call and avoids yet another setupApp
@@ -113,8 +122,9 @@ func TestModelsBump_GLM52FullStepDown(t *testing.T) {
 		require.NoError(t, runErr, "step down to index %d", i)
 		// See the comment in TestModelsBump_GLM52FullStepUp: release the
 		// per-data-dir SQLite connection between iterations to avoid a
-		// Windows-only TempDir-cleanup file-lock race.
-		db.ResetPool()
+		// Windows-only TempDir-cleanup file-lock race — scoped to this
+		// test's own data dir, not the whole pool.
+		_ = db.Release(filepath.Dir(globalPath))
 
 		// Assert against the raw config file directly (see same comment).
 		data, err := os.ReadFile(globalPath)

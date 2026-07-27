@@ -62,10 +62,20 @@ func isolatedModelsEnv(t *testing.T) (globalPath string) {
 	t.Cleanup(func() {
 		_ = os.Chdir(orig)
 		cancel()
-		db.ResetPool()
+		// Release only THIS test's own connection (ref-counted, keyed by
+		// tmp) rather than db.ResetPool(), which used to nuke the ENTIRE
+		// process-wide connection pool — including any other test's still-
+		// open connection to a completely different data dir, if that
+		// other test happened to be running concurrently (t.Parallel()) in
+		// this same package's test binary. That cross-test interference,
+		// not just OS-level handle-release lag, was a real contributor to
+		// this package's Windows-only "process cannot access the file"
+		// flakiness: one test's cleanup could force-close a sibling's live
+		// connection out from under it.
+		_ = db.Release(tmp)
 
 		// Root-caused Windows-only flake (testing.go's TempDir
-		// RemoveAll cleanup): db.ResetPool() above is synchronous —
+		// RemoveAll cleanup): db.Release() above is synchronous —
 		// it calls sql.DB.Close() directly under a mutex, which in
 		// turn drives modernc.org/sqlite's conn.Close() ->
 		// sqlite3_close_v2() -> a synchronous Win32 CloseHandle on

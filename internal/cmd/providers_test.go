@@ -874,12 +874,19 @@ func runProvidersCmdInIsolatedApp(t *testing.T, cmd *cobra.Command, providerJSON
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(func() {
 		_ = os.Chdir(orig)
-		// setupApp opens a pooled SQLite connection under workDir and
-		// spawns background goroutines keyed on ctx; cancel ctx and force
-		// close every pooled connection so t.TempDir cleanup doesn't hit a
-		// locked crush.db / crush.log on Windows.
+		// setupApp opens a pooled SQLite connection under tmp; cancel ctx
+		// and release THIS test's own connection so t.TempDir cleanup
+		// doesn't hit a locked crush.db / crush.log on Windows.
+		//
+		// db.Release(tmp), not db.ResetPool(): this file alone has ~19
+		// t.Parallel() tests sharing this helper. ResetPool() used to nuke
+		// the ENTIRE process-wide connection pool, including any other
+		// still-running parallel test's live connection to a different
+		// data dir — real cross-test interference, not just OS-level
+		// handle-release lag, and a genuine contributor to this package's
+		// Windows-only "process cannot access the file" flakiness.
 		cancel()
-		db.ResetPool()
+		_ = db.Release(tmp)
 	})
 	carrier := &cobra.Command{Use: "crush"}
 	carrier.Flags().Bool("debug", false, "")

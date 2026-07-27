@@ -10,36 +10,19 @@
 # golangci-lint is used from PATH when present, otherwise `go run` fetches the
 # pinned version (downloaded once into the module cache, then reused).
 #
-# A real contributing cause investigated this session: Go's default temp
-# dir on this machine (TEMP/TMP) points OUTSIDE the repo, at
-# D:\system_artefact\Temp, plausibly not covered by whatever antivirus
-# exclusion covers the repo checkout — real-time AV scanning touching a
-# just-closed sqlite/process-teardown file can delay Windows' handle release
-# past even a generous bounded-retry. Confirmed empirically (an isolated
-# repeat of a previously-flaky test passed 5/5 with TMP/TEMP redirected
-# inside the repo checkout) — but redirecting TEMP *into* the actual git
-# working tree has a real, demonstrated side effect: internal/config's
-# TestLookupConfigs_BoundedByProject specifically asserts config-lookup does
-# NOT climb past a project boundary, and with TempDir now nested inside this
-# repo's own real .git, that assertion broke deterministically (same failure
-# on every run, not flaky) — a self-inflicted regression, reverted. TEMP/TMP
-# are therefore left at their normal system default here; a real fix would
-# need either an admin-configured AV exclusion on the actual system temp
-# path, or a redirect target that is demonstrably outside any git working
-# tree — neither is something this hook can safely do unattended.
-#
-# What IS kept, defense-in-depth against the same root symptom (Windows
-# handle-release lag under load): -p (package-level test parallelism)
-# capped and -parallel (t.Parallel() subtest concurrency within a package
-# binary) serialized, rather than left at Go's default (GOMAXPROCS, e.g.
-# 16-way on a 16-thread box, for both knobs independently) — several
-# packages (agent/cliprovider, agent/tools/mcp, internal/cmd) spawn real OS
-# subprocesses / open sqlite handles as part of their own tests. Costs only
-# wall-clock. Below that: a transparent retry-once of the whole test step,
-# standard practice for rare environment-driven flakiness that survives the
-# capping above — a genuine regression fails identically on both attempts,
-# so this cannot mask real breakage. CI (ubuntu-latest) doesn't have this
-# problem and is intentionally left at its own default.
+# This session root-caused three genuine Windows-only test races (see git
+# log for internal/agent/cliprovider/provider_test.go,
+# internal/agent/tools/mcp/process_windows_test.go, and
+# internal/cmd/models_use_test.go) — each fixed AT THE SPECIFIC TEST, not by
+# slowing the whole suite down. (An earlier version of this hook also capped
+# -p/-parallel globally as extra defense-in-depth; that made every push take
+# 3-5x longer for no longer-necessary benefit once the actual tests were
+# fixed, so it was removed — full default Go parallelism is used here again.)
+# A transparent retry-once remains below as a cheap backstop for whatever
+# rare environment-driven flakiness still slips through (AV scanning,
+# genuine OS scheduling lag): a real regression fails identically on both
+# attempts, so this cannot mask real breakage, and the common case (no
+# flake) never pays for it.
 #
 # Bypass in an emergency with:  git push --no-verify
 set -uo pipefail
@@ -63,12 +46,12 @@ else
 		|| fail "lint failed (ran via 'go run'; install golangci-lint for speed)"
 fi
 
-step "go test -short -failfast -p 4 -parallel 1 ./..."
-if go test -short -failfast -p 4 -parallel 1 ./...; then
+step "go test -short -failfast ./..."
+if go test -short -failfast ./...; then
 	printf '\033[32m(tests passed on the first attempt)\033[0m\n'
 else
-	printf '\033[33m⚠ tests failed once — retrying (known Windows handle-release flakiness, see comment above)\033[0m\n'
-	go test -short -failfast -p 4 -parallel 1 ./... || fail "tests failed twice in a row — not the known flake, treat as real"
+	printf '\033[33m⚠ tests failed once — retrying (known rare Windows flakiness, see comment above)\033[0m\n'
+	go test -short -failfast ./... || fail "tests failed twice in a row — not the known flake, treat as real"
 	printf '\033[33m(tests passed on retry)\033[0m\n'
 fi
 
