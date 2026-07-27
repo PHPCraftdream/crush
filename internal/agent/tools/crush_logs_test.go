@@ -131,8 +131,9 @@ func TestCrushLogs_EmptyFile(t *testing.T) {
 	t.Parallel()
 	tempDir := t.TempDir()
 	logFile := filepath.Join(tempDir, "crush.log")
-	_, err := os.Create(logFile)
+	file, err := os.Create(logFile)
 	require.NoError(t, err)
+	require.NoError(t, file.Close())
 
 	result := runCrushLogs(logFile, CrushLogsParams{Lines: 50})
 	require.Contains(t, result, "Log file is empty")
