@@ -1734,6 +1734,19 @@ func newWorkerToolTestCoordinator(t *testing.T, env fakeEnv, includeWorker bool)
 		cfg.Config().Models[config.SelectedModelTypeWorker] = registerProvider("worker-provider", "worker-model")
 	}
 
+	// Explicitly populate the coder/task agent definitions. config.Load only
+	// calls SetupAgents when IsConfigured() (i.e. at least one provider was
+	// configured from the host env: an API key, or a local CLI provider like
+	// `claude` on PATH) — on a from-scratch CI runner with no provider
+	// credentials and no CLI binaries on PATH, IsConfigured() is false, Load
+	// returns early, and Agents stays empty. This test injects its own
+	// synthetic providers AFTER config.Init returns, so the Agents map would
+	// otherwise never be built (and coord.cfg.Config().Agents[AgentTask] /
+	// [AgentCoder] lookups in TestBuildAgent_OrchestratorActiveWiring would
+	// miss). Calling SetupAgents here makes the test independent of whatever
+	// providers the host machine happens to have configured.
+	cfg.SetupAgents()
+
 	return &coordinator{
 		cfg:         cfg,
 		sessions:    env.sessions,
@@ -1948,6 +1961,12 @@ func TestBuildTools_CoderHasAskQuestion(t *testing.T) {
 	cfg.Config().Models[config.SelectedModelTypeLarge] = registerProvider("large-provider", "large-model")
 	cfg.Config().Models[config.SelectedModelTypeSmall] = registerProvider("small-provider", "small-model")
 
+	// config.Load only calls SetupAgents when IsConfigured() — false on a
+	// from-scratch CI runner with no provider credentials and no CLI binaries
+	// on PATH — so Agents would otherwise be empty. See the fuller note in
+	// newWorkerToolTestCoordinator.
+	cfg.SetupAgents()
+
 	coord := &coordinator{
 		cfg:         cfg,
 		sessions:    env.sessions,
@@ -2069,8 +2088,16 @@ func TestAllToolNames_CoversUnconditionallyBuiltTools(t *testing.T) {
 	}
 
 	env := testEnv(t)
+	// Isolate from the host machine's real global config, then explicitly set
+	// up agents: config.Load only calls SetupAgents when IsConfigured(), which
+	// is false on a from-scratch CI runner (no provider credentials, no CLI
+	// binaries on PATH). Without this the Agents map is empty and the
+	// Agents[AgentCoder] lookup below misses. See newWorkerToolTestCoordinator
+	// for the fuller note.
+	t.Setenv("CRUSH_GLOBAL_DATA", t.TempDir())
 	cfg, err := config.Init(env.workingDir, "", false)
 	require.NoError(t, err)
+	cfg.SetupAgents()
 
 	coderCfg, ok := cfg.Config().Agents[config.AgentCoder]
 	require.True(t, ok, "coder agent must be configured")

@@ -406,20 +406,44 @@ func TestModelsUse_AllFourValid_StillWritesAll(t *testing.T) {
 	assert.Contains(t, content, `"glm-5.2"`)
 }
 
+// seedZAIProvider overwrites the isolated crush.json at globalPath with an
+// explicit zai provider that carries a literal (self-resolving, non-empty)
+// api_key.
+//
+// Any test that exercises the raw "zai/glm-4.7-flash[@effort]" syntax needs
+// this. That path resolves through a.ResolveModel -> findModels, which
+// iterates the LIVE, post-configureProviders provider map — and a provider
+// only survives there if its API key resolves non-empty (see
+// configureProviders' zai case in internal/config/load.go). isolatedModelsEnv
+// has no ZAI_API_KEY/ZHIPU_API_KEY, so without this the zai provider is
+// dropped and "zai/glm-4.7-flash" resolves to nothing.
+//
+// These tests historically passed ONLY by accident: isolatedModelsEnv
+// redirects CRUSH_GLOBAL_DATA/XDG_DATA_HOME but NOT GlobalConfig()
+// (CRUSH_GLOBAL_CONFIG/XDG_CONFIG_HOME), so on a dev machine with a real
+// ~/.config/crush/crush.json configuring zai with an api_key, that host
+// config leaked in and kept the provider alive. On a from-scratch CI runner
+// (no such file, no env keys) the provider was absent and these tests failed
+// with `model "zai/glm-4.7-flash" not found`. Seeding the provider explicitly
+// makes the raw-resolution path deterministic, independent of host config.
+// The model list itself still comes from the embedded catwalk catalog.
+func seedZAIProvider(t *testing.T, globalPath string) {
+	t.Helper()
+	require.NoError(t, os.WriteFile(globalPath,
+		[]byte(`{"providers":{"zai":{"api_key":"test-zai-key"}}}`), 0o644))
+}
+
 // TestModelsUse_RawZAIEffort_ValidSucceeds covers the new validated raw
 // "provider/model@effort" path for a Z.AI atom: a level that IS one of the
 // real declared levels (off/on, for a boolean-thinking-only model like
-// glm-4.7-flash) must still be accepted and written.
-//
-// Uses glm-4.7-flash rather than glm-5.2 here because this isolated test
-// harness's cached provider catalog (CRUSH_PROVIDER_CACHE_ONLY=1, shared
-// ambient cache under the user's data dir) resolves "zai/glm-4.7-flash"
-// reliably via a.ResolveModel but not every zai model id — an environmental
-// quirk of the shared cache, unrelated to this task's validation logic
-// (which is exercised precisely, atom-by-atom, by the
-// TestValidateEffortForModel_* unit tests below instead).
+// glm-4.7-flash) must still be accepted and written. seedZAIProvider makes
+// "zai/glm-4.7-flash" resolvable deterministically regardless of host config
+// (the raw path goes through a.ResolveModel against the live provider map).
+// The effort-validation logic itself is exercised precisely, atom-by-atom, by
+// the TestValidateEffortForModel_* unit tests below.
 func TestModelsUse_RawZAIEffort_ValidSucceeds(t *testing.T) {
 	globalPath := isolatedModelsEnv(t)
+	seedZAIProvider(t, globalPath)
 
 	resetModelsUseFlags(t)
 	_, runErr := runModelsCmd(t, modelsUseCmd,
@@ -443,7 +467,10 @@ func TestModelsUse_RawZAIEffort_ValidSucceeds(t *testing.T) {
 // model that resolves to a KNOWN atom (glm-4.7-flash -> glm4_7_flash, which
 // declares {"off","on"}) must now be rejected with a clear error.
 func TestModelsUse_RawZAIEffort_TypoNowFailsCleanly(t *testing.T) {
-	isolatedModelsEnv(t)
+	globalPath := isolatedModelsEnv(t)
+	// The model must resolve first for effort validation to be reached; seed
+	// zai so this asserts the effort-typo path, not a spurious "not found".
+	seedZAIProvider(t, globalPath)
 
 	resetModelsUseFlags(t)
 	_, runErr := runModelsCmd(t, modelsUseCmd,
@@ -458,7 +485,10 @@ func TestModelsUse_RawZAIEffort_TypoNowFailsCleanly(t *testing.T) {
 // validation applies uniformly to the --worker/--reviewer role slots added
 // in task #68, not just the two positional large/small args.
 func TestModelsUse_RawZAIEffort_TypoRejectedForWorkerSlot(t *testing.T) {
-	isolatedModelsEnv(t)
+	globalPath := isolatedModelsEnv(t)
+	// The model must resolve first for effort validation to be reached; seed
+	// zai so this asserts the effort-typo path, not a spurious "not found".
+	seedZAIProvider(t, globalPath)
 
 	resetModelsUseFlags(t)
 	_, runErr := runModelsCmd(t, modelsUseCmd,
