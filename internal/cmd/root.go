@@ -199,10 +199,11 @@ func runWebMode(cmd *cobra.Command) error {
 
 func Execute() {
 	options := []fang.Option{
-		// Fork patch: append the upstream triage watermark so `crush --version`
-		// answers "how far has upstream actually been reviewed" without anyone
-		// having to open docs/plans/. See version.UpstreamTriagedVersion.
-		fang.WithVersion(version.Version + " (upstream triaged: " + version.UpstreamTriagedVersion + ")"),
+		// Fork patch: show the release-line version alongside the upstream
+		// triage watermark so `crush --version` answers "how far has upstream
+		// actually been reviewed" without anyone having to open docs/plans/.
+		// See version.VersionLine / version.UpstreamTriagedVersion.
+		fang.WithVersion(version.VersionLine()),
 		fang.WithNotifySignal(os.Interrupt),
 	}
 

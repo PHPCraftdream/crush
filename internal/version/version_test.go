@@ -2,10 +2,18 @@ package version
 
 import (
 	"runtime/debug"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 )
+
+func TestVersionLine(t *testing.T) {
+	t.Parallel()
+	want := forkBaseVersion + "@" + strings.TrimPrefix(UpstreamTriagedVersion, "v")
+	require.Equal(t, want, VersionLine())
+	require.False(t, strings.HasPrefix(VersionLine(), "v"), "VersionLine must not carry a \"v\" prefix")
+}
 
 func TestDeriveDevVersion(t *testing.T) {
 	t.Parallel()

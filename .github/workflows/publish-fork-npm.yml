@@ -180,11 +180,19 @@ jobs:
         # before `npm publish` ever runs. The linux/x64 package is runnable on
         # this Actions runner; the same source and LDFLAGS are used for every
         # cross-compiled package.
+        #
+        # `crush --version` prints version.VersionLine() (e.g. "0.1.7@0.87.0"
+        # — forkBaseVersion "@" UpstreamTriagedVersion, no "v" prefix), NOT
+        # the raw ldflags-injected version.Version. So EXPECTED must be the
+        # bare numeric tag (steps.ver.outputs.version), not go_version, and
+        # "@" must be added to the tokenizer's split-char set below so
+        # "0.1.7@0.87.0" splits into "0.1.7" and "0.87.0" rather than staying
+        # one token that could never match.
         env:
-          GO_VERSION_STRING: ${{ steps.ver.outputs.go_version }}
+          VERSION: ${{ steps.ver.outputs.version }}
         run: |
           set -euo pipefail
-          EXPECTED="${GO_VERSION_STRING}"   # e.g. v0.1.0 (resolved from the npm-v tag)
+          EXPECTED="${VERSION}"   # e.g. 0.1.7 (resolved from the npm-v tag, no "v" prefix)
           if [ -z "$EXPECTED" ]; then
             echo "::error::expected version is empty — the version-resolution step failed"
             exit 1
@@ -212,7 +220,7 @@ jobs:
           # expanded as a pathname.
           matched=0
           set -f
-          for tok in $(printf '%s' "$OUT" | tr '()[],;:' ' '); do
+          for tok in $(printf '%s' "$OUT" | tr '()[],;:@' ' '); do
             if [ "$tok" = "$EXPECTED" ]; then
               matched=1
               break

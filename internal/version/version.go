@@ -33,6 +33,18 @@ const forkBaseVersion = "0.1.7"
 // Bumped by hand at the end of an upstream triage pass, never automatically.
 const UpstreamTriagedVersion = "v0.87.0"
 
+// VersionLine is what `crush --version`/`crush version` prints: the fork's
+// release-line version and how far upstream has been triaged, joined by "@"
+// with no "v" prefixes. Deliberately built from forkBaseVersion and
+// UpstreamTriagedVersion directly rather than from the package-level Version
+// var — Version carries a commit hash on local dev builds and a "v" prefix on
+// release builds, neither of which belongs in this one human-facing summary
+// line. Other consumers of Version (user agent, telemetry, MCP handshake,
+// FullVersion for the web UI) are untouched by this.
+func VersionLine() string {
+	return forkBaseVersion + "@" + strings.TrimPrefix(UpstreamTriagedVersion, "v")
+}
+
 // Build-time parameters set via -ldflags. These act as overrides: when a
 // release/packaging build injects them (see .goreleaser.yml and the
 // publish-fork-npm workflow), the values below are replaced and treated as
