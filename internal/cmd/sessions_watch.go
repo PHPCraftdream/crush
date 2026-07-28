@@ -150,6 +150,14 @@ func liveTailSession(ctx context.Context, a *app.App, sessionID, locksDir string
 	var lastSubAgentPulse time.Time
 	var lastSubAgentNote string
 
+	// Resume-race guard state — see decideWatchExit. watchStart anchors the
+	// grace window; sawLiveLock records whether this watch has ever seen the
+	// session's lock heartbeating (after which end signals are trusted with
+	// no delay); warnedWaiting keeps the "holding on" notice to one line.
+	watchStart := time.Now()
+	sawLiveLock := false
+	warnedWaiting := false
+
 	for {
 		// Ctrl+C wins over everything. fang wraps the root command's
 		// context with signal.NotifyContext(os.Interrupt), so a single
@@ -165,9 +173,27 @@ func liveTailSession(ctx context.Context, a *app.App, sessionID, locksDir string
 
 		// Check for end first so we print a summary even when there are
 		// no new messages to emit on this tick.
-		if done, reason := isSessionFinished(ctx, a, sessionID, locksDir); done {
+		st, reason := isSessionFinished(ctx, a, sessionID, locksDir)
+		if st.lockAlive {
+			sawLiveLock = true
+		}
+		tickAt := time.Now()
+		lastActivityAge := time.Duration(0)
+		if st.lastActivity > 0 {
+			lastActivityAge = tickAt.Sub(time.Unix(st.lastActivity, 0))
+		}
+		switch decideWatchExit(st, sawLiveLock, tickAt.Sub(watchStart), lastActivityAge) {
+		case watchExit:
 			printWatchSummary(os.Stderr, ctx, a, sessionID, reason)
 			return nil
+		case watchWaitForStart:
+			if !warnedWaiting {
+				fmt.Fprintf(os.Stderr,
+					"(session looks finished but no live lock yet — waiting up to %s in case a run is starting up)\n",
+					formatDurationShort(watchStartGrace))
+				warnedWaiting = true
+			}
+		case watchKeepWatching:
 		}
 
 		select {
@@ -269,7 +295,7 @@ const liveLockMaxAge = 20 * time.Second
 // it next to "reason:". I/O-doing wrapper; the pure decision lives in
 // isSessionFinishedFromState so it is unit-testable without an app /
 // filesystem.
-func isSessionFinished(ctx context.Context, a *app.App, sessionID, locksDir string) (bool, string) {
+func isSessionFinished(ctx context.Context, a *app.App, sessionID, locksDir string) (watchState, string) {
 	sess, sessErr := a.Sessions.Get(ctx, sessionID)
 	msgs, msgsErr := a.Messages.List(ctx, sessionID)
 	lockPath := filepath.Join(locksDir, "session-"+sanitiseSessionIDForFilename(sessionID)+".lock")
@@ -282,7 +308,97 @@ func isSessionFinished(ctx context.Context, a *app.App, sessionID, locksDir stri
 	if info, err := os.Stat(lockPath); err == nil {
 		lockAlive = time.Since(info.ModTime()) < liveLockMaxAge
 	}
-	return isSessionFinishedFromState(sess, sessErr, msgs, msgsErr, lockAlive)
+
+	done, reason := isSessionFinishedFromState(sess, sessErr, msgs, msgsErr, lockAlive)
+
+	// Freshest activity anywhere we can see it, used to tell "this session
+	// wrapped up long ago" from "something is happening right now".
+	lastActivity := sess.UpdatedAt
+	if newest := newestMessageUnix(msgs); newest > lastActivity {
+		lastActivity = newest
+	}
+	return watchState{
+		done:         done,
+		lockAlive:    lockAlive,
+		lastActivity: lastActivity,
+	}, reason
+}
+
+// watchState is the raw per-tick observation the live-tail loop feeds into
+// [decideWatchExit]. Split out from the exit decision so the (surprisingly
+// subtle) "is this really the end?" rule can be unit-tested without an app,
+// a filesystem or a clock.
+type watchState struct {
+	// done is the classic end verdict from isSessionFinishedFromState.
+	done bool
+	// lockAlive reports whether the session lock was heartbeating this tick.
+	lockAlive bool
+	// lastActivity is the newest unix timestamp seen on the session row or
+	// any of its messages. 0 when unknown.
+	lastActivity int64
+}
+
+// watchStartGrace is how long a freshly started watch keeps waiting when
+// the session ALREADY looked finished before the watch ever observed a
+// live lock.
+//
+// Why this exists: `crush run --session <id>` on an existing session
+// RESUMES it, and clears the previous run's ended_reason only once the app
+// has booted (app.go's SetEndedReason(ctx, id, "")). Booting takes seconds
+// — config load, DB open, provider init. An orchestrator that launches the
+// run and immediately starts `sessions watch` therefore lands in a window
+// where the lock of the new run does not exist yet while the DB still
+// carries the PREVIOUS run's terminal state (ended_reason set, last
+// assistant message finished with end_turn). Watch used to trust that
+// instantly and print a full "--- session ended ---" summary for a session
+// that was in fact just starting — observed in the wild on session
+// r24-8-dealloc-batch-internals, where `sessions why` reported the session
+// alive with a 5s-old heartbeat moments after watch had "completed".
+//
+// 15s comfortably covers a cold start while staying far below the
+// patience of anyone watching a live session.
+const watchStartGrace = 15 * time.Second
+
+// watchIdleForSure is how quiet a session must be for a missing lock to be
+// unambiguous. Past this, nothing is starting up — the session genuinely
+// ended earlier — so `sessions watch <old-session>` still prints its
+// summary immediately instead of sitting through watchStartGrace.
+const watchIdleForSure = 60 * time.Second
+
+// watchVerdict is what the live-tail loop should do about a tick.
+type watchVerdict int
+
+const (
+	// watchKeepWatching: the session is running (or nothing says otherwise).
+	watchKeepWatching watchVerdict = iota
+	// watchExit: the session really has ended — print the summary and stop.
+	watchExit
+	// watchWaitForStart: it LOOKS ended, but a run may be booting into this
+	// session right now. Hold off until watchStartGrace expires.
+	watchWaitForStart
+)
+
+// decideWatchExit turns a raw observation into an action.
+//
+// The only genuinely ambiguous case is "the end signals fire, but this
+// watch has never once seen the session's lock alive". That is both what a
+// long-finished session looks like AND what a session being resumed looks
+// like during the new run's boot window. Two escape hatches keep the grace
+// from costing anything in practice:
+//
+//   - sawLiveLock: once we have observed the session actually running, a
+//     later end signal is trusted immediately. This is the normal
+//     "watch a live session until it finishes" path — unchanged, no delay.
+//   - lastActivityAge > watchIdleForSure: a session nothing has touched for
+//     a minute is not mid-boot. Trusted immediately.
+func decideWatchExit(st watchState, sawLiveLock bool, sinceWatchStart, lastActivityAge time.Duration) watchVerdict {
+	if !st.done {
+		return watchKeepWatching
+	}
+	if sawLiveLock || lastActivityAge > watchIdleForSure || sinceWatchStart >= watchStartGrace {
+		return watchExit
+	}
+	return watchWaitForStart
 }
 
 // isSessionFinishedFromState is the pure decision used by isSessionFinished.

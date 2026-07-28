@@ -397,3 +397,62 @@ func TestFormatAge(t *testing.T) {
 	assert.Equal(t, "2h15m", formatAge(2*time.Hour+15*time.Minute))
 	assert.Equal(t, "48h0m", formatAge(48*time.Hour))
 }
+
+// --- resume-race guard (decideWatchExit) -----------------------------------
+//
+// Regression cover for a false "--- session ended ---" summary printed by
+// `crush sessions watch` against a session that was in fact just being
+// resumed. `crush run --session <id>` on an existing session clears the
+// previous run's ended_reason only after the app boots, so an orchestrator
+// that launches the run and immediately starts watching sees, for a few
+// seconds: no lock for the new run yet + the PREVIOUS run's terminal state
+// still in the DB. Observed live on r24-8-dealloc-batch-internals, where
+// `sessions why` reported the session alive with a 5s-old heartbeat right
+// after watch had already "completed".
+
+func TestDecideWatchExit_NotDoneKeepsWatching(t *testing.T) {
+	st := watchState{done: false, lockAlive: true}
+	assert.Equal(t, watchKeepWatching, decideWatchExit(st, true, time.Second, time.Second))
+}
+
+func TestDecideWatchExit_TrustsEndAfterSeeingSessionAlive(t *testing.T) {
+	// The normal "watch a running session until it finishes" path: we saw
+	// the lock heartbeating at some point, so the end is real and must be
+	// acted on with NO grace delay.
+	st := watchState{done: true, lockAlive: false, lastActivity: time.Now().Unix()}
+	assert.Equal(t, watchExit, decideWatchExit(st, true, time.Second, time.Second))
+}
+
+func TestDecideWatchExit_WaitsOutTheResumeRace(t *testing.T) {
+	// The bug: freshly started watch, never saw a live lock, DB looks
+	// terminal, and the session was touched moments ago — i.e. a run is
+	// very likely booting into it right now. Must NOT exit.
+	st := watchState{done: true, lockAlive: false, lastActivity: time.Now().Unix()}
+	assert.Equal(t, watchWaitForStart,
+		decideWatchExit(st, false, 2*time.Second, 3*time.Second))
+}
+
+func TestDecideWatchExit_GivesUpWaitingAfterGrace(t *testing.T) {
+	// The grace is bounded: if no run has shown up by then, the terminal
+	// state was genuine after all and watch must still print its summary.
+	st := watchState{done: true, lockAlive: false, lastActivity: time.Now().Unix()}
+	assert.Equal(t, watchExit,
+		decideWatchExit(st, false, watchStartGrace+time.Second, 3*time.Second))
+}
+
+func TestDecideWatchExit_LongIdleSessionExitsImmediately(t *testing.T) {
+	// No UX regression for `sessions watch <old-session>`: a session nothing
+	// has touched for over a minute cannot be mid-boot, so the summary is
+	// printed at once rather than after watchStartGrace.
+	st := watchState{done: true, lockAlive: false}
+	assert.Equal(t, watchExit,
+		decideWatchExit(st, false, time.Second, watchIdleForSure+time.Second))
+}
+
+func TestDecideWatchExit_GraceBoundaryIsInclusive(t *testing.T) {
+	// Exactly at the grace boundary we stop waiting — an off-by-one here
+	// would leave the loop stuck in watchWaitForStart forever.
+	st := watchState{done: true, lockAlive: false, lastActivity: time.Now().Unix()}
+	assert.Equal(t, watchExit,
+		decideWatchExit(st, false, watchStartGrace, time.Second))
+}
