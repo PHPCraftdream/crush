@@ -242,6 +242,108 @@ func checkSegment(segment string) error {
 	return nil
 }
 
+// windowOpenerVerbs is the subset of commandWrappers that explicitly asks
+// Windows for a brand-new, visible console/GUI window — as opposed to
+// merely evaluating a string in the current shell (invoke-expression,
+// invoke-command). `start`/`Start-Process`/`Start-Job` all map to
+// CreateProcess with their OWN creation flags, chosen by cmd.exe/
+// PowerShell itself, not by whatever spawned the outer shell — so a
+// SysProcAttr.HideWindow set on the outer process (see platform.Command)
+// has no effect on the window these verbs create. See
+// WindowOpenerError's doc comment for the full mechanism.
+var windowOpenerVerbs = map[string]bool{
+	"start":         true, // cmd: start <cmd> [args] — always opens a new window
+	"start-process": true, // PowerShell cmdlet — same effect, -WindowStyle Hidden not assumed
+	"start-job":     true, // PowerShell — background job, but the job's own window still opens
+}
+
+// WindowOpenerError is returned by CheckWindowSafety when a command would
+// explicitly request a new console/GUI window via start / Start-Process /
+// Start-Job, even nested inside a recognised shell wrapper (cmd /c,
+// powershell -Command, an -EncodedCommand payload, …).
+type WindowOpenerError struct {
+	Verb    string // the matched verb, as canonicalized ("start", "start-process", "start-job")
+	Snippet string // the offending segment, for forensic context
+}
+
+func (e *WindowOpenerError) Error() string {
+	return fmt.Sprintf(
+		"agentguard: refused %q — this command explicitly opens a new, visible window "+
+			"(unrelated to whether the command that runs it is hidden) (in: %s)",
+		e.Verb, e.Snippet,
+	)
+}
+
+// CheckWindowSafety inspects a shell command string for start /
+// Start-Process / Start-Job — the one class of invocation that pops a
+// real, visible window on Windows no matter how the process that RUNS
+// this command string was itself launched. platform.Command hides the
+// window of the process crush directly spawns (e.g. the outer cmd.exe
+// running this command), but `start` inside that command asks Windows to
+// create a SEPARATE process with its own, independently-chosen creation
+// flags — a request the outer process's hidden-window attribute cannot
+// suppress. Nil means the command was not seen to do this (not a
+// guarantee: like Check, this is a best-effort textual scan, not a shell
+// parser, and only recurses one level into shell/PowerShell wrappers).
+//
+// Reuses the same segment-splitting and shell-wrapper-unwrapping helpers
+// as Check so a `start` buried behind `bash -c`, `powershell -Command`, or
+// a base64 -EncodedCommand payload is still caught.
+func CheckWindowSafety(command string) *WindowOpenerError {
+	if command == "" {
+		return nil
+	}
+	for _, segment := range splitChained(command) {
+		if err := checkSegmentWindowSafety(segment); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func checkSegmentWindowSafety(segment string) *WindowOpenerError {
+	tokens := tokenize(segment)
+	if len(tokens) == 0 {
+		return nil
+	}
+	i := 0
+	for i < len(tokens) && strings.Contains(tokens[i], "=") && !strings.HasPrefix(tokens[i], "-") {
+		if isEnvAssignment(tokens[i]) {
+			i++
+		} else {
+			break
+		}
+	}
+	if i >= len(tokens) {
+		return nil
+	}
+	head := tokens[i]
+	rest := tokens[i+1:]
+
+	for (head == "exec" || head == "command" || head == "time" || head == "nohup") && len(rest) > 0 {
+		head = rest[0]
+		rest = rest[1:]
+	}
+	for head == "&" && len(rest) > 0 {
+		head = rest[0]
+		rest = rest[1:]
+	}
+
+	headCanon := canonicalName(head)
+
+	if windowOpenerVerbs[headCanon] {
+		return &WindowOpenerError{Verb: headCanon, Snippet: segment}
+	}
+
+	if shellRunners[headCanon] {
+		if inner := extractShellInner(headCanon, rest); inner != "" {
+			return CheckWindowSafety(inner)
+		}
+	}
+
+	return nil
+}
+
 // canonicalName strips directory prefix and a known executable suffix,
 // then lower-cases. "/usr/bin/Claude.EXE" → "claude".
 func canonicalName(name string) string {

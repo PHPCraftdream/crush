@@ -223,3 +223,99 @@ func TestIsEnvAssignment(t *testing.T) {
 	assert.False(t, isEnvAssignment("no-equals"))
 	assert.False(t, isEnvAssignment("123=bad"))
 }
+
+// --- CheckWindowSafety ------------------------------------------------------
+//
+// Separate concern from Check/commandWrappers above: Check asks "does this
+// launch a denied AI agent", CheckWindowSafety asks "does this explicitly
+// open a new, visible window that platform.Command's HideWindow on the
+// OUTER process cannot suppress" — see the doc comment on
+// WindowOpenerError for the mechanism. A harmless target (`start notepad`)
+// must still be caught; that's the whole point.
+
+func TestCheckWindowSafety_AllowsHarmless(t *testing.T) {
+	for _, cmd := range []string{
+		"",
+		"ls -la",
+		"git status",
+		"echo hello",
+		"go build ./...",
+		`cmd /c "echo hi"`,
+		"bash -c 'go build .'",
+		// Similarly-named but NOT the flagged verb — must not false-positive
+		// on a substring/prefix match.
+		"restart-service foo",
+		"Start-Sleep -Seconds 1",
+		"startup-check.sh",
+	} {
+		t.Run(cmd, func(t *testing.T) {
+			assert.Nil(t, CheckWindowSafety(cmd))
+		})
+	}
+}
+
+func TestCheckWindowSafety_BlocksDirectStartFamily(t *testing.T) {
+	cases := []string{
+		"start notepad.exe",
+		"start /b notepad.exe",
+		"Start-Process notepad.exe",
+		"Start-Process -FilePath notepad.exe",
+		"Start-Job notepad.exe",
+	}
+	for _, cmd := range cases {
+		t.Run(cmd, func(t *testing.T) {
+			err := CheckWindowSafety(cmd)
+			require.Error(t, err, "should block: %s", cmd)
+			assert.Contains(t, err.Error(), "new, visible window")
+		})
+	}
+}
+
+func TestCheckWindowSafety_BlocksThroughShellWrappers(t *testing.T) {
+	cases := []string{
+		`cmd /c "start notepad.exe"`,
+		`powershell -c "Start-Process notepad.exe"`,
+		`bash -c "echo hi && cmd /c start notepad.exe"`,
+	}
+	for _, cmd := range cases {
+		t.Run(cmd, func(t *testing.T) {
+			require.Error(t, CheckWindowSafety(cmd), "should block: %s", cmd)
+		})
+	}
+}
+
+func TestCheckWindowSafety_BlocksInsideChainedCommand(t *testing.T) {
+	require.Error(t, CheckWindowSafety("go build ./... && start notepad.exe"))
+	require.Error(t, CheckWindowSafety("start notepad.exe; echo done"))
+	require.Error(t, CheckWindowSafety("echo hi | cat && start calc.exe"))
+}
+
+func TestCheckWindowSafety_BlocksEncodedCommand(t *testing.T) {
+	src := "Start-Process notepad.exe"
+	u16 := make([]byte, 0, len(src)*2)
+	for _, r := range src {
+		u16 = append(u16, byte(r), 0)
+	}
+	encoded := base64.StdEncoding.EncodeToString(u16)
+	cmd := "powershell -EncodedCommand " + encoded
+	err := CheckWindowSafety(cmd)
+	require.Error(t, err, "encoded command containing Start-Process must be decoded and blocked: %s", cmd)
+}
+
+func TestCheckWindowSafety_DoesNotBlockInvokeExpression(t *testing.T) {
+	// iex/Invoke-Expression evaluate a string in the CURRENT shell — they
+	// don't themselves request a new window (unlike start/Start-Process/
+	// Start-Job). Out of scope for this check unless the evaluated string
+	// itself contains a start-family verb.
+	assert.Nil(t, CheckWindowSafety(`iex 'echo hi'`))
+	assert.Nil(t, CheckWindowSafety(`Invoke-Expression "go build ./..."`))
+}
+
+func TestCheckWindowSafety_ErrorReportsVerbAndSnippet(t *testing.T) {
+	err := CheckWindowSafety("start notepad.exe")
+	require.Error(t, err)
+	var winErr *WindowOpenerError
+	require.ErrorAs(t, err, &winErr)
+	assert.Equal(t, "start", winErr.Verb)
+	assert.Equal(t, "start notepad.exe", winErr.Snippet)
+}

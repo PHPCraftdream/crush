@@ -301,6 +301,19 @@ func registerBashTool(srv *mcp.Server, perms permission.Service, workingDir stri
 			return toolError(guardErr.Error()), nil, nil
 		}
 
+		// Refuse `start` / `Start-Process` / `Start-Job`: on Windows these
+		// open a brand-new, visible console/GUI window regardless of the
+		// outer cmd.exe's own HideWindow attribute (see platform.Command's
+		// doc comment and agentguard.CheckWindowSafety) — a model running
+		// unattended via `crush run` has no legitimate reason to pop a
+		// window on the operator's desktop, and every such window steals
+		// focus and covers whatever the operator was doing.
+		if runtime.GOOS == "windows" {
+			if winErr := agentguard.CheckWindowSafety(input.Command); winErr != nil {
+				return toolError(winErr.Error()), nil, nil
+			}
+		}
+
 		wd := workingDir
 		if input.WorkingDir != "" {
 			wd = input.WorkingDir
