@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 
 	"charm.land/fantasy"
@@ -43,7 +45,12 @@ func newTranscriptTestDB(t *testing.T) (session.Service, message.Service) {
 			small_model_id TEXT,
 			small_model_reasoning_effort TEXT DEFAULT 'medium',
 			system_prompt TEXT DEFAULT '',
-			yolo_enabled INTEGER NOT NULL DEFAULT 0
+			yolo_enabled INTEGER NOT NULL DEFAULT 0,
+			cancel_requested INTEGER NOT NULL DEFAULT 0,
+			ended_reason TEXT NOT NULL DEFAULT '',
+			budget_max_cost REAL NOT NULL DEFAULT 0,
+			budget_max_tokens INTEGER NOT NULL DEFAULT 0,
+			budget_timeout_sec INTEGER NOT NULL DEFAULT 0
 		);
 		CREATE TABLE messages (
 			id TEXT PRIMARY KEY,
@@ -219,4 +226,94 @@ func TestReadDelegationTranscript_ReadsGrandchild(t *testing.T) {
 	resp := runTranscriptTool(t, s, m, parent.ID, grandchild.ID)
 	require.False(t, resp.IsError)
 	require.Contains(t, resp.Content, "deep work")
+}
+
+// TestRenderDelegationTranscript_MaxMessages verifies that only the most recent
+// max_messages are included, with a pagination marker indicating how many were
+// omitted.
+func TestRenderDelegationTranscript_MaxMessages(t *testing.T) {
+	t.Parallel()
+
+	// Build 60 messages, each with distinct text.
+	var msgs []message.Message
+	for i := 0; i < 60; i++ {
+		msgs = append(msgs, message.Message{
+			Role: message.Assistant,
+			Parts: []message.ContentPart{
+				message.TextContent{Text: fmt.Sprintf("message %d", i)},
+			},
+		})
+	}
+
+	out := renderDelegationTranscript("sess", msgs, ReadDelegationTranscriptParams{MaxMessages: 10, MaxBytes: 500_000})
+
+	// Must contain the last 10 messages (50-59).
+	require.Contains(t, out, "message 59")
+	require.Contains(t, out, "message 50")
+	// Must NOT contain earlier messages.
+	require.NotContains(t, out, "message 49")
+	require.NotContains(t, out, "message 0")
+	// Must show pagination marker.
+	require.Contains(t, out, "50 earlier omitted")
+}
+
+// TestRenderDelegationTranscript_MaxBytes verifies that the rendered output does
+// not exceed the byte budget and includes a truncation marker when it would.
+func TestRenderDelegationTranscript_MaxBytes(t *testing.T) {
+	t.Parallel()
+
+	// A single message with a very long text that exceeds the budget.
+	longText := strings.Repeat("A", 10_000)
+	msgs := []message.Message{
+		{Role: message.Assistant, Parts: []message.ContentPart{message.TextContent{Text: longText}}},
+	}
+
+	maxBytes := 500
+	out := renderDelegationTranscript("sess", msgs, ReadDelegationTranscriptParams{MaxMessages: 50, MaxBytes: maxBytes})
+
+	require.Less(t, len(out), maxBytes+300,
+		"output must be approximately within the byte budget (plus marker)")
+	require.Contains(t, out, "truncated")
+	require.Contains(t, out, "bytes dropped")
+}
+
+// TestRenderDelegationTranscript_Offset verifies offset pages backward from the
+// end, skipping newer messages.
+func TestRenderDelegationTranscript_Offset(t *testing.T) {
+	t.Parallel()
+
+	var msgs []message.Message
+	for i := 0; i < 30; i++ {
+		msgs = append(msgs, message.Message{
+			Role: message.Assistant,
+			Parts: []message.ContentPart{
+				message.TextContent{Text: fmt.Sprintf("msg %d", i)},
+			},
+		})
+	}
+
+	// offset=10, max_messages=10: should show messages 10-19 (0-indexed).
+	out := renderDelegationTranscript("sess", msgs, ReadDelegationTranscriptParams{MaxMessages: 10, Offset: 10, MaxBytes: 500_000})
+
+	require.Contains(t, out, "msg 19")
+	require.Contains(t, out, "msg 10")
+	require.NotContains(t, out, "msg 20") // newer, skipped by offset
+	require.NotContains(t, out, "msg 9")  // older, omitted
+	require.Contains(t, out, "newer skipped")
+}
+
+// TestRenderDelegationTranscript_Defaults verifies that when no params are set,
+// sensible defaults are used and no truncation marker appears for small inputs.
+func TestRenderDelegationTranscript_Defaults(t *testing.T) {
+	t.Parallel()
+
+	msgs := []message.Message{
+		{Role: message.Assistant, Parts: []message.ContentPart{message.TextContent{Text: "hello"}}},
+	}
+
+	out := renderDelegationTranscript("sess", msgs, ReadDelegationTranscriptParams{})
+
+	require.Contains(t, out, "hello")
+	require.NotContains(t, out, "truncated")
+	require.NotContains(t, out, "omitted")
 }

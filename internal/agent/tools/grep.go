@@ -2,8 +2,8 @@ package tools
 
 import (
 	"bufio"
-	"bytes"
 	"cmp"
+	"container/heap"
 	"context"
 	_ "embed"
 	"encoding/json"
@@ -79,6 +79,40 @@ type grepMatch struct {
 	lineNum  int
 	charNum  int
 	lineText string
+	seq      int64 // insertion order, for stable sort tie-breaking
+}
+
+// boundedMatchHeap is a min-heap keyed by eviction priority: the root is the
+// match that should be discarded FIRST when the heap is full — the one with
+// the oldest modTime, and among ties the one inserted latest (largest seq).
+// This retains the top-K newest matches while preserving line order within
+// ties (same modTime), matching the previous sort.SliceStable behaviour.
+type boundedMatchHeap []grepMatch
+
+func (h boundedMatchHeap) Len() int { return len(h) }
+func (h boundedMatchHeap) Less(i, j int) bool {
+	if !h[i].modTime.Equal(h[j].modTime) {
+		return h[i].modTime.Before(h[j].modTime) // older = more evictable
+	}
+	return h[i].seq > h[j].seq // same modTime: later line = more evictable
+}
+func (h boundedMatchHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+func (h *boundedMatchHeap) Push(x any)   { *h = append(*h, x.(grepMatch)) }
+func (h *boundedMatchHeap) Pop() any {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[:n-1]
+	return x
+}
+
+// evictFirst reports whether a should be evicted before b (a is "less" in heap
+// order — more evictable). Used to compare a candidate against the heap root.
+func evictFirst(a, b grepMatch) bool {
+	if !a.modTime.Equal(b.modTime) {
+		return a.modTime.Before(b.modTime)
+	}
+	return a.seq > b.seq
 }
 
 type GrepResponseMetadata struct {
@@ -192,36 +226,31 @@ func NewGrepTool(workingDir string, config config.ToolGrep) fantasy.AgentTool {
 }
 
 func searchFiles(ctx context.Context, pattern, rootPath, include string, limit int) ([]grepMatch, bool, error) {
-	matches, err := searchWithRipgrep(ctx, pattern, rootPath, include)
+	matches, truncated, err := searchWithRipgrep(ctx, pattern, rootPath, include, limit)
 	if err != nil {
 		matches, err = searchFilesWithRegex(pattern, rootPath, include)
 		if err != nil {
 			return nil, false, err
 		}
+		// Regex fallback path: sort + truncate as before.
+		sort.SliceStable(matches, func(i, j int) bool {
+			return matches[i].modTime.After(matches[j].modTime)
+		})
+		truncated = len(matches) > limit
+		if truncated {
+			matches = matches[:limit]
+		}
 	}
-
-	// Use a stable sort so that the multiple matches a single file can
-	// contribute (all sharing the same modTime) keep their original
-	// line order and stay grouped together in the rendered output.
-	sort.SliceStable(matches, func(i, j int) bool {
-		return matches[i].modTime.After(matches[j].modTime)
-	})
-
-	truncated := len(matches) > limit
-	if truncated {
-		matches = matches[:limit]
-	}
-
 	return matches, truncated, nil
 }
 
-func searchWithRipgrep(ctx context.Context, pattern, path, include string) ([]grepMatch, error) {
+func searchWithRipgrep(ctx context.Context, pattern, path, include string, limit int) ([]grepMatch, bool, error) {
 	cmd := getRgSearchCmd(ctx, pattern, path, include)
 	if cmd == nil {
-		return nil, fmt.Errorf("ripgrep not found in $PATH")
+		return nil, false, fmt.Errorf("ripgrep not found in $PATH")
 	}
 
-	// Only add ignore files if they exist
+	// Only add ignore files if they exist.
 	for _, ignoreFile := range []string{".gitignore", ".crushignore"} {
 		ignorePath := filepath.Join(path, ignoreFile)
 		if _, err := os.Stat(ignorePath); err == nil {
@@ -229,16 +258,28 @@ func searchWithRipgrep(ctx context.Context, pattern, path, include string) ([]gr
 		}
 	}
 
-	output, err := cmd.Output()
+	// Stream rg's stdout line-by-line instead of buffering the entire output.
+	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
-			return []grepMatch{}, nil
-		}
-		return nil, err
+		return nil, false, err
+	}
+	if err := cmd.Start(); err != nil {
+		return nil, false, err
 	}
 
-	var matches []grepMatch
-	for line := range bytes.SplitSeq(bytes.TrimSpace(output), []byte{'\n'}) {
+	// statCache ensures one os.Stat call per unique file path, not one per
+	// submatch. A file with N matches previously triggered N Stat syscalls;
+	// now it triggers exactly one.
+	statCache := make(map[string]os.FileInfo)
+	h := &boundedMatchHeap{}
+	var seq int64
+
+	scanner := bufio.NewScanner(stdout)
+	// Allow long lines (minified JS etc.) — up to 4 MiB per JSON line.
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+
+	for scanner.Scan() {
+		line := scanner.Bytes()
 		if len(line) == 0 {
 			continue
 		}
@@ -246,26 +287,75 @@ func searchWithRipgrep(ctx context.Context, pattern, path, include string) ([]gr
 		if err := json.Unmarshal(line, &match); err != nil {
 			continue
 		}
-		if match.Type != "match" {
+		if match.Type != "match" || len(match.Data.Submatches) == 0 {
 			continue
 		}
-		for _, m := range match.Data.Submatches {
-			fi, err := os.Stat(match.Data.Path.Text)
+		// Only take the first submatch per line (matches original behaviour).
+		sub := match.Data.Submatches[0]
+
+		fi, ok := statCache[match.Data.Path.Text]
+		if !ok {
+			fi, err = os.Stat(match.Data.Path.Text)
 			if err != nil {
-				continue // Skip files we can't access
+				continue // Skip files we can't access.
 			}
-			matches = append(matches, grepMatch{
-				path:     match.Data.Path.Text,
-				modTime:  fi.ModTime(),
-				lineNum:  match.Data.LineNumber,
-				charNum:  m.Start + 1, // ensure 1-based
-				lineText: strings.TrimSpace(match.Data.Lines.Text),
-			})
-			// only get the first match of each line
-			break
+			statCache[match.Data.Path.Text] = fi
+		}
+
+		seq++
+		gm := grepMatch{
+			path:     match.Data.Path.Text,
+			modTime:  fi.ModTime(),
+			lineNum:  match.Data.LineNumber,
+			charNum:  sub.Start + 1, // ensure 1-based
+			lineText: strings.TrimSpace(match.Data.Lines.Text),
+			seq:      seq,
+		}
+
+		if h.Len() < limit {
+			heap.Push(h, gm)
+		} else if !evictFirst(gm, (*h)[0]) {
+			// gm is less evictable than the root — it deserves a spot.
+			(*h)[0] = gm
+			heap.Fix(h, 0)
 		}
 	}
-	return matches, nil
+
+	// If the scan loop stopped early due to a scanner error (most notably
+	// bufio.ErrTooLong: a single JSON line — e.g. one match inside a
+	// pathologically long line, a minified bundle, a base64 blob — exceeding
+	// the 4 MiB buffer above) rather than reaching the pipe's natural EOF,
+	// rg may still be mid-write with more output queued. Per os/exec's
+	// documented contract, Wait must not be called until all reads from the
+	// pipe have completed; skipping this drain lets rg block forever on a
+	// full OS pipe buffer once nobody is reading it, and Wait then hangs
+	// forever waiting for a process that will never exit on its own.
+	// Confirmed by reproduction: a single ~6 MiB matched line reliably hung
+	// Wait() indefinitely without this drain.
+	if scanErr := scanner.Err(); scanErr != nil {
+		_, _ = io.Copy(io.Discard, stdout)
+	}
+
+	// Wait for rg to finish and check exit code (1 = no matches, not an error).
+	if waitErr := cmd.Wait(); waitErr != nil {
+		if exitErr, ok := waitErr.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+			// rg exit code 1 = no matches found.
+		} else {
+			return nil, false, waitErr
+		}
+	}
+
+	// Extract and sort the bounded heap: newest modTime first, ties by seq asc
+	// (preserves original line order within the same file/modTime).
+	matches := []grepMatch(*h)
+	sort.SliceStable(matches, func(i, j int) bool {
+		if !matches[i].modTime.Equal(matches[j].modTime) {
+			return matches[i].modTime.After(matches[j].modTime)
+		}
+		return matches[i].seq < matches[j].seq
+	})
+
+	return matches, seq > int64(limit), nil
 }
 
 type ripgrepMatch struct {
@@ -333,12 +423,8 @@ func searchFilesWithRegex(pattern, rootPath, include string) ([]grepMatch, error
 			return nil
 		}
 
-		lineMatches, err := fileMatches(path, regex)
-		if err != nil {
-			return nil // Skip files we can't read
-		}
-
-		for _, lm := range lineMatches {
+		stopWalk := false
+		walkErr := fileMatches(path, regex, func(lm lineMatch) bool {
 			matches = append(matches, grepMatch{
 				path:     path,
 				modTime:  info.ModTime(),
@@ -347,8 +433,16 @@ func searchFilesWithRegex(pattern, rootPath, include string) ([]grepMatch, error
 				lineText: lm.lineText,
 			})
 			if len(matches) >= 200 {
-				return filepath.SkipAll
+				stopWalk = true
+				return false
 			}
+			return true
+		})
+		if walkErr != nil {
+			return nil // Skip files we can't read.
+		}
+		if stopWalk {
+			return filepath.SkipAll
 		}
 
 		return nil
@@ -369,26 +463,26 @@ type lineMatch struct {
 	lineText string
 }
 
-// fileMatches returns every line in filePath that matches pattern. Like
-// ripgrep, it reports one entry per matching line (using the first match
-// on the line for the column) instead of stopping at the first match in
-// the file.
-func fileMatches(filePath string, pattern *regexp.Regexp) ([]lineMatch, error) {
+// fileMatches calls onMatch for every line in filePath that matches pattern.
+// Like ripgrep, it reports one entry per matching line (using the first match
+// on the line for the column) instead of stopping at the first match in the
+// file. If onMatch returns false, scanning stops immediately — the caller can
+// bail out as soon as it has enough matches without reading the entire file.
+func fileMatches(filePath string, pattern *regexp.Regexp, onMatch func(lineMatch) bool) error {
 	if pattern == nil {
-		return nil, nil
+		return nil
 	}
 	// Only search text files.
 	if !isTextFile(filePath) {
-		return nil, nil
+		return nil
 	}
 
 	file, err := os.Open(filePath)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer file.Close()
 
-	var matches []lineMatch
 	reader := bufio.NewReader(file)
 	lineNum := 0
 	for {
@@ -397,21 +491,23 @@ func fileMatches(filePath string, pattern *regexp.Regexp) ([]lineMatch, error) {
 		line = strings.TrimSuffix(line, "\n")
 		line = strings.TrimSuffix(line, "\r")
 		if loc := pattern.FindStringIndex(line); loc != nil {
-			matches = append(matches, lineMatch{
+			if !onMatch(lineMatch{
 				lineNum:  lineNum,
 				charNum:  loc[0] + 1,
 				lineText: line,
-			})
+			}) {
+				return nil
+			}
 		}
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			return nil, err
+			return err
 		}
 	}
 
-	return matches, nil
+	return nil
 }
 
 // isTextFile checks if a file is a text file by examining its MIME type.

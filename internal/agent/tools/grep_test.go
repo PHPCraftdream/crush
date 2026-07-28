@@ -1,10 +1,18 @@
 package tools
 
 import (
+	"bufio"
+	"container/heap"
+	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -87,7 +95,8 @@ func TestGrepWithIgnoreFiles(t *testing.T) {
 	for name, fn := range map[string]func(pattern, path, include string) ([]grepMatch, error){
 		"regex": searchFilesWithRegex,
 		"rg": func(pattern, path, include string) ([]grepMatch, error) {
-			return searchWithRipgrep(t.Context(), pattern, path, include)
+			matches, _, err := searchWithRipgrep(t.Context(), pattern, path, include, 100)
+			return matches, err
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -147,7 +156,8 @@ func TestSearchImplementations(t *testing.T) {
 	for name, fn := range map[string]func(pattern, path, include string) ([]grepMatch, error){
 		"regex": searchFilesWithRegex,
 		"rg": func(pattern, path, include string) ([]grepMatch, error) {
-			return searchWithRipgrep(t.Context(), pattern, path, include)
+			matches, _, err := searchWithRipgrep(t.Context(), pattern, path, include, 100)
+			return matches, err
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -403,7 +413,8 @@ func TestMultipleMatchesPerFile(t *testing.T) {
 	for name, fn := range map[string]func(pattern, path, include string) ([]grepMatch, error){
 		"regex": searchFilesWithRegex,
 		"rg": func(pattern, path, include string) ([]grepMatch, error) {
-			return searchWithRipgrep(t.Context(), pattern, path, include)
+			matches, _, err := searchWithRipgrep(t.Context(), pattern, path, include, 100)
+			return matches, err
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -435,7 +446,8 @@ func TestColumnMatch(t *testing.T) {
 	for name, fn := range map[string]func(pattern, path, include string) ([]grepMatch, error){
 		"regex": searchFilesWithRegex,
 		"rg": func(pattern, path, include string) ([]grepMatch, error) {
-			return searchWithRipgrep(t.Context(), pattern, path, include)
+			matches, _, err := searchWithRipgrep(t.Context(), pattern, path, include, 100)
+			return matches, err
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -455,4 +467,225 @@ func TestColumnMatch(t *testing.T) {
 			require.Equal(t, "testdata/grep.txt", filepath.ToSlash(filepath.Clean(match.path)))
 		})
 	}
+}
+
+// TestBoundedMatchHeapRetainsNewest verifies the bounded heap keeps exactly the
+// K newest matches by modTime (ties broken by earliest insertion order) when
+// more than K matches are fed in.
+func TestBoundedMatchHeapRetainsNewest(t *testing.T) {
+	t.Parallel()
+	h := &boundedMatchHeap{}
+	limit := 10
+	base := time.Now()
+
+	for i := 0; i < 100; i++ {
+		gm := grepMatch{
+			path:    fmt.Sprintf("file_%d.txt", i),
+			modTime: base.Add(time.Duration(i) * time.Minute),
+			seq:     int64(i + 1),
+		}
+		if h.Len() < limit {
+			heap.Push(h, gm)
+		} else if !evictFirst(gm, (*h)[0]) {
+			(*h)[0] = gm
+			heap.Fix(h, 0)
+		}
+	}
+
+	require.Equal(t, limit, h.Len(), "heap must never exceed limit")
+
+	matches := []grepMatch(*h)
+	sort.SliceStable(matches, func(i, j int) bool {
+		if !matches[i].modTime.Equal(matches[j].modTime) {
+			return matches[i].modTime.After(matches[j].modTime)
+		}
+		return matches[i].seq < matches[j].seq
+	})
+
+	// Should be the 10 newest (indices 90-99), sorted newest-first.
+	for i, m := range matches {
+		expected := 99 - i
+		require.Equal(t, fmt.Sprintf("file_%d.txt", expected), m.path,
+			"position %d should be file_%d", i, expected)
+	}
+}
+
+// TestBoundedMatchHeapStableTiebreak verifies that when multiple matches share
+// the same modTime, earlier-inserted ones (smaller seq = earlier line) survive
+// eviction over later ones within the same modTime group.
+func TestBoundedMatchHeapStableTiebreak(t *testing.T) {
+	t.Parallel()
+	h := &boundedMatchHeap{}
+	limit := 2
+	mt := time.Now()
+
+	// 3 matches, same modTime, increasing seq (line order).
+	for i := 0; i < 3; i++ {
+		gm := grepMatch{
+			path:    fmt.Sprintf("f%d", i),
+			modTime: mt,
+			seq:     int64(i + 1),
+		}
+		if h.Len() < limit {
+			heap.Push(h, gm)
+		} else if !evictFirst(gm, (*h)[0]) {
+			(*h)[0] = gm
+			heap.Fix(h, 0)
+		}
+	}
+
+	require.Equal(t, limit, h.Len())
+	// Should keep seq 1 and 2 (earliest), NOT seq 3.
+	seqs := map[int64]bool{}
+	for _, m := range *h {
+		seqs[m.seq] = true
+	}
+	require.True(t, seqs[1], "seq=1 must survive (earliest line)")
+	require.True(t, seqs[2], "seq=2 must survive")
+	require.False(t, seqs[3], "seq=3 must be evicted (latest line, same modTime)")
+}
+
+// TestFileMatchesCallbackStopsEarly verifies fileMatches stops reading the file
+// immediately when the callback returns false, rather than scanning the entire
+// file. This tests the regex fallback path (no ripgrep dependency).
+func TestFileMatchesCallbackStopsEarly(t *testing.T) {
+	t.Parallel()
+	tempDir := t.TempDir()
+
+	// Create a file with 10000 matching lines.
+	var content strings.Builder
+	for i := 0; i < 10000; i++ {
+		content.WriteString("match line\n")
+	}
+	path := filepath.Join(tempDir, "big.txt")
+	require.NoError(t, os.WriteFile(path, []byte(content.String()), 0o644))
+
+	re := regexp.MustCompile("match")
+	callCount := 0
+	err := fileMatches(path, re, func(lm lineMatch) bool {
+		callCount++
+		return false // stop immediately after first match
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, callCount,
+		"callback must be called exactly once when it returns false on the first match")
+}
+
+// TestFileMatchesCallbackCollectsAll verifies the callback path still finds all
+// matches when the callback always returns true.
+func TestFileMatchesCallbackCollectsAll(t *testing.T) {
+	t.Parallel()
+	tempDir := t.TempDir()
+
+	content := "match one\nxyz\nmatch two\nmatch three\n"
+	path := filepath.Join(tempDir, "file.txt")
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+	re := regexp.MustCompile("match")
+	var collected []lineMatch
+	err := fileMatches(path, re, func(lm lineMatch) bool {
+		collected = append(collected, lm)
+		return true
+	})
+	require.NoError(t, err)
+	require.Len(t, collected, 3)
+	require.Equal(t, 1, collected[0].lineNum)
+	require.Equal(t, 3, collected[1].lineNum)
+	require.Equal(t, 4, collected[2].lineNum)
+}
+
+// TestScanThenWaitPattern_DrainsOnScanErrorInsteadOfHanging is a regression
+// test for a deadlock confirmed by direct reproduction against the exact
+// scan-then-Wait shape searchWithRipgrep uses.
+//
+// rg --json emits one JSON object per line, and that line embeds the ENTIRE
+// matched source line. A single matched line long enough to exceed the
+// scanner's 4 MiB buffer (a minified bundle, a base64 blob, any
+// pathologically long line — a realistic real-world scenario, not
+// contrived) makes bufio.Scanner return bufio.ErrTooLong and stop — before
+// rg has necessarily finished writing the rest of its output. Per os/exec's
+// documented contract, calling Wait() before all reads from the pipe
+// complete can deadlock once the child blocks writing to a full OS pipe
+// buffer with nobody draining it. Confirmed directly with a standalone
+// reproduction of this exact pattern (scan loop, then bare cmd.Wait() with
+// no drain-on-error): Wait() hung indefinitely (well past an 8s timeout)
+// against a real `rg --json` invocation over a ~6 MiB single-line file.
+// searchWithRipgrep's fix drains the pipe (io.Copy to io.Discard) when
+// scanner.Err() is non-nil, before calling Wait — this test proves that
+// exact pattern is deadlock-free using the SAME real `rg` binary and the
+// SAME oversized-line scenario.
+//
+// This test does NOT call searchWithRipgrep directly: getRgSearchCmd goes
+// through getRg(), which is a sync.OnceValue that unconditionally returns
+// "" whenever testing.Testing() is true (see rg.go) — a pre-existing,
+// deliberate test-time guard that means searchWithRipgrep can never
+// actually invoke a real rg process under `go test`, by design. Bypassing
+// that package-wide memoized guard just for this one test would be a
+// larger, riskier change than the deadlock fix itself, so this test
+// exercises the identical scan-then-drain-then-Wait sequence standalone
+// against a real rg process resolved via exec.LookPath, which is exactly
+// what triggers and then resolves the deadlock — the file-format/JSON
+// parsing differences between this and searchWithRipgrep are immaterial to
+// what's being proven (the pipe-draining contract).
+func TestScanThenWaitPattern_DrainsOnScanErrorInsteadOfHanging(t *testing.T) {
+	rgPath, lookErr := exec.LookPath("rg")
+	if lookErr != nil {
+		t.Skip("rg is not in $PATH")
+	}
+	t.Parallel()
+	tempDir := t.TempDir()
+
+	// One line comfortably past the 4 MiB scanner buffer, followed by
+	// several short matching lines that would remain unread in the pipe if
+	// the scan loop stopped without draining.
+	var b strings.Builder
+	b.WriteString(strings.Repeat("x", 6*1024*1024))
+	b.WriteString(" NEEDLE_OVERSIZED_LINE\n")
+	for i := range 50 {
+		fmt.Fprintf(&b, "short line %d NEEDLE_OVERSIZED_LINE\n", i)
+	}
+	path := filepath.Join(tempDir, "huge.txt")
+	require.NoError(t, os.WriteFile(path, []byte(b.String()), 0o644))
+
+	runOnce := func(drainOnScanError bool) error {
+		cmd := exec.CommandContext(t.Context(), rgPath, "--json", "NEEDLE_OVERSIZED_LINE", path)
+		stdout, err := cmd.StdoutPipe()
+		require.NoError(t, err)
+		require.NoError(t, cmd.Start())
+
+		scanner := bufio.NewScanner(stdout)
+		scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+		for scanner.Scan() {
+		}
+		if drainOnScanError && scanner.Err() != nil {
+			_, _ = io.Copy(io.Discard, stdout)
+		}
+		return cmd.Wait()
+	}
+
+	t.Run("with_drain_returns_promptly", func(t *testing.T) {
+		t.Parallel()
+		done := make(chan error, 1)
+		go func() { done <- runOnce(true) }()
+		select {
+		case <-done:
+			// rg exits fine either way; we only care that Wait() returned.
+		case <-time.After(15 * time.Second):
+			t.Fatal("Wait() hung even with the drain-on-scan-error fix applied")
+		}
+	})
+
+	t.Run("without_drain_hangs_confirming_the_bug_shape", func(t *testing.T) {
+		t.Parallel()
+		done := make(chan error, 1)
+		go func() { done <- runOnce(false) }()
+		select {
+		case <-done:
+			t.Fatal("expected Wait() to hang without the drain (bug reproduction did not trigger — " +
+				"the oversized-line/pipe-buffer scenario may no longer apply on this platform)")
+		case <-time.After(5 * time.Second):
+			// Expected: this proves the bug is real absent the fix, so the
+			// "with_drain" subtest above is actually testing something.
+		}
+	})
 }

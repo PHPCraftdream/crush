@@ -22,9 +22,8 @@ func TestFormatSourcegraphResults(t *testing.T) {
 							"__typename": "FileMatch",
 							"repository": map[string]any{"name": "owner/repo"},
 							"file": map[string]any{
-								"path":    "main.go",
-								"url":     "https://example.com/owner/repo/main.go",
-								"content": "package main\n\nfunc main() {\n\tprintln(\"match\")\n}\n",
+								"path": "main.go",
+								"url":  "https://example.com/owner/repo/main.go",
 							},
 							"lineMatches": []any{
 								map[string]any{
@@ -46,9 +45,7 @@ func TestFormatSourcegraphResults(t *testing.T) {
 	require.Contains(t, got, "(Result limit reached, try a more specific query)")
 	require.Contains(t, got, "## Result 1: owner/repo/main.go")
 	require.Contains(t, got, "URL: https://example.com/owner/repo/main.go")
-	require.Contains(t, got, "3| func main() {")
-	require.Contains(t, got, "4|  \tprintln(\"match\")")
-	require.Contains(t, got, "5| }")
+	require.Contains(t, got, "4| \tprintln(\"match\")")
 }
 
 func TestFormatSourcegraphResultsRespectsCount(t *testing.T) {

@@ -16,10 +16,21 @@ import (
 )
 
 type SourcegraphParams struct {
-	Query         string `json:"query" description:"The Sourcegraph search query"`
-	Count         int    `json:"count,omitempty" description:"Optional number of results to return (default: 10, max: 20)"`
-	ContextWindow int    `json:"context_window,omitempty" description:"The context around the match to return (default: 10 lines)"`
-	Timeout       int    `json:"timeout,omitempty" description:"Optional timeout in seconds (max 120)"`
+	Query string `json:"query" description:"The Sourcegraph search query"`
+	Count int    `json:"count,omitempty" description:"Optional number of results to return (default: 10, max: 20)"`
+	// ContextWindow is currently a NO-OP: rendering used to fetch each
+	// matched file's FULL content over the GraphQL API just to slice out a
+	// few surrounding lines, which meant every single search unconditionally
+	// downloaded whole files regardless of how large they were. That fetch
+	// was removed (the query now only asks for path/url/lineMatches.preview,
+	// never file.content) to bound response size, at the cost of this
+	// parameter no longer having any effect — only the single matched line
+	// (preview) is shown. Kept in the schema rather than removed outright so
+	// existing callers passing this field don't get a hard schema-validation
+	// error; the description makes the current behavior explicit instead of
+	// silently ignoring the field.
+	ContextWindow int `json:"context_window,omitempty" description:"Deprecated / currently ignored: only the single matched line is shown, not surrounding context, to avoid downloading whole file contents on every search."`
+	Timeout       int `json:"timeout,omitempty" description:"Optional timeout in seconds (max 120)"`
 }
 
 type SourcegraphResponseMetadata struct {
@@ -28,6 +39,12 @@ type SourcegraphResponseMetadata struct {
 }
 
 const SourcegraphToolName = "sourcegraph"
+
+// maxSourcegraphBodyBytes caps how much of the Sourcegraph API HTTP response
+// body we read into memory. A pathological response (huge file contents,
+// verbose search) would otherwise be buffered entirely by io.ReadAll.
+// 10 MiB is generous for search results while preventing unbounded growth.
+const maxSourcegraphBodyBytes = 10 * 1024 * 1024
 
 //go:embed sourcegraph.md.tpl
 var sourcegraphDescriptionTmpl []byte
@@ -97,7 +114,7 @@ func NewSourcegraphTool(client *http.Client) fantasy.AgentTool {
 			}
 
 			request := graphqlRequest{
-				Query: "query Search($query: String!) { search(query: $query, version: V2, patternType: keyword ) { results { matchCount, limitHit, resultCount, approximateResultCount, missing { name }, timedout { name }, indexUnavailable, results { __typename, ... on FileMatch { repository { name }, file { path, url, content }, lineMatches { preview, lineNumber, offsetAndLengths } } } } } }",
+				Query: "query Search($query: String!) { search(query: $query, version: V2, patternType: keyword ) { results { matchCount, limitHit, resultCount, approximateResultCount, missing { name }, timedout { name }, indexUnavailable, results { __typename, ... on FileMatch { repository { name }, file { path, url }, lineMatches { preview, lineNumber, offsetAndLengths } } } } } }",
 			}
 			request.Variables.Query = params.Query
 
@@ -127,14 +144,14 @@ func NewSourcegraphTool(client *http.Client) fantasy.AgentTool {
 			defer resp.Body.Close()
 
 			if resp.StatusCode != http.StatusOK {
-				body, _ := io.ReadAll(resp.Body)
+				body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 				if len(body) > 0 {
 					return fantasy.NewTextErrorResponse(fmt.Sprintf("Request failed with status code: %d, response: %s", resp.StatusCode, string(body))), nil
 				}
 
 				return fantasy.NewTextErrorResponse(fmt.Sprintf("Request failed with status code: %d", resp.StatusCode)), nil
 			}
-			body, err := io.ReadAll(resp.Body)
+			body, err := io.ReadAll(io.LimitReader(resp.Body, maxSourcegraphBodyBytes))
 			if err != nil {
 				return fantasy.ToolResponse{}, fmt.Errorf("failed to read response body: %w", err)
 			}
@@ -260,7 +277,6 @@ func formatSourcegraphResult(buffer *strings.Builder, index int, res any, contex
 	repoName, _ := repo["name"].(string)
 	filePath, _ := file["path"].(string)
 	fileURL, _ := file["url"].(string)
-	fileContent, _ := file["content"].(string)
 
 	fmt.Fprintf(buffer, "## Result %d: %s/%s\n\n", index+1, repoName, filePath)
 
@@ -268,44 +284,31 @@ func formatSourcegraphResult(buffer *strings.Builder, index int, res any, contex
 		fmt.Fprintf(buffer, "URL: %s\n\n", fileURL)
 	}
 
-	formatSourcegraphLineMatches(buffer, lineMatches, fileContent, contextWindow)
+	formatSourcegraphLineMatches(buffer, lineMatches, contextWindow)
 }
 
-func formatSourcegraphLineMatches(buffer *strings.Builder, lineMatches []any, fileContent string, contextWindow int) {
+func formatSourcegraphLineMatches(buffer *strings.Builder, lineMatches []any, contextWindow int) {
 	for _, lm := range lineMatches {
 		lineMatch, ok := lm.(map[string]any)
 		if !ok {
 			continue
 		}
-		formatSourcegraphLineMatch(buffer, lineMatch, fileContent, contextWindow)
+		formatSourcegraphLineMatch(buffer, lineMatch, contextWindow)
 	}
 }
 
-func formatSourcegraphLineMatch(buffer *strings.Builder, lineMatch map[string]any, fileContent string, contextWindow int) {
+// contextWindow is currently unused: showing surrounding lines required
+// fetching each matched file's full content, which is exactly the
+// unbounded-response-size problem this file no longer does. Kept as a
+// parameter (rather than removed) purely so this call chain doesn't need
+// reshaping if a bounded, context-aware alternative is added later — see
+// the doc comment on SourcegraphParams.ContextWindow.
+func formatSourcegraphLineMatch(buffer *strings.Builder, lineMatch map[string]any, contextWindow int) {
 	lineNumber, _ := lineMatch["lineNumber"].(float64)
 	preview, _ := lineMatch["preview"].(string)
 	line := int(lineNumber)
 
 	buffer.WriteString("```\n")
-	if fileContent == "" {
-		fmt.Fprintf(buffer, "%d| %s\n", line, preview)
-		buffer.WriteString("```\n\n")
-		return
-	}
-
-	lines := strings.Split(fileContent, "\n")
-	startLine := max(1, line-contextWindow)
-	for j := startLine - 1; j < line-1 && j < len(lines); j++ {
-		if j >= 0 {
-			fmt.Fprintf(buffer, "%d| %s\n", j+1, lines[j])
-		}
-	}
-
-	fmt.Fprintf(buffer, "%d|  %s\n", line, preview)
-
-	endLine := line + contextWindow
-	for j := line; j < endLine && j < len(lines); j++ {
-		fmt.Fprintf(buffer, "%d| %s\n", j+1, lines[j])
-	}
+	fmt.Fprintf(buffer, "%d| %s\n", line, preview)
 	buffer.WriteString("```\n\n")
 }
