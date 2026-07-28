@@ -4,9 +4,11 @@
 -- NOTE: as of this fork the session-layer wrapper (session.go
 -- DrainPendingInjects / CreatePendingInject) talks to this table via raw
 -- database/sql, matching the existing cross-process signal pattern
--- (RequestCancel / SetBudget). These sqlc annotations are kept so a future
--- `sqlc generate` stays consistent, but the generated methods are not
--- currently wired into db.go to avoid sqlc rewriting unrelated files.
+-- (RequestCancel / SetBudget). These sqlc-generated methods below ARE
+-- wired into db.go's Prepare/Close/WithTx (as of the sqlc regeneration
+-- that added call_tree_activity.sql), but nothing in the codebase calls
+-- them yet — session.go's raw-SQL path remains the actual implementation.
+-- Keep both in sync if pending_injects' schema changes.
 
 -- name: CreatePendingInject :exec
 INSERT INTO pending_injects (

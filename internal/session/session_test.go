@@ -40,7 +40,12 @@ func newTestDB(t *testing.T) (*sql.DB, *db.Queries) {
 			small_model_reasoning_effort TEXT DEFAULT 'medium',
 			system_prompt TEXT DEFAULT '',
 			yolo_enabled INTEGER NOT NULL DEFAULT 0,
-			deleted_todos TEXT NOT NULL DEFAULT '[]'
+			deleted_todos TEXT NOT NULL DEFAULT '[]',
+			cancel_requested INTEGER NOT NULL DEFAULT 0,
+			ended_reason TEXT NOT NULL DEFAULT '',
+			budget_max_cost REAL NOT NULL DEFAULT 0,
+			budget_max_tokens INTEGER NOT NULL DEFAULT 0,
+			budget_timeout_sec INTEGER NOT NULL DEFAULT 0
 		);
 
 		CREATE TABLE session_permissions (
@@ -374,4 +379,33 @@ func TestCreateSession_DefaultReasoningEffort(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "high", retrieved.LargeModelReasoningEffort)
 	assert.Equal(t, "high", retrieved.SmallModelReasoningEffort)
+}
+
+// TestGetCallTreeActivity_NoMessages confirms a freshly created session with
+// no messages at all reports ok=false (nothing to report yet), not an error.
+func TestGetCallTreeActivity_NoMessages(t *testing.T) {
+	sqlDB, q := newTestDB(t)
+	svc := NewService(q, sqlDB)
+	ctx := t.Context()
+
+	sess, err := svc.Create(ctx, "empty")
+	require.NoError(t, err)
+
+	act, ok, err := svc.GetCallTreeActivity(ctx, sess.ID)
+	require.NoError(t, err)
+	require.False(t, ok)
+	require.Zero(t, act.LatestUnix)
+}
+
+// TestGetCallTreeActivityBatch_Empty confirms calling the batch method with
+// zero root IDs returns an empty, non-nil map without touching the DB.
+func TestGetCallTreeActivityBatch_Empty(t *testing.T) {
+	sqlDB, q := newTestDB(t)
+	svc := NewService(q, sqlDB)
+	ctx := t.Context()
+
+	got, err := svc.GetCallTreeActivityBatch(ctx, nil)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	require.Empty(t, got)
 }

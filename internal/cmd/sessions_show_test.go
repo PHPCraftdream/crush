@@ -103,7 +103,12 @@ func newTestDB(t *testing.T) (*sql.DB, *db.Queries) {
 			small_model_id TEXT,
 			small_model_reasoning_effort TEXT DEFAULT 'medium',
 			system_prompt TEXT DEFAULT '',
-			yolo_enabled INTEGER NOT NULL DEFAULT 0
+			yolo_enabled INTEGER NOT NULL DEFAULT 0,
+			cancel_requested INTEGER NOT NULL DEFAULT 0,
+			ended_reason TEXT NOT NULL DEFAULT '',
+			budget_max_cost REAL NOT NULL DEFAULT 0,
+			budget_max_tokens INTEGER NOT NULL DEFAULT 0,
+			budget_timeout_sec INTEGER NOT NULL DEFAULT 0
 		);
 
 		CREATE TABLE messages (

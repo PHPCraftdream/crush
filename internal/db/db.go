@@ -30,6 +30,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.createMessageStmt, err = db.PrepareContext(ctx, createMessage); err != nil {
 		return nil, fmt.Errorf("error preparing query CreateMessage: %w", err)
 	}
+	if q.createPendingInjectStmt, err = db.PrepareContext(ctx, createPendingInject); err != nil {
+		return nil, fmt.Errorf("error preparing query CreatePendingInject: %w", err)
+	}
 	if q.createSessionStmt, err = db.PrepareContext(ctx, createSession); err != nil {
 		return nil, fmt.Errorf("error preparing query CreateSession: %w", err)
 	}
@@ -41,6 +44,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	}
 	if q.deleteMessageStmt, err = db.PrepareContext(ctx, deleteMessage); err != nil {
 		return nil, fmt.Errorf("error preparing query DeleteMessage: %w", err)
+	}
+	if q.deletePendingInjectStmt, err = db.PrepareContext(ctx, deletePendingInject); err != nil {
+		return nil, fmt.Errorf("error preparing query DeletePendingInject: %w", err)
 	}
 	if q.deletePermissionStmt, err = db.PrepareContext(ctx, deletePermission); err != nil {
 		return nil, fmt.Errorf("error preparing query DeletePermission: %w", err)
@@ -56,6 +62,12 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	}
 	if q.getAverageResponseTimeStmt, err = db.PrepareContext(ctx, getAverageResponseTime); err != nil {
 		return nil, fmt.Errorf("error preparing query GetAverageResponseTime: %w", err)
+	}
+	if q.getCallTreeActivityStmt, err = db.PrepareContext(ctx, getCallTreeActivity); err != nil {
+		return nil, fmt.Errorf("error preparing query GetCallTreeActivity: %w", err)
+	}
+	if q.getCallTreeActivityBatchStmt, err = db.PrepareContext(ctx, getCallTreeActivityBatch); err != nil {
+		return nil, fmt.Errorf("error preparing query GetCallTreeActivityBatch: %w", err)
 	}
 	if q.getFileStmt, err = db.PrepareContext(ctx, getFile); err != nil {
 		return nil, fmt.Errorf("error preparing query GetFile: %w", err)
@@ -105,6 +117,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.listAllSessionPermissionsStmt, err = db.PrepareContext(ctx, listAllSessionPermissions); err != nil {
 		return nil, fmt.Errorf("error preparing query ListAllSessionPermissions: %w", err)
 	}
+	if q.listAllSessionsStmt, err = db.PrepareContext(ctx, listAllSessions); err != nil {
+		return nil, fmt.Errorf("error preparing query ListAllSessions: %w", err)
+	}
 	if q.listAllUserMessagesStmt, err = db.PrepareContext(ctx, listAllUserMessages); err != nil {
 		return nil, fmt.Errorf("error preparing query ListAllUserMessages: %w", err)
 	}
@@ -122,6 +137,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	}
 	if q.listNewFilesStmt, err = db.PrepareContext(ctx, listNewFiles); err != nil {
 		return nil, fmt.Errorf("error preparing query ListNewFiles: %w", err)
+	}
+	if q.listPendingInjectsBySessionStmt, err = db.PrepareContext(ctx, listPendingInjectsBySession); err != nil {
+		return nil, fmt.Errorf("error preparing query ListPendingInjectsBySession: %w", err)
 	}
 	if q.listSessionPermissionsStmt, err = db.PrepareContext(ctx, listSessionPermissions); err != nil {
 		return nil, fmt.Errorf("error preparing query ListSessionPermissions: %w", err)
@@ -186,6 +204,11 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing createMessageStmt: %w", cerr)
 		}
 	}
+	if q.createPendingInjectStmt != nil {
+		if cerr := q.createPendingInjectStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing createPendingInjectStmt: %w", cerr)
+		}
+	}
 	if q.createSessionStmt != nil {
 		if cerr := q.createSessionStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing createSessionStmt: %w", cerr)
@@ -204,6 +227,11 @@ func (q *Queries) Close() error {
 	if q.deleteMessageStmt != nil {
 		if cerr := q.deleteMessageStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing deleteMessageStmt: %w", cerr)
+		}
+	}
+	if q.deletePendingInjectStmt != nil {
+		if cerr := q.deletePendingInjectStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing deletePendingInjectStmt: %w", cerr)
 		}
 	}
 	if q.deletePermissionStmt != nil {
@@ -229,6 +257,16 @@ func (q *Queries) Close() error {
 	if q.getAverageResponseTimeStmt != nil {
 		if cerr := q.getAverageResponseTimeStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing getAverageResponseTimeStmt: %w", cerr)
+		}
+	}
+	if q.getCallTreeActivityStmt != nil {
+		if cerr := q.getCallTreeActivityStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing getCallTreeActivityStmt: %w", cerr)
+		}
+	}
+	if q.getCallTreeActivityBatchStmt != nil {
+		if cerr := q.getCallTreeActivityBatchStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing getCallTreeActivityBatchStmt: %w", cerr)
 		}
 	}
 	if q.getFileStmt != nil {
@@ -311,6 +349,11 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing listAllSessionPermissionsStmt: %w", cerr)
 		}
 	}
+	if q.listAllSessionsStmt != nil {
+		if cerr := q.listAllSessionsStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing listAllSessionsStmt: %w", cerr)
+		}
+	}
 	if q.listAllUserMessagesStmt != nil {
 		if cerr := q.listAllUserMessagesStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing listAllUserMessagesStmt: %w", cerr)
@@ -339,6 +382,11 @@ func (q *Queries) Close() error {
 	if q.listNewFilesStmt != nil {
 		if cerr := q.listNewFilesStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing listNewFilesStmt: %w", cerr)
+		}
+	}
+	if q.listPendingInjectsBySessionStmt != nil {
+		if cerr := q.listPendingInjectsBySessionStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing listPendingInjectsBySessionStmt: %w", cerr)
 		}
 	}
 	if q.listSessionPermissionsStmt != nil {
@@ -462,15 +510,19 @@ type Queries struct {
 	tx                               *sql.Tx
 	createFileStmt                   *sql.Stmt
 	createMessageStmt                *sql.Stmt
+	createPendingInjectStmt          *sql.Stmt
 	createSessionStmt                *sql.Stmt
 	createSessionPermissionStmt      *sql.Stmt
 	deleteFileStmt                   *sql.Stmt
 	deleteMessageStmt                *sql.Stmt
+	deletePendingInjectStmt          *sql.Stmt
 	deletePermissionStmt             *sql.Stmt
 	deleteSessionStmt                *sql.Stmt
 	deleteSessionFilesStmt           *sql.Stmt
 	deleteSessionMessagesStmt        *sql.Stmt
 	getAverageResponseTimeStmt       *sql.Stmt
+	getCallTreeActivityStmt          *sql.Stmt
+	getCallTreeActivityBatchStmt     *sql.Stmt
 	getFileStmt                      *sql.Stmt
 	getFileByPathAndSessionStmt      *sql.Stmt
 	getFileReadStmt                  *sql.Stmt
@@ -487,12 +539,14 @@ type Queries struct {
 	getUsageByModelStmt              *sql.Stmt
 	incrementSessionCostStmt         *sql.Stmt
 	listAllSessionPermissionsStmt    *sql.Stmt
+	listAllSessionsStmt              *sql.Stmt
 	listAllUserMessagesStmt          *sql.Stmt
 	listFilesByPathStmt              *sql.Stmt
 	listFilesBySessionStmt           *sql.Stmt
 	listLatestSessionFilesStmt       *sql.Stmt
 	listMessagesBySessionStmt        *sql.Stmt
 	listNewFilesStmt                 *sql.Stmt
+	listPendingInjectsBySessionStmt  *sql.Stmt
 	listSessionPermissionsStmt       *sql.Stmt
 	listSessionReadFilesStmt         *sql.Stmt
 	listSessionsStmt                 *sql.Stmt
@@ -517,15 +571,19 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		tx:                               tx,
 		createFileStmt:                   q.createFileStmt,
 		createMessageStmt:                q.createMessageStmt,
+		createPendingInjectStmt:          q.createPendingInjectStmt,
 		createSessionStmt:                q.createSessionStmt,
 		createSessionPermissionStmt:      q.createSessionPermissionStmt,
 		deleteFileStmt:                   q.deleteFileStmt,
 		deleteMessageStmt:                q.deleteMessageStmt,
+		deletePendingInjectStmt:          q.deletePendingInjectStmt,
 		deletePermissionStmt:             q.deletePermissionStmt,
 		deleteSessionStmt:                q.deleteSessionStmt,
 		deleteSessionFilesStmt:           q.deleteSessionFilesStmt,
 		deleteSessionMessagesStmt:        q.deleteSessionMessagesStmt,
 		getAverageResponseTimeStmt:       q.getAverageResponseTimeStmt,
+		getCallTreeActivityStmt:          q.getCallTreeActivityStmt,
+		getCallTreeActivityBatchStmt:     q.getCallTreeActivityBatchStmt,
 		getFileStmt:                      q.getFileStmt,
 		getFileByPathAndSessionStmt:      q.getFileByPathAndSessionStmt,
 		getFileReadStmt:                  q.getFileReadStmt,
@@ -542,12 +600,14 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		getUsageByModelStmt:              q.getUsageByModelStmt,
 		incrementSessionCostStmt:         q.incrementSessionCostStmt,
 		listAllSessionPermissionsStmt:    q.listAllSessionPermissionsStmt,
+		listAllSessionsStmt:              q.listAllSessionsStmt,
 		listAllUserMessagesStmt:          q.listAllUserMessagesStmt,
 		listFilesByPathStmt:              q.listFilesByPathStmt,
 		listFilesBySessionStmt:           q.listFilesBySessionStmt,
 		listLatestSessionFilesStmt:       q.listLatestSessionFilesStmt,
 		listMessagesBySessionStmt:        q.listMessagesBySessionStmt,
 		listNewFilesStmt:                 q.listNewFilesStmt,
+		listPendingInjectsBySessionStmt:  q.listPendingInjectsBySessionStmt,
 		listSessionPermissionsStmt:       q.listSessionPermissionsStmt,
 		listSessionReadFilesStmt:         q.listSessionReadFilesStmt,
 		listSessionsStmt:                 q.listSessionsStmt,

@@ -226,8 +226,10 @@ func reclassifyCrashedAsDone(
 // are currently blocked on (and being kept alive by) a sub-agent.
 //
 // Only sessions already flagged "running" are probed — at-rest / crashed /
-// done sessions are left untouched — so the extra call-tree walks are
-// bounded by the number of live sessions (usually one or two).
+// done sessions are left untouched. All of them are checked in ONE batched
+// SQL query (computeCallTreeActivityBatch) instead of one call-tree query
+// per running session, so `sessions list` stays O(1) queries for this step
+// regardless of how many sessions happen to be running concurrently.
 func markDelegatingSessions(
 	ctx context.Context,
 	a *app.App,
@@ -237,8 +239,26 @@ func markDelegatingSessions(
 	if statusByID == nil || a == nil {
 		return statusByID
 	}
+
+	running := make([]session.Session, 0, len(sessions))
 	for _, s := range sessions {
-		if statusByID[s.ID] != "running" {
+		if statusByID[s.ID] == "running" {
+			running = append(running, s)
+		}
+	}
+	if len(running) == 0 {
+		return statusByID
+	}
+
+	ids := make([]string, len(running))
+	for i, s := range running {
+		ids[i] = s.ID
+	}
+	activity := computeCallTreeActivityBatch(ctx, a, ids)
+
+	for _, s := range running {
+		act, ok := activity[s.ID]
+		if !ok {
 			continue
 		}
 		// Baseline = the session's own updated_at. A descendant sub-agent
@@ -246,7 +266,7 @@ func markDelegatingSessions(
 		// delegation. (The session row's updated_at is NOT bumped by child
 		// message inserts — see the DB triggers — so this comparison is
 		// meaningful.)
-		if act, fresher := callTreeActivityFresherThan(ctx, a, s.ID, s.UpdatedAt); fresher && act.SubAgentActive {
+		if act.LatestUnix > s.UpdatedAt && act.SubAgentActive {
 			statusByID[s.ID] = "delegating"
 		}
 	}

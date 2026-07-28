@@ -12,6 +12,18 @@ import (
 type Querier interface {
 	CreateFile(ctx context.Context, arg CreateFileParams) (File, error)
 	CreateMessage(ctx context.Context, arg CreateMessageParams) (Message, error)
+	// pending_injects is the cross-process inject queue for `crush sessions
+	// inject`. See migration 20260703000001 for the full semantics.
+	//
+	// NOTE: as of this fork the session-layer wrapper (session.go
+	// DrainPendingInjects / CreatePendingInject) talks to this table via raw
+	// database/sql, matching the existing cross-process signal pattern
+	// (RequestCancel / SetBudget). These sqlc-generated methods below ARE
+	// wired into db.go's Prepare/Close/WithTx (as of the sqlc regeneration
+	// that added call_tree_activity.sql), but nothing in the codebase calls
+	// them yet — session.go's raw-SQL path remains the actual implementation.
+	// Keep both in sync if pending_injects' schema changes.
+	CreatePendingInject(ctx context.Context, arg CreatePendingInjectParams) error
 	CreateSession(ctx context.Context, arg CreateSessionParams) (Session, error)
 	// ON CONFLICT DO NOTHING relies on idx_session_permissions_uniq from
 	// migration 20260517000001. Without it a repeated Always-Allow click
@@ -21,11 +33,14 @@ type Querier interface {
 	CreateSessionPermission(ctx context.Context, arg CreateSessionPermissionParams) error
 	DeleteFile(ctx context.Context, id string) error
 	DeleteMessage(ctx context.Context, id string) error
+	DeletePendingInject(ctx context.Context, id string) error
 	DeletePermission(ctx context.Context, id string) error
 	DeleteSession(ctx context.Context, id string) error
 	DeleteSessionFiles(ctx context.Context, sessionID string) error
 	DeleteSessionMessages(ctx context.Context, sessionID string) error
 	GetAverageResponseTime(ctx context.Context) (int64, error)
+	GetCallTreeActivity(ctx context.Context, id string) (GetCallTreeActivityRow, error)
+	GetCallTreeActivityBatch(ctx context.Context, rootIds []string) ([]GetCallTreeActivityBatchRow, error)
 	GetFile(ctx context.Context, id string) (File, error)
 	GetFileByPathAndSession(ctx context.Context, arg GetFileByPathAndSessionParams) (File, error)
 	GetFileRead(ctx context.Context, arg GetFileReadParams) (ReadFile, error)
@@ -46,12 +61,16 @@ type Querier interface {
 	// Returns the updated row so the caller can refresh its snapshot.
 	IncrementSessionCost(ctx context.Context, arg IncrementSessionCostParams) (Session, error)
 	ListAllSessionPermissions(ctx context.Context) ([]SessionPermission, error)
+	// Returns every session including children (no parent_session_id filter).
+	// Used by sessions gc to enumerate all sessions for garbage collection.
+	ListAllSessions(ctx context.Context) ([]Session, error)
 	ListAllUserMessages(ctx context.Context) ([]Message, error)
 	ListFilesByPath(ctx context.Context, path string) ([]File, error)
 	ListFilesBySession(ctx context.Context, sessionID string) ([]File, error)
 	ListLatestSessionFiles(ctx context.Context, sessionID string) ([]File, error)
 	ListMessagesBySession(ctx context.Context, sessionID string) ([]Message, error)
 	ListNewFiles(ctx context.Context) ([]File, error)
+	ListPendingInjectsBySession(ctx context.Context, sessionID string) ([]PendingInject, error)
 	ListSessionPermissions(ctx context.Context, sessionID string) ([]SessionPermission, error)
 	ListSessionReadFiles(ctx context.Context, sessionID string) ([]ReadFile, error)
 	ListSessions(ctx context.Context) ([]Session, error)
@@ -70,8 +89,8 @@ type Querier interface {
 	UpdateMessage(ctx context.Context, arg UpdateMessageParams) error
 	UpdateMessagePinned(ctx context.Context, arg UpdateMessagePinnedParams) error
 	UpdatePermissionEnabled(ctx context.Context, arg UpdatePermissionEnabledParams) error
-	// Overwrites title/prompt_tokens/completion_tokens/summary/todos but NOT
-	// cost. Cost is mutated only via IncrementSessionCost so concurrent
+	// Overwrites title/prompt_tokens/completion_tokens/summary/todos/deleted_todos
+	// but NOT cost. Cost is mutated only via IncrementSessionCost so concurrent
 	// sub-agent goroutines (and parallel crush processes that ever share a
 	// session) cannot lose accrued cost via read-modify-write.
 	UpdateSession(ctx context.Context, arg UpdateSessionParams) (Session, error)

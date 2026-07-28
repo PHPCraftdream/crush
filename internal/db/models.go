@@ -19,21 +19,47 @@ type File struct {
 }
 
 type Message struct {
-	ID               string         `json:"id"`
-	SessionID        string         `json:"session_id"`
-	Role             string         `json:"role"`
-	Parts            string         `json:"parts"`
-	Model            sql.NullString `json:"model"`
-	CreatedAt        int64          `json:"created_at"`
-	UpdatedAt        int64          `json:"updated_at"`
-	FinishedAt       sql.NullInt64  `json:"finished_at"`
-	Provider         sql.NullString `json:"provider"`
-	IsSummaryMessage int64          `json:"is_summary_message"`
-	Pinned           int64          `json:"pinned"`
-	Hidden           int64          `json:"hidden"`
+	ID                  string         `json:"id"`
+	SessionID           string         `json:"session_id"`
+	Role                string         `json:"role"`
+	Parts               string         `json:"parts"`
+	Model               sql.NullString `json:"model"`
+	CreatedAt           int64          `json:"created_at"`
+	UpdatedAt           int64          `json:"updated_at"`
+	FinishedAt          sql.NullInt64  `json:"finished_at"`
+	Provider            sql.NullString `json:"provider"`
+	IsSummaryMessage    int64          `json:"is_summary_message"`
+	Pinned              int64          `json:"pinned"`
+	Hidden              int64          `json:"hidden"`
 	ReasoningEffort     sql.NullString `json:"reasoning_effort"`
 	AutoResumed         int64          `json:"auto_resumed"`
 	BackgroundJobNotice int64          `json:"background_job_notice"`
+}
+
+type PendingInject struct {
+	ID        string `json:"id"`
+	SessionID string `json:"session_id"`
+	MessageID string `json:"message_id"`
+	Content   string `json:"content"`
+	Interrupt int64  `json:"interrupt"`
+	CreatedAt int64  `json:"created_at"`
+}
+
+type QueueTask struct {
+	ID         string          `json:"id"`
+	SessionID  sql.NullString  `json:"session_id"`
+	Prompt     string          `json:"prompt"`
+	Role       sql.NullString  `json:"role"`
+	MaxCost    sql.NullFloat64 `json:"max_cost"`
+	MaxTokens  sql.NullInt64   `json:"max_tokens"`
+	TimeoutSec sql.NullInt64   `json:"timeout_sec"`
+	Status     string          `json:"status"`
+	Cost       sql.NullFloat64 `json:"cost"`
+	Tokens     sql.NullInt64   `json:"tokens"`
+	ExitReason sql.NullString  `json:"exit_reason"`
+	CreatedAt  int64           `json:"created_at"`
+	StartedAt  sql.NullInt64   `json:"started_at"`
+	FinishedAt sql.NullInt64   `json:"finished_at"`
 }
 
 type ReadFile struct {
@@ -62,6 +88,11 @@ type Session struct {
 	YoloEnabled               int64          `json:"yolo_enabled"`
 	LargeModelReasoningEffort sql.NullString `json:"large_model_reasoning_effort"`
 	SmallModelReasoningEffort sql.NullString `json:"small_model_reasoning_effort"`
+	CancelRequested           int64          `json:"cancel_requested"`
+	EndedReason               string         `json:"ended_reason"`
+	BudgetMaxCost             float64        `json:"budget_max_cost"`
+	BudgetMaxTokens           int64          `json:"budget_max_tokens"`
+	BudgetTimeoutSec          int64          `json:"budget_timeout_sec"`
 	DeletedTodos              string         `json:"deleted_todos"`
 }
 

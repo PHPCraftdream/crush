@@ -113,6 +113,19 @@ type Service interface {
 	// gather a parent run's sub-agent fan-out outputs after Run()
 	// returns.
 	ListSubSessions(ctx context.Context, parentSessionID string) ([]Session, error)
+	// GetCallTreeActivity returns the freshest message activity anywhere in
+	// rootID's call tree (rootID itself plus every descendant reachable via
+	// parent_session_id) in ONE recursive-CTE query, instead of a
+	// per-node Messages.List + ListSubSessions walk. ok is false when the
+	// tree has no messages at all (nothing to report).
+	GetCallTreeActivity(ctx context.Context, rootID string) (activity CallTreeActivity, ok bool, err error)
+	// GetCallTreeActivityBatch is the batch form of GetCallTreeActivity: it
+	// computes the freshest call-tree activity for EVERY id in rootIDs in
+	// one query. Used by `sessions list`, which otherwise walked the whole
+	// descendant tree of every running session individually. The returned
+	// map is keyed by root session ID; roots with no activity in their tree
+	// are simply absent from the map.
+	GetCallTreeActivityBatch(ctx context.Context, rootIDs []string) (map[string]CallTreeActivity, error)
 	Save(ctx context.Context, session Session) (Session, error)
 	// IncrementCost atomically adds delta to the session's cost via an
 	// additive SQL UPDATE. Use this instead of read-modify-write through
@@ -170,6 +183,22 @@ type service struct {
 	*pubsub.Broker[Session]
 	db *sql.DB
 	q  *db.Queries
+}
+
+// CallTreeActivity is the freshest message activity found anywhere in a
+// session's call tree (the session itself plus every descendant sub-agent
+// session reachable via parent_session_id), as computed by the
+// GetCallTreeActivity / GetCallTreeActivityBatch recursive-CTE queries.
+type CallTreeActivity struct {
+	// SessionID is the descendant (or root) session the activity belongs
+	// to — i.e. which node in the tree produced LatestUnix.
+	SessionID string
+	// Role is the role of the freshest message ("assistant" / "tool" /
+	// "user").
+	Role string
+	// LatestUnix is the newest message activity timestamp (max of
+	// created_at / updated_at) across the whole tree.
+	LatestUnix int64
 }
 
 func (s *service) Create(ctx context.Context, title string) (Session, error) {
@@ -423,6 +452,46 @@ func (s *service) ListSubSessions(ctx context.Context, parentSessionID string) (
 		sessions[i] = s.fromDBItem(dbSession)
 	}
 	return sessions, nil
+}
+
+// GetCallTreeActivity implementation: see the Service interface doc. A
+// sql.ErrNoRows result (no messages anywhere in the tree) is reported as
+// (zero-value, false, nil) rather than propagated as an error — an empty
+// tree is a normal, expected state (e.g. a session that was just created),
+// not a failure.
+func (s *service) GetCallTreeActivity(ctx context.Context, rootID string) (CallTreeActivity, bool, error) {
+	row, err := s.q.GetCallTreeActivity(ctx, rootID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return CallTreeActivity{}, false, nil
+		}
+		return CallTreeActivity{}, false, err
+	}
+	return CallTreeActivity{
+		SessionID:  row.SessionID,
+		Role:       row.Role,
+		LatestUnix: row.LatestUnix,
+	}, true, nil
+}
+
+// GetCallTreeActivityBatch implementation: see the Service interface doc.
+func (s *service) GetCallTreeActivityBatch(ctx context.Context, rootIDs []string) (map[string]CallTreeActivity, error) {
+	out := make(map[string]CallTreeActivity, len(rootIDs))
+	if len(rootIDs) == 0 {
+		return out, nil
+	}
+	rows, err := s.q.GetCallTreeActivityBatch(ctx, rootIDs)
+	if err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		out[row.RootSessionID] = CallTreeActivity{
+			SessionID:  row.SessionID,
+			Role:       row.Role,
+			LatestUnix: row.LatestUnix,
+		}
+	}
+	return out, nil
 }
 
 func (s *service) List(ctx context.Context) ([]Session, error) {

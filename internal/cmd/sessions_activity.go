@@ -71,89 +71,80 @@ func (c callTreeActivity) Age(now time.Time) (time.Duration, bool) {
 	return now.Sub(time.Unix(c.LatestUnix, 0)), true
 }
 
-// computeCallTreeActivity walks the session identified by rootID plus every
-// descendant sub-agent session (parent_session_id chain) and returns the
-// freshest message activity found anywhere in that tree. This is the single
+// computeCallTreeActivity returns the freshest message activity found
+// anywhere in rootID's call tree (rootID itself plus every descendant
+// sub-agent session reachable via parent_session_id). This is the single
 // source of truth consumed by `sessions why` / `locks` / `list` / `show` /
 // `watch` / `last` so none of them has to duplicate freshness logic.
 //
-// Cost: one Messages.List per session in the tree plus one ListSubSessions
-// per session. A normal run has a root and a small number of sub-agent
-// sessions, so this is a handful of indexed queries. The visit cap
-// (subTreeWalkMaxSessions) and the visited-set guard keep a degenerate or
-// cyclic tree from turning it into an unbounded sweep.
+// Cost: ONE SQL query (a recursive CTE joined against messages), replacing
+// the earlier BFS implementation that issued one Messages.List (full
+// message history + Parts decode) plus one ListSubSessions per node in the
+// tree. The freshest-timestamp aggregation and the "prefer a descendant on
+// a tied timestamp" rule (see session.Service.GetCallTreeActivity) now both
+// happen inside SQLite via MAX()/ORDER BY, so no message content ever
+// crosses into Go just to answer "what's the newest activity". The
+// recursion depth is capped at 511 inside the query itself (mirrors
+// subTreeWalkMaxSessions) as a defensive guard against a pathological
+// fan-out or an accidental parent/child cycle in the data.
 //
-// Error handling: a Messages.List or ListSubSessions failure on any single
-// node is intentionally NOT fatal and does not change the returned value —
-// this is a best-effort diagnostic signal consumed by six different display
-// surfaces (`sessions why`/`locks`/`list`/`show`/`watch`/`last`), all of
-// which already treat a zero-value callTreeActivity as "no activity found"
-// and none of which currently expect a partial-failure signal. Changing the
-// return type to plumb a "some nodes could not be checked" flag through all
-// six callers would be a much larger, riskier change for what is a read-only
-// diagnostic path (unlike isDescendantSession's security-relevant ownership
-// check, where silently continuing on error is NOT acceptable). Instead we
-// log each swallowed error at Debug level so a transient DB error is visible
-// under `--verbose`/debug logging instead of silently vanishing into "no
-// activity", without changing any caller's behavior.
+// Error handling: a query failure is NOT fatal and returns the zero-value
+// callTreeActivity — this is a best-effort diagnostic signal consumed by six
+// different display surfaces (`sessions why`/`locks`/`list`/`show`/`watch`/
+// `last`), all of which already treat a zero-value callTreeActivity as "no
+// activity found". Unlike the old per-node BFS, a single aggregate query
+// cannot partially fail on just one tree node — it either returns the whole
+// tree's answer or it doesn't return at all — so the failure is logged once
+// at Debug level rather than per-node.
 func computeCallTreeActivity(ctx context.Context, a *app.App, rootID string) callTreeActivity {
 	out := callTreeActivity{}
 	if a == nil || rootID == "" {
 		return out
 	}
 
-	visited := make(map[string]struct{}, 8)
-	queue := []string{rootID}
-	visits := 0
-
-	for len(queue) > 0 && visits < subTreeWalkMaxSessions {
-		id := queue[0]
-		queue = queue[1:]
-		if _, seen := visited[id]; seen {
-			continue
-		}
-		visited[id] = struct{}{}
-		visits++
-
-		isDescendant := id != rootID
-		msgs, err := a.Messages.List(ctx, id)
-		if err != nil {
-			slog.Debug("computeCallTreeActivity: failed to list messages, this node's activity is not reflected in the result", "session_id", id, "root_id", rootID, "error", err)
-		}
-		if err == nil {
-			for i := range msgs {
-				ts := latestMessageUnix(msgs[i])
-				// Strictly-newer always wins. On an EQUAL timestamp (common:
-				// the parent's delegating tool-call row and the sub-agent's
-				// first row land in the same wall-clock second), prefer a
-				// descendant so the "live edge of work" is reported as the
-				// sub-agent, not the parent that's merely blocked waiting on
-				// it. Without this tie-break a fast delegation reads as
-				// "parent active" for its first second.
-				better := ts > out.LatestUnix ||
-					(ts == out.LatestUnix && isDescendant && !out.SubAgentActive)
-				if better {
-					out.LatestUnix = ts
-					out.DeepestSessionID = id
-					out.SubAgentActive = isDescendant
-					out.LatestRole = string(msgs[i].Role)
-				}
-			}
-		}
-
-		children, err := a.Sessions.ListSubSessions(ctx, id)
-		if err != nil {
-			slog.Debug("computeCallTreeActivity: failed to list sub-sessions, this node's descendants are not reflected in the result", "session_id", id, "root_id", rootID, "error", err)
-		}
-		if err == nil {
-			for _, child := range children {
-				if _, seen := visited[child.ID]; !seen {
-					queue = append(queue, child.ID)
-				}
-			}
-		}
+	act, ok, err := a.Sessions.GetCallTreeActivity(ctx, rootID)
+	if err != nil {
+		slog.Debug("computeCallTreeActivity: query failed, tree activity is not reflected in the result", "root_id", rootID, "error", err)
+		return out
+	}
+	if !ok {
+		return out
 	}
 
+	out.LatestUnix = act.LatestUnix
+	out.DeepestSessionID = act.SessionID
+	out.SubAgentActive = act.SessionID != rootID
+	out.LatestRole = act.Role
+	return out
+}
+
+// computeCallTreeActivityBatch is the batch form of computeCallTreeActivity:
+// it computes the freshest call-tree activity for EVERY id in rootIDs in
+// ONE SQL query, instead of one query per root. Used by `sessions list`,
+// which otherwise walked the whole descendant tree of every running session
+// individually. Roots with no activity anywhere in their tree are simply
+// absent from the returned map (mirroring the zero-value callTreeActivity a
+// per-root call would have produced).
+func computeCallTreeActivityBatch(ctx context.Context, a *app.App, rootIDs []string) map[string]callTreeActivity {
+	out := make(map[string]callTreeActivity, len(rootIDs))
+	if a == nil || len(rootIDs) == 0 {
+		return out
+	}
+
+	results, err := a.Sessions.GetCallTreeActivityBatch(ctx, rootIDs)
+	if err != nil {
+		slog.Debug("computeCallTreeActivityBatch: query failed, tree activity is not reflected in the result", "root_count", len(rootIDs), "error", err)
+		return out
+	}
+
+	for rootID, act := range results {
+		out[rootID] = callTreeActivity{
+			LatestUnix:       act.LatestUnix,
+			DeepestSessionID: act.SessionID,
+			SubAgentActive:   act.SessionID != rootID,
+			LatestRole:       act.Role,
+		}
+	}
 	return out
 }
 
