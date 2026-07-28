@@ -152,7 +152,7 @@ func TestCrushInfo_YoloMode(t *testing.T) {
 		Providers:   csync.NewMap[string, config.ProviderConfig](),
 		Permissions: &config.Permissions{},
 	})
-	cfg.Overrides().SkipPermissionRequests = true
+	cfg.SetSkipPermissionRequests(true)
 
 	output := buildCrushInfo(cfg, nil, nil, nil)
 	require.Contains(t, output, "[permissions]")
@@ -258,7 +258,7 @@ func TestCrushInfo_DeterministicOrdering(t *testing.T) {
 			AllowedTools: []string{"z-perm", "a-perm"},
 		},
 	})
-	cfg.Overrides().SkipPermissionRequests = true
+	cfg.SetSkipPermissionRequests(true)
 
 	// Test MCP ordering via writeMCP directly.
 	var mcpBuf strings.Builder

@@ -3,8 +3,11 @@ package config
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -118,21 +121,21 @@ func TestConfigStore_RuntimeOverrides_Independent(t *testing.T) {
 	require.False(t, store1.Overrides().SkipPermissionRequests)
 	require.False(t, store2.Overrides().SkipPermissionRequests)
 
-	store1.Overrides().SkipPermissionRequests = true
+	store1.SetSkipPermissionRequests(true)
 
 	require.True(t, store1.Overrides().SkipPermissionRequests)
 	require.False(t, store2.Overrides().SkipPermissionRequests)
 }
 
-func TestConfigStore_RuntimeOverrides_MutableViaPointer(t *testing.T) {
+func TestConfigStore_RuntimeOverrides_SetterPublishesNewGeneration(t *testing.T) {
 	t.Parallel()
 
 	store := newTestConfigStore(testStoreOpts{config: &Config{}})
-	overrides := store.Overrides()
 
-	require.False(t, overrides.SkipPermissionRequests)
+	require.False(t, store.Overrides().SkipPermissionRequests)
 
-	overrides.SkipPermissionRequests = true
+	store.SetSkipPermissionRequests(true)
+
 	require.True(t, store.Overrides().SkipPermissionRequests)
 }
 
@@ -731,4 +734,121 @@ func TestRefreshOAuthToken_UsesDiskTokenWhenDifferent(t *testing.T) {
 	require.Equal(t, "newer-access-token", updatedConfig.APIKey)
 	require.Equal(t, "newer-access-token", updatedConfig.OAuthToken.AccessToken)
 	require.Equal(t, "refresh-abc", updatedConfig.OAuthToken.RefreshToken)
+}
+
+// TestSetProviderRuntimeConfig_VisibleImmediatelyAndDiscardedByReload
+// verifies the core contract of SetProviderRuntimeConfig: the in-memory
+// provider update is visible immediately after the call returns, but a
+// subsequent ReloadFromDisk rebuilds Providers from disk and discards the
+// runtime-only change by design (the template/key on disk is the source of
+// truth, not the in-memory copy).
+func TestSetProviderRuntimeConfig_VisibleImmediatelyAndDiscardedByReload(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "crush.json")
+
+	// Config with one provider on disk.
+	initialConfig := `{
+		"providers": {
+			"openai": {
+				"api_key": "disk-key",
+				"models": [{"id": "gpt-4", "name": "GPT-4"}]
+			}
+		}
+	}`
+	require.NoError(t, os.WriteFile(configPath, []byte(initialConfig), 0o600))
+
+	// Isolate from host global config.
+	t.Setenv("CRUSH_GLOBAL_CONFIG", dir)
+	t.Setenv("CRUSH_GLOBAL_DATA", dir)
+	resetProviderState()
+	t.Cleanup(resetProviderState)
+
+	store, err := Load(dir, dir, false)
+	require.NoError(t, err)
+	store.globalDataPath = configPath
+	store.CaptureStalenessSnapshot([]string{configPath})
+
+	// Verify the provider loaded from disk.
+	pc, ok := store.Config().Providers.Get("openai")
+	require.True(t, ok)
+	require.Equal(t, "disk-key", pc.APIKey)
+
+	// Apply a runtime-only update (simulating an API key refresh).
+	pc.APIKey = "refreshed-key"
+	store.SetProviderRuntimeConfig("openai", pc)
+
+	// The update must be visible immediately — no intervening reload.
+	pc2, ok := store.Config().Providers.Get("openai")
+	require.True(t, ok)
+	require.Equal(t, "refreshed-key", pc2.APIKey,
+		"SetProviderRuntimeConfig change must be visible immediately")
+
+	// A reload rebuilds Providers from disk, discarding the runtime-only
+	// change. The API key reverts to the disk value.
+	require.NoError(t, store.ReloadFromDisk(context.Background()))
+
+	pc3, ok := store.Config().Providers.Get("openai")
+	require.True(t, ok)
+	require.Equal(t, "disk-key", pc3.APIKey,
+		"reload must rebuild Providers from disk, discarding runtime-only updates")
+}
+
+// TestProviderUpdates_ConcurrentReloadNoRace runs SetProviderRuntimeConfig
+// and ReloadFromDisk concurrently to verify (via the -race detector) that
+// the publishMu guard prevents any data race between the in-memory provider
+// update and the reload's full snapshot rebuild.
+func TestProviderUpdates_ConcurrentReloadNoRace(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "crush.json")
+
+	initialConfig := `{
+		"providers": {
+			"openai": {
+				"api_key": "disk-key",
+				"models": [{"id": "gpt-4", "name": "GPT-4"}]
+			}
+		}
+	}`
+	require.NoError(t, os.WriteFile(configPath, []byte(initialConfig), 0o600))
+
+	t.Setenv("CRUSH_GLOBAL_CONFIG", dir)
+	t.Setenv("CRUSH_GLOBAL_DATA", dir)
+	resetProviderState()
+	t.Cleanup(resetProviderState)
+
+	store, err := Load(dir, dir, false)
+	require.NoError(t, err)
+	store.globalDataPath = configPath
+	store.CaptureStalenessSnapshot([]string{configPath})
+
+	ctx := context.Background()
+	var wg sync.WaitGroup
+	var stop atomic.Bool
+
+	// Reloader: continuously reloads from disk until stop is set.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for !stop.Load() {
+			_ = store.ReloadFromDisk(ctx)
+		}
+	}()
+
+	// Writer: repeatedly applies runtime-only provider updates.
+	for i := range 200 {
+		pc, ok := store.Config().Providers.Get("openai")
+		if !ok {
+			continue
+		}
+		pc.APIKey = fmt.Sprintf("refreshed-key-%d", i)
+		store.SetProviderRuntimeConfig("openai", pc)
+	}
+
+	stop.Store(true)
+	wg.Wait()
+
+	// After all concurrent activity, the store must still be consistent:
+	// the provider is present (from the last reload or the last write).
+	_, ok := store.Config().Providers.Get("openai")
+	require.True(t, ok, "provider must still be present after concurrent updates")
 }

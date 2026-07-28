@@ -2372,7 +2372,7 @@ func (c *coordinator) refreshApiKeyTemplate(ctx context.Context, providerCfg con
 	}
 
 	providerCfg.APIKey = newAPIKey
-	c.cfg.Config().Providers.Set(providerCfg.ID, providerCfg)
+	c.cfg.SetProviderRuntimeConfig(providerCfg.ID, providerCfg)
 
 	if err := c.UpdateModels(ctx); err != nil {
 		return err

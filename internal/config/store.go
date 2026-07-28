@@ -177,23 +177,30 @@ func (s *ConfigStore) SetupAgents() {
 	s.loadSnapshot().config.SetupAgents()
 }
 
-// Overrides returns the runtime overrides for this store.
-//
-// NOTE: this returns a pointer into the CURRENT snapshot's embedded
-// RuntimeOverrides. Mutating through the returned pointer (as
-// SetSkipPermissionRequests-style callers do today) is a pre-existing,
-// deliberately-kept exception to the copy-on-write rule: RuntimeOverrides
-// is a single bool used as a process/session-lifetime toggle, never
-// persisted, and never read as part of a "generation" that needs to be
-// consistent with Config()/Resolver(). If a reload publishes a new
-// snapshot after a caller fetched this pointer, further writes through the
-// old pointer will not be visible in the new snapshot — callers needing
-// the override to survive a reload should re-fetch Overrides() after each
-// ReloadFromDisk. This mirrors the pre-refactor behavior (overrides were
-// copied by value across old/new state during reload) and is called out
-// explicitly rather than silently carried over.
-func (s *ConfigStore) Overrides() *RuntimeOverrides {
-	return &s.loadSnapshot().overrides
+// Overrides returns the runtime overrides as a value copy. Callers cannot
+// mutate the store's internal snapshot state through the returned value —
+// use SetSkipPermissionRequests for writes, which goes through the
+// copy-on-write publish path (publishMu + clone + atomic Store) so the
+// change is visible as a new generation and survives subsequent reloads
+// (reloadFromDiskLocked carries overrides forward from prev.overrides).
+func (s *ConfigStore) Overrides() RuntimeOverrides {
+	return s.loadSnapshot().overrides
+}
+
+// SetSkipPermissionRequests sets the SkipPermissionRequests runtime override
+// through the copy-on-write path (publishMu + snapshot clone + atomic Store),
+// so the change is visible as a new generation and survives subsequent
+// reloads (reloadFromDiskLocked carries overrides forward from prev.overrides).
+// Unlike the old Overrides() pointer-return pattern, this cannot lose the
+// write to a concurrent reload that publishes a new snapshot between the
+// caller's read and write.
+func (s *ConfigStore) SetSkipPermissionRequests(v bool) {
+	s.publishMu.Lock()
+	defer s.publishMu.Unlock()
+	cur := s.loadSnapshot()
+	next := cur.clone()
+	next.overrides.SkipPermissionRequests = v
+	s.snap.Store(next)
 }
 
 // LoadedPaths returns the config file paths that were successfully loaded.
@@ -641,16 +648,22 @@ func (s *ConfigStore) SetProviderAPIKey(scope Scope, providerID string, apiKey a
 		}
 	}
 
-	// Providers is a *csync.Map: it carries its own internal RWMutex, so
-	// Get/Set on it are safe to call directly without going through
-	// updateConfig's copy-on-write path. We still fetch both the map and
-	// knownProviders from ONE current snapshot (rather than two separate
-	// loadSnapshot() calls) purely to use a single, less stale view — the
-	// Providers map itself is the same shared instance across config
-	// generations until a reload rebuilds cfg from scratch, and mutating
-	// it in place is intentional: a config reload triggered concurrently
-	// with this call is expected to observe (or itself trigger) the
-	// updated provider, not silently lose it to a copy-on-write swap.
+	// Take publishMu around the in-memory provider update so no concurrent
+	// reload can swap the Providers *csync.Map between loadSnapshot() and
+	// .Set(). Each reload creates a BRAND NEW *csync.Map (confirmed by
+	// reading the load chain: loadFromBytes → json.Unmarshal →
+	// Map.UnmarshalJSON allocates a fresh inner map, and setDefaults
+	// creates a fresh NewMap if unmarshal left it nil — the old map is
+	// never carried forward into the new snapshot). Without publishMu, a
+	// concurrent reload could publish a new snapshot between our
+	// loadSnapshot() and .Set(), leaving our write in an already-orphaned
+	// map invisible to new readers. The disk write above already persists
+	// the key, so a subsequent reload picks it up from disk regardless;
+	// publishMu just closes the narrow window where the in-memory update
+	// is silently lost before that reload runs.
+	s.publishMu.Lock()
+	defer s.publishMu.Unlock()
+
 	sn := s.loadSnapshot()
 	providerConfig, exists = sn.config.Providers.Get(providerID)
 	if exists {
@@ -684,6 +697,24 @@ func (s *ConfigStore) SetProviderAPIKey(scope Scope, providerID string, apiKey a
 	}
 	sn.config.Providers.Set(providerID, providerConfig)
 	return nil
+}
+
+// SetProviderRuntimeConfig updates a provider's config in the CURRENT
+// generation's Providers map. It is for in-memory-only provider updates that
+// are NOT persisted to disk — e.g. re-resolving an API key template after a
+// 401 error in the coordinator. A subsequent reload will rebuild Providers
+// from disk (re-resolving the template), discarding this change by design.
+//
+// publishMu is held so no concurrent reload can swap the Providers
+// *csync.Map between loadSnapshot() and .Set(). Each reload creates a brand
+// new *csync.Map (confirmed: loadFromBytes → json.Unmarshal calls
+// Map.UnmarshalJSON which allocates a fresh inner map; setDefaults creates a
+// fresh NewMap if unmarshal left it nil), so without this lock the .Set()
+// could land in an already-orphaned map that no reader sees.
+func (s *ConfigStore) SetProviderRuntimeConfig(providerID string, pc ProviderConfig) {
+	s.publishMu.Lock()
+	defer s.publishMu.Unlock()
+	s.loadSnapshot().config.Providers.Set(providerID, pc)
 }
 
 // RefreshOAuthToken refreshes the OAuth token for the given provider.
