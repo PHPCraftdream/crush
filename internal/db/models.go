@@ -94,6 +94,7 @@ type Session struct {
 	BudgetMaxTokens           int64          `json:"budget_max_tokens"`
 	BudgetTimeoutSec          int64          `json:"budget_timeout_sec"`
 	DeletedTodos              string         `json:"deleted_todos"`
+	ParentCostAccounted       float64        `json:"parent_cost_accounted"`
 }
 
 type SessionPermission struct {

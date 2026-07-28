@@ -140,3 +140,24 @@ SET
     small_model_reasoning_effort = ?,
     updated_at = strftime('%s', 'now')
 WHERE id = ?;
+
+-- name: GetSessionCostAccounting :one
+-- Returns the child's current cost and the amount already charged to the
+-- parent (parent_cost_accounted). Used by TransferChildCostToParent inside
+-- a transaction so delta = cost - accounted is computed from a single
+-- consistent read within that transaction.
+SELECT cost, parent_cost_accounted
+FROM sessions
+WHERE id = ? LIMIT 1;
+
+-- name: SetParentCostAccounted :exec
+-- Marks the child's full current cost as charged to the parent, so the
+-- next TransferChildCostToParent call charges only new cost accrued above
+-- this point. Run inside the same transaction as the parent's
+-- IncrementSessionCost so a crash between the two cannot leave the parent
+-- charged but the child's accounting lagging (or vice versa).
+UPDATE sessions
+SET
+    parent_cost_accounted = ?,
+    updated_at = strftime('%s', 'now')
+WHERE id = ?;

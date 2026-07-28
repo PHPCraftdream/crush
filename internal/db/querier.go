@@ -49,6 +49,11 @@ type Querier interface {
 	GetMessage(ctx context.Context, id string) (Message, error)
 	GetRecentActivity(ctx context.Context) ([]GetRecentActivityRow, error)
 	GetSessionByID(ctx context.Context, id string) (Session, error)
+	// Returns the child's current cost and the amount already charged to the
+	// parent (parent_cost_accounted). Used by TransferChildCostToParent inside
+	// a transaction so delta = cost - accounted is computed from a single
+	// consistent read within that transaction.
+	GetSessionCostAccounting(ctx context.Context, id string) (GetSessionCostAccountingRow, error)
 	GetToolUsage(ctx context.Context) ([]GetToolUsageRow, error)
 	GetTotalStats(ctx context.Context) (GetTotalStatsRow, error)
 	GetUsageByDay(ctx context.Context) ([]GetUsageByDayRow, error)
@@ -86,6 +91,12 @@ type Querier interface {
 	MatchSessionPermission(ctx context.Context, arg MatchSessionPermissionParams) (string, error)
 	RecordFileRead(ctx context.Context, arg RecordFileReadParams) error
 	RenameSession(ctx context.Context, arg RenameSessionParams) error
+	// Marks the child's full current cost as charged to the parent, so the
+	// next TransferChildCostToParent call charges only new cost accrued above
+	// this point. Run inside the same transaction as the parent's
+	// IncrementSessionCost so a crash between the two cannot leave the parent
+	// charged but the child's accounting lagging (or vice versa).
+	SetParentCostAccounted(ctx context.Context, arg SetParentCostAccountedParams) error
 	UpdateMessage(ctx context.Context, arg UpdateMessageParams) error
 	UpdateMessagePinned(ctx context.Context, arg UpdateMessagePinnedParams) error
 	UpdatePermissionEnabled(ctx context.Context, arg UpdatePermissionEnabledParams) error

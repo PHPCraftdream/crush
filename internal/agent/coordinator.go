@@ -2438,16 +2438,6 @@ func (c *coordinator) runSubAgent(ctx context.Context, params subAgentParams) (f
 		session = created
 	}
 
-	// Baseline for updateParentSessionCost below: the child's cost AT THE
-	// START of this call. For a fresh sub-agent this is 0. For a resumed
-	// one it is exactly what was already charged to the parent when the
-	// PRIOR call paused (that charge used this same child's Cost at the
-	// time it paused) — so subtracting it here yields only the NEW cost
-	// accrued during this resume, not the whole child total again. See
-	// updateParentSessionCost's doc comment for why charging the raw
-	// total on every call (pause AND resume) double-counts.
-	initialChildCost := session.Cost
-
 	// Call session setup function if provided
 	if params.SessionSetup != nil {
 		params.SessionSetup(session.ID)
@@ -2496,39 +2486,37 @@ func (c *coordinator) runSubAgent(ctx context.Context, params subAgentParams) (f
 			ProviderID: model.ModelCfg.Provider,
 		})
 	}
-	// A sub-agent that called ask_question stops its turn via
-	// AwaitingAnswerError (see question_stop.go), not a genuine failure —
-	// letting it fall into the generic branch below would tell the parent
-	// model "the sub-agent FAILED", and it would likely redo the work itself
-	// instead of answering. Recognize this case first and return a normal
-	// SUCCESSFUL tool response shaped as a question, still costing whatever
-	// the sub-agent spent before it paused. The generic error branch below
-	// is unchanged for genuine failures.
-	var awaitingAnswer *AwaitingAnswerError
-	if errors.As(err, &awaitingAnswer) {
-		if costErr := c.updateParentSessionCost(ctx, session.ID, params.SessionID, initialChildCost); costErr != nil {
-			slog.Warn(
-				"Failed to update parent session cost",
-				"child_session", session.ID,
-				"parent_session", params.SessionID,
-				"error", costErr,
-			)
-		}
-		return fantasy.NewTextResponse(subAgentQuestionText(session.ID, awaitingAnswer)), nil
-	}
-	if err != nil {
-		return fantasy.NewTextErrorResponse(fmt.Sprintf("Failed to generate response: %s", err)), nil
-	}
-
-	// Update parent session cost on a best-effort basis. A failure here must
-	// not discard the sub-agent output that was already produced.
-	if err := c.updateParentSessionCost(ctx, session.ID, params.SessionID, initialChildCost); err != nil {
+	// Charge the parent for whatever the child spent on this run, on EVERY
+	// outcome (success, ask_question pause, or genuine error). This replaces
+	// the old in-memory baselineCost scheme: TransferChildCostToParent reads
+	// the child's persisted parent_cost_accounted ledger inside one
+	// transaction and charges only the delta since the last transfer, so the
+	// spent amount is never lost. A failed charge only logs a warning — the
+	// uncharged delta persists in (child.cost - child.parent_cost_accounted)
+	// and is recovered on the next successful call. The previous code skipped
+	// the charge on the generic-error path, permanently losing that cost.
+	if costErr := c.updateParentSessionCost(ctx, session.ID, params.SessionID); costErr != nil {
 		slog.Warn(
 			"Failed to update parent session cost",
 			"child_session", session.ID,
 			"parent_session", params.SessionID,
-			"error", err,
+			"error", costErr,
 		)
+	}
+
+	// A sub-agent that called ask_question stops its turn via
+	// AwaitingAnswerError (see question_stop.go), not a genuine failure —
+	// letting it fall into the generic branch below would tell the parent
+	// model "the sub-agent FAILED", and it would likely redo the work itself
+	// instead of answering. Recognize this case and return a normal
+	// SUCCESSFUL tool response shaped as a question. Cost was already charged
+	// above regardless of outcome.
+	var awaitingAnswer *AwaitingAnswerError
+	if errors.As(err, &awaitingAnswer) {
+		return fantasy.NewTextResponse(subAgentQuestionText(session.ID, awaitingAnswer)), nil
+	}
+	if err != nil {
+		return fantasy.NewTextErrorResponse(fmt.Sprintf("Failed to generate response: %s", err)), nil
 	}
 
 	output := subAgentOutput(result)
@@ -2545,55 +2533,22 @@ func subAgentOutput(result *fantasy.AgentResult) string {
 	return result.Response.Content.Text()
 }
 
-// updateParentSessionCost accumulates the cost from a child session into
-// its parent session. Uses the atomic additive UPDATE (IncrementCost) so
-// concurrent sub-agent fan-out (multiple children finishing in different
-// goroutines and each charging the same parent) cannot lose cost via
-// read-modify-write the way the old Get+modify+Save pattern would.
+// updateParentSessionCost transfers the cost a child session accrued since
+// the last transfer to its parent. It is a thin delegate to the
+// transactional session.Service.TransferChildCostToParent, which reads the
+// child's persisted parent_cost_accounted ledger, charges only the delta
+// (cost - accounted, clamped >= 0) to the parent via an atomic additive
+// UPDATE, and advances the child's accounted marker — all inside one DB
+// transaction.
 //
-// baselineCost is the child's OWN Cost at the moment this runSubAgent call
-// started (0 for a fresh sub-agent, or whatever the child's Cost was when
-// it last paused, for a resume). Only childSession.Cost - baselineCost —
-// the cost accrued DURING this call — is charged to the parent.
-//
-// Why a delta and not the raw total: a sub-agent that calls ask_question
-// pauses mid-task, and runSubAgent charges the parent right then with
-// whatever the child has spent so far (say A). When the orchestrator later
-// answers, the SAME child session resumes and runs runSubAgent again,
-// finishing with total cost A+B. Charging childSession.Cost verbatim on
-// EVERY call — as this used to do — charges the parent A (at the pause)
-// then A+B (at the resume), for a total of 2A+B instead of the correct
-// A+B: the portion already charged at the pause got billed to the parent
-// a second time. Subtracting baselineCost (which the caller captured as
-// exactly what the child's Cost was AT the pause, i.e. what was already
-// charged) fixes this without needing any new persisted state — the
-// child's own Cost field IS the running total, so "cost since baseline"
-// is all the information needed.
-//
-// Fork patch (concurrency): rewritten from Get-parent → modify Cost →
-// Save back. See CHANGELOG.fork.md (Section 4.I).
-func (c *coordinator) updateParentSessionCost(ctx context.Context, childSessionID, parentSessionID string, baselineCost float64) error {
-	childSession, err := c.sessions.Get(ctx, childSessionID)
-	if err != nil {
-		return fmt.Errorf("get child session: %w", err)
-	}
-
-	delta := childSession.Cost - baselineCost
-	if delta < 0 {
-		// Should not happen (session cost only grows), but never charge a
-		// parent a negative amount over a stale/inconsistent read.
-		delta = 0
-	}
-
-	// IncrementCost handles the zero-delta case by routing to Get, which
-	// surfaces a not-found error if the parent session was deleted between
-	// the child finishing and this call — preserves the previous error
-	// semantics.
-	if _, err := c.sessions.IncrementCost(ctx, parentSessionID, delta); err != nil {
-		return fmt.Errorf("increment parent session cost: %w", err)
-	}
-
-	return nil
+// Because the baseline now lives in the database (parent_cost_accounted),
+// there is no in-memory baselineCost parameter: the function is safe across
+// process restarts, concurrent resumes of the same child, and failed
+// charges (an uncharged delta persists and is recovered on the next call).
+// Callers should invoke it on EVERY sub-agent outcome (success,
+// ask_question, error) so no spent cost is ever silently dropped.
+func (c *coordinator) updateParentSessionCost(ctx context.Context, childSessionID, parentSessionID string) error {
+	return c.sessions.TransferChildCostToParent(ctx, childSessionID, parentSessionID)
 }
 
 // discoverSkills runs skill discovery for this coordinator at session

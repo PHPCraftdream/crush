@@ -100,6 +100,10 @@ func (m *mockSessionService) IncrementCost(_ context.Context, id string, delta f
 	return session.Session{}, nil
 }
 
+func (m *mockSessionService) TransferChildCostToParent(context.Context, string, string) error {
+	return nil
+}
+
 func (m *mockSessionService) UpdateTitleAndUsage(context.Context, string, string, int64, int64, float64) error {
 	return nil
 }

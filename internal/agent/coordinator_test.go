@@ -416,6 +416,46 @@ func TestRunSubAgent(t *testing.T) {
 		assert.NotContains(t, resp.Content, "SUB-AGENT QUESTION")
 	})
 
+	// Required test (а): a sub-agent that fails with a genuine error (not
+	// ask_question) must STILL charge the parent for whatever it spent before
+	// failing. The old code returned the error response without charging,
+	// permanently losing that cost; the transactional ledger now charges on
+	// every outcome.
+	t.Run("genuine failure still charges the parent for the cost accrued", func(t *testing.T) {
+		env := testEnv(t)
+		coord := newTestCoordinator(t, env, providerID, providerCfg)
+
+		parentSession, err := env.sessions.Create(t.Context(), "Parent")
+		require.NoError(t, err)
+
+		agent := newMockAgent(providerID, 4096, func(ctx context.Context, call SessionAgentCall) (*fantasy.AgentResult, error) {
+			// The sub-agent spends something before it fails.
+			if _, err := env.sessions.IncrementCost(ctx, call.SessionID, 0.04); err != nil {
+				return nil, err
+			}
+			return nil, errors.New("connection reset by peer")
+		})
+
+		resp, err := coord.runSubAgent(t.Context(), subAgentParams{
+			Agent:          agent,
+			SessionID:      parentSession.ID,
+			AgentMessageID: "msg-1",
+			ToolCallID:     "call-1",
+			Prompt:         "test",
+			SessionTitle:   "Test",
+		})
+		require.NoError(t, err)
+		assert.True(t, resp.IsError, "the failure must still be surfaced as a tool error")
+		assert.Equal(t, "Failed to generate response: connection reset by peer", resp.Content)
+
+		// Despite the error, the parent must have been charged the 0.04 the
+		// child spent. This is the regression: previously this was 0.0.
+		updated, err := env.sessions.Get(t.Context(), parentSession.ID)
+		require.NoError(t, err)
+		assert.InDelta(t, 0.04, updated.Cost, 1e-9,
+			"a failed sub-agent run must still charge the parent for the cost it accrued before failing")
+	})
+
 	// Gap 2 (Phase 3.2): resume_session_id must continue the SAME session -
 	// the session id passed to Agent.Run must match the existing child
 	// session, and the prior conversation persisted by the first call must
@@ -683,7 +723,7 @@ func TestUpdateParentSessionCost(t *testing.T) {
 		_, err = env.sessions.IncrementCost(t.Context(), child.ID, 0.10)
 		require.NoError(t, err)
 
-		err = coord.updateParentSessionCost(t.Context(), child.ID, parent.ID, 0)
+		err = coord.updateParentSessionCost(t.Context(), child.ID, parent.ID)
 		require.NoError(t, err)
 
 		updated, err := env.sessions.Get(t.Context(), parent.ID)
@@ -710,9 +750,9 @@ func TestUpdateParentSessionCost(t *testing.T) {
 		_, err = env.sessions.IncrementCost(t.Context(), child2.ID, 0.03)
 		require.NoError(t, err)
 
-		err = coord.updateParentSessionCost(t.Context(), child1.ID, parent.ID, 0)
+		err = coord.updateParentSessionCost(t.Context(), child1.ID, parent.ID)
 		require.NoError(t, err)
-		err = coord.updateParentSessionCost(t.Context(), child2.ID, parent.ID, 0)
+		err = coord.updateParentSessionCost(t.Context(), child2.ID, parent.ID)
 		require.NoError(t, err)
 
 		updated, err := env.sessions.Get(t.Context(), parent.ID)
@@ -729,7 +769,7 @@ func TestUpdateParentSessionCost(t *testing.T) {
 		parent, err := env.sessions.Create(t.Context(), "Parent")
 		require.NoError(t, err)
 
-		err = coord.updateParentSessionCost(t.Context(), "non-existent", parent.ID, 0)
+		err = coord.updateParentSessionCost(t.Context(), "non-existent", parent.ID)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "get child session")
 	})
@@ -745,7 +785,7 @@ func TestUpdateParentSessionCost(t *testing.T) {
 		child, err := env.sessions.CreateTaskSession(t.Context(), "tool-1", parent.ID, "Child")
 		require.NoError(t, err)
 
-		err = coord.updateParentSessionCost(t.Context(), child.ID, "non-existent", 0)
+		err = coord.updateParentSessionCost(t.Context(), child.ID, "non-existent")
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "increment parent session cost")
 	})
@@ -761,7 +801,7 @@ func TestUpdateParentSessionCost(t *testing.T) {
 		child, err := env.sessions.CreateTaskSession(t.Context(), "tool-1", parent.ID, "Child")
 		require.NoError(t, err)
 
-		err = coord.updateParentSessionCost(t.Context(), child.ID, parent.ID, 0)
+		err = coord.updateParentSessionCost(t.Context(), child.ID, parent.ID)
 		require.NoError(t, err)
 
 		updated, err := env.sessions.Get(t.Context(), parent.ID)
@@ -769,11 +809,11 @@ func TestUpdateParentSessionCost(t *testing.T) {
 		assert.InDelta(t, 0.0, updated.Cost, 1e-9)
 	})
 
-	t.Run("only charges the delta above baseline, not the raw total", func(t *testing.T) {
-		// Direct-unit-test counterpart to the runSubAgent-level
-		// "cost accounting is not skipped on the resume path" test: proves
-		// the fix at the updateParentSessionCost layer itself, independent
-		// of how runSubAgent computes the baseline it passes in.
+	// Required test (в): idempotency via the persisted parent_cost_accounted
+	// ledger. A repeat call with no new child cost accrued between them must
+	// charge the parent exactly zero — the second call reads accounted == cost
+	// and so computes delta 0.
+	t.Run("idempotent repeat call charges zero with no new child cost", func(t *testing.T) {
 		env := testEnv(t)
 		cfg, err := config.Init(env.workingDir, "", false)
 		require.NoError(t, err)
@@ -784,21 +824,57 @@ func TestUpdateParentSessionCost(t *testing.T) {
 		child, err := env.sessions.CreateTaskSession(t.Context(), "tool-1", parent.ID, "Child")
 		require.NoError(t, err)
 
-		// Child accrues 0.03 pre-pause, charged to the parent with baseline 0.
+		_, err = env.sessions.IncrementCost(t.Context(), child.ID, 0.07)
+		require.NoError(t, err)
+
+		// First transfer charges the full 0.07 delta (accounted was 0).
+		require.NoError(t, coord.updateParentSessionCost(t.Context(), child.ID, parent.ID))
+		afterFirst, err := env.sessions.Get(t.Context(), parent.ID)
+		require.NoError(t, err)
+		assert.InDelta(t, 0.07, afterFirst.Cost, 1e-9)
+
+		// Second transfer, immediately, with no new child cost: delta is now
+		// cost(0.07) - accounted(0.07) == 0, so the parent must NOT be charged.
+		require.NoError(t, coord.updateParentSessionCost(t.Context(), child.ID, parent.ID))
+		afterSecond, err := env.sessions.Get(t.Context(), parent.ID)
+		require.NoError(t, err)
+		assert.InDelta(t, 0.07, afterSecond.Cost, 1e-9,
+			"a repeat call with no new child cost must charge zero (idempotency via parent_cost_accounted)")
+	})
+
+	// Direct-unit-test counterpart to the runSubAgent-level "cost accounting
+	// is not skipped on the resume path" test: proves the persisted-ledger
+	// delta logic at the updateParentSessionCost layer itself. The baseline no
+	// longer comes from an in-memory parameter — it is read from the child's
+	// parent_cost_accounted column inside the transfer transaction, so only
+	// cost accrued since the last successful transfer is charged.
+	t.Run("charges only the delta since the last transfer, not the raw total", func(t *testing.T) {
+		env := testEnv(t)
+		cfg, err := config.Init(env.workingDir, "", false)
+		require.NoError(t, err)
+		coord := &coordinator{cfg: cfg, sessions: env.sessions}
+
+		parent, err := env.sessions.Create(t.Context(), "Parent")
+		require.NoError(t, err)
+		child, err := env.sessions.CreateTaskSession(t.Context(), "tool-1", parent.ID, "Child")
+		require.NoError(t, err)
+
+		// Child accrues 0.03 (e.g. before an ask_question pause); first
+		// transfer charges the full 0.03 delta (accounted was 0).
 		_, err = env.sessions.IncrementCost(t.Context(), child.ID, 0.03)
 		require.NoError(t, err)
-		require.NoError(t, coord.updateParentSessionCost(t.Context(), child.ID, parent.ID, 0))
+		require.NoError(t, coord.updateParentSessionCost(t.Context(), child.ID, parent.ID))
 
 		afterPause, err := env.sessions.Get(t.Context(), parent.ID)
 		require.NoError(t, err)
 		assert.InDelta(t, 0.03, afterPause.Cost, 1e-9)
 
-		// Child resumes and accrues another 0.02 (total now 0.05). Charging
-		// with baseline=0.03 (what was already billed) must add only 0.02,
-		// not the full 0.05 again.
+		// Child resumes and accrues another 0.02 (total now 0.05). The next
+		// transfer reads accounted=0.03 and charges only delta 0.02, not the
+		// full 0.05 again.
 		_, err = env.sessions.IncrementCost(t.Context(), child.ID, 0.02)
 		require.NoError(t, err)
-		require.NoError(t, coord.updateParentSessionCost(t.Context(), child.ID, parent.ID, 0.03))
+		require.NoError(t, coord.updateParentSessionCost(t.Context(), child.ID, parent.ID))
 
 		afterResume, err := env.sessions.Get(t.Context(), parent.ID)
 		require.NoError(t, err)

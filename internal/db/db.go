@@ -93,6 +93,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.getSessionByIDStmt, err = db.PrepareContext(ctx, getSessionByID); err != nil {
 		return nil, fmt.Errorf("error preparing query GetSessionByID: %w", err)
 	}
+	if q.getSessionCostAccountingStmt, err = db.PrepareContext(ctx, getSessionCostAccounting); err != nil {
+		return nil, fmt.Errorf("error preparing query GetSessionCostAccounting: %w", err)
+	}
 	if q.getToolUsageStmt, err = db.PrepareContext(ctx, getToolUsage); err != nil {
 		return nil, fmt.Errorf("error preparing query GetToolUsage: %w", err)
 	}
@@ -164,6 +167,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	}
 	if q.renameSessionStmt, err = db.PrepareContext(ctx, renameSession); err != nil {
 		return nil, fmt.Errorf("error preparing query RenameSession: %w", err)
+	}
+	if q.setParentCostAccountedStmt, err = db.PrepareContext(ctx, setParentCostAccounted); err != nil {
+		return nil, fmt.Errorf("error preparing query SetParentCostAccounted: %w", err)
 	}
 	if q.updateMessageStmt, err = db.PrepareContext(ctx, updateMessage); err != nil {
 		return nil, fmt.Errorf("error preparing query UpdateMessage: %w", err)
@@ -309,6 +315,11 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing getSessionByIDStmt: %w", cerr)
 		}
 	}
+	if q.getSessionCostAccountingStmt != nil {
+		if cerr := q.getSessionCostAccountingStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing getSessionCostAccountingStmt: %w", cerr)
+		}
+	}
 	if q.getToolUsageStmt != nil {
 		if cerr := q.getToolUsageStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing getToolUsageStmt: %w", cerr)
@@ -429,6 +440,11 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing renameSessionStmt: %w", cerr)
 		}
 	}
+	if q.setParentCostAccountedStmt != nil {
+		if cerr := q.setParentCostAccountedStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing setParentCostAccountedStmt: %w", cerr)
+		}
+	}
 	if q.updateMessageStmt != nil {
 		if cerr := q.updateMessageStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing updateMessageStmt: %w", cerr)
@@ -531,6 +547,7 @@ type Queries struct {
 	getMessageStmt                   *sql.Stmt
 	getRecentActivityStmt            *sql.Stmt
 	getSessionByIDStmt               *sql.Stmt
+	getSessionCostAccountingStmt     *sql.Stmt
 	getToolUsageStmt                 *sql.Stmt
 	getTotalStatsStmt                *sql.Stmt
 	getUsageByDayStmt                *sql.Stmt
@@ -555,6 +572,7 @@ type Queries struct {
 	matchSessionPermissionStmt       *sql.Stmt
 	recordFileReadStmt               *sql.Stmt
 	renameSessionStmt                *sql.Stmt
+	setParentCostAccountedStmt       *sql.Stmt
 	updateMessageStmt                *sql.Stmt
 	updateMessagePinnedStmt          *sql.Stmt
 	updatePermissionEnabledStmt      *sql.Stmt
@@ -592,6 +610,7 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		getMessageStmt:                   q.getMessageStmt,
 		getRecentActivityStmt:            q.getRecentActivityStmt,
 		getSessionByIDStmt:               q.getSessionByIDStmt,
+		getSessionCostAccountingStmt:     q.getSessionCostAccountingStmt,
 		getToolUsageStmt:                 q.getToolUsageStmt,
 		getTotalStatsStmt:                q.getTotalStatsStmt,
 		getUsageByDayStmt:                q.getUsageByDayStmt,
@@ -616,6 +635,7 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		matchSessionPermissionStmt:       q.matchSessionPermissionStmt,
 		recordFileReadStmt:               q.recordFileReadStmt,
 		renameSessionStmt:                q.renameSessionStmt,
+		setParentCostAccountedStmt:       q.setParentCostAccountedStmt,
 		updateMessageStmt:                q.updateMessageStmt,
 		updateMessagePinnedStmt:          q.updateMessagePinnedStmt,
 		updatePermissionEnabledStmt:      q.updatePermissionEnabledStmt,

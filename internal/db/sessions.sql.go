@@ -43,7 +43,7 @@ INSERT INTO sessions (
     ?,
     ?,
     0
-) RETURNING id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id, system_prompt, yolo_enabled, large_model_reasoning_effort, small_model_reasoning_effort, cancel_requested, ended_reason, budget_max_cost, budget_max_tokens, budget_timeout_sec, deleted_todos
+) RETURNING id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id, system_prompt, yolo_enabled, large_model_reasoning_effort, small_model_reasoning_effort, cancel_requested, ended_reason, budget_max_cost, budget_max_tokens, budget_timeout_sec, deleted_todos, parent_cost_accounted
 `
 
 type CreateSessionParams struct {
@@ -101,6 +101,7 @@ func (q *Queries) CreateSession(ctx context.Context, arg CreateSessionParams) (S
 		&i.BudgetMaxTokens,
 		&i.BudgetTimeoutSec,
 		&i.DeletedTodos,
+		&i.ParentCostAccounted,
 	)
 	return i, err
 }
@@ -116,7 +117,7 @@ func (q *Queries) DeleteSession(ctx context.Context, id string) error {
 }
 
 const getLastSession = `-- name: GetLastSession :one
-SELECT id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id, system_prompt, yolo_enabled, large_model_reasoning_effort, small_model_reasoning_effort, cancel_requested, ended_reason, budget_max_cost, budget_max_tokens, budget_timeout_sec, deleted_todos
+SELECT id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id, system_prompt, yolo_enabled, large_model_reasoning_effort, small_model_reasoning_effort, cancel_requested, ended_reason, budget_max_cost, budget_max_tokens, budget_timeout_sec, deleted_todos, parent_cost_accounted
 FROM sessions
 ORDER BY updated_at DESC
 LIMIT 1
@@ -151,12 +152,13 @@ func (q *Queries) GetLastSession(ctx context.Context) (Session, error) {
 		&i.BudgetMaxTokens,
 		&i.BudgetTimeoutSec,
 		&i.DeletedTodos,
+		&i.ParentCostAccounted,
 	)
 	return i, err
 }
 
 const getSessionByID = `-- name: GetSessionByID :one
-SELECT id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id, system_prompt, yolo_enabled, large_model_reasoning_effort, small_model_reasoning_effort, cancel_requested, ended_reason, budget_max_cost, budget_max_tokens, budget_timeout_sec, deleted_todos
+SELECT id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id, system_prompt, yolo_enabled, large_model_reasoning_effort, small_model_reasoning_effort, cancel_requested, ended_reason, budget_max_cost, budget_max_tokens, budget_timeout_sec, deleted_todos, parent_cost_accounted
 FROM sessions
 WHERE id = ? LIMIT 1
 `
@@ -190,7 +192,30 @@ func (q *Queries) GetSessionByID(ctx context.Context, id string) (Session, error
 		&i.BudgetMaxTokens,
 		&i.BudgetTimeoutSec,
 		&i.DeletedTodos,
+		&i.ParentCostAccounted,
 	)
+	return i, err
+}
+
+const getSessionCostAccounting = `-- name: GetSessionCostAccounting :one
+SELECT cost, parent_cost_accounted
+FROM sessions
+WHERE id = ? LIMIT 1
+`
+
+type GetSessionCostAccountingRow struct {
+	Cost                float64 `json:"cost"`
+	ParentCostAccounted float64 `json:"parent_cost_accounted"`
+}
+
+// Returns the child's current cost and the amount already charged to the
+// parent (parent_cost_accounted). Used by TransferChildCostToParent inside
+// a transaction so delta = cost - accounted is computed from a single
+// consistent read within that transaction.
+func (q *Queries) GetSessionCostAccounting(ctx context.Context, id string) (GetSessionCostAccountingRow, error) {
+	row := q.queryRow(ctx, q.getSessionCostAccountingStmt, getSessionCostAccounting, id)
+	var i GetSessionCostAccountingRow
+	err := row.Scan(&i.Cost, &i.ParentCostAccounted)
 	return i, err
 }
 
@@ -200,7 +225,7 @@ SET
     cost = cost + ?,
     updated_at = strftime('%s', 'now')
 WHERE id = ?
-RETURNING id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id, system_prompt, yolo_enabled, large_model_reasoning_effort, small_model_reasoning_effort, cancel_requested, ended_reason, budget_max_cost, budget_max_tokens, budget_timeout_sec, deleted_todos
+RETURNING id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id, system_prompt, yolo_enabled, large_model_reasoning_effort, small_model_reasoning_effort, cancel_requested, ended_reason, budget_max_cost, budget_max_tokens, budget_timeout_sec, deleted_todos, parent_cost_accounted
 `
 
 type IncrementSessionCostParams struct {
@@ -241,12 +266,13 @@ func (q *Queries) IncrementSessionCost(ctx context.Context, arg IncrementSession
 		&i.BudgetMaxTokens,
 		&i.BudgetTimeoutSec,
 		&i.DeletedTodos,
+		&i.ParentCostAccounted,
 	)
 	return i, err
 }
 
 const listAllSessions = `-- name: ListAllSessions :many
-SELECT id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id, system_prompt, yolo_enabled, large_model_reasoning_effort, small_model_reasoning_effort, cancel_requested, ended_reason, budget_max_cost, budget_max_tokens, budget_timeout_sec, deleted_todos
+SELECT id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id, system_prompt, yolo_enabled, large_model_reasoning_effort, small_model_reasoning_effort, cancel_requested, ended_reason, budget_max_cost, budget_max_tokens, budget_timeout_sec, deleted_todos, parent_cost_accounted
 FROM sessions
 ORDER BY updated_at DESC
 `
@@ -288,6 +314,7 @@ func (q *Queries) ListAllSessions(ctx context.Context) ([]Session, error) {
 			&i.BudgetMaxTokens,
 			&i.BudgetTimeoutSec,
 			&i.DeletedTodos,
+			&i.ParentCostAccounted,
 		); err != nil {
 			return nil, err
 		}
@@ -303,7 +330,7 @@ func (q *Queries) ListAllSessions(ctx context.Context) ([]Session, error) {
 }
 
 const listSessions = `-- name: ListSessions :many
-SELECT id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id, system_prompt, yolo_enabled, large_model_reasoning_effort, small_model_reasoning_effort, cancel_requested, ended_reason, budget_max_cost, budget_max_tokens, budget_timeout_sec, deleted_todos
+SELECT id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id, system_prompt, yolo_enabled, large_model_reasoning_effort, small_model_reasoning_effort, cancel_requested, ended_reason, budget_max_cost, budget_max_tokens, budget_timeout_sec, deleted_todos, parent_cost_accounted
 FROM sessions
 WHERE parent_session_id is NULL
 ORDER BY updated_at DESC
@@ -344,6 +371,7 @@ func (q *Queries) ListSessions(ctx context.Context) ([]Session, error) {
 			&i.BudgetMaxTokens,
 			&i.BudgetTimeoutSec,
 			&i.DeletedTodos,
+			&i.ParentCostAccounted,
 		); err != nil {
 			return nil, err
 		}
@@ -359,7 +387,7 @@ func (q *Queries) ListSessions(ctx context.Context) ([]Session, error) {
 }
 
 const listSubSessions = `-- name: ListSubSessions :many
-SELECT id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id, system_prompt, yolo_enabled, large_model_reasoning_effort, small_model_reasoning_effort, cancel_requested, ended_reason, budget_max_cost, budget_max_tokens, budget_timeout_sec, deleted_todos
+SELECT id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id, system_prompt, yolo_enabled, large_model_reasoning_effort, small_model_reasoning_effort, cancel_requested, ended_reason, budget_max_cost, budget_max_tokens, budget_timeout_sec, deleted_todos, parent_cost_accounted
 FROM sessions
 WHERE parent_session_id = ?
 ORDER BY created_at ASC
@@ -403,6 +431,7 @@ func (q *Queries) ListSubSessions(ctx context.Context, parentSessionID sql.NullS
 			&i.BudgetMaxTokens,
 			&i.BudgetTimeoutSec,
 			&i.DeletedTodos,
+			&i.ParentCostAccounted,
 		); err != nil {
 			return nil, err
 		}
@@ -434,6 +463,29 @@ func (q *Queries) RenameSession(ctx context.Context, arg RenameSessionParams) er
 	return err
 }
 
+const setParentCostAccounted = `-- name: SetParentCostAccounted :exec
+UPDATE sessions
+SET
+    parent_cost_accounted = ?,
+    updated_at = strftime('%s', 'now')
+WHERE id = ?
+`
+
+type SetParentCostAccountedParams struct {
+	ParentCostAccounted float64 `json:"parent_cost_accounted"`
+	ID                  string  `json:"id"`
+}
+
+// Marks the child's full current cost as charged to the parent, so the
+// next TransferChildCostToParent call charges only new cost accrued above
+// this point. Run inside the same transaction as the parent's
+// IncrementSessionCost so a crash between the two cannot leave the parent
+// charged but the child's accounting lagging (or vice versa).
+func (q *Queries) SetParentCostAccounted(ctx context.Context, arg SetParentCostAccountedParams) error {
+	_, err := q.exec(ctx, q.setParentCostAccountedStmt, setParentCostAccounted, arg.ParentCostAccounted, arg.ID)
+	return err
+}
+
 const updateSession = `-- name: UpdateSession :one
 UPDATE sessions
 SET
@@ -445,7 +497,7 @@ SET
     deleted_todos = ?,
     updated_at = strftime('%s', 'now')
 WHERE id = ?
-RETURNING id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id, system_prompt, yolo_enabled, large_model_reasoning_effort, small_model_reasoning_effort, cancel_requested, ended_reason, budget_max_cost, budget_max_tokens, budget_timeout_sec, deleted_todos
+RETURNING id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, large_model_provider, large_model_id, small_model_provider, small_model_id, system_prompt, yolo_enabled, large_model_reasoning_effort, small_model_reasoning_effort, cancel_requested, ended_reason, budget_max_cost, budget_max_tokens, budget_timeout_sec, deleted_todos, parent_cost_accounted
 `
 
 type UpdateSessionParams struct {
@@ -499,6 +551,7 @@ func (q *Queries) UpdateSession(ctx context.Context, arg UpdateSessionParams) (S
 		&i.BudgetMaxTokens,
 		&i.BudgetTimeoutSec,
 		&i.DeletedTodos,
+		&i.ParentCostAccounted,
 	)
 	return i, err
 }

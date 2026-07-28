@@ -142,6 +142,17 @@ type Service interface {
 	// with zero accrued cost still wants to fail if the parent went
 	// away. Pass a non-zero delta only when you actually want to charge.
 	IncrementCost(ctx context.Context, sessionID string, delta float64) (Session, error)
+	// TransferChildCostToParent moves the child session's cost accrued since
+	// the last transfer into the parent session, atomically in one DB
+	// transaction. It reads the child's persisted parent_cost_accounted
+	// ledger, charges only the delta (cost - accounted, clamped >= 0) to the
+	// parent via the atomic IncrementSessionCost UPDATE, and advances the
+	// child's accounted marker to its current cost — all inside one tx so a
+	// crash between the parent charge and the child bookkeeping cannot leave
+	// them inconsistent. Idempotent: a repeat call with no new child cost
+	// charges zero. Replaces the old in-memory baseline scheme that lost cost
+	// on sub-agent error paths, process restarts, and failed charges.
+	TransferChildCostToParent(ctx context.Context, childSessionID, parentSessionID string) error
 	UpdateTitleAndUsage(ctx context.Context, sessionID, title string, promptTokens, completionTokens int64, cost float64) error
 	UpdateModels(ctx context.Context, sessionID, largeProvider, largeModel, smallProvider, smallModel string) error
 	UpdateReasoningEffort(ctx context.Context, sessionID, largeEffort, smallEffort string) error
@@ -360,6 +371,68 @@ func (s *service) IncrementCost(ctx context.Context, sessionID string, delta flo
 	session := s.fromDBItem(dbSession)
 	s.Publish(pubsub.UpdatedEvent, session)
 	return session, nil
+}
+
+// TransferChildCostToParent — see Service.TransferChildCostToParent doc.
+//
+// The whole operation runs in one transaction so the parent charge and the
+// child's accounted marker advance together or not at all: a crash between
+// them can neither double-charge the parent nor lose the child's delta. The
+// parent is always touched (even when delta is 0) so a deleted parent still
+// surfaces as an error via the RETURNING clause — preserving the not-found
+// semantics the previous IncrementCost(id, 0) short-circuit gave callers.
+func (s *service) TransferChildCostToParent(ctx context.Context, childSessionID, parentSessionID string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	qtx := s.q.WithTx(tx)
+
+	accounting, err := qtx.GetSessionCostAccounting(ctx, childSessionID)
+	if err != nil {
+		return fmt.Errorf("get child session: %w", err)
+	}
+
+	delta := accounting.Cost - accounting.ParentCostAccounted
+	if delta < 0 {
+		// Should not happen (cost only grows), but never charge negative.
+		delta = 0
+	}
+
+	// Always run the parent UPDATE: for delta 0 it is a no-op write, but the
+	// RETURNING clause still surfaces sql.ErrNoRows if the parent was deleted
+	// between the child finishing and this call.
+	if _, err := qtx.IncrementSessionCost(ctx, db.IncrementSessionCostParams{
+		ID:   parentSessionID,
+		Cost: delta,
+	}); err != nil {
+		return fmt.Errorf("increment parent session cost: %w", err)
+	}
+
+	// Advance the child's accounted marker to its current cost so the next
+	// call charges only newly accrued cost. Inside the same tx as the parent
+	// charge, so a crash cannot leave the parent billed but the child lagging.
+	if err := qtx.SetParentCostAccounted(ctx, db.SetParentCostAccountedParams{
+		ID:                  childSessionID,
+		ParentCostAccounted: accounting.Cost,
+	}); err != nil {
+		return fmt.Errorf("set child accounted cost: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit transfer: %w", err)
+	}
+
+	// Publish refreshed snapshots so the UI reflects both new balances.
+	if sess, err := s.Get(ctx, childSessionID); err == nil {
+		s.Publish(pubsub.UpdatedEvent, sess)
+	}
+	if sess, err := s.Get(ctx, parentSessionID); err == nil {
+		s.Publish(pubsub.UpdatedEvent, sess)
+	}
+	return nil
 }
 
 // UpdateTitleAndUsage updates only the title and usage fields atomically.
