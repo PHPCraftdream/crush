@@ -120,11 +120,13 @@ type Service interface {
 	// tree has no messages at all (nothing to report).
 	GetCallTreeActivity(ctx context.Context, rootID string) (activity CallTreeActivity, ok bool, err error)
 	// GetCallTreeActivityBatch is the batch form of GetCallTreeActivity: it
-	// computes the freshest call-tree activity for EVERY id in rootIDs in
-	// one query. Used by `sessions list`, which otherwise walked the whole
-	// descendant tree of every running session individually. The returned
-	// map is keyed by root session ID; roots with no activity in their tree
-	// are simply absent from the map.
+	// computes the freshest call-tree activity for EVERY id in rootIDs,
+	// chunking the root list internally so a single batch can never exceed
+	// SQLite's variable-parameter limit (callTreeActivityBatchChunkSize roots
+	// per underlying query). Used by `sessions list`, which otherwise walked
+	// the whole descendant tree of every running session individually. The
+	// returned map is keyed by root session ID; roots with no activity in
+	// their tree are simply absent from the map.
 	GetCallTreeActivityBatch(ctx context.Context, rootIDs []string) (map[string]CallTreeActivity, error)
 	Save(ctx context.Context, session Session) (Session, error)
 	// IncrementCost atomically adds delta to the session's cost via an
@@ -547,21 +549,40 @@ func (s *service) GetCallTreeActivity(ctx context.Context, rootID string) (CallT
 	}, true, nil
 }
 
+// callTreeActivityBatchChunkSize caps how many root IDs are passed to the
+// underlying sqlc-generated GetCallTreeActivityBatch in a single query. The
+// generated query expands rootIDs via sqlc.slice into one SQL parameter per
+// id, so an unbounded list would eventually hit SQLite's
+// SQLITE_MAX_VARIABLE_NUMBER ceiling (999 on older builds). 500 stays well
+// below that with headroom for the query's other bound parameters, and keeps
+// each recursive-CTE fan-out bounded to a reasonable batch. Because every
+// root's tree is independent (the CTE partitions by root_session_id),
+// splitting roots across chunks and merging the per-root maps is exact.
+const callTreeActivityBatchChunkSize = 500
+
 // GetCallTreeActivityBatch implementation: see the Service interface doc.
+// rootIDs are split into callTreeActivityBatchChunkSize-sized chunks, each run
+// as a separate underlying query, and the per-root results merged into one map.
 func (s *service) GetCallTreeActivityBatch(ctx context.Context, rootIDs []string) (map[string]CallTreeActivity, error) {
 	out := make(map[string]CallTreeActivity, len(rootIDs))
 	if len(rootIDs) == 0 {
 		return out, nil
 	}
-	rows, err := s.q.GetCallTreeActivityBatch(ctx, rootIDs)
-	if err != nil {
-		return nil, err
-	}
-	for _, row := range rows {
-		out[row.RootSessionID] = CallTreeActivity{
-			SessionID:  row.SessionID,
-			Role:       row.Role,
-			LatestUnix: row.LatestUnix,
+	for start := 0; start < len(rootIDs); start += callTreeActivityBatchChunkSize {
+		end := start + callTreeActivityBatchChunkSize
+		if end > len(rootIDs) {
+			end = len(rootIDs)
+		}
+		rows, err := s.q.GetCallTreeActivityBatch(ctx, rootIDs[start:end])
+		if err != nil {
+			return nil, err
+		}
+		for _, row := range rows {
+			out[row.RootSessionID] = CallTreeActivity{
+				SessionID:  row.SessionID,
+				Role:       row.Role,
+				LatestUnix: row.LatestUnix,
+			}
 		}
 	}
 	return out, nil

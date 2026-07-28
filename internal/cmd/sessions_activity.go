@@ -11,14 +11,6 @@ import (
 	"github.com/charmbracelet/crush/internal/session"
 )
 
-// subTreeWalkMaxSessions caps how many sessions the call-tree walk will
-// visit, as a defensive guard against pathological fan-out or an
-// accidental parent/child cycle in the data. In practice a run has a
-// handful of sub-agent sessions; this ceiling only exists so a single
-// `sessions why`/`locks` invocation can never turn into an unbounded
-// DB sweep.
-const subTreeWalkMaxSessions = 512
-
 // callTreeActivity is the ONE underlying signal this fork plumbs through
 // every session-monitoring surface: "the most recent real activity
 // anywhere in this session's call tree, including inside an in-flight
@@ -84,9 +76,11 @@ func (c callTreeActivity) Age(now time.Time) (time.Duration, bool) {
 // a tied timestamp" rule (see session.Service.GetCallTreeActivity) now both
 // happen inside SQLite via MAX()/ORDER BY, so no message content ever
 // crosses into Go just to answer "what's the newest activity". The
-// recursion depth is capped at 511 inside the query itself (mirrors
-// subTreeWalkMaxSessions) as a defensive guard against a pathological
-// fan-out or an accidental parent/child cycle in the data.
+// recursion depth is capped at 511 inside the query itself as a defensive
+// guard against a pathological deep chain or an accidental parent/child
+// cycle in the data. Fan-out (tree WIDTH) is intentionally NOT bounded --
+// see the header comment in call_tree_activity.sql for why that is not
+// treatable in a SQLite recursive CTE and not a real risk in practice.
 //
 // Error handling: a query failure is NOT fatal and returns the zero-value
 // callTreeActivity — this is a best-effort diagnostic signal consumed by six
@@ -119,12 +113,13 @@ func computeCallTreeActivity(ctx context.Context, a *app.App, rootID string) cal
 }
 
 // computeCallTreeActivityBatch is the batch form of computeCallTreeActivity:
-// it computes the freshest call-tree activity for EVERY id in rootIDs in
-// ONE SQL query, instead of one query per root. Used by `sessions list`,
+// it computes the freshest call-tree activity for EVERY id in rootIDs in one
+// service call, instead of one query per root. Used by `sessions list`,
 // which otherwise walked the whole descendant tree of every running session
 // individually. Roots with no activity anywhere in their tree are simply
 // absent from the returned map (mirroring the zero-value callTreeActivity a
-// per-root call would have produced).
+// per-root call would have produced). The underlying service chunks the root
+// list so a single batch can never exceed SQLite's parameter limit.
 func computeCallTreeActivityBatch(ctx context.Context, a *app.App, rootIDs []string) map[string]callTreeActivity {
 	out := make(map[string]callTreeActivity, len(rootIDs))
 	if a == nil || len(rootIDs) == 0 {

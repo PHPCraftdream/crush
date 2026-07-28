@@ -187,8 +187,8 @@ func TestGetCallTreeActivity_EmptyTree(t *testing.T) {
 // TestGetCallTreeActivity_DepthGuard builds a session chain deeper than the
 // 511-hop cap baked into the recursive CTE and asserts the query still
 // returns promptly (no hang) and simply does not see activity beyond the
-// cap. This is the SQL-side counterpart of the Go layer's
-// subTreeWalkMaxSessions guard against a pathological fan-out.
+// cap. This guards the DEPTH axis of the recursion; tree WIDTH (fan-out) is
+// intentionally unbounded -- see call_tree_activity.sql's header comment.
 //
 // SQLite session/message rows have no FK-based way to form a genuine CYCLE
 // in parent_session_id (a chain always terminates at a NULL parent), so the
@@ -277,4 +277,77 @@ func TestGetCallTreeActivityBatch_EmptyInput(t *testing.T) {
 	rows, err := q.GetCallTreeActivityBatch(ctx, nil)
 	require.NoError(t, err)
 	require.Empty(t, rows)
+}
+
+// TestGetCallTreeActivity_WideTree is the WIDTH counterpart of the depth
+// guard above: one root with a large number of DIRECT children (depth 1, but
+// wide fan-out). Since fan-out is intentionally NOT bounded by row count (see
+// call_tree_activity.sql's header comment), this test asserts the query still
+// completes promptly and returns the correct freshest activity -- confirming
+// that an unbounded fan-out is not a real problem at a realistic-but-large
+// width. Contrast with TestGetCallTreeActivity_DepthGuard which exercises the
+// DEPTH axis.
+func TestGetCallTreeActivity_WideTree(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	conn, q := newCallTreeTestDB(t)
+
+	const childCount = 2000
+	root := "root-" + uuid.NewString()
+	insertSession(t, conn, root, "", 100, 100)
+	insertMessage(t, conn, root, "user", 100, 100)
+
+	// Bulk-insert via a transaction: the pure-Go SQLite driver is far faster
+	// committing one tx than childCount*2 individual Exec round-trips.
+	tx, err := conn.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	for i := 0; i < childCount; i++ {
+		id := uuid.NewString()
+		_, err := tx.Exec(
+			`INSERT INTO sessions (id, parent_session_id, title, updated_at, created_at)
+			 VALUES (?, ?, 'wide', 100, 100)`,
+			id, root,
+		)
+		require.NoError(t, err)
+		// Each child's activity is strictly increasing; the last child wins.
+		_, err = tx.Exec(
+			`INSERT INTO messages (id, session_id, role, parts, created_at, updated_at)
+			 VALUES (?, ?, 'assistant', '[]', ?, ?)`,
+			uuid.NewString(), id, int64(200+i), int64(200+i),
+		)
+		require.NoError(t, err)
+	}
+	require.NoError(t, tx.Commit())
+
+	row, err := q.GetCallTreeActivity(ctx, root)
+	require.NoError(t, err, "wide fan-out must not hang or error")
+	require.EqualValues(t, 200+childCount-1, row.LatestUnix, "freshest activity is on the last child")
+}
+
+// TestMigration_ParentSessionIdIndex asserts migration 20260728000002 created
+// idx_sessions_parent_session_id on sessions(parent_session_id). That index
+// backs the recursive descent in GetCallTreeActivity
+// (WHERE s.parent_session_id = tree.session_id) and ListSubSessions; without
+// it every recursion step is a full sessions scan. newCallTreeTestDB runs the
+// REAL migrations via db.Connect, so this verifies the migration applies
+// cleanly and produces the index.
+func TestMigration_ParentSessionIdIndex(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	conn, _ := newCallTreeTestDB(t)
+
+	rows, err := conn.QueryContext(ctx,
+		`SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='sessions'`)
+	require.NoError(t, err)
+	defer rows.Close()
+
+	var names []string
+	for rows.Next() {
+		var n string
+		require.NoError(t, rows.Scan(&n))
+		names = append(names, n)
+	}
+	require.NoError(t, rows.Err())
+	require.Contains(t, names, "idx_sessions_parent_session_id",
+		"migration must create idx_sessions_parent_session_id on sessions(parent_session_id)")
 }
