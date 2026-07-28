@@ -286,14 +286,22 @@ type sessionAgent struct {
 	// coder agent in coordinator.buildAgent.
 	orchestratorActive func() bool
 
-	messageQueue *csync.Map[string, []SessionAgentCall]
+	// messageQueue and injectQueue are per-session FIFO queues. They use
+	// csync.KeyedQueue (not csync.Map[string, []T]) because every real
+	// usage here is a composite read-modify-write (append-to-existing,
+	// or read-then-delete-to-drain) — pairing Map.Get with a later
+	// Map.Set/Del leaves a window where a concurrent Append/drain can
+	// interleave and silently lose a queued message. KeyedQueue makes
+	// each of those composite operations (Append, TakeAll, PopFront) a
+	// single atomic critical section per session id.
+	messageQueue *csync.KeyedQueue[SessionAgentCall]
 	// injectQueue holds user messages that were ALREADY persisted to the DB
 	// (visible in the UI immediately) and are waiting to be merged into the
 	// next provider request via PrepareStep. Unlike messageQueue (where the
 	// DB write happens at drain time), injectQueue entries are pre-created
 	// rows from InjectMessage — the drain just adds them to prepared.Messages
 	// so the in-flight Run() sees them without restart. Seamless injection.
-	injectQueue    *csync.Map[string, []message.Message]
+	injectQueue    *csync.KeyedQueue[message.Message]
 	activeRequests *csync.Map[string, context.CancelFunc]
 	// summarizeQueue holds a pending manual-summarise request per session,
 	// queued while the session was busy.
@@ -384,8 +392,8 @@ func NewSessionAgent(
 		tools:                    csync.NewSliceFrom(opts.Tools),
 		isYolo:                   opts.IsYolo,
 		notify:                   opts.Notify,
-		messageQueue:             csync.NewMap[string, []SessionAgentCall](),
-		injectQueue:              csync.NewMap[string, []message.Message](),
+		messageQueue:             csync.NewKeyedQueue[SessionAgentCall](),
+		injectQueue:              csync.NewKeyedQueue[message.Message](),
 		activeRequests:           csync.NewMap[string, context.CancelFunc](),
 		summarizeQueue:           csync.NewMap[string, fantasy.ProviderOptions](),
 		streamIdleTimeout:        opts.StreamIdleTimeout,
@@ -469,12 +477,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 
 	// Queue the message if busy
 	if a.IsSessionBusy(call.SessionID) {
-		existing, ok := a.messageQueue.Get(call.SessionID)
-		if !ok {
-			existing = []SessionAgentCall{}
-		}
-		existing = append(existing, call)
-		a.messageQueue.Set(call.SessionID, existing)
+		a.messageQueue.Append(call.SessionID, call)
 		return nil, nil
 	}
 
@@ -960,8 +963,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			// Use latest tools (updated by SetTools when MCP tools change).
 			prepared.Tools = a.tools.Copy()
 
-			queuedCalls, _ := a.messageQueue.Get(call.SessionID)
-			a.messageQueue.Del(call.SessionID)
+			queuedCalls := a.messageQueue.TakeAll(call.SessionID)
 			for _, queued := range queuedCalls {
 				// Interrupt-inject path: the message row already exists in the
 				// DB (created by `crush sessions inject --interrupt`). Load it
@@ -987,8 +989,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			// (persisted at click time by InjectMessage), so we only need
 			// to splice them into the current prompt — no second Create
 			// call, no duplicate rows in history.
-			injected, _ := a.injectQueue.Get(call.SessionID)
-			a.injectQueue.Del(call.SessionID)
+			injected := a.injectQueue.TakeAll(call.SessionID)
 			for _, inj := range injected {
 				prepared.Messages = append(prepared.Messages, inj.ToAIMessage()...)
 			}
@@ -1747,9 +1748,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 		// cancel func first so the recursive Run() doesn't see the session
 		// as busy.
 		if isCancelErr {
-			if queuedMessages, ok := a.messageQueue.Get(call.SessionID); ok && len(queuedMessages) > 0 {
-				firstQueuedMessage := queuedMessages[0]
-				a.messageQueue.Set(call.SessionID, queuedMessages[1:])
+			if firstQueuedMessage, ok := a.messageQueue.PopFront(call.SessionID); ok {
 				a.activeRequests.Del(call.SessionID)
 				cancel()
 				return a.Run(ctx, firstQueuedMessage)
@@ -1768,13 +1767,8 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 		hasPendingToolCalls := len(currentAssistant.ToolCalls()) > 0
 		sessionLock.Unlock()
 		if hasPendingToolCalls {
-			existing, ok := a.messageQueue.Get(call.SessionID)
-			if !ok {
-				existing = []SessionAgentCall{}
-			}
 			call.Prompt = fmt.Sprintf("The previous session was interrupted because it got too long, the initial user request was: `%s`", call.Prompt)
-			existing = append(existing, call)
-			a.messageQueue.Set(call.SessionID, existing)
+			a.messageQueue.Append(call.SessionID, call)
 		}
 	}
 
@@ -1792,13 +1786,11 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 		})
 	}
 
-	queuedMessages, ok := a.messageQueue.Get(call.SessionID)
-	if !ok || len(queuedMessages) == 0 {
+	firstQueuedMessage, ok := a.messageQueue.PopFront(call.SessionID)
+	if !ok {
 		return result, err
 	}
 	// There are queued messages restart the loop.
-	firstQueuedMessage := queuedMessages[0]
-	a.messageQueue.Set(call.SessionID, queuedMessages[1:])
 	return a.Run(ctx, firstQueuedMessage)
 }
 
@@ -2002,12 +1994,10 @@ func (a *sessionAgent) runSummarize(ctx context.Context, sessionID string, opts 
 	// messageQueue during summarisation.
 	a.activeRequests.Del(sessionID + "-summarize")
 	cancel()
-	queuedMessages, ok := a.messageQueue.Get(sessionID)
-	if !ok || len(queuedMessages) == 0 {
+	firstQueuedMessage, ok := a.messageQueue.PopFront(sessionID)
+	if !ok {
 		return nil
 	}
-	firstQueuedMessage := queuedMessages[0]
-	a.messageQueue.Set(sessionID, queuedMessages[1:])
 	_, qErr := a.Run(ctx, firstQueuedMessage)
 	return qErr
 }
@@ -2682,22 +2672,21 @@ func (a *sessionAgent) Cancel(sessionID string) {
 
 	if a.QueuedPrompts(sessionID) > 0 {
 		slog.Debug("Clearing queued prompts", "session_id", sessionID)
-		a.messageQueue.Del(sessionID)
+		a.messageQueue.Clear(sessionID)
 	}
-	a.injectQueue.Del(sessionID)
+	a.injectQueue.Clear(sessionID)
 }
 
 func (a *sessionAgent) ClearQueue(sessionID string) {
 	if a.QueuedPrompts(sessionID) > 0 {
 		slog.Debug("Clearing queued prompts", "session_id", sessionID)
-		a.messageQueue.Del(sessionID)
+		a.messageQueue.Clear(sessionID)
 	}
-	a.injectQueue.Del(sessionID)
+	a.injectQueue.Clear(sessionID)
 }
 
 func (a *sessionAgent) QueueMessage(call SessionAgentCall) {
-	existing, _ := a.messageQueue.Get(call.SessionID)
-	a.messageQueue.Set(call.SessionID, append(existing, call))
+	a.messageQueue.Append(call.SessionID, call)
 }
 
 // InjectMessage — see SessionAgent interface comment. Persists immediately
@@ -2711,8 +2700,7 @@ func (a *sessionAgent) InjectMessage(ctx context.Context, call SessionAgentCall)
 		return message.Message{}, err
 	}
 	if a.IsSessionBusy(call.SessionID) {
-		existing, _ := a.injectQueue.Get(call.SessionID)
-		a.injectQueue.Set(call.SessionID, append(existing, msg))
+		a.injectQueue.Append(call.SessionID, msg)
 	}
 	return msg, nil
 }
@@ -2753,16 +2741,12 @@ func (a *sessionAgent) IsSessionBusy(sessionID string) bool {
 }
 
 func (a *sessionAgent) QueuedPrompts(sessionID string) int {
-	l, ok := a.messageQueue.Get(sessionID)
-	if !ok {
-		return 0
-	}
-	return len(l)
+	return a.messageQueue.Len(sessionID)
 }
 
 func (a *sessionAgent) QueuedPromptsList(sessionID string) []string {
-	l, ok := a.messageQueue.Get(sessionID)
-	if !ok {
+	l := a.messageQueue.Snapshot(sessionID)
+	if len(l) == 0 {
 		return nil
 	}
 	prompts := make([]string, len(l))
