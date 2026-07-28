@@ -49,6 +49,13 @@ const (
 	truncationMarkerBudget = 128
 )
 
+// bufferRetention is the duration after completion before a job's buffered
+// stdout/stderr bytes are released via a one-shot time.AfterFunc armed in
+// Start's completion goroutine. Defaults to BufferRetentionMinutes; tests
+// override it to a short duration to exercise the timer path without waiting
+// 15 minutes.
+var bufferRetention = time.Duration(BufferRetentionMinutes) * time.Minute
+
 // boundedBuffer is a thread-safe, size-bounded byte sink used for a single
 // background job's stdout or stderr stream.
 //
@@ -192,8 +199,13 @@ func (b *boundedBuffer) Len() int {
 func (b *boundedBuffer) release() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.buf.Reset()
-	b.head.Reset()
+	// Reassign zero-valued buffers instead of calling Reset().
+	// bytes.Buffer.Reset() keeps the underlying capacity (documented stdlib
+	// behaviour), so the old multi-MiB backing arrays would stay resident in
+	// the heap until the boundedBuffer itself is collected. A fresh zero-value
+	// Buffer has no backing array, letting GC reclaim the old one immediately.
+	b.buf = bytes.Buffer{}
+	b.head = bytes.Buffer{}
 	// Keep writtenBytes/truncated/droppedBytes as-is: String() below will
 	// still report a non-empty, honest placeholder rather than silently
 	// looking like the command produced no output.
@@ -304,6 +316,11 @@ func (m *BackgroundShellManager) Start(ctx context.Context, workingDir string, b
 
 		bgShell.exitErr = err
 		bgShell.completedAt.Store(time.Now().Unix())
+		// Schedule buffer release on a timer so the (up to 6 MiB) buffered
+		// stdout/stderr is freed after bufferRetention even if no further
+		// bash task ever calls Cleanup. releaseBuffers is guarded by
+		// bufReleased, so a later Cleanup or duplicate fire is a no-op.
+		time.AfterFunc(bufferRetention, bgShell.releaseBuffers)
 	}()
 
 	return bgShell, nil
@@ -419,10 +436,10 @@ func (m *BackgroundShellManager) KillAll(ctx context.Context) {
 // strings are bounded snapshots (see boundedBuffer) — for a job that has
 // produced more than the per-stream cap of output, the middle has been
 // replaced with a "[N bytes truncated]" marker. If the buffers were already
-// released after completion (see releaseBuffers/OnDone wiring), and the
-// stream had produced output before release, a placeholder note is returned
-// instead of an empty string so this doesn't look like the command produced
-// no output.
+// released after completion (scheduled via time.AfterFunc from the job's
+// completion goroutine, see Start), and the stream had produced output before
+// release, a placeholder note is returned instead of an empty string so this
+// doesn't look like the command produced no output.
 func (bs *BackgroundShell) GetOutput() (stdout string, stderr string, done bool, err error) {
 	stdout, stderr = bs.snapshotOutput()
 	select {
@@ -448,15 +465,23 @@ func (bs *BackgroundShell) snapshotOutput() (stdout string, stderr string) {
 }
 
 // releaseBuffers drops the buffered stdout/stderr content (freeing the
-// memory) while leaving the job's status/metadata intact. Safe to call more
-// than once. Intended to run after completion notice has been delivered to
-// subscribers (OnDone), so a finished job doesn't hold up to
-// 2*maxStreamBufferBytes resident for the entire CompletedJobRetentionMinutes
-// window when nobody is going to read it again.
+// memory) while leaving the job's status/metadata intact. Idempotent: the
+// first caller wins (via bufReleased CAS), subsequent callers return
+// immediately. Automatically scheduled via time.AfterFunc from the job's
+// completion goroutine (Start) after bufferRetention, and also reachable
+// from Cleanup when a subsequent bash task triggers it — whichever fires
+// first performs the release, the second is a no-op.
 func (bs *BackgroundShell) releaseBuffers() {
+	// Swap-based idempotency: the first caller (the completion timer in
+	// Start, or Cleanup) flips bufReleased false→true and performs the
+	// actual release; any later caller sees the already-true flag and
+	// returns immediately. This makes double-release safe regardless of
+	// call ordering between the timer and a subsequent Cleanup.
+	if bs.bufReleased.Swap(true) {
+		return
+	}
 	bs.stdout.release()
 	bs.stderr.release()
-	bs.bufReleased.Store(true)
 }
 
 // OnDone registers fn to be called EXACTLY ONCE when this background shell
