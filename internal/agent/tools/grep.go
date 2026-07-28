@@ -2,11 +2,13 @@ package tools
 
 import (
 	"bufio"
+	"bytes"
 	"cmp"
 	"container/heap"
 	"context"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"io"
@@ -123,6 +125,15 @@ type GrepResponseMetadata struct {
 const (
 	GrepToolName        = "grep"
 	maxGrepContentWidth = 500
+	// maxFallbackLineBytes bounds the bytes accumulated for a single source
+	// line in the regex fallback scanner (fileMatches). A single pathological
+	// line with no newline — a minified bundle, a base64 blob — would
+	// otherwise be read in full by bufio.Reader.ReadString and force an
+	// unbounded allocation. Lines longer than this are truncated and flagged.
+	// Mirrors the 4 MiB cap already used by the ripgrep branch's scanner.
+	maxFallbackLineBytes = 4 * 1024 * 1024
+	// fallbackTruncateSuffix marks a line that exceeded maxFallbackLineBytes.
+	fallbackTruncateSuffix = "...[truncated]"
 )
 
 //go:embed grep.md.tpl
@@ -228,7 +239,15 @@ func NewGrepTool(workingDir string, config config.ToolGrep) fantasy.AgentTool {
 func searchFiles(ctx context.Context, pattern, rootPath, include string, limit int) ([]grepMatch, bool, error) {
 	matches, truncated, err := searchWithRipgrep(ctx, pattern, rootPath, include, limit)
 	if err != nil {
-		matches, err = searchFilesWithRegex(pattern, rootPath, include)
+		// If the operation was cancelled or the deadline expired — either the
+		// ripgrep error says so, or the context is already done for any other
+		// reason — do NOT fall back to the much heavier regex tree walk. The
+		// caller has given up, and a full walk would just burn CPU/IO for a
+		// result nobody wants.
+		if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, false, err
+		}
+		matches, err = searchFilesWithRegex(ctx, pattern, rootPath, include)
 		if err != nil {
 			return nil, false, err
 		}
@@ -374,7 +393,7 @@ type ripgrepMatch struct {
 	} `json:"data"`
 }
 
-func searchFilesWithRegex(pattern, rootPath, include string) ([]grepMatch, error) {
+func searchFilesWithRegex(ctx context.Context, pattern, rootPath, include string) ([]grepMatch, error) {
 	matches := []grepMatch{}
 
 	// Use cached regex compilation
@@ -398,6 +417,13 @@ func searchFilesWithRegex(pattern, rootPath, include string) ([]grepMatch, error
 	err = filepath.Walk(rootPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil // Skip errors
+		}
+
+		// Honour context cancellation before doing any per-file work.
+		// Returning the context error aborts filepath.Walk and propagates to
+		// the caller instead of grinding through the whole tree.
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
 
 		if info.IsDir() {
@@ -424,7 +450,7 @@ func searchFilesWithRegex(pattern, rootPath, include string) ([]grepMatch, error
 		}
 
 		stopWalk := false
-		walkErr := fileMatches(path, regex, func(lm lineMatch) bool {
+		walkErr := fileMatches(ctx, path, regex, func(lm lineMatch) bool {
 			matches = append(matches, grepMatch{
 				path:     path,
 				modTime:  info.ModTime(),
@@ -439,6 +465,11 @@ func searchFilesWithRegex(pattern, rootPath, include string) ([]grepMatch, error
 			return true
 		})
 		if walkErr != nil {
+			// Propagate cancellation so the whole walk aborts immediately;
+			// other read errors just skip the file (previous behaviour).
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			return nil // Skip files we can't read.
 		}
 		if stopWalk {
@@ -448,6 +479,8 @@ func searchFilesWithRegex(pattern, rootPath, include string) ([]grepMatch, error
 		return nil
 	})
 	if err != nil {
+		// filepath.Walk may return a context error returned by the callback
+		// above; surface it directly.
 		return nil, err
 	}
 
@@ -468,7 +501,10 @@ type lineMatch struct {
 // on the line for the column) instead of stopping at the first match in the
 // file. If onMatch returns false, scanning stops immediately — the caller can
 // bail out as soon as it has enough matches without reading the entire file.
-func fileMatches(filePath string, pattern *regexp.Regexp, onMatch func(lineMatch) bool) error {
+// Lines longer than maxFallbackLineBytes are truncated and flagged rather than
+// forcing an unbounded allocation. The context is honoured periodically so a
+// cancelled caller does not wait for a huge file to finish scanning.
+func fileMatches(ctx context.Context, filePath string, pattern *regexp.Regexp, onMatch func(lineMatch) bool) error {
 	if pattern == nil {
 		return nil
 	}
@@ -484,30 +520,70 @@ func fileMatches(filePath string, pattern *regexp.Regexp, onMatch func(lineMatch
 	defer file.Close()
 
 	reader := bufio.NewReader(file)
+	var lineBuf bytes.Buffer
 	lineNum := 0
 	for {
-		line, err := reader.ReadString('\n')
+		truncated, rerr := readBoundedLine(reader, &lineBuf, maxFallbackLineBytes)
 		lineNum++
-		line = strings.TrimSuffix(line, "\n")
+
+		line := lineBuf.String()
 		line = strings.TrimSuffix(line, "\r")
 		if loc := pattern.FindStringIndex(line); loc != nil {
+			lineText := line
+			if truncated {
+				lineText = line + fallbackTruncateSuffix
+			}
 			if !onMatch(lineMatch{
 				lineNum:  lineNum,
 				charNum:  loc[0] + 1,
-				lineText: line,
+				lineText: lineText,
 			}) {
 				return nil
 			}
 		}
-		if err == io.EOF {
+
+		if rerr == io.EOF {
 			break
 		}
-		if err != nil {
-			return err
+		if rerr != nil {
+			return rerr
+		}
+
+		// Honour cancellation mid-file (e.g. a single huge file). Checking on
+		// every line adds overhead on files with many short lines, so check on
+		// a fixed cadence.
+		if lineNum%1024 == 0 && ctx.Err() != nil {
+			return ctx.Err()
 		}
 	}
 
 	return nil
+}
+
+// readBoundedLine reads a single line (up to and including the next '\n', or
+// until the underlying reader is exhausted) from r into buf, resetting buf
+// first. It accumulates at most maxLen bytes of the line into buf; any bytes
+// beyond maxLen are read and discarded so a single pathological line with no
+// newline cannot force an unbounded allocation. The trailing '\n' is consumed
+// but not stored; a preceding '\r' (CRLF) is left in buf for the caller to
+// trim. Returns io.EOF when the reader is exhausted. If the line was longer
+// than maxLen, truncated is true.
+func readBoundedLine(r *bufio.Reader, buf *bytes.Buffer, maxLen int) (truncated bool, err error) {
+	buf.Reset()
+	for {
+		b, rerr := r.ReadByte()
+		if rerr != nil {
+			return truncated, rerr
+		}
+		if b == '\n' {
+			return truncated, nil
+		}
+		if buf.Len() < maxLen {
+			buf.WriteByte(b)
+		} else {
+			truncated = true
+		}
+	}
 }
 
 // isTextFile checks if a file is a text file by examining its MIME type.

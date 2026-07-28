@@ -3,6 +3,8 @@ package tools
 import (
 	"bufio"
 	"container/heap"
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -93,7 +95,9 @@ func TestGrepWithIgnoreFiles(t *testing.T) {
 
 	// Test both implementations
 	for name, fn := range map[string]func(pattern, path, include string) ([]grepMatch, error){
-		"regex": searchFilesWithRegex,
+		"regex": func(pattern, path, include string) ([]grepMatch, error) {
+			return searchFilesWithRegex(t.Context(), pattern, path, include)
+		},
 		"rg": func(pattern, path, include string) ([]grepMatch, error) {
 			matches, _, err := searchWithRipgrep(t.Context(), pattern, path, include, 100)
 			return matches, err
@@ -154,7 +158,9 @@ func TestSearchImplementations(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(tempDir, ".crushignore"), []byte("file5.txt\n"), 0o644))
 
 	for name, fn := range map[string]func(pattern, path, include string) ([]grepMatch, error){
-		"regex": searchFilesWithRegex,
+		"regex": func(pattern, path, include string) ([]grepMatch, error) {
+			return searchFilesWithRegex(t.Context(), pattern, path, include)
+		},
 		"rg": func(pattern, path, include string) ([]grepMatch, error) {
 			matches, _, err := searchWithRipgrep(t.Context(), pattern, path, include, 100)
 			return matches, err
@@ -411,7 +417,9 @@ func TestMultipleMatchesPerFile(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(tempDir, "file.txt"), []byte(content), 0o644))
 
 	for name, fn := range map[string]func(pattern, path, include string) ([]grepMatch, error){
-		"regex": searchFilesWithRegex,
+		"regex": func(pattern, path, include string) ([]grepMatch, error) {
+			return searchFilesWithRegex(t.Context(), pattern, path, include)
+		},
 		"rg": func(pattern, path, include string) ([]grepMatch, error) {
 			matches, _, err := searchWithRipgrep(t.Context(), pattern, path, include, 100)
 			return matches, err
@@ -444,7 +452,9 @@ func TestColumnMatch(t *testing.T) {
 
 	// Test both implementations
 	for name, fn := range map[string]func(pattern, path, include string) ([]grepMatch, error){
-		"regex": searchFilesWithRegex,
+		"regex": func(pattern, path, include string) ([]grepMatch, error) {
+			return searchFilesWithRegex(t.Context(), pattern, path, include)
+		},
 		"rg": func(pattern, path, include string) ([]grepMatch, error) {
 			matches, _, err := searchWithRipgrep(t.Context(), pattern, path, include, 100)
 			return matches, err
@@ -562,7 +572,7 @@ func TestFileMatchesCallbackStopsEarly(t *testing.T) {
 
 	re := regexp.MustCompile("match")
 	callCount := 0
-	err := fileMatches(path, re, func(lm lineMatch) bool {
+	err := fileMatches(t.Context(), path, re, func(lm lineMatch) bool {
 		callCount++
 		return false // stop immediately after first match
 	})
@@ -583,7 +593,7 @@ func TestFileMatchesCallbackCollectsAll(t *testing.T) {
 
 	re := regexp.MustCompile("match")
 	var collected []lineMatch
-	err := fileMatches(path, re, func(lm lineMatch) bool {
+	err := fileMatches(t.Context(), path, re, func(lm lineMatch) bool {
 		collected = append(collected, lm)
 		return true
 	})
@@ -688,4 +698,150 @@ func TestScanThenWaitPattern_DrainsOnScanErrorInsteadOfHanging(t *testing.T) {
 			// "with_drain" subtest above is actually testing something.
 		}
 	})
+}
+
+// TestSearchFilesCancelledContextSkipsFallback verifies that when the context
+// is already cancelled before searchFiles is called, the regex fallback walk is
+// NOT launched: the ripgrep "not found" error is returned as-is rather than the
+// walk running and surfacing context.Canceled.
+func TestSearchFilesCancelledContextSkipsFallback(t *testing.T) {
+	t.Parallel()
+	// A tree large enough that a full fallback walk would be observably slow.
+	tempDir := t.TempDir()
+	for i := range 4000 {
+		p := filepath.Join(tempDir, fmt.Sprintf("d%d", i/100), fmt.Sprintf("f%d.txt", i))
+		require.NoError(t, os.MkdirAll(filepath.Dir(p), 0o755))
+		require.NoError(t, os.WriteFile(p, []byte("needle line\n"), 0o644))
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancelled before the call
+
+	start := time.Now()
+	matches, truncated, err := searchFiles(ctx, "needle", tempDir, "", 100)
+	elapsed := time.Since(start)
+
+	require.Error(t, err)
+	// The guard short-circuits: the ripgrep "not found" error is returned
+	// as-is. Had the fallback run, it would surface context.Canceled instead.
+	require.False(t, errors.Is(err, context.Canceled), "fallback must not run, got %v", err)
+	require.False(t, errors.Is(err, context.DeadlineExceeded), "fallback must not run, got %v", err)
+	require.Contains(t, err.Error(), "ripgrep", "the ripgrep error must be returned directly, proving the fallback was skipped")
+	require.Empty(t, matches)
+	require.False(t, truncated)
+	t.Logf("cancelled searchFiles returned in %s (err=%v)", elapsed, err)
+}
+
+// TestFileMatchesBoundedLineTruncatesHugeLine verifies that a single line with
+// no newline, several MiB long, does not force an unbounded allocation: it is
+// truncated to the cap, marked, and matched without crashing or hanging.
+func TestFileMatchesBoundedLineTruncatesHugeLine(t *testing.T) {
+	t.Parallel()
+	tempDir := t.TempDir()
+
+	// ~6 MiB single line, needle within the retained (first 4 MiB) portion.
+	var b strings.Builder
+	b.WriteString(strings.Repeat("x", 1024*1024))   // 1 MiB prefix
+	b.WriteString("NEEDLE")                         // match, well under the 4 MiB cap
+	b.WriteString(strings.Repeat("y", 5*1024*1024)) // 5 MiB suffix, no newline
+	huge := b.String()
+	path := filepath.Join(tempDir, "huge.txt")
+	require.NoError(t, os.WriteFile(path, []byte(huge), 0o644))
+
+	re := regexp.MustCompile("NEEDLE")
+	var got []lineMatch
+	require.NoError(t, fileMatches(t.Context(), path, re, func(lm lineMatch) bool {
+		got = append(got, lm)
+		return true
+	}))
+
+	require.Len(t, got, 1, "the single huge line must be matched exactly once")
+	require.LessOrEqual(t, len(got[0].lineText), maxFallbackLineBytes+len(fallbackTruncateSuffix),
+		"truncated line must not hold the full oversized line (%d bytes)", len(huge))
+	require.True(t, strings.HasSuffix(got[0].lineText, fallbackTruncateSuffix),
+		"truncated line must carry the truncation marker")
+	t.Logf("huge-line match lineText length=%d (full line=%d)", len(got[0].lineText), len(huge))
+}
+
+// TestFileMatchesBoundedLineContinuesAfterTruncation verifies that after a
+// truncated (oversized) line the scanner keeps scanning subsequent lines — the
+// key advantage over bufio.Scanner, which stops dead on ErrTooLong.
+func TestFileMatchesBoundedLineContinuesAfterTruncation(t *testing.T) {
+	t.Parallel()
+	tempDir := t.TempDir()
+
+	var b strings.Builder
+	// Line 1: oversized, needle in the retained portion.
+	b.WriteString(strings.Repeat("x", 1024*1024))
+	b.WriteString("NEEDLE")
+	b.WriteString(strings.Repeat("y", 5*1024*1024))
+	b.WriteString("\n")
+	// Line 2: normal line, also matches.
+	b.WriteString("NEEDLE on a short line\n")
+	path := filepath.Join(tempDir, "huge3.txt")
+	require.NoError(t, os.WriteFile(path, []byte(b.String()), 0o644))
+
+	re := regexp.MustCompile("NEEDLE")
+	var got []lineMatch
+	require.NoError(t, fileMatches(t.Context(), path, re, func(lm lineMatch) bool {
+		got = append(got, lm)
+		return true
+	}))
+
+	require.Len(t, got, 2, "must continue scanning after a truncated line")
+	require.Equal(t, 1, got[0].lineNum)
+	require.True(t, strings.HasSuffix(got[0].lineText, fallbackTruncateSuffix))
+	require.Equal(t, 2, got[1].lineNum)
+	require.Equal(t, "NEEDLE on a short line", got[1].lineText)
+}
+
+// TestSearchFilesWithRegexRespectsMidWalkCancellation verifies that cancelling
+// the context while the fallback walk is in progress aborts it promptly
+// (surfacing context.Canceled) instead of grinding through the whole tree. The
+// searched pattern does NOT match the file content so the 200-match cap never
+// triggers an early stop — the walk must traverse every file, giving
+// cancellation something real to interrupt mid-flight.
+func TestSearchFilesWithRegexRespectsMidWalkCancellation(t *testing.T) {
+	t.Parallel()
+	tempDir := t.TempDir()
+	const files = 4000
+	content := strings.Repeat("filler line\n", 160) // ~1.9 KiB/file, no match for the pattern below
+	for i := range files {
+		p := filepath.Join(tempDir, fmt.Sprintf("d%d", i/200), fmt.Sprintf("f%d.txt", i))
+		require.NoError(t, os.MkdirAll(filepath.Dir(p), 0o755))
+		require.NoError(t, os.WriteFile(p, []byte(content), 0o644))
+	}
+	const missingPattern = "ZZQ_NO_SUCH_NEEDLE_ZZQ"
+
+	// Baseline: a full, uninterrupted walk over the whole tree.
+	fullStart := time.Now()
+	_, fullErr := searchFilesWithRegex(context.Background(), missingPattern, tempDir, "")
+	fullElapsed := time.Since(fullStart)
+	require.NoError(t, fullErr)
+	t.Logf("full walk of %d files took %s", files, fullElapsed)
+
+	// Cancel mid-walk: wait a quarter of the measured full-walk duration, then
+	// cancel, so the walk is guaranteed to be in progress when it arrives.
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := searchFilesWithRegex(ctx, missingPattern, tempDir, "")
+		done <- err
+	}()
+	time.Sleep(fullElapsed / 4)
+	cancelStart := time.Now()
+	cancel()
+
+	select {
+	case err := <-done:
+		abortElapsed := time.Since(cancelStart)
+		require.Error(t, err)
+		require.True(t, errors.Is(err, context.Canceled), "expected context.Canceled, got %v", err)
+		t.Logf("mid-walk cancellation returned %s after cancel (full walk %s)", abortElapsed, fullElapsed)
+		// Must abort shortly after cancellation, not grind to the end.
+		require.Less(t, abortElapsed, fullElapsed/2,
+			"walk should abort shortly after cancellation (abort=%s, full=%s)", abortElapsed, fullElapsed)
+	case <-time.After(5 * time.Second):
+		t.Fatal("searchFilesWithRegex did not return within 5s after cancellation")
+	}
 }
