@@ -116,7 +116,8 @@ func mergeExternalMCPServers(cfg *Config, store *ConfigStore, external map[strin
 		}
 		// Check if the user has toggled this server off via the UI.
 		if store.HasConfigField(ScopeWorkspace, "mcp."+name+".disabled") {
-			data, _ := os.ReadFile(store.workspacePath)
+			workspacePath, _ := store.configPath(ScopeWorkspace)
+			data, _ := os.ReadFile(workspacePath)
 			if len(data) > 0 {
 				var ws struct {
 					MCP map[string]struct {

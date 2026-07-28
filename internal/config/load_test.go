@@ -310,7 +310,7 @@ func TestLoadFromConfigPaths_InvalidJSON(t *testing.T) {
 
 // testStore wraps a Config in a minimal ConfigStore for testing.
 func testStore(cfg *Config) *ConfigStore {
-	return &ConfigStore{config: cfg}
+	return NewTestStore(cfg)
 }
 
 func TestConfig_setDefaults(t *testing.T) {
@@ -1747,13 +1747,13 @@ func TestConfig_configureSelectedModels(t *testing.T) {
 			},
 		}
 		cfg.setDefaults(dir, "")
-		store := &ConfigStore{config: cfg, globalDataPath: globalPath}
+		store := newTestConfigStore(testStoreOpts{config: cfg, globalDataPath: globalPath})
 		env := env.NewFromMap(map[string]string{})
 		resolver := NewShellVariableResolver(env)
 		err := cfg.configureProviders(context.Background(), store, env, resolver, knownProviders)
 		require.NoError(t, err)
 
-		err = configureSelectedModels(store, knownProviders, false)
+		err = configureSelectedModels(store, cfg, knownProviders, false)
 		require.NoError(t, err)
 
 		// In-memory falls back to default.
@@ -1803,7 +1803,7 @@ func TestConfig_configureSelectedModels(t *testing.T) {
 		err := cfg.configureProviders(context.Background(), testStore(cfg), env, resolver, knownProviders)
 		require.NoError(t, err)
 
-		err = configureSelectedModels(testStore(cfg), knownProviders, true)
+		err = configureSelectedModels(testStore(cfg), cfg, knownProviders, true)
 		require.NoError(t, err)
 		large := cfg.Models[SelectedModelTypeLarge]
 		small := cfg.Models[SelectedModelTypeSmall]
@@ -1865,7 +1865,7 @@ func TestConfig_configureSelectedModels(t *testing.T) {
 		err := cfg.configureProviders(context.Background(), testStore(cfg), env, resolver, knownProviders)
 		require.NoError(t, err)
 
-		err = configureSelectedModels(testStore(cfg), knownProviders, true)
+		err = configureSelectedModels(testStore(cfg), cfg, knownProviders, true)
 		require.NoError(t, err)
 		large := cfg.Models[SelectedModelTypeLarge]
 		small := cfg.Models[SelectedModelTypeSmall]
@@ -1910,7 +1910,7 @@ func TestConfig_configureSelectedModels(t *testing.T) {
 		err := cfg.configureProviders(context.Background(), testStore(cfg), env, resolver, knownProviders)
 		require.NoError(t, err)
 
-		err = configureSelectedModels(testStore(cfg), knownProviders, true)
+		err = configureSelectedModels(testStore(cfg), cfg, knownProviders, true)
 		require.NoError(t, err)
 		large := cfg.Models[SelectedModelTypeLarge]
 		require.Equal(t, "large-model", large.Model)
@@ -1979,7 +1979,7 @@ func TestConfig_configureSelectedModels(t *testing.T) {
 		err := cfg.configureProviders(context.Background(), testStore(cfg), env, resolver, knownProviders)
 		require.NoError(t, err)
 
-		err = configureSelectedModels(testStore(cfg), knownProviders, true)
+		err = configureSelectedModels(testStore(cfg), cfg, knownProviders, true)
 		require.NoError(t, err)
 		large := cfg.Models[SelectedModelTypeLarge]
 		small := cfg.Models[SelectedModelTypeSmall]

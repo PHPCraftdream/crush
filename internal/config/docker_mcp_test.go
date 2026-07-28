@@ -66,18 +66,21 @@ func TestEnableDockerMCP(t *testing.T) {
 		cfg := &Config{
 			MCP: make(map[string]MCPConfig),
 		}
-		store := &ConfigStore{
+		store := newTestConfigStore(testStoreOpts{
 			config:         cfg,
 			globalDataPath: configPath,
 			resolver:       NewShellVariableResolver(env.New()),
-		}
+		})
 
 		err := store.EnableDockerMCP()
 		require.NoError(t, err)
 
-		// Check in-memory config.
-		require.True(t, cfg.IsDockerMCPEnabled())
-		mcpConfig, exists := cfg.MCP[DockerMCPName]
+		// Check in-memory config. EnableDockerMCP is copy-on-write, so the
+		// update is only visible through the store, not the original cfg
+		// local (which the store no longer shares after the first write).
+		updated := store.Config()
+		require.True(t, updated.IsDockerMCPEnabled())
+		mcpConfig, exists := updated.MCP[DockerMCPName]
 		require.True(t, exists)
 		require.Equal(t, MCPStdio, mcpConfig.Type)
 		require.Equal(t, "docker", mcpConfig.Command)
@@ -101,11 +104,11 @@ func TestEnableDockerMCP(t *testing.T) {
 		cfg := &Config{
 			MCP: make(map[string]MCPConfig),
 		}
-		store := &ConfigStore{
+		store := newTestConfigStore(testStoreOpts{
 			config:         cfg,
 			globalDataPath: configPath,
 			resolver:       NewShellVariableResolver(env.New()),
-		}
+		})
 
 		err := store.EnableDockerMCP()
 		require.Error(t, err)
@@ -133,21 +136,23 @@ func TestDisableDockerMCP(t *testing.T) {
 				},
 			},
 		}
-		store := &ConfigStore{
+		store := newTestConfigStore(testStoreOpts{
 			config:         cfg,
 			globalDataPath: configPath,
 			resolver:       NewShellVariableResolver(env.New()),
-		}
+		})
 
 		// Verify it's enabled first.
-		require.True(t, cfg.IsDockerMCPEnabled())
+		require.True(t, store.Config().IsDockerMCPEnabled())
 
 		err := store.DisableDockerMCP()
 		require.NoError(t, err)
 
-		// Check in-memory config.
-		require.False(t, cfg.IsDockerMCPEnabled())
-		_, exists := cfg.MCP[DockerMCPName]
+		// Check in-memory config through the store (copy-on-write means
+		// the original cfg local is no longer what the store holds).
+		updated := store.Config()
+		require.False(t, updated.IsDockerMCPEnabled())
+		_, exists := updated.MCP[DockerMCPName]
 		require.False(t, exists)
 	})
 
@@ -157,11 +162,11 @@ func TestDisableDockerMCP(t *testing.T) {
 		cfg := &Config{
 			MCP: nil,
 		}
-		store := &ConfigStore{
+		store := newTestConfigStore(testStoreOpts{
 			config:         cfg,
 			globalDataPath: filepath.Join(t.TempDir(), "crush.json"),
 			resolver:       NewShellVariableResolver(env.New()),
-		}
+		})
 
 		err := store.DisableDockerMCP()
 		require.NoError(t, err)
@@ -181,13 +186,13 @@ func TestEnableDockerMCPWithRealDockerWhenAvailable(t *testing.T) {
 	cfg := &Config{
 		MCP: make(map[string]MCPConfig),
 	}
-	store := &ConfigStore{
+	store := newTestConfigStore(testStoreOpts{
 		config:         cfg,
 		globalDataPath: configPath,
 		resolver:       NewShellVariableResolver(env.New()),
-	}
+	})
 
 	err := store.EnableDockerMCP()
 	require.NoError(t, err)
-	require.True(t, cfg.IsDockerMCPEnabled())
+	require.True(t, store.Config().IsDockerMCPEnabled())
 }

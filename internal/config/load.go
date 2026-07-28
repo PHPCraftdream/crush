@@ -35,6 +35,16 @@ const defaultCatwalkURL = "https://catwalk.charm.land"
 
 // Load loads the configuration from the default paths and returns a
 // ConfigStore that owns both the pure-data Config and all runtime state.
+//
+// Everything that belongs to one generation (config, workspacePath,
+// resolver, knownProviders, loadedPaths) is prepared entirely on local
+// variables and only published to the store's snapshot once, at the very
+// end, after every step that can mutate the config (setDefaults, workspace
+// merge, provider/model configuration, SetupAgents) has already run to
+// completion. This mirrors reloadFromDiskLocked's "build fully, then swap
+// once" shape so the store never has a window where a reader could observe
+// a half-configured config (e.g. providers set but SetupAgents not yet
+// run).
 func Load(workingDir, dataDir string, debug bool) (*ConfigStore, error) {
 	configPaths := lookupConfigs(workingDir)
 
@@ -45,22 +55,33 @@ func Load(workingDir, dataDir string, debug bool) (*ConfigStore, error) {
 
 	cfg.setDefaults(workingDir, dataDir)
 
-	store := &ConfigStore{
-		config:         cfg,
-		workingDir:     workingDir,
-		globalDataPath: GlobalConfigData(),
-		workspacePath:  filepath.Join(cfg.Options.DataDirectory, fmt.Sprintf("%s.json", appName)),
-		loadedPaths:    loadedPaths,
-	}
+	globalDataPath := GlobalConfigData()
+	workspacePath := filepath.Join(cfg.Options.DataDirectory, fmt.Sprintf("%s.json", appName))
 
 	if debug {
 		cfg.Options.Debug = true
 	}
 
+	// store is constructed early (with an empty/placeholder snapshot) only
+	// because configureProviders and mergeExternalMCPServers need a
+	// *ConfigStore to call scope-aware helpers (RemoveConfigField,
+	// HasConfigField) that read/write disk paths, not the in-memory
+	// config. Its real, fully-prepared snapshot is published in one shot
+	// at the end of this function via publish().
+	store := &ConfigStore{
+		workingDir:     workingDir,
+		globalDataPath: globalDataPath,
+	}
+	store.snap.Store(&storeSnapshot{
+		config:        cfg,
+		workspacePath: workspacePath,
+		loadedPaths:   loadedPaths,
+	})
+
 	// Load workspace config last so it has highest priority.
-	if wsData, err := os.ReadFile(store.workspacePath); err == nil && len(wsData) > 0 {
+	if wsData, err := os.ReadFile(workspacePath); err == nil && len(wsData) > 0 {
 		if !json.Valid(wsData) {
-			return nil, fmt.Errorf("invalid JSON in config file %s", store.workspacePath)
+			return nil, fmt.Errorf("invalid JSON in config file %s", workspacePath)
 		}
 		merged, mergeErr := loadFromBytes(append([][]byte{mustMarshalConfig(cfg)}, wsData))
 		if mergeErr == nil {
@@ -68,8 +89,7 @@ func Load(workingDir, dataDir string, debug bool) (*ConfigStore, error) {
 			dataDir := cfg.Options.DataDirectory
 			*cfg = *merged
 			cfg.setDefaults(workingDir, dataDir)
-			store.config = cfg
-			store.loadedPaths = append(store.loadedPaths, store.workspacePath)
+			loadedPaths = append(loadedPaths, workspacePath)
 		}
 	}
 
@@ -107,16 +127,14 @@ func Load(workingDir, dataDir string, debug bool) (*ConfigStore, error) {
 	}
 
 	// Load known providers, this loads the config from catwalk
-	providers, err := Providers(cfg)
+	knownProviders, err := Providers(cfg)
 	if err != nil {
 		return nil, err
 	}
-	store.knownProviders = providers
 
 	env := env.New()
 	// Configure providers
 	valueResolver := NewShellVariableResolver(env)
-	store.resolver = valueResolver
 
 	// Hold reloadMu during the initial load so that auto-reload triggered by
 	// config-modifying operations inside configureProviders (e.g.
@@ -124,21 +142,34 @@ func Load(workingDir, dataDir string, debug bool) (*ConfigStore, error) {
 	store.reloadMu.Lock()
 	defer store.reloadMu.Unlock()
 
-	if err := cfg.configureProviders(context.Background(), store, env, valueResolver, store.knownProviders); err != nil {
+	publish := func() {
+		store.snap.Store(&storeSnapshot{
+			config:         cfg,
+			resolver:       valueResolver,
+			knownProviders: knownProviders,
+			loadedPaths:    loadedPaths,
+			workspacePath:  workspacePath,
+		})
+	}
+
+	if err := cfg.configureProviders(context.Background(), store, env, valueResolver, knownProviders); err != nil {
 		return nil, fmt.Errorf("failed to configure providers: %w", err)
 	}
 
 	if !cfg.IsConfigured() {
 		slog.Warn("No providers configured")
+		publish()
 		return store, nil
 	}
 
-	if err := configureSelectedModels(store, store.knownProviders, true); err != nil {
+	if err := configureSelectedModels(store, cfg, knownProviders, true); err != nil {
 		return nil, fmt.Errorf("failed to configure selected models: %w", err)
 	}
-	store.SetupAgents()
+	cfg.SetupAgents()
 
-	// Capture initial staleness snapshot
+	// Publish the fully-prepared generation in one shot, then capture the
+	// initial staleness snapshot against it.
+	publish()
 	store.captureStalenessSnapshot(loadedPaths)
 
 	return store, nil
@@ -732,8 +763,16 @@ func (c *Config) defaultModelSelection(knownProviders []catwalk.Provider) (large
 	return largeModel, smallModel, err
 }
 
-func configureSelectedModels(store *ConfigStore, knownProviders []catwalk.Provider, persist bool) error {
-	c := store.config
+// configureSelectedModels computes the effective large/small model
+// selection for cfg and writes the result back into cfg.Models. store is
+// only consulted when persist is true (the initial Load path), to persist
+// a corrected selection back to disk via UpdatePreferredModel — it is
+// never read for its own Config(), so callers preparing a *Config that has
+// not yet been published to the store (e.g. reloadFromDiskLocked building
+// the next generation locally) can pass any store here; only its
+// persistence side effects (disk write + eventual reload) are used.
+func configureSelectedModels(store *ConfigStore, cfg *Config, knownProviders []catwalk.Provider, persist bool) error {
+	c := cfg
 	defaultLarge, defaultSmall, err := c.defaultModelSelection(knownProviders)
 	if err != nil {
 		return fmt.Errorf("failed to select default models: %w", err)

@@ -3,6 +3,7 @@ package config
 import (
 	"context"
 	"fmt"
+	"maps"
 	"sync"
 	"time"
 
@@ -89,10 +90,13 @@ func (s *ConfigStore) PrepareDockerMCPConfig() (MCPConfig, error) {
 	}
 
 	mcpConfig := DockerMCPConfig()
-	if s.config.MCP == nil {
-		s.config.MCP = make(map[string]MCPConfig)
-	}
-	s.config.MCP[DockerMCPName] = mcpConfig
+	s.updateConfig(func(cfgCopy *Config) {
+		cfgCopy.MCP = maps.Clone(cfgCopy.MCP)
+		if cfgCopy.MCP == nil {
+			cfgCopy.MCP = make(map[string]MCPConfig)
+		}
+		cfgCopy.MCP[DockerMCPName] = mcpConfig
+	})
 	return mcpConfig, nil
 }
 
@@ -119,15 +123,19 @@ func (s *ConfigStore) EnableDockerMCP() error {
 
 // DisableDockerMCP removes Docker MCP configuration and persists the change.
 func (s *ConfigStore) DisableDockerMCP() error {
-	if s.config.MCP == nil {
+	if s.Config().MCP == nil {
 		return nil
 	}
 
-	// Remove from in-memory config.
-	delete(s.config.MCP, DockerMCPName)
+	var mcpAfterRemoval MCPs
+	s.updateConfig(func(cfgCopy *Config) {
+		cfgCopy.MCP = maps.Clone(cfgCopy.MCP)
+		delete(cfgCopy.MCP, DockerMCPName)
+		mcpAfterRemoval = cfgCopy.MCP
+	})
 
 	// Persist the updated MCP map to the config file.
-	if err := s.SetConfigField(ScopeGlobal, "mcp", s.config.MCP); err != nil {
+	if err := s.SetConfigField(ScopeGlobal, "mcp", mcpAfterRemoval); err != nil {
 		return fmt.Errorf("failed to persist docker mcp removal: %w", err)
 	}
 

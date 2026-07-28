@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
 	"sync"
+	"sync/atomic"
 
 	"charm.land/catwalk/pkg/catwalk"
 	hyperp "github.com/charmbracelet/crush/internal/agent/hyper"
@@ -35,20 +37,62 @@ type RuntimeOverrides struct {
 	SkipPermissionRequests bool
 }
 
+// storeSnapshot is an immutable point-in-time view of everything that
+// ReloadFromDisk (or a copy-on-write mutator) replaces as one unit. A
+// reader that loads a *storeSnapshot via ConfigStore.snap always sees a
+// single, internally-consistent generation: config/resolver/knownProviders/
+// etc. all came from the same load or the same mutation, never a mix of an
+// old and a new generation torn across separate fields.
+//
+// Fields NOT here (workingDir, globalDataPath) are set once when the
+// ConfigStore is constructed and never change afterwards, so they don't
+// need to be part of the versioned snapshot.
+type storeSnapshot struct {
+	config             *Config
+	resolver           VariableResolver
+	knownProviders     []catwalk.Provider
+	loadedPaths        []string // config files that were successfully loaded
+	trackedConfigPaths []string // unique, normalized config file paths
+	snapshots          map[string]fileSnapshot
+	workspacePath      string // .crush/crush.json (recomputed on every reload)
+	overrides          RuntimeOverrides
+}
+
+// clone returns a shallow copy of the snapshot. Callers that need to
+// change one field (e.g. workspacePath, overrides) can clone then
+// mutate the copy before publishing it — the original snapshot, still
+// visible to any reader that loaded it earlier, is never touched.
+func (sn *storeSnapshot) clone() *storeSnapshot {
+	if sn == nil {
+		return &storeSnapshot{}
+	}
+	c := *sn
+	return &c
+}
+
 // ConfigStore is the single entry point for all config access. It owns the
 // pure-data Config, runtime state (working directory, resolver, known
 // providers), and persistence to both global and workspace config files.
+//
+// Thread-safety model: all state that changes together as one logical
+// generation (config, resolver, knownProviders, loadedPaths, overrides,
+// workspacePath, staleness tracking) lives in an immutable *storeSnapshot
+// published through the snap atomic.Pointer. Readers call snap.Load() once
+// and read every field from the same snapshot — lock-free, and always a
+// single consistent generation. Writers (both ReloadFromDisk and the
+// copy-on-write setters like SetCompactMode) serialize against each other
+// via reloadMu/writeMu, build a brand new snapshot from a shallow copy of
+// the config plus freshly cloned nested collections, and publish it with a
+// single snap.Store — the old snapshot, and anything still holding a
+// reference to it, is left completely untouched.
 type ConfigStore struct {
-	config             *Config
-	workingDir         string
-	resolver           VariableResolver
-	globalDataPath     string   // ~/.local/share/crush/crush.json
-	workspacePath      string   // .crush/crush.json
-	loadedPaths        []string // config files that were successfully loaded
-	knownProviders     []catwalk.Provider
-	overrides          RuntimeOverrides
-	trackedConfigPaths []string                // unique, normalized config file paths
-	snapshots          map[string]fileSnapshot // path -> snapshot at last capture
+	snap atomic.Pointer[storeSnapshot]
+
+	// workingDir and globalDataPath are set once at construction time
+	// (Load / NewTestStore) and never mutated afterwards, so they are
+	// safe to read without synchronization.
+	workingDir     string
+	globalDataPath string // ~/.local/share/crush/crush.json
 
 	// reloadMu serialises ReloadFromDisk calls so concurrent reloads (e.g.
 	// the web UI's file watcher racing a config write) cannot tear store
@@ -56,11 +100,35 @@ type ConfigStore struct {
 	// skip a redundant reload when one is already in progress — this also
 	// covers the re-entrant call from configureProviders during a reload.
 	reloadMu sync.Mutex
+
+	// writeMu serialises the copy-on-write mutators (SetCompactMode,
+	// UpdatePreferredModels, SetProviderAPIKey, ...) against each other so
+	// two concurrent writers can't both read the same stale snapshot,
+	// build their own updated copy, and have one silently clobber the
+	// other's change when they publish. It does NOT serialise against
+	// reloadMu: a reload rebuilds the whole config from disk, while a
+	// writer applies one targeted in-memory change — both still publish
+	// through the same atomic snap.Store, so whichever finishes last wins
+	// and neither can tear the snapshot.
+	writeMu sync.Mutex
+}
+
+// loadSnapshot returns the current published snapshot. It never returns
+// nil: the store is always constructed with an initial snapshot.
+func (s *ConfigStore) loadSnapshot() *storeSnapshot {
+	sn := s.snap.Load()
+	if sn == nil {
+		// Defensive: should not happen for a store built via Load or
+		// NewTestStore, but avoids a nil-pointer panic for any
+		// zero-value ConfigStore{} a test might construct directly.
+		return &storeSnapshot{}
+	}
+	return sn
 }
 
 // Config returns the pure-data config struct (read-only after load).
 func (s *ConfigStore) Config() *Config {
-	return s.config
+	return s.loadSnapshot().config
 }
 
 // WorkingDir returns the current working directory.
@@ -70,45 +138,66 @@ func (s *ConfigStore) WorkingDir() string {
 
 // Resolver returns the variable resolver.
 func (s *ConfigStore) Resolver() VariableResolver {
-	return s.resolver
+	return s.loadSnapshot().resolver
 }
 
 // Resolve resolves a variable reference using the configured resolver.
 func (s *ConfigStore) Resolve(key string) (string, error) {
-	if s.resolver == nil {
+	resolver := s.loadSnapshot().resolver
+	if resolver == nil {
 		return "", fmt.Errorf("no variable resolver configured")
 	}
-	return s.resolver.ResolveValue(key)
+	return resolver.ResolveValue(key)
 }
 
-// KnownProviders returns the list of known providers.
+// KnownProviders returns the list of known providers. The returned slice
+// is not copied: reload/mutation always replaces the whole slice (never
+// mutates an existing one in place), so a snapshot's backing array is
+// never written to after publication and it's safe to hand it out
+// directly.
 func (s *ConfigStore) KnownProviders() []catwalk.Provider {
-	return s.knownProviders
+	return s.loadSnapshot().knownProviders
 }
 
 // SetupAgents configures the coder and task agents on the config.
 func (s *ConfigStore) SetupAgents() {
-	s.config.SetupAgents()
+	s.loadSnapshot().config.SetupAgents()
 }
 
 // Overrides returns the runtime overrides for this store.
+//
+// NOTE: this returns a pointer into the CURRENT snapshot's embedded
+// RuntimeOverrides. Mutating through the returned pointer (as
+// SetSkipPermissionRequests-style callers do today) is a pre-existing,
+// deliberately-kept exception to the copy-on-write rule: RuntimeOverrides
+// is a single bool used as a process/session-lifetime toggle, never
+// persisted, and never read as part of a "generation" that needs to be
+// consistent with Config()/Resolver(). If a reload publishes a new
+// snapshot after a caller fetched this pointer, further writes through the
+// old pointer will not be visible in the new snapshot — callers needing
+// the override to survive a reload should re-fetch Overrides() after each
+// ReloadFromDisk. This mirrors the pre-refactor behavior (overrides were
+// copied by value across old/new state during reload) and is called out
+// explicitly rather than silently carried over.
 func (s *ConfigStore) Overrides() *RuntimeOverrides {
-	return &s.overrides
+	return &s.loadSnapshot().overrides
 }
 
 // LoadedPaths returns the config file paths that were successfully loaded.
+// Returns a copy so callers can't mutate the snapshot's backing array.
 func (s *ConfigStore) LoadedPaths() []string {
-	return slices.Clone(s.loadedPaths)
+	return slices.Clone(s.loadSnapshot().loadedPaths)
 }
 
 // configPath returns the file path for the given scope.
 func (s *ConfigStore) configPath(scope Scope) (string, error) {
 	switch scope {
 	case ScopeWorkspace:
-		if s.workspacePath == "" {
+		workspacePath := s.loadSnapshot().workspacePath
+		if workspacePath == "" {
 			return "", ErrNoWorkspaceConfig
 		}
-		return s.workspacePath, nil
+		return workspacePath, nil
 	default:
 		return s.globalDataPath, nil
 	}
@@ -271,6 +360,48 @@ func (s *ConfigStore) ReadAllModelsAtScope(scope Scope) (map[SelectedModelType]*
 	return out, nil
 }
 
+// updateConfig applies a targeted, copy-on-write mutation to the store's
+// config and publishes it as a new generation.
+//
+// It takes writeMu (serialising all copy-on-write mutators against each
+// other — without it, two concurrent callers could both read the same
+// starting snapshot, apply their own change to independent copies, and
+// have the second Store() silently discard the first writer's change),
+// shallow-copies the top-level *Config (cfgCopy := *cur.config), and hands
+// the mutate callback a pointer to that copy. mutate is responsible for
+// cloning any nested map/pointer it intends to change (e.g. Options, a
+// map[K]V field) before writing through it — updateConfig only guarantees
+// the top-level struct is a fresh copy, not anything it points to. Once
+// mutate returns, the new *Config is published as part of a new
+// storeSnapshot (resolver/knownProviders/etc. carried over unchanged from
+// the snapshot the mutation started from) via a single atomic Store.
+//
+// This is intentionally synchronous and always publishes — callers that
+// also persist to disk (the common case: every setter below writes through
+// SetConfigField/SetConfigFields right after) will shortly see their
+// change superseded by autoReload's own fresh-from-disk snapshot; that's
+// fine and matches pre-refactor semantics, where the in-memory mutation
+// was always a best-effort "make the change visible immediately" step
+// ahead of the disk-round-trip reload. When autoReload is skipped (no
+// workingDir configured, e.g. in unit tests), this in-memory mutation is
+// the only durable change, exactly as before.
+func (s *ConfigStore) updateConfig(mutate func(cfgCopy *Config)) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	cur := s.loadSnapshot()
+	next := cur.clone()
+
+	var cfgCopy Config
+	if cur.config != nil {
+		cfgCopy = *cur.config
+	}
+	mutate(&cfgCopy)
+	next.config = &cfgCopy
+
+	s.snap.Store(next)
+}
+
 // UpdatePreferredModel updates the preferred model for the given type and
 // persists it to the config file at the given scope.
 func (s *ConfigStore) UpdatePreferredModel(scope Scope, modelType SelectedModelType, model SelectedModel) error {
@@ -296,9 +427,15 @@ func (s *ConfigStore) UpdatePreferredModels(scope Scope, models map[SelectedMode
 	if err := s.SetConfigFields(scope, fields); err != nil {
 		return fmt.Errorf("failed to update preferred models: %w", err)
 	}
-	for modelType, model := range models {
-		s.config.Models[modelType] = model
-	}
+	s.updateConfig(func(cfgCopy *Config) {
+		cfgCopy.Models = maps.Clone(cfgCopy.Models)
+		if cfgCopy.Models == nil {
+			cfgCopy.Models = make(map[SelectedModelType]SelectedModel, len(models))
+		}
+		for modelType, model := range models {
+			cfgCopy.Models[modelType] = model
+		}
+	})
 	for modelType, model := range models {
 		if err := s.recordRecentModel(scope, modelType, model); err != nil {
 			return err
@@ -307,22 +444,75 @@ func (s *ConfigStore) UpdatePreferredModels(scope Scope, models map[SelectedMode
 	return nil
 }
 
+// SetSelectedModelRuntime overrides a single model slot (large/small/
+// worker/reviewer) in memory ONLY — no disk write, no autoReload, no
+// recent-models bookkeeping. It exists for callers that need a
+// process-lifetime override rather than a persisted preference, e.g.
+// `crush run --model=...`/--small-model=...`, which temporarily swaps the
+// active model for one non-interactive invocation and must NOT leave that
+// override sitting in crush.json for the next run to inherit.
+//
+// Before this method existed, that one-shot CLI override went through
+// app.config.Config().Models[...] = ... — mutating the map returned by
+// Config() directly from a different package, bypassing ConfigStore
+// entirely and racing any concurrent reader of the same map. Now it goes
+// through the same copy-on-write path (updateConfig) as every other
+// mutator, just without the SetConfigFields disk round-trip.
+func (s *ConfigStore) SetSelectedModelRuntime(modelType SelectedModelType, model SelectedModel) {
+	s.updateConfig(func(cfgCopy *Config) {
+		cfgCopy.Models = maps.Clone(cfgCopy.Models)
+		if cfgCopy.Models == nil {
+			cfgCopy.Models = make(map[SelectedModelType]SelectedModel, 1)
+		}
+		cfgCopy.Models[modelType] = model
+	})
+}
+
 // SetCompactMode sets the compact mode setting and persists it.
 func (s *ConfigStore) SetCompactMode(scope Scope, enabled bool) error {
-	if s.config.Options == nil {
-		s.config.Options = &Options{}
-	}
-	s.config.Options.TUI.CompactMode = enabled
+	s.updateConfig(func(cfgCopy *Config) {
+		optsCopy := cloneOptions(cfgCopy.Options)
+		tuiCopy := cloneTUIOptions(optsCopy.TUI)
+		tuiCopy.CompactMode = enabled
+		optsCopy.TUI = tuiCopy
+		cfgCopy.Options = optsCopy
+	})
 	return s.SetConfigField(scope, "options.tui.compact_mode", enabled)
 }
 
 // SetTransparentBackground sets the transparent background setting and persists it.
 func (s *ConfigStore) SetTransparentBackground(scope Scope, enabled bool) error {
-	if s.config.Options == nil {
-		s.config.Options = &Options{}
-	}
-	s.config.Options.TUI.Transparent = &enabled
+	s.updateConfig(func(cfgCopy *Config) {
+		optsCopy := cloneOptions(cfgCopy.Options)
+		tuiCopy := cloneTUIOptions(optsCopy.TUI)
+		tuiCopy.Transparent = &enabled
+		optsCopy.TUI = tuiCopy
+		cfgCopy.Options = optsCopy
+	})
 	return s.SetConfigField(scope, "options.tui.transparent", enabled)
+}
+
+// cloneOptions returns a fresh *Options copy suitable for copy-on-write
+// mutation: a nil input yields a fresh zero-value Options (matching the
+// historical "if s.config.Options == nil { s.config.Options = &Options{} }"
+// lazy-init behaviour), and a non-nil input is shallow-copied so the
+// caller can freely reassign its own fields (like TUI) without touching
+// the Options struct any other snapshot might still be reading.
+func cloneOptions(o *Options) *Options {
+	if o == nil {
+		return &Options{}
+	}
+	c := *o
+	return &c
+}
+
+// cloneTUIOptions mirrors cloneOptions for the nested *TUIOptions pointer.
+func cloneTUIOptions(t *TUIOptions) *TUIOptions {
+	if t == nil {
+		return &TUIOptions{}
+	}
+	c := *t
+	return &c
 }
 
 // SetProviderAPIKey sets the API key for a provider and persists it.
@@ -354,15 +544,26 @@ func (s *ConfigStore) SetProviderAPIKey(scope Scope, providerID string, apiKey a
 		}
 	}
 
-	providerConfig, exists = s.config.Providers.Get(providerID)
+	// Providers is a *csync.Map: it carries its own internal RWMutex, so
+	// Get/Set on it are safe to call directly without going through
+	// updateConfig's copy-on-write path. We still fetch both the map and
+	// knownProviders from ONE current snapshot (rather than two separate
+	// loadSnapshot() calls) purely to use a single, less stale view — the
+	// Providers map itself is the same shared instance across config
+	// generations until a reload rebuilds cfg from scratch, and mutating
+	// it in place is intentional: a config reload triggered concurrently
+	// with this call is expected to observe (or itself trigger) the
+	// updated provider, not silently lose it to a copy-on-write swap.
+	sn := s.loadSnapshot()
+	providerConfig, exists = sn.config.Providers.Get(providerID)
 	if exists {
 		setKeyOrToken()
-		s.config.Providers.Set(providerID, providerConfig)
+		sn.config.Providers.Set(providerID, providerConfig)
 		return nil
 	}
 
 	var foundProvider *catwalk.Provider
-	for _, p := range s.knownProviders {
+	for _, p := range sn.knownProviders {
 		if string(p.ID) == providerID {
 			foundProvider = &p
 			break
@@ -384,7 +585,7 @@ func (s *ConfigStore) SetProviderAPIKey(scope Scope, providerID string, apiKey a
 	} else {
 		return fmt.Errorf("provider with ID %s not found in known providers", providerID)
 	}
-	s.config.Providers.Set(providerID, providerConfig)
+	sn.config.Providers.Set(providerID, providerConfig)
 	return nil
 }
 
@@ -396,7 +597,8 @@ func (s *ConfigStore) SetProviderAPIKey(scope Scope, providerID string, apiKey a
 // refresh token), the disk is re-checked to recover the other session's
 // token.
 func (s *ConfigStore) RefreshOAuthToken(ctx context.Context, scope Scope, providerID string) error {
-	providerConfig, exists := s.config.Providers.Get(providerID)
+	providers := s.loadSnapshot().config.Providers
+	providerConfig, exists := providers.Get(providerID)
 	if !exists {
 		return fmt.Errorf("provider %s not found", providerID)
 	}
@@ -448,7 +650,7 @@ func (s *ConfigStore) RefreshOAuthToken(ctx context.Context, scope Scope, provid
 		providerConfig.SetupGitHubCopilot()
 	}
 
-	s.config.Providers.Set(providerID, providerConfig)
+	providers.Set(providerID, providerConfig)
 
 	if err := s.SetConfigFields(scope, map[string]any{
 		fmt.Sprintf("providers.%s.api_key", providerID): refreshedToken.AccessToken,
@@ -461,13 +663,15 @@ func (s *ConfigStore) RefreshOAuthToken(ctx context.Context, scope Scope, provid
 }
 
 // applyToken updates the in-memory provider config with the given token.
+// Providers is a *csync.Map (its own internal RWMutex), so Set is safe to
+// call directly here without a copy-on-write config swap.
 func (s *ConfigStore) applyToken(providerConfig ProviderConfig, token *oauth.Token, providerID string) error {
 	providerConfig.OAuthToken = token
 	providerConfig.APIKey = token.AccessToken
 	if providerID == string(catwalk.InferenceProviderCopilot) {
 		providerConfig.SetupGitHubCopilot()
 	}
-	s.config.Providers.Set(providerID, providerConfig)
+	s.loadSnapshot().config.Providers.Set(providerID, providerConfig)
 	return nil
 }
 
@@ -512,10 +716,6 @@ func (s *ConfigStore) recordRecentModel(scope Scope, modelType SelectedModelType
 		return nil
 	}
 
-	if s.config.RecentModels == nil {
-		s.config.RecentModels = make(map[SelectedModelType][]SelectedModel)
-	}
-
 	eq := func(a, b SelectedModel) bool {
 		return a.Provider == b.Provider && a.Model == b.Model
 	}
@@ -525,7 +725,7 @@ func (s *ConfigStore) recordRecentModel(scope Scope, modelType SelectedModelType
 		Model:    model.Model,
 	}
 
-	current := s.config.RecentModels[modelType]
+	current := s.loadSnapshot().config.RecentModels[modelType]
 	withoutCurrent := slices.DeleteFunc(slices.Clone(current), func(existing SelectedModel) bool {
 		return eq(existing, entry)
 	})
@@ -539,7 +739,13 @@ func (s *ConfigStore) recordRecentModel(scope Scope, modelType SelectedModelType
 		return nil
 	}
 
-	s.config.RecentModels[modelType] = updated
+	s.updateConfig(func(cfgCopy *Config) {
+		cfgCopy.RecentModels = maps.Clone(cfgCopy.RecentModels)
+		if cfgCopy.RecentModels == nil {
+			cfgCopy.RecentModels = make(map[SelectedModelType][]SelectedModel)
+		}
+		cfgCopy.RecentModels[modelType] = updated
+	})
 
 	if err := s.SetConfigField(scope, fmt.Sprintf("recent_models.%s", modelType), updated); err != nil {
 		return fmt.Errorf("failed to persist recent models: %w", err)
@@ -550,10 +756,42 @@ func (s *ConfigStore) recordRecentModel(scope Scope, modelType SelectedModelType
 
 // NewTestStore creates a ConfigStore for testing purposes.
 func NewTestStore(cfg *Config, loadedPaths ...string) *ConfigStore {
-	return &ConfigStore{
+	s := &ConfigStore{}
+	s.snap.Store(&storeSnapshot{
 		config:      cfg,
 		loadedPaths: loadedPaths,
-	}
+	})
+	return s
+}
+
+// testStoreOpts configures the fields newTestConfigStore should set on the
+// snapshot/store it builds. Only used by this package's own white-box
+// tests, which used to build ConfigStore{config: ..., globalDataPath: ...}
+// literals directly — that stopped compiling once config/workspacePath
+// moved behind the snap atomic.Pointer, so tests now go through this
+// helper instead.
+type testStoreOpts struct {
+	config         *Config
+	globalDataPath string
+	workspacePath  string
+	resolver       VariableResolver
+	loadedPaths    []string
+}
+
+// newTestConfigStore builds a *ConfigStore for this package's white-box
+// tests from the given options, publishing them as a single snapshot the
+// same way production code does. globalDataPath is stored directly on the
+// ConfigStore (it's the one config-related field that isn't part of the
+// snapshot), everything else goes into the initial storeSnapshot.
+func newTestConfigStore(opts testStoreOpts) *ConfigStore {
+	s := &ConfigStore{globalDataPath: opts.globalDataPath}
+	s.snap.Store(&storeSnapshot{
+		config:        opts.config,
+		workspacePath: opts.workspacePath,
+		resolver:      opts.resolver,
+		loadedPaths:   opts.loadedPaths,
+	})
+	return s
 }
 
 // ImportCopilot attempts to import a GitHub Copilot token from disk.
@@ -591,13 +829,13 @@ func (s *ConfigStore) ImportCopilot() (*oauth.Token, bool) {
 
 // SetTheme sets the TUI theme and persists it.
 func (s *ConfigStore) SetTheme(scope Scope, theme string) error {
-	if s.config.Options == nil {
-		s.config.Options = &Options{}
-	}
-	if s.config.Options.TUI == nil {
-		s.config.Options.TUI = &TUIOptions{}
-	}
-	s.config.Options.TUI.Theme = theme
+	s.updateConfig(func(cfgCopy *Config) {
+		optsCopy := cloneOptions(cfgCopy.Options)
+		tuiCopy := cloneTUIOptions(optsCopy.TUI)
+		tuiCopy.Theme = theme
+		optsCopy.TUI = tuiCopy
+		cfgCopy.Options = optsCopy
+	})
 	return s.SetConfigField(scope, "options.tui.theme", theme)
 }
 
@@ -607,21 +845,23 @@ func (s *ConfigStore) SetTheme(scope Scope, theme string) error {
 // *bool only to distinguish "not set, use default ON" from an explicit
 // choice, and SetConfigField writes the underlying primitive.
 func (s *ConfigStore) SetKeepAliveEnabled(scope Scope, enabled bool) error {
-	if s.config.Options == nil {
-		s.config.Options = &Options{}
-	}
-	v := enabled
-	s.config.Options.KeepAliveEnabled = &v
+	s.updateConfig(func(cfgCopy *Config) {
+		optsCopy := cloneOptions(cfgCopy.Options)
+		v := enabled
+		optsCopy.KeepAliveEnabled = &v
+		cfgCopy.Options = optsCopy
+	})
 	return s.SetConfigField(scope, "options.keep_alive_enabled", enabled)
 }
 
 // RemoveProviderAPIKey removes the API key for the given provider from disk and
-// removes it from the in-memory enabled providers list.
+// removes it from the in-memory enabled providers list. Providers is a
+// *csync.Map (its own internal RWMutex), so Del is safe to call directly.
 func (s *ConfigStore) RemoveProviderAPIKey(scope Scope, providerID string) error {
 	if err := s.RemoveConfigField(scope, fmt.Sprintf("providers.%s.api_key", providerID)); err != nil {
 		return fmt.Errorf("failed to remove provider API key: %w", err)
 	}
-	s.config.Providers.Del(providerID)
+	s.loadSnapshot().config.Providers.Del(providerID)
 	return nil
 }
 
@@ -632,17 +872,20 @@ func (s *ConfigStore) RecordRecentModel(scope Scope, modelType SelectedModelType
 
 // RemoveRecentModel removes a model from the recent list and persists to disk.
 func (s *ConfigStore) RemoveRecentModel(scope Scope, modelType SelectedModelType, model SelectedModel) error {
-	if s.config.RecentModels == nil {
+	current := s.loadSnapshot().config.RecentModels[modelType]
+	if current == nil {
 		return nil
 	}
-	current := s.config.RecentModels[modelType]
 	updated := slices.DeleteFunc(slices.Clone(current), func(m SelectedModel) bool {
 		return m.Provider == model.Provider && m.Model == model.Model
 	})
 	if len(updated) == len(current) {
 		return nil
 	}
-	s.config.RecentModels[modelType] = updated
+	s.updateConfig(func(cfgCopy *Config) {
+		cfgCopy.RecentModels = maps.Clone(cfgCopy.RecentModels)
+		cfgCopy.RecentModels[modelType] = updated
+	})
 	if err := s.SetConfigField(scope, fmt.Sprintf("recent_models.%s", modelType), updated); err != nil {
 		return fmt.Errorf("failed to persist recent models: %w", err)
 	}
@@ -651,10 +894,11 @@ func (s *ConfigStore) RemoveRecentModel(scope Scope, modelType SelectedModelType
 
 // LogPath returns the path to the log file.
 func (s *ConfigStore) LogPath() string {
-	if s.config.Options == nil || s.config.Options.DataDirectory == "" {
+	opts := s.loadSnapshot().config.Options
+	if opts == nil || opts.DataDirectory == "" {
 		return ""
 	}
-	return filepath.Join(s.config.Options.DataDirectory, "logs", "crush.log")
+	return filepath.Join(opts.DataDirectory, "logs", "crush.log")
 }
 
 // StalenessResult contains the result of a staleness check.
@@ -671,8 +915,10 @@ func (s *ConfigStore) ConfigStaleness() StalenessResult {
 	var result StalenessResult
 	result.Errors = make(map[string]error)
 
-	for _, path := range s.trackedConfigPaths {
-		snapshot, hadSnapshot := s.snapshots[path]
+	sn := s.loadSnapshot()
+
+	for _, path := range sn.trackedConfigPaths {
+		snapshot, hadSnapshot := sn.snapshots[path]
 
 		info, err := os.Stat(path)
 		exists := err == nil && !info.IsDir()
@@ -708,13 +954,24 @@ func (s *ConfigStore) ConfigStaleness() StalenessResult {
 	return result
 }
 
-// RefreshStalenessSnapshot captures fresh snapshots of all tracked config files.
+// RefreshStalenessSnapshot captures fresh snapshots of all tracked config
+// files and publishes them as part of a new store generation. It only
+// touches the snapshots/trackedConfigPaths pair — config, resolver,
+// knownProviders etc. are carried over unchanged from whatever generation
+// is current at the time of the swap.
 func (s *ConfigStore) RefreshStalenessSnapshot() error {
-	if s.snapshots == nil {
-		s.snapshots = make(map[string]fileSnapshot)
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	cur := s.loadSnapshot()
+	next := cur.clone()
+	if next.snapshots == nil {
+		next.snapshots = make(map[string]fileSnapshot)
+	} else {
+		next.snapshots = maps.Clone(next.snapshots)
 	}
 
-	for _, path := range s.trackedConfigPaths {
+	for _, path := range next.trackedConfigPaths {
 		info, err := os.Stat(path)
 		exists := err == nil && !info.IsDir()
 
@@ -728,13 +985,17 @@ func (s *ConfigStore) RefreshStalenessSnapshot() error {
 			snapshot.ModTime = info.ModTime().UnixNano()
 		}
 
-		s.snapshots[path] = snapshot
+		next.snapshots[path] = snapshot
 	}
 
+	s.snap.Store(next)
 	return nil
 }
 
-// CaptureStalenessSnapshot captures snapshots for the given paths.
+// CaptureStalenessSnapshot recomputes the set of tracked config paths (the
+// paths passed in, plus the store's own workspace/global paths) and
+// refreshes their on-disk snapshots, publishing both as part of a single
+// new generation.
 func (s *ConfigStore) CaptureStalenessSnapshot(paths []string) {
 	seen := make(map[string]struct{})
 	for _, p := range paths {
@@ -748,8 +1009,9 @@ func (s *ConfigStore) CaptureStalenessSnapshot(paths []string) {
 		seen[abs] = struct{}{}
 	}
 
-	if s.workspacePath != "" {
-		abs, err := filepath.Abs(s.workspacePath)
+	workspacePath := s.loadSnapshot().workspacePath
+	if workspacePath != "" {
+		abs, err := filepath.Abs(workspacePath)
 		if err == nil {
 			seen[abs] = struct{}{}
 		}
@@ -761,11 +1023,18 @@ func (s *ConfigStore) CaptureStalenessSnapshot(paths []string) {
 		}
 	}
 
-	s.trackedConfigPaths = make([]string, 0, len(seen))
+	tracked := make([]string, 0, len(seen))
 	for p := range seen {
-		s.trackedConfigPaths = append(s.trackedConfigPaths, p)
+		tracked = append(tracked, p)
 	}
-	slices.Sort(s.trackedConfigPaths)
+	slices.Sort(tracked)
+
+	s.writeMu.Lock()
+	cur := s.loadSnapshot()
+	next := cur.clone()
+	next.trackedConfigPaths = tracked
+	s.snap.Store(next)
+	s.writeMu.Unlock()
 
 	s.RefreshStalenessSnapshot()
 }
@@ -789,6 +1058,17 @@ func (s *ConfigStore) ReloadFromDisk(ctx context.Context) error {
 // reloadMu, which both serialises concurrent reloads and prevents the
 // re-entrant auto-reload that configureProviders would otherwise trigger
 // via RemoveConfigField mid-reload.
+//
+// Everything for the new generation (config, resolver, knownProviders,
+// loadedPaths, workspacePath) is built on purely local variables — cfg is
+// never assigned into the store and configureSelectedModels/SetupAgents
+// operate on the local cfg — so the *only* store mutation in the whole
+// function is the single s.snap.Store at the very end, once every step
+// that can fail (ValidateHooks, configureProviders, configureSelectedModels)
+// has already succeeded. On any error we simply return without calling
+// Store; the previously published snapshot is untouched and remains
+// visible to readers, which is the "rollback" — there is nothing to
+// manually restore.
 func (s *ConfigStore) reloadFromDiskLocked(ctx context.Context) error {
 	configPaths := lookupConfigs(s.workingDir)
 	cfg, loadedPaths, err := loadFromConfigPaths(configPaths)
@@ -796,9 +1076,11 @@ func (s *ConfigStore) reloadFromDiskLocked(ctx context.Context) error {
 		return fmt.Errorf("failed to reload config: %w", err)
 	}
 
+	prev := s.loadSnapshot()
+
 	var dataDir string
-	if s.config != nil && s.config.Options != nil {
-		dataDir = s.config.Options.DataDirectory
+	if prev.config != nil && prev.config.Options != nil {
+		dataDir = prev.config.Options.DataDirectory
 	}
 	cfg.setDefaults(s.workingDir, dataDir)
 
@@ -820,7 +1102,7 @@ func (s *ConfigStore) reloadFromDiskLocked(ctx context.Context) error {
 		return fmt.Errorf("invalid hook configuration on reload: %w", err)
 	}
 
-	overrides := s.overrides
+	overrides := prev.overrides
 
 	env := env.New()
 	resolver := NewShellVariableResolver(env)
@@ -833,40 +1115,31 @@ func (s *ConfigStore) reloadFromDiskLocked(ctx context.Context) error {
 		return fmt.Errorf("failed to configure providers during reload: %w", err)
 	}
 
-	oldConfig := s.config
-	oldLoadedPaths := s.loadedPaths
-	oldResolver := s.resolver
-	oldKnownProviders := s.knownProviders
-	oldOverrides := s.overrides
-	oldWorkspacePath := s.workspacePath
-
-	s.config = cfg
-	s.loadedPaths = loadedPaths
-	s.resolver = resolver
-	s.knownProviders = providers
-	s.overrides = overrides
-	s.workspacePath = workspacePath
-
-	var setupErr error
 	if !cfg.IsConfigured() {
 		slog.Warn("No providers configured after reload")
 	} else {
-		if err := configureSelectedModels(s, providers, false); err != nil {
-			setupErr = fmt.Errorf("failed to configure selected models during reload: %w", err)
-		} else {
-			s.SetupAgents()
+		if err := configureSelectedModels(s, cfg, providers, false); err != nil {
+			return fmt.Errorf("failed to configure selected models during reload: %w", err)
 		}
+		cfg.SetupAgents()
 	}
 
-	if setupErr != nil {
-		s.config = oldConfig
-		s.loadedPaths = oldLoadedPaths
-		s.resolver = oldResolver
-		s.knownProviders = oldKnownProviders
-		s.overrides = oldOverrides
-		s.workspacePath = oldWorkspacePath
-		return setupErr
+	// Every fallible step has succeeded — publish the new generation as a
+	// single atomic swap. Anything that already loaded `prev` (or an
+	// earlier snapshot) keeps reading a fully-consistent, if stale, view;
+	// nothing observes config/resolver/knownProviders from different
+	// generations mixed together.
+	next := &storeSnapshot{
+		config:             cfg,
+		resolver:           resolver,
+		knownProviders:     providers,
+		loadedPaths:        loadedPaths,
+		trackedConfigPaths: prev.trackedConfigPaths,
+		snapshots:          prev.snapshots,
+		workspacePath:      workspacePath,
+		overrides:          overrides,
 	}
+	s.snap.Store(next)
 
 	s.captureStalenessSnapshot(loadedPaths)
 

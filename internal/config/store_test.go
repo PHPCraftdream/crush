@@ -16,9 +16,9 @@ import (
 func TestConfigStore_ConfigPath_GlobalAlwaysWorks(t *testing.T) {
 	t.Parallel()
 
-	store := &ConfigStore{
+	store := newTestConfigStore(testStoreOpts{
 		globalDataPath: "/some/global/crush.json",
-	}
+	})
 
 	path, err := store.configPath(ScopeGlobal)
 	require.NoError(t, err)
@@ -28,9 +28,9 @@ func TestConfigStore_ConfigPath_GlobalAlwaysWorks(t *testing.T) {
 func TestConfigStore_ConfigPath_WorkspaceReturnsPath(t *testing.T) {
 	t.Parallel()
 
-	store := &ConfigStore{
+	store := newTestConfigStore(testStoreOpts{
 		workspacePath: "/some/workspace/.crush/crush.json",
-	}
+	})
 
 	path, err := store.configPath(ScopeWorkspace)
 	require.NoError(t, err)
@@ -40,10 +40,10 @@ func TestConfigStore_ConfigPath_WorkspaceReturnsPath(t *testing.T) {
 func TestConfigStore_ConfigPath_WorkspaceErrorsWhenEmpty(t *testing.T) {
 	t.Parallel()
 
-	store := &ConfigStore{
+	store := newTestConfigStore(testStoreOpts{
 		globalDataPath: "/some/global/crush.json",
 		workspacePath:  "",
-	}
+	})
 
 	_, err := store.configPath(ScopeWorkspace)
 	require.Error(t, err)
@@ -53,11 +53,11 @@ func TestConfigStore_ConfigPath_WorkspaceErrorsWhenEmpty(t *testing.T) {
 func TestConfigStore_SetConfigField_WorkspaceScopeGuard(t *testing.T) {
 	t.Parallel()
 
-	store := &ConfigStore{
+	store := newTestConfigStore(testStoreOpts{
 		config:         &Config{},
 		globalDataPath: filepath.Join(t.TempDir(), "global.json"),
 		workspacePath:  "",
-	}
+	})
 
 	err := store.SetConfigField(ScopeWorkspace, "foo", "bar")
 	require.Error(t, err)
@@ -69,10 +69,10 @@ func TestConfigStore_SetConfigField_GlobalScopeAlwaysWorks(t *testing.T) {
 
 	dir := t.TempDir()
 	globalPath := filepath.Join(dir, "crush.json")
-	store := &ConfigStore{
+	store := newTestConfigStore(testStoreOpts{
 		config:         &Config{},
 		globalDataPath: globalPath,
-	}
+	})
 
 	err := store.SetConfigField(ScopeGlobal, "foo", "bar")
 	require.NoError(t, err)
@@ -85,11 +85,11 @@ func TestConfigStore_SetConfigField_GlobalScopeAlwaysWorks(t *testing.T) {
 func TestConfigStore_RemoveConfigField_WorkspaceScopeGuard(t *testing.T) {
 	t.Parallel()
 
-	store := &ConfigStore{
+	store := newTestConfigStore(testStoreOpts{
 		config:         &Config{},
 		globalDataPath: filepath.Join(t.TempDir(), "global.json"),
 		workspacePath:  "",
-	}
+	})
 
 	err := store.RemoveConfigField(ScopeWorkspace, "foo")
 	require.Error(t, err)
@@ -99,11 +99,11 @@ func TestConfigStore_RemoveConfigField_WorkspaceScopeGuard(t *testing.T) {
 func TestConfigStore_HasConfigField_WorkspaceScopeGuard(t *testing.T) {
 	t.Parallel()
 
-	store := &ConfigStore{
+	store := newTestConfigStore(testStoreOpts{
 		config:         &Config{},
 		globalDataPath: filepath.Join(t.TempDir(), "global.json"),
 		workspacePath:  "",
-	}
+	})
 
 	has := store.HasConfigField(ScopeWorkspace, "foo")
 	require.False(t, has)
@@ -112,8 +112,8 @@ func TestConfigStore_HasConfigField_WorkspaceScopeGuard(t *testing.T) {
 func TestConfigStore_RuntimeOverrides_Independent(t *testing.T) {
 	t.Parallel()
 
-	store1 := &ConfigStore{config: &Config{}}
-	store2 := &ConfigStore{config: &Config{}}
+	store1 := newTestConfigStore(testStoreOpts{config: &Config{}})
+	store2 := newTestConfigStore(testStoreOpts{config: &Config{}})
 
 	require.False(t, store1.Overrides().SkipPermissionRequests)
 	require.False(t, store2.Overrides().SkipPermissionRequests)
@@ -127,7 +127,7 @@ func TestConfigStore_RuntimeOverrides_Independent(t *testing.T) {
 func TestConfigStore_RuntimeOverrides_MutableViaPointer(t *testing.T) {
 	t.Parallel()
 
-	store := &ConfigStore{config: &Config{}}
+	store := newTestConfigStore(testStoreOpts{config: &Config{}})
 	overrides := store.Overrides()
 
 	require.False(t, overrides.SkipPermissionRequests)
@@ -165,10 +165,10 @@ func TestConfigStaleness_CleanImmediatelyAfterSnapshot(t *testing.T) {
 	content := []byte(`{"options": {"debug": true}}`)
 	require.NoError(t, os.WriteFile(configPath, content, 0o600))
 
-	store := &ConfigStore{
+	store := newTestConfigStore(testStoreOpts{
 		config:         &Config{},
 		globalDataPath: configPath,
-	}
+	})
 	store.captureStalenessSnapshot([]string{configPath})
 
 	result := store.ConfigStaleness()
@@ -186,10 +186,10 @@ func TestConfigStaleness_DetectsFileContentChange(t *testing.T) {
 	// Create initial config file
 	require.NoError(t, os.WriteFile(configPath, []byte(`{"debug": false}`), 0o600))
 
-	store := &ConfigStore{
+	store := newTestConfigStore(testStoreOpts{
 		config:         &Config{},
 		globalDataPath: configPath,
-	}
+	})
 	store.captureStalenessSnapshot([]string{configPath})
 
 	// Modify the file
@@ -211,10 +211,10 @@ func TestConfigStaleness_DetectsFileDeletion(t *testing.T) {
 	// Create initial config file
 	require.NoError(t, os.WriteFile(configPath, []byte(`{"debug": true}`), 0o600))
 
-	store := &ConfigStore{
+	store := newTestConfigStore(testStoreOpts{
 		config:         &Config{},
 		globalDataPath: configPath,
-	}
+	})
 	store.captureStalenessSnapshot([]string{configPath})
 
 	// Delete the file
@@ -233,10 +233,10 @@ func TestConfigStaleness_DetectsNewFile(t *testing.T) {
 	configPath := filepath.Join(dir, "crush.json")
 
 	// Don't create file initially
-	store := &ConfigStore{
+	store := newTestConfigStore(testStoreOpts{
 		config:         &Config{},
 		globalDataPath: configPath,
-	}
+	})
 	store.captureStalenessSnapshot([]string{configPath})
 
 	// Now create the file
@@ -262,10 +262,10 @@ func TestConfigStaleness_SortedOutput(t *testing.T) {
 		require.NoError(t, os.WriteFile(p, []byte(`{}`), 0o600))
 	}
 
-	store := &ConfigStore{
+	store := newTestConfigStore(testStoreOpts{
 		config:         &Config{},
 		globalDataPath: pathA,
-	}
+	})
 	// Add in reverse order to test sorting
 	store.captureStalenessSnapshot([]string{pathC, pathA, pathB})
 
@@ -290,10 +290,10 @@ func TestConfigStaleness_RefreshClearsDirtyState(t *testing.T) {
 	// Create initial config file
 	require.NoError(t, os.WriteFile(configPath, []byte(`{"debug": false}`), 0o600))
 
-	store := &ConfigStore{
+	store := newTestConfigStore(testStoreOpts{
 		config:         &Config{},
 		globalDataPath: configPath,
-	}
+	})
 	store.captureStalenessSnapshot([]string{configPath})
 
 	// Modify the file
@@ -351,8 +351,8 @@ func TestReloadFromDisk_UsesNewConfigValues(t *testing.T) {
 	store.CaptureStalenessSnapshot([]string{configPath})
 
 	// Verify initial model
-	require.Equal(t, "openai", store.config.Models[SelectedModelTypeLarge].Provider)
-	require.Equal(t, "gpt-4", store.config.Models[SelectedModelTypeLarge].Model)
+	require.Equal(t, "openai", store.Config().Models[SelectedModelTypeLarge].Provider)
+	require.Equal(t, "gpt-4", store.Config().Models[SelectedModelTypeLarge].Model)
 
 	// Modify config on disk to change model
 	updatedConfig := `{
@@ -379,8 +379,8 @@ func TestReloadFromDisk_UsesNewConfigValues(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verify the NEW config values are now in effect (regression check)
-	require.Equal(t, "anthropic", store.config.Models[SelectedModelTypeLarge].Provider)
-	require.Equal(t, "claude-3", store.config.Models[SelectedModelTypeLarge].Model)
+	require.Equal(t, "anthropic", store.Config().Models[SelectedModelTypeLarge].Provider)
+	require.Equal(t, "claude-3", store.Config().Models[SelectedModelTypeLarge].Model)
 }
 
 // TestSetConfigField_AutoReloads verifies that SetConfigField automatically
@@ -400,7 +400,7 @@ func TestSetConfigField_AutoReloads(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verify initial state
-	require.False(t, store.config.Options.Debug)
+	require.False(t, store.Config().Options.Debug)
 
 	// Set globalDataPath and capture snapshot for staleness tracking
 	store.globalDataPath = configPath
@@ -411,7 +411,7 @@ func TestSetConfigField_AutoReloads(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verify in-memory state was automatically reloaded and reflects the change
-	require.True(t, store.config.Options.Debug, "Expected config to auto-reload and show debug = true")
+	require.True(t, store.Config().Options.Debug, "Expected config to auto-reload and show debug = true")
 
 	// Verify staleness is clean after the reload
 	staleness := store.ConfigStaleness()
@@ -439,7 +439,7 @@ func TestRemoveConfigField_AutoReloads(t *testing.T) {
 	store.CaptureStalenessSnapshot([]string{configPath})
 
 	// Verify the field exists initially (indirectly - store loaded successfully)
-	require.True(t, store.config.Options.Debug)
+	require.True(t, store.Config().Options.Debug)
 
 	// Remove the debug field
 	err = store.RemoveConfigField(ScopeGlobal, "options.debug")
@@ -459,11 +459,11 @@ func TestSetConfigField_AutoReloadSkipsWhenNoWorkingDir(t *testing.T) {
 	configPath := filepath.Join(dir, "crush.json")
 
 	// Create a store without working directory (like some test setups)
-	store := &ConfigStore{
+	store := newTestConfigStore(testStoreOpts{
 		config:         &Config{},
 		globalDataPath: configPath,
 		// workingDir is empty
-	}
+	})
 
 	// SetConfigField should succeed even without workingDir (auto-reload skips)
 	err := store.SetConfigField(ScopeGlobal, "foo", "bar")
@@ -550,7 +550,7 @@ func TestSetConfigFields_AutoReloadsAtomically(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verify both fields are reflected in memory.
-	require.True(t, store.config.Options.Debug)
+	require.True(t, store.Config().Options.Debug)
 }
 
 func TestLoadTokenFromDisk_ReturnsNewerToken(t *testing.T) {
@@ -574,10 +574,10 @@ func TestLoadTokenFromDisk_ReturnsNewerToken(t *testing.T) {
 	}`
 	require.NoError(t, os.WriteFile(configPath, []byte(configContent), 0o600))
 
-	store := &ConfigStore{
+	store := newTestConfigStore(testStoreOpts{
 		config:         &Config{},
 		globalDataPath: configPath,
-	}
+	})
 
 	token, err := store.loadTokenFromDisk(ScopeGlobal, "hyper")
 	require.NoError(t, err)
@@ -609,10 +609,10 @@ func TestLoadTokenFromDisk_ReturnsNilWhenSameToken(t *testing.T) {
 	}`
 	require.NoError(t, os.WriteFile(configPath, []byte(configContent), 0o600))
 
-	store := &ConfigStore{
+	store := newTestConfigStore(testStoreOpts{
 		config:         &Config{},
 		globalDataPath: configPath,
-	}
+	})
 
 	token, err := store.loadTokenFromDisk(ScopeGlobal, "hyper")
 	require.NoError(t, err)
@@ -626,10 +626,10 @@ func TestLoadTokenFromDisk_ReturnsNilWhenFileMissing(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "nonexistent.json")
 
-	store := &ConfigStore{
+	store := newTestConfigStore(testStoreOpts{
 		config:         &Config{},
 		globalDataPath: configPath,
-	}
+	})
 
 	token, err := store.loadTokenFromDisk(ScopeGlobal, "hyper")
 	require.NoError(t, err)
@@ -646,10 +646,10 @@ func TestLoadTokenFromDisk_ReturnsNilWhenProviderMissing(t *testing.T) {
 	configContent := `{"providers": {"openai": {"api_key": "test-key"}}}`
 	require.NoError(t, os.WriteFile(configPath, []byte(configContent), 0o600))
 
-	store := &ConfigStore{
+	store := newTestConfigStore(testStoreOpts{
 		config:         &Config{},
 		globalDataPath: configPath,
-	}
+	})
 
 	token, err := store.loadTokenFromDisk(ScopeGlobal, "hyper")
 	require.NoError(t, err)
@@ -666,10 +666,10 @@ func TestLoadTokenFromDisk_ReturnsNilWhenOAuthMissing(t *testing.T) {
 	configContent := `{"providers": {"hyper": {"api_key": "test-key"}}}`
 	require.NoError(t, os.WriteFile(configPath, []byte(configContent), 0o600))
 
-	store := &ConfigStore{
+	store := newTestConfigStore(testStoreOpts{
 		config:         &Config{},
 		globalDataPath: configPath,
-	}
+	})
 
 	token, err := store.loadTokenFromDisk(ScopeGlobal, "hyper")
 	require.NoError(t, err)
@@ -714,19 +714,19 @@ func TestRefreshOAuthToken_UsesDiskTokenWhenDifferent(t *testing.T) {
 		OAuthToken: oldToken,
 	})
 
-	store := &ConfigStore{
+	store := newTestConfigStore(testStoreOpts{
 		config: &Config{
 			Providers: providers,
 		},
 		globalDataPath: configPath,
-	}
+	})
 
 	// Refresh should use the disk token without making an external call
 	err := store.RefreshOAuthToken(context.Background(), ScopeGlobal, "hyper")
 	require.NoError(t, err)
 
 	// Verify the in-memory token was updated to the disk token
-	updatedConfig, ok := store.config.Providers.Get("hyper")
+	updatedConfig, ok := store.Config().Providers.Get("hyper")
 	require.True(t, ok)
 	require.Equal(t, "newer-access-token", updatedConfig.APIKey)
 	require.Equal(t, "newer-access-token", updatedConfig.OAuthToken.AccessToken)
