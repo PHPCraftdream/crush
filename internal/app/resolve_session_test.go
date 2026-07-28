@@ -104,6 +104,14 @@ func (m *mockSessionService) TransferChildCostToParent(context.Context, string, 
 	return nil
 }
 
+func (m *mockSessionService) GetCallTreeActivity(context.Context, string) (session.CallTreeActivity, bool, error) {
+	return session.CallTreeActivity{}, false, nil
+}
+
+func (m *mockSessionService) GetCallTreeActivityBatch(context.Context, []string) (map[string]session.CallTreeActivity, error) {
+	return nil, nil
+}
+
 func (m *mockSessionService) UpdateTitleAndUsage(context.Context, string, string, int64, int64, float64) error {
 	return nil
 }
