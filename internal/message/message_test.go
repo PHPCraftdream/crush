@@ -359,18 +359,20 @@ func TestCreateMessage_BackgroundJobNoticeRoundTrip(t *testing.T) {
 	})
 }
 
-// TestUpdate_UsesPublishMustDeliver verifies that Update (the terminal,
-// DB-durable write path) does not silently drop its UpdatedEvent the
-// moment a subscriber's channel is momentarily full — unlike best-effort
-// Publish, it must wait (bounded by the broker's must-deliver timeout)
-// for buffer space, so a slow-draining UI subscriber still eventually
-// sees the final message state instead of losing it forever.
+// TestUpdate_TerminalWrite_UsesPublishMustDeliver verifies that a
+// terminal Update — one whose Finish is a real (non-Partial) finish —
+// does not silently drop its UpdatedEvent the moment a subscriber's
+// channel is momentarily full. Unlike best-effort Publish, it must wait
+// (bounded by the broker's must-deliver timeout) for buffer space, so a
+// slow-draining UI subscriber still eventually sees the final message
+// state instead of losing it forever. The Partial-checkpoint
+// counterpart is TestUpdate_PartialCheckpoint_UsesBestEffortPublish.
 //
 // service embeds *pubsub.Broker[Message] directly, so we drive the
 // broker's buffer to capacity through the same Subscribe channel the
 // service hands out, then assert Update's publish blocks past an
 // instantaneous drop and lands once the reader catches up.
-func TestUpdate_UsesPublishMustDeliver(t *testing.T) {
+func TestUpdate_TerminalWrite_UsesPublishMustDeliver(t *testing.T) {
 	_, q := newTestMessageDB(t)
 	svc := NewService(q).(*service)
 	// Give must-deliver a small but non-zero timeout so the test is
@@ -407,7 +409,7 @@ func TestUpdate_UsesPublishMustDeliver(t *testing.T) {
 	// Now call Update concurrently. Because the buffer is full,
 	// PublishMustDeliver must take its bounded-blocking slow path
 	// instead of dropping instantly.
-	created.Parts = append(created.Parts, TextContent{Text: "updated"})
+	created.Parts = append(created.Parts, Finish{Reason: "stop", Time: time.Now().Unix()})
 	updateDone := make(chan error, 1)
 	start := time.Now()
 	go func() {
@@ -449,4 +451,73 @@ func TestUpdate_UsesPublishMustDeliver(t *testing.T) {
 		}
 	}
 	assert.True(t, found, "expected the Update's UpdatedEvent to have been delivered, not dropped")
+}
+
+// TestUpdate_PartialCheckpoint_UsesBestEffortPublish verifies the
+// counterpart of TestUpdate_TerminalWrite_UsesPublishMustDeliver: an
+// Update whose Finish part is a Partial checkpoint (written by the
+// auto-checkpoint ticker every ~2s during streaming) is published via
+// best-effort Publish, NOT PublishMustDeliver. With a full subscriber
+// buffer it must return near-instantly (dropping the event for the slow
+// subscriber) instead of blocking for the configured must-deliver
+// timeout — losing one mid-stream tick is harmless because the next
+// ticker tick or the terminal Finish re-establishes current state.
+func TestUpdate_PartialCheckpoint_UsesBestEffortPublish(t *testing.T) {
+	_, q := newTestMessageDB(t)
+	svc := NewService(q).(*service)
+	// A long must-deliver timeout: if Update mistakenly routed the
+	// partial checkpoint through PublishMustDeliver, this test would
+	// observably stall ~2s against the full buffer. Best-effort Publish
+	// returns near-instantly regardless.
+	svc.SetMustDeliverTimeout(2 * time.Second)
+
+	ctx := t.Context()
+	sessionID := "test-session-partial-checkpoint"
+
+	sub := svc.Subscribe(ctx)
+
+	created, err := svc.Create(ctx, sessionID, CreateMessageParams{
+		Role:  Assistant,
+		Parts: []ContentPart{TextContent{Text: "streaming"}},
+	})
+	require.NoError(t, err)
+
+	// Drain the CreatedEvent (Create uses best-effort Publish) so the
+	// buffer is empty before we fill it below.
+	<-sub
+
+	// A mid-stream checkpoint snapshot: a Finish with Partial==true, as
+	// the auto-checkpoint ticker writes it (Reason empty, finished_at
+	// stays NULL in the DB row).
+	created.Parts = append(created.Parts, Finish{
+		Time:    time.Now().Unix(),
+		Partial: true,
+	})
+
+	// Fill the subscriber buffer completely so the next publish has no
+	// free slot: best-effort Publish must drop it, PublishMustDeliver
+	// would block ~timeout.
+	bufCap := cap(sub)
+	for range bufCap {
+		svc.Publish(pubsub.CreatedEvent, created)
+	}
+	dropsBefore := svc.DropCount()
+
+	start := time.Now()
+	err = svc.Update(ctx, created)
+	elapsed := time.Since(start)
+	require.NoError(t, err)
+
+	// Best-effort Publish returns near-instantly despite the full
+	// buffer; PublishMustDeliver would have blocked ~2s here.
+	assert.Less(t, elapsed, 200*time.Millisecond,
+		"Partial checkpoint Update must not block on a full subscriber buffer")
+
+	// The partial snapshot was dropped for the slow subscriber via the
+	// best-effort path (DropCount), not the must-deliver path
+	// (MustDeliverDropCount must stay zero — no bounded wait occurred).
+	assert.Equal(t, dropsBefore+1, svc.DropCount(),
+		"Partial checkpoint should be dropped via best-effort Publish on a full buffer")
+	assert.Equal(t, uint64(0), svc.MustDeliverDropCount(),
+		"Partial checkpoint must not exercise the must-deliver timeout path")
 }

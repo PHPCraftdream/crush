@@ -208,6 +208,23 @@ func (b *Broker[T]) Publish(t EventType, payload T) {
 // tool result, error, cancel). Callers must still tolerate rare drops
 // after timeout — recovery is the subscriber's responsibility (e.g. a
 // re-fetch on the next session-visible event).
+//
+// Delivery to subscribers is sequential, not parallel: each subscriber
+// is handed the event (with its own bounded wait) before the next is
+// considered, so worst-case wall-clock cost is O(N × timeout) for N
+// slow subscribers. This is deliberate. The message broker has exactly
+// one subscriber in practice — the web server's single fan-out
+// goroutine (internal/server/events.go), which itself broadcasts to all
+// WebSocket clients — or, in the non-interactive crush run path, one
+// CLI output subscriber (internal/app/app.go). The broker never sees
+// per-client subscriptions; client fan-out happens downstream of a
+// single broker subscriber. With N effectively 1 (at most 2 if both
+// paths ran at once), sequential delivery caps at ~1×timeout and avoids
+// the goroutine-spawn and sync.WaitGroup overhead a parallel fan-out
+// would impose on every terminal publish. If a second high-volume
+// subscriber is ever added, revisit this: switch to a bounded parallel
+// fan-out so the timeout stays O(timeout) instead of scaling with
+// subscriber count.
 func (b *Broker[T]) PublishMustDeliver(ctx context.Context, t EventType, payload T) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()

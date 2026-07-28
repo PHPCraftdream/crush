@@ -189,8 +189,10 @@ func (s *service) Update(ctx context.Context, message Message) error {
 	// finished_at stays NULL so the row is still "in progress".
 	// The auto-checkpoint ticker uses this to persist mid-stream state
 	// without confusing IsFinished / recovery.
-	if f := message.FinishPart(); f != nil && !f.Partial {
-		finishedAt.Int64 = f.Time
+	finish := message.FinishPart()
+	partialCheckpoint := finish != nil && finish.Partial
+	if finish != nil && !finish.Partial {
+		finishedAt.Int64 = finish.Time
 		finishedAt.Valid = true
 	}
 	err = s.q.UpdateMessage(ctx, db.UpdateMessageParams{
@@ -205,18 +207,27 @@ func (s *service) Update(ctx context.Context, message Message) error {
 	// Clone the message before publishing to avoid race conditions with
 	// concurrent modifications to the Parts slice.
 	//
-	// Update is the synchronous, DB-durable write path (as opposed to
-	// Notify, which is the high-frequency in-memory-only streaming
-	// path). It is called at the end of a stream once a real
-	// (non-Partial) Finish part lands, on tool-result flushes, and on
-	// summary/checkpoint persistence — i.e. exactly the terminal states
-	// a user must see rather than a mid-stream snapshot that will
-	// shortly be superseded. Use PublishMustDeliver so a momentarily
-	// full subscriber buffer doesn't silently eat the final state; the
-	// caller (agent/coordinator hot path) is bounded by
-	// mustDeliverTimeout per subscriber, so this cannot stall streaming
-	// indefinitely.
-	s.PublishMustDeliver(ctx, pubsub.UpdatedEvent, message.Clone())
+	// Delivery semantics split on whether this is a terminal write or a
+	// mid-stream checkpoint snapshot:
+	//
+	//   - Terminal (real non-Partial Finish, tool-result flush,
+	//     summary): PublishMustDeliver, so a momentarily full
+	//     subscriber buffer doesn't silently eat the final state. The
+	//     caller is bounded by mustDeliverTimeout per subscriber.
+	//
+	//   - Partial checkpoint (Finish.Partial == true, written by the
+	//     auto-checkpoint ticker every ~2s during streaming):
+	//     best-effort Publish. Such a snapshot is superseded seconds
+	//     later by the next ticker tick or the real Finish; losing one
+	//     tick for a slow subscriber is harmless because the next
+	//     update re-establishes current state. Routing it through
+	//     PublishMustDeliver would make every ~2s checkpoint pay the
+	//     full bounded-blocking wait per slow subscriber for nothing.
+	if partialCheckpoint {
+		s.Publish(pubsub.UpdatedEvent, message.Clone())
+	} else {
+		s.PublishMustDeliver(ctx, pubsub.UpdatedEvent, message.Clone())
+	}
 	return nil
 }
 
