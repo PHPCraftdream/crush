@@ -729,13 +729,24 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	// Fork patch: batch 8 — auto-checkpoint state for mid-stream
 	// persistence. See CHANGELOG.fork.md section 6.
 	//
-	// Invariant: sessionLock (already declared above) protects
-	// currentAssistant.Parts for all DB writes. The checkpoint
-	// goroutine acquires sessionLock before reading Parts and
-	// calling Update. The streaming callbacks that mutate Parts
-	// (OnTextDelta, OnToolInputStart, etc.) also hold sessionLock
-	// at their DB-write points. OnStepFinish drains the ticker
-	// and stops the goroutine before its final write.
+	// Invariant: sessionLock (already declared above) protects EVERY
+	// touch of currentAssistant — mutation, Clone(), and even a bare
+	// len(Parts)/pointer read — because the checkpoint goroutine below
+	// and the streaming callbacks (OnTextDelta, OnReasoningDelta,
+	// OnToolInputStart, ...) run concurrently on separate goroutines.
+	// message.Message.Clone() has no synchronization of its own, so a
+	// snapshot must be taken while holding sessionLock.
+	//
+	// The lock must NEVER be held across a.messages.Update (the SQLite
+	// write): every writer takes the lock, mutates/clones a private
+	// snapshot, releases the lock, then calls Update on the snapshot
+	// without the lock held. Otherwise each checkpoint tick or
+	// DB-writing callback would stall the whole streaming loop for the
+	// duration of a disk write. OnStepFinish drains the ticker and
+	// stops the goroutine (via stopCheckpoint) before its final write;
+	// the tail of Run() also calls stopCheckpoint() defensively before
+	// touching currentAssistant, in case agent.Stream returned before
+	// OnStepFinish ever ran (e.g. the very first provider call failed).
 	var checkpointPartsLen int // last-flushed len(Parts), for coalescing
 	checkpointDone := make(chan struct{})
 	checkpointStarted := false
@@ -753,12 +764,21 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 				case <-genCtx.Done():
 					return
 				case <-ticker.C:
+					// Snapshot under the lock (mutate/read/Clone all happen
+					// while other goroutines are excluded), then release the
+					// lock BEFORE the SQLite write. Holding sessionLock across
+					// a.messages.Update would stall every streaming callback
+					// (OnTextDelta, OnReasoningDelta, ...) for the duration of
+					// the disk write, once per checkpoint tick.
 					sessionLock.Lock()
+					var snap message.Message
+					haveSnap := false
+					newPartsLen := checkpointPartsLen
 					if currentAssistant != nil && len(currentAssistant.Parts) != checkpointPartsLen {
 						// Snapshot the current Parts into a clone
 						// with a Partial Finish marker so the row
 						// is recognisable as mid-stream on recovery.
-						snap := currentAssistant.Clone()
+						snap = currentAssistant.Clone()
 						snap.AddFinish(message.FinishReasonUnknown, "", "")
 						// Mark Partial on the just-added finish.
 						for i := len(snap.Parts) - 1; i >= 0; i-- {
@@ -768,6 +788,11 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 								break
 							}
 						}
+						newPartsLen = len(currentAssistant.Parts)
+						haveSnap = true
+					}
+					sessionLock.Unlock()
+					if haveSnap {
 						if err := a.messages.Update(genCtx, snap); err != nil {
 							slog.Debug(
 								"agent: checkpoint flush failed",
@@ -776,10 +801,9 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 								"err", err,
 							)
 						} else {
-							checkpointPartsLen = len(currentAssistant.Parts)
+							checkpointPartsLen = newPartsLen
 						}
 					}
-					sessionLock.Unlock()
 				}
 			}
 		}()
@@ -828,10 +852,13 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	// It never blocks: if the channel already has a pending snapshot, the old
 	// one is discarded and replaced with the newest state.
 	notifyUI := func() error {
+		sessionLock.Lock()
 		if currentAssistant == nil {
+			sessionLock.Unlock()
 			return nil
 		}
 		msg := currentAssistant.Clone()
+		sessionLock.Unlock()
 		select {
 		case latestMsgCh <- msg:
 		default:
@@ -875,15 +902,20 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 						"session_id", call.SessionID, "error", pErr)
 					peakMsg, peakDetails := peakHoursStoppedFinishText(pErr)
 					sessionLock.Lock()
-					if currentAssistant != nil {
+					var snap message.Message
+					haveSnap := currentAssistant != nil
+					if haveSnap {
 						currentAssistant.AddFinish(message.FinishReasonError, peakMsg, peakDetails)
+						snap = currentAssistant.Clone()
+					}
+					sessionLock.Unlock()
+					if haveSnap {
 						flushCtx, flushCancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
-						if uErr := a.messages.Update(flushCtx, *currentAssistant); uErr != nil {
+						if uErr := a.messages.Update(flushCtx, snap); uErr != nil {
 							slog.Warn("agent: failed to persist peak-hours finish message", "error", uErr)
 						}
 						flushCancel()
 					}
-					sessionLock.Unlock()
 					if cancelFn, ok := a.activeRequests.Get(call.SessionID); ok {
 						cancelFn()
 					}
@@ -1077,23 +1109,31 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			callContext = context.WithValue(callContext, tools.MessageIDContextKey, assistantMsg.ID)
 			callContext = context.WithValue(callContext, tools.SupportsImagesContextKey, largeModel.CatwalkCfg.SupportsImages)
 			callContext = context.WithValue(callContext, tools.ModelNameContextKey, largeModel.CatwalkCfg.Name)
+			sessionLock.Lock()
 			currentAssistant = &assistantMsg
+			sessionLock.Unlock()
 			return callContext, prepared, err
 		},
 		OnReasoningStart: func(id string, reasoning fantasy.ReasoningContent) error {
 			bumpActivity()
 			slog.Debug("agent: OnReasoningStart called", "id", id)
+			sessionLock.Lock()
 			currentAssistant.AppendReasoningContent(reasoning.Text)
-			return a.messages.Update(genCtx, *currentAssistant)
+			snap := currentAssistant.Clone()
+			sessionLock.Unlock()
+			return a.messages.Update(genCtx, snap)
 		},
 		OnReasoningDelta: func(id string, text string) error {
 			bumpActivity()
 			slog.Debug("agent: OnReasoningDelta called", "len", len(text))
+			sessionLock.Lock()
 			currentAssistant.AppendReasoningContent(text)
+			sessionLock.Unlock()
 			return notifyUI()
 		},
 		OnReasoningEnd: func(id string, reasoning fantasy.ReasoningContent) error {
 			bumpActivity()
+			sessionLock.Lock()
 			// handle anthropic signature
 			if anthropicData, ok := reasoning.ProviderMetadata[anthropic.Name]; ok {
 				if reasoning, ok := anthropicData.(*anthropic.ReasoningOptionMetadata); ok {
@@ -1111,25 +1151,26 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 				}
 			}
 			currentAssistant.FinishThinking()
-			return a.messages.Update(genCtx, *currentAssistant)
+			snap := currentAssistant.Clone()
+			sessionLock.Unlock()
+			return a.messages.Update(genCtx, snap)
 		},
 		OnTextDelta: func(id string, text string) error {
 			bumpActivity()
 			// Fork patch: batch 8 — start the checkpoint ticker on the
 			// first text delta of this step (lazily, once only).
 			startCheckpoint()
+			sessionLock.Lock()
 			// Fork patch: batch 8 — emit final-composition log at most
 			// once per step, on the first text delta after a tool boundary.
 			if sawToolBoundary && currentAssistant != nil {
 				sawToolBoundary = false
-				sessionLock.Lock()
 				slog.Info(
 					"agent: final composition started",
 					"session_id", call.SessionID,
 					"message_id", currentAssistant.ID,
 					"chars_in_message_so_far", len(currentAssistant.FullText()),
 				)
-				sessionLock.Unlock()
 			}
 			// Strip leading newline from initial text content. This is is
 			// particularly important in non-interactive mode where leading
@@ -1139,6 +1180,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			}
 
 			currentAssistant.AppendContent(text)
+			sessionLock.Unlock()
 			return notifyUI()
 		},
 		OnToolInputStart: func(id string, toolName string) error {
@@ -1150,20 +1192,28 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 				ProviderExecuted: false,
 				Finished:         false,
 			}
+			sessionLock.Lock()
 			currentAssistant.AddToolCall(toolCall)
+			snap := currentAssistant.Clone()
+			sessionLock.Unlock()
 			// Use parent ctx instead of genCtx to ensure the update succeeds
 			// even if the request is canceled mid-stream
-			return a.messages.Update(ctx, *currentAssistant)
+			return a.messages.Update(ctx, snap)
 		},
 		OnToolInputDelta: func(id string, delta string) error {
 			bumpActivity()
+			sessionLock.Lock()
 			currentAssistant.AppendToolCallInput(id, delta)
+			sessionLock.Unlock()
 			return nil // don't spam DB on every delta; ToolInputEnd will persist
 		},
 		OnToolInputEnd: func(id string) error {
 			bumpActivity()
+			sessionLock.Lock()
 			currentAssistant.FinishToolCall(id)
-			return a.messages.Update(genCtx, *currentAssistant)
+			snap := currentAssistant.Clone()
+			sessionLock.Unlock()
+			return a.messages.Update(genCtx, snap)
 		},
 		OnRetry: func(err *fantasy.ProviderError, delay time.Duration) {
 			bumpActivity()
@@ -1194,10 +1244,13 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 				ProviderExecuted: false,
 				Finished:         true,
 			}
+			sessionLock.Lock()
 			currentAssistant.AddToolCall(toolCall)
+			snap := currentAssistant.Clone()
+			sessionLock.Unlock()
 			// Use parent ctx instead of genCtx to ensure the update succeeds
 			// even if the request is canceled mid-stream
-			return a.messages.Update(ctx, *currentAssistant)
+			return a.messages.Update(ctx, snap)
 		},
 		OnToolResult: func(result fantasy.ToolResultContent) error {
 			bumpActivity()
@@ -1210,9 +1263,12 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 				toolResult.Content = "Tool call failed: arguments were not valid JSON. Please check your tool call format and try again."
 				toolResult.IsError = true
 			}
+			sessionLock.Lock()
+			sessionID := currentAssistant.SessionID
+			sessionLock.Unlock()
 			// Use parent ctx instead of genCtx to ensure the message is created
 			// even if the request is canceled mid-stream
-			_, createMsgErr := a.messages.Create(ctx, currentAssistant.SessionID, message.CreateMessageParams{
+			_, createMsgErr := a.messages.Create(ctx, sessionID, message.CreateMessageParams{
 				Role: message.Tool,
 				Parts: []message.ContentPart{
 					toolResult,
@@ -1269,6 +1325,14 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			// a blank assistant block — looking like a session lockup. Convert
 			// this case to an error so both the WUI fallback and the user see
 			// an actionable message. See CHANGELOG.fork.md section 4.D.
+			//
+			// currentAssistant reads/mutations below are under sessionLock:
+			// OnStepFinish never runs concurrently with the other streaming
+			// callbacks (fantasy invokes them sequentially from one loop),
+			// but it DOES run concurrently with the checkpoint ticker and
+			// the peak-hours watcher goroutines, which also touch
+			// currentAssistant.
+			sessionLock.Lock()
 			if finishReason == message.FinishReasonUnknown &&
 				currentAssistant.FullText() == "" &&
 				currentAssistant.ReasoningContent().Thinking == "" &&
@@ -1299,14 +1363,13 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			} else {
 				currentAssistant.AddFinish(finishReason, "", "")
 			}
+			sessionLock.Unlock()
 			// Drain any pending UI snapshot so the ticker goroutine does not
 			// publish a stale state after messages.Update writes the final one.
 			select {
 			case <-latestMsgCh:
 			default:
 			}
-			sessionLock.Lock()
-			defer sessionLock.Unlock()
 
 			updatedSession, getSessionErr := a.sessions.Get(ctx, call.SessionID)
 			if getSessionErr != nil {
@@ -1379,10 +1442,13 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 						slog.Warn("agent: aborting — provider entered peak-hours mid-turn",
 							"session_id", call.SessionID, "error", pErr)
 						peakMsg, peakDetails := peakHoursStoppedFinishText(pErr)
+						sessionLock.Lock()
 						currentAssistant.AddFinish(message.FinishReasonError, peakMsg, peakDetails)
+						snap := currentAssistant.Clone()
+						sessionLock.Unlock()
 						// Use the parent ctx (not genCtx) for the DB write —
 						// genCtx dies as soon as we cancel below.
-						if uErr := a.messages.Update(ctx, *currentAssistant); uErr != nil {
+						if uErr := a.messages.Update(ctx, snap); uErr != nil {
 							slog.Warn("agent: failed to persist peak-hours finish message", "error", uErr)
 						}
 						if cancelFn, ok := a.activeRequests.Get(call.SessionID); ok {
@@ -1400,7 +1466,10 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 				}
 			}
 
-			return a.messages.Update(genCtx, *currentAssistant)
+			sessionLock.Lock()
+			snap := currentAssistant.Clone()
+			sessionLock.Unlock()
+			return a.messages.Update(genCtx, snap)
 		},
 		StopWhen: []fantasy.StopCondition{
 			func(_ []fantasy.StepResult) bool {
@@ -1437,6 +1506,15 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			},
 		},
 	})
+	// Defensive: normally OnStepFinish stops the checkpoint ticker (via
+	// stopCheckpoint()) before its own final write. But if agent.Stream
+	// returned an error before any step ever completed (e.g. the very
+	// first provider call failed), OnStepFinish never ran and the ticker
+	// goroutine is still alive — it would otherwise race with the
+	// unlocked currentAssistant touches below. stopCheckpoint() is safe
+	// to call more than once (it just waits on an already-closed
+	// channel the second time).
+	stopCheckpoint()
 	// If the peak-hours mid-turn check fired, it had to call cancelFn()
 	// to break fantasy's loop (OnStepFinish errors alone don't stop it).
 	// Depending on exactly when fantasy notices the cancellation relative
@@ -1474,7 +1552,17 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 		isHyper := largeModel.ModelCfg.Provider == hyper.Name
 		isCancelErr := errors.Is(err, context.Canceled)
 		isWatchdogStall := isCancelErr && wd.stalled.Load()
-		if currentAssistant == nil {
+		// currentAssistant is only ever reassigned (never set back to nil)
+		// by PrepareStep, under sessionLock. agent.Stream has already
+		// returned by this point so no streaming callback can race this
+		// read, but the peak-hours watcher goroutine may still be alive
+		// (it only stops when genCtx is cancelled by the deferred cancel()
+		// at the end of Run) and touches currentAssistant under the same
+		// lock, so guard the read too.
+		sessionLock.Lock()
+		nilAssistant := currentAssistant == nil
+		sessionLock.Unlock()
+		if nilAssistant {
 			return result, err
 		}
 		// All DB writes in the error path use a detached context. The outer
@@ -1490,9 +1578,16 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 		flushCtx, flushCancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 		defer flushCancel()
 		// Ensure we finish thinking on error to close the reasoning state.
+		// From here to the final flush below, currentAssistant's Parts are
+		// mutated in place; every touch (including the plain reads used to
+		// build msgs/toolCalls) takes sessionLock to stay consistent with
+		// the peak-hours watcher goroutine that may still be running.
+		sessionLock.Lock()
 		currentAssistant.FinishThinking()
 		toolCalls := currentAssistant.ToolCalls()
-		msgs, createErr := a.messages.List(flushCtx, currentAssistant.SessionID)
+		sessionID := currentAssistant.SessionID
+		sessionLock.Unlock()
+		msgs, createErr := a.messages.List(flushCtx, sessionID)
 		if createErr != nil {
 			return nil, createErr
 		}
@@ -1500,8 +1595,11 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			if !tc.Finished {
 				tc.Finished = true
 				tc.Input = "{}"
+				sessionLock.Lock()
 				currentAssistant.AddToolCall(tc)
-				updateErr := a.messages.Update(flushCtx, *currentAssistant)
+				snap := currentAssistant.Clone()
+				sessionLock.Unlock()
+				updateErr := a.messages.Update(flushCtx, snap)
 				if updateErr != nil {
 					return nil, updateErr
 				}
@@ -1536,7 +1634,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 				Content:    content,
 				IsError:    true,
 			}
-			_, createErr = a.messages.Create(flushCtx, currentAssistant.SessionID, message.CreateMessageParams{
+			_, createErr = a.messages.Create(flushCtx, sessionID, message.CreateMessageParams{
 				Role: message.Tool,
 				Parts: []message.ContentPart{
 					toolResult,
@@ -1551,6 +1649,12 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 		var peakErr *PeakHoursError
 		var awaitingErr *AwaitingAnswerError
 		const defaultTitle = "Provider Error"
+		// None of the branches below perform I/O — they only decide which
+		// AddFinish to record based on err/isWatchdogStall/etc. — so the
+		// whole chain can run under a single lock/unlock pair guarding the
+		// currentAssistant mutation, matching the pattern used everywhere
+		// else in Run().
+		sessionLock.Lock()
 		if isWatchdogStall {
 			// Close the observability loop: the watchdog goroutine already
 			// emitted its slog.Warn at fire-time, but a log reader
@@ -1619,12 +1723,14 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 		} else {
 			currentAssistant.AddFinish(message.FinishReasonError, defaultTitle, err.Error())
 		}
+		snap := currentAssistant.Clone()
+		sessionLock.Unlock()
 		// Detached flush (flushCtx is context.WithoutCancel + 15s timeout,
 		// created at the top of this error block). This is the call that
 		// MUST land on disk — without it the assistant message has tool
 		// calls but no finish part, and the WUI/recovery sees it as still
 		// in-flight forever.
-		updateErr := a.messages.Update(flushCtx, *currentAssistant)
+		updateErr := a.messages.Update(flushCtx, snap)
 		if updateErr != nil {
 			slog.Error(
 				"agent: failed to persist final finish part",
@@ -1658,7 +1764,10 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			return nil, summarizeErr
 		}
 		// If the agent wasn't done...
-		if len(currentAssistant.ToolCalls()) > 0 {
+		sessionLock.Lock()
+		hasPendingToolCalls := len(currentAssistant.ToolCalls()) > 0
+		sessionLock.Unlock()
+		if hasPendingToolCalls {
 			existing, ok := a.messageQueue.Get(call.SessionID)
 			if !ok {
 				existing = []SessionAgentCall{}

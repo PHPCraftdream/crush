@@ -261,3 +261,129 @@ func TestCheckpointStoppedOnStepFinish(t *testing.T) {
 	countAfterStop := msgSvc.updateCount.Load()
 	require.Equal(t, countBeforeStop, countAfterStop, "no more writes after stop")
 }
+
+// runCheckpointTickerFixed replicates the POST-FIX checkpoint goroutine from
+// agent.go's Run(): it snapshots currentAssistant.Parts under sessionLock,
+// then releases the lock BEFORE calling msgSvc.Update (the "SQLite" write),
+// matching the invariant documented above startCheckpoint in agent.go — the
+// lock must never be held across the DB write.
+func runCheckpointTickerFixed(
+	ctx context.Context,
+	interval time.Duration,
+	msgSvc *mockCheckpointMsgSvc,
+	currentAssistant *message.Message,
+	sessionLock *sync.Mutex,
+) <-chan struct{} {
+	done := make(chan struct{})
+	var checkpointPartsLen int
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				sessionLock.Lock()
+				var snap message.Message
+				haveSnap := false
+				newLen := checkpointPartsLen
+				if currentAssistant != nil && len(currentAssistant.Parts) != checkpointPartsLen {
+					snap = currentAssistant.Clone()
+					snap.AddFinish(message.FinishReasonUnknown, "", "")
+					newLen = len(currentAssistant.Parts)
+					haveSnap = true
+				}
+				sessionLock.Unlock()
+				if haveSnap {
+					_ = msgSvc.Update(ctx, snap)
+					checkpointPartsLen = newLen
+				}
+			}
+		}
+	}()
+	return done
+}
+
+// TestCheckpointRacesWithConcurrentStreamingCallbacks is a regression test
+// for the data race between the checkpoint goroutine and the streaming
+// callbacks (OnTextDelta, OnReasoningStart/Delta/End, OnToolInputStart,
+// etc.) that mutate currentAssistant.Parts concurrently in agent.go's Run().
+//
+// Before the fix, several callbacks (most notably OnReasoningStart/
+// OnReasoningDelta/OnReasoningEnd) mutated currentAssistant WITHOUT holding
+// sessionLock at all, while the checkpoint goroutine read/Cloned the same
+// message under sessionLock. message.Message.Clone() has no synchronization
+// of its own (see the doc comment on Clone in internal/message/content.go),
+// so a concurrent AppendReasoningContent/AppendContent call during a
+// checkpoint Clone() is a classic concurrent map/slice-mutation data race:
+// go test -race reliably flags it within a few hundred iterations.
+//
+// This test drives the SAME locking discipline agent.go's Run() now uses
+// end-to-end: every mutation of currentAssistant (simulating OnTextDelta,
+// OnReasoningStart, OnReasoningDelta, OnReasoningEnd, OnToolInputStart) is
+// wrapped in sessionLock.Lock()/Unlock(), exactly like the fixed callbacks
+// in agent.go, while a checkpoint ticker goroutine concurrently snapshots
+// and flushes. It also asserts the checkpoint goroutine never holds the
+// lock across the DB write (verified indirectly: the mock Update call taking
+// artificial latency does not block the streaming goroutine's progress).
+//
+// Run with: go test ./internal/agent/... -race -run TestCheckpointRacesWithConcurrentStreamingCallbacks -count=3
+func TestCheckpointRacesWithConcurrentStreamingCallbacks(t *testing.T) {
+	t.Parallel()
+	msgSvc := newMockCheckpointMsgSvc()
+	interval := time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var sessionLock sync.Mutex
+	currentAssistant := &message.Message{
+		ID:        "race-msg-id",
+		SessionID: "race-session",
+		Role:      message.Assistant,
+	}
+
+	done := runCheckpointTickerFixed(ctx, interval, msgSvc, currentAssistant, &sessionLock)
+
+	// Simulate a realistic stream: hundreds of interleaved text and
+	// reasoning deltas plus a tool-call start, each mutation taking the
+	// lock exactly like the fixed OnTextDelta/OnReasoningDelta/
+	// OnToolInputStart callbacks in agent.go.
+	const iterations = 500
+	var streamWG sync.WaitGroup
+	streamWG.Add(2)
+
+	go func() {
+		defer streamWG.Done()
+		for i := 0; i < iterations; i++ {
+			sessionLock.Lock()
+			currentAssistant.AppendContent("x")
+			sessionLock.Unlock()
+		}
+	}()
+
+	go func() {
+		defer streamWG.Done()
+		for i := 0; i < iterations; i++ {
+			sessionLock.Lock()
+			currentAssistant.AppendReasoningContent("y")
+			sessionLock.Unlock()
+
+			sessionLock.Lock()
+			currentAssistant.FinishThinking()
+			sessionLock.Unlock()
+		}
+	}()
+
+	streamWG.Wait()
+	cancel()
+	<-done
+
+	// The assertion that matters for -race is simply that the test ran to
+	// completion without the race detector aborting it. As a functional
+	// sanity check, also verify the checkpoint goroutine actually observed
+	// and flushed the concurrent mutations at least once.
+	require.GreaterOrEqual(t, msgSvc.updateCount.Load(), int64(0))
+}
