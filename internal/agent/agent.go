@@ -756,39 +756,48 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	// touching currentAssistant, in case agent.Stream returned before
 	// OnStepFinish ever ran (e.g. the very first provider call failed).
 	var checkpointPartsLen int // last-flushed len(Parts), for coalescing
-	checkpointDone := make(chan struct{})
-	checkpointStarted := false
+	// checkpointStop and checkpointDone are reborn on every step.
+	// startCheckpoint allocates a fresh pair and launches the ticker
+	// goroutine; stopCheckpoint closes checkpointStop — the goroutine's
+	// dedicated exit signal — then waits on checkpointDone for it to
+	// actually exit, then nils both so the next step starts clean. The
+	// exit signal MUST be a dedicated channel, NOT genCtx.Done(): genCtx
+	// stays alive for the whole body of Run (cancelled only by the
+	// deferred cancel() at function return), so relying on it would force
+	// stopCheckpoint to always hit its 5s backstop — the ~10s/turn stall
+	// this code replaces. start/stop run on fantasy's single callback
+	// goroutine / the Run goroutine (never concurrent with each other);
+	// the ticker goroutine captures local channel refs at launch, so
+	// nil-ing the outer vars after stop does not affect it. currentAssistant
+	// access stays guarded by sessionLock below.
+	var checkpointStop chan struct{}
+	var checkpointDone chan struct{}
 	startCheckpoint := func() {
-		if a.checkpointInterval <= 0 || checkpointStarted {
+		if a.checkpointInterval <= 0 || checkpointStop != nil {
 			return
 		}
-		checkpointStarted = true
+		stop := make(chan struct{})
+		done := make(chan struct{})
+		checkpointStop = stop
+		checkpointDone = done
 		go func() {
-			defer close(checkpointDone)
+			defer close(done)
 			ticker := time.NewTicker(a.checkpointInterval)
 			defer ticker.Stop()
 			for {
 				select {
+				case <-stop:
+					return
 				case <-genCtx.Done():
 					return
 				case <-ticker.C:
-					// Snapshot under the lock (mutate/read/Clone all happen
-					// while other goroutines are excluded), then release the
-					// lock BEFORE the SQLite write. Holding sessionLock across
-					// a.messages.Update would stall every streaming callback
-					// (OnTextDelta, OnReasoningDelta, ...) for the duration of
-					// the disk write, once per checkpoint tick.
 					sessionLock.Lock()
 					var snap message.Message
 					haveSnap := false
 					newPartsLen := checkpointPartsLen
 					if currentAssistant != nil && len(currentAssistant.Parts) != checkpointPartsLen {
-						// Snapshot the current Parts into a clone
-						// with a Partial Finish marker so the row
-						// is recognisable as mid-stream on recovery.
 						snap = currentAssistant.Clone()
 						snap.AddFinish(message.FinishReasonUnknown, "", "")
-						// Mark Partial on the just-added finish.
 						for i := len(snap.Parts) - 1; i >= 0; i-- {
 							if f, ok := snap.Parts[i].(message.Finish); ok {
 								f.Partial = true
@@ -817,17 +826,21 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 		}()
 	}
 	stopCheckpoint := func() {
-		if checkpointStarted {
-			// The ticker goroutine exits on genCtx.Done (which
-			// fires on cancel() or natural completion). Just wait.
-			select {
-			case <-checkpointDone:
-			case <-time.After(5 * time.Second):
-				// Defensive: don't block the critical path.
-			}
+		if checkpointStop == nil {
+			return
 		}
+		close(checkpointStop)
+		checkpointStop = nil
+		select {
+		case <-checkpointDone:
+		case <-time.After(5 * time.Second):
+			slog.Warn(
+				"agent: checkpoint goroutine did not exit within 5s of stop signal",
+				"session_id", call.SessionID,
+			)
+		}
+		checkpointDone = nil
 	}
-	_ = stopCheckpoint // used in OnStepFinish below
 
 	// latestMsgCh holds at most one pending UI snapshot (latest-value semantics).
 	// A ticker goroutine drains it at ~20fps, decoupling the token arrival rate
@@ -1514,12 +1527,13 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	})
 	// Defensive: normally OnStepFinish stops the checkpoint ticker (via
 	// stopCheckpoint()) before its own final write. But if agent.Stream
-	// returned an error before any step ever completed (e.g. the very
-	// first provider call failed), OnStepFinish never ran and the ticker
-	// goroutine is still alive — it would otherwise race with the
-	// unlocked currentAssistant touches below. stopCheckpoint() is safe
-	// to call more than once (it just waits on an already-closed
-	// channel the second time).
+	// returned an error before any step completed (e.g. the very first
+	// provider call failed), OnStepFinish never ran and the ticker
+	// goroutine may still be alive — it would otherwise race with the
+	// unlocked currentAssistant touches below. stopCheckpoint() is safe to
+	// call more than once: after the first call the stop channel is nil'd,
+	// so subsequent calls hit the nil guard and return immediately (no
+	// second wait, no double-close).
 	stopCheckpoint()
 	// If the peak-hours mid-turn check fired, it had to call cancelFn()
 	// to break fantasy's loop (OnStepFinish errors alone don't stop it).
