@@ -81,7 +81,7 @@ func (sn *storeSnapshot) clone() *storeSnapshot {
 // and read every field from the same snapshot — lock-free, and always a
 // single consistent generation. Writers (both ReloadFromDisk and the
 // copy-on-write setters like SetCompactMode) serialize against each other
-// via reloadMu/writeMu, build a brand new snapshot from a shallow copy of
+// via publishMu, build a brand new snapshot from a shallow copy of
 // the config plus freshly cloned nested collections, and publish it with a
 // single snap.Store — the old snapshot, and anything still holding a
 // reference to it, is left completely untouched.
@@ -94,23 +94,36 @@ type ConfigStore struct {
 	workingDir     string
 	globalDataPath string // ~/.local/share/crush/crush.json
 
-	// reloadMu serialises ReloadFromDisk calls so concurrent reloads (e.g.
-	// the web UI's file watcher racing a config write) cannot tear store
-	// fields against each other. autoReload uses TryLock on reloadMu to
-	// skip a redundant reload when one is already in progress — this also
-	// covers the re-entrant call from configureProviders during a reload.
-	reloadMu sync.Mutex
+	// publishMu is the single mutex that serialises ALL snapshot
+	// publications — both ReloadFromDisk (which rebuilds the entire
+	// config from disk) and the copy-on-write mutators (updateConfig,
+	// RefreshStalenessSnapshot, CaptureStalenessSnapshot). Every
+	// read-current-generation → build-new → snap.Store cycle takes this
+	// lock for its full duration, so a writer can never publish a clone
+	// built from a stale generation on top of a reload that already
+	// published a newer one (the lost-update race that existed when
+	// reloadMu and writeMu were separate locks). autoReload uses TryLock
+	// on publishMu to skip a redundant reload when one is already in
+	// progress — this also covers the re-entrant call from
+	// configureProviders → RemoveConfigField → autoReload during a
+	// reload or the initial Load (which hold publishMu).
+	publishMu sync.Mutex
 
-	// writeMu serialises the copy-on-write mutators (SetCompactMode,
-	// UpdatePreferredModels, SetProviderAPIKey, ...) against each other so
-	// two concurrent writers can't both read the same stale snapshot,
-	// build their own updated copy, and have one silently clobber the
-	// other's change when they publish. It does NOT serialise against
-	// reloadMu: a reload rebuilds the whole config from disk, while a
-	// writer applies one targeted in-memory change — both still publish
-	// through the same atomic snap.Store, so whichever finishes last wins
-	// and neither can tear the snapshot.
-	writeMu sync.Mutex
+	// diskWriteMu serialises the on-disk read-modify-write cycle
+	// (os.ReadFile → sjson.Set/Delete → atomicWriteFile) in
+	// SetConfigFields and RemoveConfigField. Without it, two concurrent
+	// callers writing to the same crush.json path could each read the
+	// pre-write file, apply only their own key, and have the second
+	// atomicWriteFile clobber the first — a classic lost-update on the
+	// file itself, independent of the in-memory snapshot race that
+	// publishMu fixes. It is deliberately separate from publishMu so
+	// that disk I/O does not block lock-free snapshot readers, and so
+	// that the autoReload call at the end of each disk write (which
+	// acquires publishMu via ReloadFromDisk) cannot deadlock against a
+	// publishMu already held by the same goroutine. Lock ordering is
+	// always publishMu → diskWriteMu (when both are held), and
+	// diskWriteMu is always released before autoReload is called.
+	diskWriteMu sync.Mutex
 }
 
 // loadSnapshot returns the current published snapshot. It never returns
@@ -234,11 +247,22 @@ func (s *ConfigStore) SetConfigFields(scope Scope, kv map[string]any) error {
 	if err != nil {
 		return fmt.Errorf("%v: %w", kv, err)
 	}
+
+	// diskWriteMu serialises the read-modify-write cycle on the config
+	// file so that two concurrent callers (e.g. web UI + CLI) writing
+	// different keys to the same path don't clobber each other: without
+	// it, each would read the pre-write file, apply only its own key,
+	// and the second atomicWriteFile would erase the first key. The
+	// lock is released before autoReload so that autoReload's own
+	// publishMu acquisition (via ReloadFromDisk) cannot deadlock.
+	s.diskWriteMu.Lock()
+
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			data = []byte("{}")
 		} else {
+			s.diskWriteMu.Unlock()
 			return fmt.Errorf("failed to read config file: %w", err)
 		}
 	}
@@ -255,19 +279,26 @@ func (s *ConfigStore) SetConfigFields(scope Scope, kv map[string]any) error {
 	for _, key := range keys {
 		newValue, err = sjson.Set(newValue, key, kv[key])
 		if err != nil {
+			s.diskWriteMu.Unlock()
 			return fmt.Errorf("failed to set config field %s: %w", key, err)
 		}
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		s.diskWriteMu.Unlock()
 		return fmt.Errorf("failed to create config directory %q: %w", path, err)
 	}
 	if err := atomicWriteFile(path, []byte(newValue), 0o600); err != nil {
+		s.diskWriteMu.Unlock()
 		return fmt.Errorf("failed to write config file: %w", err)
 	}
 
+	s.diskWriteMu.Unlock()
+
 	// Auto-reload to keep in-memory state fresh after config edits.
 	// We use context.Background() since this is an internal operation that
-	// shouldn't be cancelled by user context.
+	// shouldn't be cancelled by user context. This runs OUTSIDE
+	// diskWriteMu so that autoReload's publishMu acquisition cannot
+	// deadlock against a diskWriteMu already held by this goroutine.
 	if err := s.autoReload(context.Background()); err != nil {
 		// Log warning but don't fail the write - disk is already updated.
 		slog.Warn("Config file updated but failed to reload in-memory state", "error", err)
@@ -284,23 +315,36 @@ func (s *ConfigStore) RemoveConfigField(scope Scope, key string) error {
 	if err != nil {
 		return fmt.Errorf("%s: %w", key, err)
 	}
+
+	// diskWriteMu serialises the read-modify-write cycle — see
+	// SetConfigFields for the full rationale. Released before autoReload
+	// to avoid deadlock against publishMu.
+	s.diskWriteMu.Lock()
+
 	data, err := os.ReadFile(path)
 	if err != nil {
+		s.diskWriteMu.Unlock()
 		return fmt.Errorf("failed to read config file: %w", err)
 	}
 
 	newValue, err := sjson.Delete(string(data), key)
 	if err != nil {
+		s.diskWriteMu.Unlock()
 		return fmt.Errorf("failed to delete config field %s: %w", key, err)
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		s.diskWriteMu.Unlock()
 		return fmt.Errorf("failed to create config directory %q: %w", path, err)
 	}
 	if err := atomicWriteFile(path, []byte(newValue), 0o600); err != nil {
+		s.diskWriteMu.Unlock()
 		return fmt.Errorf("failed to write config file: %w", err)
 	}
 
+	s.diskWriteMu.Unlock()
+
 	// Auto-reload to keep in-memory state fresh after config edits.
+	// Runs OUTSIDE diskWriteMu (see SetConfigFields).
 	if err := s.autoReload(context.Background()); err != nil {
 		slog.Warn("Config file updated but failed to reload in-memory state", "error", err)
 	}
@@ -363,10 +407,13 @@ func (s *ConfigStore) ReadAllModelsAtScope(scope Scope) (map[SelectedModelType]*
 // updateConfig applies a targeted, copy-on-write mutation to the store's
 // config and publishes it as a new generation.
 //
-// It takes writeMu (serialising all copy-on-write mutators against each
-// other — without it, two concurrent callers could both read the same
-// starting snapshot, apply their own change to independent copies, and
-// have the second Store() silently discard the first writer's change),
+// It takes publishMu (serialising all copy-on-write mutators AND reloads
+// against each other — without it, two concurrent callers could both read
+// the same starting snapshot, apply their own change to independent copies,
+// and have the second Store() silently discard the first writer's change;
+// worse, a concurrent reload's fresh-from-disk generation could be
+// silently overwritten by a writer publishing a clone of the pre-reload
+// generation),
 // shallow-copies the top-level *Config (cfgCopy := *cur.config), and hands
 // the mutate callback a pointer to that copy. mutate is responsible for
 // cloning any nested map/pointer it intends to change (e.g. Options, a
@@ -386,9 +433,21 @@ func (s *ConfigStore) ReadAllModelsAtScope(scope Scope) (map[SelectedModelType]*
 // workingDir configured, e.g. in unit tests), this in-memory mutation is
 // the only durable change, exactly as before.
 func (s *ConfigStore) updateConfig(mutate func(cfgCopy *Config)) {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
+	s.publishMu.Lock()
+	defer s.publishMu.Unlock()
+	s.updateConfigLocked(mutate)
+}
 
+// updateConfigLocked applies the same copy-on-write mutation as
+// updateConfig but WITHOUT acquiring publishMu. The caller MUST already
+// hold publishMu.
+//
+// It exists for the re-entrant call path inside Load: Load holds
+// publishMu, then configureSelectedModels → updatePreferredModelLocked →
+// updateConfigLocked applies the in-memory mutation without re-acquiring
+// the lock. Without this separation, updateConfig would deadlock on the
+// Lock call because the calling goroutine already holds publishMu.
+func (s *ConfigStore) updateConfigLocked(mutate func(cfgCopy *Config)) {
 	cur := s.loadSnapshot()
 	next := cur.clone()
 
@@ -438,6 +497,44 @@ func (s *ConfigStore) UpdatePreferredModels(scope Scope, models map[SelectedMode
 	})
 	for modelType, model := range models {
 		if err := s.recordRecentModel(scope, modelType, model); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// updatePreferredModelLocked is the re-entrant-safe variant of
+// UpdatePreferredModel for callers that already hold publishMu (i.e. Load
+// via configureSelectedModels). It uses updateConfigLocked /
+// recordRecentModelLocked instead of the lock-taking variants.
+func (s *ConfigStore) updatePreferredModelLocked(scope Scope, modelType SelectedModelType, model SelectedModel) error {
+	return s.updatePreferredModelsLocked(scope, map[SelectedModelType]SelectedModel{modelType: model})
+}
+
+// updatePreferredModelsLocked is the re-entrant-safe variant of
+// UpdatePreferredModels for callers that already hold publishMu.
+func (s *ConfigStore) updatePreferredModelsLocked(scope Scope, models map[SelectedModelType]SelectedModel) error {
+	if len(models) == 0 {
+		return nil
+	}
+	fields := make(map[string]any, len(models))
+	for modelType, model := range models {
+		fields[fmt.Sprintf("models.%s", modelType)] = model
+	}
+	if err := s.SetConfigFields(scope, fields); err != nil {
+		return fmt.Errorf("failed to update preferred models: %w", err)
+	}
+	s.updateConfigLocked(func(cfgCopy *Config) {
+		cfgCopy.Models = maps.Clone(cfgCopy.Models)
+		if cfgCopy.Models == nil {
+			cfgCopy.Models = make(map[SelectedModelType]SelectedModel, len(models))
+		}
+		for modelType, model := range models {
+			cfgCopy.Models[modelType] = model
+		}
+	})
+	for modelType, model := range models {
+		if err := s.recordRecentModelLocked(scope, modelType, model); err != nil {
 			return err
 		}
 	}
@@ -754,6 +851,52 @@ func (s *ConfigStore) recordRecentModel(scope Scope, modelType SelectedModelType
 	return nil
 }
 
+// recordRecentModelLocked is the re-entrant-safe variant of
+// recordRecentModel for callers that already hold publishMu. It uses
+// updateConfigLocked instead of updateConfig.
+func (s *ConfigStore) recordRecentModelLocked(scope Scope, modelType SelectedModelType, model SelectedModel) error {
+	if model.Provider == "" || model.Model == "" {
+		return nil
+	}
+
+	eq := func(a, b SelectedModel) bool {
+		return a.Provider == b.Provider && a.Model == b.Model
+	}
+
+	entry := SelectedModel{
+		Provider: model.Provider,
+		Model:    model.Model,
+	}
+
+	current := s.loadSnapshot().config.RecentModels[modelType]
+	withoutCurrent := slices.DeleteFunc(slices.Clone(current), func(existing SelectedModel) bool {
+		return eq(existing, entry)
+	})
+
+	updated := append([]SelectedModel{entry}, withoutCurrent...)
+	if len(updated) > maxRecentModelsPerType {
+		updated = updated[:maxRecentModelsPerType]
+	}
+
+	if slices.EqualFunc(current, updated, eq) {
+		return nil
+	}
+
+	s.updateConfigLocked(func(cfgCopy *Config) {
+		cfgCopy.RecentModels = maps.Clone(cfgCopy.RecentModels)
+		if cfgCopy.RecentModels == nil {
+			cfgCopy.RecentModels = make(map[SelectedModelType][]SelectedModel)
+		}
+		cfgCopy.RecentModels[modelType] = updated
+	})
+
+	if err := s.SetConfigField(scope, fmt.Sprintf("recent_models.%s", modelType), updated); err != nil {
+		return fmt.Errorf("failed to persist recent models: %w", err)
+	}
+
+	return nil
+}
+
 // NewTestStore creates a ConfigStore for testing purposes.
 func NewTestStore(cfg *Config, loadedPaths ...string) *ConfigStore {
 	s := &ConfigStore{}
@@ -960,9 +1103,15 @@ func (s *ConfigStore) ConfigStaleness() StalenessResult {
 // knownProviders etc. are carried over unchanged from whatever generation
 // is current at the time of the swap.
 func (s *ConfigStore) RefreshStalenessSnapshot() error {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
+	s.publishMu.Lock()
+	defer s.publishMu.Unlock()
+	s.refreshStalenessSnapshotLocked()
+	return nil
+}
 
+// refreshStalenessSnapshotLocked is the lock-free body of
+// RefreshStalenessSnapshot. The caller MUST hold publishMu.
+func (s *ConfigStore) refreshStalenessSnapshotLocked() {
 	cur := s.loadSnapshot()
 	next := cur.clone()
 	if next.snapshots == nil {
@@ -989,7 +1138,6 @@ func (s *ConfigStore) RefreshStalenessSnapshot() error {
 	}
 
 	s.snap.Store(next)
-	return nil
 }
 
 // CaptureStalenessSnapshot recomputes the set of tracked config paths (the
@@ -997,6 +1145,14 @@ func (s *ConfigStore) RefreshStalenessSnapshot() error {
 // refreshes their on-disk snapshots, publishing both as part of a single
 // new generation.
 func (s *ConfigStore) CaptureStalenessSnapshot(paths []string) {
+	s.publishMu.Lock()
+	defer s.publishMu.Unlock()
+	s.captureStalenessSnapshotLocked(paths)
+}
+
+// captureStalenessSnapshotLocked does the work of CaptureStalenessSnapshot
+// without taking publishMu. The caller MUST hold publishMu.
+func (s *ConfigStore) captureStalenessSnapshotLocked(paths []string) {
 	seen := make(map[string]struct{})
 	for _, p := range paths {
 		if p == "" {
@@ -1009,7 +1165,8 @@ func (s *ConfigStore) CaptureStalenessSnapshot(paths []string) {
 		seen[abs] = struct{}{}
 	}
 
-	workspacePath := s.loadSnapshot().workspacePath
+	cur := s.loadSnapshot()
+	workspacePath := cur.workspacePath
 	if workspacePath != "" {
 		abs, err := filepath.Abs(workspacePath)
 		if err == nil {
@@ -1029,18 +1186,21 @@ func (s *ConfigStore) CaptureStalenessSnapshot(paths []string) {
 	}
 	slices.Sort(tracked)
 
-	s.writeMu.Lock()
-	cur := s.loadSnapshot()
 	next := cur.clone()
 	next.trackedConfigPaths = tracked
 	s.snap.Store(next)
-	s.writeMu.Unlock()
 
-	s.RefreshStalenessSnapshot()
+	s.refreshStalenessSnapshotLocked()
 }
 
+// captureStalenessSnapshot is the lock-acquiring entry point for callers
+// that do NOT already hold publishMu (primarily white-box tests). Production
+// code paths that already hold publishMu (Load, reloadFromDiskLocked) call
+// captureStalenessSnapshotLocked directly to avoid a re-entrant deadlock.
 func (s *ConfigStore) captureStalenessSnapshot(paths []string) {
-	s.CaptureStalenessSnapshot(paths)
+	s.publishMu.Lock()
+	defer s.publishMu.Unlock()
+	s.captureStalenessSnapshotLocked(paths)
 }
 
 // ReloadFromDisk re-runs the config load/merge flow and updates the in-memory
@@ -1049,15 +1209,19 @@ func (s *ConfigStore) ReloadFromDisk(ctx context.Context) error {
 	if s.workingDir == "" {
 		return fmt.Errorf("cannot reload: working directory not set")
 	}
-	s.reloadMu.Lock()
-	defer s.reloadMu.Unlock()
+	s.publishMu.Lock()
+	defer s.publishMu.Unlock()
 	return s.reloadFromDiskLocked(ctx)
 }
 
 // reloadFromDiskLocked performs the actual reload. The caller must hold
-// reloadMu, which both serialises concurrent reloads and prevents the
-// re-entrant auto-reload that configureProviders would otherwise trigger
-// via RemoveConfigField mid-reload.
+// publishMu, which serialises concurrent reloads against each other AND
+// against copy-on-write mutators (updateConfig), preventing the lost-update
+// race where a writer publishes a clone built from a pre-reload generation
+// on top of a reload that already published a newer one. It also prevents
+// the re-entrant auto-reload that configureProviders would otherwise trigger
+// via RemoveConfigField mid-reload (autoReload's TryLock on publishMu fails
+// because the caller already holds it).
 //
 // Everything for the new generation (config, resolver, knownProviders,
 // loadedPaths, workspacePath) is built on purely local variables — cfg is
@@ -1141,7 +1305,9 @@ func (s *ConfigStore) reloadFromDiskLocked(ctx context.Context) error {
 	}
 	s.snap.Store(next)
 
-	s.captureStalenessSnapshot(loadedPaths)
+	// Caller already holds publishMu — use the Locked variant to avoid a
+	// re-entrant deadlock.
+	s.captureStalenessSnapshotLocked(loadedPaths)
 
 	return nil
 }
@@ -1152,16 +1318,16 @@ func (s *ConfigStore) autoReload(ctx context.Context) error {
 	}
 	// Skip if a reload is already in progress. This covers both concurrent
 	// auto-reloads after parallel writes and the re-entrant call from
-	// configureProviders during a reload (which holds reloadMu).
+	// configureProviders during a reload (which holds publishMu).
 	//
 	// Note: a write that completes after the in-progress reload has already
 	// read the config file won't be reflected in memory until the next
 	// reload. That's acceptable — writes are rare and the next user action
 	// or file-watch tick picks it up. Callers needing guaranteed freshness
 	// after a write should call ReloadFromDisk explicitly.
-	if !s.reloadMu.TryLock() {
+	if !s.publishMu.TryLock() {
 		return nil
 	}
-	defer s.reloadMu.Unlock()
+	defer s.publishMu.Unlock()
 	return s.reloadFromDiskLocked(ctx)
 }

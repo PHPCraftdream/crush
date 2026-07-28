@@ -136,11 +136,11 @@ func Load(workingDir, dataDir string, debug bool) (*ConfigStore, error) {
 	// Configure providers
 	valueResolver := NewShellVariableResolver(env)
 
-	// Hold reloadMu during the initial load so that auto-reload triggered by
+	// Hold publishMu during the initial load so that auto-reload triggered by
 	// config-modifying operations inside configureProviders (e.g.
 	// RemoveConfigField) is skipped instead of recursing.
-	store.reloadMu.Lock()
-	defer store.reloadMu.Unlock()
+	store.publishMu.Lock()
+	defer store.publishMu.Unlock()
 
 	publish := func() {
 		store.snap.Store(&storeSnapshot{
@@ -168,9 +168,10 @@ func Load(workingDir, dataDir string, debug bool) (*ConfigStore, error) {
 	cfg.SetupAgents()
 
 	// Publish the fully-prepared generation in one shot, then capture the
-	// initial staleness snapshot against it.
+	// initial staleness snapshot against it. We already hold publishMu, so
+	// call the Locked variant directly to avoid a re-entrant deadlock.
 	publish()
-	store.captureStalenessSnapshot(loadedPaths)
+	store.captureStalenessSnapshotLocked(loadedPaths)
 
 	return store, nil
 }
@@ -311,7 +312,7 @@ func (c *Config) configureProviders(ctx context.Context, store *ConfigStore, env
 			// Claude Code subscription is not supported anymore. Remove to show onboarding.
 			// RemoveConfigField persists the deletion to disk; its auto-reload
 			// is skipped because the caller (Load / reloadFromDiskLocked) holds
-			// reloadMu. The in-memory state stays consistent via Providers.Del
+			// publishMu. The in-memory state stays consistent via Providers.Del
 			// below, and any racing reload re-reads the removal from disk.
 			store.RemoveConfigField(ScopeGlobal, "providers.anthropic")
 			c.Providers.Del(string(p.ID))
@@ -791,7 +792,10 @@ func configureSelectedModels(store *ConfigStore, cfg *Config, knownProviders []c
 		if model == nil {
 			large = defaultLarge
 			if persist {
-				if err := store.UpdatePreferredModel(ScopeGlobal, SelectedModelTypeLarge, large); err != nil {
+				// Use the Locked variant because Load (the only caller with
+				// persist=true) already holds publishMu. The public
+				// UpdatePreferredModel would deadlock re-acquiring it.
+				if err := store.updatePreferredModelLocked(ScopeGlobal, SelectedModelTypeLarge, large); err != nil {
 					return fmt.Errorf("failed to update preferred large model: %w", err)
 				}
 			}
@@ -837,7 +841,7 @@ func configureSelectedModels(store *ConfigStore, cfg *Config, knownProviders []c
 		if model == nil {
 			small = defaultSmall
 			if persist {
-				if err := store.UpdatePreferredModel(ScopeGlobal, SelectedModelTypeSmall, small); err != nil {
+				if err := store.updatePreferredModelLocked(ScopeGlobal, SelectedModelTypeSmall, small); err != nil {
 					return fmt.Errorf("failed to update preferred small model: %w", err)
 				}
 			}

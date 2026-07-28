@@ -2,6 +2,7 @@ package config
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"maps"
 	"os"
@@ -427,4 +428,297 @@ func TestConcurrentUpdatePreferredModels_SingleWriterSemantics(t *testing.T) {
 	final := store.Config()
 	require.Equal(t, "global-large", final.Models[SelectedModelTypeLarge].Model, "global-scope update was lost")
 	require.Equal(t, "workspace-small", final.Models[SelectedModelTypeSmall].Model, "workspace-scope update was lost")
+}
+
+// TestConcurrentUpdateConfig_DifferentNestedFields_BothVisible fires two
+// concurrent updateConfig writers that mutate DIFFERENT nested fields of
+// Options.TUI (CompactMode vs Theme). Without publishMu serialising the
+// read-clone-mutate-publish cycle, both writers would clone the SAME
+// starting snapshot, each apply only their own field, and the second
+// Store() would silently discard the first writer's field — even though
+// the two fields are completely independent.
+//
+// This covers the same class of bug as
+// TestConcurrentUpdateConfig_DoesNotLoseUpdates but exercises the
+// Options/TUIOptions clone path (cloneOptions + cloneTUIOptions) instead
+// of the Models map path — the exact pattern SetCompactMode and SetTheme
+// use internally. The start barrier and inner loop widen the race window
+// so the test reliably catches the bug if publishMu is ever split back
+// into separate writer/reload locks.
+func TestConcurrentUpdateConfig_DifferentNestedFields_BothVisible(t *testing.T) {
+	t.Parallel()
+
+	const iterations = 20
+	for range iterations {
+		cfg := &Config{}
+		cfg.setDefaults(t.TempDir(), "")
+		store := NewTestStore(cfg)
+
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		wg.Add(2)
+
+		go func() {
+			defer wg.Done()
+			<-start
+			store.updateConfig(func(c *Config) {
+				optsCopy := cloneOptions(c.Options)
+				tuiCopy := cloneTUIOptions(optsCopy.TUI)
+				tuiCopy.CompactMode = true
+				optsCopy.TUI = tuiCopy
+				c.Options = optsCopy
+			})
+		}()
+
+		go func() {
+			defer wg.Done()
+			<-start
+			store.updateConfig(func(c *Config) {
+				optsCopy := cloneOptions(c.Options)
+				tuiCopy := cloneTUIOptions(optsCopy.TUI)
+				tuiCopy.Theme = "dark"
+				optsCopy.TUI = tuiCopy
+				c.Options = optsCopy
+			})
+		}()
+
+		close(start)
+		wg.Wait()
+
+		final := store.Config()
+		require.True(t, final.Options.TUI.CompactMode,
+			"CompactMode was lost — a concurrent writer's clone overwrote it")
+		require.Equal(t, "dark", final.Options.TUI.Theme,
+			"Theme was lost — a concurrent writer's clone overwrote it")
+	}
+}
+
+// TestUpdateConfigVsReload_ReloadDiskStateNotLostByStaleClone is the core
+// regression test for the lost-update race between a copy-on-write writer
+// (updateConfig) and a concurrent ReloadFromDisk.
+//
+// Before publishMu unified writers and reloaders under one lock, the
+// following interleaving was possible:
+//  1. Writer reads snapshot gen-0 (model "model-gen-0"), starts cloning.
+//  2. Reload reads snapshot gen-0, rebuilds entirely from disk (which now
+//     carries gen-1), publishes gen-1.
+//  3. Writer finishes cloning gen-0 + its own mutation, publishes — this
+//     Store() is made OVER gen-1 from a gen-0 clone, silently discarding
+//     everything the reload brought in from disk.
+//
+// After the fix, writer and reload are serialised under publishMu: one
+// fully completes before the other starts, so the final state always
+// reflects the reload's disk state (model "model-gen-1"). The stale-clone
+// overwrite (which would leave model "model-gen-0" despite reload having
+// physically completed later) can no longer happen.
+//
+// This test deliberately does NOT rely on a fixed sleep duration to widen
+// the race window. An earlier sleep-based version of this test (5-150ms)
+// was verified — by hand, against a worktree checked out at the
+// pre-publishMu commit — to PASS even on the buggy code: under `go test
+// -race`, ReloadFromDisk's own work (config parsing, provider setup) is
+// slowed by race instrumentation enough that it reliably takes longer than
+// any writer sleep short enough to keep the test fast, so reload always
+// happened to publish last regardless of whether the two mutexes were
+// unified. That made the sleep-based version pass unconditionally and
+// catch nothing. Instead, this version uses channels to force the exact
+// interleaving deterministically: the writer blocks INSIDE its mutate
+// callback (having already captured its — possibly stale — starting
+// snapshot) until explicitly released, so whether ReloadFromDisk can run
+// to completion while the writer is still holding the lock is observed
+// directly rather than guessed at via timing.
+func TestUpdateConfigVsReload_ReloadDiskStateNotLostByStaleClone(t *testing.T) {
+	dir := t.TempDir()
+	isolated := t.TempDir()
+	t.Setenv("HOME", isolated)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(isolated, ".config"))
+	t.Setenv("XDG_DATA_HOME", filepath.Join(isolated, ".local", "share"))
+	t.Setenv("CRUSH_GLOBAL_CONFIG", dir)
+	t.Setenv("CRUSH_GLOBAL_DATA", dir)
+	// Avoid a real network provider-catalog fetch inside ReloadFromDisk:
+	// without this, reload's duration is dominated by network I/O (measured
+	// up to ~1-2s under -race) instead of the fast, disk-only reload a real
+	// deployment sees most of the time — and a slow-for-unrelated-reasons
+	// reload would mask this test's race window just as badly as the old
+	// sleep-based version did.
+	t.Setenv("CRUSH_DISABLE_PROVIDER_AUTO_UPDATE", "1")
+	resetProviderState()
+	t.Cleanup(resetProviderState)
+
+	configPath := filepath.Join(dir, "crush.json")
+	writeGenerationConfig(t, configPath, 0)
+
+	store, err := Load(dir, dir, false)
+	require.NoError(t, err)
+	store.globalDataPath = configPath
+	store.CaptureStalenessSnapshot([]string{configPath})
+
+	// External modification: write gen-1 to disk so the reload will pick up
+	// a DIFFERENT model than what's currently in memory.
+	writeGenerationConfig(t, configPath, 1)
+
+	writerEnteredMutate := make(chan struct{})
+	writerCanFinish := make(chan struct{})
+	writerDone := make(chan struct{})
+
+	// Writer: applies an in-memory mutation (no disk write). It captures its
+	// starting snapshot (possibly stale gen-0) immediately on entering
+	// mutate, then blocks until the test releases it — holding whatever lock
+	// updateConfig takes for the ENTIRE blocked duration. If that lock is
+	// NOT shared with ReloadFromDisk (the pre-fix bug), the reload below can
+	// run to completion while the writer is still parked here; when the
+	// writer is finally released, its stale clone overwrites the reload's
+	// already-published gen-1.
+	go func() {
+		store.updateConfig(func(c *Config) {
+			close(writerEnteredMutate)
+			<-writerCanFinish
+			optsCopy := cloneOptions(c.Options)
+			optsCopy.Debug = true
+			c.Options = optsCopy
+		})
+		close(writerDone)
+	}()
+
+	<-writerEnteredMutate
+
+	reloadDone := make(chan error, 1)
+	go func() {
+		reloadDone <- store.ReloadFromDisk(context.Background())
+	}()
+
+	// Give the reload a window to complete WHILE the writer is still parked
+	// mid-mutate. Under the fix, ReloadFromDisk blocks acquiring the same
+	// lock the writer holds, so it cannot complete here — the select falls
+	// through to the timeout every time. Under the pre-fix, two-mutex
+	// scheme, reload is uncontended by the writer's lock and finishes on its
+	// own regardless of the writer, which is exactly the interleaving that
+	// causes the bug once the writer is released below.
+	reloadFinishedFirst := false
+	select {
+	case err := <-reloadDone:
+		require.NoError(t, err)
+		reloadFinishedFirst = true
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	close(writerCanFinish)
+	<-writerDone
+
+	if !reloadFinishedFirst {
+		require.NoError(t, <-reloadDone)
+	}
+
+	// The reload's disk state MUST be visible: model must be "model-gen-1",
+	// not "model-gen-0" (which would mean the writer's stale clone
+	// overwrote the reload's fresh-from-disk generation).
+	final := store.Config()
+	large, ok := final.Models[SelectedModelTypeLarge]
+	require.True(t, ok, "large model missing from final config")
+	require.Equal(t, "model-gen-1", large.Model,
+		"reload's disk state was lost — a writer published a stale clone over the reload's fresh generation (reload finished before writer released=%v)",
+		reloadFinishedFirst)
+}
+
+// TestConcurrentSetConfigFields_DifferentKeys_BothPersistedOnDisk fires
+// two concurrent SetConfigField calls writing DIFFERENT keys to the SAME
+// on-disk file. Without diskWriteMu serialising the read-modify-write
+// cycle (os.ReadFile → sjson.Set → atomicWriteFile), each goroutine reads
+// the pre-write file, applies only its own key, and the second
+// atomicWriteFile clobbers the first — a classic lost-update on the file
+// itself, independent of the in-memory snapshot race.
+//
+// With diskWriteMu, the second write blocks until the first completes, so
+// it reads the file that already contains the first key and adds its own.
+// Both keys end up on disk.
+func TestConcurrentSetConfigFields_DifferentKeys_BothPersistedOnDisk(t *testing.T) {
+	t.Parallel()
+
+	const iterations = 20
+	for range iterations {
+		dir := t.TempDir()
+		configPath := filepath.Join(dir, "crush.json")
+		require.NoError(t, os.WriteFile(configPath, []byte(`{}`), 0o600))
+
+		cfg := &Config{}
+		cfg.setDefaults(dir, "")
+		store := newTestConfigStore(testStoreOpts{
+			config:         cfg,
+			globalDataPath: configPath,
+		})
+
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		wg.Add(2)
+
+		go func() {
+			defer wg.Done()
+			<-start
+			require.NoError(t, store.SetConfigField(ScopeGlobal, "alpha", 1))
+		}()
+
+		go func() {
+			defer wg.Done()
+			<-start
+			require.NoError(t, store.SetConfigField(ScopeGlobal, "beta", 2))
+		}()
+
+		close(start)
+		wg.Wait()
+
+		// Read the file FRESH from disk — NOT from the in-memory snapshot —
+		// to verify both writes actually persisted to the file.
+		raw, err := os.ReadFile(configPath)
+		require.NoError(t, err)
+
+		var onDisk map[string]any
+		require.NoError(t, json.Unmarshal(raw, &onDisk))
+
+		_, hasAlpha := onDisk["alpha"]
+		require.True(t, hasAlpha, "key alpha was lost — concurrent disk write clobbered it")
+		_, hasBeta := onDisk["beta"]
+		require.True(t, hasBeta, "key beta was lost — concurrent disk write clobbered it")
+	}
+}
+
+// TestAutoReload_TryLockSkipsReentry_NoDeadlock verifies that autoReload,
+// when called from a context that already holds publishMu (e.g. Load or
+// reloadFromDiskLocked → configureProviders → RemoveConfigField), uses
+// TryLock and returns immediately instead of blocking forever.
+//
+// Before the publishMu unification, reloadMu served this role: Load held
+// reloadMu, and autoReload's TryLock on reloadMu failed, skipping the
+// re-entrant reload. After unification, publishMu serves the same role.
+// This test explicitly verifies the guard still works: a regression
+// (e.g. switching TryLock to Lock) would deadlock the entire process on
+// startup.
+func TestAutoReload_TryLockSkipsReentry_NoDeadlock(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	cfg := &Config{}
+	cfg.setDefaults(dir, "")
+	store := newTestConfigStore(testStoreOpts{config: cfg})
+	store.workingDir = dir // Enable the autoReload path past the early return.
+
+	// Hold publishMu, simulating the state during Load or
+	// reloadFromDiskLocked when configureProviders calls
+	// RemoveConfigField → autoReload.
+	store.publishMu.Lock()
+	defer store.publishMu.Unlock()
+
+	// autoReload must return nil immediately — TryLock(publishMu) fails
+	// because we already hold it. If it used Lock instead of TryLock,
+	// this call would block forever.
+	done := make(chan error, 1)
+	go func() {
+		done <- store.autoReload(context.Background())
+	}()
+
+	select {
+	case err := <-done:
+		require.NoError(t, err, "autoReload should return nil when TryLock fails")
+	case <-time.After(5 * time.Second):
+		t.Fatal("autoReload deadlocked — TryLock was not used or publishMu is not the guard")
+	}
 }
