@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -30,12 +31,25 @@ const LockStaleDuration = lockStaleDuration
 // Acquired around the entire `sessionAgent.Run()` call so two crush
 // processes can never write into the same session simultaneously.
 //
-// Backed by OS-level advisory file locks (flock on POSIX, LockFileEx on
-// Windows) for mutual exclusion between live processes, PLUS a heartbeat
-// that touches the lock file every 10 seconds. If the file has not been
-// touched for 20 seconds the lock is considered stale (holder crashed or
-// was killed without releasing) and the next caller deletes it and
-// proceeds.
+// Backed exclusively by OS-level advisory file locks (flock on POSIX,
+// LockFileEx on Windows) for mutual exclusion between live processes.
+// The holder also runs a heartbeat that touches the lock file's mtime
+// every 10 seconds, but that heartbeat (and the 20s "stale" threshold
+// derived from it) is diagnostics only — surfaced to operators via
+// `sessions locks`/`sessions why` as "does this look wedged". It is
+// NEVER used to decide whether a lock file may be reclaimed. Reclaiming
+// is decided exclusively by attempting the real OS lock on the existing
+// file: if that attempt succeeds, the previous holder is provably gone
+// at the kernel level (flock/LockFileEx auto-releases on process death,
+// even if its mtime is fresh or its heartbeat is merely lagging); if the
+// attempt reports contention, the file is busy, full stop, regardless of
+// how stale its mtime looks. This avoids a real bug in an earlier
+// version of this file: unlinking the path based on mtime alone raced a
+// live holder whose heartbeat had merely lagged (GC pause, transient
+// Chtimes failure) — flock is bound to the inode, not the path, so the
+// unlink didn't revoke the live holder's lock, it just let a second
+// process create a new inode at the same path and believe it owned the
+// session, producing two simultaneous owners of one session id.
 type SessionLock struct {
 	// Path is the on-disk lock file. Kept for diagnostics.
 	Path string
@@ -94,10 +108,16 @@ func TryAcquireSessionLock(dataDir, sessionID string) (*SessionLock, error) {
 	}
 	path := filepath.Join(locksDir, "session-"+sanitiseSessionID(sessionID)+".lock")
 
-	// Remove stale lock file before attempting OS lock.
-	if err := removeIfStale(path); err != nil {
-		return nil, err
-	}
+	// logStaleDiagnostics is a best-effort, decision-free hint: it never
+	// removes anything and never influences whether we succeed or fail
+	// below. The ONLY thing that may ever decide "the previous holder is
+	// gone" is actually winning the OS-level lock (flock/LockFileEx) on
+	// this exact path. mtime stopped being trustworthy as a removal
+	// trigger the day someone's GC pause or a transient Chtimes failure
+	// let a live holder's heartbeat go stale while it still held the OS
+	// lock — reclaiming on mtime alone in that case gives two "owners"
+	// of the same session at once (see package doc).
+	logStaleDiagnostics(path)
 
 	lk, err := acquireSessionLockFile(path)
 	if err == nil {
@@ -108,24 +128,31 @@ func TryAcquireSessionLock(dataDir, sessionID string) (*SessionLock, error) {
 	if !errors.As(err, &busyErr) {
 		return nil, err
 	}
-
-	// The pre-open stale check can race with another process whose heartbeat
-	// expires just after we checked but before tryLockFile reports contention.
-	// If the heartbeat is stale now, reclaim the file and try once more.
-	reclaimed, reclaimErr := reclaimStaleLock(path, "lock_contention")
-	if reclaimErr != nil {
-		return nil, reclaimErr
-	}
-	if !reclaimed {
-		return nil, busyErr
-	}
-	lk, err = acquireSessionLockFile(path)
-	if err != nil {
-		return nil, err
-	}
-	return lk, nil
+	return nil, busyErr
 }
 
+// acquireSessionLockFile opens (creating if necessary) the lock file at
+// path and attempts to take the OS-level advisory lock on THAT SAME
+// file/inode/handle. There is no "remove the file, make a new one"
+// fallback anywhere in this path: unlinking a path out from under an
+// OS lock does not release the lock (flock is bound to the inode, not
+// the path) — it just lets a second process create a fresh inode at
+// the same path and believe it owns the session while the original
+// holder, if still alive, keeps running against the old inode. Two
+// "owners" of one session id is exactly the bug this file exists to
+// prevent.
+//
+// If tryLockFile succeeds here, that is authoritative proof the
+// previous holder is gone at the OS level — the kernel releases flock/
+// LockFileEx automatically when the holding process dies or closes the
+// descriptor, regardless of what its lock file's mtime says. Only then
+// do we truncate and stamp our own PID into the file and start our own
+// heartbeat.
+//
+// If tryLockFile reports contention, that is likewise authoritative:
+// somebody else holds the OS lock right now, full stop. No mtime
+// threshold, no PID liveness probe, nothing overrides that — we return
+// SessionLockBusyError unconditionally.
 func acquireSessionLockFile(path string) (*SessionLock, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
@@ -134,7 +161,16 @@ func acquireSessionLockFile(path string) (*SessionLock, error) {
 	if err := tryLockFile(f); err != nil {
 		holderPID := readLockHolderPID(path)
 		f.Close()
-		return nil, &SessionLockBusyError{Path: path, HolderPID: holderPID}
+		if isLockContentionError(err) {
+			return nil, &SessionLockBusyError{Path: path, HolderPID: holderPID}
+		}
+		// Genuinely unidentified failure (permission denied, IO error,
+		// etc — not "someone else holds it"). Surface it as-is so the
+		// caller can tell the difference between "busy" and "broken";
+		// see agent.Run's handling, which now treats anything that
+		// isn't a *SessionLockBusyError as fatal rather than silently
+		// running without lock protection.
+		return nil, fmt.Errorf("TryAcquireSessionLock: lock file %s: %w", path, err)
 	}
 
 	myPID := os.Getpid()
@@ -143,9 +179,15 @@ func acquireSessionLockFile(path string) (*SessionLock, error) {
 	_, _ = fmt.Fprintf(f, "%d\n", myPID)
 	_ = f.Sync()
 
-	// Touch the file now so mtime is fresh from the start.
+	// Touch the file now so mtime is fresh from the start. mtime is a
+	// diagnostic aid only (surfaced via InspectSessionLock / `sessions
+	// locks`) — see the package doc on SessionLock. It is never used to
+	// decide whether a lock may be reclaimed.
 	now := time.Now()
-	_ = os.Chtimes(path, now, now)
+	if err := os.Chtimes(path, now, now); err != nil {
+		slog.Warn("session lock: failed to set initial heartbeat mtime",
+			"path", path, "err", err)
+	}
 
 	stop := make(chan struct{})
 	go heartbeat(path, stop)
@@ -179,87 +221,72 @@ func (l *SessionLock) Release() error {
 
 // heartbeat touches the lock file every lockHeartbeatInterval to signal
 // the holder is still alive. Stops when done is closed.
+//
+// This is diagnostics only ("something might be wrong if this goes
+// stale") — see the package doc on SessionLock and acquireSessionLockFile.
+// It must never be treated as the source of truth for whether the lock
+// may be reclaimed; only actually winning the OS lock decides that.
+//
+// Chtimes errors are logged (not silently dropped) but do not stop the
+// heartbeat loop and do not mark us as dead — a transient/read-only-FS
+// Chtimes failure while we are alive and still hold the OS lock must
+// never cause another process to conclude it can steal the session.
+// Logging is throttled so a persistently-failing filesystem doesn't spam
+// the log once every tick for the lifetime of a long session.
 func heartbeat(path string, done <-chan struct{}) {
 	t := time.NewTicker(lockHeartbeatInterval)
 	defer t.Stop()
+	var failCount atomic.Int64
 	for {
 		select {
 		case <-done:
 			return
 		case <-t.C:
 			now := time.Now()
-			_ = os.Chtimes(path, now, now)
-		}
-	}
-}
-
-// removeIfStale deletes the lock file if it exists and is unambiguously
-// stale. A missing file is not an error.
-//
-// Two staleness signals (either is sufficient):
-//  1. mtime older than lockStaleDuration — heartbeat would have touched
-//     the file every 10s if the holder were alive.
-//  2. holder PID is no longer a running process — covers the orphan case
-//     where the wrapper that started crush was killed but crush itself
-//     also died at the same time, so within the 20s mtime window we'd
-//     otherwise refuse a clean re-entry. See feedback round 2, #12.
-//
-// We only check the PID branch when the file is older than one
-// heartbeat tick (10s). Inside the first 10s the file may exist but PID
-// hasn't been written yet (acquirer is still in the open→lock→write
-// dance), so a PID-not-alive check would race the acquirer.
-func removeIfStale(path string) error {
-	info, err := os.Stat(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return fmt.Errorf("removeIfStale: stat %s: %w", path, err)
-	}
-	age := time.Since(info.ModTime())
-	if age > lockStaleDuration {
-		_, err := reclaimStaleLock(path, "mtime_expired")
-		return err
-	}
-	// Fork patch (orchestrator UX, round 2 #12): PID-based fast-path. If
-	// the holder PID is dead, snap the lock immediately instead of making
-	// the operator wait 20s. Skip the check for very young locks to avoid
-	// racing the acquirer's "open → lock → write PID" sequence.
-	if age > lockHeartbeatInterval {
-		if pid := readLockHolderPID(path); pid > 0 && !isProcessAlive(pid) {
-			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-				return fmt.Errorf("removeIfStale: remove orphan lock %s (PID %d dead): %w", path, pid, err)
+			if err := os.Chtimes(path, now, now); err != nil {
+				n := failCount.Add(1)
+				// Log the 1st, 2nd, 4th, 8th, 16th... failure so a
+				// persistent failure doesn't flood the log but is still
+				// visible quickly and periodically.
+				if n == 1 || n&(n-1) == 0 {
+					slog.Warn("session lock: heartbeat failed to touch lock file mtime",
+						"path", path, "err", err, "consecutive_failures", n)
+				}
+			} else {
+				failCount.Store(0)
 			}
-			slog.Info("reclaimed orphan session lock",
-				"reason", "holder_pid_dead",
-				"path", path,
-				"holder_pid", pid,
-				"age_seconds", int(age.Seconds()))
 		}
 	}
-	return nil
 }
 
-func reclaimStaleLock(path, reason string) (bool, error) {
+// logStaleDiagnostics logs (without touching the file) whether the lock
+// at path looks stale by heartbeat mtime or by holder-PID liveness. This
+// is purely informational — it feeds `sessions locks`/`sessions why`
+// style visibility into "why did my acquire attempt fail" and helps an
+// operator notice a wedged holder. It must NEVER remove the file or
+// otherwise influence acquireSessionLockFile's decision: that decision
+// is made exclusively by actually attempting the OS-level lock. See the
+// package doc and acquireSessionLockFile for the full rationale (mtime
+// can go stale for a live holder — GC pause, throttled heartbeat log,
+// transient Chtimes failure — while the OS lock is still held).
+func logStaleDiagnostics(path string) {
 	info, err := os.Stat(path)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return false, nil
-		}
-		return false, fmt.Errorf("reclaimStaleLock: stat %s: %w", path, err)
+		return
 	}
 	age := time.Since(info.ModTime())
-	if age <= lockStaleDuration {
-		return false, nil
+	if age <= lockHeartbeatInterval {
+		return
 	}
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		return false, fmt.Errorf("reclaimStaleLock: remove stale lock %s: %w", path, err)
+	pid := readLockHolderPID(path)
+	pidAlive := pid > 0 && isProcessAlive(pid)
+	if age > lockStaleDuration || (pid > 0 && !pidAlive) {
+		slog.Debug("session lock: existing lock file looks stale by heartbeat/PID, will attempt real OS lock to confirm",
+			"path", path,
+			"age_seconds", int(age.Seconds()),
+			"holder_pid", pid,
+			"holder_pid_alive", pidAlive)
 	}
-	slog.Info("reclaimed stale session lock",
-		"reason", reason,
-		"path", path,
-		"age_seconds", int(age.Seconds()))
-	return true, nil
 }
 
 func sanitiseSessionID(id string) string {

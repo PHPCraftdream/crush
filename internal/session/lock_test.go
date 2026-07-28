@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -193,11 +194,18 @@ func TestTryAcquireSessionLock_OrphanPIDIsCleared(t *testing.T) {
 	require.NoError(t, lk.Release())
 }
 
-// TestTryAcquireSessionLock_LiveOrphanPIDStillBusy is the negative
-// counterpart: the lock file lists the CURRENT process's PID (definitely
-// alive), so the PID branch must NOT remove it. This prevents an "I see
-// no heartbeat in 11s, but the process is fine" false positive.
-func TestTryAcquireSessionLock_LiveOrphanPIDStillBusy(t *testing.T) {
+// TestTryAcquireSessionLock_StaleMtimeButNoRealLockIsReclaimed replaces the
+// old removeIfStale-based test. Under the new protocol, a stale-looking
+// mtime by itself proves nothing — reclaim is decided solely by attempting
+// the real OS lock. Here nobody actually holds the OS lock (the file was
+// written by a plain os.WriteFile, not through TryAcquireSessionLock), so
+// even though the PID in the file is our own (definitely "alive"), the
+// lock must still be acquirable: liveness of the PID is not authoritative
+// either, only the OS lock attempt is. This exercises
+// logStaleDiagnostics + acquireSessionLockFile end-to-end without ever
+// calling the old removeIfStale/reclaimStaleLock internals, which no
+// longer exist.
+func TestTryAcquireSessionLock_StaleMtimeButNoRealLockIsReclaimed(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "locks", "session-live.lock")
 	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
@@ -207,30 +215,13 @@ func TestTryAcquireSessionLock_LiveOrphanPIDStillBusy(t *testing.T) {
 	mtime := time.Now().Add(-(lockHeartbeatInterval + time.Second))
 	require.NoError(t, os.Chtimes(path, mtime, mtime))
 
-	// removeIfStale must NOT remove a lock whose PID is alive.
-	require.NoError(t, removeIfStale(path))
-	_, statErr := os.Stat(path)
-	assert.NoError(t, statErr, "lock for a live PID must survive removeIfStale")
-}
-
-func TestReclaimStaleLock(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "locks", "session-stale.lock")
-	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
-
-	require.NoError(t, os.WriteFile(path, []byte("12345\n"), 0o644))
-	fresh, err := reclaimStaleLock(path, "test")
+	// Nobody actually holds the OS lock on this file (it was never
+	// acquired via acquireSessionLockFile), so the real lock attempt
+	// must succeed regardless of what the PID/mtime heuristics say.
+	lk, err := TryAcquireSessionLock(dir, "live")
 	require.NoError(t, err)
-	assert.False(t, fresh)
-	require.FileExists(t, path)
-
-	staleTime := time.Now().Add(-(lockStaleDuration + time.Second))
-	require.NoError(t, os.Chtimes(path, staleTime, staleTime))
-	reclaimed, err := reclaimStaleLock(path, "test")
-	require.NoError(t, err)
-	assert.True(t, reclaimed)
-	_, err = os.Stat(path)
-	assert.True(t, os.IsNotExist(err))
+	require.NotNil(t, lk)
+	require.NoError(t, lk.Release())
 }
 
 func TestTryAcquireSessionLock_FreshLockIsRespected(t *testing.T) {
@@ -277,4 +268,143 @@ func TestLockPathStructure(t *testing.T) {
 	assert.True(t, strings.HasPrefix(lk.Path, expectedDir),
 		"lock file %q must be under %q", lk.Path, expectedDir)
 	assert.True(t, strings.HasSuffix(lk.Path, ".lock"))
+}
+
+// assertBusyHolderPID checks the HolderPID reported in a SessionLockBusyError
+// against the real holder's PID, accounting for a documented Windows-only
+// limitation: tryLockFile's LockFileEx takes a MANDATORY lock on the whole
+// file for the holder's lifetime, so a contending process's os.ReadFile of
+// that same file (which is exactly what readLockHolderPID does) fails with
+// a sharing/lock violation and reports PID 0 — not because the PID is
+// unknown, but because Windows won't let a second handle read the range
+// while the mandatory lock is held. See readLockFile's doc comment. POSIX
+// advisory locks don't have this problem, so on non-Windows we assert the
+// exact PID.
+func assertBusyHolderPID(t *testing.T, wantPID, gotPID int) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		assert.True(t, gotPID == 0 || gotPID == wantPID,
+			"on Windows, HolderPID is expected to read back as 0 while the mandatory lock is held (or, if read timing allows it, the real PID); got %d, holder is %d", gotPID, wantPID)
+		return
+	}
+	assert.Equal(t, wantPID, gotPID)
+}
+
+// ---------------------------------------------------------------------
+// Real second-process regression tests for the reclaim protocol.
+//
+// These are the tests that actually prove the fix: a single Go test
+// process taking flock twice on its own file descriptors is not a valid
+// proxy for "does a second process see contention", and it is exactly
+// that gap that let the original bug (unlink-by-mtime racing a live
+// holder) ship. See lock_helper_test.go for the child-process harness.
+// ---------------------------------------------------------------------
+
+// TestCrossProcess_BusyIsImmediate is test A: a real second process
+// holds the lock; our attempt to acquire the same session id must fail
+// with SessionLockBusyError immediately (well under the 20s stale
+// window), never falling through to any mtime-based wait.
+func TestCrossProcess_BusyIsImmediate(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns a real child process; skipped in -short")
+	}
+	dir := t.TempDir()
+
+	holder := spawnLockHolder(t, dir, "cross-a", 0 /* hold until stopped */)
+	defer holder.stop(t)
+	require.True(t, holder.locked, "helper process failed to acquire lock: %s", holder.failed)
+
+	start := time.Now()
+	_, err := TryAcquireSessionLock(dir, "cross-a")
+	elapsed := time.Since(start)
+
+	var busyErr *SessionLockBusyError
+	require.Error(t, err)
+	require.True(t, errors.As(err, &busyErr), "expected SessionLockBusyError, got %v", err)
+	assertBusyHolderPID(t, holder.pid, busyErr.HolderPID)
+	assert.Less(t, elapsed, 5*time.Second,
+		"acquire must fail fast via a real OS-lock contention check, not wait out any mtime timeout")
+}
+
+// TestCrossProcess_StaleMtimeButAliveHolderStaysBusy is test B: this is
+// THE regression test for the bug itself. A real second process holds
+// the lock and is genuinely alive and still holding the OS lock, but we
+// artificially back-date the lock file's mtime past lockStaleDuration to
+// simulate a lagging/failed heartbeat (GC pause, transient Chtimes
+// failure, slow filesystem, etc). The lock must NOT be reclaimed: the
+// old mtime-driven removeIfStale/reclaimStaleLock code would have
+// unlinked the file here and let us "steal" the session out from under
+// a live holder — two owners of one session id. The new protocol must
+// refuse, because attempting the real OS lock still finds it held.
+func TestCrossProcess_StaleMtimeButAliveHolderStaysBusy(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns a real child process; skipped in -short")
+	}
+	dir := t.TempDir()
+
+	holder := spawnLockHolder(t, dir, "cross-b", 0 /* hold until stopped */)
+	defer holder.stop(t)
+	require.True(t, holder.locked, "helper process failed to acquire lock: %s", holder.failed)
+
+	path := lockPathFor(dir, "cross-b")
+	staleTime := time.Now().Add(-(lockStaleDuration + 5*time.Second))
+	require.NoError(t, os.Chtimes(path, staleTime, staleTime),
+		"back-dating mtime to simulate a lagging heartbeat on an otherwise-live holder")
+
+	// Sanity: the holder process is still alive and still holds the OS
+	// lock at this point (we haven't stopped it).
+	require.True(t, IsProcessAlive(holder.pid), "helper process must still be alive for this test to be meaningful")
+
+	_, err := TryAcquireSessionLock(dir, "cross-b")
+	var busyErr *SessionLockBusyError
+	require.Error(t, err, "a live holder's lock must survive a stale-looking mtime — this is the core regression test for the reclaim bug")
+	require.True(t, errors.As(err, &busyErr), "expected SessionLockBusyError, got %v", err)
+	assertBusyHolderPID(t, holder.pid, busyErr.HolderPID)
+
+	// Lock file must still be on disk and must NOT have been unlinked —
+	// unlinking while the OS lock is held by a live process is exactly
+	// the bug: flock is bound to the inode, so unlink doesn't revoke the
+	// live holder's lock, it just lets a new inode appear at the same
+	// path and create a second "owner".
+	_, statErr := os.Stat(path)
+	assert.NoError(t, statErr, "lock file for a live, still-locking holder must not be removed")
+}
+
+// TestCrossProcess_DeadHolderIsReclaimedPromptly is test C: a real
+// second process acquires the lock, then is killed (SIGKILL / TerminateProcess)
+// without any explicit unlock or cleanup. The OS itself releases the
+// flock/LockFileEx when the process dies, so our next acquire attempt
+// must succeed promptly via the real lock attempt — it must not need to
+// wait for the mtime staleness window to elapse, and it must not rely on
+// unlinking the old file (the file's own mtime here is deliberately left
+// FRESH, to prove reclaim happens via the OS lock, not via any mtime
+// heuristic).
+func TestCrossProcess_DeadHolderIsReclaimedPromptly(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns a real child process; skipped in -short")
+	}
+	dir := t.TempDir()
+
+	holder := spawnLockHolder(t, dir, "cross-c", 0 /* hold until stopped */)
+	require.True(t, holder.locked, "helper process failed to acquire lock: %s", holder.failed)
+
+	// Kill without giving it a chance to Release() — simulates a crash.
+	require.NoError(t, holder.cmd.Process.Kill())
+	_, _ = holder.cmd.Process.Wait()
+
+	// Mtime is left exactly as the (still-alive-when-it-wrote-it) holder
+	// last touched it — i.e. fresh, well inside lockStaleDuration. If
+	// reclaim were still mtime-gated, this acquire would incorrectly
+	// fail as "busy" for up to 20s. It must instead succeed immediately
+	// because the OS lock attempt is what decides, and the OS released
+	// the dead process's lock already.
+	start := time.Now()
+	lk, err := TryAcquireSessionLock(dir, "cross-c")
+	elapsed := time.Since(start)
+
+	require.NoError(t, err, "a lock abandoned by a killed process must be reclaimable via the real OS lock, without waiting for mtime to go stale")
+	require.NotNil(t, lk)
+	assert.Less(t, elapsed, 5*time.Second,
+		"reclaim of a dead holder's lock must happen promptly via OS lock, not via any mtime wait")
+	require.NoError(t, lk.Release())
 }

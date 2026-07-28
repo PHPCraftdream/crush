@@ -3,6 +3,7 @@
 package session
 
 import (
+	"errors"
 	"os"
 
 	"golang.org/x/sys/windows"
@@ -40,4 +41,19 @@ func unlockFile(f *os.File) error {
 		^uint32(0),
 		&overlapped,
 	)
+}
+
+// isLockContentionError reports whether err from tryLockFile means
+// "another process holds this lock right now" as opposed to some other,
+// unrelated failure. LockFileEx with LOCKFILE_FAIL_IMMEDIATELY reports
+// contention as ERROR_LOCK_VIOLATION. A plain open/read racing against
+// another handle's mandatory range lock on the same file (which is what
+// Windows enforces for LockFileEx, unlike POSIX advisory locks) can also
+// surface as ERROR_SHARING_VIOLATION — treat that the same way here,
+// since from this package's point of view both mean "busy", not
+// "broken". Callers must not treat any other error as "busy" — see
+// acquireSessionLockFile.
+func isLockContentionError(err error) bool {
+	return errors.Is(err, windows.ERROR_LOCK_VIOLATION) ||
+		errors.Is(err, windows.ERROR_SHARING_VIOLATION)
 }

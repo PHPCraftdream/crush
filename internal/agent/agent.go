@@ -503,20 +503,25 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 				)
 				return nil, fmt.Errorf("session %q is already in use: %w", call.SessionID, lockErr)
 			}
-			// Non-busy errors (IO, permission denied on locks dir) —
-			// log and continue without the inter-process guard rather
-			// than fail the whole run. The in-process IsSessionBusy
-			// check still protects against intra-process races.
-			slog.Warn("agent.Run: failed to acquire inter-process session lock, continuing without it",
+			// Unidentified error (not "busy") — e.g. permission denied,
+			// IO error, or any other failure that isn't "someone else
+			// holds this lock". Previously this case logged a warning
+			// and continued WITHOUT the inter-process guard, which
+			// defeats the whole point: the in-process IsSessionBusy
+			// check only protects against races inside this one
+			// process, not the cross-process double-spawn this lock
+			// exists for. Fail closed instead — refuse to run rather
+			// than silently proceed unprotected.
+			slog.Error("agent.Run: failed to acquire inter-process session lock, refusing to run unprotected",
 				"session_id", call.SessionID, "err", lockErr)
-		} else {
-			ipcLock = lk
-			defer func() {
-				if relErr := ipcLock.Release(); relErr != nil {
-					slog.Debug("agent.Run: release session lock failed", "session_id", call.SessionID, "err", relErr)
-				}
-			}()
+			return nil, fmt.Errorf("session %q: could not acquire session lock: %w", call.SessionID, lockErr)
 		}
+		ipcLock = lk
+		defer func() {
+			if relErr := ipcLock.Release(); relErr != nil {
+				slog.Debug("agent.Run: release session lock failed", "session_id", call.SessionID, "err", relErr)
+			}
+		}()
 	}
 
 	// Copy mutable fields under lock to avoid races with SetTools/SetModels.
