@@ -246,7 +246,7 @@ func TestRenderDelegationTranscript_MaxMessages(t *testing.T) {
 		})
 	}
 
-	out := renderDelegationTranscript("sess", msgs, ReadDelegationTranscriptParams{MaxMessages: 10, MaxBytes: 500_000})
+	out := renderDelegationTranscript("sess", msgs[50:], 60, ReadDelegationTranscriptParams{MaxMessages: 10, MaxBytes: 500_000})
 
 	// Must contain the last 10 messages (50-59).
 	require.Contains(t, out, "message 59")
@@ -270,7 +270,7 @@ func TestRenderDelegationTranscript_MaxBytes(t *testing.T) {
 	}
 
 	maxBytes := 500
-	out := renderDelegationTranscript("sess", msgs, ReadDelegationTranscriptParams{MaxMessages: 50, MaxBytes: maxBytes})
+	out := renderDelegationTranscript("sess", msgs, 1, ReadDelegationTranscriptParams{MaxMessages: 50, MaxBytes: maxBytes})
 
 	require.Less(t, len(out), maxBytes+300,
 		"output must be approximately within the byte budget (plus marker)")
@@ -294,7 +294,7 @@ func TestRenderDelegationTranscript_Offset(t *testing.T) {
 	}
 
 	// offset=10, max_messages=10: should show messages 10-19 (0-indexed).
-	out := renderDelegationTranscript("sess", msgs, ReadDelegationTranscriptParams{MaxMessages: 10, Offset: 10, MaxBytes: 500_000})
+	out := renderDelegationTranscript("sess", msgs[10:20], 30, ReadDelegationTranscriptParams{MaxMessages: 10, Offset: 10, MaxBytes: 500_000})
 
 	require.Contains(t, out, "msg 19")
 	require.Contains(t, out, "msg 10")
@@ -312,9 +312,112 @@ func TestRenderDelegationTranscript_Defaults(t *testing.T) {
 		{Role: message.Assistant, Parts: []message.ContentPart{message.TextContent{Text: "hello"}}},
 	}
 
-	out := renderDelegationTranscript("sess", msgs, ReadDelegationTranscriptParams{})
+	out := renderDelegationTranscript("sess", msgs, 1, ReadDelegationTranscriptParams{})
 
 	require.Contains(t, out, "hello")
 	require.NotContains(t, out, "truncated")
 	require.NotContains(t, out, "omitted")
+}
+
+// spyMessageService wraps a message.Service and records the arguments and
+// result size of the most recent ListPaginated call, so a test can prove the
+// tool read only a bounded window from the DB instead of the whole history.
+type spyMessageService struct {
+	message.Service
+	listPaginatedLimit  int
+	listPaginatedOffset int
+	listPaginatedLen    int
+	listPaginatedCalled bool
+}
+
+func (s *spyMessageService) ListPaginated(ctx context.Context, sessionID string, limit, offset int) ([]message.Message, error) {
+	msgs, err := s.Service.ListPaginated(ctx, sessionID, limit, offset)
+	s.listPaginatedLimit = limit
+	s.listPaginatedOffset = offset
+	s.listPaginatedLen = len(msgs)
+	s.listPaginatedCalled = true
+	return msgs, err
+}
+
+// TestReadDelegationTranscript_PaginationReadsBoundedWindow proves the tool
+// pages at the SQL layer: a session with 1000 messages read with
+// max_messages=10 must request (and receive) only ~10 rows from
+// ListPaginated, not decode all 1000, while still reporting the true total in
+// its "N earlier omitted" marker.
+func TestReadDelegationTranscript_PaginationReadsBoundedWindow(t *testing.T) {
+	t.Parallel()
+	s, m := newTranscriptTestDB(t)
+
+	parent, err := s.Create(context.Background(), "parent")
+	require.NoError(t, err)
+	child, err := s.CreateTaskSession(context.Background(), "m$$c", parent.ID, "worker")
+	require.NoError(t, err)
+
+	// Seed 1000 messages so the full history is far larger than the window.
+	for i := 0; i < 1000; i++ {
+		_, err = m.Create(context.Background(), child.ID, message.CreateMessageParams{
+			Role:  message.Assistant,
+			Parts: []message.ContentPart{message.TextContent{Text: fmt.Sprintf("line %d", i)}},
+		})
+		require.NoError(t, err)
+	}
+
+	spy := &spyMessageService{Service: m}
+	tool := NewReadDelegationTranscriptTool(s, spy)
+	input, err := json.Marshal(ReadDelegationTranscriptParams{SessionID: child.ID, MaxMessages: 10, MaxBytes: 1_500_000})
+	require.NoError(t, err)
+	ctx := context.WithValue(context.Background(), SessionIDContextKey, parent.ID)
+	resp, runErr := tool.Run(ctx, fantasy.ToolCall{ID: "c1", Name: ReadDelegationTranscriptToolName, Input: string(input)})
+
+	require.NoError(t, runErr)
+	require.False(t, resp.IsError, "reading a legitimate child must succeed: %s", resp.Content)
+
+	// The DB query must have asked for only the window size, and received at
+	// most that many rows — not the full 1000-message history.
+	require.True(t, spy.listPaginatedCalled, "tool must read via ListPaginated, not List")
+	require.Equal(t, 10, spy.listPaginatedLimit, "ListPaginated must request only the window size")
+	require.LessOrEqual(t, spy.listPaginatedLen, 10, "ListPaginated must return at most the window size")
+	// The marker must still reflect the true total of 1000.
+	require.Contains(t, resp.Content, "990 earlier omitted")
+}
+
+// TestRenderDelegationTranscript_HardMaxBytesClamp proves an absurdly large
+// max_bytes (10^9) is clamped to hardMaxTranscriptBytes rather than passing
+// through: a payload that would otherwise fit entirely under 10^9 must still
+// be truncated near the hard ceiling.
+func TestRenderDelegationTranscript_HardMaxBytesClamp(t *testing.T) {
+	t.Parallel()
+
+	// 5 MiB of text would fit comfortably under a 10^9 budget if unclamped.
+	huge := strings.Repeat("B", 5_000_000)
+	msgs := []message.Message{
+		{Role: message.Assistant, Parts: []message.ContentPart{message.TextContent{Text: huge}}},
+	}
+
+	out := renderDelegationTranscript("sess", msgs, 1, ReadDelegationTranscriptParams{MaxBytes: 1_000_000_000})
+
+	require.Less(t, len(out), hardMaxTranscriptBytes+1024,
+		"absurd max_bytes must be clamped to hardMaxTranscriptBytes, not pass through")
+	require.Contains(t, out, "truncated")
+}
+
+// TestRenderDelegationTranscript_HugeMessageBounded proves a single content
+// part carrying several MiB does not blow past the byte budget: the output
+// stays within max_bytes (plus a small marker margin), confirming the budget
+// is checked per-part at write time rather than after assembling the whole
+// message.
+func TestRenderDelegationTranscript_HugeMessageBounded(t *testing.T) {
+	t.Parallel()
+
+	huge := strings.Repeat("Z", 3_000_000) // 3 MiB in a single content part.
+	msgs := []message.Message{
+		{Role: message.Assistant, Parts: []message.ContentPart{message.TextContent{Text: huge}}},
+	}
+
+	out := renderDelegationTranscript("sess", msgs, 1, ReadDelegationTranscriptParams{MaxBytes: 50_000})
+
+	require.Less(t, len(out), 50_000+1024,
+		"a huge single-part message must not blow past the byte budget")
+	require.Contains(t, out, "truncated")
+	require.Contains(t, out, "bytes dropped")
 }

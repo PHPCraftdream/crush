@@ -10,6 +10,7 @@ import (
 )
 
 type Querier interface {
+	CountMessagesBySession(ctx context.Context, sessionID string) (int64, error)
 	CreateFile(ctx context.Context, arg CreateFileParams) (File, error)
 	CreateMessage(ctx context.Context, arg CreateMessageParams) (Message, error)
 	// pending_injects is the cross-process inject queue for `crush sessions
@@ -74,6 +75,7 @@ type Querier interface {
 	ListFilesBySession(ctx context.Context, sessionID string) ([]File, error)
 	ListLatestSessionFiles(ctx context.Context, sessionID string) ([]File, error)
 	ListMessagesBySession(ctx context.Context, sessionID string) ([]Message, error)
+	ListMessagesBySessionPaginated(ctx context.Context, arg ListMessagesBySessionPaginatedParams) ([]Message, error)
 	ListNewFiles(ctx context.Context) ([]File, error)
 	ListPendingInjectsBySession(ctx context.Context, sessionID string) ([]PendingInject, error)
 	ListSessionPermissions(ctx context.Context, sessionID string) ([]SessionPermission, error)

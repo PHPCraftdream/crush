@@ -57,6 +57,15 @@ type Service interface {
 	Notify(message Message)
 	Get(ctx context.Context, id string) (Message, error)
 	List(ctx context.Context, sessionID string) ([]Message, error)
+	// ListPaginated returns at most limit messages for a session, newest first
+	// (DESC by created_at), skipping the first offset rows. It is the paginated
+	// counterpart to List so callers can read just the window they need instead
+	// of decoding the entire history.
+	ListPaginated(ctx context.Context, sessionID string, limit, offset int) ([]Message, error)
+	// Count returns the total number of messages stored for a session. Used by
+	// callers that page with ListPaginated to render accurate "N earlier
+	// omitted" markers without loading the full history.
+	Count(ctx context.Context, sessionID string) (int64, error)
 	ListUserMessages(ctx context.Context, sessionID string) ([]Message, error)
 	ListAllUserMessages(ctx context.Context) ([]Message, error)
 	Delete(ctx context.Context, id string) error
@@ -252,6 +261,29 @@ func (s *service) List(ctx context.Context, sessionID string) ([]Message, error)
 		}
 	}
 	return messages, nil
+}
+
+func (s *service) ListPaginated(ctx context.Context, sessionID string, limit, offset int) ([]Message, error) {
+	dbMessages, err := s.q.ListMessagesBySessionPaginated(ctx, db.ListMessagesBySessionPaginatedParams{
+		SessionID: sessionID,
+		Limit:     int64(limit),
+		Offset:    int64(offset),
+	})
+	if err != nil {
+		return nil, err
+	}
+	messages := make([]Message, len(dbMessages))
+	for i, dbMessage := range dbMessages {
+		messages[i], err = s.fromDBItem(dbMessage)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return messages, nil
+}
+
+func (s *service) Count(ctx context.Context, sessionID string) (int64, error) {
+	return s.q.CountMessagesBySession(ctx, sessionID)
 }
 
 func (s *service) ListUserMessages(ctx context.Context, sessionID string) ([]Message, error) {

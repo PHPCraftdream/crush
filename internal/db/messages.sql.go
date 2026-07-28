@@ -10,6 +10,19 @@ import (
 	"database/sql"
 )
 
+const countMessagesBySession = `-- name: CountMessagesBySession :one
+SELECT COUNT(*)
+FROM messages
+WHERE session_id = ?
+`
+
+func (q *Queries) CountMessagesBySession(ctx context.Context, sessionID string) (int64, error) {
+	row := q.queryRow(ctx, q.countMessagesBySessionStmt, countMessagesBySession, sessionID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const createMessage = `-- name: CreateMessage :one
 INSERT INTO messages (
     id,
@@ -184,6 +197,59 @@ ORDER BY created_at ASC
 
 func (q *Queries) ListMessagesBySession(ctx context.Context, sessionID string) ([]Message, error) {
 	rows, err := q.query(ctx, q.listMessagesBySessionStmt, listMessagesBySession, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Message{}
+	for rows.Next() {
+		var i Message
+		if err := rows.Scan(
+			&i.ID,
+			&i.SessionID,
+			&i.Role,
+			&i.Parts,
+			&i.Model,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.FinishedAt,
+			&i.Provider,
+			&i.IsSummaryMessage,
+			&i.Pinned,
+			&i.Hidden,
+			&i.ReasoningEffort,
+			&i.AutoResumed,
+			&i.BackgroundJobNotice,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listMessagesBySessionPaginated = `-- name: ListMessagesBySessionPaginated :many
+SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden, reasoning_effort, auto_resumed, background_job_notice
+FROM messages
+WHERE session_id = ?
+ORDER BY created_at DESC
+LIMIT ? OFFSET ?
+`
+
+type ListMessagesBySessionPaginatedParams struct {
+	SessionID string `json:"session_id"`
+	Limit     int64  `json:"limit"`
+	Offset    int64  `json:"offset"`
+}
+
+func (q *Queries) ListMessagesBySessionPaginated(ctx context.Context, arg ListMessagesBySessionPaginatedParams) ([]Message, error) {
+	rows, err := q.query(ctx, q.listMessagesBySessionPaginatedStmt, listMessagesBySessionPaginated, arg.SessionID, arg.Limit, arg.Offset)
 	if err != nil {
 		return nil, err
 	}

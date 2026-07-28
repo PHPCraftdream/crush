@@ -64,3 +64,15 @@ SELECT *
 FROM messages
 WHERE role = 'user'
 ORDER BY created_at DESC;
+
+-- name: ListMessagesBySessionPaginated :many
+SELECT *
+FROM messages
+WHERE session_id = ?
+ORDER BY created_at DESC
+LIMIT ? OFFSET ?;
+
+-- name: CountMessagesBySession :one
+SELECT COUNT(*)
+FROM messages
+WHERE session_id = ?;

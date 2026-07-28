@@ -38,6 +38,18 @@ const (
 	// and a marker is appended indicating how many bytes were dropped —
 	// similar to the boundedBuffer pattern in internal/shell/background.go.
 	defaultTranscriptMaxBytes = 150_000
+
+	// hardMaxTranscriptMessages is the absolute ceiling on max_messages,
+	// regardless of what the caller requests. 10x the default (50) — generous
+	// enough for a deep inspection of a delegation, bounded enough that a
+	// runaway request can never pull thousands of decoded rows into memory.
+	hardMaxTranscriptMessages = 500
+
+	// hardMaxTranscriptBytes is the absolute ceiling on max_bytes. 10x the
+	// default (150000): worst-case rendered output stays near ~1.5 MiB even
+	// if the model asks for a gigabyte, so a pathological request can never
+	// balloon the orchestrator's context.
+	hardMaxTranscriptBytes = 1_500_000
 )
 
 // ReadDelegationTranscriptParams is the JSON schema for the
@@ -124,12 +136,32 @@ func NewReadDelegationTranscriptTool(sessions session.Service, messages message.
 				)), nil
 			}
 
-			msgs, err := messages.List(ctx, target)
+			// Page at the SQL layer instead of loading the entire history: count
+			// the true total (for an accurate "N earlier omitted" marker) and read
+			// only the requested window. Before this, messages.List decoded every
+			// row of the session before the window was applied — a multi-MiB
+			// transcript was fully materialised even when only the tail was shown.
+			maxMessages, _, offset := clampTranscriptWindow(params)
+
+			total, err := messages.Count(ctx, target)
+			if err != nil {
+				return fantasy.ToolResponse{}, fmt.Errorf("failed to count messages for session %q: %w", target, err)
+			}
+
+			window, err := messages.ListPaginated(ctx, target, maxMessages, offset)
 			if err != nil {
 				return fantasy.ToolResponse{}, fmt.Errorf("failed to list messages for session %q: %w", target, err)
 			}
 
-			return fantasy.NewTextResponse(renderDelegationTranscript(target, msgs, params)), nil
+			// ListPaginated returns newest-first (DESC by created_at); reverse
+			// into chronological order so the transcript reads oldest-to-newest,
+			// matching the visible order callers saw before pagination moved to
+			// the DB.
+			for i, j := 0, len(window)-1; i < j; i, j = i+1, j-1 {
+				window[i], window[j] = window[j], window[i]
+			}
+
+			return fantasy.NewTextResponse(renderDelegationTranscript(target, window, int(total), params)), nil
 		},
 	)
 }
@@ -182,12 +214,91 @@ func isDescendantSession(ctx context.Context, sessions session.Service, rootID, 
 	return false, nil
 }
 
-// renderTranscriptMessage renders a single message into a compact transcript
-// section. Extracted from renderDelegationTranscript so the byte-budget loop
-// can render one message at a time and stop mid-stream when the budget is hit.
-func renderTranscriptMessage(num, total int, msg message.Message) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "── message %d/%d [%s] ──\n", num, total, msg.Role)
+// markerReserve is the byte budget set aside for the "[transcript
+// truncated: ...]" epilog so content + marker never materially exceeds
+// maxBytes.
+const markerReserve = 256
+
+// clampTranscriptWindow normalises the caller-supplied window parameters:
+// missing values fall back to the defaults, and absurdly large values are
+// clamped to the hard ceilings so a model can never bypass the output-size
+// guard by passing max_bytes=10^9 or max_messages=10^6.
+func clampTranscriptWindow(params ReadDelegationTranscriptParams) (maxMessages, maxBytes, offset int) {
+	maxMessages = params.MaxMessages
+	if maxMessages <= 0 {
+		maxMessages = defaultTranscriptMaxMessages
+	}
+	if maxMessages > hardMaxTranscriptMessages {
+		maxMessages = hardMaxTranscriptMessages
+	}
+	maxBytes = params.MaxBytes
+	if maxBytes <= 0 {
+		maxBytes = defaultTranscriptMaxBytes
+	}
+	if maxBytes > hardMaxTranscriptBytes {
+		maxBytes = hardMaxTranscriptBytes
+	}
+	offset = params.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	return maxMessages, maxBytes, offset
+}
+
+// transcriptBuffer wraps a strings.Builder with a content-byte budget. Each
+// write checks the remaining budget BEFORE committing bytes, so a single
+// enormous content part is truncated in place rather than being rendered
+// whole into an intermediate buffer and trimmed afterwards — the old
+// "assemble-then-cut" pattern doubled peak memory for one huge message
+// (renderTranscriptMessage built the entire section, then the caller sliced
+// it down to the budget).
+type transcriptBuffer struct {
+	b             *strings.Builder
+	contentBudget int
+	written       int
+	droppedBytes  int
+	truncated     bool
+}
+
+// writeStr writes s if it fits within the remaining content budget. It
+// returns true when the whole string was written. Once the budget is
+// exhausted it is a no-op (truncated stays latched). If s does not fit, a
+// prefix truncated at the last valid UTF-8 rune boundary is written, the
+// unwritten tail is accounted in droppedBytes, and truncated is latched —
+// mirroring internal/shell/background.go's boundedBuffer rune handling.
+func (tb *transcriptBuffer) writeStr(s string) bool {
+	if tb.truncated {
+		return false
+	}
+	remaining := tb.contentBudget - tb.written
+	if remaining <= 0 {
+		tb.truncated = true
+		return false
+	}
+	if len(s) <= remaining {
+		tb.b.WriteString(s)
+		tb.written += len(s)
+		return true
+	}
+	cut := remaining
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	tb.b.WriteString(s[:cut])
+	tb.written += cut
+	tb.droppedBytes += len(s) - cut
+	tb.truncated = true
+	return false
+}
+
+// renderMessageInto renders one message into tb, numbering it num of total.
+// Header and every content part are written straight through the budgeted
+// buffer (no per-message intermediate Builder). Returns wroteHeader: whether
+// at least the header line was emitted, which the caller uses to decide
+// whether a budget-induced stop omits this message entirely or only the
+// messages after it.
+func renderMessageInto(tb *transcriptBuffer, num, total int, msg message.Message) (wroteHeader bool) {
+	wroteHeader = tb.writeStr(fmt.Sprintf("── message %d/%d [%s] ──\n", num, total, msg.Role))
 	rendered := 0
 	for _, part := range msg.Parts {
 		switch p := part.(type) {
@@ -195,25 +306,33 @@ func renderTranscriptMessage(num, total int, msg message.Message) string {
 			if strings.TrimSpace(p.Text) == "" {
 				continue
 			}
-			b.WriteString(p.Text)
-			if !strings.HasSuffix(p.Text, "\n") {
-				b.WriteByte('\n')
+			// Write the text directly; only append a newline when the text
+			// was fully written, so a multi-MiB part never gets copied into a
+			// fresh text+"\n" string just to add the separator.
+			if tb.writeStr(p.Text) {
+				if !strings.HasSuffix(p.Text, "\n") {
+					tb.writeStr("\n")
+				}
+				rendered++
 			}
-			rendered++
 		case message.ReasoningContent:
 			if strings.TrimSpace(p.Thinking) == "" {
 				continue
 			}
-			fmt.Fprintf(&b, "[thinking] %s\n", truncatePreview(firstLine(p.Thinking), 200))
-			rendered++
+			if tb.writeStr(fmt.Sprintf("[thinking] %s\n", truncatePreview(firstLine(p.Thinking), 200))) {
+				rendered++
+			}
 		case message.ToolCall:
 			input := strings.TrimSpace(p.Input)
+			var ok bool
 			if input != "" {
-				fmt.Fprintf(&b, "[tool: %s] %s\n", p.Name, truncatePreview(collapseWhitespace(input), 200))
+				ok = tb.writeStr(fmt.Sprintf("[tool: %s] %s\n", p.Name, truncatePreview(collapseWhitespace(input), 200)))
 			} else {
-				fmt.Fprintf(&b, "[tool: %s]\n", p.Name)
+				ok = tb.writeStr(fmt.Sprintf("[tool: %s]\n", p.Name))
 			}
-			rendered++
+			if ok {
+				rendered++
+			}
 		case message.ToolResult:
 			name := p.Name
 			if name == "" {
@@ -224,50 +343,45 @@ func renderTranscriptMessage(num, total int, msg message.Message) string {
 				prefix += " ERROR"
 			}
 			body := summariseTranscriptResult(p.Content)
+			var ok bool
 			if body != "" {
-				fmt.Fprintf(&b, "%s %s\n", prefix, body)
+				ok = tb.writeStr(fmt.Sprintf("%s %s\n", prefix, body))
 			} else {
-				fmt.Fprintf(&b, "%s\n", prefix)
+				ok = tb.writeStr(fmt.Sprintf("%s\n", prefix))
 			}
-			rendered++
+			if ok {
+				rendered++
+			}
 		}
 	}
 	if rendered == 0 {
-		b.WriteString("(no content)\n")
+		tb.writeStr("(no content)\n")
 	}
 	if f := msg.FinishPart(); f != nil && f.Reason != "" {
-		fmt.Fprintf(&b, "(finished: %s)\n", f.Reason)
+		tb.writeStr(fmt.Sprintf("(finished: %s)\n", f.Reason))
 	}
-	b.WriteByte('\n')
-	return b.String()
+	tb.writeStr("\n")
+	return wroteHeader
 }
 
 // renderDelegationTranscript formats a child session's messages into a compact,
-// human/agent-readable transcript with bounded output. Two limits are enforced:
+// human/agent-readable transcript with bounded output. msgs MUST be the
+// already-paginated window in chronological (ASC) order; total is the true
+// message count for the session (used for the "N earlier omitted" marker and
+// per-message X/total numbering). Two limits are enforced:
 //
-//  1. max_messages: only the most recent N messages are rendered (configurable
-//     via params.MaxMessages, default 50). An offset can page backward.
+//  1. max_messages: applied by the caller at the SQL layer
+//     (ListMessagesBySessionPaginated, DESC LIMIT/OFFSET); only the window is
+//     passed in here.
 //
-//  2. max_bytes: the total rendered output is capped (configurable via
-//     params.MaxBytes, default 150000). If the budget is exceeded mid-message,
-//     output is truncated at a rune boundary and a "[N bytes truncated]"
-//     marker is appended — same pattern as internal/shell/background.go's
-//     boundedBuffer.
-func renderDelegationTranscript(sessionID string, msgs []message.Message, params ReadDelegationTranscriptParams) string {
-	maxMessages := params.MaxMessages
-	if maxMessages <= 0 {
-		maxMessages = defaultTranscriptMaxMessages
-	}
-	maxBytes := params.MaxBytes
-	if maxBytes <= 0 {
-		maxBytes = defaultTranscriptMaxBytes
-	}
-	offset := params.Offset
-	if offset < 0 {
-		offset = 0
-	}
-
-	total := len(msgs)
+//  2. max_bytes: the rendered output is capped (configurable via
+//     params.MaxBytes, default 150000, hard ceiling 1.5 MiB). If the budget is
+//     exceeded mid-message, output is truncated at a rune boundary and a
+//     "[N bytes dropped ..., M subsequent message(s) omitted]" marker is
+//     appended — same pattern as internal/shell/background.go's boundedBuffer.
+func renderDelegationTranscript(sessionID string, msgs []message.Message, total int, params ReadDelegationTranscriptParams) string {
+	_, maxBytes, offset := clampTranscriptWindow(params)
+	windowSize := len(msgs)
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "Sub-agent delegation transcript (session %s), %d message(s)", sessionID, total)
@@ -276,73 +390,62 @@ func renderDelegationTranscript(sessionID string, msgs []message.Message, params
 		return b.String()
 	}
 
-	// Compute the visible window. Offset trims from the END (newest); the
-	// window is the maxMessages messages ending at (total - offset).
-	end := total - offset
-	if end < 0 {
-		end = 0
+	// 1-based chronological position of the first message in the window, so
+	// per-message numbering and the pagination marker stay accurate without
+	// the caller having to pass the full history.
+	firstNum := total - offset - windowSize + 1
+	if firstNum < 1 {
+		firstNum = 1
 	}
-	start := end - maxMessages
-	if start < 0 {
-		start = 0
+	lastNum := firstNum + windowSize - 1
+
+	if windowSize == 0 {
+		fmt.Fprintf(&b, " [offset %d is past the end; no messages in window]", offset)
+		b.WriteString(":\n\n(no messages in the requested window)\n")
+		return b.String()
 	}
 
 	// Pagination marker when not showing everything.
-	if start > 0 || offset > 0 {
+	if firstNum > 1 || offset > 0 {
 		b.WriteString(" [")
-		fmt.Fprintf(&b, "showing messages %d-%d", start+1, end)
-		if start > 0 {
-			fmt.Fprintf(&b, "; %d earlier omitted", start)
+		fmt.Fprintf(&b, "showing messages %d-%d", firstNum, lastNum)
+		if firstNum > 1 {
+			fmt.Fprintf(&b, "; %d earlier omitted", firstNum-1)
 		}
-		if end < total {
-			fmt.Fprintf(&b, "; %d newer skipped (offset=%d)", total-end, offset)
+		if total > lastNum {
+			fmt.Fprintf(&b, "; %d newer skipped (offset=%d)", total-lastNum, offset)
 		}
 		b.WriteString("]")
 	}
 	b.WriteString(":\n\n")
 
-	// Render window with byte budget. Reserve space for the truncation marker
-	// so content + marker never materially exceeds maxBytes.
-	const markerReserve = 256
-	headerLen := b.Len()
-	contentBudget := maxBytes - headerLen - markerReserve
-	if contentBudget < 0 {
-		contentBudget = 0
+	// Render the window with a byte budget. Each part is written straight into
+	// the budgeted buffer and checked against the remaining budget BEFORE
+	// committing, so a single huge content part cannot blow past maxBytes.
+	tb := &transcriptBuffer{b: &b, contentBudget: maxBytes - b.Len() - markerReserve}
+	if tb.contentBudget < 0 {
+		tb.contentBudget = 0
 	}
 
-	truncated := false
-	var droppedBytes int
 	omittedMsgs := 0
-	for i := start; i < end; i++ {
-		section := renderTranscriptMessage(i+1, total, msgs[i])
-		written := b.Len() - headerLen
-		remaining := contentBudget - written
-		if remaining <= 0 {
-			omittedMsgs = end - i
-			truncated = true
+	for idx, msg := range msgs {
+		wroteHeader := renderMessageInto(tb, firstNum+idx, total, msg)
+		if tb.truncated {
+			if wroteHeader {
+				// This message was partially shown; only later ones are omitted.
+				omittedMsgs = windowSize - idx - 1
+			} else {
+				// Budget exhausted before this message's header: it is omitted too.
+				omittedMsgs = windowSize - idx
+			}
 			break
 		}
-		if len(section) <= remaining {
-			b.WriteString(section)
-			continue
-		}
-		// Truncate this section at the last valid UTF-8 rune boundary that
-		// fits within the remaining budget.
-		cut := remaining
-		for cut > 0 && !utf8.RuneStart(section[cut]) {
-			cut--
-		}
-		b.WriteString(section[:cut])
-		droppedBytes += len(section) - cut
-		omittedMsgs = end - i - 1
-		truncated = true
-		break
 	}
 
-	if truncated {
+	if tb.truncated {
 		b.WriteString("\n... [transcript truncated: ")
-		if droppedBytes > 0 {
-			fmt.Fprintf(&b, "%d bytes dropped in last message, ", droppedBytes)
+		if tb.droppedBytes > 0 {
+			fmt.Fprintf(&b, "%d bytes dropped in last message, ", tb.droppedBytes)
 		}
 		fmt.Fprintf(&b, "%d subsequent message(s) omitted (max_bytes=%d)] ...\n", omittedMsgs, maxBytes)
 	}
