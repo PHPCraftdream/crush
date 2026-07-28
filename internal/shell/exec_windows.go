@@ -58,7 +58,7 @@ func processGroupExecHandler(killTimeout time.Duration) interp.ExecHandlerFunc {
 		if err == nil {
 			stopf := context.AfterFunc(ctx, func() {
 				// cmd.Stdout/Stderr here are plain io.Writers (our
-				// syncBuffer, not *os.File), so os/exec backs them with an
+				// boundedBuffer, not *os.File), so os/exec backs them with an
 				// OS pipe and a copy-goroutine that cmd.Wait() joins. That
 				// goroutine only sees EOF once EVERY process holding the
 				// pipe's write end closes it. A plain Process.Signal —

@@ -54,8 +54,13 @@ func NewJobOutputTool() fantasy.AgentTool {
 			}
 
 			if params.Wait {
-				baseSo, baseSe, _, _ := bgShell.GetOutput()
-				baseLen := len(baseSo) + len(baseSe)
+				// Use the monotonic total-written-bytes counter, not a
+				// GetOutput snapshot's length, as the baseline: once a
+				// stream's bounded buffer has truncated, the snapshot no
+				// longer grows 1:1 with real output, so a snapshot-derived
+				// baseline would make WaitForChange return immediately
+				// instead of actually waiting for new output.
+				baseLen := bgShell.TotalWrittenBytes()
 				waitCtx, cancelWait := context.WithTimeout(ctx, jobOutputMaxWait)
 				bgShell.WaitForChange(waitCtx, baseLen)
 				cancelWait()

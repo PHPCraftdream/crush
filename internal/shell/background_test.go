@@ -4,6 +4,8 @@ import (
 	"context"
 	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -145,8 +147,8 @@ func TestBackgroundShellManager_Kill_ReturnsOnCtxDone(t *testing.T) {
 		done:      make(chan struct{}), // never closed
 		cancel:    func() {},           // no-op: cancellation does nothing
 		ctx:       context.Background(),
-		stdout:    &syncBuffer{},
-		stderr:    &syncBuffer{},
+		stdout:    &boundedBuffer{maxBytes: maxStreamBufferBytes},
+		stderr:    &boundedBuffer{maxBytes: maxStreamBufferBytes},
 		StartTime: time.Now(),
 	}
 	manager.shells.Set(bgShell.ID, bgShell)
@@ -390,8 +392,8 @@ func TestBackgroundShell_WaitForChange_ReturnsOnOutputGrowth(t *testing.T) {
 	t.Parallel()
 
 	bgShell := &BackgroundShell{
-		stdout:    &syncBuffer{},
-		stderr:    &syncBuffer{},
+		stdout:    &boundedBuffer{maxBytes: maxStreamBufferBytes},
+		stderr:    &boundedBuffer{maxBytes: maxStreamBufferBytes},
 		done:      make(chan struct{}),
 		StartTime: time.Now(),
 	}
@@ -426,8 +428,8 @@ func TestBackgroundShell_WaitForChange_ReturnsOnCompletion(t *testing.T) {
 	t.Parallel()
 
 	bgShell := &BackgroundShell{
-		stdout:    &syncBuffer{},
-		stderr:    &syncBuffer{},
+		stdout:    &boundedBuffer{maxBytes: maxStreamBufferBytes},
+		stderr:    &boundedBuffer{maxBytes: maxStreamBufferBytes},
 		done:      make(chan struct{}),
 		StartTime: time.Now(),
 	}
@@ -460,8 +462,8 @@ func TestBackgroundShell_WaitForChange_ReturnsOnCtxDone(t *testing.T) {
 	t.Parallel()
 
 	bgShell := &BackgroundShell{
-		stdout:    &syncBuffer{},
-		stderr:    &syncBuffer{},
+		stdout:    &boundedBuffer{maxBytes: maxStreamBufferBytes},
+		stderr:    &boundedBuffer{maxBytes: maxStreamBufferBytes},
 		done:      make(chan struct{}),
 		StartTime: time.Now(),
 	}
@@ -556,4 +558,285 @@ func TestBackgroundShell_Elapsed(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 		require.Positive(t, bgShell.Elapsed())
 	})
+}
+
+// TestBoundedBuffer_CapsSnapshotSize proves that writing far more than
+// maxBytes into a boundedBuffer never yields a String() snapshot larger than
+// the configured cap (plus the small, fixed marker overhead already
+// accounted for in enforceLimitLocked's budget) — this is the core memory
+// fix: previously (syncBuffer wrapping bytes.Buffer) an arbitrarily large
+// write grew the snapshot without bound.
+func TestBoundedBuffer_CapsSnapshotSize(t *testing.T) {
+	t.Parallel()
+
+	const maxBytes = 64 * 1024 // small cap so the test writes fast
+	b := newBoundedBuffer(maxBytes)
+
+	line := strings.Repeat("x", 100) + "\n"
+	totalWritten := 0
+	// Write ~50x the cap worth of data.
+	for totalWritten < maxBytes*50 {
+		n, err := b.WriteString(line)
+		require.NoError(t, err)
+		totalWritten += n
+	}
+
+	snapshot := b.String()
+	require.LessOrEqual(t, len(snapshot), maxBytes,
+		"bounded buffer snapshot must never exceed the configured cap")
+
+	// The monotonic counter must reflect everything ever written, not just
+	// what's resident.
+	require.Equal(t, totalWritten, b.Len())
+	require.Greater(t, b.Len(), maxBytes, "test sanity: must have written more than the cap")
+}
+
+// TestBoundedBuffer_PreservesHeadAndTailWithMarker proves that once a
+// boundedBuffer overflows, the snapshot contains BOTH the first bytes ever
+// written (head — usually identifies the command / earliest errors) AND the
+// most recently written bytes (tail — current state), joined by an explicit
+// truncation marker reporting how many bytes were dropped from the middle.
+// This is the classic head+tail log-truncation pattern; a naive "keep only
+// the first N" or "keep only the last N" (ring buffer) policy would fail
+// this test by construction.
+func TestBoundedBuffer_PreservesHeadAndTailWithMarker(t *testing.T) {
+	t.Parallel()
+
+	const maxBytes = 8 * 1024
+	b := newBoundedBuffer(maxBytes)
+
+	require.NoError(t, mustWrite(b, "HEAD-MARKER-START\n"))
+
+	// Write enough padding to guarantee the head marker would be evicted by
+	// a plain ring-buffer / tail-only policy.
+	padding := strings.Repeat("pad-line-filler-content\n", 2000)
+	require.NoError(t, mustWrite(b, padding))
+
+	require.NoError(t, mustWrite(b, "TAIL-MARKER-END\n"))
+
+	snapshot := b.String()
+
+	require.Contains(t, snapshot, "HEAD-MARKER-START", "head must survive truncation")
+	require.Contains(t, snapshot, "TAIL-MARKER-END", "tail must survive truncation")
+	require.Regexp(t, `\[\d+ bytes truncated\]`, snapshot, "must report an explicit truncation marker with a byte count")
+	require.LessOrEqual(t, len(snapshot), maxBytes)
+}
+
+func mustWrite(b *boundedBuffer, s string) error {
+	_, err := b.WriteString(s)
+	return err
+}
+
+// TestBackgroundShell_WaitForChange_DetectsGrowthAfterOverflow proves
+// WaitForChange keeps detecting new output as "change" even once a stream's
+// bounded buffer has already overflowed and started dropping old bytes —
+// i.e. the monotonic writtenBytes counter (not the bounded/possibly-shrunk
+// resident snapshot) drives the comparison, so growth is never silently
+// missed after truncation kicks in.
+func TestBackgroundShell_WaitForChange_DetectsGrowthAfterOverflow(t *testing.T) {
+	t.Parallel()
+
+	const maxBytes = 4 * 1024
+	bgShell := &BackgroundShell{
+		stdout:    newBoundedBuffer(maxBytes),
+		stderr:    newBoundedBuffer(maxBytes),
+		done:      make(chan struct{}),
+		StartTime: time.Now(),
+	}
+
+	// Overflow the buffer well past its cap before establishing a baseline.
+	overflow := strings.Repeat("overflow-line-content-here\n", 1000)
+	_, err := bgShell.stdout.WriteString(overflow)
+	require.NoError(t, err)
+	require.Greater(t, bgShell.stdout.Len(), maxBytes, "test sanity: must have overflowed")
+
+	baseline := bgShell.stdout.Len() + bgShell.stderr.Len()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	t.Cleanup(cancel)
+
+	waitDone := make(chan struct{})
+	go func() {
+		bgShell.WaitForChange(ctx, baseline)
+		close(waitDone)
+	}()
+
+	// Confirm it does NOT return immediately (no growth yet).
+	select {
+	case <-waitDone:
+		t.Fatal("WaitForChange returned before any new output was written past the baseline")
+	case <-time.After(300 * time.Millisecond):
+		// Expected: still waiting.
+	}
+
+	// Write more — even though this keeps overflowing the resident buffer,
+	// the monotonic counter must still grow and WaitForChange must notice.
+	_, err = bgShell.stdout.WriteString("more-output-after-overflow\n")
+	require.NoError(t, err)
+
+	select {
+	case <-waitDone:
+		// Expected: detected growth past baseline despite ongoing truncation.
+	case <-time.After(2 * time.Second):
+		t.Fatal("WaitForChange did not detect growth after buffer overflow")
+	}
+}
+
+// TestBackgroundShell_ConcurrentReadWrite exercises concurrent GetOutput /
+// WaitForChange readers against a concurrent writer goroutine (mirroring the
+// real ExecStream call pattern where the shell interpreter writes
+// continuously while job_output/bash poll concurrently). Intended to run
+// under `-race`: it must complete without triggering the race detector and
+// without ever observing a snapshot larger than the cap.
+func TestBackgroundShell_ConcurrentReadWrite(t *testing.T) {
+	t.Parallel()
+
+	const maxBytes = 16 * 1024
+	bgShell := &BackgroundShell{
+		stdout:    newBoundedBuffer(maxBytes),
+		stderr:    newBoundedBuffer(maxBytes),
+		done:      make(chan struct{}),
+		StartTime: time.Now(),
+	}
+
+	var wg sync.WaitGroup
+
+	// Writer: simulates ExecStream writing continuously.
+	wg.Go(func() {
+		for i := 0; i < 2000; i++ {
+			_, _ = bgShell.stdout.WriteString("line of output data\n")
+			_, _ = bgShell.stderr.WriteString("err line\n")
+		}
+	})
+
+	// Readers: simulate job_output polling via GetOutput and WaitForChange.
+	for range 4 {
+		wg.Go(func() {
+			for i := 0; i < 200; i++ {
+				stdout, stderr, _, _ := bgShell.GetOutput()
+				require.LessOrEqual(t, len(stdout), maxBytes)
+				require.LessOrEqual(t, len(stderr), maxBytes)
+			}
+		})
+	}
+	wg.Go(func() {
+		ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+		defer cancel()
+		bgShell.WaitForChange(ctx, 0)
+	})
+
+	wg.Wait()
+	close(bgShell.done)
+}
+
+// TestBackgroundShell_ReleaseBuffers_KeepsPlaceholderNotEmpty proves that
+// once buffers are released post-completion, GetOutput doesn't silently
+// return an empty string for a stream that actually produced output — that
+// would look indistinguishable from "the command produced no output", which
+// is a regression in its own right. It should instead surface an explicit
+// placeholder.
+func TestBackgroundShell_ReleaseBuffers_KeepsPlaceholderNotEmpty(t *testing.T) {
+	t.Parallel()
+
+	bgShell := &BackgroundShell{
+		stdout: newBoundedBuffer(maxStreamBufferBytes),
+		stderr: newBoundedBuffer(maxStreamBufferBytes),
+		done:   make(chan struct{}),
+	}
+	_, err := bgShell.stdout.WriteString("some real output")
+	require.NoError(t, err)
+	close(bgShell.done)
+
+	stdoutBefore, _, _, _ := bgShell.GetOutput()
+	require.Equal(t, "some real output", stdoutBefore)
+
+	bgShell.releaseBuffers()
+
+	stdoutAfter, stderrAfter, done, _ := bgShell.GetOutput()
+	require.True(t, done)
+	require.NotEmpty(t, stdoutAfter, "must not silently look like empty output after release")
+	require.NotEqual(t, "some real output", stdoutAfter, "test sanity: content must actually have been released")
+	require.Empty(t, stderrAfter, "stream that never produced output stays empty after release")
+}
+
+// TestBackgroundShellManager_Start_AtomicLimitCheck proves the
+// check-then-insert sequence in Start (Len() >= MaxBackgroundJobs, then
+// Set()) can't be overshot by concurrent callers racing past the check
+// before either has inserted. Runs many concurrent Start calls against a
+// manager whose limit is effectively the real MaxBackgroundJobs constant, and
+// asserts the resulting count never exceeds it.
+func TestBackgroundShellManager_Start_AtomicLimitCheck(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	manager := newBackgroundShellManager()
+
+	const attempts = MaxBackgroundJobs + 20
+	var wg sync.WaitGroup
+	var succeeded atomic.Int64
+	for range attempts {
+		wg.Go(func() {
+			// Use a synthetic insert path via Start with a fast-completing
+			// command so process creation cost doesn't dominate; concurrency
+			// is what matters for exercising the race window.
+			_, err := manager.Start(t.Context(), workingDir, nil, "echo hi", "")
+			if err == nil {
+				succeeded.Add(1)
+			}
+		})
+	}
+	wg.Wait()
+
+	require.LessOrEqual(t, int(succeeded.Load()), MaxBackgroundJobs,
+		"concurrent Start calls must never overshoot MaxBackgroundJobs")
+	require.LessOrEqual(t, manager.shells.Len(), MaxBackgroundJobs)
+
+	// Clean up any still-tracked shells.
+	manager.KillAll(t.Context())
+}
+
+// TestBackgroundShell_TotalWrittenBytes_SurvivesOverflow proves
+// TotalWrittenBytes (the correct baseline for WaitForChange) keeps growing
+// 1:1 with real writes even once the underlying stream has overflowed its
+// cap and GetOutput's snapshot has stopped growing at the same rate. This
+// guards against a regression where a caller mistakenly derives its
+// WaitForChange baseline from len(stdout)+len(stderr) (a bounded snapshot)
+// instead of TotalWrittenBytes: once overflowed, such a baseline would
+// already sit below the live monotonic counters, making WaitForChange return
+// immediately (falsely reporting "new output") instead of actually waiting.
+func TestBackgroundShell_TotalWrittenBytes_SurvivesOverflow(t *testing.T) {
+	t.Parallel()
+
+	const maxBytes = 2 * 1024
+	bgShell := &BackgroundShell{
+		stdout:    newBoundedBuffer(maxBytes),
+		stderr:    newBoundedBuffer(maxBytes),
+		done:      make(chan struct{}),
+		StartTime: time.Now(),
+	}
+
+	// Overflow stdout well past its cap.
+	overflow := strings.Repeat("line-of-output-content\n", 500)
+	_, err := bgShell.stdout.WriteString(overflow)
+	require.NoError(t, err)
+
+	snapshot := bgShell.stdout.String()
+	total := bgShell.TotalWrittenBytes()
+
+	require.Greater(t, total, len(snapshot),
+		"once overflowed, the monotonic total must exceed the bounded snapshot length")
+	require.Equal(t, len(overflow), total, "total must equal every byte ever written, not just what's resident")
+
+	// A baseline taken from TotalWrittenBytes right now must NOT look like
+	// "growth" has already happened relative to itself.
+	baseline := bgShell.TotalWrittenBytes()
+	ctx, cancel := context.WithTimeout(t.Context(), 400*time.Millisecond)
+	t.Cleanup(cancel)
+
+	start := time.Now()
+	bgShell.WaitForChange(ctx, baseline)
+	elapsed := time.Since(start)
+
+	require.GreaterOrEqual(t, elapsed, 350*time.Millisecond,
+		"WaitForChange must actually wait out the ctx deadline when using a TotalWrittenBytes baseline with no further writes, not return immediately")
 }

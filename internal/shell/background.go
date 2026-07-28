@@ -17,30 +17,194 @@ const (
 	MaxBackgroundJobs = 50
 	// CompletedJobRetentionMinutes is how long to keep completed jobs before auto-cleanup (8 hours)
 	CompletedJobRetentionMinutes = 8 * 60
+
+	// BufferRetentionMinutes is how long a completed job keeps its buffered
+	// stdout/stderr bytes resident before Cleanup releases them (frees the
+	// memory but keeps the job record itself — status/exit code/Command/etc.
+	// — around until CompletedJobRetentionMinutes). This is intentionally
+	// much shorter than CompletedJobRetentionMinutes: the buffered bytes are
+	// the expensive part (up to 2*maxStreamBufferBytes per job) and are only
+	// realistically useful for a short window right after completion, while
+	// job metadata is cheap to keep for the full retention window so status
+	// queries (job_output on a long-finished job) still resolve, just
+	// without the original bytes.
+	BufferRetentionMinutes = 15
+
+	// maxStreamBufferBytes bounds how much of a single stdout/stderr stream a
+	// background job keeps resident in memory. A chatty/never-ending command
+	// (`yes`, a noisy `watch`, a verbose build that never stops) would
+	// otherwise grow its buffer without limit for as long as the job runs —
+	// with up to MaxBackgroundJobs (50) such jobs live at once, that's an
+	// unbounded multiplier on process memory. 3 MiB per stream (6 MiB per job
+	// including both stdout+stderr, ~300 MiB worst case across 50 jobs) is
+	// generous enough to hold many thousands of lines of real command output
+	// (job_output/bash still only ever surface the last MaxOutputLength=30000
+	// characters to the model via TruncateOutput) while capping the pathological
+	// case at a small, predictable ceiling.
+	maxStreamBufferBytes = 3 * 1024 * 1024
+
+	// truncationMarkerBudget is reserved out of maxStreamBufferBytes for the
+	// "[N bytes truncated]" marker text itself, so the buffer's resident size
+	// never exceeds maxStreamBufferBytes even after the marker is spliced in.
+	truncationMarkerBudget = 128
 )
 
-// syncBuffer is a thread-safe wrapper around bytes.Buffer.
-type syncBuffer struct {
-	buf bytes.Buffer
+// boundedBuffer is a thread-safe, size-bounded byte sink used for a single
+// background job's stdout or stderr stream.
+//
+// Unlike bytes.Buffer (the previous implementation, via syncBuffer), it never
+// grows without bound: once the resident content would exceed maxBytes, the
+// MIDDLE of the stream is dropped and replaced with a "[N bytes truncated]"
+// marker, keeping the HEAD (first bytes ever written — usually identifies the
+// command and any early errors) and the TAIL (most recent bytes — the current
+// state) both intact. This is the standard head+tail log-truncation pattern:
+// simply dropping the tail (keep-first-N-bytes) would make a long-running job
+// look permanently frozen at its earliest output, and simply dropping the
+// head (keep-last-N-bytes, like a ring buffer) would lose the context of what
+// command was even running or how it failed at the start.
+//
+// A monotonic writtenBytes counter tracks the *total* number of bytes ever
+// written, independent of how much is actually resident after truncation.
+// This lets callers (WaitForChange) detect "new output has arrived" purely by
+// comparing counters, without copying/allocating a snapshot of the buffered
+// content on every poll.
+type boundedBuffer struct {
 	mu  sync.RWMutex
+	buf bytes.Buffer
+
+	maxBytes int
+
+	// head holds the first headCap bytes ever written; once populated it is
+	// immutable for the lifetime of the buffer.
+	head    bytes.Buffer
+	headCap int
+
+	// writtenBytes is the total number of bytes ever passed to Write, whether
+	// or not they are still resident in buf/head. It only ever increases.
+	writtenBytes atomic.Int64
+
+	// truncated is set once bytes have been dropped from the middle, so
+	// String() knows to splice in the marker.
+	truncated atomic.Bool
+	// droppedBytes is how many bytes have been removed from the middle
+	// (excludes head, excludes what's still resident in buf).
+	droppedBytes atomic.Int64
 }
 
-func (sb *syncBuffer) Write(p []byte) (n int, err error) {
-	sb.mu.Lock()
-	defer sb.mu.Unlock()
-	return sb.buf.Write(p)
+func newBoundedBuffer(maxBytes int) *boundedBuffer {
+	if maxBytes <= 0 {
+		maxBytes = maxStreamBufferBytes
+	}
+	return &boundedBuffer{
+		maxBytes: maxBytes,
+		// Keep a fixed head allotment of a quarter of the budget (bounded to
+		// a sane floor/ceiling) — enough to preserve early context without
+		// starving the tail, which is what most callers actually care about
+		// while a job is still running.
+		headCap: max(min(maxBytes/4, 256*1024), 1),
+	}
 }
 
-func (sb *syncBuffer) WriteString(s string) (n int, err error) {
-	sb.mu.Lock()
-	defer sb.mu.Unlock()
-	return sb.buf.WriteString(s)
+// Write appends p to the buffer, enforcing the size bound. It always reports
+// having written len(p) bytes (matching bytes.Buffer/io.Writer semantics) —
+// bytes beyond the cap are counted in writtenBytes and then dropped from the
+// middle of the resident content, never silently discarded from the caller's
+// point of view.
+func (b *boundedBuffer) Write(p []byte) (n int, err error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	n = len(p)
+	b.writtenBytes.Add(int64(n))
+
+	// Fill head first, from the very first bytes ever written.
+	if b.head.Len() < b.headCap {
+		room := b.headCap - b.head.Len()
+		take := min(room, len(p))
+		b.head.Write(p[:take])
+		p = p[take:]
+	}
+
+	if len(p) == 0 {
+		return n, nil
+	}
+
+	b.buf.Write(p)
+	b.enforceLimitLocked()
+	return n, nil
 }
 
-func (sb *syncBuffer) String() string {
-	sb.mu.RLock()
-	defer sb.mu.RUnlock()
-	return sb.buf.String()
+// WriteString is the string equivalent of Write.
+func (b *boundedBuffer) WriteString(s string) (n int, err error) {
+	return b.Write([]byte(s))
+}
+
+// enforceLimitLocked drops bytes from the front of b.buf (the middle of the
+// overall stream, since head is stored separately) once the resident head +
+// tail content would exceed maxBytes. Caller must hold b.mu.
+func (b *boundedBuffer) enforceLimitLocked() {
+	tailBudget := b.maxBytes - b.head.Len() - truncationMarkerBudget
+	if tailBudget < 0 {
+		tailBudget = 0
+	}
+	if b.buf.Len() <= tailBudget {
+		return
+	}
+	excess := b.buf.Len() - tailBudget
+	b.buf.Next(excess) // drop `excess` bytes from the front (middle of stream)
+	b.droppedBytes.Add(int64(excess))
+	b.truncated.Store(true)
+}
+
+// String returns a bounded snapshot of the buffered content: if nothing has
+// ever been truncated, it's simply everything written so far (head==empty in
+// that case since all bytes fit in buf); otherwise it's head + a
+// "[N bytes truncated]" marker + tail, which never exceeds maxBytes.
+func (b *boundedBuffer) String() string {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	if !b.truncated.Load() {
+		if b.head.Len() == 0 {
+			return b.buf.String()
+		}
+		return b.head.String() + b.buf.String()
+	}
+
+	dropped := b.droppedBytes.Load()
+	marker := fmt.Sprintf("\n... [%d bytes truncated] ...\n", dropped)
+	return b.head.String() + marker + b.buf.String()
+}
+
+// Len reports the total number of bytes ever written to the buffer,
+// including ones already dropped by truncation. This is the value
+// WaitForChange compares against, so growth is always observable even after
+// the buffer itself has started discarding old data.
+func (b *boundedBuffer) Len() int {
+	return int(b.writtenBytes.Load())
+}
+
+// release drops the buffered content (head/tail bytes) while preserving the
+// monotonic writtenBytes counter and truncation bookkeeping. Used once a
+// completed job's output has been delivered to subscribers, so long-lived
+// jobs don't hold their full (bounded, but still up to a few MiB) buffer
+// resident for the entire CompletedJobRetentionMinutes retention window.
+func (b *boundedBuffer) release() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.buf.Reset()
+	b.head.Reset()
+	// Keep writtenBytes/truncated/droppedBytes as-is: String() below will
+	// still report a non-empty, honest placeholder rather than silently
+	// looking like the command produced no output.
+}
+
+// released reports whether release() has been called (buffer content
+// discarded) despite the stream having produced output at some point.
+func (b *boundedBuffer) releasedWithContent() bool {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.head.Len() == 0 && b.buf.Len() == 0 && b.writtenBytes.Load() > 0
 }
 
 // BackgroundShell represents a shell running in the background.
@@ -53,16 +217,25 @@ type BackgroundShell struct {
 	StartTime   time.Time
 	ctx         context.Context
 	cancel      context.CancelFunc
-	stdout      *syncBuffer
-	stderr      *syncBuffer
+	stdout      *boundedBuffer
+	stderr      *boundedBuffer
 	done        chan struct{}
 	exitErr     error
 	completedAt atomic.Int64 // Unix timestamp when job completed (0 if still running)
+	bufReleased atomic.Bool  // true once the stdout/stderr buffers have been released post-completion
 }
 
 // BackgroundShellManager manages background shell instances.
 type BackgroundShellManager struct {
 	shells *csync.Map[string, *BackgroundShell]
+
+	// startMu serializes the "check MaxBackgroundJobs then insert" sequence
+	// in Start so two concurrent Start calls can't both observe room under
+	// the limit and both insert, overshooting MaxBackgroundJobs. shells
+	// itself is a csync.Map (safe for concurrent Get/Set/Len individually),
+	// but Len()-then-Set() across two calls is a classic non-atomic
+	// check-then-act race without this extra lock serializing the sequence.
+	startMu sync.Mutex
 }
 
 var (
@@ -88,7 +261,13 @@ func GetBackgroundShellManager() *BackgroundShellManager {
 
 // Start creates and starts a new background shell with the given command.
 func (m *BackgroundShellManager) Start(ctx context.Context, workingDir string, blockFuncs []BlockFunc, command string, description string) (*BackgroundShell, error) {
-	// Check job limit
+	m.startMu.Lock()
+	defer m.startMu.Unlock()
+
+	// Check job limit. Holding startMu across the check-and-insert below
+	// (m.shells.Set further down) makes this atomic with respect to other
+	// concurrent Start calls, so the limit can't be overshot by a
+	// check-then-act race.
 	if m.shells.Len() >= MaxBackgroundJobs {
 		return nil, fmt.Errorf("maximum number of background jobs (%d) reached. Please terminate or wait for some jobs to complete", MaxBackgroundJobs)
 	}
@@ -111,8 +290,8 @@ func (m *BackgroundShellManager) Start(ctx context.Context, workingDir string, b
 		Shell:       shell,
 		ctx:         shellCtx,
 		cancel:      cancel,
-		stdout:      &syncBuffer{},
-		stderr:      &syncBuffer{},
+		stdout:      newBoundedBuffer(maxStreamBufferBytes),
+		stderr:      newBoundedBuffer(maxStreamBufferBytes),
 		done:        make(chan struct{}),
 	}
 
@@ -184,16 +363,29 @@ func (m *BackgroundShellManager) List() []string {
 	return ids
 }
 
-// Cleanup removes completed jobs that have been finished for more than the retention period
+// Cleanup removes completed jobs that have been finished for more than the
+// retention period, and — for completed jobs past the shorter
+// BufferRetentionMinutes but not yet past full retention — releases their
+// buffered stdout/stderr bytes to shrink memory use while keeping the job
+// record (status, exit code, Command, etc.) queryable for the full window.
 func (m *BackgroundShellManager) Cleanup() int {
 	now := time.Now().Unix()
 	retentionSeconds := int64(CompletedJobRetentionMinutes * 60)
+	bufferRetentionSeconds := int64(BufferRetentionMinutes * 60)
 
 	var toRemove []string
 	for shell := range m.shells.Seq() {
 		completedAt := shell.completedAt.Load()
-		if completedAt > 0 && now-completedAt > retentionSeconds {
+		if completedAt <= 0 {
+			continue
+		}
+		age := now - completedAt
+		if age > retentionSeconds {
 			toRemove = append(toRemove, shell.ID)
+			continue
+		}
+		if age > bufferRetentionSeconds && !shell.bufReleased.Load() {
+			shell.releaseBuffers()
 		}
 	}
 
@@ -223,14 +415,48 @@ func (m *BackgroundShellManager) KillAll(ctx context.Context) {
 	wg.Wait()
 }
 
-// GetOutput returns the current output of a background shell.
+// GetOutput returns the current output of a background shell. The returned
+// strings are bounded snapshots (see boundedBuffer) — for a job that has
+// produced more than the per-stream cap of output, the middle has been
+// replaced with a "[N bytes truncated]" marker. If the buffers were already
+// released after completion (see releaseBuffers/OnDone wiring), and the
+// stream had produced output before release, a placeholder note is returned
+// instead of an empty string so this doesn't look like the command produced
+// no output.
 func (bs *BackgroundShell) GetOutput() (stdout string, stderr string, done bool, err error) {
+	stdout, stderr = bs.snapshotOutput()
 	select {
 	case <-bs.done:
-		return bs.stdout.String(), bs.stderr.String(), true, bs.exitErr
+		return stdout, stderr, true, bs.exitErr
 	default:
-		return bs.stdout.String(), bs.stderr.String(), false, nil
+		return stdout, stderr, false, nil
 	}
+}
+
+func (bs *BackgroundShell) snapshotOutput() (stdout string, stderr string) {
+	stdout = bs.stdout.String()
+	stderr = bs.stderr.String()
+	if bs.bufReleased.Load() {
+		if stdout == "" && bs.stdout.releasedWithContent() {
+			stdout = "(output was truncated after completion)"
+		}
+		if stderr == "" && bs.stderr.releasedWithContent() {
+			stderr = "(output was truncated after completion)"
+		}
+	}
+	return stdout, stderr
+}
+
+// releaseBuffers drops the buffered stdout/stderr content (freeing the
+// memory) while leaving the job's status/metadata intact. Safe to call more
+// than once. Intended to run after completion notice has been delivered to
+// subscribers (OnDone), so a finished job doesn't hold up to
+// 2*maxStreamBufferBytes resident for the entire CompletedJobRetentionMinutes
+// window when nobody is going to read it again.
+func (bs *BackgroundShell) releaseBuffers() {
+	bs.stdout.release()
+	bs.stderr.release()
+	bs.bufReleased.Store(true)
 }
 
 // OnDone registers fn to be called EXACTLY ONCE when this background shell
@@ -283,10 +509,28 @@ func (bs *BackgroundShell) Elapsed() time.Duration {
 	return time.Since(bs.StartTime)
 }
 
-// WaitForChange blocks until the job finishes, total buffered output grows
-// beyond sinceLen bytes, or ctx ends. It polls the buffered output on a short
-// ticker — there is no event bus for incremental writes, so the granularity
-// is the ticker interval (250ms). Returns without error from any branch.
+// TotalWrittenBytes returns the total number of stdout+stderr bytes ever
+// written by the job so far, independent of how much is still resident after
+// bounded-buffer truncation. Callers that want to poll for "has more output
+// arrived" (job_output's wait:true path) MUST use this — not
+// len(stdout)+len(stderr) from GetOutput's bounded snapshot — as the baseline
+// passed to WaitForChange. Once a stream has overflowed its cap, the
+// snapshot's length no longer grows 1:1 with real output, so a baseline
+// derived from it would already be smaller than the live counters
+// WaitForChange compares against, making WaitForChange return immediately
+// instead of actually waiting for new output.
+func (bs *BackgroundShell) TotalWrittenBytes() int {
+	return bs.stdout.Len() + bs.stderr.Len()
+}
+
+// WaitForChange blocks until the job finishes, total written output (stdout+
+// stderr combined, counted via each stream's monotonic writtenBytes counter —
+// NOT the bounded resident snapshot, so this keeps working correctly even
+// after a stream has been truncated) grows beyond sinceLen bytes, or ctx
+// ends. sinceLen should come from TotalWrittenBytes, not from measuring a
+// GetOutput snapshot. It polls the counters on a short ticker — there is no
+// event bus for incremental writes, so the granularity is the ticker
+// interval (250ms). Returns without error from any branch.
 func (bs *BackgroundShell) WaitForChange(ctx context.Context, sinceLen int) {
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
@@ -297,8 +541,7 @@ func (bs *BackgroundShell) WaitForChange(ctx context.Context, sinceLen int) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			so, se, _, _ := bs.GetOutput()
-			if len(so)+len(se) > sinceLen {
+			if bs.stdout.Len()+bs.stderr.Len() > sinceLen {
 				return
 			}
 		}
