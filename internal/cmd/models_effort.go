@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"os/exec"
 	"regexp"
 	"strings"
 	"sync"
@@ -38,8 +37,7 @@ func (s *cliEffortSource) Levels() []string {
 	if v, ok := effortCache[s.Binary]; ok {
 		return v
 	}
-	helpCmd := exec.CommandContext(context.Background(), s.Binary, s.HelpArg)
-	platform.HideConsoleWindow(helpCmd)
+	helpCmd := platform.Command(context.Background(), s.Binary, s.HelpArg)
 	out, err := helpCmd.CombinedOutput()
 	if err != nil {
 		slog.Warn("could not detect effort levels — falling back", "binary", s.Binary, "err", err)

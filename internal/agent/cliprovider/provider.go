@@ -1155,9 +1155,8 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 
 	if proc.stdout == nil {
 		// Pipe fallback: large prompt (stdin required) or PTY unavailable.
-		cmd := exec.CommandContext(ctx, m.spec.Binary, args...)
+		cmd := platform.Command(ctx, m.spec.Binary, args...)
 		cmd.Dir = m.workingDir
-		platform.HideConsoleWindow(cmd)
 		if useStdin {
 			cmd.Stdin = strings.NewReader(prompt)
 		}

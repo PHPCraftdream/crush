@@ -25,12 +25,11 @@ func runOnFinishHook(hook, sessionID, exitReason string, cost float64, tokens in
 	var cmd *exec.Cmd
 	switch runtime.GOOS {
 	case "windows":
-		cmd = exec.CommandContext(ctx, "cmd", "/c", hook)
+		cmd = platform.Command(ctx, "cmd", "/c", hook)
 	default:
-		cmd = exec.CommandContext(ctx, "bash", "-c", hook)
+		cmd = platform.Command(ctx, "bash", "-c", hook)
 	}
 
-	platform.HideConsoleWindow(cmd)
 	cmd.Env = append(
 		os.Environ(),
 		"CRUSH_SESSION_ID="+sessionID,

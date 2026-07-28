@@ -562,8 +562,7 @@ func registerGrepTool(srv *mcp.Server, perms permission.Service, workingDir stri
 		if input.Glob != "" {
 			args = append(args, "--include="+input.Glob)
 		}
-		cmd := exec.CommandContext(ctx, args[0], args[1:]...)
-		platform.HideConsoleWindow(cmd)
+		cmd := platform.Command(ctx, args[0], args[1:]...)
 		var buf bytes.Buffer
 		cmd.Stdout = &buf
 		cmd.Stderr = &buf
@@ -724,12 +723,11 @@ func resolvePath(path, workingDir string) string {
 func runShell(ctx context.Context, command, dir string) (string, error) {
 	var cmd *exec.Cmd
 	if runtime.GOOS == "windows" {
-		cmd = exec.CommandContext(ctx, "cmd.exe", "/c", command)
+		cmd = platform.Command(ctx, "cmd.exe", "/c", command)
 	} else {
-		cmd = exec.CommandContext(ctx, "bash", "-c", command)
+		cmd = platform.Command(ctx, "bash", "-c", command)
 	}
 	cmd.Dir = dir
-	platform.HideConsoleWindow(cmd)
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf

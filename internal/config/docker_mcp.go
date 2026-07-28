@@ -3,7 +3,6 @@ package config
 import (
 	"context"
 	"fmt"
-	"os/exec"
 	"sync"
 	"time"
 
@@ -11,8 +10,7 @@ import (
 )
 
 var dockerMCPVersionRunner = func(ctx context.Context) error {
-	cmd := exec.CommandContext(ctx, "docker", "mcp", "version")
-	platform.HideConsoleWindow(cmd)
+	cmd := platform.Command(ctx, "docker", "mcp", "version")
 	return cmd.Run()
 }
 

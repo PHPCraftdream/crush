@@ -35,8 +35,7 @@ func KillProcess(pid int) error {
 		return nil
 	}
 	if path, lookErr := exec.LookPath("taskkill"); lookErr == nil {
-		cmd := exec.CommandContext(context.Background(), path, "/F", "/T", "/PID", fmt.Sprintf("%d", pid))
-		platform.HideConsoleWindow(cmd)
+		cmd := platform.Command(context.Background(), path, "/F", "/T", "/PID", fmt.Sprintf("%d", pid))
 		out, err := cmd.CombinedOutput()
 		if err == nil {
 			return nil

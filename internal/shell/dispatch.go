@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/crush/internal/filepathext"
+	"github.com/charmbracelet/crush/internal/platform"
 	"mvdan.cc/sh/v3/expand"
 	"mvdan.cc/sh/v3/interp"
 	"mvdan.cc/sh/v3/syntax"
@@ -190,7 +191,7 @@ func dispatchShebang(ctx context.Context, scriptPath string, probe []byte, args 
 	cmdArgs = append(cmdArgs, scriptPath)
 	cmdArgs = append(cmdArgs, args[1:]...)
 
-	cmd := exec.CommandContext(ctx, interpreter, cmdArgs...)
+	cmd := platform.Command(ctx, interpreter, cmdArgs...)
 	hc := interp.HandlerCtx(ctx)
 	cmd.Dir = hc.Dir
 	cmd.Env = execEnvList(hc.Env)

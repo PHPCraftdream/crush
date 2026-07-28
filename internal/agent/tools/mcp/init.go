@@ -584,9 +584,8 @@ func createTransport(ctx context.Context, m config.MCPConfig, resolver config.Va
 		if err != nil {
 			return nil, err
 		}
-		cmd := exec.CommandContext(ctx, home.Long(command), args...)
+		cmd := platform.Command(ctx, home.Long(command), args...)
 		cmd.Env = append(os.Environ(), envs...)
-		platform.HideConsoleWindow(cmd)
 		// Run the child in its own process group and kill the whole group when
 		// the session context is cancelled. A stdio server often spawns its own
 		// children (signal-mcp launches signal-cli); os/exec's default
@@ -661,9 +660,8 @@ func mcpTimeout(m config.MCPConfig) time.Duration {
 func stdioCheck(old *exec.Cmd) error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, old.Path, old.Args...)
+	cmd := platform.Command(ctx, old.Path, old.Args...)
 	cmd.Env = old.Env
-	platform.HideConsoleWindow(cmd)
 	out, err := cmd.CombinedOutput()
 	if err == nil || errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return nil

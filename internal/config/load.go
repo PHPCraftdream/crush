@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"maps"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -1033,12 +1032,11 @@ func assignIfNil[T any](ptr **T, val T) {
 }
 
 func isInsideWorktree() bool {
-	cmd := exec.CommandContext(
+	cmd := platform.Command(
 		context.Background(),
 		"git", "rev-parse",
 		"--is-inside-work-tree",
 	)
-	platform.HideConsoleWindow(cmd)
 	bts, err := cmd.CombinedOutput()
 	return err == nil && strings.TrimSpace(string(bts)) == "true"
 }
@@ -1049,12 +1047,11 @@ func isInsideWorktree() bool {
 // failure mode). Linked worktrees and submodules each report their own
 // top-level, which is what callers want when bounding lookups.
 func worktreeRoot(dir string) string {
-	cmd := exec.CommandContext(
+	cmd := platform.Command(
 		context.Background(),
 		"git", "rev-parse", "--show-toplevel",
 	)
 	cmd.Dir = dir
-	platform.HideConsoleWindow(cmd)
 	out, err := cmd.Output()
 	if err != nil {
 		return ""

@@ -354,8 +354,7 @@ func runQueueTask(ctx context.Context, cwd string, task queue.Task) (float64, in
 		cmdArgs = append(cmdArgs, "--timeout", fmt.Sprintf("%ds", task.TimeoutSec))
 	}
 
-	execCmd := exec.CommandContext(ctx, crushBin, cmdArgs...)
-	platform.HideConsoleWindow(execCmd)
+	execCmd := platform.Command(ctx, crushBin, cmdArgs...)
 	execCmd.Dir = cwd
 	execCmd.Stdin = strings.NewReader(task.Prompt)
 

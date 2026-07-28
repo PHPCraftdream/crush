@@ -39,8 +39,7 @@ func getRgCmd(ctx context.Context, globPattern string) *exec.Cmd {
 		}
 		args = append(args, "--glob", globPattern)
 	}
-	cmd := exec.CommandContext(ctx, name, args...)
-	platform.HideConsoleWindow(cmd)
+	cmd := platform.Command(ctx, name, args...)
 	return cmd
 }
 
@@ -56,7 +55,6 @@ func getRgSearchCmd(ctx context.Context, pattern, path, include string) *exec.Cm
 	}
 	args = append(args, path)
 
-	cmd := exec.CommandContext(ctx, name, args...)
-	platform.HideConsoleWindow(cmd)
+	cmd := platform.Command(ctx, name, args...)
 	return cmd
 }
