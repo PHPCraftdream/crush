@@ -4,12 +4,14 @@ import (
 	"context"
 	"database/sql"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	_ "modernc.org/sqlite"
 
 	"github.com/charmbracelet/crush/internal/db"
+	"github.com/charmbracelet/crush/internal/pubsub"
 )
 
 func newTestMessageDB(t *testing.T) (*sql.DB, *db.Queries) {
@@ -355,4 +357,96 @@ func TestCreateMessage_BackgroundJobNoticeRoundTrip(t *testing.T) {
 		require.NoError(t, err)
 		assert.False(t, got.BackgroundJobNotice, "Get should return BackgroundJobNotice=false for default")
 	})
+}
+
+// TestUpdate_UsesPublishMustDeliver verifies that Update (the terminal,
+// DB-durable write path) does not silently drop its UpdatedEvent the
+// moment a subscriber's channel is momentarily full — unlike best-effort
+// Publish, it must wait (bounded by the broker's must-deliver timeout)
+// for buffer space, so a slow-draining UI subscriber still eventually
+// sees the final message state instead of losing it forever.
+//
+// service embeds *pubsub.Broker[Message] directly, so we drive the
+// broker's buffer to capacity through the same Subscribe channel the
+// service hands out, then assert Update's publish blocks past an
+// instantaneous drop and lands once the reader catches up.
+func TestUpdate_UsesPublishMustDeliver(t *testing.T) {
+	_, q := newTestMessageDB(t)
+	svc := NewService(q).(*service)
+	// Give must-deliver a small but non-zero timeout so the test is
+	// fast without being flaky, and so we can distinguish "dropped
+	// immediately like Publish" from "waited, like PublishMustDeliver".
+	svc.SetMustDeliverTimeout(300 * time.Millisecond)
+
+	ctx := t.Context()
+	sessionID := "test-session-mustdeliver"
+
+	// Subscribe before Create so we have a channel to observe/fill;
+	// otherwise Create's CreatedEvent is published to no one.
+	sub := svc.Subscribe(ctx)
+
+	created, err := svc.Create(ctx, sessionID, CreateMessageParams{
+		Role:  Assistant,
+		Parts: []ContentPart{TextContent{Text: "hello"}},
+	})
+	require.NoError(t, err)
+
+	// Drain the CreatedEvent (Create uses best-effort Publish) so it
+	// doesn't interfere with counting the Update below.
+	<-sub
+
+	// Fill the subscriber's buffer completely using best-effort
+	// Publish on the embedded broker, so the next publish (Update's)
+	// has no free slot and must take PublishMustDeliver's
+	// bounded-blocking path.
+	bufCap := cap(sub)
+	for range bufCap {
+		svc.Publish(pubsub.CreatedEvent, created)
+	}
+
+	// Now call Update concurrently. Because the buffer is full,
+	// PublishMustDeliver must take its bounded-blocking slow path
+	// instead of dropping instantly.
+	created.Parts = append(created.Parts, TextContent{Text: "updated"})
+	updateDone := make(chan error, 1)
+	start := time.Now()
+	go func() {
+		updateDone <- svc.Update(ctx, created)
+	}()
+
+	// Give Update a brief head start to ensure it has entered the
+	// blocking path before we start draining, then drain one slot so
+	// delivery can succeed within the timeout.
+	time.Sleep(50 * time.Millisecond)
+	<-sub // free one slot
+
+	select {
+	case err := <-updateDone:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Update did not return")
+	}
+	elapsed := time.Since(start)
+
+	// If Update had used best-effort Publish, it would have returned
+	// (and dropped) almost instantly. Seeing it take a non-trivial
+	// amount of time (waiting for the drained slot) instead of an
+	// instant no-op is the observable signature of PublishMustDeliver's
+	// bounded-blocking path being used, and it must still be well under
+	// the outer safety bound.
+	assert.Less(t, elapsed, time.Second, "Update should not block indefinitely")
+
+	// Drain the rest of the filler events plus the delivered update
+	// looking for the UpdatedEvent carrying our new part.
+	found := false
+	for i := 0; i < bufCap; i++ {
+		select {
+		case ev := <-sub:
+			if ev.Type == pubsub.UpdatedEvent && len(ev.Payload.Parts) == 2 {
+				found = true
+			}
+		default:
+		}
+	}
+	assert.True(t, found, "expected the Update's UpdatedEvent to have been delivered, not dropped")
 }

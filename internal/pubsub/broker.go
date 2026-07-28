@@ -49,6 +49,7 @@ type Broker[T any] struct {
 	subs                 map[chan Event[T]]struct{}
 	mu                   sync.RWMutex
 	done                 chan struct{}
+	shutdownOnce         sync.Once
 	subCount             int
 	channelBufferSize    int
 	mustDeliverTimeout   time.Duration
@@ -82,13 +83,22 @@ func (b *Broker[T]) SetMustDeliverTimeout(d time.Duration) {
 	b.mustDeliverTimeout = d
 }
 
+// Shutdown closes the broker: it closes b.done (unblocking any pending
+// Subscribe/Publish/PublishMustDeliver waiters) and closes every current
+// subscriber channel. It is safe to call concurrently and more than
+// once — only the first call does any work.
+//
+// The close(b.done) step is guarded by a sync.Once because closing an
+// already-closed channel panics; a naive check-then-close (via select
+// on b.done) has a race window between the check and the close that
+// two concurrent Shutdown callers can both pass through. The
+// subscriber-draining loop below does not need the same protection: it
+// is already serialized by b.mu, and re-running it against an
+// already-emptied b.subs map is a harmless no-op.
 func (b *Broker[T]) Shutdown() {
-	select {
-	case <-b.done: // Already closed
-		return
-	default:
+	b.shutdownOnce.Do(func() {
 		close(b.done)
-	}
+	})
 
 	b.mu.Lock()
 	defer b.mu.Unlock()

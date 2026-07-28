@@ -87,7 +87,15 @@ func (s *service) Delete(ctx context.Context, id string) error {
 	}
 	// Clone the message before publishing to avoid race conditions with
 	// concurrent modifications to the Parts slice.
-	s.Publish(pubsub.DeletedEvent, message.Clone())
+	//
+	// Deletion is a terminal, low-frequency event: if it's silently
+	// dropped because a subscriber's channel is momentarily full, the UI
+	// keeps showing a message that no longer exists in the DB, with no
+	// further event ever arriving to correct it (unlike Update, nothing
+	// else republishes this message's state afterward). Use
+	// PublishMustDeliver so the drop only happens after a bounded wait,
+	// not on the first full buffer.
+	s.PublishMustDeliver(ctx, pubsub.DeletedEvent, message.Clone())
 	return nil
 }
 
@@ -139,6 +147,14 @@ func (s *service) Create(ctx context.Context, sessionID string, params CreateMes
 	}
 	// Clone the message before publishing to avoid race conditions with
 	// concurrent modifications to the Parts slice.
+	//
+	// Create is deliberately left on best-effort Publish: a brand-new
+	// message is (outside of Hidden/summary rows) about to be updated
+	// repeatedly as the assistant streams, via Notify/Update below,
+	// which already use must-deliver where it matters. If this
+	// CreatedEvent is dropped under contention, the next Update quickly
+	// re-establishes the message for subscribers; there's no terminal
+	// state here worth blocking the caller for.
 	s.Publish(pubsub.CreatedEvent, message.Clone())
 	return message, nil
 }
@@ -188,7 +204,19 @@ func (s *service) Update(ctx context.Context, message Message) error {
 	message.UpdatedAt = time.Now().Unix()
 	// Clone the message before publishing to avoid race conditions with
 	// concurrent modifications to the Parts slice.
-	s.Publish(pubsub.UpdatedEvent, message.Clone())
+	//
+	// Update is the synchronous, DB-durable write path (as opposed to
+	// Notify, which is the high-frequency in-memory-only streaming
+	// path). It is called at the end of a stream once a real
+	// (non-Partial) Finish part lands, on tool-result flushes, and on
+	// summary/checkpoint persistence — i.e. exactly the terminal states
+	// a user must see rather than a mid-stream snapshot that will
+	// shortly be superseded. Use PublishMustDeliver so a momentarily
+	// full subscriber buffer doesn't silently eat the final state; the
+	// caller (agent/coordinator hot path) is bounded by
+	// mustDeliverTimeout per subscriber, so this cannot stall streaming
+	// indefinitely.
+	s.PublishMustDeliver(ctx, pubsub.UpdatedEvent, message.Clone())
 	return nil
 }
 
@@ -284,7 +312,10 @@ func (s *service) SetPinned(ctx context.Context, id string, pinned bool) error {
 	if err != nil {
 		return err
 	}
-	s.Publish(pubsub.UpdatedEvent, msg.Clone())
+	// Explicit, low-frequency user action (pin/unpin) — not part of the
+	// streaming hot path, so the bounded PublishMustDeliver wait is free
+	// here, and the user should reliably see their own action reflected.
+	s.PublishMustDeliver(ctx, pubsub.UpdatedEvent, msg.Clone())
 	return nil
 }
 
