@@ -2,6 +2,9 @@ package cmd
 
 import (
 	"context"
+	"errors"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -118,4 +121,94 @@ func TestSubAgentActivityNote_OnlyWhenFresher(t *testing.T) {
 	// Baseline far in the future → nothing is fresher → note empty.
 	future := now.Add(time.Hour).Unix()
 	require.Empty(t, subAgentActivityNote(ctx, a, parent.ID, future, now))
+}
+
+// flakyMessageService wraps a message.Service and forces List to fail for one
+// specific session id, simulating a transient DB error on that node of the
+// call-tree walk.
+type flakyMessageService struct {
+	message.Service
+	failFor string
+}
+
+func (f *flakyMessageService) List(ctx context.Context, sessionID string) ([]message.Message, error) {
+	if sessionID == f.failFor {
+		return nil, errors.New("simulated transient DB error")
+	}
+	return f.Service.List(ctx, sessionID)
+}
+
+// slogRecordCapture is a minimal slog.Handler that records every log record
+// it receives, so a test can assert a specific message was actually logged
+// rather than merely that the code path didn't panic.
+type slogRecordCapture struct {
+	records []slog.Record
+}
+
+func (c *slogRecordCapture) Enabled(context.Context, slog.Level) bool { return true }
+func (c *slogRecordCapture) Handle(_ context.Context, r slog.Record) error {
+	c.records = append(c.records, r)
+	return nil
+}
+func (c *slogRecordCapture) WithAttrs(_ []slog.Attr) slog.Handler { return c }
+func (c *slogRecordCapture) WithGroup(_ string) slog.Handler      { return c }
+
+func (c *slogRecordCapture) hasMessageContaining(substr string) bool {
+	for _, r := range c.records {
+		if strings.Contains(r.Message, substr) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestComputeCallTreeActivity_MessagesListErrorIsLogged confirms that when
+// Messages.List fails for a node in the call tree, computeCallTreeActivity
+// (a) does not change its returned value based on the failing node (this is
+// a diagnostic, best-effort signal — see the comment on
+// computeCallTreeActivity for why the return type isn't being changed to
+// carry partial-failure info through all six call-tree consumers), and (b)
+// actually logs the swallowed error at Debug level so it is visible under
+// verbose/debug logging instead of silently vanishing into "no activity".
+func TestComputeCallTreeActivity_MessagesListErrorIsLogged(t *testing.T) {
+	ctx := context.Background()
+
+	conn, q := newTestDB(t)
+	s := session.NewService(q, conn)
+	m := message.NewService(q)
+
+	parent, err := s.Create(ctx, "parent")
+	require.NoError(t, err)
+	_, err = m.Create(ctx, parent.ID, message.CreateMessageParams{
+		Role:  message.User,
+		Parts: []message.ContentPart{message.TextContent{Text: "hello"}},
+	})
+	require.NoError(t, err)
+
+	child, err := s.CreateTaskSession(ctx, "msg$$call", parent.ID, "sub-agent")
+	require.NoError(t, err)
+	_, err = m.Create(ctx, child.ID, message.CreateMessageParams{
+		Role:  message.Assistant,
+		Parts: []message.ContentPart{message.TextContent{Text: "working"}},
+	})
+	require.NoError(t, err)
+
+	flakyM := &flakyMessageService{Service: m, failFor: child.ID}
+	a := &app.App{Messages: flakyM, Sessions: s}
+
+	capture := &slogRecordCapture{}
+	origLogger := slog.Default()
+	slog.SetDefault(slog.New(capture))
+	defer slog.SetDefault(origLogger)
+
+	act := computeCallTreeActivity(ctx, a, parent.ID)
+
+	// Behavior unchanged: the parent's own message is still found and
+	// reported, even though the child's activity couldn't be checked.
+	require.NotZero(t, act.LatestUnix)
+	require.Equal(t, parent.ID, act.DeepestSessionID)
+	require.False(t, act.SubAgentActive)
+
+	require.True(t, capture.hasMessageContaining("failed to list messages"),
+		"the swallowed Messages.List error must be logged at Debug level, not silently dropped")
 }

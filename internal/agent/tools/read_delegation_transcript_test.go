@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"charm.land/fantasy"
@@ -135,6 +136,66 @@ func TestReadDelegationTranscript_RefusesSelf(t *testing.T) {
 
 	resp := runTranscriptTool(t, s, m, parent.ID, parent.ID)
 	require.True(t, resp.IsError, "reading own session must be refused")
+}
+
+// flakySubSessionsService wraps a session.Service and forces ListSubSessions
+// to fail once the walk reaches failAt, simulating a transient DB error on an
+// intermediate node of the descendant tree.
+type flakySubSessionsService struct {
+	session.Service
+	failAt string
+}
+
+func (f *flakySubSessionsService) ListSubSessions(ctx context.Context, parentSessionID string) ([]session.Session, error) {
+	if parentSessionID == f.failAt {
+		return nil, errors.New("simulated transient DB error")
+	}
+	return f.Service.ListSubSessions(ctx, parentSessionID)
+}
+
+// TestReadDelegationTranscript_TreeWalkErrorIsSurfaced confirms that a DB
+// error partway through the ownership walk (isDescendantSession) is surfaced
+// to the caller as a real Go error rather than being silently swallowed and
+// treated as "not a descendant". Before the fix, isDescendantSession would
+// `continue` past the failing node, walk to the end of the (now-truncated)
+// tree, and return a plain `false` — indistinguishable from a genuine
+// ownership refusal — even though the target session (a real grandchild) was
+// only unreachable because we failed to check.
+func TestReadDelegationTranscript_TreeWalkErrorIsSurfaced(t *testing.T) {
+	t.Parallel()
+	s, m := newTranscriptTestDB(t)
+
+	parent, err := s.Create(context.Background(), "parent")
+	require.NoError(t, err)
+	child, err := s.CreateTaskSession(context.Background(), "m1$$c1", parent.ID, "worker")
+	require.NoError(t, err)
+	grandchild, err := s.CreateTaskSession(context.Background(), "m2$$c2", child.ID, "sub-worker")
+	require.NoError(t, err)
+	_, err = m.Create(context.Background(), grandchild.ID, message.CreateMessageParams{
+		Role:  message.Assistant,
+		Parts: []message.ContentPart{message.TextContent{Text: "deep work"}},
+	})
+	require.NoError(t, err)
+
+	// Fail ListSubSessions specifically on the intermediate "child" node, the
+	// one whose children include the real target (grandchild). Without the
+	// fix this would make the whole branch invisible and the walk would
+	// finish having never found grandchild, returning a false "not a
+	// descendant" refusal instead of surfacing the failure.
+	flaky := &flakySubSessionsService{Service: s, failAt: child.ID}
+
+	tool := NewReadDelegationTranscriptTool(flaky, m)
+	input, err := json.Marshal(ReadDelegationTranscriptParams{SessionID: grandchild.ID})
+	require.NoError(t, err)
+	ctx := context.WithValue(context.Background(), SessionIDContextKey, parent.ID)
+	resp, runErr := tool.Run(ctx, fantasy.ToolCall{ID: "c1", Name: ReadDelegationTranscriptToolName, Input: string(input)})
+
+	require.Error(t, runErr, "a mid-walk DB error must surface as a real error, not a silent false/refusal")
+	require.NotContains(t, runErr.Error(), "is not a sub-agent delegation",
+		"the error must be distinguishable from a genuine ownership refusal")
+	require.Contains(t, runErr.Error(), "failed to verify session ownership")
+	// The tool must not have returned a (nil-error) refusal response either.
+	require.Empty(t, resp.Content)
 }
 
 // TestReadDelegationTranscript_ReadsGrandchild confirms nested delegations

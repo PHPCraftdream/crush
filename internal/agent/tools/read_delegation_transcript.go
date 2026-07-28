@@ -80,7 +80,19 @@ func NewReadDelegationTranscriptTool(sessions session.Service, messages message.
 			// session. Walk the caller's descendant tree (parent_session_id
 			// chain) and confirm target is reached. This refuses arbitrary or
 			// unrelated session ids the same way runSubAgent's resume path does.
-			if !isDescendantSession(ctx, sessions, callerID, target) {
+			isDescendant, err := isDescendantSession(ctx, sessions, callerID, target)
+			if err != nil {
+				// A DB error partway through the tree walk means we could NOT
+				// verify ownership one way or the other — it does NOT mean
+				// target isn't a descendant. This is a security-relevant check
+				// (who may read whose transcript), so silently treating
+				// "couldn't verify" the same as "verified not a descendant"
+				// would produce a final-sounding refusal for what might be a
+				// perfectly legitimate child session. Surface a real error so
+				// the caller can retry instead.
+				return fantasy.ToolResponse{}, fmt.Errorf("failed to verify session ownership for %q: %w", target, err)
+			}
+			if !isDescendant {
 				return fantasy.NewTextErrorResponse(fmt.Sprintf(
 					"session_id %q is not a sub-agent delegation of the current session; refusing to read a session that does not belong to this agent",
 					target,
@@ -101,11 +113,21 @@ func NewReadDelegationTranscriptTool(sessions session.Service, messages message.
 // i.e. reachable by following parent_session_id links down from rootID. It
 // walks the tree breadth-first with a visited-set and a visit cap so a
 // degenerate or cyclic tree can never turn this into an unbounded DB sweep.
-// Returns false when rootID == target (a session is not its own descendant),
-// which the caller treats separately.
-func isDescendantSession(ctx context.Context, sessions session.Service, rootID, target string) bool {
+// Returns (false, nil) when rootID == target (a session is not its own
+// descendant), which the caller treats separately.
+//
+// Returns a non-nil error when ListSubSessions fails on ANY node visited
+// during the walk. This is deliberate: this is a security-relevant ownership
+// check, so a transient DB error on one intermediate node must NOT be
+// swallowed and treated as "that branch has no matching descendant" — doing
+// so would make an entire subtree invisible and could misclassify a
+// legitimate child session as "not a descendant" purely because we failed to
+// look. The caller is expected to surface this as a real error rather than
+// falling through to the final "not a sub-agent delegation" refusal, which
+// would read as a deliberate, final denial instead of "we couldn't check".
+func isDescendantSession(ctx context.Context, sessions session.Service, rootID, target string) (bool, error) {
 	if rootID == "" || target == "" || rootID == target {
-		return false
+		return false, nil
 	}
 	visited := make(map[string]struct{}, 8)
 	queue := []string{rootID}
@@ -121,18 +143,18 @@ func isDescendantSession(ctx context.Context, sessions session.Service, rootID, 
 
 		children, err := sessions.ListSubSessions(ctx, id)
 		if err != nil {
-			continue
+			return false, fmt.Errorf("listing sub-sessions of %q: %w", id, err)
 		}
 		for _, child := range children {
 			if child.ID == target {
-				return true
+				return true, nil
 			}
 			if _, seen := visited[child.ID]; !seen {
 				queue = append(queue, child.ID)
 			}
 		}
 	}
-	return false
+	return false, nil
 }
 
 // renderDelegationTranscript formats a child session's messages into a compact,

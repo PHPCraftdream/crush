@@ -172,7 +172,6 @@ var (
 func Providers(cfg *Config) ([]catwalk.Provider, error) {
 	providerOnce.Do(func() {
 		var wg sync.WaitGroup
-		var errs []error
 		providers := csync.NewSlice[catwalk.Provider]()
 		autoupdate := !cfg.Options.DisableProviderAutoUpdate
 		customProvidersOnly := cfg.Options.DisableDefaultProviders
@@ -182,6 +181,17 @@ func Providers(cfg *Config) ([]catwalk.Provider, error) {
 
 		var hyperProvider catwalk.Provider
 		var hyperFound bool
+
+		// Each goroutine below writes its own error into a private variable
+		// rather than appending to a shared `errs` slice: a concurrent
+		// `errs = append(errs, ...)` from both goroutines is a data race
+		// (and can silently drop one of the two errors even when it
+		// "happens" not to trip the race detector). Collecting into two
+		// separate variables and joining them after wg.Wait() below needs
+		// no synchronization at all, since by then both goroutines have
+		// already returned.
+		var catwalkErr error
+		var hyperErr error
 
 		wg.Go(func() {
 			if customProvidersOnly {
@@ -195,7 +205,7 @@ func Providers(cfg *Config) ([]catwalk.Provider, error) {
 			items, err := catwalkSyncer.Get(ctx)
 			if err != nil {
 				catwalkURL := fmt.Sprintf("%s/v2/providers", cmp.Or(os.Getenv("CATWALK_URL"), defaultCatwalkURL))
-				errs = append(errs, fmt.Errorf("Crush was unable to fetch an updated list of providers from %s. Consider setting CRUSH_DISABLE_PROVIDER_AUTO_UPDATE=1 to use the embedded providers bundled at the time of this Crush release. You can also update providers manually. For more info see crush update-providers --help.\n\nCause: %w", catwalkURL, err)) //nolint:staticcheck
+				catwalkErr = fmt.Errorf("Crush was unable to fetch an updated list of providers from %s. Consider setting CRUSH_DISABLE_PROVIDER_AUTO_UPDATE=1 to use the embedded providers bundled at the time of this Crush release. You can also update providers manually. For more info see crush update-providers --help.\n\nCause: %w", catwalkURL, err) //nolint:staticcheck
 				return
 			}
 			providers.Append(items...)
@@ -210,7 +220,7 @@ func Providers(cfg *Config) ([]catwalk.Provider, error) {
 
 			item, err := hyperSyncer.Get(ctx)
 			if err != nil {
-				errs = append(errs, fmt.Errorf("Crush was unable to fetch updated information from Hyper: %w", err)) //nolint:staticcheck
+				hyperErr = fmt.Errorf("Crush was unable to fetch updated information from Hyper: %w", err) //nolint:staticcheck
 				return
 			}
 			hyperProvider = item
@@ -224,7 +234,7 @@ func Providers(cfg *Config) ([]catwalk.Provider, error) {
 		} else {
 			providerList = slices.Collect(providers.Seq())
 		}
-		providerErr = errors.Join(errs...)
+		providerErr = errors.Join(catwalkErr, hyperErr)
 	})
 	return providerList, providerErr
 }

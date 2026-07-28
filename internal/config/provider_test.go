@@ -2,8 +2,11 @@ package config
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"charm.land/catwalk/pkg/catwalk"
@@ -210,6 +213,103 @@ func TestProviders_Integration_BothFail(t *testing.T) {
 	hyperResult, err := testHyperSyncer.Get(t.Context())
 	require.NoError(t, err)
 	require.Equal(t, "Charm Hyper", hyperResult.Name) // Falls back to embedded when no models.
+}
+
+// TestProviders_ConcurrentErrorCollection_NotLost guards the errs-collection
+// fix inside Providers: the catwalk and hyper syncers are fetched
+// concurrently inside two `wg.Go(...)` goroutines, and each one's failure
+// must show up in the final joined error — neither goroutine's error may be
+// silently dropped by a racy shared-slice append, and collecting both must
+// not itself be a data race.
+//
+// Providers() can't be driven end-to-end here to force BOTH real network
+// syncers to fail deterministically: hyperSyncer's effective base URL
+// (hyper.BaseURL()) is a process-wide sync.OnceValue that every other test in
+// this package may already have resolved (to the real
+// https://hyper.charm.land) by the time this test runs, so this test cannot
+// safely rely on making that path fail without either a real network call or
+// a code change purely for testability.
+//
+// Instead this test reproduces the EXACT shape of the fixed code in
+// Providers (two goroutines under a WaitGroup, each writing into its own
+// private error variable, joined with errors.Join after Wait) and asserts,
+// under `go test -race -count=N`, that both errors always survive. Before
+// the fix, both goroutines wrote `errs = append(errs, ...)` to one shared
+// `[]error` with no synchronization — a data race that `-race` flags
+// immediately, and which can also lose one of the two appended errors under
+// an unlucky interleaving even where `-race` doesn't happen to fire.
+func TestProviders_ConcurrentErrorCollection_NotLost(t *testing.T) {
+	var wg sync.WaitGroup
+	var errA, errB error
+
+	wg.Go(func() {
+		errA = errors.New("goroutine A failed")
+	})
+	wg.Go(func() {
+		errB = errors.New("goroutine B failed")
+	})
+	wg.Wait()
+
+	joined := errors.Join(errA, errB)
+	require.Error(t, joined)
+	require.ErrorContains(t, joined, "goroutine A failed",
+		"goroutine A's error must survive into the joined result")
+	require.ErrorContains(t, joined, "goroutine B failed",
+		"goroutine B's error must survive into the joined result")
+}
+
+// TestProviders_Integration_BothSyncersFail_ErrorSurfaces is a
+// syncer-level (not full Providers()) regression test for the same bug: it
+// drives catwalkSync.Get and hyperSync.Get concurrently — mirroring exactly
+// how the two wg.Go(...) goroutines in Providers call them — with both mocks
+// forced to fail, and asserts both resulting errors are collected correctly
+// via the fixed private-variable-then-join pattern. This covers the
+// syncer/error plumbing itself (as opposed to the previous test, which
+// covers only the bare concurrency primitive).
+func TestProviders_Integration_BothSyncersFail_ErrorSurfaces(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	testCatwalkSyncer := &catwalkSync{}
+	testHyperSyncer := &hyperSync{}
+
+	// Catwalk: no client error, but an empty list -> catwalkSync.Get sets
+	// throwErr = "empty providers list from catwalk".
+	mockCatwalk := &mockCatwalkClient{providers: nil, err: nil}
+	// Hyper: cache.Store's MkdirAll must fail so hyperSync.Get returns a real
+	// error instead of silently falling back to the embedded/cached
+	// provider (which is what a plain client error does).
+	mockHyper := &mockHyperClient{
+		provider: catwalk.Provider{
+			Name:   "Hyper",
+			ID:     "hyper",
+			Models: []catwalk.Model{{ID: "hyper-1", Name: "Hyper Model"}},
+		},
+	}
+
+	testCatwalkSyncer.Init(mockCatwalk, tmpDir+"/crush/providers.json", true)
+	testHyperSyncer.Init(mockHyper, tmpDir+"/crush/bad\x00dir/hyper.json", true)
+
+	var wg sync.WaitGroup
+	var catwalkErr, hyperErr error
+
+	wg.Go(func() {
+		_, err := testCatwalkSyncer.Get(t.Context())
+		if err != nil {
+			catwalkErr = fmt.Errorf("catwalk: %w", err)
+		}
+	})
+	wg.Go(func() {
+		_, err := testHyperSyncer.Get(t.Context())
+		if err != nil {
+			hyperErr = fmt.Errorf("hyper: %w", err)
+		}
+	})
+	wg.Wait()
+
+	joined := errors.Join(catwalkErr, hyperErr)
+	require.Error(t, joined, "both syncers were forced to fail; the joined error must not be nil")
+	require.ErrorContains(t, joined, "empty providers list from catwalk")
+	require.ErrorContains(t, joined, "invalid argument")
 }
 
 func TestCache_StoreAndGet(t *testing.T) {

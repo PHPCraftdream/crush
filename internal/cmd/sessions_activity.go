@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/charmbracelet/crush/internal/app"
@@ -81,6 +82,20 @@ func (c callTreeActivity) Age(now time.Time) (time.Duration, bool) {
 // sessions, so this is a handful of indexed queries. The visit cap
 // (subTreeWalkMaxSessions) and the visited-set guard keep a degenerate or
 // cyclic tree from turning it into an unbounded sweep.
+//
+// Error handling: a Messages.List or ListSubSessions failure on any single
+// node is intentionally NOT fatal and does not change the returned value —
+// this is a best-effort diagnostic signal consumed by six different display
+// surfaces (`sessions why`/`locks`/`list`/`show`/`watch`/`last`), all of
+// which already treat a zero-value callTreeActivity as "no activity found"
+// and none of which currently expect a partial-failure signal. Changing the
+// return type to plumb a "some nodes could not be checked" flag through all
+// six callers would be a much larger, riskier change for what is a read-only
+// diagnostic path (unlike isDescendantSession's security-relevant ownership
+// check, where silently continuing on error is NOT acceptable). Instead we
+// log each swallowed error at Debug level so a transient DB error is visible
+// under `--verbose`/debug logging instead of silently vanishing into "no
+// activity", without changing any caller's behavior.
 func computeCallTreeActivity(ctx context.Context, a *app.App, rootID string) callTreeActivity {
 	out := callTreeActivity{}
 	if a == nil || rootID == "" {
@@ -101,7 +116,11 @@ func computeCallTreeActivity(ctx context.Context, a *app.App, rootID string) cal
 		visits++
 
 		isDescendant := id != rootID
-		if msgs, err := a.Messages.List(ctx, id); err == nil {
+		msgs, err := a.Messages.List(ctx, id)
+		if err != nil {
+			slog.Debug("computeCallTreeActivity: failed to list messages, this node's activity is not reflected in the result", "session_id", id, "root_id", rootID, "error", err)
+		}
+		if err == nil {
 			for i := range msgs {
 				ts := latestMessageUnix(msgs[i])
 				// Strictly-newer always wins. On an EQUAL timestamp (common:
@@ -122,7 +141,11 @@ func computeCallTreeActivity(ctx context.Context, a *app.App, rootID string) cal
 			}
 		}
 
-		if children, err := a.Sessions.ListSubSessions(ctx, id); err == nil {
+		children, err := a.Sessions.ListSubSessions(ctx, id)
+		if err != nil {
+			slog.Debug("computeCallTreeActivity: failed to list sub-sessions, this node's descendants are not reflected in the result", "session_id", id, "root_id", rootID, "error", err)
+		}
+		if err == nil {
 			for _, child := range children {
 				if _, seen := visited[child.ID]; !seen {
 					queue = append(queue, child.ID)
