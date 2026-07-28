@@ -557,9 +557,15 @@ func TestRunSubAgent(t *testing.T) {
 		parentSession, err := env.sessions.Create(t.Context(), "Parent")
 		require.NoError(t, err)
 
+		// Cost BEFORE the pause must be non-zero: a zero pre-pause cost
+		// makes the double-charge bug (parent gets A + (A+B) instead of
+		// A+B) indistinguishable from correct behavior, since 2*0+B == B.
 		var childSessionID string
-		firstAgent := newMockAgent(providerID, 4096, func(_ context.Context, call SessionAgentCall) (*fantasy.AgentResult, error) {
+		firstAgent := newMockAgent(providerID, 4096, func(ctx context.Context, call SessionAgentCall) (*fantasy.AgentResult, error) {
 			childSessionID = call.SessionID
+			if _, err := env.sessions.IncrementCost(ctx, call.SessionID, 0.03); err != nil {
+				return nil, err
+			}
 			return nil, &AwaitingAnswerError{Question: "q?", SessionID: call.SessionID}
 		})
 		_, err = coord.runSubAgent(t.Context(), subAgentParams{
@@ -572,8 +578,13 @@ func TestRunSubAgent(t *testing.T) {
 		})
 		require.NoError(t, err)
 
+		afterPauseParent, err := env.sessions.Get(t.Context(), parentSession.ID)
+		require.NoError(t, err)
+		assert.InDelta(t, 0.03, afterPauseParent.Cost, 1e-9, "the pre-pause cost must reach the parent exactly once")
+
 		resumeAgent := newMockAgent(providerID, 4096, func(ctx context.Context, call SessionAgentCall) (*fantasy.AgentResult, error) {
-			// Simulate cost accruing on the resumed turn.
+			// Simulate cost accruing on the resumed turn, ON TOP of the
+			// 0.03 the child already carries from before the pause.
 			if _, err := env.sessions.IncrementCost(ctx, call.SessionID, 0.02); err != nil {
 				return nil, err
 			}
@@ -592,7 +603,8 @@ func TestRunSubAgent(t *testing.T) {
 
 		updatedParent, err := env.sessions.Get(t.Context(), parentSession.ID)
 		require.NoError(t, err)
-		assert.InDelta(t, 0.02, updatedParent.Cost, 1e-9, "cost accrued on the resumed turn must still reach the parent")
+		assert.InDelta(t, 0.05, updatedParent.Cost, 1e-9,
+			"parent must be charged the child's total (0.03+0.02), not double-charged the pre-pause portion (0.03+0.05=0.08)")
 	})
 
 	t.Run("session setup callback is invoked", func(t *testing.T) {
@@ -671,7 +683,7 @@ func TestUpdateParentSessionCost(t *testing.T) {
 		_, err = env.sessions.IncrementCost(t.Context(), child.ID, 0.10)
 		require.NoError(t, err)
 
-		err = coord.updateParentSessionCost(t.Context(), child.ID, parent.ID)
+		err = coord.updateParentSessionCost(t.Context(), child.ID, parent.ID, 0)
 		require.NoError(t, err)
 
 		updated, err := env.sessions.Get(t.Context(), parent.ID)
@@ -698,9 +710,9 @@ func TestUpdateParentSessionCost(t *testing.T) {
 		_, err = env.sessions.IncrementCost(t.Context(), child2.ID, 0.03)
 		require.NoError(t, err)
 
-		err = coord.updateParentSessionCost(t.Context(), child1.ID, parent.ID)
+		err = coord.updateParentSessionCost(t.Context(), child1.ID, parent.ID, 0)
 		require.NoError(t, err)
-		err = coord.updateParentSessionCost(t.Context(), child2.ID, parent.ID)
+		err = coord.updateParentSessionCost(t.Context(), child2.ID, parent.ID, 0)
 		require.NoError(t, err)
 
 		updated, err := env.sessions.Get(t.Context(), parent.ID)
@@ -717,7 +729,7 @@ func TestUpdateParentSessionCost(t *testing.T) {
 		parent, err := env.sessions.Create(t.Context(), "Parent")
 		require.NoError(t, err)
 
-		err = coord.updateParentSessionCost(t.Context(), "non-existent", parent.ID)
+		err = coord.updateParentSessionCost(t.Context(), "non-existent", parent.ID, 0)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "get child session")
 	})
@@ -733,7 +745,7 @@ func TestUpdateParentSessionCost(t *testing.T) {
 		child, err := env.sessions.CreateTaskSession(t.Context(), "tool-1", parent.ID, "Child")
 		require.NoError(t, err)
 
-		err = coord.updateParentSessionCost(t.Context(), child.ID, "non-existent")
+		err = coord.updateParentSessionCost(t.Context(), child.ID, "non-existent", 0)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "increment parent session cost")
 	})
@@ -749,12 +761,49 @@ func TestUpdateParentSessionCost(t *testing.T) {
 		child, err := env.sessions.CreateTaskSession(t.Context(), "tool-1", parent.ID, "Child")
 		require.NoError(t, err)
 
-		err = coord.updateParentSessionCost(t.Context(), child.ID, parent.ID)
+		err = coord.updateParentSessionCost(t.Context(), child.ID, parent.ID, 0)
 		require.NoError(t, err)
 
 		updated, err := env.sessions.Get(t.Context(), parent.ID)
 		require.NoError(t, err)
 		assert.InDelta(t, 0.0, updated.Cost, 1e-9)
+	})
+
+	t.Run("only charges the delta above baseline, not the raw total", func(t *testing.T) {
+		// Direct-unit-test counterpart to the runSubAgent-level
+		// "cost accounting is not skipped on the resume path" test: proves
+		// the fix at the updateParentSessionCost layer itself, independent
+		// of how runSubAgent computes the baseline it passes in.
+		env := testEnv(t)
+		cfg, err := config.Init(env.workingDir, "", false)
+		require.NoError(t, err)
+		coord := &coordinator{cfg: cfg, sessions: env.sessions}
+
+		parent, err := env.sessions.Create(t.Context(), "Parent")
+		require.NoError(t, err)
+		child, err := env.sessions.CreateTaskSession(t.Context(), "tool-1", parent.ID, "Child")
+		require.NoError(t, err)
+
+		// Child accrues 0.03 pre-pause, charged to the parent with baseline 0.
+		_, err = env.sessions.IncrementCost(t.Context(), child.ID, 0.03)
+		require.NoError(t, err)
+		require.NoError(t, coord.updateParentSessionCost(t.Context(), child.ID, parent.ID, 0))
+
+		afterPause, err := env.sessions.Get(t.Context(), parent.ID)
+		require.NoError(t, err)
+		assert.InDelta(t, 0.03, afterPause.Cost, 1e-9)
+
+		// Child resumes and accrues another 0.02 (total now 0.05). Charging
+		// with baseline=0.03 (what was already billed) must add only 0.02,
+		// not the full 0.05 again.
+		_, err = env.sessions.IncrementCost(t.Context(), child.ID, 0.02)
+		require.NoError(t, err)
+		require.NoError(t, coord.updateParentSessionCost(t.Context(), child.ID, parent.ID, 0.03))
+
+		afterResume, err := env.sessions.Get(t.Context(), parent.ID)
+		require.NoError(t, err)
+		assert.InDelta(t, 0.05, afterResume.Cost, 1e-9,
+			"parent must reflect the child's total exactly once (0.05), not double-charge the pre-pause portion (0.08)")
 	})
 }
 

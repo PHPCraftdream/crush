@@ -2438,6 +2438,16 @@ func (c *coordinator) runSubAgent(ctx context.Context, params subAgentParams) (f
 		session = created
 	}
 
+	// Baseline for updateParentSessionCost below: the child's cost AT THE
+	// START of this call. For a fresh sub-agent this is 0. For a resumed
+	// one it is exactly what was already charged to the parent when the
+	// PRIOR call paused (that charge used this same child's Cost at the
+	// time it paused) — so subtracting it here yields only the NEW cost
+	// accrued during this resume, not the whole child total again. See
+	// updateParentSessionCost's doc comment for why charging the raw
+	// total on every call (pause AND resume) double-counts.
+	initialChildCost := session.Cost
+
 	// Call session setup function if provided
 	if params.SessionSetup != nil {
 		params.SessionSetup(session.ID)
@@ -2496,7 +2506,7 @@ func (c *coordinator) runSubAgent(ctx context.Context, params subAgentParams) (f
 	// is unchanged for genuine failures.
 	var awaitingAnswer *AwaitingAnswerError
 	if errors.As(err, &awaitingAnswer) {
-		if costErr := c.updateParentSessionCost(ctx, session.ID, params.SessionID); costErr != nil {
+		if costErr := c.updateParentSessionCost(ctx, session.ID, params.SessionID, initialChildCost); costErr != nil {
 			slog.Warn(
 				"Failed to update parent session cost",
 				"child_session", session.ID,
@@ -2512,7 +2522,7 @@ func (c *coordinator) runSubAgent(ctx context.Context, params subAgentParams) (f
 
 	// Update parent session cost on a best-effort basis. A failure here must
 	// not discard the sub-agent output that was already produced.
-	if err := c.updateParentSessionCost(ctx, session.ID, params.SessionID); err != nil {
+	if err := c.updateParentSessionCost(ctx, session.ID, params.SessionID, initialChildCost); err != nil {
 		slog.Warn(
 			"Failed to update parent session cost",
 			"child_session", session.ID,
@@ -2541,19 +2551,45 @@ func subAgentOutput(result *fantasy.AgentResult) string {
 // goroutines and each charging the same parent) cannot lose cost via
 // read-modify-write the way the old Get+modify+Save pattern would.
 //
+// baselineCost is the child's OWN Cost at the moment this runSubAgent call
+// started (0 for a fresh sub-agent, or whatever the child's Cost was when
+// it last paused, for a resume). Only childSession.Cost - baselineCost —
+// the cost accrued DURING this call — is charged to the parent.
+//
+// Why a delta and not the raw total: a sub-agent that calls ask_question
+// pauses mid-task, and runSubAgent charges the parent right then with
+// whatever the child has spent so far (say A). When the orchestrator later
+// answers, the SAME child session resumes and runs runSubAgent again,
+// finishing with total cost A+B. Charging childSession.Cost verbatim on
+// EVERY call — as this used to do — charges the parent A (at the pause)
+// then A+B (at the resume), for a total of 2A+B instead of the correct
+// A+B: the portion already charged at the pause got billed to the parent
+// a second time. Subtracting baselineCost (which the caller captured as
+// exactly what the child's Cost was AT the pause, i.e. what was already
+// charged) fixes this without needing any new persisted state — the
+// child's own Cost field IS the running total, so "cost since baseline"
+// is all the information needed.
+//
 // Fork patch (concurrency): rewritten from Get-parent → modify Cost →
 // Save back. See CHANGELOG.fork.md (Section 4.I).
-func (c *coordinator) updateParentSessionCost(ctx context.Context, childSessionID, parentSessionID string) error {
+func (c *coordinator) updateParentSessionCost(ctx context.Context, childSessionID, parentSessionID string, baselineCost float64) error {
 	childSession, err := c.sessions.Get(ctx, childSessionID)
 	if err != nil {
 		return fmt.Errorf("get child session: %w", err)
+	}
+
+	delta := childSession.Cost - baselineCost
+	if delta < 0 {
+		// Should not happen (session cost only grows), but never charge a
+		// parent a negative amount over a stale/inconsistent read.
+		delta = 0
 	}
 
 	// IncrementCost handles the zero-delta case by routing to Get, which
 	// surfaces a not-found error if the parent session was deleted between
 	// the child finishing and this call — preserves the previous error
 	// semantics.
-	if _, err := c.sessions.IncrementCost(ctx, parentSessionID, childSession.Cost); err != nil {
+	if _, err := c.sessions.IncrementCost(ctx, parentSessionID, delta); err != nil {
 		return fmt.Errorf("increment parent session cost: %w", err)
 	}
 
