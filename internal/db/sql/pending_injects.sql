@@ -7,7 +7,7 @@
 -- (RequestCancel / SetBudget). These sqlc-generated methods below ARE
 -- wired into db.go's Prepare/Close/WithTx (as of the sqlc regeneration
 -- that added call_tree_activity.sql), but nothing in the codebase calls
--- them yet — session.go's raw-SQL path remains the actual implementation.
+-- them yet - session.go's raw-SQL path remains the actual implementation.
 -- Keep both in sync if pending_injects' schema changes.
 
 -- name: CreatePendingInject :exec

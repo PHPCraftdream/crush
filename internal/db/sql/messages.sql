@@ -7,7 +7,15 @@ WHERE id = ? LIMIT 1;
 SELECT *
 FROM messages
 WHERE session_id = ?
-ORDER BY created_at ASC;
+-- rowid is the tie-breaker: created_at is stored in SECONDS, so a single agent
+-- turn produces dozens of rows with an identical created_at. Without a total
+-- order SQLite does not guarantee a stable order among those ties. This is the
+-- same class of bug fixed for ListMessagesBySessionPaginated (see its comment
+-- below) - here applied to the oldest-first, non-paginated variant, so
+-- (created_at ASC, rowid ASC) is a deterministic oldest-first total order.
+-- rowid is SQLite's implicit monotonic insertion counter (messages.id is a
+-- non-monotonic UUID, unsuitable as a tiebreaker).
+ORDER BY created_at ASC, rowid ASC;
 
 -- name: CreateMessage :one
 INSERT INTO messages (

@@ -372,6 +372,28 @@ func (s *service) ForkSession(ctx context.Context, srcID, title string) (Session
 	// Copy every message verbatim. Parts is carried across as the raw JSON
 	// blob (no decode/re-encode round-trip), so the fork is a faithful copy
 	// of the source history. Any copy error aborts the whole transaction.
+	//
+	// Deliberately no per-message pubsub.CreatedEvent here (unlike
+	// message.Service.Create, which the old non-transactional path went
+	// through): this loop writes via qtx.CreateMessage directly against the
+	// tx, bypassing the message package's Service/Broker entirely, so there
+	// is no message.Service handle available to publish through from inside
+	// session's ForkSession. Publishing would also need to wait until AFTER
+	// the commit below (a subscriber must never observe a message row from
+	// an uncommitted, possibly-rolled-back tx), which would mean re-reading
+	// every copied message post-commit just to build event payloads.
+	// Checked whether any subscriber actually needs incremental per-message
+	// events for a fork: the only consumer is the web UI
+	// (internal/server/events.go forwards message.Service's broker to
+	// EventMessageCreated/Updated), and its client-side handler for the
+	// session-level fork event does NOT rely on incremental message
+	// events — web/src/useWS.ts's "session_created" handler unconditionally
+	// calls `ws.send("load_messages", { sessionID: s.ID })` for every new
+	// session (fork included), which does a full re-fetch of the session's
+	// messages. So a client attached at fork time still ends up with a
+	// complete, correct transcript. If a future subscriber needs
+	// incremental per-message fork events, publish them AFTER tx.Commit()
+	// below (loop over the re-read committed rows), not inside the tx.
 	srcMsgs, err := qtx.ListMessagesBySession(ctx, srcID)
 	if err != nil {
 		return Session{}, fmt.Errorf("list source messages: %w", err)
@@ -554,6 +576,18 @@ func (s *service) SetUsage(ctx context.Context, sessionID string, promptTokens, 
 // flip the summary pointer and reset token counters as one logical op. Like
 // SetUsage it leaves title, todos, and cost untouched, so it cannot lose
 // concurrent edits to those columns.
+//
+// NULL vs empty-string note: `sessions reset` calls this with
+// summaryMessageID equal to the Go zero value to clear the pointer, which
+// writes a SQL empty string rather than NULL to summary_message_id —
+// unlike the old generic Save/UpdateSession path, which stored a Go
+// zero-value string as NULL via sql.NullString{Valid: false}. This is
+// intentionally NOT treated as a bug: every reader of SummaryMessageID
+// compares it against the empty string (Session.SummaryMessageID != ""),
+// and no SQL query anywhere filters or joins on
+// `summary_message_id IS NULL`. An empty string and NULL are therefore
+// equivalent for every consumer of this column today. Do not "fix" this
+// without first auditing for a new IS NULL usage.
 func (s *service) SetSummaryAndUsage(ctx context.Context, sessionID, summaryMessageID string, promptTokens, completionTokens int64) error {
 	if _, err := s.db.ExecContext(ctx,
 		`UPDATE sessions SET summary_message_id = ?, prompt_tokens = ?, completion_tokens = ?, updated_at = strftime('%s', 'now') WHERE id = ?`,

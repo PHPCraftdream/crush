@@ -22,7 +22,7 @@ type Querier interface {
 	// (RequestCancel / SetBudget). These sqlc-generated methods below ARE
 	// wired into db.go's Prepare/Close/WithTx (as of the sqlc regeneration
 	// that added call_tree_activity.sql), but nothing in the codebase calls
-	// them yet — session.go's raw-SQL path remains the actual implementation.
+	// them yet - session.go's raw-SQL path remains the actual implementation.
 	// Keep both in sync if pending_injects' schema changes.
 	CreatePendingInject(ctx context.Context, arg CreatePendingInjectParams) error
 	CreateSession(ctx context.Context, arg CreateSessionParams) (Session, error)
@@ -40,6 +40,29 @@ type Querier interface {
 	DeleteSessionFiles(ctx context.Context, sessionID string) error
 	DeleteSessionMessages(ctx context.Context, sessionID string) error
 	GetAverageResponseTime(ctx context.Context) (int64, error)
+	// call_tree_activity.sql: freshest message activity across a session's whole
+	// descendant call tree (root + every sub-agent session reachable via
+	// parent_session_id), in ONE recursive-CTE query per root.
+	//
+	// Bounded vs. unbounded:
+	//   * DEPTH is capped: the recursive member carries `tree.depth < 511`, so a
+	//     pathological deep chain (or an accidental parent/child cycle) can never
+	//     recurse indefinitely (see TestGetCallTreeActivity_DepthGuard).
+	//   * WIDTH (fan-out) is NOT bounded by row count. A single root with many
+	//     direct children produces that many rows in the CTE regardless of depth.
+	//     This is a deliberate, documented choice, not an oversight: SQLite's
+	//     recursive CTE cannot bound the TOTAL number of materialized rows -- the
+	//     recursive member only sees the PREVIOUS iteration's working table, never
+	//     the accumulated set, so a running "rows visited" counter is not
+	//     expressible in the recursion, and SQLite does not support LIMIT inside
+	//     the recursive member. Bounding fan-out would therefore require either
+	//     abandoning this SQL CTE (the SQL form replaced the Go BFS in task #104)
+	//     or reverting to a Go-side BFS, neither of which is warranted: in
+	//     practice a parent session spawns at most a handful of concurrent
+	//     sub-agent delegations, so unbounded fan-out is not a real performance
+	//     risk. The single-root form also ends in LIMIT 1 and the batch form in a
+	//     per-root ROW_NUMBER()=1 filter, so only one row per root ever leaves
+	//     the query.
 	GetCallTreeActivity(ctx context.Context, id string) (GetCallTreeActivityRow, error)
 	GetCallTreeActivityBatch(ctx context.Context, rootIds []string) ([]GetCallTreeActivityBatchRow, error)
 	GetFile(ctx context.Context, id string) (File, error)
@@ -74,7 +97,21 @@ type Querier interface {
 	ListFilesByPath(ctx context.Context, path string) ([]File, error)
 	ListFilesBySession(ctx context.Context, sessionID string) ([]File, error)
 	ListLatestSessionFiles(ctx context.Context, sessionID string) ([]File, error)
+	// rowid is the tie-breaker: created_at is stored in SECONDS, so a single agent
+	// turn produces dozens of rows with an identical created_at. Without a total
+	// order SQLite does not guarantee a stable order among those ties. This is the
+	// same class of bug fixed for ListMessagesBySessionPaginated (see its comment
+	// below) - here applied to the oldest-first, non-paginated variant, so
+	// (created_at ASC, rowid ASC) is a deterministic oldest-first total order.
+	// rowid is SQLite's implicit monotonic insertion counter (messages.id is a
+	// non-monotonic UUID, unsuitable as a tiebreaker).
 	ListMessagesBySession(ctx context.Context, sessionID string) ([]Message, error)
+	// rowid is the tie-breaker: created_at is stored in SECONDS, so a single agent
+	// turn produces dozens of rows with an identical created_at. Without a total
+	// order SQLite does not guarantee a stable order among those ties, which makes
+	// OFFSET pagination lose/duplicate rows when the query plan shifts between
+	// page fetches. rowid is SQLite's implicit monotonic insertion counter, so
+	// (created_at DESC, rowid DESC) is a deterministic newest-first total order.
 	ListMessagesBySessionPaginated(ctx context.Context, arg ListMessagesBySessionPaginatedParams) ([]Message, error)
 	ListNewFiles(ctx context.Context) ([]File, error)
 	ListPendingInjectsBySession(ctx context.Context, sessionID string) ([]PendingInject, error)
@@ -102,11 +139,6 @@ type Querier interface {
 	UpdateMessage(ctx context.Context, arg UpdateMessageParams) error
 	UpdateMessagePinned(ctx context.Context, arg UpdateMessagePinnedParams) error
 	UpdatePermissionEnabled(ctx context.Context, arg UpdatePermissionEnabledParams) error
-	// Overwrites title/prompt_tokens/completion_tokens/summary/todos/deleted_todos
-	// but NOT cost. Cost is mutated only via IncrementSessionCost so concurrent
-	// sub-agent goroutines (and parallel crush processes that ever share a
-	// session) cannot lose accrued cost via read-modify-write.
-	UpdateSession(ctx context.Context, arg UpdateSessionParams) (Session, error)
 	UpdateSessionModels(ctx context.Context, arg UpdateSessionModelsParams) error
 	UpdateSessionReasoningEffort(ctx context.Context, arg UpdateSessionReasoningEffortParams) error
 	UpdateSessionSystemPrompt(ctx context.Context, arg UpdateSessionSystemPromptParams) error

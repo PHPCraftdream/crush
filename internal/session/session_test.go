@@ -555,6 +555,7 @@ func TestConcurrentRenameAndTodos_NoDataLoss(t *testing.T) {
 func TestBroadOverwriteLosesConcurrentUsage(t *testing.T) {
 	t.Parallel()
 	sqlDB, q := newTestDB(t)
+	sqlDB.SetMaxOpenConns(1) // production-faithful single-connection pool; see TestConcurrentRenameAndUsage_NoDataLoss.
 	svc := NewService(q, sqlDB)
 	ctx := t.Context()
 

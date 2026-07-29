@@ -192,9 +192,17 @@ const listMessagesBySession = `-- name: ListMessagesBySession :many
 SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden, reasoning_effort, auto_resumed, background_job_notice
 FROM messages
 WHERE session_id = ?
-ORDER BY created_at ASC
+ORDER BY created_at ASC, rowid ASC
 `
 
+// rowid is the tie-breaker: created_at is stored in SECONDS, so a single agent
+// turn produces dozens of rows with an identical created_at. Without a total
+// order SQLite does not guarantee a stable order among those ties. This is the
+// same class of bug fixed for ListMessagesBySessionPaginated (see its comment
+// below) - here applied to the oldest-first, non-paginated variant, so
+// (created_at ASC, rowid ASC) is a deterministic oldest-first total order.
+// rowid is SQLite's implicit monotonic insertion counter (messages.id is a
+// non-monotonic UUID, unsuitable as a tiebreaker).
 func (q *Queries) ListMessagesBySession(ctx context.Context, sessionID string) ([]Message, error) {
 	rows, err := q.query(ctx, q.listMessagesBySessionStmt, listMessagesBySession, sessionID)
 	if err != nil {
@@ -238,10 +246,6 @@ const listMessagesBySessionPaginated = `-- name: ListMessagesBySessionPaginated 
 SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden, reasoning_effort, auto_resumed, background_job_notice
 FROM messages
 WHERE session_id = ?
--- rowid tie-breaker: created_at is in SECONDS, so one agent turn produces many
--- rows with identical created_at; without a total order SQLite does not
--- guarantee a stable order among ties, so OFFSET pagination can drop/duplicate
--- rows when the plan shifts. rowid is the implicit monotonic insertion counter.
 ORDER BY created_at DESC, rowid DESC
 LIMIT ? OFFSET ?
 `
@@ -252,6 +256,12 @@ type ListMessagesBySessionPaginatedParams struct {
 	Offset    int64  `json:"offset"`
 }
 
+// rowid is the tie-breaker: created_at is stored in SECONDS, so a single agent
+// turn produces dozens of rows with an identical created_at. Without a total
+// order SQLite does not guarantee a stable order among those ties, which makes
+// OFFSET pagination lose/duplicate rows when the query plan shifts between
+// page fetches. rowid is SQLite's implicit monotonic insertion counter, so
+// (created_at DESC, rowid DESC) is a deterministic newest-first total order.
 func (q *Queries) ListMessagesBySessionPaginated(ctx context.Context, arg ListMessagesBySessionPaginatedParams) ([]Message, error) {
 	rows, err := q.query(ctx, q.listMessagesBySessionPaginatedStmt, listMessagesBySessionPaginated, arg.SessionID, arg.Limit, arg.Offset)
 	if err != nil {

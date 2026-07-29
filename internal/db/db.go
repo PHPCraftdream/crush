@@ -186,9 +186,6 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.updatePermissionEnabledStmt, err = db.PrepareContext(ctx, updatePermissionEnabled); err != nil {
 		return nil, fmt.Errorf("error preparing query UpdatePermissionEnabled: %w", err)
 	}
-	if q.updateSessionStmt, err = db.PrepareContext(ctx, updateSession); err != nil {
-		return nil, fmt.Errorf("error preparing query UpdateSession: %w", err)
-	}
 	if q.updateSessionModelsStmt, err = db.PrepareContext(ctx, updateSessionModels); err != nil {
 		return nil, fmt.Errorf("error preparing query UpdateSessionModels: %w", err)
 	}
@@ -476,11 +473,6 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing updatePermissionEnabledStmt: %w", cerr)
 		}
 	}
-	if q.updateSessionStmt != nil {
-		if cerr := q.updateSessionStmt.Close(); cerr != nil {
-			err = fmt.Errorf("error closing updateSessionStmt: %w", cerr)
-		}
-	}
 	if q.updateSessionModelsStmt != nil {
 		if cerr := q.updateSessionModelsStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing updateSessionModelsStmt: %w", cerr)
@@ -594,7 +586,6 @@ type Queries struct {
 	updateMessageStmt                  *sql.Stmt
 	updateMessagePinnedStmt            *sql.Stmt
 	updatePermissionEnabledStmt        *sql.Stmt
-	updateSessionStmt                  *sql.Stmt
 	updateSessionModelsStmt            *sql.Stmt
 	updateSessionReasoningEffortStmt   *sql.Stmt
 	updateSessionSystemPromptStmt      *sql.Stmt
@@ -659,7 +650,6 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		updateMessageStmt:                  q.updateMessageStmt,
 		updateMessagePinnedStmt:            q.updateMessagePinnedStmt,
 		updatePermissionEnabledStmt:        q.updatePermissionEnabledStmt,
-		updateSessionStmt:                  q.updateSessionStmt,
 		updateSessionModelsStmt:            q.updateSessionModelsStmt,
 		updateSessionReasoningEffortStmt:   q.updateSessionReasoningEffortStmt,
 		updateSessionSystemPromptStmt:      q.updateSessionSystemPromptStmt,
