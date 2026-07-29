@@ -54,6 +54,22 @@ func isolatedModelsEnv(t *testing.T) (globalPath string) {
 	tmp := t.TempDir()
 	t.Setenv("XDG_DATA_HOME", tmp)
 	t.Setenv("CRUSH_GLOBAL_DATA", tmp)
+	// GlobalConfig() (CRUSH_GLOBAL_CONFIG/XDG_CONFIG_HOME) is a SEPARATE
+	// resolution path from GlobalConfigData() (CRUSH_GLOBAL_DATA) above —
+	// see CLAUDE.md's "two real config paths" caveat. Without this,
+	// app.New() (invoked by e.g. TestModelsBump_AllFourRoles) reads the
+	// real host ~/.config/crush/crush.json and, if it configures MCP
+	// servers, tries to open real network connections to them from
+	// inside the test — observed hanging a stress run for 9+ minutes
+	// until the 10-minute go test panic-timeout. Both env vars resolve
+	// to the same "<dir>/crush.json" filename, so pointing
+	// CRUSH_GLOBAL_CONFIG at the same tmp as CRUSH_GLOBAL_DATA collapses
+	// them onto the one already-isolated globalPath below — lookupConfigs
+	// (internal/config/load.go) loads both GlobalConfig() and
+	// GlobalConfigData() and merges them, so isolating only one of the two
+	// still left the other free to leak the real host file in.
+	t.Setenv("XDG_CONFIG_HOME", tmp)
+	t.Setenv("CRUSH_GLOBAL_CONFIG", tmp)
 	t.Setenv("CRUSH_PROVIDER_CACHE_ONLY", "1")
 
 	crushlog.Setup("", false)
@@ -65,7 +81,22 @@ func isolatedModelsEnv(t *testing.T) (globalPath string) {
 	require.NoError(t, os.Chdir(workDir))
 
 	globalPath = filepath.Join(tmp, "crush.json")
-	require.NoError(t, os.WriteFile(globalPath, []byte(`{}`), 0o644))
+	// Seed a synthetic zai api_key from the start rather than starting
+	// from a bare "{}". Live model resolution (a.ResolveModel /
+	// configureSelectedModels, exercised by e.g. modelsUseCmd's
+	// large/small positionals and modelsBumpCmd/modelsStateCmd's role
+	// reads) drops any provider whose api_key doesn't resolve non-empty —
+	// see configureProviders' zai case in internal/config/load.go. Before
+	// CRUSH_GLOBAL_CONFIG was isolated above, that requirement was met by
+	// accident via a real host ~/.config/crush/crush.json's real zai key
+	// leaking in; now that the leak is closed, every test using this
+	// harness needs its own deterministic key so zai atoms keep resolving
+	// instead of silently falling back to a default provider (observed:
+	// local-cli/cli-claude-haiku) and corrupting the file these tests
+	// read back. seedZAIProvider below performs the identical write for
+	// callers that want to do it explicitly/redundantly; both write the
+	// same content.
+	require.NoError(t, os.WriteFile(globalPath, []byte(`{"providers":{"zai":{"api_key":"test-zai-key"}}}`), 0o644))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(func() {
@@ -113,6 +144,20 @@ func isolatedModelsEnv(t *testing.T) (globalPath string) {
 		// cleanup absorbs the OS lag instead of racing t.TempDir()'s
 		// fixed budget.
 		waitForSQLiteHandleRelease(t, tmp)
+
+		// Same treatment for workDir (the second t.TempDir() call
+		// above, used as this test's cwd): os.Chdir(orig) already ran
+		// at the top of this closure, so workDir is no longer the
+		// process's current directory by this point, but a command run
+		// under test (crushlog.Setup, setupApp, or the command itself)
+		// can still leave a file underneath it with pending Windows
+		// handle-release lag, same class of race as the SQLite files —
+		// observed directly: a TestModelsBump_GLM52FullStepUp failure
+		// with the locked path ending in \002 (workDir, not \001/tmp).
+		// waitForSQLiteHandleRelease's actual mechanism (retry the real
+		// os.RemoveAll) isn't SQLite-specific despite the name, so it
+		// applies here unchanged.
+		waitForSQLiteHandleRelease(t, workDir)
 	})
 
 	for _, cmd := range []*cobra.Command{modelsUseCmd, modelsStateCmd, modelsUnsetCmd} {

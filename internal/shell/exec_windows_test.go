@@ -113,7 +113,16 @@ func TestBackgroundShellManager_Kill_TreeKillsOrphanedGrandchild_Windows(t *test
 	elapsed := time.Since(start)
 
 	require.NoError(t, err)
-	require.Less(t, elapsed, 10*time.Second,
+	// Tree-kill normally returns in well under 2s. The 30s bound (not a
+	// tight one) exists only to distinguish "prompt" from the broken
+	// behavior this test guards against — hanging for the grandchild's
+	// full 60s sleep — while leaving headroom for process-spawn/taskkill
+	// latency under a loaded machine (observed: 10.85s against a 10s
+	// bound during a full `-race` package-suite run; isolated runs are
+	// consistently under 2s). A real regression back to the old
+	// direct-child-only kill would still take the full 60s, nowhere
+	// close to this bound either way.
+	require.Less(t, elapsed, 30*time.Second,
 		"Kill must tree-kill the orphaned grandchild and return promptly; "+
 			"without tree-kill it hangs until the grandchild's own sleep ends")
 }
