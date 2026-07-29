@@ -224,6 +224,12 @@ func dispatchShebang(ctx context.Context, scriptPath string, probe []byte, args 
 // The permissive fallback is what makes #!/bin/bash portable to Windows
 // boxes where Git for Windows puts bash.exe on PATH but there is no
 // /bin/bash on disk.
+//
+// On Windows the PATH-lookup is WSL-aware: if the first match is the WSL
+// launcher (C:\Windows\System32\bash.exe / wsl.exe), it is skipped in favor
+// of a later Git Bash/MSYS bash on PATH. The WSL launcher expects
+// Linux-style paths (/mnt/...) and would fail on the Windows-style script
+// path we pass; see lookPathSkipping and isWSLLauncher.
 func resolveInterpreter(path string) (string, error) {
 	_, statErr := os.Stat(path)
 	if statErr == nil {
@@ -236,19 +242,147 @@ func resolveInterpreter(path string) (string, error) {
 	base := filepath.Base(path)
 	if base == "" || base == path && !strings.ContainsAny(path, `/\`) {
 		// Already a bare name — just do a PATH lookup.
-		resolved, err := exec.LookPath(path)
+		resolved, err := lookPathSkipping(path, isWSLLauncher)
 		if err != nil {
+			if errors.Is(err, errWSLLauncherOnly) {
+				return "", err
+			}
 			return "", fmt.Errorf("interpreter %q not found in PATH", path)
 		}
 		return resolved, nil
 	}
-	resolved, err := exec.LookPath(base)
+	resolved, err := lookPathSkipping(base, isWSLLauncher)
 	if err != nil {
+		if errors.Is(err, errWSLLauncherOnly) {
+			return "", err
+		}
 		return "", fmt.Errorf("interpreter %q not found and %q not in PATH", path, base)
 	}
 	slog.Debug("Shebang interpreter not found; falling back to PATH",
 		"requested", path, "resolved", resolved)
 	return resolved, nil
+}
+
+// errWSLLauncherOnly is wrapped by lookPathSkipping when every candidate on
+// PATH is a WSL launcher. Callers detect it with errors.Is to surface the
+// clear, actionable message instead of a generic "not found".
+var errWSLLauncherOnly = errors.New("only the WSL launcher is available on PATH")
+
+// lookPathSkipping looks up name on PATH like exec.LookPath, but skips any
+// candidate for which skip returns true. On non-Windows (or when skip is nil)
+// it is a thin wrapper around exec.LookPath.
+//
+// On Windows it is what makes #!/bin/bash prefer Git for Windows' bash over
+// the WSL launcher: the WSL launcher expects Linux-style paths (/mnt/...)
+// and would fail on the Windows-style script path passed by dispatchShebang.
+// The fast path returns exec.LookPath's result unchanged when it is not a
+// skipped candidate, so the common case (Git Bash first on PATH) behaves
+// exactly as before. Only when the first hit is skipped do we walk PATH
+// ourselves, honoring PATHEXT, to find a later usable candidate.
+//
+// If only skipped candidates exist, the returned error wraps
+// errWSLLauncherOnly so callers can present a clear message rather than
+// silently handing back a launcher that is doomed to fail.
+func lookPathSkipping(name string, skip func(string) bool) (string, error) {
+	if runtime.GOOS != "windows" || skip == nil {
+		return exec.LookPath(name)
+	}
+	// Fast path: the standard lookup already yields a usable candidate.
+	if resolved, err := exec.LookPath(name); err == nil && !skip(resolved) {
+		return resolved, nil
+	}
+	// Slow path: walk PATH ourselves, honoring PATHEXT, and return the first
+	// non-skipped regular file. resolveInterpreter only ever passes bare
+	// names (e.g. "bash"), so we mirror exec.LookPath's PATHEXT resolution.
+	exts := windowsPathExts()
+	var skipped string
+	for _, dir := range filepath.SplitList(os.Getenv("PATH")) {
+		if dir == "" {
+			continue
+		}
+		for _, cand := range pathExtCandidates(dir, name, exts) {
+			fi, err := os.Stat(cand)
+			if err != nil || fi.IsDir() {
+				continue
+			}
+			if skip(cand) {
+				if skipped == "" {
+					skipped = cand
+				}
+				continue
+			}
+			return cand, nil
+		}
+	}
+	if skipped != "" {
+		return "", fmt.Errorf("interpreter %q resolves only to the WSL launcher %s, which cannot run a script by its Windows path; install Git for Windows or place Git Bash ahead of WSL on PATH: %w", name, skipped, errWSLLauncherOnly)
+	}
+	return "", fmt.Errorf("%s: %w", name, exec.ErrNotFound)
+}
+
+// windowsPathExts returns the ordered extensions to try when looking up a
+// bare name on Windows, parsed from %PATHEXT% with a sane default.
+func windowsPathExts() []string {
+	pe := os.Getenv("PATHEXT")
+	if pe == "" {
+		return []string{".COM", ".EXE", ".BAT", ".CMD"}
+	}
+	parts := strings.Split(pe, ";")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// pathExtCandidates enumerates candidate paths for name in dir. When name
+// already has an extension, only that exact file is tried; otherwise each
+// extension is appended, mirroring exec.LookPath on Windows.
+func pathExtCandidates(dir, name string, exts []string) []string {
+	if filepath.Ext(name) != "" {
+		return []string{filepath.Join(dir, name)}
+	}
+	out := make([]string, 0, len(exts))
+	for _, e := range exts {
+		out = append(out, filepath.Join(dir, name+e))
+	}
+	return out
+}
+
+// wslLauncherPaths are the canonical Windows Subsystem for Linux launcher
+// executables. A shebang interpreter resolving here is the WSL launcher, not
+// Git Bash/MSYS bash: it expects Linux-style paths and would fail on the
+// Windows-style script path we pass.
+var wslLauncherPaths = []string{
+	`C:\Windows\System32\bash.exe`,
+	`C:\Windows\System32\wsl.exe`,
+	`C:\Windows\SysWOW64\bash.exe`,
+	`C:\Windows\SysWOW64\wsl.exe`,
+}
+
+// isWSLLauncher reports whether p is one of the known WSL launcher
+// executables. The comparison is case-insensitive and treats "/" and "\"
+// as equivalent, matching how Windows resolves paths. Always false off
+// Windows.
+func isWSLLauncher(p string) bool {
+	if runtime.GOOS != "windows" {
+		return false
+	}
+	n := normPath(p)
+	for _, w := range wslLauncherPaths {
+		if normPath(w) == n {
+			return true
+		}
+	}
+	return false
+}
+
+// normPath lowercases p and normalizes forward slashes to backslashes for
+// case-insensitive Windows path comparison.
+func normPath(p string) string {
+	return strings.ToLower(strings.ReplaceAll(p, "/", `\`))
 }
 
 // shebang captures the parsed `#!` line. interpreter is the program to
