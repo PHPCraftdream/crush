@@ -142,9 +142,11 @@ func (s *permissionService) GrantPersistent(permission PermissionRequest) {
 		ToolCallID: permission.ToolCallID,
 		Granted:    true,
 	})
-	respCh, ok := s.pendingRequests.Get(permission.ID)
+	respCh, ok := s.pendingRequests.Take(permission.ID)
 	if ok {
 		respCh <- true
+	} else {
+		slog.Debug("Permission request already resolved", "id", permission.ID)
 	}
 
 	// Fork patch (concurrency): the in-memory append was dropped — the DB
@@ -182,9 +184,11 @@ func (s *permissionService) Grant(permission PermissionRequest) {
 		ToolCallID: permission.ToolCallID,
 		Granted:    true,
 	})
-	respCh, ok := s.pendingRequests.Get(permission.ID)
+	respCh, ok := s.pendingRequests.Take(permission.ID)
 	if ok {
 		respCh <- true
+	} else {
+		slog.Debug("Permission request already resolved", "id", permission.ID)
 	}
 
 	s.activeRequestMu.Lock()
@@ -200,9 +204,11 @@ func (s *permissionService) Deny(permission PermissionRequest) {
 		Granted:    false,
 		Denied:     true,
 	})
-	respCh, ok := s.pendingRequests.Get(permission.ID)
+	respCh, ok := s.pendingRequests.Take(permission.ID)
 	if ok {
 		respCh <- false
+	} else {
+		slog.Debug("Permission request already resolved", "id", permission.ID)
 	}
 
 	s.activeRequestMu.Lock()

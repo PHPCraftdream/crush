@@ -298,3 +298,88 @@ func TestDisabledPermissions_NotMatched(t *testing.T) {
 	wg.Wait()
 	assert.False(t, result2, "disabled rule must NOT auto-approve")
 }
+
+// TestGrant_ConcurrentDuplicates_NoBlock verifies that concurrent
+// duplicate Grant calls for the same permission ID all return promptly.
+// Before the atomic Take fix, Grant used Get (no removal): with a buffered
+// response channel of capacity 1 and a single Request that receives
+// exactly once, a third concurrent Grant permanently blocked on the send
+// (the lone receive unblocks only one of the blocked senders). Three
+// grants are used because two only transiently block — the single receive
+// drains one slot and unblocks the second sender — whereas the third has
+// no remaining receiver and hangs forever on the unfixed code.
+func TestGrant_ConcurrentDuplicates_NoBlock(t *testing.T) {
+	svc := newTestService(t, false, nil)
+	events := svc.Subscribe(t.Context())
+
+	var wg sync.WaitGroup
+	var result bool
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		result, _ = svc.Request(t.Context(), CreatePermissionRequest{
+			SessionID: "s1", ToolName: "bash", Action: "run", Path: "/tmp",
+		})
+	}()
+
+	ev := <-events
+
+	// Fire three Grants concurrently for the same ID.
+	const numGrants = 3
+	done := make(chan struct{}, numGrants)
+	for range numGrants {
+		go func() {
+			defer func() { done <- struct{}{} }()
+			svc.Grant(ev.Payload)
+		}()
+	}
+
+	for range numGrants {
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("duplicate Grant blocked: did not return within 2s")
+		}
+	}
+	wg.Wait()
+	assert.True(t, result, "Request must be granted by one of the Grants")
+}
+
+// TestGrant_ThenDeny_SameID_NoBlock confirms a Grant that resolves a
+// request followed by a Deny for the same ID does not block: after the
+// Grant atomically consumes the pending entry via Take, the late Deny
+// finds nothing (ok=false) and returns. This is a regression guard for
+// the racing-responder scenario (web client + auto-approve, double-click).
+func TestGrant_ThenDeny_SameID_NoBlock(t *testing.T) {
+	svc := newTestService(t, false, nil)
+	events := svc.Subscribe(t.Context())
+
+	var wg sync.WaitGroup
+	var result bool
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		result, _ = svc.Request(t.Context(), CreatePermissionRequest{
+			SessionID: "s1", ToolName: "bash", Action: "run", Path: "/tmp",
+		})
+	}()
+
+	ev := <-events
+
+	// Grant resolves the request (non-blocking send into the buffered channel).
+	svc.Grant(ev.Payload)
+	wg.Wait()
+	assert.True(t, result, "Request must be granted")
+
+	// A late Deny for the already-resolved ID must return promptly, not block.
+	done := make(chan struct{}, 1)
+	go func() {
+		defer func() { done <- struct{}{} }()
+		svc.Deny(ev.Payload)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("late Deny for already-resolved ID blocked: did not return within 2s")
+	}
+}
