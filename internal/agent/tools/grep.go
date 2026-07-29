@@ -523,7 +523,7 @@ func fileMatches(ctx context.Context, filePath string, pattern *regexp.Regexp, o
 	var lineBuf bytes.Buffer
 	lineNum := 0
 	for {
-		truncated, rerr := readBoundedLine(reader, &lineBuf, maxFallbackLineBytes)
+		truncated, rerr := readBoundedLine(ctx, reader, &lineBuf, maxFallbackLineBytes)
 		lineNum++
 
 		line := lineBuf.String()
@@ -568,13 +568,23 @@ func fileMatches(ctx context.Context, filePath string, pattern *regexp.Regexp, o
 // but not stored; a preceding '\r' (CRLF) is left in buf for the caller to
 // trim. Returns io.EOF when the reader is exhausted. If the line was longer
 // than maxLen, truncated is true.
-func readBoundedLine(r *bufio.Reader, buf *bytes.Buffer, maxLen int) (truncated bool, err error) {
+//
+// The context is honoured every cancellationCheckBytes so a cancelled caller
+// does not wait for a single pathological line (no newline, many MiB) to be
+// read in full before the per-line cancellation check in fileMatches fires: a
+// single line means that check never runs, so without this in-line cadence a
+// huge line would keep this byte loop (and the caller) alive long past the
+// deadline. The maxLen cap bounds memory; this cadence bounds latency.
+func readBoundedLine(ctx context.Context, r *bufio.Reader, buf *bytes.Buffer, maxLen int) (truncated bool, err error) {
 	buf.Reset()
+	const cancellationCheckBytes = 64 * 1024
+	var read int64
 	for {
 		b, rerr := r.ReadByte()
 		if rerr != nil {
 			return truncated, rerr
 		}
+		read++
 		if b == '\n' {
 			return truncated, nil
 		}
@@ -582,6 +592,9 @@ func readBoundedLine(r *bufio.Reader, buf *bytes.Buffer, maxLen int) (truncated 
 			buf.WriteByte(b)
 		} else {
 			truncated = true
+		}
+		if read%cancellationCheckBytes == 0 && ctx.Err() != nil {
+			return truncated, ctx.Err()
 		}
 	}
 }

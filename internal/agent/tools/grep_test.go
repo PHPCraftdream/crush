@@ -2,6 +2,7 @@ package tools
 
 import (
 	"bufio"
+	"bytes"
 	"container/heap"
 	"context"
 	"errors"
@@ -843,5 +844,109 @@ func TestSearchFilesWithRegexRespectsMidWalkCancellation(t *testing.T) {
 			"walk should abort shortly after cancellation (abort=%s, full=%s)", abortElapsed, fullElapsed)
 	case <-time.After(5 * time.Second):
 		t.Fatal("searchFilesWithRegex did not return within 5s after cancellation")
+	}
+}
+
+// TestFileMatchesHonoursDeadlineMidHugeLine proves the regex fallback aborts a
+// single multi-MiB line (no '\n') promptly when the context deadline passes,
+// rather than reading the whole line and returning nil. fileMatches checks ctx
+// only between lines, so with one line that check never fires — the fix lives
+// inside readBoundedLine. Timing is measured relative to a full-read baseline
+// on this machine, so the assertion is machine-independent.
+func TestFileMatchesHonoursDeadlineMidHugeLine(t *testing.T) {
+	t.Parallel()
+	tempDir := t.TempDir()
+
+	// A single line, no newline, several MiB. The pattern never matches, so
+	// the entire line is scanned (capped at maxFallbackLineBytes, then bytes
+	// discarded) before fileMatches can move on.
+	huge := strings.Repeat("x", 16*1024*1024) // 16 MiB
+	path := filepath.Join(tempDir, "huge.txt")
+	require.NoError(t, os.WriteFile(path, []byte(huge), 0o644))
+
+	re := regexp.MustCompile("ZZQ_NO_SUCH_NEEDLE_ZZQ")
+
+	// Baseline: an uninterrupted full read of the single huge line.
+	fullStart := time.Now()
+	require.NoError(t, fileMatches(context.Background(), path, re, func(lineMatch) bool { return true }))
+	fullElapsed := time.Since(fullStart)
+	t.Logf("full read of 16 MiB single-line file took %s", fullElapsed)
+
+	// Deadline short enough that the read must still be in progress.
+	deadline := fullElapsed / 4
+	if deadline < 5*time.Millisecond {
+		deadline = 5 * time.Millisecond
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), deadline)
+	defer cancel()
+
+	done := make(chan error, 1)
+	start := time.Now()
+	go func() {
+		done <- fileMatches(ctx, path, re, func(lineMatch) bool { return true })
+	}()
+
+	select {
+	case err := <-done:
+		elapsed := time.Since(start)
+		require.Error(t, err)
+		require.ErrorIs(t, err, context.DeadlineExceeded,
+			"fileMatches must honour the deadline mid-line, got %v", err)
+		require.Less(t, elapsed, fullElapsed,
+			"fileMatches should abort near the deadline (%s), not after a full read (%s)", deadline, fullElapsed)
+		t.Logf("aborted %s after start (deadline %s, full read %s)", elapsed, deadline, fullElapsed)
+	case <-time.After(10 * time.Second):
+		t.Fatal("fileMatches did not return within 10s")
+	}
+}
+
+// slowEndlessLineReader yields an endless stream of non-newline bytes,
+// sleeping a fixed interval on each Read. It models a single pathological
+// line with no '\n' that takes wall-clock time to read, letting a unit test
+// assert cancellation latency deterministically rather than depending on
+// disk/CPU speed.
+type slowEndlessLineReader struct {
+	chunkInterval time.Duration
+	chunk         []byte
+}
+
+func (r *slowEndlessLineReader) Read(p []byte) (int, error) {
+	time.Sleep(r.chunkInterval)
+	return copy(p, r.chunk), nil
+}
+
+// TestReadBoundedLineHonoursContextCancellation proves readBoundedLine reacts
+// to a cancelled context mid-line (every ~64 KiB) rather than only between
+// lines. Against a single pathological line with no newline — which never lets
+// fileMatches' per-line check fire — the in-line cadence is the only thing
+// that bounds cancellation latency.
+func TestReadBoundedLineHonoursContextCancellation(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+
+	r := &slowEndlessLineReader{
+		chunkInterval: 2 * time.Millisecond,
+		chunk:         bytes.Repeat([]byte{'x'}, 4096),
+	}
+	br := bufio.NewReader(r)
+	var buf bytes.Buffer
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := readBoundedLine(ctx, br, &buf, maxFallbackLineBytes)
+		done <- err
+	}()
+
+	// Let it start producing bytes, then cancel.
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, context.Canceled,
+			"readBoundedLine must surface the context error once cancelled")
+	case <-time.After(2 * time.Second):
+		t.Fatal("readBoundedLine did not return within 2s of cancellation " +
+			"(it read the whole pathological line instead of honouring ctx)")
 	}
 }
