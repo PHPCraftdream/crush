@@ -16,6 +16,50 @@ import (
 	"strings"
 )
 
+// RenameAsideName returns the path dst should be moved to before a fresh
+// binary is written in its place, given a uniqueness token (normally
+// time.Now().UnixNano(), passed in as a string so this stays a pure
+// function over its inputs and is unit-testable without touching the
+// clock). Windows will not let us delete a file backing a running
+// process's image, but it will let us rename it out of the way and then
+// write a new file under the freed name (confirmed by hand on 2026-07-29 —
+// see docs/plans/2026-07-29-relaunch-from-cache.md §2): the running
+// process keeps paging from the renamed file's data, and the name becomes
+// free for the replacement. The renamed-aside file is swept up by
+// SweepRenameAsideLeftovers on a later deploy, once the process holding it
+// has exited and delete finally succeeds.
+func RenameAsideName(dst, token string) string {
+	return dst + ".old-" + token
+}
+
+// SweepRenameAsideLeftovers best-effort deletes leftover rename-aside
+// files next to dst from previous deploys: both the ".old-<token>" files
+// this package creates (via RenameAsideName) and the legacy ".bak-*"
+// files an older deploy mechanism left behind (observed on disk, not
+// hypothetical — see the plan's grabli registry, Г11). It returns the
+// paths it successfully removed; failures (most commonly a busy file
+// still held open by a live crush process) are swallowed on purpose —
+// a file that refuses to delete just means a live session is still
+// serving it, and it will be swept on a later deploy once that session
+// exits. This function never returns an error and never panics: a
+// deploy must not fail just because old garbage from a previous run
+// couldn't be cleaned up yet.
+func SweepRenameAsideLeftovers(dst string) []string {
+	var removed []string
+	for _, pattern := range []string{dst + ".old-*", dst + ".bak-*"} {
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			continue
+		}
+		for _, m := range matches {
+			if os.Remove(m) == nil {
+				removed = append(removed, m)
+			}
+		}
+	}
+	return removed
+}
+
 // DefaultInstallPath returns the standard per-user install location for
 // the running OS — reachable without admin/root rights:
 //

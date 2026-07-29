@@ -329,6 +329,18 @@ func runQueueTask(ctx context.Context, cwd string, task queue.Task) (float64, in
 		sessionID = task.ID
 	}
 
+	// os.Executable() resolves to whatever binary the OS currently has
+	// mapped under the canonical install path. Since deploy.go hot-swaps
+	// that binary via rename-aside instead of killing live sessions (see
+	// docs/plans/2026-07-29-relaunch-from-cache.md §7), a queued `crush
+	// run` spawned from a long-lived parent always gets the CURRENT
+	// canonical binary — the just-updated version, in the unlucky case —
+	// never the version the parent itself was loaded from. This is
+	// deliberate: it's the OS's default path-resolution behavior, not a
+	// bug we're choosing not to fix. Resolving the parent's own path once
+	// at startup would not "freeze" a version either (the same path just
+	// points at different bytes after a hot swap), so pinning the child
+	// to the parent's version was considered and rejected as incoherent.
 	crushBin, err := os.Executable()
 	if err != nil {
 		return 0, 0, "", err

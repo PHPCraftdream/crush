@@ -219,6 +219,97 @@ func TestWindowsPathExts(t *testing.T) {
 	}
 }
 
+func TestRenameAsideName(t *testing.T) {
+	got := RenameAsideName(filepath.Join("C:", "bin", "crush.exe"), "12345")
+	want := filepath.Join("C:", "bin", "crush.exe") + ".old-12345"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+
+	// Distinct tokens must produce distinct names — the whole point is
+	// that concurrent/successive deploys don't collide with each other's
+	// still-live rename-aside targets.
+	a := RenameAsideName("/bin/crush", "1")
+	b := RenameAsideName("/bin/crush", "2")
+	if a == b {
+		t.Errorf("expected different tokens to produce different names, both got %q", a)
+	}
+}
+
+func TestSweepRenameAsideLeftovers(t *testing.T) {
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "crush.exe")
+
+	// Nothing on disk at all: must not panic or error, and must report
+	// nothing removed.
+	if got := SweepRenameAsideLeftovers(dst); len(got) != 0 {
+		t.Fatalf("expected no removals against an empty dir, got %v", got)
+	}
+
+	// Create one .old-* leftover, one legacy .bak-* leftover, and one
+	// unrelated file that must NOT match either glob.
+	oldLeftover := RenameAsideName(dst, "111")
+	bakLeftover := dst + ".bak-b53789cc"
+	unrelated := filepath.Join(dir, "some-other-file.txt")
+	for _, p := range []string{oldLeftover, bakLeftover, unrelated} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", p, err)
+		}
+	}
+
+	removed := SweepRenameAsideLeftovers(dst)
+	if len(removed) != 2 {
+		t.Fatalf("expected 2 removals, got %v", removed)
+	}
+	if _, err := os.Stat(oldLeftover); !os.IsNotExist(err) {
+		t.Errorf("expected %s to be removed", oldLeftover)
+	}
+	if _, err := os.Stat(bakLeftover); !os.IsNotExist(err) {
+		t.Errorf("expected %s to be removed", bakLeftover)
+	}
+	if _, err := os.Stat(unrelated); err != nil {
+		t.Errorf("unrelated file should not have been touched: %v", err)
+	}
+
+	// Calling again on an already-swept dir must be a safe no-op.
+	if got := SweepRenameAsideLeftovers(dst); len(got) != 0 {
+		t.Fatalf("expected no removals on second sweep, got %v", got)
+	}
+}
+
+// TestSweepRenameAsideLeftovers_BusyFileIsIgnored simulates the "still
+// held by a live process" case: on Windows, a file that is open for
+// reading/execution cannot be removed, and SweepRenameAsideLeftovers must
+// swallow that failure rather than erroring out. We approximate "busy" by
+// holding our own open handle to the leftover file, which is enough to
+// make os.Remove fail on Windows (POSIX systems allow unlinking open
+// files, so this case is Windows-specific; on other OSes it's a no-op
+// assertion that sweeping still doesn't error).
+func TestSweepRenameAsideLeftovers_BusyFileIsIgnored(t *testing.T) {
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "crush.exe")
+	busy := RenameAsideName(dst, "999")
+	if err := os.WriteFile(busy, []byte("x"), 0o644); err != nil {
+		t.Fatalf("write %s: %v", busy, err)
+	}
+
+	f, err := os.Open(busy)
+	if err != nil {
+		t.Fatalf("open %s: %v", busy, err)
+	}
+	defer f.Close()
+
+	// Must not panic; on Windows the removal will fail and be silently
+	// skipped, on Unix it may succeed (unlink-while-open is legal there).
+	_ = SweepRenameAsideLeftovers(dst)
+
+	if runtime.GOOS == "windows" {
+		if _, statErr := os.Stat(busy); statErr != nil {
+			t.Errorf("expected busy file to survive the sweep on windows, but it's gone: %v", statErr)
+		}
+	}
+}
+
 func writeExe(t *testing.T, p string) string {
 	t.Helper()
 	if err := os.WriteFile(p, []byte("x"), 0o755); err != nil {
