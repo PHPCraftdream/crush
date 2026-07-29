@@ -238,12 +238,42 @@ func binaryName() string {
 	return "crush"
 }
 
+// npmNodeOS and npmNodeArch map this OS/arch to the Node "os"/"cpu" package
+// names used for the fork's per-platform npm packages
+// (node_modules/@phpcraftdream/crush-<node_os>-<node_arch>/bin/<binaryName()>),
+// mirroring the TARGETS table in .github/workflows/publish-fork-npm.yml.
+// Only the pair matching THIS machine needs to resolve correctly — deploy.go
+// only ever replaces binaries on the machine it runs on — so we hardcode the
+// mapping for the platforms deploy.go actually builds for (see binaryName())
+// rather than building a general GOOS/GOARCH → node table.
+func npmNodeOS() string {
+	if runtime.GOOS == "windows" {
+		return "win32"
+	}
+	return runtime.GOOS // "linux", "darwin"
+}
+
+func npmNodeArch() string {
+	switch runtime.GOARCH {
+	case "amd64":
+		return "x64"
+	case "arm64":
+		return "arm64"
+	default:
+		return runtime.GOARCH
+	}
+}
+
 // resolveDests decides what files to overwrite. Priority:
 //  1. $CRUSH_DEPLOY_PATH set → single forced target, used as-is.
 //  2. Otherwise we discover the npm-installed crush via exec.LookPath
 //     and return EVERY binary we can find around it:
-//     a. <npm-dir>/node_modules/@charmland/crush/bin/crush(.exe)
-//     — the real binary the JS wrapper execs via `node`.
+//     a. <npm-dir>/node_modules/@phpcraftdream/crush-<node_os>-<node_arch>/bin/crush(.exe)
+//     — the real binary the JS wrapper execs via `node`. The fork ships
+//     the binary in the PLATFORM package, not the meta package (unlike
+//     upstream's @charmland/crush, which bundled bin/ directly in the
+//     package the JS wrapper lives in) — see
+//     docs/plans/2026-07-29-relaunch-from-cache.md §5.3.
 //     b. <npm-dir>/crush.exe (Windows only) — a sibling native
 //     binary that `cmd` may pick BEFORE the JS wrapper depending
 //     on PATHEXT and PATH ordering. Historically this slot
@@ -286,8 +316,11 @@ func resolveDests() ([]string, error) {
 	dir := filepath.Dir(p)
 
 	var cands []string
-	// (a) node_modules real binary.
-	npmBin := filepath.Join(dir, "node_modules", "@charmland", "crush", "bin", binaryName())
+	// (a) node_modules real binary — lives in the fork's per-platform
+	// package (@phpcraftdream/crush-<node_os>-<node_arch>), not the meta
+	// package (@phpcraftdream/crush) that owns bin/crush.js.
+	npmBin := filepath.Join(dir, "node_modules", "@phpcraftdream",
+		fmt.Sprintf("crush-%s-%s", npmNodeOS(), npmNodeArch()), "bin", binaryName())
 	if _, err := os.Stat(npmBin); err == nil {
 		cands = append(cands, npmBin)
 	}
