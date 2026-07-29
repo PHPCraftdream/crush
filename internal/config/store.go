@@ -11,6 +11,7 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"charm.land/catwalk/pkg/catwalk"
 	hyperp "github.com/charmbracelet/crush/internal/agent/hyper"
@@ -18,6 +19,7 @@ import (
 	"github.com/charmbracelet/crush/internal/oauth"
 	"github.com/charmbracelet/crush/internal/oauth/copilot"
 	"github.com/charmbracelet/crush/internal/oauth/hyper"
+	"github.com/charmbracelet/crush/internal/session"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -237,6 +239,50 @@ func (s *ConfigStore) HasConfigField(scope Scope, key string) bool {
 	return gjson.Get(string(data), key).Exists()
 }
 
+// configWriteLockTimeout caps how long a config write waits for the
+// inter-process sidecar lock before failing. Mirrors the 30s budget used by
+// cliprovider's acquireMCPConfigLock for the same class of cross-process
+// config read-modify-write, so a wedged sibling crush process (debugger
+// attached, suspended shell, frozen network mount) cannot indefinitely freeze
+// parallel runs that share the same crush.json.
+const configWriteLockTimeout = 30 * time.Second
+
+// withConfigWriteLock runs fn while holding BOTH the in-process diskWriteMu
+// and an exclusive OS-level lock on a sidecar lock file co-located with the
+// config path (path + ".lock" — the same convention cliprovider's
+// acquireMCPConfigLock uses for the same class of cross-process config RMW).
+//
+// diskWriteMu serialises concurrent goroutines inside THIS process; the OS
+// lock (flock on POSIX, LockFileEx on Windows, via session.FileLock)
+// serialises SEPARATE crush processes that share the same config file — two
+// parallel `crush run` sessions on one machine each own a private
+// diskWriteMu, so without the OS lock each could read the same pre-write
+// file, apply only its own key, and the second atomicWriteFile would
+// silently erase the first writer's key (a classic lost-update across
+// processes that diskWriteMu alone cannot prevent, since it is not visible
+// to the other process). The OS lock is per open file description, so two
+// ConfigStore instances in one test (each with its own diskWriteMu) contend
+// on it exactly as two real processes would.
+//
+// Both locks are released before fn returns, so the caller's subsequent
+// autoReload (which acquires publishMu via ReloadFromDisk) cannot deadlock
+// against a re-entrant caller that already holds publishMu and entered this
+// path (e.g. Load → configureProviders → RemoveConfigField). Lock ordering
+// is always diskWriteMu → inter-process file lock.
+func (s *ConfigStore) withConfigWriteLock(path string, fn func() error) error {
+	s.diskWriteMu.Lock()
+	defer s.diskWriteMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), configWriteLockTimeout)
+	defer cancel()
+	lock, err := session.AcquireFileLockContext(ctx, path+".lock")
+	if err != nil {
+		return fmt.Errorf("failed to lock config file %q: %w", path, err)
+	}
+	defer lock.Release()
+	return fn()
+}
+
 // SetConfigField sets a key/value pair in the config file for the given scope.
 // After a successful write, it automatically reloads config to keep in-memory
 // state fresh.
@@ -244,34 +290,10 @@ func (s *ConfigStore) SetConfigField(scope Scope, key string, value any) error {
 	return s.SetConfigFields(scope, map[string]any{key: value})
 }
 
-// SetConfigFields sets multiple key/value pairs in the config file for the given
-// scope in a single write. After a successful write, it automatically reloads
-// config to keep in-memory state fresh. This is preferred over multiple
-// SetConfigField calls when writing several fields atomically to avoid
-// intermediate reloads with partial state.
 func (s *ConfigStore) SetConfigFields(scope Scope, kv map[string]any) error {
 	path, err := s.configPath(scope)
 	if err != nil {
 		return fmt.Errorf("%v: %w", kv, err)
-	}
-
-	// diskWriteMu serialises the read-modify-write cycle on the config
-	// file so that two concurrent callers (e.g. web UI + CLI) writing
-	// different keys to the same path don't clobber each other: without
-	// it, each would read the pre-write file, apply only its own key,
-	// and the second atomicWriteFile would erase the first key. The
-	// lock is released before autoReload so that autoReload's own
-	// publishMu acquisition (via ReloadFromDisk) cannot deadlock.
-	s.diskWriteMu.Lock()
-
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			data = []byte("{}")
-		} else {
-			s.diskWriteMu.Unlock()
-			return fmt.Errorf("failed to read config file: %w", err)
-		}
 	}
 
 	// Apply keys in sorted order so the on-disk output is deterministic
@@ -282,30 +304,40 @@ func (s *ConfigStore) SetConfigFields(scope Scope, kv map[string]any) error {
 	}
 	slices.Sort(keys)
 
-	newValue := string(data)
-	for _, key := range keys {
-		newValue, err = sjson.Set(newValue, key, kv[key])
+	// withConfigWriteLock serialises the read-modify-write both in-process
+	// (diskWriteMu) and across processes (OS lock on path+".lock") — see its
+	// doc comment. The lock is released before autoReload below so that
+	// autoReload's publishMu acquisition cannot deadlock.
+	if err := s.withConfigWriteLock(path, func() error {
+		data, err := os.ReadFile(path)
 		if err != nil {
-			s.diskWriteMu.Unlock()
-			return fmt.Errorf("failed to set config field %s: %w", key, err)
+			if os.IsNotExist(err) {
+				data = []byte("{}")
+			} else {
+				return fmt.Errorf("failed to read config file: %w", err)
+			}
 		}
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		s.diskWriteMu.Unlock()
-		return fmt.Errorf("failed to create config directory %q: %w", path, err)
-	}
-	if err := atomicWriteFile(path, []byte(newValue), 0o600); err != nil {
-		s.diskWriteMu.Unlock()
-		return fmt.Errorf("failed to write config file: %w", err)
+		newValue := string(data)
+		for _, key := range keys {
+			newValue, err = sjson.Set(newValue, key, kv[key])
+			if err != nil {
+				return fmt.Errorf("failed to set config field %s: %w", key, err)
+			}
+		}
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return fmt.Errorf("failed to create config directory %q: %w", path, err)
+		}
+		if err := atomicWriteFile(path, []byte(newValue), 0o600); err != nil {
+			return fmt.Errorf("failed to write config file: %w", err)
+		}
+		return nil
+	}); err != nil {
+		return err
 	}
 
-	s.diskWriteMu.Unlock()
-
-	// Auto-reload to keep in-memory state fresh after config edits.
-	// We use context.Background() since this is an internal operation that
-	// shouldn't be cancelled by user context. This runs OUTSIDE
-	// diskWriteMu so that autoReload's publishMu acquisition cannot
-	// deadlock against a diskWriteMu already held by this goroutine.
+	// Auto-reload to keep in-memory state fresh after config edits. Runs
+	// OUTSIDE withConfigWriteLock so its publishMu acquisition cannot
+	// deadlock (see SetConfigFields history).
 	if err := s.autoReload(context.Background()); err != nil {
 		// Log warning but don't fail the write - disk is already updated.
 		slog.Warn("Config file updated but failed to reload in-memory state", "error", err)
@@ -314,44 +346,36 @@ func (s *ConfigStore) SetConfigFields(scope Scope, kv map[string]any) error {
 	return nil
 }
 
-// RemoveConfigField removes a key from the config file for the given scope.
-// After a successful write, it automatically reloads config to keep in-memory
-// state fresh.
 func (s *ConfigStore) RemoveConfigField(scope Scope, key string) error {
 	path, err := s.configPath(scope)
 	if err != nil {
 		return fmt.Errorf("%s: %w", key, err)
 	}
 
-	// diskWriteMu serialises the read-modify-write cycle — see
-	// SetConfigFields for the full rationale. Released before autoReload
-	// to avoid deadlock against publishMu.
-	s.diskWriteMu.Lock()
-
-	data, err := os.ReadFile(path)
-	if err != nil {
-		s.diskWriteMu.Unlock()
-		return fmt.Errorf("failed to read config file: %w", err)
+	// withConfigWriteLock serialises the read-modify-write both in-process
+	// and across processes — see SetConfigFields. Released before autoReload.
+	if err := s.withConfigWriteLock(path, func() error {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("failed to read config file: %w", err)
+		}
+		newValue, err := sjson.Delete(string(data), key)
+		if err != nil {
+			return fmt.Errorf("failed to delete config field %s: %w", key, err)
+		}
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return fmt.Errorf("failed to create config directory %q: %w", path, err)
+		}
+		if err := atomicWriteFile(path, []byte(newValue), 0o600); err != nil {
+			return fmt.Errorf("failed to write config file: %w", err)
+		}
+		return nil
+	}); err != nil {
+		return err
 	}
-
-	newValue, err := sjson.Delete(string(data), key)
-	if err != nil {
-		s.diskWriteMu.Unlock()
-		return fmt.Errorf("failed to delete config field %s: %w", key, err)
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		s.diskWriteMu.Unlock()
-		return fmt.Errorf("failed to create config directory %q: %w", path, err)
-	}
-	if err := atomicWriteFile(path, []byte(newValue), 0o600); err != nil {
-		s.diskWriteMu.Unlock()
-		return fmt.Errorf("failed to write config file: %w", err)
-	}
-
-	s.diskWriteMu.Unlock()
 
 	// Auto-reload to keep in-memory state fresh after config edits.
-	// Runs OUTSIDE diskWriteMu (see SetConfigFields).
+	// Runs OUTSIDE withConfigWriteLock (see SetConfigFields).
 	if err := s.autoReload(context.Background()); err != nil {
 		slog.Warn("Config file updated but failed to reload in-memory state", "error", err)
 	}
