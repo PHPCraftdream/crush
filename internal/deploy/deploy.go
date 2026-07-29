@@ -219,3 +219,48 @@ func WindowsPathExts(pathext string) []string {
 	}
 	return exts
 }
+
+// NpmNodeOS maps a Go GOOS value to the Node "os" package name used for
+// the fork's per-platform npm packages
+// (node_modules/@phpcraftdream/crush-<node_os>-<node_arch>/bin/<binaryName>),
+// mirroring the TARGETS table in .github/workflows/publish-fork-npm.yml.
+// goos is passed in explicitly (rather than read from runtime.GOOS)
+// so this stays a pure function over its input and every branch can be
+// unit-tested from a single CI runner regardless of that runner's own OS.
+func NpmNodeOS(goos string) string {
+	if goos == "windows" {
+		return "win32"
+	}
+	return goos // "linux", "darwin"
+}
+
+// NpmNodeArch maps a Go GOARCH value to the Node "cpu" package name used
+// for the fork's per-platform npm packages. goarch is passed in
+// explicitly (rather than read from runtime.GOARCH) for the same
+// testability reason as NpmNodeOS.
+func NpmNodeArch(goarch string) string {
+	switch goarch {
+	case "amd64":
+		return "x64"
+	case "arm64":
+		return "arm64"
+	default:
+		return goarch
+	}
+}
+
+// NpmPlatformBinaryPath returns the path to the real binary inside the
+// fork's per-platform npm package — the one the JS wrapper execs via
+// `node` — given the npm package directory (the dir containing
+// node_modules, i.e. the directory holding the `crush` entry found on
+// PATH), the target OS/arch (as Go GOOS/GOARCH values), and the local
+// binary name (crush or crush.exe). The fork ships the binary in the
+// PLATFORM package, not the meta package (unlike upstream's
+// @charmland/crush, which bundled bin/ directly in the package the JS
+// wrapper lives in) — see docs/plans/2026-07-29-relaunch-from-cache.md
+// §5.3. Pure function over its inputs — no filesystem access — so it's
+// unit-testable for any OS/arch combination on any runner.
+func NpmPlatformBinaryPath(npmDir, goos, goarch, binaryName string) string {
+	return filepath.Join(npmDir, "node_modules", "@phpcraftdream",
+		fmt.Sprintf("crush-%s-%s", NpmNodeOS(goos), NpmNodeArch(goarch)), "bin", binaryName)
+}

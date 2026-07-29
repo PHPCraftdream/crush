@@ -238,32 +238,6 @@ func binaryName() string {
 	return "crush"
 }
 
-// npmNodeOS and npmNodeArch map this OS/arch to the Node "os"/"cpu" package
-// names used for the fork's per-platform npm packages
-// (node_modules/@phpcraftdream/crush-<node_os>-<node_arch>/bin/<binaryName()>),
-// mirroring the TARGETS table in .github/workflows/publish-fork-npm.yml.
-// Only the pair matching THIS machine needs to resolve correctly — deploy.go
-// only ever replaces binaries on the machine it runs on — so we hardcode the
-// mapping for the platforms deploy.go actually builds for (see binaryName())
-// rather than building a general GOOS/GOARCH → node table.
-func npmNodeOS() string {
-	if runtime.GOOS == "windows" {
-		return "win32"
-	}
-	return runtime.GOOS // "linux", "darwin"
-}
-
-func npmNodeArch() string {
-	switch runtime.GOARCH {
-	case "amd64":
-		return "x64"
-	case "arm64":
-		return "arm64"
-	default:
-		return runtime.GOARCH
-	}
-}
-
 // resolveDests decides what files to overwrite. Priority:
 //  1. $CRUSH_DEPLOY_PATH set → single forced target, used as-is.
 //  2. Otherwise we discover the npm-installed crush via exec.LookPath
@@ -319,8 +293,7 @@ func resolveDests() ([]string, error) {
 	// (a) node_modules real binary — lives in the fork's per-platform
 	// package (@phpcraftdream/crush-<node_os>-<node_arch>), not the meta
 	// package (@phpcraftdream/crush) that owns bin/crush.js.
-	npmBin := filepath.Join(dir, "node_modules", "@phpcraftdream",
-		fmt.Sprintf("crush-%s-%s", npmNodeOS(), npmNodeArch()), "bin", binaryName())
+	npmBin := deploy.NpmPlatformBinaryPath(dir, runtime.GOOS, runtime.GOARCH, binaryName())
 	if _, err := os.Stat(npmBin); err == nil {
 		cands = append(cands, npmBin)
 	}

@@ -310,6 +310,71 @@ func TestSweepRenameAsideLeftovers_BusyFileIsIgnored(t *testing.T) {
 	}
 }
 
+func TestNpmNodeOS(t *testing.T) {
+	cases := []struct {
+		goos string
+		want string
+	}{
+		{"windows", "win32"},
+		{"linux", "linux"},
+		{"darwin", "darwin"},
+	}
+	for _, c := range cases {
+		if got := NpmNodeOS(c.goos); got != c.want {
+			t.Errorf("NpmNodeOS(%q) = %q, want %q", c.goos, got, c.want)
+		}
+	}
+}
+
+func TestNpmNodeArch(t *testing.T) {
+	cases := []struct {
+		goarch string
+		want   string
+	}{
+		{"amd64", "x64"},
+		{"arm64", "arm64"},
+		{"riscv64", "riscv64"}, // default: passthrough of unrecognized GOARCH
+	}
+	for _, c := range cases {
+		if got := NpmNodeArch(c.goarch); got != c.want {
+			t.Errorf("NpmNodeArch(%q) = %q, want %q", c.goarch, got, c.want)
+		}
+	}
+}
+
+func TestNpmPlatformBinaryPath(t *testing.T) {
+	cases := []struct {
+		npmDir, goos, goarch, binaryName string
+	}{
+		{filepath.Join("/some", "npm", "dir"), "windows", "amd64", "crush.exe"},
+		{filepath.Join("/some", "npm", "dir"), "linux", "arm64", "crush"},
+	}
+	for _, c := range cases {
+		got := NpmPlatformBinaryPath(c.npmDir, c.goos, c.goarch, c.binaryName)
+		want := filepath.Join(c.npmDir, "node_modules", "@phpcraftdream",
+			"crush-"+NpmNodeOS(c.goos)+"-"+NpmNodeArch(c.goarch), "bin", c.binaryName)
+		if got != want {
+			t.Errorf("NpmPlatformBinaryPath(%q, %q, %q, %q) = %q, want %q",
+				c.npmDir, c.goos, c.goarch, c.binaryName, got, want)
+		}
+	}
+
+	// Concrete, spelled-out example matching the docstring, independent
+	// of NpmNodeOS/NpmNodeArch helpers, for windows/amd64.
+	got := NpmPlatformBinaryPath(filepath.Join("/some", "npm", "dir"), "windows", "amd64", "crush.exe")
+	want := filepath.Join("/some", "npm", "dir", "node_modules", "@phpcraftdream", "crush-win32-x64", "bin", "crush.exe")
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+
+	// Concrete example for linux/arm64.
+	got = NpmPlatformBinaryPath(filepath.Join("/some", "npm", "dir"), "linux", "arm64", "crush")
+	want = filepath.Join("/some", "npm", "dir", "node_modules", "@phpcraftdream", "crush-linux-arm64", "bin", "crush")
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
 func writeExe(t *testing.T, p string) string {
 	t.Helper()
 	if err := os.WriteFile(p, []byte("x"), 0o755); err != nil {
