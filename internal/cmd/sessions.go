@@ -377,12 +377,7 @@ crush sessions reset pr-42 --force
 		// by applying a negative delta equal to the current value. See
 		// CHANGELOG.fork.md (Section 4.I).
 		previousCost := sess.Cost
-		sess.MessageCount = 0
-		sess.PromptTokens = 0
-		sess.CompletionTokens = 0
-		sess.Cost = 0
-		sess.SummaryMessageID = ""
-		if _, err := a.Sessions.Save(cmd.Context(), sess); err != nil {
+		if err := a.Sessions.SetSummaryAndUsage(cmd.Context(), sess.ID, "", 0, 0); err != nil {
 			return fmt.Errorf("failed to reset session counters for %s: %w", sess.ID, err)
 		}
 		if previousCost != 0 {

@@ -675,8 +675,7 @@ func registerTodosTool(srv *mcp.Server, sessions session.Service, sessionID stri
 			"prev", sess.Todos,
 			"merged", todos,
 		)
-		sess.Todos = todos
-		if _, err := sessions.Save(ctx, sess); err != nil {
+		if err := sessions.SetTodos(ctx, sessionID, todos, sess.DeletedTodos); err != nil {
 			return toolError("failed to save todos: " + err.Error()), nil, nil
 		}
 

@@ -1406,8 +1406,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 					return costErr
 				}
 			}
-			_, sessionErr := a.sessions.Save(ctx, updatedSession)
-			if sessionErr != nil {
+			if sessionErr := a.sessions.SetUsage(ctx, updatedSession.ID, updatedSession.PromptTokens, updatedSession.CompletionTokens); sessionErr != nil {
 				return sessionErr
 			}
 			currentSession = updatedSession
@@ -1986,10 +1985,7 @@ func (a *sessionAgent) runSummarize(ctx context.Context, sessionID string, opts 
 	// to an approximate count when the provider omits OutputTokens on the
 	// summary stream's final usage chunk.
 	usage := resp.Response.Usage
-	freshSession.SummaryMessageID = summaryMessage.ID
-	freshSession.CompletionTokens = summaryCompletionTokens(usage, summaryMessage)
-	freshSession.PromptTokens = 0
-	if _, err = a.sessions.Save(genCtx, freshSession); err != nil {
+	if err := a.sessions.SetSummaryAndUsage(genCtx, freshSession.ID, summaryMessage.ID, 0, summaryCompletionTokens(usage, summaryMessage)); err != nil {
 		return err
 	}
 
@@ -2161,11 +2157,7 @@ func (a *sessionAgent) runSummarizeSilent(ctx context.Context, sessionID string,
 			return costErr
 		}
 	}
-	freshSession.SummaryMessageID = summaryMessage.ID
-	freshSession.CompletionTokens = resp.Response.Usage.OutputTokens
-	freshSession.PromptTokens = 0
-	_, err = a.sessions.Save(genCtx, freshSession)
-	return err
+	return a.sessions.SetSummaryAndUsage(genCtx, freshSession.ID, summaryMessage.ID, 0, resp.Response.Usage.OutputTokens)
 }
 
 func (a *sessionAgent) getCacheControlOptions() fantasy.ProviderOptions {

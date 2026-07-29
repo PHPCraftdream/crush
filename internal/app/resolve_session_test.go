@@ -82,10 +82,6 @@ func (m *mockSessionService) List(context.Context) ([]session.Session, error) {
 	return m.sessions, nil
 }
 
-func (m *mockSessionService) Save(_ context.Context, s session.Session) (session.Session, error) {
-	return s, nil
-}
-
 // IncrementCost: mock that mutates the in-memory session if found,
 // returns it (or an empty one with the id-not-found semantics matching
 // the real DB layer). Added when Service.IncrementCost was introduced
@@ -117,6 +113,16 @@ func (m *mockSessionService) UpdateTitleAndUsage(context.Context, string, string
 }
 
 func (m *mockSessionService) Rename(context.Context, string, string) error {
+	return nil
+}
+
+func (m *mockSessionService) SetUsage(context.Context, string, int64, int64) error { return nil }
+
+func (m *mockSessionService) SetSummaryAndUsage(context.Context, string, string, int64, int64) error {
+	return nil
+}
+
+func (m *mockSessionService) SetTodos(context.Context, string, []session.Todo, []string) error {
 	return nil
 }
 

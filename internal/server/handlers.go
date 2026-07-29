@@ -628,10 +628,7 @@ func handleForkSession(ctx context.Context, a *appPkg.App, c *Client, msg WSMess
 
 	// Copy todos from source
 	if len(src.Todos) > 0 {
-		if updated, err2 := a.Sessions.Get(ctx, fork.ID); err2 == nil {
-			updated.Todos = src.Todos
-			fork, _ = a.Sessions.Save(ctx, updated)
-		}
+		_ = a.Sessions.SetTodos(ctx, fork.ID, src.Todos, nil)
 	}
 
 	// Re-fetch fork to get fully updated state
@@ -1008,13 +1005,11 @@ func handleRenameSession(ctx context.Context, a *appPkg.App, c *Client, msg WSMe
 		c.reply(msg.ID, EventError, nil, "invalid payload")
 		return
 	}
-	sess, err := a.Sessions.Get(ctx, p.SessionID)
-	if err != nil {
+	if err := a.Sessions.Rename(ctx, p.SessionID, p.Title); err != nil {
 		c.reply(msg.ID, EventError, nil, err.Error())
 		return
 	}
-	sess.Title = p.Title
-	sess, err = a.Sessions.Save(ctx, sess)
+	sess, err := a.Sessions.Get(ctx, p.SessionID)
 	if err != nil {
 		c.reply(msg.ID, EventError, nil, err.Error())
 		return
@@ -1978,7 +1973,7 @@ func handleUpdateTodos(ctx context.Context, a *appPkg.App, c *Client, msg WSMess
 	}
 	sess.DeletedTodos = filtered
 
-	if _, err := a.Sessions.Save(ctx, sess); err != nil {
+	if err := a.Sessions.SetTodos(ctx, sess.ID, todos, filtered); err != nil {
 		c.reply(msg.ID, EventError, nil, "failed to save todos")
 		return
 	}

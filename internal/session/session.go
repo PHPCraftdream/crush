@@ -128,10 +128,12 @@ type Service interface {
 	// returned map is keyed by root session ID; roots with no activity in
 	// their tree are simply absent from the map.
 	GetCallTreeActivityBatch(ctx context.Context, rootIDs []string) (map[string]CallTreeActivity, error)
-	Save(ctx context.Context, session Session) (Session, error)
+	SetUsage(ctx context.Context, sessionID string, promptTokens, completionTokens int64) error
+	SetSummaryAndUsage(ctx context.Context, sessionID, summaryMessageID string, promptTokens, completionTokens int64) error
+	SetTodos(ctx context.Context, sessionID string, todos []Todo, deletedTodos []string) error
 	// IncrementCost atomically adds delta to the session's cost via an
-	// additive SQL UPDATE. Use this instead of read-modify-write through
-	// Save when accruing per-step or per-sub-agent cost: it is race-free
+	// additive SQL UPDATE. Always prefer this over a read-modify-write of the
+	// cost column when accruing per-step or per-sub-agent cost: it is race-free
 	// under fan-out (multiple sub-agent goroutines completing concurrently
 	// and each charging the same parent) and across processes that ever
 	// share a session ID. Returns the refreshed session snapshot.
@@ -315,48 +317,6 @@ func (s *service) GetLast(ctx context.Context) (Session, error) {
 	return s.fromDBItem(dbSession), nil
 }
 
-// Save overwrites title/tokens/summary/todos for a session. Cost is NOT
-// written by this call (the underlying UpdateSession SQL was reshaped to
-// exclude it) so a stale in-memory session.Cost cannot stomp cost that
-// other goroutines accrued concurrently. Use IncrementCost for cost
-// mutations.
-//
-// Fork patch (concurrency): the upstream Save also wrote the cost
-// column. See CHANGELOG.fork.md (Section 4.I).
-func (s *service) Save(ctx context.Context, session Session) (Session, error) {
-	todosJSON, err := marshalTodos(session.Todos)
-	if err != nil {
-		return Session{}, err
-	}
-
-	deletedTodosJSON, err := marshalDeletedTodos(session.DeletedTodos)
-	if err != nil {
-		return Session{}, err
-	}
-
-	dbSession, err := s.q.UpdateSession(ctx, db.UpdateSessionParams{
-		ID:               session.ID,
-		Title:            session.Title,
-		PromptTokens:     session.PromptTokens,
-		CompletionTokens: session.CompletionTokens,
-		SummaryMessageID: sql.NullString{
-			String: session.SummaryMessageID,
-			Valid:  session.SummaryMessageID != "",
-		},
-		Todos: sql.NullString{
-			String: todosJSON,
-			Valid:  todosJSON != "",
-		},
-		DeletedTodos: deletedTodosJSON,
-	})
-	if err != nil {
-		return Session{}, err
-	}
-	session = s.fromDBItem(dbSession)
-	s.Publish(pubsub.UpdatedEvent, session)
-	return session, nil
-}
-
 // IncrementCost adds delta to the session cost atomically. See interface
 // doc on Service.IncrementCost for rationale.
 func (s *service) IncrementCost(ctx context.Context, sessionID string, delta float64) (Session, error) {
@@ -455,6 +415,70 @@ func (s *service) UpdateSystemPrompt(ctx context.Context, sessionID, prompt stri
 		ID:           sessionID,
 		SystemPrompt: prompt,
 	}); err != nil {
+		return err
+	}
+	if sess, err := s.Get(ctx, sessionID); err == nil {
+		s.Publish(pubsub.UpdatedEvent, sess)
+	}
+	return nil
+}
+
+// SetUsage overwrites only the prompt/completion token counters for a
+// session. It does not touch title, todos, summary, or cost, so it cannot
+// clobber concurrent edits to those fields the way a full Save did. Used by
+// the agent's per-step finalization to persist the latest context-window
+// token snapshot.
+func (s *service) SetUsage(ctx context.Context, sessionID string, promptTokens, completionTokens int64) error {
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE sessions SET prompt_tokens = ?, completion_tokens = ?, updated_at = strftime('%s', 'now') WHERE id = ?`,
+		promptTokens, completionTokens, sessionID,
+	); err != nil {
+		return err
+	}
+	if sess, err := s.Get(ctx, sessionID); err == nil {
+		s.Publish(pubsub.UpdatedEvent, sess)
+	}
+	return nil
+}
+
+// SetSummaryAndUsage overwrites summary_message_id together with the
+// prompt/completion token counters in one UPDATE. Used by the summarization
+// paths (manual and silent compaction) and by `sessions reset`, which must
+// flip the summary pointer and reset token counters as one logical op. Like
+// SetUsage it leaves title, todos, and cost untouched, so it cannot lose
+// concurrent edits to those columns.
+func (s *service) SetSummaryAndUsage(ctx context.Context, sessionID, summaryMessageID string, promptTokens, completionTokens int64) error {
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE sessions SET summary_message_id = ?, prompt_tokens = ?, completion_tokens = ?, updated_at = strftime('%s', 'now') WHERE id = ?`,
+		summaryMessageID, promptTokens, completionTokens, sessionID,
+	); err != nil {
+		return err
+	}
+	if sess, err := s.Get(ctx, sessionID); err == nil {
+		s.Publish(pubsub.UpdatedEvent, sess)
+	}
+	return nil
+}
+
+// SetTodos overwrites the todos and deleted_todos (tombstone) columns for a
+// session in one UPDATE. It leaves title, token counters, summary, and cost
+// untouched, so a todos edit can no longer clobber a concurrent rename or
+// agent step the way a full Save did.
+func (s *service) SetTodos(ctx context.Context, sessionID string, todos []Todo, deletedTodos []string) error {
+	todosJSON, err := marshalTodos(todos)
+	if err != nil {
+		return err
+	}
+	deletedTodosJSON, err := marshalDeletedTodos(deletedTodos)
+	if err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE sessions SET todos = ?, deleted_todos = ?, updated_at = strftime('%s', 'now') WHERE id = ?`,
+		sql.NullString{String: todosJSON, Valid: todosJSON != ""},
+		deletedTodosJSON,
+		sessionID,
+	); err != nil {
 		return err
 	}
 	if sess, err := s.Get(ctx, sessionID); err == nil {

@@ -186,8 +186,7 @@ func NewTodosTool(sessions session.Service) fantasy.AgentTool {
 				}
 			}
 
-			currentSession.Todos = todos
-			if _, err = sessions.Save(ctx, currentSession); err != nil {
+			if err := sessions.SetTodos(ctx, sessionID, todos, currentSession.DeletedTodos); err != nil {
 				return fantasy.ToolResponse{}, fmt.Errorf("failed to save todos: %w", err)
 			}
 
