@@ -69,7 +69,13 @@ ORDER BY created_at DESC;
 SELECT *
 FROM messages
 WHERE session_id = ?
-ORDER BY created_at DESC
+-- rowid is the tie-breaker: created_at is stored in SECONDS, so a single agent
+-- turn produces dozens of rows with an identical created_at. Without a total
+-- order SQLite does not guarantee a stable order among those ties, which makes
+-- OFFSET pagination lose/duplicate rows when the query plan shifts between
+-- page fetches. rowid is SQLite's implicit monotonic insertion counter, so
+-- (created_at DESC, rowid DESC) is a deterministic newest-first total order.
+ORDER BY created_at DESC, rowid DESC
 LIMIT ? OFFSET ?;
 
 -- name: CountMessagesBySession :one

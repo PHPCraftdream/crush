@@ -50,6 +50,15 @@ const (
 	// if the model asks for a gigabyte, so a pathological request can never
 	// balloon the orchestrator's context.
 	hardMaxTranscriptBytes = 1_500_000
+
+	// hardMaxTranscriptOffset is the absolute ceiling on offset. OFFSET makes
+	// SQLite scan and discard the leading rows before returning the window, so
+	// an absurd offset (10^9) is a cheap DoS against the DB thread. 100x the
+	// message window ceiling (500): generous for paging deep into a very large
+	// delegation while bounding the discarded-row scan to a fast sub-second
+	// range. A real delegation exceeding this is effectively unbounded history
+	// the orchestrator would never read in full anyway.
+	hardMaxTranscriptOffset = 50_000
 )
 
 // ReadDelegationTranscriptParams is the JSON schema for the
@@ -241,6 +250,9 @@ func clampTranscriptWindow(params ReadDelegationTranscriptParams) (maxMessages, 
 	offset = params.Offset
 	if offset < 0 {
 		offset = 0
+	}
+	if offset > hardMaxTranscriptOffset {
+		offset = hardMaxTranscriptOffset
 	}
 	return maxMessages, maxBytes, offset
 }

@@ -238,7 +238,11 @@ const listMessagesBySessionPaginated = `-- name: ListMessagesBySessionPaginated 
 SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden, reasoning_effort, auto_resumed, background_job_notice
 FROM messages
 WHERE session_id = ?
-ORDER BY created_at DESC
+-- rowid tie-breaker: created_at is in SECONDS, so one agent turn produces many
+-- rows with identical created_at; without a total order SQLite does not
+-- guarantee a stable order among ties, so OFFSET pagination can drop/duplicate
+-- rows when the plan shifts. rowid is the implicit monotonic insertion counter.
+ORDER BY created_at DESC, rowid DESC
 LIMIT ? OFFSET ?
 `
 
