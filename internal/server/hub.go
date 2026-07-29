@@ -16,6 +16,22 @@ const (
 	maxMessageSize = 20 * 1024 * 1024 // 20 MB — supports image attachments
 	sendBufSize    = 512
 	maxBufferSize  = 2000 // max events to replay to new clients
+
+	// replayByteBudget bounds the total bytes held in the replay buffer across all
+	// events. Normal traffic (small JSON deltas) fits ~2000 events well under 8 MiB,
+	// so the per-event count limit stays the binding constraint and full history is
+	// preserved; this only kicks in for pathological streams (e.g. hundreds of large
+	// growing-message snapshots), hard-capping a single hub's replay memory.
+	replayByteBudget = 16 * 1024 * 1024 // 16 MiB
+
+	// replayMaxEventSize is the per-event ceiling for STORAGE in the replay buffer.
+	// Events larger than this are almost always image attachments or huge tool
+	// outputs; a newly-connecting client doesn't need them re-transmitted from the
+	// buffer (they're already persisted in the DB/message layer the UI loads on
+	// initial fetch). Skipping storage here (1) stops one blob evicting dozens of
+	// normal events, (2) bounds the byte-budget eviction loop. Live fan-out to
+	// already-connected clients is unaffected.
+	replayMaxEventSize = 1024 * 1024 // 1 MiB per event
 )
 
 // Client represents a single WebSocket connection.
@@ -25,6 +41,75 @@ type Client struct {
 	send chan []byte
 }
 
+// replayBuffer is a fixed-capacity ring buffer of broadcast events.
+//
+// It enforces three independent bounds:
+//   - count:     at most cap entries (legacy maxBufferSize semantic),
+//   - bytes:     total stored bytes <= replayByteBudget,
+//   - per-event: events larger than replayMaxEventSize are not stored at all.
+//
+// All ops are O(1): the backing slice is pre-allocated once and never re-sliced
+// or appended to, so eviction never copies the underlying array.
+//
+// NOTE: a cleaner long-term design would store only the latest snapshot per
+// entity (session/message/tool) and serve it to new clients via REST/DB instead
+// of replaying intermediate events. That is a larger architectural change and is
+// intentionally out of scope here; see task #130.
+type replayBuffer struct {
+	buf   [][]byte // len == cap, pre-allocated; entries recycled in place
+	head  int      // index of the oldest stored entry
+	tail  int      // index where the next push writes
+	count int      // number of valid entries, count <= len(buf)
+	bytes int      // sum of len() of valid entries
+}
+
+// newReplayBuffer returns an empty ring buffer with capacity maxBufferSize.
+func newReplayBuffer() replayBuffer {
+	return replayBuffer{buf: make([][]byte, maxBufferSize)}
+}
+
+// push appends msg, evicting oldest entries as needed to satisfy the count and
+// byte-budget bounds. Events exceeding replayMaxEventSize are rejected (not
+// stored) and reported via slog at debug level. Returns true if stored.
+func (r *replayBuffer) push(msg []byte) bool {
+	if len(msg) > replayMaxEventSize {
+		slog.Debug("ws: replay event exceeds per-event limit, not buffering",
+			"len", len(msg), "limit", replayMaxEventSize)
+		return false
+	}
+	capN := len(r.buf)
+	if r.count == capN { // count bound: full -> evict oldest
+		r.evictHead()
+	}
+	r.buf[r.tail] = msg
+	r.tail = (r.tail + 1) % capN
+	r.count++
+	r.bytes += len(msg)
+	// Byte-budget bound: evict oldest until within budget. Guard count > 1 so
+	// the just-pushed event (<= replayMaxEventSize <= replayByteBudget) is kept.
+	for r.bytes > replayByteBudget && r.count > 1 {
+		r.evictHead()
+	}
+	return true
+}
+
+// evictHead removes the oldest entry. Caller guarantees count >= 1.
+func (r *replayBuffer) evictHead() {
+	capN := len(r.buf)
+	r.bytes -= len(r.buf[r.head])
+	r.buf[r.head] = nil // drop reference so the slice can be GC'd
+	r.head = (r.head + 1) % capN
+	r.count--
+}
+
+// forEach applies fn to each stored entry in oldest-to-newest order.
+func (r *replayBuffer) forEach(fn func([]byte)) {
+	capN := len(r.buf)
+	for i := 0; i < r.count; i++ {
+		fn(r.buf[(r.head+i)%capN])
+	}
+}
+
 // Hub maintains connected clients and an event replay buffer.
 //
 // All accesses to clients and buffer happen inside the single Run() goroutine,
@@ -32,7 +117,7 @@ type Client struct {
 // messages from multiple producer goroutines.
 type Hub struct {
 	clients    map[*Client]struct{}
-	buffer     [][]byte // circular replay buffer; only touched inside Run()
+	buffer     replayBuffer // ring replay buffer; only touched inside Run()
 	broadcast  chan []byte
 	register   chan *Client
 	unregister chan *Client
@@ -41,7 +126,7 @@ type Hub struct {
 func newHub() *Hub {
 	return &Hub{
 		clients:    make(map[*Client]struct{}),
-		buffer:     make([][]byte, 0, maxBufferSize),
+		buffer:     newReplayBuffer(),
 		broadcast:  make(chan []byte, 1024),
 		register:   make(chan *Client, 64),
 		unregister: make(chan *Client, 64),
@@ -62,13 +147,13 @@ func (h *Hub) Run(ctx context.Context) {
 			// Add to active set first so no broadcasts are lost after this point.
 			h.clients[c] = struct{}{}
 			// Replay all buffered events to the new client (non-blocking per-event).
-			for _, msg := range h.buffer {
+			h.buffer.forEach(func(msg []byte) {
 				select {
 				case c.send <- msg:
 				default:
 					// Client buffer full; skip older replayed events rather than block.
 				}
-			}
+			})
 
 		case c := <-h.unregister:
 			if _, ok := h.clients[c]; ok {
@@ -77,11 +162,7 @@ func (h *Hub) Run(ctx context.Context) {
 			}
 
 		case msg := <-h.broadcast:
-			// Store in replay buffer; drop oldest when full.
-			if len(h.buffer) >= maxBufferSize {
-				h.buffer = h.buffer[1:]
-			}
-			h.buffer = append(h.buffer, msg)
+			h.buffer.push(msg) // store (skips oversized events; eviction handled inside)
 
 			// Fan-out to all active clients (non-blocking; slow clients drop messages).
 			for c := range h.clients {
