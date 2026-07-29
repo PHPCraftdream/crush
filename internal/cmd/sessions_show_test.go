@@ -79,6 +79,16 @@ func newTestDB(t *testing.T) (*sql.DB, *db.Queries) {
 	t.Helper()
 	sqlDB, err := sql.Open("sqlite", ":memory:")
 	require.NoError(t, err)
+	// With modernc's SQLite driver, each pooled connection to ":memory:" is
+	// a SEPARATE, independently-empty database — there is no shared backing
+	// store across connections the way file-backed SQLite has. Without
+	// capping the pool to a single connection, database/sql is free to open
+	// a second connection under concurrent use (e.g. a caller holding a
+	// transaction open across multiple statements, as sessions_fork_test.go
+	// does), and that second connection sees none of the tables created
+	// below, failing with "no such table". See the identical fix/comment in
+	// internal/session/session_test.go's newTestDB.
+	sqlDB.SetMaxOpenConns(1)
 	t.Cleanup(func() { sqlDB.Close() })
 
 	// Run migrations

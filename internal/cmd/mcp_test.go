@@ -22,6 +22,21 @@ func newTestStoreWithDir(t *testing.T) (*config.ConfigStore, string) {
 	require.NoError(t, os.MkdirAll(globalDir, 0o755))
 	t.Setenv("CRUSH_GLOBAL_DATA", globalDir)
 
+	// GlobalConfig() (CRUSH_GLOBAL_CONFIG/XDG_CONFIG_HOME) is a SEPARATE
+	// resolution path from GlobalConfigData() (CRUSH_GLOBAL_DATA) above —
+	// see CLAUDE.md's "two real config paths" caveat. Without this,
+	// config.Load below merges in the real host ~/.config/crush/crush.json,
+	// leaking real mcp/providers config into these in-memory-store tests.
+	// There's no app.New()/mcp.Initialize in this path so there's no network
+	// risk here (unlike runProvidersCmdInIsolatedApp), but the leak still
+	// pollutes assertions on a machine with a populated host config. Use a
+	// directory distinct from globalDir so lookupConfigs doesn't load and
+	// merge the same file with itself under two different env vars.
+	globalConfigDir := filepath.Join(dir, "globalconfig")
+	require.NoError(t, os.MkdirAll(globalConfigDir, 0o755))
+	t.Setenv("XDG_CONFIG_HOME", globalConfigDir)
+	t.Setenv("CRUSH_GLOBAL_CONFIG", globalConfigDir)
+
 	// Write an empty config so Load finds it.
 	configPath := filepath.Join(globalDir, "crush.json")
 	require.NoError(t, os.WriteFile(configPath, []byte("{}"), 0o600))

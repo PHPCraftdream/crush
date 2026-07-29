@@ -851,6 +851,24 @@ func runProvidersCmdInIsolatedApp(t *testing.T, cmd *cobra.Command, providerJSON
 	tmp := t.TempDir()
 	t.Setenv("XDG_DATA_HOME", tmp)
 	t.Setenv("CRUSH_GLOBAL_DATA", tmp)
+	// GlobalConfig() (CRUSH_GLOBAL_CONFIG/XDG_CONFIG_HOME) is a SEPARATE
+	// resolution path from GlobalConfigData() (CRUSH_GLOBAL_DATA) above — see
+	// CLAUDE.md's "two real config paths" caveat and the longer explanation
+	// in isolatedModelsEnv (models_use_test.go). Without this, setupApp's
+	// app.New() -> mcp.Initialize reads the real host
+	// ~/.config/crush/crush.json and, if it configures MCP servers, tries to
+	// open real network connections to them from inside the test — this is
+	// the exact path that previously hung a stress run for 9+ minutes.
+	//
+	// Use a SEPARATE subdirectory from CRUSH_GLOBAL_DATA (not the same tmp)
+	// so lookupConfigs (internal/config/load.go), which loads and merges
+	// both GlobalConfig() and GlobalConfigData(), doesn't load the same file
+	// path twice under two different env vars — see the "Low, latent"
+	// duplicate-merge caveat fixed in isolatedModelsEnv.
+	configDir := filepath.Join(tmp, "config")
+	require.NoError(t, os.MkdirAll(configDir, 0o755))
+	t.Setenv("XDG_CONFIG_HOME", configDir)
+	t.Setenv("CRUSH_GLOBAL_CONFIG", configDir)
 	// Cache-only so provider discovery makes no network calls.
 	t.Setenv("CRUSH_PROVIDER_CACHE_ONLY", "1")
 

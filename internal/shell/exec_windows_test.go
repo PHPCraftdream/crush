@@ -122,6 +122,15 @@ func TestBackgroundShellManager_Kill_TreeKillsOrphanedGrandchild_Windows(t *test
 	// consistently under 2s). A real regression back to the old
 	// direct-child-only kill would still take the full 60s, nowhere
 	// close to this bound either way.
+	//
+	// Note: this 30s bound numerically matches runLevel1Helper's own 30s
+	// time.Sleep (see above) — that's coincidental, not load-bearing. The
+	// discrimination this assertion relies on is driven by the grandchild's
+	// handle (60s sleep, level 2), not level 1's sleep duration: a broken
+	// (non-tree-kill) implementation hangs on the grandchild's inherited
+	// stdout/stderr handle regardless of how long level 1 itself would have
+	// slept, so this bound would still correctly fail even if level 1's
+	// sleep were changed to something other than 30s.
 	require.Less(t, elapsed, 30*time.Second,
 		"Kill must tree-kill the orphaned grandchild and return promptly; "+
 			"without tree-kill it hangs until the grandchild's own sleep ends")

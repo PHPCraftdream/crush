@@ -106,6 +106,12 @@ func TestIsWSLLauncher_HonorsSystemRoot(t *testing.T) {
 // %SystemRoot% set, but the code must not silently stop detecting WSL just
 // because a test or unusual launch context cleared the environment.
 func TestIsWSLLauncher_FallsBackWhenSystemRootUnset(t *testing.T) {
+	// Deliberately no t.Parallel() here: this test uses raw os.Unsetenv +
+	// manual os.Setenv restore (there is no t.Unsetenv) instead of
+	// t.Setenv, which is unsafe to run concurrently with any other test in
+	// this package/binary that reads or sets SystemRoot — see the identical
+	// warning on isolatedModelsEnv in internal/cmd/models_use_test.go for
+	// why raw os.Unsetenv/restore and t.Parallel() must never be combined.
 	orig, had := os.LookupEnv("SystemRoot")
 	os.Unsetenv("SystemRoot")
 	t.Cleanup(func() {

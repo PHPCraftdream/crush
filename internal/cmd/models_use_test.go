@@ -52,24 +52,37 @@ func isolatedModelsEnv(t *testing.T) (globalPath string) {
 	// test.
 	config.ResetProviderCacheForTests()
 	tmp := t.TempDir()
-	t.Setenv("XDG_DATA_HOME", tmp)
-	t.Setenv("CRUSH_GLOBAL_DATA", tmp)
+	dataDir := filepath.Join(tmp, "data")
+	require.NoError(t, os.MkdirAll(dataDir, 0o755))
+	t.Setenv("XDG_DATA_HOME", dataDir)
+	t.Setenv("CRUSH_GLOBAL_DATA", dataDir)
 	// GlobalConfig() (CRUSH_GLOBAL_CONFIG/XDG_CONFIG_HOME) is a SEPARATE
 	// resolution path from GlobalConfigData() (CRUSH_GLOBAL_DATA) above —
-	// see CLAUDE.md's "two real config paths" caveat. Without this,
-	// app.New() (invoked by e.g. TestModelsBump_AllFourRoles) reads the
+	// see CLAUDE.md's "two real config paths" caveat. Without this, app.New()
+	// (invoked by e.g. TestModelsBump_AllFourRoles) reads the
 	// real host ~/.config/crush/crush.json and, if it configures MCP
 	// servers, tries to open real network connections to them from
 	// inside the test — observed hanging a stress run for 9+ minutes
-	// until the 10-minute go test panic-timeout. Both env vars resolve
-	// to the same "<dir>/crush.json" filename, so pointing
-	// CRUSH_GLOBAL_CONFIG at the same tmp as CRUSH_GLOBAL_DATA collapses
-	// them onto the one already-isolated globalPath below — lookupConfigs
-	// (internal/config/load.go) loads both GlobalConfig() and
-	// GlobalConfigData() and merges them, so isolating only one of the two
-	// still left the other free to leak the real host file in.
-	t.Setenv("XDG_CONFIG_HOME", tmp)
-	t.Setenv("CRUSH_GLOBAL_CONFIG", tmp)
+	// until the 10-minute go test panic-timeout.
+	//
+	// configDir MUST be a directory distinct from dataDir, not the same tmp
+	// reused for both env vars: lookupConfigs (internal/config/load.go)
+	// loads BOTH GlobalConfig() and GlobalConfigData() and merges them via
+	// go-jsons, which merges (rather than replaces) array-valued fields on
+	// collision. Pointing both env vars at the identical "<dir>/crush.json"
+	// path made lookupConfigs load and merge that one file with itself —
+	// harmless while the seeded config below has no array fields, but a
+	// latent bug (doubled array entries, doubled ConfigStore.LoadedPaths()
+	// entries) waiting for a future test to add one. globalPath below stays
+	// pointed at dataDir (where GlobalConfigData()/ScopeGlobal actually
+	// resolves and where modelsUseCmd/modelsBumpCmd actually write); configDir
+	// only needs to exist and be isolated from the real host file —
+	// lookupConfigs still merges dataDir's crush.json (with the seeded zai
+	// key) in regardless of which of the two paths it physically lives under.
+	configDir := filepath.Join(tmp, "config")
+	require.NoError(t, os.MkdirAll(configDir, 0o755))
+	t.Setenv("XDG_CONFIG_HOME", configDir)
+	t.Setenv("CRUSH_GLOBAL_CONFIG", configDir)
 	t.Setenv("CRUSH_PROVIDER_CACHE_ONLY", "1")
 
 	crushlog.Setup("", false)
@@ -80,7 +93,7 @@ func isolatedModelsEnv(t *testing.T) (globalPath string) {
 	require.NoError(t, err)
 	require.NoError(t, os.Chdir(workDir))
 
-	globalPath = filepath.Join(tmp, "crush.json")
+	globalPath = filepath.Join(dataDir, "crush.json")
 	// Seed a synthetic zai api_key from the start rather than starting
 	// from a bare "{}". Live model resolution (a.ResolveModel /
 	// configureSelectedModels, exercised by e.g. modelsUseCmd's
