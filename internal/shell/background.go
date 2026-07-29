@@ -49,6 +49,18 @@ const (
 	truncationMarkerBudget = 128
 )
 
+// No separate count-based cap is enforced on COMPLETED jobs, by design. A job
+// that has finished is cheap once its buffered stdout/stderr is released
+// (BufferRetentionMinutes, ~15 min after completion): only lightweight
+// metadata (ID, Command, timestamps, atomic fields — a few hundred bytes) stays
+// resident until CompletedJobRetentionMinutes purges it via Cleanup, which the
+// bash tool invokes at the start of every run. The time-based retention
+// already bounds how long completed jobs linger, and even thousands of them
+// amount to only a few MiB of metadata; a separate count-based eviction would
+// add a tuning knob and a "which completed job to drop first" policy for
+// negligible gain. The concurrency limit (MaxBackgroundJobs) is enforced on
+// ACTIVE jobs only via BackgroundShellManager.activeJobs.
+
 // bufferRetention is the duration after completion before a job's buffered
 // stdout/stderr bytes are released via a one-shot time.AfterFunc armed in
 // Start's completion goroutine. Defaults to BufferRetentionMinutes; tests
@@ -241,12 +253,23 @@ type BackgroundShell struct {
 type BackgroundShellManager struct {
 	shells *csync.Map[string, *BackgroundShell]
 
+	// activeJobs counts the number of currently-running (not yet completed)
+	// background jobs. It is the value the MaxBackgroundJobs limit is checked
+	// against: unlike shells.Len() — which also counts completed jobs held for
+	// up to CompletedJobRetentionMinutes so their results stay queryable — this
+	// counter is decremented the moment a job's goroutine finishes, so a job
+	// completing immediately frees its concurrency slot. Incremented under
+	// startMu in Start (atomically with the limit check and the shells.Set
+	// insert); decremented lock-free from the job's completion goroutine.
+	activeJobs atomic.Int64
+
 	// startMu serializes the "check MaxBackgroundJobs then insert" sequence
 	// in Start so two concurrent Start calls can't both observe room under
 	// the limit and both insert, overshooting MaxBackgroundJobs. shells
 	// itself is a csync.Map (safe for concurrent Get/Set/Len individually),
-	// but Len()-then-Set() across two calls is a classic non-atomic
-	// check-then-act race without this extra lock serializing the sequence.
+	// but the check-then-increment-and-insert across two calls is a classic
+	// non-atomic check-then-act race without this extra lock serializing the
+	// sequence.
 	startMu sync.Mutex
 }
 
@@ -276,11 +299,14 @@ func (m *BackgroundShellManager) Start(ctx context.Context, workingDir string, b
 	m.startMu.Lock()
 	defer m.startMu.Unlock()
 
-	// Check job limit. Holding startMu across the check-and-insert below
-	// (m.shells.Set further down) makes this atomic with respect to other
-	// concurrent Start calls, so the limit can't be overshot by a
-	// check-then-act race.
-	if m.shells.Len() >= MaxBackgroundJobs {
+	// Check job limit against ACTIVE jobs only (not shells.Len(), which also
+	// includes completed jobs retained for up to CompletedJobRetentionMinutes
+	// so their results stay queryable — counting those would permanently block
+	// new jobs once the retention window fills up even if everything has
+	// finished). Holding startMu across the check-and-insert below (and the
+	// activeJobs increment) makes this atomic with respect to other concurrent
+	// Start calls, so the limit can't be overshot by a check-then-act race.
+	if m.activeJobs.Load() >= int64(MaxBackgroundJobs) {
 		return nil, fmt.Errorf("maximum number of background jobs (%d) reached. Please terminate or wait for some jobs to complete", MaxBackgroundJobs)
 	}
 
@@ -308,6 +334,11 @@ func (m *BackgroundShellManager) Start(ctx context.Context, workingDir string, b
 	}
 
 	m.shells.Set(id, bgShell)
+	// Reserve the concurrency slot now (under startMu, atomically with the
+	// limit check above). Released when the goroutine finishes, right after
+	// completedAt is set — that single point covers normal completion, Kill,
+	// and KillAll, since all three reach "done" via this goroutine returning.
+	m.activeJobs.Add(1)
 
 	go func() {
 		defer close(bgShell.done)
@@ -316,6 +347,7 @@ func (m *BackgroundShellManager) Start(ctx context.Context, workingDir string, b
 
 		bgShell.exitErr = err
 		bgShell.completedAt.Store(time.Now().Unix())
+		m.activeJobs.Add(-1)
 		// Schedule buffer release on a timer so the (up to 6 MiB) buffered
 		// stdout/stderr is freed after bufferRetention even if no further
 		// bash task ever calls Cleanup. releaseBuffers is guarded by
@@ -329,6 +361,14 @@ func (m *BackgroundShellManager) Start(ctx context.Context, workingDir string, b
 // Get retrieves a background shell by ID.
 func (m *BackgroundShellManager) Get(id string) (*BackgroundShell, bool) {
 	return m.shells.Get(id)
+}
+
+// ActiveJobs returns the number of currently-running background jobs (started
+// but not yet completed). This is the value the MaxBackgroundJobs concurrency
+// limit is enforced against; completed jobs retained for result querying are
+// not counted.
+func (m *BackgroundShellManager) ActiveJobs() int {
+	return int(m.activeJobs.Load())
 }
 
 // Remove removes a background shell from the manager without terminating it.
