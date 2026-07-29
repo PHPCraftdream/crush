@@ -44,7 +44,14 @@ func TestResolveInterpreter_PermissiveFallback_Windows(t *testing.T) {
 // TestIsWSLLauncher_KnownPaths checks the pure path-based WSL detection
 // against the canonical launcher locations and confirms Git Bash is NOT
 // mistaken for WSL. No PATH access — fully deterministic on any host.
+//
+// SystemRoot is explicitly set to the standard C:\Windows here so the
+// hardcoded expectations below stay valid regardless of the host's real
+// %SystemRoot%; the non-standard-install case is covered separately by
+// TestIsWSLLauncher_HonorsSystemRoot.
 func TestIsWSLLauncher_KnownPaths(t *testing.T) {
+	t.Setenv("SystemRoot", `C:\Windows`)
+
 	cases := []struct {
 		in   string
 		want bool
@@ -62,6 +69,53 @@ func TestIsWSLLauncher_KnownPaths(t *testing.T) {
 		if got := isWSLLauncher(c.in); got != c.want {
 			t.Errorf("isWSLLauncher(%q) = %v, want %v", c.in, got, c.want)
 		}
+	}
+}
+
+// TestIsWSLLauncher_HonorsSystemRoot proves WSL-launcher detection follows
+// %SystemRoot% rather than a hardcoded C:\Windows. On a machine where
+// Windows is installed on a non-standard drive (a rare but real and
+// supported configuration), detection must still work against that drive's
+// System32/SysWOW64 paths, and must NOT be fooled by a look-alike path
+// under the unused default drive.
+func TestIsWSLLauncher_HonorsSystemRoot(t *testing.T) {
+	t.Setenv("SystemRoot", `D:\Windows`)
+
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{`D:\Windows\System32\bash.exe`, true},
+		{`D:\Windows\System32\wsl.exe`, true},
+		{`D:\Windows\SysWOW64\bash.exe`, true},
+		{`d:\windows\system32\BASH.EXE`, true},           // case-insensitive
+		{`D:/Windows/System32/bash.exe`, true},           // forward slashes
+		{`C:\Windows\System32\bash.exe`, false},          // stale default-drive path, should no longer match
+		{`D:\Program Files\Git\usr\bin\bash.exe`, false}, // Git Bash
+	}
+	for _, c := range cases {
+		if got := isWSLLauncher(c.in); got != c.want {
+			t.Errorf("isWSLLauncher(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}
+
+// TestIsWSLLauncher_FallsBackWhenSystemRootUnset proves detection still
+// works (against the default C:\Windows) when %SystemRoot% is unset, e.g.
+// in a scrubbed test environment. Real Windows machines always have
+// %SystemRoot% set, but the code must not silently stop detecting WSL just
+// because a test or unusual launch context cleared the environment.
+func TestIsWSLLauncher_FallsBackWhenSystemRootUnset(t *testing.T) {
+	orig, had := os.LookupEnv("SystemRoot")
+	os.Unsetenv("SystemRoot")
+	t.Cleanup(func() {
+		if had {
+			os.Setenv("SystemRoot", orig)
+		}
+	})
+
+	if !isWSLLauncher(`C:\Windows\System32\bash.exe`) {
+		t.Fatal("expected fallback to default C:\\Windows to detect the WSL launcher")
 	}
 }
 

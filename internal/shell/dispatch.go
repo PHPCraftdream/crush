@@ -351,15 +351,30 @@ func pathExtCandidates(dir, name string, exts []string) []string {
 	return out
 }
 
-// wslLauncherPaths are the canonical Windows Subsystem for Linux launcher
-// executables. A shebang interpreter resolving here is the WSL launcher, not
-// Git Bash/MSYS bash: it expects Linux-style paths and would fail on the
-// Windows-style script path we pass.
-var wslLauncherPaths = []string{
-	`C:\Windows\System32\bash.exe`,
-	`C:\Windows\System32\wsl.exe`,
-	`C:\Windows\SysWOW64\bash.exe`,
-	`C:\Windows\SysWOW64\wsl.exe`,
+// defaultSystemRoot is the fallback used when %SystemRoot% is unset. This is
+// the standard location on the overwhelming majority of Windows installs,
+// but the environment variable is authoritative: Windows can be installed
+// on a drive other than C:, and hardcoding the path would silently break
+// WSL-launcher detection on such machines.
+const defaultSystemRoot = `C:\Windows`
+
+// wslLauncherPaths returns the canonical Windows Subsystem for Linux
+// launcher executables, rooted at %SystemRoot% (falling back to
+// defaultSystemRoot if the variable is unset, e.g. in a scrubbed test
+// environment). A shebang interpreter resolving here is the WSL launcher,
+// not Git Bash/MSYS bash: it expects Linux-style paths and would fail on
+// the Windows-style script path we pass.
+func wslLauncherPaths() []string {
+	root := os.Getenv("SystemRoot")
+	if root == "" {
+		root = defaultSystemRoot
+	}
+	return []string{
+		filepath.Join(root, `System32\bash.exe`),
+		filepath.Join(root, `System32\wsl.exe`),
+		filepath.Join(root, `SysWOW64\bash.exe`),
+		filepath.Join(root, `SysWOW64\wsl.exe`),
+	}
 }
 
 // isWSLLauncher reports whether p is one of the known WSL launcher
@@ -371,7 +386,7 @@ func isWSLLauncher(p string) bool {
 		return false
 	}
 	n := normPath(p)
-	for _, w := range wslLauncherPaths {
+	for _, w := range wslLauncherPaths() {
 		if normPath(w) == n {
 			return true
 		}
