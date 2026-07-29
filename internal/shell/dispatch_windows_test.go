@@ -52,8 +52,8 @@ func TestIsWSLLauncher_KnownPaths(t *testing.T) {
 		{`C:\Windows\System32\bash.exe`, true},
 		{`C:\Windows\System32\wsl.exe`, true},
 		{`C:\Windows\SysWOW64\bash.exe`, true},
-		{`c:\windows\system32\BASH.EXE`, true},  // case-insensitive
-		{`C:/Windows/System32/bash.exe`, true},  // forward slashes
+		{`c:\windows\system32\BASH.EXE`, true},           // case-insensitive
+		{`C:/Windows/System32/bash.exe`, true},           // forward slashes
 		{`D:\Program Files\Git\usr\bin\bash.exe`, false}, // Git Bash
 		{`C:\Users\me\bin\bash.exe`, false},
 		{``, false},

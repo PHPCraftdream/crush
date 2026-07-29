@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 )
 
 // RenameAsideName returns the path dst should be moved to before a fresh
@@ -85,17 +86,30 @@ func SwapRenameAside(rename func(old, new string) error, tmp, dst, aside string)
 	return nil
 }
 
-// SweepRenameAsideLeftovers best-effort deletes leftover rename-aside
-// files next to dst from previous deploys: both the ".old-<token>" files
-// this package creates (via RenameAsideName) and the legacy ".bak-*"
-// files an older deploy mechanism left behind (observed on disk, not
-// hypothetical — see the plan's grabli registry, Г11). It returns the
-// paths it successfully removed; failures (most commonly a busy file
-// still held open by a live crush process) are swallowed on purpose —
-// a file that refuses to delete just means a live session is still
-// serving it, and it will be swept on a later deploy once that session
-// exits. This function never returns an error and never panics: a
-// deploy must not fail just because old garbage from a previous run
+// staleTempFileAge is how old a leftover ".new-<token>" temp file (see
+// TempBuildName) must be before SweepRenameAsideLeftovers will delete it.
+// These files are only ever created mid-copy by a deploy that is still
+// running, so a fresh one may belong to a concurrent `go run deploy.go`
+// (an accepted, documented race — see replaceFile's doc comment) and must
+// not be swept out from under it. A file this old can only be a leftover
+// from a deploy that crashed, was killed, or lost power before its own
+// `defer os.Remove(tmp)` ran — no legitimate deploy takes anywhere near
+// this long.
+const staleTempFileAge = time.Hour
+
+// SweepRenameAsideLeftovers best-effort deletes leftover files next to
+// dst from previous deploys: the ".old-<token>" rename-aside files this
+// package creates (via RenameAsideName), the legacy ".bak-*" files an
+// older deploy mechanism left behind (observed on disk, not hypothetical
+// — see the plan's grabli registry, Г11), and ".new-<token>" temp-copy
+// files (via TempBuildName) old enough to be certain they were abandoned
+// by a crashed deploy rather than belonging to one still in progress. It
+// returns the paths it successfully removed; failures (most commonly a
+// busy file still held open by a live crush process) are swallowed on
+// purpose — a file that refuses to delete just means a live session is
+// still serving it, and it will be swept on a later deploy once that
+// session exits. This function never returns an error and never panics:
+// a deploy must not fail just because old garbage from a previous run
 // couldn't be cleaned up yet.
 func SweepRenameAsideLeftovers(dst string) []string {
 	var removed []string
@@ -105,6 +119,18 @@ func SweepRenameAsideLeftovers(dst string) []string {
 			continue
 		}
 		for _, m := range matches {
+			if os.Remove(m) == nil {
+				removed = append(removed, m)
+			}
+		}
+	}
+	matches, err := filepath.Glob(dst + ".new-*")
+	if err == nil {
+		for _, m := range matches {
+			fi, statErr := os.Stat(m)
+			if statErr != nil || time.Since(fi.ModTime()) < staleTempFileAge {
+				continue
+			}
 			if os.Remove(m) == nil {
 				removed = append(removed, m)
 			}

@@ -240,6 +240,7 @@ func (b *teeBody) Close() error {
 	b.mu.Lock()
 	already := b.closed
 	b.closed = true
+	preview := b.buf.String()
 	b.mu.Unlock()
 	if already {
 		return nil
@@ -247,7 +248,7 @@ func (b *teeBody) Close() error {
 	err := b.body.Close()
 	b.once.Do(func() {
 		if b.onClose != nil {
-			b.onClose(b.buf.String())
+			b.onClose(preview)
 		}
 	})
 	return err

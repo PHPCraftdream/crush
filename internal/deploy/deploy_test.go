@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestDefaultInstallPath(t *testing.T) {
@@ -276,6 +277,39 @@ func TestSweepRenameAsideLeftovers(t *testing.T) {
 	// Calling again on an already-swept dir must be a safe no-op.
 	if got := SweepRenameAsideLeftovers(dst); len(got) != 0 {
 		t.Fatalf("expected no removals on second sweep, got %v", got)
+	}
+}
+
+// TestSweepRenameAsideLeftovers_NewTempFiles verifies the age gate on
+// ".new-<token>" temp-copy files: a fresh one (indistinguishable from a
+// concurrently-running deploy's in-progress copy) must survive the sweep,
+// while one old enough to only plausibly be a leftover from a crashed
+// deploy must be removed.
+func TestSweepRenameAsideLeftovers_NewTempFiles(t *testing.T) {
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "crush.exe")
+
+	fresh := TempBuildName(dst, "111")
+	stale := TempBuildName(dst, "222")
+	for _, p := range []string{fresh, stale} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", p, err)
+		}
+	}
+	oldTime := time.Now().Add(-2 * staleTempFileAge)
+	if err := os.Chtimes(stale, oldTime, oldTime); err != nil {
+		t.Fatalf("chtimes %s: %v", stale, err)
+	}
+
+	removed := SweepRenameAsideLeftovers(dst)
+	if len(removed) != 1 || removed[0] != stale {
+		t.Fatalf("expected exactly [%s] removed, got %v", stale, removed)
+	}
+	if _, err := os.Stat(fresh); err != nil {
+		t.Errorf("fresh .new-* file must survive the sweep (could belong to a concurrent deploy), got: %v", err)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Errorf("stale .new-* file should have been removed, stat err: %v", err)
 	}
 }
 
