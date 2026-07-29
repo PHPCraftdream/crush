@@ -155,9 +155,22 @@ func main() {
 	// 4. Copy with a temp + rename to make the swap atomic for each
 	//    target. Live sessions are never killed: on Unix the rename is
 	//    safe for running processes outright; on Windows replaceFile
-	//    renames any busy dst aside instead of deleting it. If any single
-	//    replace fails we bail — leaving a mixed state is worse than
-	//    leaving the original.
+	//    renames any busy dst aside instead of deleting it.
+	//
+	//    Multiple destinations are replaced sequentially with NO
+	//    cross-destination rollback: if the 2nd dst fails after the 1st
+	//    succeeded, the 1st stays on the new build and the 2nd is left
+	//    at its OLD build (replaceFile restores it rather than leaving a
+	//    missing file). This partial-rollback is an accepted risk because
+	//    (a) all destinations are the same logical target kept in sync,
+	//    (b) a failed replaceFile now restores the original dst, so the
+	//    worst case is "some dsts old, some new" — never a missing
+	//    binary, and (c) redeploying is idempotent: rerunning deploy.go
+	//    re-copies the same freshly built src to every dst, converging
+	//    them all to the new build. Preparing every temp copy up front
+	//    and only then renaming would not make the renames joint-atomic
+	//    across dsts anyway, so it adds complexity without removing the
+	//    fundamental last-writer gap.
 	for _, dst := range dsts {
 		if err := replaceFile(src, dst); err != nil {
 			fatal("replace %s: %v", dst, err)
@@ -336,9 +349,9 @@ func resolveDests() ([]string, error) {
 	return out, nil
 }
 
-// replaceFile copies src → dst atomically (write to dst.new, rename
-// over dst). Falls back to a direct copy on filesystems that don't
-// allow cross-device renames.
+// replaceFile copies src → dst atomically (write to a unique temp in
+// dst's directory, then rename over dst). Falls back to a direct copy on
+// filesystems that don't allow cross-device renames.
 //
 // On Windows, a running process holding dst open (e.g. a live `crush
 // run` session) makes a straight rename-over-dst fail: Windows refuses
@@ -351,24 +364,50 @@ func resolveDests() ([]string, error) {
 // becomes free for the new binary. The renamed-aside file lingers until
 // a later deploy's SweepRenameAsideLeftovers can finally remove it, once
 // every process still holding it has exited.
+//
+// The rename-aside swap itself (dst→aside, then tmp→dst) is delegated to
+// deploy.SwapRenameAside, which guards the dangerous second step: if
+// moving tmp into the freed dst fails (e.g. an antivirus transiently
+// locks the freshly written tmp), it rolls the old binary back from
+// aside to dst so the operator is never left with a MISSING binary.
+//
+// No inter-process deploy-lock is taken here, by design. The per-deploy
+// temp path (dst + ".new-<pid>-<nanos>") already eliminates file-level
+// collisions between concurrent deploys, and the rename-aside token is
+// likewise per-deploy so two deploys produce distinct aside names and
+// never clobber each other's stranded old binary. A cross-platform file
+// lock (flock on Unix, LockFileEx on Windows) would add stale-lock and
+// deadlock risk for a race — two operators running deploy.go at the same
+// instant on the same dst — that is already a benign last-writer-wins
+// (both write a valid freshly built binary) rather than corruption. Not
+// worth the complexity.
 func replaceFile(src, dst string) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
 	}
-	tmp := dst + ".new"
+	// Per-deploy unique token (pid + nanos) shared by the temp file and
+	// the rename-aside name, so a single deploy's artifacts are
+	// self-consistent and two concurrent deploys never share a temp file.
+	token := fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano())
+	tmp := deploy.TempBuildName(dst, token)
 	if err := copyFile(src, tmp); err != nil {
 		return err
 	}
+	// Best-effort cleanup of the temp copy on any exit path. On the
+	// success path tmp has been renamed away, so this is a no-op; on a
+	// failure path it removes the stale partial copy.
+	defer os.Remove(tmp)
+
 	if err := os.Rename(tmp, dst); err != nil {
 		if errors.Is(err, os.ErrExist) || runtime.GOOS == "windows" {
 			if _, statErr := os.Stat(dst); statErr == nil {
-				aside := deploy.RenameAsideName(dst, fmt.Sprintf("%d", time.Now().UnixNano()))
-				if err2 := os.Rename(dst, aside); err2 != nil {
-					return fmt.Errorf("rename-aside %s → %s: %w", dst, aside, err2)
-				}
+				aside := deploy.RenameAsideName(dst, token)
+				return deploy.SwapRenameAside(os.Rename, tmp, dst, aside)
 			}
+			// dst no longer exists (vanished between the first rename
+			// attempt and now): nothing to rename aside, just retry.
 			if err2 := os.Rename(tmp, dst); err2 != nil {
-				return fmt.Errorf("rename %s → %s after rename-aside: %w", tmp, dst, err2)
+				return fmt.Errorf("rename %s → %s: %w", tmp, dst, err2)
 			}
 			return nil
 		}

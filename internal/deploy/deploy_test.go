@@ -1,9 +1,11 @@
 package deploy
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -310,6 +312,128 @@ func TestSweepRenameAsideLeftovers_BusyFileIsIgnored(t *testing.T) {
 	}
 }
 
+func TestTempBuildName(t *testing.T) {
+	got := TempBuildName(filepath.Join("C:", "bin", "crush.exe"), "1234-567")
+	want := filepath.Join("C:", "bin", "crush.exe") + ".new-1234-567"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+	// Distinct tokens must yield distinct temp paths so concurrent
+	// deploys never share a temp file.
+	if TempBuildName("/bin/crush", "1") == TempBuildName("/bin/crush", "2") {
+		t.Errorf("distinct tokens produced the same temp path")
+	}
+}
+
+func TestSwapRenameAside_Success(t *testing.T) {
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "crush.exe")
+	aside := RenameAsideName(dst, "tok")
+	tmp := TempBuildName(dst, "tok")
+	writeFileBytes(t, dst, []byte("old-binary"))
+	writeFileBytes(t, tmp, []byte("new-binary"))
+
+	if err := SwapRenameAside(os.Rename, tmp, dst, aside); err != nil {
+		t.Fatalf("expected success, got: %v", err)
+	}
+	assertContents(t, dst, []byte("new-binary"))
+	assertContents(t, aside, []byte("old-binary"))
+	if _, err := os.Stat(tmp); !os.IsNotExist(err) {
+		t.Fatalf("expected temp file to be renamed into dst (gone), stat err: %v", err)
+	}
+}
+
+// TestSwapRenameAside_SecondRenameFailsRestored is the core fault-
+// injection test for issue #127: it makes the SECOND rename (tmp → dst,
+// the one that runs AFTER the old binary was already moved to aside)
+// fail, and asserts the old binary is rolled back to dst so the operator
+// is never left with a missing binary. The first rename (dst → aside) is
+// exercised via real os.Rename; only the second is faulted, matching the
+// real-world cause (an antivirus transiently locking the freshly written
+// tmp on Windows). rename is injected rather than relying on real OS file
+// locking because making os.Rename fail at exactly this step is not
+// deterministically reproducible across CI runners.
+func TestSwapRenameAside_SecondRenameFailsRestored(t *testing.T) {
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "crush.exe")
+	aside := RenameAsideName(dst, "tok")
+	tmp := TempBuildName(dst, "tok")
+	writeFileBytes(t, dst, []byte("old-binary"))
+	writeFileBytes(t, tmp, []byte("new-binary"))
+
+	faulted := false
+	rename := func(old, new string) error {
+		if old == tmp && new == dst {
+			faulted = true
+			return errors.New("fault: antivirus locked the freshly written tmp")
+		}
+		return os.Rename(old, new)
+	}
+
+	err := SwapRenameAside(rename, tmp, dst, aside)
+	if err == nil {
+		t.Fatal("expected an error because the second rename was faulted")
+	}
+	if !faulted {
+		t.Fatal("the faulted second-rename path was never exercised")
+	}
+	// CRITICAL assertion: dst must hold the OLD binary again, not be
+	// missing. This is the exact regression #127 fixes.
+	assertContents(t, dst, []byte("old-binary"))
+	// aside was moved back to dst, so it must be gone.
+	if _, err := os.Stat(aside); !os.IsNotExist(err) {
+		t.Fatalf("expected aside to be restored back onto dst (gone), stat err: %v", err)
+	}
+	if !strings.Contains(err.Error(), "restored") {
+		t.Errorf("error should report the binary was restored, got: %v", err)
+	}
+}
+
+// TestSwapRenameAside_RestoreAlsoFails covers the catastrophic tail:
+// both the second rename AND the rollback fail, leaving dst missing and
+// the old binary stranded at aside. The function cannot recover, but it
+// MUST return an error naming BOTH paths so the operator can manually
+// move aside back to dst.
+func TestSwapRenameAside_RestoreAlsoFails(t *testing.T) {
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "crush.exe")
+	aside := RenameAsideName(dst, "tok")
+	tmp := TempBuildName(dst, "tok")
+	writeFileBytes(t, dst, []byte("old-binary"))
+	writeFileBytes(t, tmp, []byte("new-binary"))
+
+	rename := func(old, new string) error {
+		switch {
+		case old == dst && new == aside:
+			return os.Rename(old, new) // rename-aside succeeds
+		case old == tmp && new == dst:
+			return errors.New("fault: second rename blocked")
+		case old == aside && new == dst:
+			return errors.New("fault: restore blocked")
+		}
+		return os.Rename(old, new)
+	}
+
+	err := SwapRenameAside(rename, tmp, dst, aside)
+	if err == nil {
+		t.Fatal("expected an error when both rename and restore fail")
+	}
+	// dst is missing — nothing could be put back.
+	if _, statErr := os.Stat(dst); !os.IsNotExist(statErr) {
+		t.Fatalf("expected dst to be missing after restore failure, stat err: %v", statErr)
+	}
+	// The old binary is stranded at aside.
+	assertContents(t, aside, []byte("old-binary"))
+	// Error MUST name both paths for manual recovery.
+	msg := err.Error()
+	if !strings.Contains(msg, aside) {
+		t.Errorf("error must name the aside path %q for manual recovery, got: %v", aside, err)
+	}
+	if !strings.Contains(msg, dst) {
+		t.Errorf("error must name the dst path %q for manual recovery, got: %v", dst, err)
+	}
+}
+
 func TestNpmNodeOS(t *testing.T) {
 	cases := []struct {
 		goos string
@@ -381,4 +505,24 @@ func writeExe(t *testing.T, p string) string {
 		t.Fatalf("write %s: %v", p, err)
 	}
 	return p
+}
+
+// writeFileBytes writes contents to p (or fails the test). Test helper.
+func writeFileBytes(t *testing.T, p string, contents []byte) {
+	t.Helper()
+	if err := os.WriteFile(p, contents, 0o755); err != nil {
+		t.Fatalf("write %s: %v", p, err)
+	}
+}
+
+// assertContents fails the test unless p holds exactly want. Test helper.
+func assertContents(t *testing.T, p string, want []byte) {
+	t.Helper()
+	got, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatalf("read %s: %v", p, err)
+	}
+	if string(got) != string(want) {
+		t.Fatalf("%s holds %q, want %q", p, got, want)
+	}
 }

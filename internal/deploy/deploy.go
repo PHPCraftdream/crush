@@ -32,6 +32,59 @@ func RenameAsideName(dst, token string) string {
 	return dst + ".old-" + token
 }
 
+// TempBuildName returns the temp path deploy.go's replaceFile writes the
+// freshly built binary to before renaming it into dst's slot. The token
+// (normally the same process-unique token used for the rename-aside name)
+// makes the path unique per deploy, so two concurrent `go run deploy.go`
+// invocations — or a deploy overlapping the npm wrapper's own copy — do
+// not write to a single shared "dst.new" file and clobber each other's
+// partial copy. Pure function over its inputs — unit-testable.
+func TempBuildName(dst, token string) string {
+	return dst + ".new-" + token
+}
+
+// SwapRenameAside performs the rename-aside swap deploy.go's replaceFile
+// uses once a straight rename-over-dst has been refused (dst exists and,
+// on Windows, is busy): move the existing dst out of the way to aside,
+// then move the freshly written tmp into dst's slot. It is the second
+// step — moving tmp into the now-freed dst — that this function guards.
+//
+// If moving tmp into dst fails (e.g. an antivirus transiently locks the
+// freshly created tmp on Windows), dst would be left MISSING: the old
+// binary was already moved to aside in the first step, and the new one
+// never arrived. To avoid leaving the operator without a working binary,
+// SwapRenameAside immediately attempts to move aside back to dst. The
+// caller (deploy.go) passes os.Rename as rename; tests pass a fault-
+// injecting rename to exercise the rollback deterministically on every
+// OS, since making the real os.Rename fail at exactly this step is not
+// reliably reproducible.
+//
+// Returns:
+//   - nil on success: the new binary is at dst, the old one at aside.
+//   - a non-nil error if the second rename failed but the old binary was
+//     restored from aside to dst (dst is whole again — the failed deploy
+//     left things exactly as they were; the operator can rerun).
+//   - a composite error naming BOTH aside and dst if the restore-back
+//     ALSO failed: dst is now missing and the old binary is stranded at
+//     aside. This is the rare catastrophic case (two distinct transient
+//     locks); the error names both paths so recovery is a single move.
+func SwapRenameAside(rename func(old, new string) error, tmp, dst, aside string) error {
+	if err := rename(dst, aside); err != nil {
+		return fmt.Errorf("rename-aside %s → %s: %w", dst, aside, err)
+	}
+	if err := rename(tmp, dst); err != nil {
+		// dst is now EMPTY — the old binary is stranded at aside. Try to
+		// put it back so the operator is not left without a working crush.
+		if rerr := rename(aside, dst); rerr != nil {
+			return fmt.Errorf("rename %s → %s after rename-aside failed: %v; restore %s → %s ALSO failed — dst %s is now MISSING, recover manually by moving %s back to %s: %w", tmp, dst, err, aside, dst, dst, aside, dst, rerr)
+		}
+		// Restored: dst holds the old binary again. Surface the original
+		// failure so the caller knows the deploy did not take.
+		return fmt.Errorf("rename %s → %s after rename-aside failed (old binary restored to %s from %s): %w", tmp, dst, dst, aside, err)
+	}
+	return nil
+}
+
 // SweepRenameAsideLeftovers best-effort deletes leftover rename-aside
 // files next to dst from previous deploys: both the ".old-<token>" files
 // this package creates (via RenameAsideName) and the legacy ".bak-*"
