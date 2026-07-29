@@ -33,7 +33,7 @@ func insertSession(t *testing.T, conn *sql.DB, id, parentID string, createdAt, u
 	if parentID != "" {
 		parent = sql.NullString{String: parentID, Valid: true}
 	}
-	_, err := conn.Exec(
+	_, err := conn.ExecContext(t.Context(),
 		`INSERT INTO sessions (id, parent_session_id, title, updated_at, created_at)
 		 VALUES (?, ?, ?, ?, ?)`,
 		id, parent, "test session", updatedAt, createdAt,
@@ -46,7 +46,7 @@ func insertSession(t *testing.T, conn *sql.DB, id, parentID string, createdAt, u
 // strftime('%s','now')) for the same determinism reason as insertSession.
 func insertMessage(t *testing.T, conn *sql.DB, sessionID, role string, createdAt, updatedAt int64) {
 	t.Helper()
-	_, err := conn.Exec(
+	_, err := conn.ExecContext(t.Context(),
 		`INSERT INTO messages (id, session_id, role, parts, created_at, updated_at)
 		 VALUES (?, ?, ?, '[]', ?, ?)`,
 		uuid.NewString(), sessionID, role, createdAt, updatedAt,
@@ -99,13 +99,13 @@ func TestGetCallTreeActivity_UsesUpdatedAtWhenNewer(t *testing.T) {
 	insertSession(t, conn, root, "", 100, 100)
 
 	// Older message, but edited (updated_at bumped) after the newer-created one.
-	_, err := conn.Exec(
+	_, err := conn.ExecContext(ctx,
 		`INSERT INTO messages (id, session_id, role, parts, created_at, updated_at) VALUES (?, ?, 'assistant', '[]', 100, 500)`,
 		uuid.NewString(), root,
 	)
 	require.NoError(t, err)
 	// Newer-created message, never edited.
-	_, err = conn.Exec(
+	_, err = conn.ExecContext(ctx,
 		`INSERT INTO messages (id, session_id, role, parts, created_at, updated_at) VALUES (?, ?, 'user', '[]', 300, 300)`,
 		uuid.NewString(), root,
 	)
@@ -303,14 +303,14 @@ func TestGetCallTreeActivity_WideTree(t *testing.T) {
 	require.NoError(t, err)
 	for i := 0; i < childCount; i++ {
 		id := uuid.NewString()
-		_, err := tx.Exec(
+		_, err := tx.ExecContext(ctx,
 			`INSERT INTO sessions (id, parent_session_id, title, updated_at, created_at)
 			 VALUES (?, ?, 'wide', 100, 100)`,
 			id, root,
 		)
 		require.NoError(t, err)
 		// Each child's activity is strictly increasing; the last child wins.
-		_, err = tx.Exec(
+		_, err = tx.ExecContext(ctx,
 			`INSERT INTO messages (id, session_id, role, parts, created_at, updated_at)
 			 VALUES (?, ?, 'assistant', '[]', ?, ?)`,
 			uuid.NewString(), id, int64(200+i), int64(200+i),

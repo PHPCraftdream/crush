@@ -638,11 +638,11 @@ func TestFileMatchesCallbackCollectsAll(t *testing.T) {
 // parsing differences between this and searchWithRipgrep are immaterial to
 // what's being proven (the pipe-draining contract).
 func TestScanThenWaitPattern_DrainsOnScanErrorInsteadOfHanging(t *testing.T) {
+	t.Parallel()
 	rgPath, lookErr := exec.LookPath("rg")
 	if lookErr != nil {
 		t.Skip("rg is not in $PATH")
 	}
-	t.Parallel()
 	tempDir := t.TempDir()
 
 	// One line comfortably past the 4 MiB scanner buffer, followed by

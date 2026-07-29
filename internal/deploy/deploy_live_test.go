@@ -120,7 +120,7 @@ func TestReplaceFile_LiveWindowsProcess(t *testing.T) {
 	removed := SweepRenameAsideLeftovers(dst)
 	if len(removed) != 1 || removed[0] != aside {
 		time.Sleep(300 * time.Millisecond)
-		removed = SweepRenameAsideLeftovers(dst)
+		_ = SweepRenameAsideLeftovers(dst)
 	}
 	if _, err := os.Stat(aside); !os.IsNotExist(err) {
 		t.Fatalf("expected rename-aside leftover to be removable after process exit, still present (stat err: %v)", err)
@@ -147,7 +147,7 @@ func buildSleeper(t *testing.T, outPath string) {
 	}
 	pkgDir := filepath.Join(filepath.Dir(thisFile), "testdata", "sleeper")
 
-	cmd := exec.Command("go", "build", "-o", outPath, ".")
+	cmd := exec.CommandContext(t.Context(), "go", "build", "-o", outPath, ".")
 	cmd.Dir = pkgDir
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("building testdata/sleeper failed: %v\n%s", err, out)
