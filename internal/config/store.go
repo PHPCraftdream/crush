@@ -279,6 +279,21 @@ func (s *ConfigStore) withConfigWriteLock(path string, fn func() error) error {
 	if err != nil {
 		return fmt.Errorf("failed to lock config file %q: %w", path, err)
 	}
+	// Deliberately NOT calling os.Remove on the sidecar after Release: the
+	// lock file is left on disk permanently by design, not cleaned up here.
+	// A remove-after-release would race a concurrent process that has
+	// already reopened/relocked the same path between our unlock and the
+	// remove — on POSIX that's harmless (flock is keyed off the inode, so
+	// unlinking a path while another process holds an open fd to the old
+	// inode doesn't disturb that process's lock), but on Windows it is not:
+	// os.OpenFile here does not pass FILE_SHARE_DELETE, so a concurrent
+	// holder's open handle would make our os.Remove fail with a sharing
+	// violation, and even if it succeeded, deleting the path out from under
+	// a process that just resolved it for LockFileEx risks the next opener
+	// creating a distinct, unrelated file object at the same path while the
+	// old one is still locked — reintroducing exactly the split-brain this
+	// lock exists to prevent. Leaving a handful of empty *.lock sidecars
+	// next to crush.json is a one-time, bounded cost; deleting them is not.
 	defer lock.Release()
 	return fn()
 }
@@ -290,6 +305,23 @@ func (s *ConfigStore) SetConfigField(scope Scope, key string, value any) error {
 	return s.SetConfigFields(scope, map[string]any{key: value})
 }
 
+// SetConfigFields sets multiple key/value pairs in the config file for the
+// given scope in a single read-modify-write, so callers that need to persist
+// several keys at once (e.g. UpdatePreferredModels) get one atomic on-disk
+// write instead of one per key. Keys are applied in sorted order so the
+// resulting JSON is deterministic regardless of map iteration order, keeping
+// crush.json diffs stable across runs.
+//
+// The read-modify-write cycle is protected at two levels: an in-process
+// diskWriteMu (serialises concurrent goroutines within this ConfigStore) and
+// an inter-process OS-level file lock on a path+".lock" sidecar, acquired via
+// withConfigWriteLock (backed by session.FileLock — flock on POSIX,
+// LockFileEx on Windows). The in-process mutex alone cannot prevent two
+// separate `crush` processes sharing the same crush.json from each reading
+// the pre-write file, applying only their own keys, and the second
+// atomicWriteFile silently clobbering the first — the file lock closes that
+// cross-process gap. After a successful write, it automatically reloads
+// config to keep in-memory state fresh.
 func (s *ConfigStore) SetConfigFields(scope Scope, kv map[string]any) error {
 	path, err := s.configPath(scope)
 	if err != nil {
@@ -346,6 +378,15 @@ func (s *ConfigStore) SetConfigFields(scope Scope, kv map[string]any) error {
 	return nil
 }
 
+// RemoveConfigField deletes a single key from the config file for the given
+// scope (e.g. removing a stored provider API key). Like SetConfigFields, the
+// on-disk read-modify-write is protected at two levels: the in-process
+// diskWriteMu and an inter-process OS-level file lock on a path+".lock"
+// sidecar acquired via withConfigWriteLock (backed by session.FileLock —
+// flock on POSIX, LockFileEx on Windows), so two separate `crush` processes
+// racing to edit the same crush.json cannot silently clobber each other's
+// change. After a successful write, it automatically reloads config to keep
+// in-memory state fresh.
 func (s *ConfigStore) RemoveConfigField(scope Scope, key string) error {
 	path, err := s.configPath(scope)
 	if err != nil {

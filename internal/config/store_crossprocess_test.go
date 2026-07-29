@@ -113,21 +113,40 @@ func TestUnprotectedRMW_DeterministicallyLosesUpdate(t *testing.T) {
 
 	// Phase 2: both write from their own (stale, identical) read. Each write
 	// is a full overwrite, so the second clobbers the first.
+	//
+	// Errors are collected on a channel rather than asserted with
+	// require.NoError inside the goroutines themselves: testing.T's
+	// FailNow/Fatal (which require.NoError calls on failure) is documented
+	// to be safe only from the test's own goroutine — calling it from a
+	// goroutine spawned by the test is undefined behavior and can hang or
+	// misbehave. So each goroutine only sends its error (nil on success)
+	// and every assertion happens back in the main test goroutine below.
+	errCh := make(chan error, 2)
 	var writeWg sync.WaitGroup
 	writeWg.Add(2)
 	go func() {
 		defer writeWg.Done()
 		out, err := sjson.Set(string(readA), "options.tui.theme", "dark")
-		require.NoError(t, err)
-		require.NoError(t, os.WriteFile(configPath, []byte(out), 0o600))
+		if err != nil {
+			errCh <- err
+			return
+		}
+		errCh <- os.WriteFile(configPath, []byte(out), 0o600)
 	}()
 	go func() {
 		defer writeWg.Done()
 		out, err := sjson.Set(string(readB), "options.tui.compact_mode", true)
-		require.NoError(t, err)
-		require.NoError(t, os.WriteFile(configPath, []byte(out), 0o600))
+		if err != nil {
+			errCh <- err
+			return
+		}
+		errCh <- os.WriteFile(configPath, []byte(out), 0o600)
 	}()
 	writeWg.Wait()
+	close(errCh)
+	for err := range errCh {
+		require.NoError(t, err)
+	}
 
 	data, err := os.ReadFile(configPath)
 	require.NoError(t, err)

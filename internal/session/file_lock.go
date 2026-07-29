@@ -31,6 +31,20 @@ type FileLock struct {
 }
 
 // Release unlocks and closes the lock file. Safe to call on nil.
+//
+// Deliberately does NOT os.Remove the sidecar file at l.Path — the lock file
+// is left on disk permanently by design. Removing it here would race a
+// concurrent process that acquires the lock (reopens/relocks the same path)
+// between this unlock and the remove: on POSIX that race is harmless (flock
+// is keyed off the inode, so unlinking the path doesn't disturb a
+// still-open fd to the old inode), but on Windows it is not — the file is
+// opened without FILE_SHARE_DELETE, so a concurrent holder's open handle
+// would make the remove fail with a sharing violation, and even a
+// successful delete risks a subsequent opener creating a distinct file
+// object at the same path while an older one is still locked, which can
+// reintroduce the exact split-brain this lock exists to prevent. Leaving a
+// handful of empty *.lock sidecars on disk is a one-time, bounded cost;
+// deleting them is not worth the cross-platform risk.
 func (l *FileLock) Release() error {
 	if l == nil || l.f == nil {
 		return nil
