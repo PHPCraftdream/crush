@@ -591,67 +591,17 @@ func handleForkSession(ctx context.Context, a *appPkg.App, c *Client, msg WSMess
 		return
 	}
 
-	// Load source session
-	src, err := a.Sessions.Get(ctx, p.SessionID)
-	if err != nil {
-		c.reply(msg.ID, EventError, nil, err.Error())
-		return
-	}
-
-	title := p.Title
-	if title == "" {
-		title = src.Title + " fork"
-	}
-
-	// Create the new (forked) session
-	fork, err := a.Sessions.Create(ctx, title)
+	// ForkSession performs the clone atomically in one DB transaction: the
+	// new session row plus every copied message commit together or not at
+	// all, so a midway failure surfaces as an explicit error rather than a
+	// half-built fork the client mistakes for a complete one.
+	fork, err := a.Sessions.ForkSession(ctx, p.SessionID, p.Title)
 	if err != nil {
 		c.reply(msg.ID, EventError, nil, err.Error())
 		return
 	}
 	// Web sessions never prompt for permissions — arm auto-approve at birth.
 	autoApproveWebSession(a, fork.ID)
-
-	// Copy models from source
-	if src.LargeModelProvider != "" || src.SmallModelProvider != "" {
-		_ = a.Sessions.UpdateModels(
-			ctx, fork.ID,
-			src.LargeModelProvider, src.LargeModelID,
-			src.SmallModelProvider, src.SmallModelID,
-		)
-	}
-
-	// Copy system prompt from source
-	if src.SystemPrompt != "" {
-		_ = a.Sessions.UpdateSystemPrompt(ctx, fork.ID, src.SystemPrompt)
-	}
-
-	// Copy todos from source
-	if len(src.Todos) > 0 {
-		_ = a.Sessions.SetTodos(ctx, fork.ID, src.Todos, nil)
-	}
-
-	// Re-fetch fork to get fully updated state
-	if updated, err2 := a.Sessions.Get(ctx, fork.ID); err2 == nil {
-		fork = updated
-	}
-
-	// Copy all messages from source session
-	msgs, err := a.Messages.List(ctx, p.SessionID)
-	if err != nil {
-		c.reply(msg.ID, EventError, nil, err.Error())
-		return
-	}
-	for _, m := range msgs {
-		_, _ = a.Messages.Create(ctx, fork.ID, message.CreateMessageParams{
-			Role:             message.MessageRole(m.Role),
-			Parts:            m.Parts,
-			Model:            string(m.Model),
-			Provider:         m.Provider,
-			ReasoningEffort:  m.ReasoningEffort,
-			IsSummaryMessage: m.IsSummaryMessage,
-		})
-	}
 
 	// Broadcast so all tabs see the fork and switch to it
 	c.hub.Broadcast(EventSessionCreated, fork)

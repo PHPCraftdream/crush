@@ -74,7 +74,9 @@ func newTestDB(t *testing.T) (*sql.DB, *db.Queries) {
 			finished_at INTEGER,
 			is_summary_message INTEGER NOT NULL DEFAULT 0,
 			pinned INTEGER NOT NULL DEFAULT 0,
-			hidden INTEGER NOT NULL DEFAULT 0
+			hidden INTEGER NOT NULL DEFAULT 0,
+			auto_resumed INTEGER NOT NULL DEFAULT 0,
+			background_job_notice INTEGER NOT NULL DEFAULT 0
 		);
 
 		CREATE TABLE files (
@@ -613,4 +615,119 @@ func TestBroadOverwriteLosesConcurrentUsage(t *testing.T) {
 	assert.Equal(t, "renamed", got.Title, "title should have been renamed")
 	assert.Equal(t, int64(0), got.PromptTokens,
 		"broad read-modify-write overwriting all columns MUST have clobbered the concurrent usage update — if this is 111 the test is no longer reproducing the old bug")
+}
+
+func countMsgsForSession(t *testing.T, ctx context.Context, sqlDB *sql.DB, sessionID string) int64 {
+	t.Helper()
+	var n int64
+	require.NoError(t, sqlDB.QueryRowContext(ctx, `SELECT COUNT(*) FROM messages WHERE session_id = ?`, sessionID).Scan(&n))
+	return n
+}
+
+func countAllSessions(t *testing.T, ctx context.Context, sqlDB *sql.DB) int64 {
+	t.Helper()
+	var n int64
+	require.NoError(t, sqlDB.QueryRowContext(ctx, `SELECT COUNT(*) FROM sessions`).Scan(&n))
+	return n
+}
+
+// TestForkSession_HappyPath verifies the transactional fork clones the
+// source session's models, system prompt, todos, and EVERY message into a
+// new session.
+func TestForkSession_HappyPath(t *testing.T) {
+	t.Parallel()
+	sqlDB, q := newTestDB(t)
+	svc := NewService(q, sqlDB)
+	ctx := t.Context()
+
+	src, err := svc.Create(ctx, "source")
+	require.NoError(t, err)
+	require.NoError(t, svc.UpdateModels(ctx, src.ID, "provL", "modelL", "provS", "modelS"))
+	require.NoError(t, svc.UpdateSystemPrompt(ctx, src.ID, "be careful"))
+	require.NoError(t, svc.SetTodos(ctx, src.ID, []Todo{{Content: "do thing", Status: TodoStatusPending}}, nil))
+
+	// Seed three messages with distinguishable parts and deterministic order.
+	seedRoles := []string{"user", "assistant", "user"}
+	seedParts := []string{
+		`[{"type":"text","data":{"text":"a"}}]`,
+		`[{"type":"text","data":{"text":"b"}}]`,
+		`[{"type":"text","data":{"text":"c"}}]`,
+	}
+	for i := range seedRoles {
+		_, err := sqlDB.ExecContext(ctx,
+			`INSERT INTO messages (id, session_id, role, parts, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`,
+			uuid.NewString(), src.ID, seedRoles[i], seedParts[i], 100+i, 100+i)
+		require.NoError(t, err)
+	}
+	require.EqualValues(t, 3, countMsgsForSession(t, ctx, sqlDB, src.ID))
+
+	fork, err := svc.ForkSession(ctx, src.ID, "")
+	require.NoError(t, err)
+	require.NotEqual(t, src.ID, fork.ID)
+	require.Equal(t, "source fork", fork.Title)
+	require.Equal(t, "provL", fork.LargeModelProvider)
+	require.Equal(t, "modelS", fork.SmallModelID)
+	require.Equal(t, "be careful", fork.SystemPrompt)
+	require.Len(t, fork.Todos, 1)
+
+	require.EqualValues(t, 3, countMsgsForSession(t, ctx, sqlDB, fork.ID))
+
+	rows, err := q.ListMessagesBySession(ctx, fork.ID)
+	require.NoError(t, err)
+	require.Len(t, rows, 3)
+	require.Equal(t, "user", rows[0].Role)
+	require.Equal(t, "assistant", rows[1].Role)
+	require.Equal(t, "user", rows[2].Role)
+	require.Equal(t, seedParts[0], rows[0].Parts)
+}
+
+// TestForkSession_MidwayFailureRollsBack arms a trigger that aborts the
+// copy of a sentinel-role message placed AFTER two normal messages, then
+// asserts the ENTIRE fork (new session row + every copied message) is rolled
+// back and the caller receives the error — no partial fork survives.
+func TestForkSession_MidwayFailureRollsBack(t *testing.T) {
+	t.Parallel()
+	sqlDB, q := newTestDB(t)
+	svc := NewService(q, sqlDB)
+	ctx := t.Context()
+
+	src, err := svc.Create(ctx, "source")
+	require.NoError(t, err)
+
+	// Two normal messages (copied first), then a sentinel message whose role
+	// trips the trigger. created_at orders ListMessagesBySession so the
+	// sentinel is reached only after the normal copies succeed.
+	for i, role := range []string{"user", "assistant", "TRIPWIRE"} {
+		_, err := sqlDB.ExecContext(ctx,
+			`INSERT INTO messages (id, session_id, role, parts, created_at, updated_at) VALUES (?, ?, ?, '[]', ?, ?)`,
+			uuid.NewString(), src.ID, role, 100+i, 100+i)
+		require.NoError(t, err)
+	}
+
+	// Arm the tripwire AFTER seeding the source so seeding is not aborted.
+	// The BEFORE INSERT trigger fires (and aborts) only when ForkSession
+	// copies the TRIPWIRE message.
+	_, err = sqlDB.ExecContext(ctx, `
+		CREATE TRIGGER tripwire_before_insert
+		BEFORE INSERT ON messages
+		WHEN new.role = 'TRIPWIRE'
+		BEGIN
+			SELECT RAISE(ABORT, 'injected midway copy failure');
+		END`)
+	require.NoError(t, err)
+
+	beforeSessions := countAllSessions(t, ctx, sqlDB)
+	beforeSrcMsgs := countMsgsForSession(t, ctx, sqlDB, src.ID)
+
+	_, err = svc.ForkSession(ctx, src.ID, "should-not-survive")
+	require.Error(t, err, "midway copy failure must surface as an error to the caller")
+
+	// No new session row committed: total session count unchanged.
+	require.Equal(t, beforeSessions, countAllSessions(t, ctx, sqlDB), "fork session must not survive a rolled-back fork")
+	// Source is untouched.
+	require.Equal(t, beforeSrcMsgs, countMsgsForSession(t, ctx, sqlDB, src.ID), "source messages must be untouched")
+	// No orphan messages reference any non-source session.
+	var orphanCount int64
+	require.NoError(t, sqlDB.QueryRowContext(ctx, `SELECT COUNT(*) FROM messages WHERE session_id != ?`, src.ID).Scan(&orphanCount))
+	require.Zero(t, orphanCount, "no partial fork messages may remain after rollback")
 }

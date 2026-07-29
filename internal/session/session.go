@@ -163,6 +163,13 @@ type Service interface {
 	UpdateSystemPrompt(ctx context.Context, sessionID, prompt string) error
 	Rename(ctx context.Context, id string, title string) error
 	Delete(ctx context.Context, id string) error
+	// ForkSession clones srcID into a brand-new session in a single DB
+	// transaction: it creates a fresh session row and copies the source's
+	// models, system prompt, todos, and every message. A failure at any
+	// point rolls back the whole clone so no half-built fork is left for a
+	// client to see; the caller receives the error instead. If title is
+	// empty it defaults to "<src title> fork". Returns the committed fork.
+	ForkSession(ctx context.Context, srcID, title string) (Session, error)
 
 	// CancelRequested flag: cross-process cancel signal.
 	RequestCancel(ctx context.Context, sessionID string) error
@@ -299,6 +306,106 @@ func (s *service) Delete(ctx context.Context, id string) error {
 	session := s.fromDBItem(dbSession)
 	s.Publish(pubsub.DeletedEvent, session)
 	return nil
+}
+
+// ForkSession clones srcID into a brand-new session in a single DB
+// transaction. It creates a fresh session row, copies the source's models,
+// system prompt, and todos, and copies every message verbatim — all inside
+// one tx so a failure at any point (e.g. the Nth message copy) rolls back
+// the new session row and every message copied so far. The caller gets an
+// error and no half-built fork is left behind. Mirrors the transactional
+// shape of Delete and TransferChildCostToParent.
+func (s *service) ForkSession(ctx context.Context, srcID, title string) (Session, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Session{}, fmt.Errorf("begin fork transaction: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	qtx := s.q.WithTx(tx)
+
+	// Read the source inside the tx so the copy is consistent with itself.
+	src, err := qtx.GetSessionByID(ctx, srcID)
+	if err != nil {
+		return Session{}, fmt.Errorf("load source session: %w", err)
+	}
+
+	resolvedTitle := title
+	if resolvedTitle == "" {
+		resolvedTitle = src.Title + " fork"
+	}
+
+	forkID := uuid.New().String()
+	if _, err := qtx.CreateSession(ctx, db.CreateSessionParams{
+		ID:    forkID,
+		Title: resolvedTitle,
+	}); err != nil {
+		return Session{}, fmt.Errorf("create forked session: %w", err)
+	}
+
+	// Copy the source's model selection, system prompt, and todos onto the
+	// fork via column-scoped UPDATEs routed through qtx so they share the tx.
+	if err := qtx.UpdateSessionModels(ctx, db.UpdateSessionModelsParams{
+		LargeModelProvider: src.LargeModelProvider,
+		LargeModelID:       src.LargeModelID,
+		SmallModelProvider: src.SmallModelProvider,
+		SmallModelID:       src.SmallModelID,
+		ID:                 forkID,
+	}); err != nil {
+		return Session{}, fmt.Errorf("copy models into fork: %w", err)
+	}
+	if err := qtx.UpdateSessionSystemPrompt(ctx, db.UpdateSessionSystemPromptParams{
+		SystemPrompt: src.SystemPrompt,
+		ID:           forkID,
+	}); err != nil {
+		return Session{}, fmt.Errorf("copy system prompt into fork: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE sessions SET todos = ?, deleted_todos = ?, updated_at = strftime('%s', 'now') WHERE id = ?`,
+		src.Todos,
+		src.DeletedTodos,
+		forkID,
+	); err != nil {
+		return Session{}, fmt.Errorf("copy todos into fork: %w", err)
+	}
+
+	// Copy every message verbatim. Parts is carried across as the raw JSON
+	// blob (no decode/re-encode round-trip), so the fork is a faithful copy
+	// of the source history. Any copy error aborts the whole transaction.
+	srcMsgs, err := qtx.ListMessagesBySession(ctx, srcID)
+	if err != nil {
+		return Session{}, fmt.Errorf("list source messages: %w", err)
+	}
+	for _, m := range srcMsgs {
+		if _, err := qtx.CreateMessage(ctx, db.CreateMessageParams{
+			ID:                  uuid.New().String(),
+			SessionID:           forkID,
+			Role:                m.Role,
+			Parts:               m.Parts,
+			Model:               m.Model,
+			Provider:            m.Provider,
+			ReasoningEffort:     m.ReasoningEffort,
+			IsSummaryMessage:    m.IsSummaryMessage,
+			Hidden:              m.Hidden,
+			AutoResumed:         m.AutoResumed,
+			BackgroundJobNotice: m.BackgroundJobNotice,
+		}); err != nil {
+			return Session{}, fmt.Errorf("copy message into fork: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return Session{}, fmt.Errorf("commit fork transaction: %w", err)
+	}
+
+	// Re-read the committed fork to return its final, fully-populated state.
+	fork, err := s.q.GetSessionByID(ctx, forkID)
+	if err != nil {
+		return Session{}, fmt.Errorf("reload forked session: %w", err)
+	}
+	sess := s.fromDBItem(fork)
+	s.Publish(pubsub.CreatedEvent, sess)
+	return sess, nil
 }
 
 func (s *service) Get(ctx context.Context, id string) (Session, error) {

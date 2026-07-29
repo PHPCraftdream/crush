@@ -130,6 +130,10 @@ func (m *mockSessionService) Delete(context.Context, string) error {
 	return nil
 }
 
+func (m *mockSessionService) ForkSession(_ context.Context, _ string, title string) (session.Session, error) {
+	return session.Session{ID: "forked-session-id", Title: title}, nil
+}
+
 func (m *mockSessionService) CreateAgentToolSessionID(messageID, toolCallID string) string {
 	return fmt.Sprintf("%s$$%s", messageID, toolCallID)
 }
