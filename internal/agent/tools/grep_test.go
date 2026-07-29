@@ -950,3 +950,71 @@ func TestReadBoundedLineHonoursContextCancellation(t *testing.T) {
 			"(it read the whole pathological line instead of honouring ctx)")
 	}
 }
+
+// TestFileMatchesDoesNotReportSpuriousMatchOnCancelledPartialLine proves that
+// when readBoundedLine surfaces a non-EOF error (context cancellation fired
+// mid-line by its in-line ~64 KiB cadence, see #135), fileMatches must not
+// call onMatch against the partial line buffered so far — even when a real
+// pattern match sits in the bytes already read. Before the fix, fileMatches
+// ran pattern.FindStringIndex on the partial line before checking rerr, so a
+// match in the already-read prefix of a huge, never-terminated line was
+// reported right before the cancellation error was returned.
+func TestFileMatchesDoesNotReportSpuriousMatchOnCancelledPartialLine(t *testing.T) {
+	t.Parallel()
+	tempDir := t.TempDir()
+
+	// A single line, no newline, with a real match in its first bytes,
+	// followed by many MiB of filler. readBoundedLine buffers the match
+	// (and returns truncated=true well before EOF) long before the whole
+	// line — or a full read — completes, so a short deadline is guaranteed
+	// to land mid-line, after the match is already sitting in lineBuf.
+	const needle = "needle-match-XYZ"
+	huge := needle + " " + strings.Repeat("x", 16*1024*1024) // 16 MiB
+	path := filepath.Join(tempDir, "huge-with-early-match.txt")
+	require.NoError(t, os.WriteFile(path, []byte(huge), 0o644))
+
+	re := regexp.MustCompile(needle)
+
+	// Baseline: an uninterrupted full read of the single huge line.
+	fullStart := time.Now()
+	var baselineCalls int
+	require.NoError(t, fileMatches(context.Background(), path, re, func(lineMatch) bool {
+		baselineCalls++
+		return true
+	}))
+	fullElapsed := time.Since(fullStart)
+	require.Equal(t, 1, baselineCalls, "sanity check: the needle must be a real, findable match")
+	t.Logf("full read of 16 MiB single-line file took %s", fullElapsed)
+
+	// Deadline short enough that the read must still be in progress, so
+	// readBoundedLine's mid-line cadence (every ~64 KiB) fires the
+	// cancellation while the needle is already buffered but the line isn't
+	// finished (no io.EOF yet).
+	deadline := fullElapsed / 4
+	if deadline < 5*time.Millisecond {
+		deadline = 5 * time.Millisecond
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), deadline)
+	defer cancel()
+
+	var onMatchCalls int
+	done := make(chan error, 1)
+	go func() {
+		done <- fileMatches(ctx, path, re, func(lineMatch) bool {
+			onMatchCalls++
+			return true
+		})
+	}()
+
+	select {
+	case err := <-done:
+		require.Error(t, err)
+		require.ErrorIs(t, err, context.DeadlineExceeded,
+			"fileMatches must surface the cancellation error, got %v", err)
+		require.Equal(t, 0, onMatchCalls,
+			"a match found only in a partial, not-fully-read line must not reach onMatch "+
+				"when the read was aborted by context cancellation")
+	case <-time.After(10 * time.Second):
+		t.Fatal("fileMatches did not return within 10s of the context deadline")
+	}
+}

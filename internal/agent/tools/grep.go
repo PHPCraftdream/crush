@@ -526,6 +526,16 @@ func fileMatches(ctx context.Context, filePath string, pattern *regexp.Regexp, o
 		truncated, rerr := readBoundedLine(ctx, reader, &lineBuf, maxFallbackLineBytes)
 		lineNum++
 
+		// A non-EOF error (e.g. context cancellation surfaced mid-line by
+		// readBoundedLine's in-line cadence, or a real I/O error) means buf
+		// holds a partial, not-fully-read line: matching against it could
+		// report a spurious/truncated hit to onMatch right before the error
+		// is returned. Only io.EOF is a legitimate "line complete" case for a
+		// final line with no trailing '\n' — that one must still be matched.
+		if rerr != nil && rerr != io.EOF {
+			return rerr
+		}
+
 		line := lineBuf.String()
 		line = strings.TrimSuffix(line, "\r")
 		if loc := pattern.FindStringIndex(line); loc != nil {
@@ -544,9 +554,6 @@ func fileMatches(ctx context.Context, filePath string, pattern *regexp.Regexp, o
 
 		if rerr == io.EOF {
 			break
-		}
-		if rerr != nil {
-			return rerr
 		}
 
 		// Honour cancellation mid-file (e.g. a single huge file). Checking on
