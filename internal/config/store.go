@@ -58,6 +58,16 @@ type storeSnapshot struct {
 	snapshots          map[string]fileSnapshot
 	workspacePath      string // .crush/crush.json (recomputed on every reload)
 	overrides          RuntimeOverrides
+
+	// generation is a monotonically increasing counter assigned at publish
+	// time (see ConfigStore.publishLocked). It exists so a long-running
+	// candidate build in reloadFromDiskUnlocked (which runs WITHOUT
+	// publishMu — see reloadMu) can detect, at publish time, whether some
+	// other writer already published a newer generation while the build
+	// was in flight, and rebase instead of silently clobbering it with a
+	// candidate built from a now-stale base. Never read by anything
+	// outside this CAS check; it is not part of the store's public API.
+	generation uint64
 }
 
 // clone returns a shallow copy of the snapshot. Callers that need to
@@ -126,6 +136,29 @@ type ConfigStore struct {
 	// always publishMu → diskWriteMu (when both are held), and
 	// diskWriteMu is always released before autoReload is called.
 	diskWriteMu sync.Mutex
+
+	// reloadMu serialises the CANDIDATE-BUILD phase of a disk reload
+	// (loadFromConfigPaths, workspace merge, configureProviders — which
+	// includes every shell-substitution ResolveValue call for provider
+	// keys/headers — and configureSelectedModels) against other
+	// concurrent reload attempts, WITHOUT holding publishMu. This is the
+	// fix for the lock-convoy where a single hung "$(...)" in a config
+	// value used to block publishMu — and therefore every reader,
+	// including unrelated runtime mutators like SetSkipPermissionRequests
+	// or SetProviderRuntimeConfig — for as long as the shell substitution
+	// ran (up to resolveTimeout).
+	//
+	// reloadFromDiskUnlocked takes reloadMu, builds a full candidate
+	// snapshot from local variables ONLY (no store mutation), releases
+	// reloadMu, then takes publishMu just long enough to CAS-check the
+	// generation and publish. autoReload uses TryLock on reloadMu (not
+	// publishMu) to preserve the original "skip a redundant reload when
+	// one is already in progress" behaviour without reintroducing the
+	// publishMu hold. Lock ordering when both are held: reloadMu is
+	// always released before publishMu is acquired — they are never held
+	// at the same time by the same goroutine, so there is no new
+	// deadlock ordering to reason about against publishMu → diskWriteMu.
+	reloadMu sync.Mutex
 }
 
 // loadSnapshot returns the current published snapshot. It never returns
@@ -139,6 +172,17 @@ func (s *ConfigStore) loadSnapshot() *storeSnapshot {
 		return &storeSnapshot{}
 	}
 	return sn
+}
+
+// publishLocked assigns the next generation number to next and publishes
+// it. The caller MUST already hold publishMu — generation is only ever
+// assigned/read while holding that lock, so incrementing it here is not
+// itself a race even though the field is also readable lock-free via
+// loadSnapshot() (readers only ever compare it back against a value they
+// captured under publishMu; see reloadFromDiskUnlocked's CAS check).
+func (s *ConfigStore) publishLocked(next *storeSnapshot) {
+	next.generation = s.loadSnapshot().generation + 1
+	s.snap.Store(next)
 }
 
 // Config returns the pure-data config struct (read-only after load).
@@ -202,7 +246,7 @@ func (s *ConfigStore) SetSkipPermissionRequests(v bool) {
 	cur := s.loadSnapshot()
 	next := cur.clone()
 	next.overrides.SkipPermissionRequests = v
-	s.snap.Store(next)
+	s.publishLocked(next)
 }
 
 // LoadedPaths returns the config file paths that were successfully loaded.
@@ -666,7 +710,7 @@ func (s *ConfigStore) updateConfigLocked(mutate func(cfgCopy *Config)) {
 	mutate(&cfgCopy)
 	next.config = &cfgCopy
 
-	s.snap.Store(next)
+	s.publishLocked(next)
 }
 
 // UpdatePreferredModel updates the preferred model for the given type and
@@ -1369,7 +1413,7 @@ func (s *ConfigStore) refreshStalenessSnapshotLocked() {
 		next.snapshots[path] = snapshot
 	}
 
-	s.snap.Store(next)
+	s.publishLocked(next)
 }
 
 // CaptureStalenessSnapshot recomputes the set of tracked config paths (the
@@ -1420,7 +1464,7 @@ func (s *ConfigStore) captureStalenessSnapshotLocked(paths []string) {
 
 	next := cur.clone()
 	next.trackedConfigPaths = tracked
-	s.snap.Store(next)
+	s.publishLocked(next)
 
 	s.refreshStalenessSnapshotLocked()
 }
@@ -1435,43 +1479,80 @@ func (s *ConfigStore) captureStalenessSnapshot(paths []string) {
 	s.captureStalenessSnapshotLocked(paths)
 }
 
-// ReloadFromDisk re-runs the config load/merge flow and updates the in-memory
-// config atomically.
+// ReloadFromDisk re-runs the config load/merge flow and updates the
+// in-memory config atomically.
+//
+// The heavy candidate-build work (disk I/O, JSON parsing, and — the
+// expensive part — configureProviders' shell-substitution ResolveValue
+// calls for every provider's API key/headers, each bounded by
+// resolveTimeout) deliberately runs WITHOUT holding publishMu; see
+// reloadFromDiskUnlocked. A single hung "$(...)" in a config value used to
+// hold publishMu for the resolver's full timeout, which serialises every
+// reader/writer of the store — including unrelated runtime mutators like
+// SetSkipPermissionRequests — behind it. Only the final generation-check
+// and pointer swap take publishMu now, for a duration bounded by memory
+// operations, not shell subprocess I/O.
 func (s *ConfigStore) ReloadFromDisk(ctx context.Context) error {
 	if s.workingDir == "" {
 		return fmt.Errorf("cannot reload: working directory not set")
 	}
-	s.publishMu.Lock()
-	defer s.publishMu.Unlock()
-	return s.reloadFromDiskLocked(ctx)
+	return s.reloadFromDiskUnlocked(ctx)
 }
 
-// reloadFromDiskLocked performs the actual reload. The caller must hold
-// publishMu, which serialises concurrent reloads against each other AND
-// against copy-on-write mutators (updateConfig), preventing the lost-update
-// race where a writer publishes a clone built from a pre-reload generation
-// on top of a reload that already published a newer one. It also prevents
-// the re-entrant auto-reload that configureProviders would otherwise trigger
-// via RemoveConfigField mid-reload (autoReload's TryLock on publishMu fails
-// because the caller already holds it).
+// reloadFromDiskUnlocked builds a full candidate storeSnapshot from local
+// variables only — no store field is touched until the very end — then
+// publishes it under a short publishMu critical section.
 //
-// Everything for the new generation (config, resolver, knownProviders,
-// loadedPaths, workspacePath) is built on purely local variables — cfg is
-// never assigned into the store and configureSelectedModels/SetupAgents
-// operate on the local cfg — so the *only* store mutation in the whole
-// function is the single s.snap.Store at the very end, once every step
-// that can fail (ValidateHooks, configureProviders, configureSelectedModels)
-// has already succeeded. On any error we simply return without calling
-// Store; the previously published snapshot is untouched and remains
-// visible to readers, which is the "rollback" — there is nothing to
-// manually restore.
-func (s *ConfigStore) reloadFromDiskLocked(ctx context.Context) error {
+// Two locks are involved, never held simultaneously by the same call:
+//
+//   - reloadMu serialises the candidate-build phase against other
+//     concurrent reload attempts (autoReload's TryLock on reloadMu skips a
+//     redundant reload the same way it used to skip on publishMu). This
+//     is purely about not wasting work building N candidates in parallel
+//     when one would do — it is NOT required for correctness, since the
+//     publish step below is itself safe against concurrent publishers.
+//   - publishMu guards only the generation-check + swap at the end. Its
+//     hold time is now bounded by a handful of map/pointer operations,
+//     never by config-file I/O or shell subprocess execution.
+//
+// Base generation vs CAS semantics: the candidate is built starting from
+// `prev`, the snapshot published at the time the build started. If some
+// other writer (a copy-on-write mutator, e.g. SetSkipPermissionRequests)
+// publishes a newer generation while the build is still in flight, this
+// reload's candidate is stale only with respect to the fields it carries
+// FORWARD from prev unchanged (overrides, trackedConfigPaths, snapshots)
+// — cfg/resolver/knownProviders/loadedPaths/workspacePath are always
+// freshly built from disk regardless of what changed concurrently in
+// memory, so they can never regress. Rather than discarding a fully-built
+// candidate (expensive: it already paid the shell-resolution cost) or
+// silently overwriting the concurrent writer's change, the publish step
+// re-reads the CURRENT snapshot under publishMu and rebases just those
+// forwarded fields onto it before storing — the writer's change survives,
+// and the reload's fresh disk state still wins for everything reload
+// itself is authoritative over. This mirrors the reasoning already
+// applied to staleness tracking (CaptureStalenessSnapshot) for the same
+// class of "small piece of forwarded state, rebase onto latest" problem.
+func (s *ConfigStore) reloadFromDiskUnlocked(ctx context.Context) error {
+	s.reloadMu.Lock()
+	defer s.reloadMu.Unlock()
+	return s.buildAndPublishReload(ctx)
+}
+
+// buildAndPublishReload is reloadFromDiskUnlocked's body, factored out so
+// autoReload can call it directly after its own TryLock(reloadMu) without
+// double-locking reloadMu (sync.Mutex is not reentrant).
+func (s *ConfigStore) buildAndPublishReload(ctx context.Context) error {
 	configPaths := lookupConfigs(s.workingDir)
 	cfg, loadedPaths, err := loadFromConfigPaths(configPaths)
 	if err != nil {
 		return fmt.Errorf("failed to reload config: %w", err)
 	}
 
+	// prev is read WITHOUT publishMu: it is only used to seed defaults
+	// (dataDir) and as the starting point for the rebase-on-publish
+	// below. Reading it unlocked is safe because storeSnapshot is
+	// immutable once published — loadSnapshot() always returns either
+	// this value or a strictly newer one, never a torn/partial view.
 	prev := s.loadSnapshot()
 
 	var dataDir string
@@ -1498,34 +1579,47 @@ func (s *ConfigStore) reloadFromDiskLocked(ctx context.Context) error {
 		return fmt.Errorf("invalid hook configuration on reload: %w", err)
 	}
 
-	overrides := prev.overrides
-
-	env := env.New()
-	resolver := NewShellVariableResolver(env)
+	// env/resolver are built fresh from the real process environment on
+	// every reload. ctx is now threaded all the way into ResolveValue
+	// (via configureProviders → resolver.ResolveValue), so a caller that
+	// cancels ctx (e.g. app shutdown) can abort an in-flight shell
+	// substitution instead of waiting out the full resolveTimeout.
+	baseEnv := env.New()
+	resolver := NewShellVariableResolver(baseEnv, WithContext(ctx))
 	providers, err := Providers(cfg)
 	if err != nil {
 		return fmt.Errorf("failed to load providers during reload: %w", err)
 	}
 
-	if err := cfg.configureProviders(ctx, s, env, resolver, providers); err != nil {
+	// This is the expensive step this refactor is about: configureProviders
+	// resolves every provider's API key/headers (and MCP discovery),
+	// each ResolveValue call bounded by resolveTimeout. It runs under
+	// reloadMu (serialising it against other reload attempts) but NOT
+	// publishMu — a hung shell substitution here no longer blocks
+	// SetSkipPermissionRequests/SetProviderRuntimeConfig/other readers.
+	if err := cfg.configureProviders(ctx, s, baseEnv, resolver, providers); err != nil {
 		return fmt.Errorf("failed to configure providers during reload: %w", err)
 	}
 
 	if !cfg.IsConfigured() {
 		slog.Warn("No providers configured after reload")
 	} else {
+		// persist=false: reloadFromDiskUnlocked runs without publishMu
+		// held, so configureSelectedModels must NOT take the Locked
+		// (reentrant-only) path here — there is no reentrant lock to
+		// avoid re-acquiring. Only Load (which does hold publishMu for
+		// its whole body) passes persist=true.
 		if err := configureSelectedModels(s, cfg, providers, false); err != nil {
 			return fmt.Errorf("failed to configure selected models during reload: %w", err)
 		}
 		cfg.SetupAgents()
 	}
 
-	// Every fallible step has succeeded — publish the new generation as a
-	// single atomic swap. Anything that already loaded `prev` (or an
-	// earlier snapshot) keeps reading a fully-consistent, if stale, view;
-	// nothing observes config/resolver/knownProviders from different
-	// generations mixed together.
-	next := &storeSnapshot{
+	// Every fallible step has succeeded. Build the candidate snapshot from
+	// what this build started with (prev) — see the rebase step below for
+	// why this is safe even if a concurrent writer published a newer
+	// generation while the above ran unlocked.
+	candidate := &storeSnapshot{
 		config:             cfg,
 		resolver:           resolver,
 		knownProviders:     providers,
@@ -1533,12 +1627,31 @@ func (s *ConfigStore) reloadFromDiskLocked(ctx context.Context) error {
 		trackedConfigPaths: prev.trackedConfigPaths,
 		snapshots:          prev.snapshots,
 		workspacePath:      workspacePath,
-		overrides:          overrides,
+		overrides:          prev.overrides,
 	}
-	s.snap.Store(next)
 
-	// Caller already holds publishMu — use the Locked variant to avoid a
-	// re-entrant deadlock.
+	s.publishMu.Lock()
+	defer s.publishMu.Unlock()
+
+	// Rebase: if the currently-published snapshot is no longer `prev`
+	// (some copy-on-write mutator published in the meantime), carry its
+	// overrides/staleness-tracking forward onto the candidate instead of
+	// the ones captured before the unlocked build — otherwise this
+	// publish would silently revert that concurrent change. cfg/resolver/
+	// knownProviders/loadedPaths/workspacePath are NOT rebased: they are
+	// reload's own authoritative fresh-from-disk output regardless of
+	// what changed concurrently in memory.
+	cur := s.loadSnapshot()
+	if cur.generation != prev.generation {
+		candidate.overrides = cur.overrides
+		candidate.trackedConfigPaths = cur.trackedConfigPaths
+		candidate.snapshots = cur.snapshots
+	}
+
+	s.publishLocked(candidate)
+
+	// Caller (this function) already holds publishMu — use the Locked
+	// variant to avoid a re-entrant deadlock.
 	s.captureStalenessSnapshotLocked(loadedPaths)
 
 	return nil
@@ -1549,17 +1662,21 @@ func (s *ConfigStore) autoReload(ctx context.Context) error {
 		return nil // Expected skip: working directory not set.
 	}
 	// Skip if a reload is already in progress. This covers both concurrent
-	// auto-reloads after parallel writes and the re-entrant call from
-	// configureProviders during a reload (which holds publishMu).
+	// auto-reloads after parallel writes and the re-entrant call that
+	// configureProviders could in principle trigger mid-build. reloadMu
+	// (not publishMu) is the guard now: the candidate-build phase this
+	// dedups against no longer holds publishMu at all, so TryLock on
+	// publishMu would no longer detect "a reload is already in progress"
+	// for most of that phase.
 	//
 	// Note: a write that completes after the in-progress reload has already
 	// read the config file won't be reflected in memory until the next
 	// reload. That's acceptable — writes are rare and the next user action
 	// or file-watch tick picks it up. Callers needing guaranteed freshness
 	// after a write should call ReloadFromDisk explicitly.
-	if !s.publishMu.TryLock() {
+	if !s.reloadMu.TryLock() {
 		return nil
 	}
-	defer s.publishMu.Unlock()
-	return s.reloadFromDiskLocked(ctx)
+	defer s.reloadMu.Unlock()
+	return s.buildAndPublishReload(ctx)
 }

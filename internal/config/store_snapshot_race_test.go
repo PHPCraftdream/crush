@@ -672,17 +672,20 @@ func TestConcurrentSetConfigFields_DifferentKeys_BothPersistedOnDisk(t *testing.
 	}
 }
 
-// TestAutoReload_TryLockSkipsReentry_NoDeadlock verifies that autoReload,
-// when called from a context that already holds publishMu (e.g. Load or
-// reloadFromDiskLocked → configureProviders → RemoveConfigField), uses
-// TryLock and returns immediately instead of blocking forever.
+// TestAutoReload_TryLockSkipsReentry_NoDeadlock verifies that autoReload
+// uses TryLock on reloadMu and returns immediately instead of blocking
+// forever when a reload's candidate-build phase is already in progress.
 //
-// Before the publishMu unification, reloadMu served this role: Load held
-// reloadMu, and autoReload's TryLock on reloadMu failed, skipping the
-// re-entrant reload. After unification, publishMu serves the same role.
-// This test explicitly verifies the guard still works: a regression
-// (e.g. switching TryLock to Lock) would deadlock the entire process on
-// startup.
+// reloadMu (not publishMu) is the reentrancy/dedup guard since the P1.2
+// refactor: the candidate-build phase (loadFromConfigPaths,
+// configureProviders' shell resolution, configureSelectedModels) now runs
+// WITHOUT publishMu held, specifically so it can't block unrelated
+// runtime mutators for the duration of a slow shell substitution. reloadMu
+// still serialises concurrent reload attempts against each other and
+// preserves the original "skip a redundant reload already in progress"
+// behaviour. This test verifies the guard still works: a regression
+// (e.g. switching TryLock to Lock, or guarding on publishMu again) would
+// either deadlock or let two reload builds race each other.
 func TestAutoReload_TryLockSkipsReentry_NoDeadlock(t *testing.T) {
 	t.Parallel()
 
@@ -692,13 +695,13 @@ func TestAutoReload_TryLockSkipsReentry_NoDeadlock(t *testing.T) {
 	store := newTestConfigStore(testStoreOpts{config: cfg})
 	store.workingDir = dir // Enable the autoReload path past the early return.
 
-	// Hold publishMu, simulating the state during Load or
-	// reloadFromDiskLocked when configureProviders calls
-	// RemoveConfigField → autoReload.
-	store.publishMu.Lock()
-	defer store.publishMu.Unlock()
+	// Hold reloadMu, simulating a reload candidate-build already in
+	// progress (either from another autoReload call or an explicit
+	// ReloadFromDisk).
+	store.reloadMu.Lock()
+	defer store.reloadMu.Unlock()
 
-	// autoReload must return nil immediately — TryLock(publishMu) fails
+	// autoReload must return nil immediately — TryLock(reloadMu) fails
 	// because we already hold it. If it used Lock instead of TryLock,
 	// this call would block forever.
 	done := make(chan error, 1)
@@ -710,6 +713,150 @@ func TestAutoReload_TryLockSkipsReentry_NoDeadlock(t *testing.T) {
 	case err := <-done:
 		require.NoError(t, err, "autoReload should return nil when TryLock fails")
 	case <-time.After(5 * time.Second):
-		t.Fatal("autoReload deadlocked — TryLock was not used or publishMu is not the guard")
+		t.Fatal("autoReload deadlocked — TryLock was not used or reloadMu is not the guard")
 	}
+}
+
+// TestReloadCandidateBuild_DoesNotBlockRuntimeMutator is the P1.2
+// regression test at the lock level: it simulates a reload's
+// candidate-build phase being in flight (holding reloadMu, matching
+// exactly what buildAndPublishReload does for the entire duration of
+// configureProviders' shell-substitution ResolveValue calls) and verifies
+// that an unrelated runtime mutator — SetSkipPermissionRequests, which
+// only ever needs publishMu — completes promptly rather than blocking for
+// the build's duration.
+//
+// Before the fix, ReloadFromDisk held publishMu for its ENTIRE body
+// (candidate build + publish), so any goroutine simulating "a slow
+// resolve is in flight" by holding that same lock would also block every
+// runtime mutator. After the fix, the build phase holds only reloadMu;
+// publishMu is free for the whole time, so SetSkipPermissionRequests must
+// return almost immediately even while reloadMu is held.
+func TestReloadCandidateBuild_DoesNotBlockRuntimeMutator(t *testing.T) {
+	t.Parallel()
+
+	cfg := &Config{}
+	cfg.setDefaults(t.TempDir(), "")
+	store := NewTestStore(cfg)
+
+	// Simulate "reload candidate-build phase in flight" by holding
+	// reloadMu directly, without touching publishMu — exactly the
+	// invariant buildAndPublishReload now provides: the expensive,
+	// potentially-minutes-long shell resolution runs under reloadMu only.
+	store.reloadMu.Lock()
+	defer store.reloadMu.Unlock()
+
+	done := make(chan struct{})
+	start := time.Now()
+	go func() {
+		store.SetSkipPermissionRequests(true)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		elapsed := time.Since(start)
+		require.Less(t, elapsed, 2*time.Second,
+			"SetSkipPermissionRequests must not be blocked by a concurrent reload's candidate-build phase (reloadMu)")
+	case <-time.After(5 * time.Second):
+		t.Fatal("SetSkipPermissionRequests blocked on reloadMu — the P1.2 fix regressed: publishMu must be independent of the build phase")
+	}
+
+	require.True(t, store.Overrides().SkipPermissionRequests, "the runtime override must have actually been applied")
+}
+
+// writeSlowProviderConfig writes a crush.json defining a single custom
+// provider whose api_key is a shell command substitution that blocks for
+// sleepSeconds — the real-world shape of P1.2's failure mode (a hung
+// "$(...)" in a provider credential). base_url and models are pre-set so
+// discovery isn't triggered and the only resolver call on this provider's
+// path is the api_key ResolveValue in configureProviders' custom-provider
+// validation loop.
+func writeSlowProviderConfig(t *testing.T, path string, sleepSeconds int) {
+	t.Helper()
+	content := fmt.Sprintf(`{
+		"providers": {
+			"slowprovider": {
+				"base_url": "https://example.invalid/v1",
+				"api_key": "$(sleep %d)",
+				"models": [{"id": "slow-model", "name": "slow-model"}]
+			}
+		}
+	}`, sleepSeconds)
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+}
+
+// TestReloadFromDisk_HungResolve_DoesNotBlockIndependentRuntimeChange is
+// the end-to-end P1.2 regression test using a REAL shell command
+// substitution (no fakes/mocks for the resolver), matching the review's
+// exact ask: "a hung resolver must not block an independent runtime
+// config change (e.g. SetConfigFields/SetProviderRuntimeConfig) for
+// minutes; it must go through while resolve is still hanging elsewhere."
+//
+// A ReloadFromDisk is kicked off against a config whose only provider's
+// api_key is `$(sleep 5)` — a real subprocess that blocks configureProviders
+// for 5 real seconds. While that reload is in flight, this test calls
+// SetProviderRuntimeConfig (an independent, unrelated in-memory mutation
+// that only needs publishMu) and asserts it returns in well under the 5
+// seconds the reload's resolve is still blocked on. Before the P1.2 fix,
+// ReloadFromDisk held publishMu for its entire body, so
+// SetProviderRuntimeConfig would have been forced to wait out the full
+// hang.
+func TestReloadFromDisk_HungResolve_DoesNotBlockIndependentRuntimeChange(t *testing.T) {
+	dir := t.TempDir()
+	isolated := t.TempDir()
+	t.Setenv("HOME", isolated)
+	t.Setenv("PATH", os.Getenv("PATH")) // preserve real PATH so $(sleep) resolves
+	isolateAllGlobalConfigPaths(t)
+	t.Setenv("CRUSH_DISABLE_PROVIDER_AUTO_UPDATE", "1")
+	resetProviderState()
+	t.Cleanup(resetProviderState)
+
+	configPath := filepath.Join(dir, "crush.json")
+	writeGenerationConfig(t, configPath, 0)
+
+	store, err := Load(dir, dir, false)
+	require.NoError(t, err)
+	store.globalDataPath = configPath
+	store.CaptureStalenessSnapshot([]string{configPath})
+
+	const sleepSeconds = 5
+	writeSlowProviderConfig(t, configPath, sleepSeconds)
+
+	reloadDone := make(chan error, 1)
+	reloadStart := time.Now()
+	go func() {
+		reloadDone <- store.ReloadFromDisk(context.Background())
+	}()
+
+	// Give the reload a moment to actually enter configureProviders and
+	// start blocking on the real "sleep 5" subprocess before we measure
+	// the independent mutator's latency against it.
+	time.Sleep(300 * time.Millisecond)
+
+	mutatorStart := time.Now()
+	store.SetProviderRuntimeConfig("unrelated-provider", ProviderConfig{
+		ID:     "unrelated-provider",
+		APIKey: "some-key",
+	})
+	mutatorElapsed := time.Since(mutatorStart)
+
+	require.Less(t, mutatorElapsed, 2*time.Second,
+		"SetProviderRuntimeConfig must not be blocked by ReloadFromDisk's in-flight shell resolve (elapsed=%v)", mutatorElapsed)
+
+	// Sanity: the runtime config change actually landed while the reload
+	// was still in flight, proving it went through the store rather than
+	// silently failing/no-op'ing.
+	pc, ok := store.Config().Providers.Get("unrelated-provider")
+	require.True(t, ok, "SetProviderRuntimeConfig's provider must be visible immediately")
+	require.Equal(t, "some-key", pc.APIKey)
+
+	select {
+	case err := <-reloadDone:
+		require.NoError(t, err)
+	case <-time.After(30 * time.Second):
+		t.Fatal("reload did not finish within 30s of the real sleep(5) resolve completing")
+	}
+	require.GreaterOrEqual(t, time.Since(reloadStart), sleepSeconds*time.Second,
+		"sanity: the reload must have actually waited out the real sleep, not short-circuited it")
 }

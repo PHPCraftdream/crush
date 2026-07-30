@@ -10,8 +10,29 @@ import (
 )
 
 // resolveTimeout bounds how long a single ResolveValue call may spend
-// inside shell expansion (including any command substitution).
-const resolveTimeout = 5 * time.Minute
+// inside shell expansion (including any command substitution), as a
+// last-resort ceiling when no caller context imposes a tighter deadline.
+//
+// Was 5 minutes. That default made sense only if ResolveValue had no other
+// way to be cancelled: since it always ran under context.Background(), the
+// only thing that could ever stop a hung "$(...)" was this timeout, and it
+// gated app startup and every config reload through publishMu (see
+// store.go's ConfigStore doc comment and the P1.2 fix), so 5 minutes could
+// stall the entire process for 5 minutes on a single misbehaving config
+// value. Two things changed:
+//  1. reloadFromDiskUnlocked no longer holds publishMu during resolution
+//     at all, so a hung resolve no longer blocks unrelated readers/writers
+//     — only the reload that triggered it.
+//  2. shellVariableResolver now accepts the caller's ctx (see
+//     WithContext), so a caller that has its own deadline (or gets
+//     cancelled, e.g. on shutdown) can abort a hung shell substitution
+//     well before this ceiling.
+//
+// 30s is still generous for any legitimate `$(...)` (reading a secret
+// from a local vault CLI, a keychain prompt, etc.) while bounding the
+// worst case for an interactive startup path that has no better context
+// to inherit a deadline from.
+const resolveTimeout = 30 * time.Second
 
 type VariableResolver interface {
 	ResolveValue(value string) (string, error)
@@ -49,9 +70,30 @@ func WithExpander(e Expander) ShellResolverOption {
 	}
 }
 
+// WithContext binds a base context that every ResolveValue call on the
+// resulting resolver derives its per-call timeout from (via
+// context.WithTimeout(ctx, resolveTimeout)), instead of the package
+// default of context.Background().
+//
+// This lets a caller with its own cancellation source — e.g.
+// reloadFromDiskUnlocked, which now receives the ctx originally passed to
+// ReloadFromDisk — cause an in-flight shell substitution to abort as soon
+// as THAT ctx is cancelled (app shutdown, a caller-imposed deadline)
+// rather than always waiting out the full resolveTimeout ceiling. A nil
+// ctx is treated as context.Background(), matching the previous
+// unconditional default.
+func WithContext(ctx context.Context) ShellResolverOption {
+	return func(r *shellVariableResolver) {
+		if ctx != nil {
+			r.ctx = ctx
+		}
+	}
+}
+
 type shellVariableResolver struct {
 	env    env.Env
 	expand Expander
+	ctx    context.Context
 }
 
 // NewShellVariableResolver returns a VariableResolver that delegates to
@@ -66,6 +108,7 @@ func NewShellVariableResolver(e env.Env, opts ...ShellResolverOption) VariableRe
 	r := &shellVariableResolver{
 		env:    e,
 		expand: shell.ExpandValue,
+		ctx:    context.Background(),
 	}
 	for _, opt := range opts {
 		opt(r)
@@ -94,7 +137,11 @@ func (r *shellVariableResolver) ResolveValue(value string) (string, error) {
 		return "", fmt.Errorf("invalid value format: %s", value)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), resolveTimeout)
+	base := r.ctx
+	if base == nil {
+		base = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(base, resolveTimeout)
 	defer cancel()
 
 	out, err := r.expand(ctx, value, r.env.Env())

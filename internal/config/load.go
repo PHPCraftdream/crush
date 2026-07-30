@@ -186,38 +186,61 @@ func mustMarshalConfig(cfg *Config) []byte {
 	return data
 }
 
-func PushPopCrushEnv() func() {
-	var found []string
-	for _, ev := range os.Environ() {
-		if strings.HasPrefix(ev, "CRUSH_") {
-			pair := strings.SplitN(ev, "=", 2)
-			if len(pair) != 2 {
-				continue
-			}
-			found = append(found, strings.TrimPrefix(pair[0], "CRUSH_"))
+// crushEnvOverlay scans e for "CRUSH_X" entries and returns a map of the
+// bare "X" -> value they should shadow, so a config value written as
+// "$FOO" resolves against CRUSH_FOO when the caller has set it (the
+// documented escape hatch for overriding a variable crush itself doesn't
+// own, e.g. in CI or a sandboxed agent run without touching the real
+// FOO for every other process on the machine).
+//
+// This is a pure function of the given Env — it does not read or mutate
+// os.Environ() directly, so it is safe to call concurrently from multiple
+// ConfigStore reloads without any of them observing (or clobbering) each
+// other's overlay. Historically (PushPopCrushEnv) this same computation
+// was applied by temporarily os.Setenv-ing the process's real environment
+// and restoring it after the resolver ran — that mutated global state
+// visible to every other goroutine and child process for the duration
+// (including a concurrent reload's own resolution, or a sub-agent
+// subprocess spawned by unrelated code mid-resolve) and, because
+// os.Getenv cannot distinguish "unset" from "set to empty", left a
+// variable that was absent before the call permanently set to "" after
+// "restoring" it. See internal/env.NewOverlay for the replacement
+// mechanism: the overlay computed here is passed explicitly to the
+// resolver and to configureProviders' own env.Get calls instead.
+func crushEnvOverlay(e env.Env) map[string]string {
+	const prefix = "CRUSH_"
+	overlay := make(map[string]string)
+	for _, ev := range e.Env() {
+		key, _, ok := strings.Cut(ev, "=")
+		if !ok || !strings.HasPrefix(key, prefix) {
+			continue
 		}
+		bare := strings.TrimPrefix(key, prefix)
+		overlay[bare] = e.Get(key)
 	}
-	backups := make(map[string]string)
-	for _, ev := range found {
-		backups[ev] = os.Getenv(ev)
-	}
-
-	for _, ev := range found {
-		os.Setenv(ev, os.Getenv("CRUSH_"+ev))
-	}
-
-	restore := func() {
-		for k, v := range backups {
-			os.Setenv(k, v)
-		}
-	}
-	return restore
+	return overlay
 }
 
-func (c *Config) configureProviders(ctx context.Context, store *ConfigStore, env env.Env, resolver VariableResolver, knownProviders []catwalk.Provider) error {
+func (c *Config) configureProviders(ctx context.Context, store *ConfigStore, baseEnv env.Env, resolver VariableResolver, knownProviders []catwalk.Provider) error {
 	knownProviderNames := make(map[string]bool)
-	restore := PushPopCrushEnv()
-	defer restore()
+
+	// Overlay CRUSH_X -> X explicitly for both env.Get lookups below and
+	// the resolver, rather than mutating the process environment (see
+	// crushEnvOverlay's doc comment for why). The overlay is scoped to
+	// this call: no global state changes, so concurrent reloads/resolves
+	// never see or clobber each other's overlay.
+	overlay := crushEnvOverlay(baseEnv)
+	env := env.NewOverlay(baseEnv, overlay)
+	if len(overlay) > 0 {
+		if r, ok := resolver.(*shellVariableResolver); ok {
+			// Preserve the caller's expander override (tests) and bound
+			// ctx (see resolve.go's WithContext) — only the env changes
+			// here, not the resolver's other behaviour.
+			resolver = NewShellVariableResolver(env, WithExpander(r.expand), WithContext(r.ctx))
+		} else {
+			resolver = NewShellVariableResolver(env, WithContext(ctx))
+		}
+	}
 
 	// When disable_default_providers is enabled, skip all default/embedded
 	// providers entirely. Users must fully specify any providers they want.
@@ -386,7 +409,7 @@ func (c *Config) configureProviders(ctx context.Context, store *ConfigStore, env
 			// documents that variable name, don't need to set a second
 			// variable. It's only consulted when the primary resolves
 			// CLEANLY to empty, so ZAI_API_KEY always wins. Both names
-			// honour the CRUSH_ prefix via PushPopCrushEnv above.
+			// honour the CRUSH_ prefix via the overlay built above.
 			v, err := resolver.ResolveValue(p.APIKey)
 			switch {
 			case err != nil:
