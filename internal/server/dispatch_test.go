@@ -130,6 +130,117 @@ func TestDispatchBoundsConcurrencyPerConnection(t *testing.T) {
 	waitWithTimeout(t, &started, 5*time.Second)
 }
 
+// TestDispatchControlBypassesWorkSemaphore is the regression test for the
+// bug fixed here: with maxConcurrentHandlersPerConn work handlers already
+// blocked/held open on one Client (simulating 12 long-running agent turns
+// in flight, exactly like TestDispatchBoundsConcurrencyPerConnection does),
+// a control-plane-shaped dispatch (dispatchControl, which is what
+// CmdCancelAgent/CmdInterruptAndSend now go through instead of dispatch)
+// must still complete promptly instead of queuing behind those 12 slots.
+//
+// Before the fix, dispatchControl didn't exist and control-plane commands
+// were routed through dispatch/c.sem — this test would time out waiting for
+// "control" to run, exactly reproducing the readPump starvation scenario
+// described in the bug report (a stuck cancel/interrupt eventually leads to
+// a 60s i/o-timeout connection teardown because readPump never calls
+// ReadMessage() again while blocked acquiring a semaphore slot).
+func TestDispatchControlBypassesWorkSemaphore(t *testing.T) {
+	t.Parallel()
+
+	c := newClient(newHub(), nil)
+
+	// Saturate the WORK semaphore with maxConcurrentHandlersPerConn handlers
+	// that block until the test releases them.
+	release := make(chan struct{})
+	var blocked sync.WaitGroup
+	blocked.Add(maxConcurrentHandlersPerConn)
+	for i := 0; i < maxConcurrentHandlersPerConn; i++ {
+		c.dispatch("slowWork", func() {
+			blocked.Done()
+			<-release
+		})
+	}
+	// Wait for all of them to actually be running (i.e. the work semaphore
+	// is fully saturated) before exercising the control-plane path.
+	waitWithTimeout(t, &blocked, 2*time.Second)
+	defer close(release)
+
+	// Now dispatch a control-plane-shaped command. If it shared c.sem with
+	// the 12 blocked handlers above, this would hang until release fires.
+	var controlRan sync.WaitGroup
+	controlRan.Add(1)
+	start := time.Now()
+	c.dispatchControl("handleCancelAgent", func() {
+		defer controlRan.Done()
+	})
+	waitWithTimeout(t, &controlRan, time.Second)
+	elapsed := time.Since(start)
+
+	require.Less(t, elapsed, time.Second,
+		"control-plane dispatch must not queue behind saturated work handlers")
+}
+
+// TestDispatchControlDoesNotStarveWorkSemaphore proves the fix doesn't cut
+// both ways: dispatching control-plane commands (even many of them) must
+// never let them interfere with, or starve, the legitimate backpressure
+// applied to long-running work handlers. Concretely: saturating the work
+// semaphore still blocks a 13th work-shaped dispatch's CALLER exactly as
+// before, regardless of how many control-plane dispatches ran concurrently.
+func TestDispatchControlDoesNotStarveWorkSemaphore(t *testing.T) {
+	t.Parallel()
+
+	c := newClient(newHub(), nil)
+
+	release := make(chan struct{})
+
+	var blocked sync.WaitGroup
+	blocked.Add(maxConcurrentHandlersPerConn)
+	for i := 0; i < maxConcurrentHandlersPerConn; i++ {
+		c.dispatch("slowWork", func() {
+			blocked.Done()
+			<-release
+		})
+	}
+	waitWithTimeout(t, &blocked, 2*time.Second)
+
+	// Fire a burst of control-plane dispatches concurrently with the
+	// saturated work semaphore — none of this should affect sem's state.
+	const controlBurst = 50
+	var controlDone sync.WaitGroup
+	controlDone.Add(controlBurst)
+	for i := 0; i < controlBurst; i++ {
+		c.dispatchControl("handleCancelAgent", func() {
+			controlDone.Done()
+		})
+	}
+	waitWithTimeout(t, &controlDone, 2*time.Second)
+
+	// A 13th WORK-shaped dispatch must still block its caller (the sem is
+	// still fully saturated by the 12 handlers held open above) — this is
+	// the backpressure semantics #154 introduced and must be preserved.
+	acquired := make(chan struct{})
+	go func() {
+		c.dispatch("oneMoreWork", func() {})
+		close(acquired)
+	}()
+
+	select {
+	case <-acquired:
+		t.Fatal("13th work dispatch acquired a semaphore slot while all 12 were still held — backpressure regressed")
+	case <-time.After(200 * time.Millisecond):
+		// Expected: still blocked waiting for a slot.
+	}
+
+	// Release the held handlers; the queued 13th dispatch must now proceed.
+	close(release)
+
+	select {
+	case <-acquired:
+	case <-time.After(2 * time.Second):
+		t.Fatal("13th work dispatch never acquired a slot after handlers were released")
+	}
+}
+
 // waitWithTimeout fails the test instead of hanging forever if wg never
 // completes (e.g. a regression reintroduces a deadlock in dispatch).
 func waitWithTimeout(t *testing.T, wg *sync.WaitGroup, timeout time.Duration) {

@@ -30,6 +30,17 @@ const (
 	// frames simply wait to be dispatched instead of spawning more goroutines.
 	maxConcurrentHandlersPerConn = 12
 
+	// maxConcurrentControlHandlersPerConn bounds control-plane dispatches (see
+	// dispatchControl) — currently CmdCancelAgent and CmdInterruptAndSend.
+	// These never call into AgentCoordinator.Run: they look up an in-memory
+	// map, invoke a stored context.CancelFunc, and/or do a bounded DB read +
+	// local recompute, so they return in well under a second even under load.
+	// The cap is much larger than maxConcurrentHandlersPerConn (which gates
+	// genuinely long-running, minutes-long agent turns) purely as a sanity
+	// backstop against a buggy/malicious client flooding cancel/interrupt
+	// frames — it is not expected to ever bind in practice.
+	maxConcurrentControlHandlersPerConn = 256
+
 	// replayByteBudget bounds the total bytes held in the replay buffer across all
 	// events. Normal traffic (small JSON deltas) fits ~2000 events well under 8 MiB,
 	// so the per-event count limit stays the binding constraint and full history is
@@ -58,17 +69,26 @@ type Client struct {
 	// a counting semaphore implemented as a buffered channel: acquire sends
 	// a token, release receives one.
 	sem chan struct{}
+
+	// controlSem is the analogous semaphore for control-plane dispatches
+	// (see dispatchControl) — a separate, much larger pool so a control-plane
+	// frame (cancel/interrupt) is never queued behind sem's 12 long-running
+	// work slots. Keeping it a distinct channel (rather than sharing sem)
+	// is the whole point of the fix: control-plane commands must not compete
+	// with long-running handlers for the same bounded resource.
+	controlSem chan struct{}
 }
 
-// newClient constructs a Client with its per-connection handler semaphore
+// newClient constructs a Client with its per-connection handler semaphores
 // initialised. Always use this instead of a bare &Client{} literal so the
-// semaphore is never nil.
+// semaphores are never nil.
 func newClient(hub *Hub, conn *websocket.Conn) *Client {
 	return &Client{
-		hub:  hub,
-		conn: conn,
-		send: make(chan []byte, sendBufSize),
-		sem:  make(chan struct{}, maxConcurrentHandlersPerConn),
+		hub:        hub,
+		conn:       conn,
+		send:       make(chan []byte, sendBufSize),
+		sem:        make(chan struct{}, maxConcurrentHandlersPerConn),
+		controlSem: make(chan struct{}, maxConcurrentControlHandlersPerConn),
 	}
 }
 
@@ -90,18 +110,53 @@ func newClient(hub *Hub, conn *websocket.Conn) *Client {
 // function name) used only for logging.
 func (c *Client) dispatch(name string, fn func()) {
 	c.sem <- struct{}{}
-	go func() {
-		defer func() { <-c.sem }()
-		defer func() {
-			if r := recover(); r != nil {
-				slog.Error("ws: handler panic",
-					"handler", name,
-					"panic", r,
-					"stack", string(debug.Stack()))
-			}
-		}()
-		fn()
+	go runRecovered(name, func() { <-c.sem }, fn)
+}
+
+// dispatchControl is dispatch's counterpart for control-plane commands —
+// currently CmdCancelAgent and CmdInterruptAndSend. It runs fn in a new
+// goroutine gated by controlSem (a separate, generously-sized semaphore)
+// instead of sem, and provides the SAME panic-recovery safety net as
+// dispatch.
+//
+// Why this needs to exist at all: handleIncoming (handlers.go) calls dispatch
+// synchronously from readPump's read loop (server.go) — the acquire
+// `c.sem <- struct{}{}` blocks the CALLER once maxConcurrentHandlersPerConn
+// long-running handlers (e.g. handleSendMessage, which can hold its slot for
+// an entire multi-minute agent turn) are already in flight. If a
+// cancel/interrupt command shared that same semaphore, it would queue behind
+// those 12 slots — exactly when the user most needs it to go through
+// immediately, e.g. to cancel one of the stuck turns. While readPump is
+// blocked acquiring a slot, it never calls conn.ReadMessage() again, so the
+// pong handler (registered in server.go) never runs to extend the read
+// deadline, and the connection is torn down by an i/o timeout ~60s later
+// (pongWait) — during which the user had no way to cancel anything on this
+// connection.
+//
+// Using a separate, much larger semaphore instead of no gate at all keeps a
+// bounded worst case (a buggy/malicious client flooding control-plane frames
+// still can't spawn unbounded goroutines) while making it practically
+// impossible for legitimate cancel/interrupt traffic to ever queue.
+func (c *Client) dispatchControl(name string, fn func()) {
+	c.controlSem <- struct{}{}
+	go runRecovered(name, func() { <-c.controlSem }, fn)
+}
+
+// runRecovered runs fn with panic isolation identical to dispatch's original
+// behaviour: any panic is recovered and logged (with a stack trace) instead
+// of propagating and crashing the process. release is always called first,
+// via defer, so the calling semaphore slot is freed even if fn panics.
+func runRecovered(name string, release func(), fn func()) {
+	defer release()
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("ws: handler panic",
+				"handler", name,
+				"panic", r,
+				"stack", string(debug.Stack()))
+		}
 	}()
+	fn()
 }
 
 // replayBuffer is a fixed-capacity ring buffer of broadcast events.
