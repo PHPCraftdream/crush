@@ -236,6 +236,23 @@ type service struct {
 	*pubsub.Broker[Session]
 	db *sql.DB
 	q  *db.Queries
+
+	// readDB/qRead back the standalone, read-only hot paths (List, ListAll,
+	// ListSubSessions, Get, GetLast, GetCallTreeActivity(Batch)) that don't
+	// need read-your-own-write consistency with a subsequent write in the
+	// same call. When a caller doesn't provide a separate reader (the
+	// common NewService constructor, used by every test and by anything
+	// that intentionally wants single-connection semantics against
+	// :memory: databases), these simply alias db/q, so routing to them is
+	// a no-op fallback to today's serialized behavior.
+	//
+	// Everything else (writes, transactions, and reads inside a
+	// transaction like ForkSessionTx's GetSessionByID) intentionally keeps
+	// using db/q — the single writer connection — so this split never
+	// changes write semantics or read-after-write guarantees for anything
+	// but the named standalone read paths.
+	readDB *sql.DB
+	qRead  *db.Queries
 }
 
 // CallTreeActivity is the freshest message activity found anywhere in a
@@ -526,7 +543,7 @@ func (s *service) ForkSessionTx(ctx context.Context, srcID string, o ForkOptions
 }
 
 func (s *service) Get(ctx context.Context, id string) (Session, error) {
-	dbSession, err := s.q.GetSessionByID(ctx, id)
+	dbSession, err := s.qRead.GetSessionByID(ctx, id)
 	if err != nil {
 		return Session{}, err
 	}
@@ -534,7 +551,7 @@ func (s *service) Get(ctx context.Context, id string) (Session, error) {
 }
 
 func (s *service) GetLast(ctx context.Context) (Session, error) {
-	dbSession, err := s.q.GetLastSession(ctx)
+	dbSession, err := s.qRead.GetLastSession(ctx)
 	if err != nil {
 		return Session{}, err
 	}
@@ -775,7 +792,7 @@ func (s *service) Rename(ctx context.Context, id string, title string) error {
 // ListSubSessions implementation: thin wrapper around the sqlc-
 // generated query. Returns an empty slice when no sub-sessions exist.
 func (s *service) ListSubSessions(ctx context.Context, parentSessionID string) ([]Session, error) {
-	dbSessions, err := s.q.ListSubSessions(ctx, sql.NullString{
+	dbSessions, err := s.qRead.ListSubSessions(ctx, sql.NullString{
 		String: parentSessionID,
 		Valid:  parentSessionID != "",
 	})
@@ -795,7 +812,7 @@ func (s *service) ListSubSessions(ctx context.Context, parentSessionID string) (
 // tree is a normal, expected state (e.g. a session that was just created),
 // not a failure.
 func (s *service) GetCallTreeActivity(ctx context.Context, rootID string) (CallTreeActivity, bool, error) {
-	row, err := s.q.GetCallTreeActivity(ctx, rootID)
+	row, err := s.qRead.GetCallTreeActivity(ctx, rootID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return CallTreeActivity{}, false, nil
@@ -833,7 +850,7 @@ func (s *service) GetCallTreeActivityBatch(ctx context.Context, rootIDs []string
 		if end > len(rootIDs) {
 			end = len(rootIDs)
 		}
-		rows, err := s.q.GetCallTreeActivityBatch(ctx, rootIDs[start:end])
+		rows, err := s.qRead.GetCallTreeActivityBatch(ctx, rootIDs[start:end])
 		if err != nil {
 			return nil, err
 		}
@@ -849,7 +866,7 @@ func (s *service) GetCallTreeActivityBatch(ctx context.Context, rootIDs []string
 }
 
 func (s *service) List(ctx context.Context) ([]Session, error) {
-	dbSessions, err := s.q.ListSessions(ctx)
+	dbSessions, err := s.qRead.ListSessions(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -869,7 +886,7 @@ func (s *service) List(ctx context.Context) ([]Session, error) {
 // WebSocket events stream (internal/server/events.go) without per-session
 // estimated-state tracking. See CHANGELOG.fork.md Section 2.
 func (s *service) ListAll(ctx context.Context) ([]Session, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, parent_session_id, title, message_count,
+	rows, err := s.readDB.QueryContext(ctx, `SELECT id, parent_session_id, title, message_count,
 		prompt_tokens, completion_tokens, cost, updated_at, created_at,
 		summary_message_id, todos,
 		large_model_provider, large_model_id,
@@ -1192,7 +1209,28 @@ func NewService(q *db.Queries, conn *sql.DB) Service {
 		Broker: broker,
 		db:     conn,
 		q:      q,
+		readDB: conn,
+		qRead:  q,
 	}
+}
+
+// NewServiceWithReader is NewService plus a separate read-only connection
+// (readConn/qRead) for the standalone hot read paths documented on the
+// service struct. Production wiring (internal/app.New) uses this with
+// db.ConnectRead's WAL-mode read-only pool so heavy reads (call-tree CTEs,
+// `sessions list`/`grep`) run concurrently with the single writer connection
+// instead of queuing behind it. Every other caller (tests, and anything
+// against a :memory: database where a genuinely separate reader either
+// can't see the writer's data or isn't worth the complexity) should keep
+// using plain NewService, which makes readDB/qRead alias the writer and so
+// behaves exactly as it did before this split.
+func NewServiceWithReader(q *db.Queries, conn *sql.DB, qRead *db.Queries, readConn *sql.DB) Service {
+	svc := NewService(q, conn).(*service)
+	if qRead != nil && readConn != nil {
+		svc.qRead = qRead
+		svc.readDB = readConn
+	}
+	return svc
 }
 
 // CreateAgentToolSessionID creates a session ID for agent tool sessions using the format "messageID$$toolCallID"

@@ -76,13 +76,38 @@ type Service interface {
 type service struct {
 	*pubsub.Broker[Message]
 	q db.Querier
+
+	// qRead backs the standalone, read-only hot paths (Get, List,
+	// ListPaginated, Count, ListUserMessages, ListAllUserMessages) that
+	// don't need read-your-own-write consistency with a subsequent write in
+	// the same call — most notably transcript pagination, which can walk a
+	// large OFFSET and would otherwise sit in the same single-connection
+	// queue as every in-flight agent message write. Defaults to q (see
+	// NewService), so callers that don't opt into a separate reader get
+	// today's serialized behavior unchanged.
+	qRead db.Querier
 }
 
 func NewService(q db.Querier) Service {
 	return &service{
 		Broker: pubsub.NewBroker[Message](),
 		q:      q,
+		qRead:  q,
 	}
+}
+
+// NewServiceWithReader is NewService plus a separate read-only Querier
+// (qRead) for the standalone hot read paths documented on the service
+// struct. Production wiring (internal/app.New) passes db.ConnectRead's
+// WAL-mode read-only pool here so transcript pagination and message listing
+// run concurrently with the single writer connection instead of queuing
+// behind it. Passing a nil qRead behaves exactly like NewService.
+func NewServiceWithReader(q db.Querier, qRead db.Querier) Service {
+	svc := NewService(q).(*service)
+	if qRead != nil {
+		svc.qRead = qRead
+	}
+	return svc
 }
 
 func (s *service) Delete(ctx context.Context, id string) error {
@@ -241,7 +266,7 @@ func (s *service) Update(ctx context.Context, message Message) error {
 }
 
 func (s *service) Get(ctx context.Context, id string) (Message, error) {
-	dbMessage, err := s.q.GetMessage(ctx, id)
+	dbMessage, err := s.qRead.GetMessage(ctx, id)
 	if err != nil {
 		return Message{}, err
 	}
@@ -249,7 +274,7 @@ func (s *service) Get(ctx context.Context, id string) (Message, error) {
 }
 
 func (s *service) List(ctx context.Context, sessionID string) ([]Message, error) {
-	dbMessages, err := s.q.ListMessagesBySession(ctx, sessionID)
+	dbMessages, err := s.qRead.ListMessagesBySession(ctx, sessionID)
 	if err != nil {
 		return nil, err
 	}
@@ -264,7 +289,7 @@ func (s *service) List(ctx context.Context, sessionID string) ([]Message, error)
 }
 
 func (s *service) ListPaginated(ctx context.Context, sessionID string, limit, offset int) ([]Message, error) {
-	dbMessages, err := s.q.ListMessagesBySessionPaginated(ctx, db.ListMessagesBySessionPaginatedParams{
+	dbMessages, err := s.qRead.ListMessagesBySessionPaginated(ctx, db.ListMessagesBySessionPaginatedParams{
 		SessionID: sessionID,
 		Limit:     int64(limit),
 		Offset:    int64(offset),
@@ -283,11 +308,11 @@ func (s *service) ListPaginated(ctx context.Context, sessionID string, limit, of
 }
 
 func (s *service) Count(ctx context.Context, sessionID string) (int64, error) {
-	return s.q.CountMessagesBySession(ctx, sessionID)
+	return s.qRead.CountMessagesBySession(ctx, sessionID)
 }
 
 func (s *service) ListUserMessages(ctx context.Context, sessionID string) ([]Message, error) {
-	dbMessages, err := s.q.ListUserMessagesBySession(ctx, sessionID)
+	dbMessages, err := s.qRead.ListUserMessagesBySession(ctx, sessionID)
 	if err != nil {
 		return nil, err
 	}
@@ -302,7 +327,7 @@ func (s *service) ListUserMessages(ctx context.Context, sessionID string) ([]Mes
 }
 
 func (s *service) ListAllUserMessages(ctx context.Context) ([]Message, error) {
-	dbMessages, err := s.q.ListAllUserMessages(ctx)
+	dbMessages, err := s.qRead.ListAllUserMessages(ctx)
 	if err != nil {
 		return nil, err
 	}

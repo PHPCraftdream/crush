@@ -71,10 +71,40 @@ type App struct {
 // New initializes a new application instance.
 func New(ctx context.Context, conn *sql.DB, store *config.ConfigStore) (*App, error) {
 	q := db.New(conn)
-	sessions := session.NewService(q, conn)
-	messages := message.NewService(q)
-	files := history.NewService(q, conn)
 	cfg := store.Config()
+
+	// Open a separate read-only pool alongside the writer connection so the
+	// heaviest standalone read paths (call-tree CTEs behind `sessions
+	// list`/`why`/`watch`, transcript pagination, `sessions grep`) run
+	// concurrently with the single writer connection instead of queuing
+	// behind it and behind each other. See internal/db/connect.go's
+	// ConnectRead doc and session/message's NewServiceWithReader doc for the
+	// full rationale.
+	//
+	// This is additive to db.Connect, which the caller already invoked to
+	// obtain conn — ConnectRead shares that same pool entry's refCount, so
+	// the existing single db.Release(dataDir) call in the cleanup func
+	// below must become two (one per Connect/ConnectRead call this process
+	// made) to avoid leaking the reader's reference. If the reader fails to
+	// open for any reason, we degrade to today's single-connection
+	// behavior (qRead/readDB alias the writer) rather than failing
+	// startup over a purely load-shedding optimization.
+	var qRead *db.Queries
+	var readConn *sql.DB
+	dataDir := cfg.Options.DataDirectory
+	if dataDir != "" {
+		rc, err := db.ConnectRead(ctx, dataDir)
+		if err != nil {
+			slog.Warn("Failed to open read-only DB pool, reads will serialize with writes", "error", err)
+		} else {
+			readConn = rc
+			qRead = db.New(rc)
+		}
+	}
+
+	sessions := session.NewServiceWithReader(q, conn, qRead, readConn)
+	messages := message.NewServiceWithReader(q, qRead)
+	files := history.NewService(q, conn)
 	skipPermissionsRequests := store.Overrides().SkipPermissionRequests
 	var allowedTools []string
 	if cfg.Permissions != nil && cfg.Permissions.AllowedTools != nil {
@@ -120,12 +150,28 @@ func New(ctx context.Context, conn *sql.DB, store *config.ConfigStore) (*App, er
 
 	go mcp.Initialize(ctx, app.Permissions, store)
 
-	// Release the shared database connection on shutdown. The pool
+	// Release the shared database connection(s) on shutdown. The pool
 	// closes the underlying *sql.DB when the last reference is released.
-	dataDir := cfg.Options.DataDirectory
+	// One Release call is needed per Connect/ConnectRead call this process
+	// made against dataDir: the caller already did one Connect (for conn)
+	// before calling New, and New itself did one ConnectRead above (when
+	// dataDir != "" and it succeeded) — so we release twice, matching the
+	// two increments, or once if the reader was never opened (dataDir=="").
+	releases := 1
+	if readConn != nil {
+		releases++
+	}
 	app.cleanupFuncs = append(
 		app.cleanupFuncs,
-		func(context.Context) error { return db.Release(dataDir) },
+		func(context.Context) error {
+			var err error
+			for range releases {
+				if e := db.Release(dataDir); e != nil {
+					err = e
+				}
+			}
+			return err
+		},
 		func(ctx context.Context) error { return mcp.Close(ctx) },
 	)
 

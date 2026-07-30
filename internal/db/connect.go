@@ -39,9 +39,18 @@ func init() {
 	}
 }
 
-// connEntry holds a shared database connection and its reference count.
+// connEntry holds a shared database connection pair and its reference
+// count. db is the single-connection writer (SetMaxOpenConns(1) — see the
+// comment in Connect for why). readDB is a separate, read-only pool that
+// WAL allows to run concurrently with the writer without touching the
+// corruption-prone write path; it is only ever nil-safe-equal to db itself
+// when opening a genuinely separate read-only handle isn't possible (see
+// ConnectRead). Both handles share one refCount and are opened/closed
+// together so Connect/ConnectRead/Release callers don't have to reason
+// about two independent lifetimes.
 type connEntry struct {
 	db       *sql.DB
+	readDB   *sql.DB
 	refCount int
 }
 
@@ -55,7 +64,48 @@ var (
 // file already exists, the existing connection is returned with its
 // reference count incremented. Callers must pair each Connect with a
 // [Release] when they no longer need the connection.
+//
+// Connect only ever returns the single-connection WRITER handle. Callers
+// that also want a concurrent read-only handle for hot, standalone read
+// paths (list/grep/call-tree queries that don't need read-your-own-write
+// consistency with a subsequent write in the same call) should additionally
+// call [ConnectRead] with the same dataDir — it shares this entry's
+// refCount, so a single [Release] tears down both.
 func Connect(ctx context.Context, dataDir string) (*sql.DB, error) {
+	entry, err := connect(ctx, dataDir)
+	if err != nil {
+		return nil, err
+	}
+	return entry.db, nil
+}
+
+// ConnectRead opens (or reuses) a read-only connection pool for the same
+// database Connect would open, sharing its reference count. WAL mode lets
+// readers run fully concurrently with the single writer connection instead
+// of queuing behind it — this is the point of keeping the two separate.
+//
+// dataDir must have already been (or be about to be) passed to Connect;
+// calling ConnectRead alone still opens the writer underneath (migrations
+// must run before anything reads), it just returns the reader handle. Every
+// call increments the shared refCount, so a caller that calls both Connect
+// and ConnectRead for the same dataDir must call [Release] the same number
+// of times it called either one (once per Connect/ConnectRead pair, not
+// once per function).
+func ConnectRead(ctx context.Context, dataDir string) (*sql.DB, error) {
+	entry, err := connect(ctx, dataDir)
+	if err != nil {
+		return nil, err
+	}
+	return entry.readDB, nil
+}
+
+// connect is the shared implementation behind Connect and ConnectRead: it
+// opens (or reuses) the pool entry for dataDir, running migrations exactly
+// once, and increments the entry's refCount once per call — so callers that
+// want BOTH a writer and a reader handle for the same dataDir must call
+// [Release] twice (once per Connect/ConnectRead call they made), matching
+// the existing "one Connect, one Release" contract extended to ConnectRead.
+func connect(ctx context.Context, dataDir string) (*connEntry, error) {
 	if dataDir == "" {
 		return nil, fmt.Errorf("data.dir is not set")
 	}
@@ -74,7 +124,7 @@ func Connect(ctx context.Context, dataDir string) (*sql.DB, error) {
 
 	if entry, ok := pool[absPath]; ok {
 		entry.refCount++
-		return entry.db, nil
+		return entry, nil
 	}
 
 	conn, err := openDB(dbPath)
@@ -106,13 +156,39 @@ func Connect(ctx context.Context, dataDir string) (*sql.DB, error) {
 		return nil, fmt.Errorf("failed to apply migrations: %w", err)
 	}
 
-	pool[absPath] = &connEntry{db: conn, refCount: 1}
-	return conn, nil
+	// Open the read-only pool AFTER migrations have run on the writer, on
+	// the same absolute path. WAL mode (already set on the writer above,
+	// and inherited file-wide) means these reader connections observe a
+	// consistent snapshot without ever blocking on — or being blocked
+	// by — the writer's single connection. mode=ro additionally guards
+	// against a read path accidentally issuing a write: it will fail
+	// fast with SQLITE_READONLY instead of silently taking the writer's
+	// place.
+	//
+	// If the read-only pool fails to open for any reason, we don't fail
+	// Connect/ConnectRead over it — we fall back to routing reads through
+	// the writer connection (readDB = conn), which is exactly today's
+	// behavior. A degraded-to-serialized read path is strictly better
+	// than refusing to start.
+	readConn, err := openReadDB(dbPath)
+	if err != nil {
+		slog.Warn("Failed to open read-only pool, reads will serialize with writes", "error", err)
+		readConn = conn
+	}
+
+	entry := &connEntry{db: conn, readDB: readConn, refCount: 1}
+	pool[absPath] = entry
+	return entry, nil
 }
 
 // Release decrements the reference count for the database at the given
-// data directory. When the count reaches zero the underlying connection
-// is closed and removed from the pool.
+// data directory. When the count reaches zero the underlying connections
+// (writer and, if separate, reader) are closed and removed from the pool.
+//
+// A caller that obtained both a writer (Connect) and a reader (ConnectRead)
+// handle for the same dataDir must call Release once per call it made to
+// either function — the shared refCount is decremented once per Release,
+// symmetric with connect()'s "increment once per call" contract.
 func Release(dataDir string) error {
 	dbPath := filepath.Join(dataDir, "crush.db")
 	absPath, err := filepath.Abs(dbPath)
@@ -134,7 +210,23 @@ func Release(dataDir string) error {
 	}
 
 	delete(pool, absPath)
-	return entry.db.Close()
+	return closeEntry(entry)
+}
+
+// closeEntry closes both handles in entry, tolerating readDB == db (the
+// fallback path in connect() when the read-only pool failed to open, or in
+// principle any future caller that intentionally shares one *sql.DB between
+// both roles) by only closing the reader when it is a distinct handle.
+func closeEntry(entry *connEntry) error {
+	var readErr error
+	if entry.readDB != nil && entry.readDB != entry.db {
+		readErr = entry.readDB.Close()
+	}
+	writeErr := entry.db.Close()
+	if writeErr != nil {
+		return writeErr
+	}
+	return readErr
 }
 
 // ResetPool closes all pooled connections and clears the pool. This is
@@ -143,7 +235,7 @@ func ResetPool() {
 	poolMu.Lock()
 	defer poolMu.Unlock()
 	for path, entry := range pool {
-		entry.db.Close()
+		closeEntry(entry) //nolint:errcheck
 		delete(pool, path)
 	}
 }
