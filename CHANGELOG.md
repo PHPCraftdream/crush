@@ -75,3 +75,100 @@ one at a time:
   within a single process). Config writes now also take a
   cross-process file lock, reusing the same locking mechanism already
   used for MCP config writes.
+
+Two further, independent full-project reviews (#152-171) turned up
+additional concurrency, security, and reliability issues, fixed and
+verified one at a time in the same way as the batch above:
+
+- **Sub-agent sessions weren't cross-process locked** (#163, critical)
+  — a sub-agent runs under its own child session id, distinct from
+  its parent's, so the parent's inter-process lock never covered it;
+  two processes could write into the same sub-agent session
+  concurrently. The lock is now taken for sub-agent sessions too.
+- **Config reload held the publish lock during shell substitution**
+  (#164) — resolving `${...}` values in config could block on an
+  external command for up to 5 minutes while holding the same lock
+  every config read/write needs; the resolve timeout is now 30s and
+  the slow disk+shell-resolve phase runs without holding the publish
+  lock at all. The same fix replaced environment-mutating shell-var
+  push/pop with a non-destructive overlay that never touches the
+  process's real environment.
+- **WebSocket handler panics could crash the whole `crush web`
+  process** (#154) — a panic in any per-connection message handler
+  is now recovered and logged with a stack trace instead of taking
+  down the server; concurrent handlers per connection are also capped.
+- **`permissionService.Request` held its lock for the entire wait on
+  a human response** (#156), serializing every other session's
+  permission prompts behind whichever one the user hadn't answered
+  yet. The lock is now released before waiting.
+- **Config write lock could stall for up to 30s under load** (#153),
+  an availability regression from an earlier change; write-lock
+  acquisition under an already-held publish lock is now bounded to 2s
+  with a stall warning instead of silently blocking full-length.
+- **`projects.Register` wasn't atomic across processes** (#157) — a
+  read-modify-write with no cross-process lock and a non-atomic file
+  write could corrupt the projects file under concurrent `crush run`
+  invocations. It now takes the same file lock as config writes and
+  writes atomically.
+- **WebSocket `CheckOrigin` always returned true** (#159) — a
+  cross-site WebSocket hijacking (CSWSH) exposure with only the
+  `SameSite` cookie attribute as a mitigation. Origin is now validated
+  against the actual bound host/port; token comparisons across
+  cookie/bearer/query/body now use a constant-time compare.
+- **Read-heavy operations serialized behind the single SQLite
+  connection** (#161) — every read and write shared one connection,
+  so a slow read (deep transcript pagination, a large call-tree query)
+  queued every other database operation, including message writes,
+  behind it. Reads now use a separate read-only connection pool that
+  runs concurrently with the writer under WAL.
+- **Grant/Deny could produce contradictory granted+denied outcomes**
+  (#167) — the outcome was published before the atomic claim of the
+  request; both are now inverted so only the actual race winner acts.
+- **Config snapshots could be mutated after publishing** (#168) —
+  some production code paths mutated already-published config objects
+  in place instead of going through the copy-on-write path, breaking
+  the immutable-snapshot contract readers rely on.
+- **Two concurrent deploys could mix binary versions** (#169) — the
+  hot-swap deploy steps weren't cross-process locked; a second deploy
+  starting mid-way through the first could interleave rename
+  operations. Deploys now take a cross-process lock around the
+  rename-aside steps. The same task added keyset-based pagination for
+  live transcript reads, replacing a racy separate count+fetch.
+- **Token accounting could go non-deterministic** (#165) — background
+  title generation and the main turn both wrote token counts through
+  the same additive/overwrite path, racing each other. Title
+  generation's cost is now tracked separately from the main turn's
+  token/cost snapshot.
+- **`cliprovider` could pick the WSL `bash.exe` launcher** (#166) on
+  Windows when it happened to sit ahead of Git Bash/MSYS on `PATH`,
+  the same class of bug fixed for shell scripts earlier (#149) but
+  missed in the CLI-provider binary resolver at the time.
+- **HTTP debug logs could leak request/response body secrets** (#170)
+  — enabling `--debug` alone used to be enough to log full LLM
+  request/response bodies (system prompts, message history, tool
+  output, sometimes API keys echoed in JSON fields). Body logging now
+  requires a separate `CRUSH_LOG_HTTP_BODIES=1` opt-in on top of
+  `--debug`, and known secret-shaped JSON fields are redacted even
+  when it's on.
+- **npm cache key was spoofable via size+mtime** (#170) — the
+  platform-package launcher's binary cache key was derived from file
+  size and mtime, so an in-place binary replacement that preserved
+  both (e.g. a deploy tool that restores timestamps) would keep
+  serving a stale cached build. The key is now a SHA-256 hash of the
+  binary's actual content.
+- A further batch of lower-severity nits and nondeterminism fixes
+  (#160, #162): grep's fallback reader no longer returns a spurious
+  partial-match error on a clean EOF, `ListUserMessagesBySession`
+  queries gained a tie-breaker for deterministic ordering, deploy's
+  temp-file close errors are now checked, lock-contention errors are
+  now a typed `ErrLockContended` instead of a string match, and
+  several small goroutine/singleflight/atomic races were closed.
+- **Orchestrator-mode prompt regression fixed before it ever shipped**
+  (#171) — an uncommitted edit to the coder prompt template had
+  compressed its worker-delegation rule to defer zero-trust
+  verification of delegated chunks to a single pass at the end instead
+  of verifying each chunk as it lands, letting mistakes compound
+  across chunks; fixed to verify per chunk again, and the "under 4
+  lines of prose" rule now explicitly exempts diagnosis/security-review/
+  handoff turns instead of relying on an implicit carve-out in a
+  different rule.

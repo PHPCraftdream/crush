@@ -1,95 +1,116 @@
 ---
-description: While a crush provider is inside its configured peak-hours refusal window, route delegated work through a local sub-agent instead of `crush run`, and auto-revert to `/crush` the instant the window closes
+description: Register a local sub-agent to fall back to when `crush` becomes unusable — peak-hours refusal or hard quota limit — and switch to it automatically, without asking, the moment either fires
 ---
 
-This skill is **opt-in and reactive**, not a standing watcher. Invoke it right after `/crush` (or a bare `crush run`) has just been refused for peak hours: `/crush-fallback <agent>`, where `<agent>` is the exact suffix-agent type from this session's `Agent` tool list (e.g. `sh`, `oh`, `fm`). **Do not invoke pre-emptively** "just in case" a window is about to open — wait for the actual refusal; the resume time this command schedules is read off that refusal, not guessed.
+`/crush-fallback <agent>` **arms** a fallback: it names the local `Agent` sub-agent type (e.g. `sh`, `oh`, `fm`) to use *if and when* `crush` becomes unusable. It does **NOT** switch anything right now.
 
-If `<agent>` is missing, **stop and ask** which agent type to use — never default to one on your own initiative (same rule as `--allow-peak-hours`: no silent choices on the operator's behalf).
+**Keep using `/crush` (`crush run`) as normal.** Switch to `<agent>` only when one of exactly two things happens:
 
-`/crush-fallback clear` (no agent argument) ends fallback mode early, manually — see "Clearing early" below.
+1. **Peak hours** — a `crush run` refused because the provider is inside its configured peak-hours window.
+2. **Hard limit** — weekly/monthly quota exhausted, account suspended, or "context window exceeded"/"quota exceeded" with no retry-after landing inside this session.
+
+Nothing else counts. A slow run, a transient 5xx, a `Process restarted`, your own `--timeout` firing, a confusing error — all of those mean **re-run `crush run` against the same `--session`**, not switch.
+
+When one of the two does fire: **switch immediately and silently.** Don't ask the operator for permission, don't ask them for the refusal text, don't confirm — arming this command already was their instruction. Just route the work through `Agent({subagent_type: "<agent>"})` and say one line about it.
+
+If `<agent>` is missing on invocation, **stop and ask** which agent type to use — that's the only thing you may never pick yourself.
 
 ## The eternal marker task
 
-All fallback state lives in ONE TaskList task per session, created the first time `/crush-fallback` runs and never marked `completed` for the rest of the session — it is a permanent sentinel, not a piece of work to finish. Look for a task whose subject is exactly:
+All fallback state lives in ONE TaskList task per session. Find it by
+subject **prefix** (never exact-match — the suffix is a live status
+summary, see below):
 
 ```
 crush-fallback state (persistent — do not complete)
 ```
 
-If it doesn't exist yet, `TaskCreate` it with that exact subject and `status: "pending"` (pending, not in_progress — nothing is "in progress" about a sentinel). If it already exists, `TaskUpdate` its `description` in place — never create a second one, never complete or delete it as part of normal operation (the one exception is `clear`, which still doesn't delete it — it just resets the description to dormant).
-
-The description field is the actual state, written as plain structured text:
+`TaskCreate` it (`status: pending`) the first time this command runs;
+afterwards `TaskUpdate` both its subject and description in place —
+never create a second one, never complete or delete it, it's a
+sentinel, not work. Keep the subject one line, always starting with
+the exact prefix above followed by `: ` and a short summary a human
+skimming `TaskList` can read without opening the task, e.g.:
 
 ```
-STATUS: active
+crush-fallback state (persistent — do not complete): sh — armed, switches on peak-hours or hard-limit
+crush-fallback state (persistent — do not complete): sh — ACTIVE (hard-limit), switch back with /crush-fallback clear
+crush-fallback state (persistent — do not complete): dormant
+```
+
+It survives `/checkpoint` + `/resume` and context compaction, so a
+fresh session sees the fallback state on `TaskList` without depending
+on conversation context.
+
+The description is the state:
+
+```
+STATUS: armed          # agent registered, /crush still in use — the normal resting state
 AGENT: <agent>
+```
+
+```
+STATUS: active         # a trigger fired; delegated work now goes through <agent>
+AGENT: <agent>
+TRIGGER: peak-hours | hard-limit
 PROVIDER: <id>
-UNTIL: <RFC3339 ReopensAt>
-CRON_JOB_ID: <id returned by CronCreate>
+UNTIL: <RFC3339>       # peak-hours only; "none" for hard-limit
+CRON_JOB_ID: <id>      # peak-hours only; "none" for hard-limit
 ```
 
-or, when dormant:
-
 ```
-STATUS: dormant
+STATUS: dormant        # cleared
 ```
 
-Because this task is never completed, it survives `/checkpoint` + `/resume` and context compaction exactly like every other open task — a fresh session picking this repo back up will see it on `TaskList` and know immediately whether fallback is (or was) active, without depending on anything staying in conversation context. This is intentionally NOT a technical interception — `/crush` itself does not read this marker automatically. Routing decisions are a matter of the operating agent honoring this instruction, exactly like the rest of `/crush`'s guidance is instruction-level, not a code hook.
+This is instruction-level, not a code hook — `/crush` does not read the marker automatically. Honoring it is on the operating agent.
 
-## Step 1 — Confirm this is a peak-hours refusal, not something else
+## On invocation — arm it, then carry on
 
-Do not enter fallback mode on a bare non-zero exit or a generic error. Look at the refusal text (stderr of the `crush run` that just failed, or what the user pasted) for **all** of:
+Upsert the marker to `STATUS: armed` with `<agent>`. Report one line: `fallback armed: <agent> (engages on peak-hours refusal or hard limit; /crush in use until then)`. **Then continue with `/crush` exactly as before** — nothing else changes yet.
 
-- `is in peak hours (` — the provider/window/refusing-until fragment.
-- `RESUME AT:` — followed by a local date-time and an RFC3339 stamp.
-- the phrase `peak-hours window` in the surrounding guidance paragraph.
+Re-invoking with a different agent (armed or active) just replaces `AGENT` in the marker; the trigger state and any existing cron stay as they are.
 
-These three strings are the stable signature `crush` always emits for this specific refusal (pre-flight refusal at turn start, and mid-turn forced stop, both print the identical guidance block — see `internal/agent/peak_hours_stop.go`'s `PeakHoursGuidance`, documented as the single source of truth for this text). If you only have `--json` output, do not infer peak-hours from `exit_reason` alone — `cancelled`/`error` are shared with timeouts, max-cost, max-tokens and generic failures; confirm via the same three strings in the accompanying stderr/`.warnings`/error text.
+## Trigger 1 — peak-hours refusal
 
-If none of these are present, this is **not** the peak-hours case — go to the existing "Fallback when `crush` hits rate limits" flow instead, or just retry per the normal transient-failure rules. Do not run both fallbacks at once.
+Recognise it by all three strings in the failed run's stderr / `--json` `.error`:
 
-## Step 2 — Extract the exact reopen time, and bail out if it's already past
+- `is in peak hours (`
+- `RESUME AT:` — followed by a local date-time and an RFC3339 stamp
+- `peak-hours window`
 
-Take the RFC3339 timestamp from the `RESUME AT:` line directly — it is already the precise moment the provider reopens, computed by `crush` itself (`PeakHoursError.ReopensAt`), including correct day-wrap handling for overnight windows. Do not recompute it from the `HH:MM-HH:MM` window yourself. If that line is truly unavailable, fall back to `crush providers show <id>` for the configured window and compute the next end time by hand — but prefer `RESUME AT:` whenever present.
+(That's the stable block `crush` always emits for this refusal — `internal/agent/peak_hours_stop.go`'s `PeakHoursGuidance`. Don't infer it from `exit_reason` alone; `cancelled`/`error` are shared with timeouts, max-cost and generic failures.)
 
-**Before touching the eternal task or scheduling anything**, compare the extracted time to now. If it is already in the past — the window closed while you were reading/acting on the refusal — there is nothing to fall back from: tell the operator the window has already reopened and go straight back to `/crush`, without creating/updating the eternal task and without arming a cron.
+Then:
 
-## Step 3 — Enter fallback mode
-
-Upsert the eternal task (see above) to `STATUS: active` with the current `<agent>`, provider id, and `UNTIL` timestamp (fill in `CRON_JOB_ID` after step 4 returns it).
-
-From this point on, until the eternal task reads `STATUS: dormant` again: any task you would normally hand to `/crush` (`crush run ...`), hand instead to `Agent({ subagent_type: "<agent>", ... })`, briefed exactly as you would brief `crush` — goal, file-set, definition of done. The same delegation hygiene from `/crush`'s "Launching" section still applies (scope call-outs for anything concurrent, no git-writing sub-agents running in parallel over the same tree, tests scoped to what changed, zero-trust verification of the diff afterward). This command changes the **transport**, not the verification bar.
-
-Unlike the rate-limit fallback (`@ao46l` for complex / `@ash` for simple), this fallback uses **one single agent type** — whatever the operator passed as `<agent>` — for everything, because the underlying reason has nothing to do with task complexity; it is purely "this provider is closed for the next N hours."
-
-## Step 4 — Arm a one-shot alarm for the window's close
-
-Use `CronCreate` with `recurring: false` — fires exactly once at the next matching wall-clock time, then auto-deletes. Peak-hours windows are `HH:MM-HH:MM` with no date component, so a 5-field cron built from just the end time's hour/minute (with `*` for day-of-month, month, day-of-week) fires at the correct next occurrence:
+1. Take the RFC3339 stamp from `RESUME AT:` verbatim — it's already the exact reopen moment, day-wrap handled. If it's already in the past, the window closed while you were reading: stay on `/crush`, don't switch.
+2. Marker → `STATUS: active`, `TRIGGER: peak-hours`, provider id, `UNTIL`.
+3. Arm the one-shot auto-revert cron below, record its id into `CRON_JOB_ID`.
+4. Route subsequent delegated work through `<agent>`.
 
 ```
 CronCreate({
-  cron: "<MM> <HH> * * *",     // minute, hour of ReopensAt, local time
+  cron: "<MM> <HH> * * *",     // minute+hour of ReopensAt, local time
   recurring: false,
   durable: true,
-  prompt: "# crush-fallback resume\n\nThe peak-hours window for provider <id> has closed (was due <RFC3339>).\n\nDo the following now:\n1. Do NOT interrupt any <agent> run that is still in flight — let it finish.\n2. Stop launching any NEW delegated work through <agent>.\n3. Route all subsequent delegated work back through `/crush` (crush run), as normal.\n4. TaskUpdate the `crush-fallback state (persistent — do not complete)` task's description to `STATUS: dormant` — do NOT complete or delete the task itself.\n5. Tell the user fallback mode has ended and `/crush` is back in use."
+  prompt: "# crush-fallback resume\n\nThe peak-hours window for provider <id> has closed (was due <RFC3339>).\n\n1. Do NOT interrupt any <agent> run still in flight — let it finish.\n2. Stop launching NEW work through <agent>.\n3. Route subsequent delegated work back through `/crush` (crush run).\n4. TaskUpdate the `crush-fallback state (persistent — do not complete)` task's description back to `STATUS: armed` + `AGENT: <agent>` — do NOT complete or delete the task.\n5. Tell the user fallback has ended and `/crush` is back in use."
 })
 ```
 
-`durable: true` is a deliberate deviation from `CronCreate`'s own default guidance (which reserves `durable` for explicit user requests) — a multi-hour wait that dies with the process would silently strand the session in fallback mode with no way back to `/crush` if Claude Code restarts mid-window. Record the returned job id into the eternal task's `CRON_JOB_ID` field immediately — needed by both `clear` and re-invocation (step 5).
+`durable: true` deliberately deviates from `CronCreate`'s default guidance: a multi-hour wait that died with the process would strand the session in fallback with no way back.
 
-## Step 5 — Re-invocation while already active
+## Trigger 2 — hard limit
 
-`/crush-fallback <agent2>` called while the eternal task reads `STATUS: active` SILENTLY SUPERSEDES the previous fallback, no confirmation needed: `CronDelete` the old `CRON_JOB_ID`, re-run Steps 1-4 for the new refusal/agent, and upsert the SAME eternal task (never a second one) with the new agent, provider, until-time, and cron job id. One-line report: "fallback re-armed: was <agent1> until <T1>, now <agent2> until <T2>".
+Weekly/monthly budget exhausted, account suspended, or "context window exceeded"/"quota exceeded" with no retry-after inside this session. No reopen time exists, so: marker → `STATUS: active`, `TRIGGER: hard-limit`, `UNTIL: none`, `CRON_JOB_ID: none`, no cron armed. Route work through `<agent>`. Only `/crush-fallback clear` ends it.
 
-## Clearing early — `/crush-fallback clear`
+## While active
 
-Ends fallback manually, before the alarm would have fired — e.g. the operator wants `/crush` back immediately regardless of the window. If the eternal task already reads `STATUS: dormant`, there's nothing to clear — say so and stop. Otherwise: `CronDelete` the `CRON_JOB_ID` from the eternal task's description, `TaskUpdate` the eternal task's description to `STATUS: dormant`, and report back. Same non-interruption rule as the alarm: any `<agent>` run already in flight finishes on its own — `clear` only stops NEW delegation through it.
+Hand anything you'd have given `crush run` to `Agent({subagent_type: "<agent>", ...})`, briefed the same way — goal, file-set, definition of done. All of `/crush`'s delegation hygiene still applies: scope call-outs for concurrent work, no parallel git-writing sub-agents over one tree, tests scoped to what changed, zero-trust verification of the diff afterward. This changes the **transport**, not the verification bar.
 
-## Do not confuse with "Fallback when `crush` hits rate limits"
+One agent type for everything — the reason is "crush is unavailable", not task complexity.
 
-That section (in `/crush`'s own body) fires on a **hard, non-recovering** condition — weekly/monthly budget exhausted, suspended account, context window exceeded — with no known return time, so it re-routes immediately and stays re-routed indefinitely (no alarm, no auto-revert).
+## `/crush-fallback clear`
 
-This command fires on a **soft, self-clearing** condition — a daily local-time window that reopens on a known schedule — so it re-routes temporarily and auto-reverts via the cron alarm. Never treat a peak-hours refusal as grounds for the rate-limit fallback's two-tier `@ao46l`/`@ash` routing, and never treat a hard-limit refusal as grounds for scheduling a `CronCreate` resume — there is no reopen time to wait for.
+Ends fallback now. If the marker already reads `dormant`, say so and stop. Otherwise: `CronDelete` the `CRON_JOB_ID` if one is recorded, set the marker to `STATUS: dormant`, report back. Any `<agent>` run already in flight finishes on its own — `clear` only stops NEW delegation through it.
 
 ## Task
 

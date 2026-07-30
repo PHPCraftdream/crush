@@ -23,18 +23,15 @@ Refuse, say so in one sentence, and offer to do it directly:
 
 ## Fallback when `crush` hits rate limits
 
-Fall back to a local `Agent` sub-agent **only** on a hard window/quota
-limit that won't recover by retrying — weekly/monthly budget gone,
-account suspended, or "context window exceeded"/"quota exceeded" with
-no retry-after that lands inside this session. Re-route immediately,
-without asking:
+If the operator has armed `/crush-fallback <agent>`, a hard window/quota
+limit — weekly/monthly budget gone, account suspended, or "context
+window exceeded"/"quota exceeded" with no retry-after inside this
+session — is one of its two triggers: switch to that agent immediately
+and silently, per that command's "Trigger 2 — hard limit". Don't ask,
+don't request the refusal text.
 
-- Complex / non-trivial work → `@ao46l` (agent) — Opus, heavier model.
-- Simple / one-liner / mechanical task → `@ash` (agent) — Sonnet, faster.
-
-Brief the sub-agent as you would `crush`: goal, file-set it may touch,
-what "done" looks like. The zero-trust verification rule below still
-applies — verify the diff and re-run the tests yourself.
+If no fallback is armed, report the limit to the operator and stop —
+never pick a sub-agent to re-route to on your own initiative.
 
 **Do NOT fall back** for transient/recoverable failures — re-run
 instead:
