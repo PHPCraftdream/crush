@@ -268,6 +268,40 @@ func resolveInterpreter(path string) (string, error) {
 // clear, actionable message instead of a generic "not found".
 var errWSLLauncherOnly = errors.New("only the WSL launcher is available on PATH")
 
+// ErrWSLLauncherOnly is the exported form of errWSLLauncherOnly, for
+// out-of-package callers (e.g. internal/agent/cliprovider) that need to
+// detect the "every PATH candidate is the WSL launcher" case with
+// errors.Is and present their own actionable message.
+var ErrWSLLauncherOnly = errWSLLauncherOnly
+
+// IsWSLLauncher reports whether p is one of the known WSL launcher
+// executables (bash.exe/wsl.exe under %SystemRoot%\System32, \SysWOW64, or
+// \Sysnative). Exported so other packages that resolve "bash" themselves
+// (e.g. cliprovider, which launches CLI binaries outside the shebang-dispatch
+// path) can reuse the exact same WSL-vs-Git-Bash classification instead of
+// re-deriving it. Always false off Windows.
+func IsWSLLauncher(p string) bool { return isWSLLauncher(p) }
+
+// LookPathSkippingWSL resolves name on PATH like exec.LookPath, but on
+// Windows skips over any candidate that is the WSL launcher (see
+// [IsWSLLauncher]), preferring a later Git Bash/MSYS bash on PATH instead.
+// This is the exported entry point for callers outside this package that
+// need to launch a bare command name (most commonly "bash") without going
+// through the shebang-dispatch machinery: it is exactly the logic
+// resolveInterpreter uses internally, factored out so it is not
+// reimplemented — and potentially not kept in sync — elsewhere.
+//
+// On non-Windows this is a thin wrapper around exec.LookPath.
+//
+// If every candidate on PATH is a WSL launcher, the returned error wraps
+// [ErrWSLLauncherOnly] so the caller can surface a clear, actionable message
+// instead of silently handing back a launcher that expects Linux-style
+// paths and cannot run anything given a Windows-style path or working
+// directory.
+func LookPathSkippingWSL(name string) (string, error) {
+	return lookPathSkipping(name, isWSLLauncher)
+}
+
 // lookPathSkipping looks up name on PATH like exec.LookPath, but skips any
 // candidate for which skip returns true. On non-Windows (or when skip is nil)
 // it is a thin wrapper around exec.LookPath.

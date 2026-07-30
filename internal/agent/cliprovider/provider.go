@@ -17,7 +17,6 @@ import (
 	"log/slog"
 	"mime"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -31,6 +30,7 @@ import (
 	"github.com/charmbracelet/crush/internal/permission"
 	"github.com/charmbracelet/crush/internal/platform"
 	"github.com/charmbracelet/crush/internal/session"
+	"github.com/charmbracelet/crush/internal/shell"
 )
 
 // sessionIDContextKey is a private key type so it cannot collide with other packages.
@@ -598,6 +598,27 @@ var AvailableFunc = detectAvailable
 // an internal data race the -race detector flags. Always false in production.
 var testDisablePTY bool
 
+// resolveBinary resolves name (a bare command like "claude" or "bash") to
+// the executable that will actually run, going through the same
+// WSL-launcher-aware PATH lookup internal/shell uses for #!/bin/bash
+// shebang dispatch (see shell.LookPathSkippingWSL).
+//
+// This matters specifically for Binary: "bash": plain exec.LookPath (and
+// the implicit lookup os/exec.Cmd performs on a bare name) can resolve to
+// %SystemRoot%\System32\bash.exe — the WSL launcher — if it happens to sit
+// ahead of Git Bash/MSYS bash on PATH. The WSL launcher expects Linux-style
+// paths (/mnt/c/...) and cannot run a script given a Windows-style path or
+// working directory, so silently handing it back here would launch a
+// process that appears to start but fails in confusing ways downstream.
+// Both call sites in Stream (PTY branch and pipe-fallback branch) resolve
+// through this helper rather than trusting exec.LookPath/os/exec's default
+// resolution directly.
+//
+// On non-Windows this is a thin wrapper around exec.LookPath.
+func resolveBinary(name string) (string, error) {
+	return shell.LookPathSkippingWSL(name)
+}
+
 // Available reports which CLI model specs are usable on this machine.
 func Available() []CLISpec { return AvailableFunc() }
 
@@ -606,7 +627,7 @@ func detectAvailable() []CLISpec {
 	var result []CLISpec
 	for _, spec := range All {
 		if !seen[spec.Binary] {
-			_, err := exec.LookPath(spec.Binary)
+			_, err := resolveBinary(spec.Binary)
 			seen[spec.Binary] = err == nil
 		}
 		if seen[spec.Binary] {
@@ -1028,9 +1049,12 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 			_ = p.Resize(8192, 50)
 			// Resolve the binary to an absolute path before passing to go-pty.
 			// On Windows, go-pty/ConPTY may resolve binary names relative to
-			// cmd.Dir instead of PATH, so we do the PATH lookup ourselves.
+			// cmd.Dir instead of PATH, so we do the PATH lookup ourselves —
+			// via resolveBinary so a bare "bash" cannot resolve to the WSL
+			// launcher ahead of Git Bash/MSYS on PATH (see resolveBinary's
+			// doc comment).
 			binaryPath := m.spec.Binary
-			if resolved, lookErr := exec.LookPath(m.spec.Binary); lookErr == nil {
+			if resolved, lookErr := resolveBinary(m.spec.Binary); lookErr == nil {
 				binaryPath = resolved
 			}
 			ptycmd := p.CommandContext(ctx, binaryPath, args...)
@@ -1155,7 +1179,19 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 
 	if proc.stdout == nil {
 		// Pipe fallback: large prompt (stdin required) or PTY unavailable.
-		cmd := platform.Command(ctx, m.spec.Binary, args...)
+		// Resolve the binary explicitly via resolveBinary rather than
+		// letting os/exec's own bare-name lookup run at Start(): on Windows
+		// that lookup can hand back the WSL launcher (System32\bash.exe) if
+		// it precedes Git Bash/MSYS bash on PATH, which cannot run anything
+		// given the Windows-style m.workingDir/args we pass below. Falling
+		// through to the bare name on lookup failure preserves the previous
+		// error surface (os/exec's own "not found" from Start) for the
+		// genuinely-missing-binary case.
+		binaryPath := m.spec.Binary
+		if resolved, lookErr := resolveBinary(m.spec.Binary); lookErr == nil {
+			binaryPath = resolved
+		}
+		cmd := platform.Command(ctx, binaryPath, args...)
 		cmd.Dir = m.workingDir
 		if useStdin {
 			cmd.Stdin = strings.NewReader(prompt)
