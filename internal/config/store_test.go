@@ -326,8 +326,7 @@ func TestReloadFromDisk_UsesNewConfigValues(t *testing.T) {
 
 	// Isolate from the host's global config so only test-provided
 	// providers are visible.
-	t.Setenv("CRUSH_GLOBAL_CONFIG", dir)
-	t.Setenv("CRUSH_GLOBAL_DATA", dir)
+	isolateAllGlobalConfigPaths(t)
 	resetProviderState()
 	t.Cleanup(resetProviderState)
 
@@ -758,8 +757,7 @@ func TestSetProviderRuntimeConfig_VisibleImmediatelyAndDiscardedByReload(t *test
 	require.NoError(t, os.WriteFile(configPath, []byte(initialConfig), 0o600))
 
 	// Isolate from host global config.
-	t.Setenv("CRUSH_GLOBAL_CONFIG", dir)
-	t.Setenv("CRUSH_GLOBAL_DATA", dir)
+	isolateAllGlobalConfigPaths(t)
 	resetProviderState()
 	t.Cleanup(resetProviderState)
 
@@ -811,8 +809,7 @@ func TestProviderUpdates_ConcurrentReloadNoRace(t *testing.T) {
 	}`
 	require.NoError(t, os.WriteFile(configPath, []byte(initialConfig), 0o600))
 
-	t.Setenv("CRUSH_GLOBAL_CONFIG", dir)
-	t.Setenv("CRUSH_GLOBAL_DATA", dir)
+	isolateAllGlobalConfigPaths(t)
 	resetProviderState()
 	t.Cleanup(resetProviderState)
 

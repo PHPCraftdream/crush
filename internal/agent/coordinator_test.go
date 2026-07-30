@@ -1647,8 +1647,10 @@ func newRoleModelTestCoordinator(t *testing.T, env fakeEnv, includeWorker bool) 
 	// or %LocalAppData%\crush): without this, config.Init falls back to
 	// GlobalConfigData(), which reads the real machine-wide crush.json and can
 	// leak a real models.worker entry into "worker NOT configured" scenarios.
-	// See isolatedModelsEnv in internal/cmd/models_use_test.go for the same pattern.
-	t.Setenv("CRUSH_GLOBAL_DATA", t.TempDir())
+	// See isolateAllGlobalConfigPaths's doc comment for why both
+	// CRUSH_GLOBAL_CONFIG and CRUSH_GLOBAL_DATA (not just the latter) must be
+	// isolated, and why they must point at different directories.
+	isolateAllGlobalConfigPaths(t)
 	cfg, err := config.Init(env.workingDir, "", false)
 	require.NoError(t, err)
 
@@ -1838,7 +1840,7 @@ func newWorkerToolTestCoordinator(t *testing.T, env fakeEnv, includeWorker bool)
 	t.Helper()
 	// Isolate from the host machine's real global config — see the identical
 	// comment in newRoleModelTestCoordinator above for why this is required.
-	t.Setenv("CRUSH_GLOBAL_DATA", t.TempDir())
+	isolateAllGlobalConfigPaths(t)
 	cfg, err := config.Init(env.workingDir, "", false)
 	require.NoError(t, err)
 
@@ -2069,7 +2071,7 @@ func TestBuildTools_CoderHasAskQuestion(t *testing.T) {
 	env := testEnv(t)
 	// Isolate from the host machine's real global config — see the identical
 	// comment in newRoleModelTestCoordinator above for why this is required.
-	t.Setenv("CRUSH_GLOBAL_DATA", t.TempDir())
+	isolateAllGlobalConfigPaths(t)
 	cfg, err := config.Init(env.workingDir, "", false)
 	require.NoError(t, err)
 
@@ -2220,7 +2222,7 @@ func TestAllToolNames_CoversUnconditionallyBuiltTools(t *testing.T) {
 	// binaries on PATH). Without this the Agents map is empty and the
 	// Agents[AgentCoder] lookup below misses. See newWorkerToolTestCoordinator
 	// for the fuller note.
-	t.Setenv("CRUSH_GLOBAL_DATA", t.TempDir())
+	isolateAllGlobalConfigPaths(t)
 	cfg, err := config.Init(env.workingDir, "", false)
 	require.NoError(t, err)
 	cfg.SetupAgents()

@@ -99,9 +99,7 @@ func TestLookupConfigs_BoundedByProject(t *testing.T) {
 	// Force GlobalConfig and GlobalConfigData to point at locations we
 	// control so they can be present in the result without polluting
 	// the developer's real config.
-	globalDir := t.TempDir()
-	t.Setenv("CRUSH_GLOBAL_CONFIG", globalDir)
-	t.Setenv("CRUSH_GLOBAL_DATA", globalDir)
+	isolateAllGlobalConfigPaths(t)
 
 	t.Run("does not pick up crush.json above non-git project", func(t *testing.T) {
 		parent := t.TempDir()

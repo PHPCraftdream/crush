@@ -58,10 +58,7 @@ func TestConcurrentReloadAndReads_NeverObservesTornGeneration(t *testing.T) {
 	dir := t.TempDir()
 	isolated := t.TempDir()
 	t.Setenv("HOME", isolated)
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(isolated, ".config"))
-	t.Setenv("XDG_DATA_HOME", filepath.Join(isolated, ".local", "share"))
-	t.Setenv("CRUSH_GLOBAL_CONFIG", dir)
-	t.Setenv("CRUSH_GLOBAL_DATA", dir)
+	isolateAllGlobalConfigPaths(t)
 	resetProviderState()
 	t.Cleanup(resetProviderState)
 
@@ -225,10 +222,7 @@ func TestFailedReload_DoesNotChangePublishedSnapshot(t *testing.T) {
 	dir := t.TempDir()
 	isolated := t.TempDir()
 	t.Setenv("HOME", isolated)
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(isolated, ".config"))
-	t.Setenv("XDG_DATA_HOME", filepath.Join(isolated, ".local", "share"))
-	t.Setenv("CRUSH_GLOBAL_CONFIG", dir)
-	t.Setenv("CRUSH_GLOBAL_DATA", dir)
+	isolateAllGlobalConfigPaths(t)
 	resetProviderState()
 	t.Cleanup(resetProviderState)
 
@@ -531,10 +525,7 @@ func TestUpdateConfigVsReload_ReloadDiskStateNotLostByStaleClone(t *testing.T) {
 	dir := t.TempDir()
 	isolated := t.TempDir()
 	t.Setenv("HOME", isolated)
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(isolated, ".config"))
-	t.Setenv("XDG_DATA_HOME", filepath.Join(isolated, ".local", "share"))
-	t.Setenv("CRUSH_GLOBAL_CONFIG", dir)
-	t.Setenv("CRUSH_GLOBAL_DATA", dir)
+	isolateAllGlobalConfigPaths(t)
 	// Avoid a real network provider-catalog fetch inside ReloadFromDisk:
 	// without this, reload's duration is dominated by network I/O (measured
 	// up to ~1-2s under -race) instead of the fast, disk-only reload a real
