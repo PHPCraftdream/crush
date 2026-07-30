@@ -49,7 +49,9 @@ func NewWebSearchTool(client *http.Client) fantasy.AgentTool {
 				maxResults = 20
 			}
 
-			maybeDelaySearch()
+			if err := maybeDelaySearch(ctx); err != nil {
+				return fantasy.NewTextErrorResponse("Search cancelled: " + err.Error()), nil
+			}
 			results, err := searchDuckDuckGo(ctx, client, params.Query, maxResults)
 			slog.Debug("Web search completed", "query", params.Query, "results", len(results), "err", err)
 			if err != nil {

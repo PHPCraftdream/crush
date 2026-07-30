@@ -45,6 +45,13 @@ var acceptLanguages = []string{
 	"en-CA,en;q=0.9,en-US;q=0.8",
 }
 
+// maxSearchBodyBytes caps how much of the DuckDuckGo search response body we
+// read into memory. A compromised or misbehaving endpoint (or a redirect to
+// a large file) would otherwise let io.ReadAll buffer an unbounded amount of
+// data. 8 MiB is generous for a search results page while preventing
+// unbounded growth (mirrors fetch.go/sourcegraph.go's LimitReader pattern).
+const maxSearchBodyBytes = 8 * 1024 * 1024
+
 func searchDuckDuckGo(ctx context.Context, client *http.Client, query string, maxResults int) ([]SearchResult, error) {
 	if maxResults <= 0 {
 		maxResults = 10
@@ -69,7 +76,7 @@ func searchDuckDuckGo(ctx context.Context, client *http.Client, query string, ma
 		return nil, fmt.Errorf("search failed with status code: %d", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxSearchBodyBytes))
 	if err != nil {
 		return nil, fmt.Errorf("failed to read response: %w", err)
 	}
@@ -206,14 +213,44 @@ var (
 )
 
 // maybeDelaySearch adds a random delay if the last search was recent.
-func maybeDelaySearch() {
+//
+// The wait duration is computed and lastSearchTime is reserved while holding
+// lastSearchMu, but the actual sleep happens after the lock is released. This
+// avoids serializing concurrent callers behind a held lock (N concurrent
+// sessions would otherwise queue their delays sequentially) and lets the
+// sleep be interrupted via ctx cancellation instead of blocking the caller
+// (and the lock, previously) for the full duration regardless of cancel/turn
+// timeout.
+func maybeDelaySearch(ctx context.Context) error {
+	wait := reserveSearchSlot()
+	if wait <= 0 {
+		return nil
+	}
+
+	select {
+	case <-time.After(wait):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// reserveSearchSlot computes how long the caller must wait before its search
+// runs and immediately reserves that slot by advancing lastSearchTime, so
+// concurrent callers each get a distinct slot instead of piling up behind a
+// held lock.
+func reserveSearchSlot() time.Duration {
 	lastSearchMu.Lock()
 	defer lastSearchMu.Unlock()
 
 	minGap := time.Duration(500+rand.IntN(1500)) * time.Millisecond
-	elapsed := time.Since(lastSearchTime)
+	now := time.Now()
+	elapsed := now.Sub(lastSearchTime)
+
+	var wait time.Duration
 	if elapsed < minGap {
-		time.Sleep(minGap - elapsed)
+		wait = minGap - elapsed
 	}
-	lastSearchTime = time.Now()
+	lastSearchTime = now.Add(wait)
+	return wait
 }

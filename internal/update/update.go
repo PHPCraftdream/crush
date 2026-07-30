@@ -14,6 +14,14 @@ import (
 const (
 	githubApiUrl = "https://api.github.com/repos/charmbracelet/crush/releases/latest"
 	userAgent    = "crush/1.0"
+
+	// maxReleaseBodyBytes caps how much of the GitHub releases API HTTP
+	// response body we read into memory. It's a real network endpoint (not
+	// a trusted local source), so an unbounded io.ReadAll/Decode is avoided
+	// even though a normal release payload is small. Mirrors the limit used
+	// for similar small JSON API responses elsewhere (e.g.
+	// internal/oauth/hyper/device.go, internal/oauth/copilot/oauth.go).
+	maxReleaseBodyBytes = 1 << 20 // 1MB
 )
 
 // Default is the default [Client].
@@ -114,12 +122,12 @@ func (c *github) Latest(ctx context.Context) (*Release, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxReleaseBodyBytes))
 		return nil, fmt.Errorf("GitHub API returned status %d: %s", resp.StatusCode, string(body))
 	}
 
 	var release Release
-	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxReleaseBodyBytes)).Decode(&release); err != nil {
 		return nil, err
 	}
 

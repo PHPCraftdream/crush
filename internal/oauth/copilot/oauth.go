@@ -20,6 +20,14 @@ const (
 	deviceCodeURL   = "https://github.com/login/device/code"
 	accessTokenURL  = "https://github.com/login/oauth/access_token"
 	copilotTokenURL = "https://api.github.com/copilot_internal/v2/token"
+
+	// maxOAuthBodyBytes caps how much of an OAuth-related HTTP response body
+	// we read into memory. These are small JSON token/error payloads from
+	// GitHub, but the response is still a real network endpoint, not a
+	// trusted local source, so an unbounded io.ReadAll/Decode is avoided.
+	// Matches internal/oauth/hyper/device.go's limit for the same class of
+	// device-code-flow responses.
+	maxOAuthBodyBytes = 1 << 20 // 1MB
 )
 
 var ErrNotAvailable = errors.New("github copilot not available")
@@ -54,12 +62,12 @@ func RequestDeviceCode(ctx context.Context) (*DeviceCode, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxOAuthBodyBytes))
 		return nil, fmt.Errorf("device code request failed: %s - %s", resp.Status, string(body))
 	}
 
 	var dc DeviceCode
-	if err := json.NewDecoder(resp.Body).Decode(&dc); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxOAuthBodyBytes)).Decode(&dc); err != nil {
 		return nil, err
 	}
 	return &dc, nil
@@ -127,7 +135,7 @@ func tryGetToken(ctx context.Context, deviceCode string) (*oauth.Token, error) {
 		AccessToken string `json:"access_token"`
 		Error       string `json:"error"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxOAuthBodyBytes)).Decode(&result); err != nil {
 		return nil, err
 	}
 
@@ -164,7 +172,7 @@ func getCopilotToken(ctx context.Context, githubToken string) (*oauth.Token, err
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxOAuthBodyBytes))
 	if err != nil {
 		return nil, err
 	}
