@@ -142,6 +142,68 @@ func (q *Queries) GetMessage(ctx context.Context, id string) (Message, error) {
 	return i, err
 }
 
+const getTranscriptWindowCursor = `-- name: GetTranscriptWindowCursor :one
+SELECT
+    created_at,
+    CAST(rowid AS INTEGER) AS row_id,
+    COUNT(*) OVER () AS total_count
+FROM messages
+WHERE session_id = ?
+ORDER BY created_at DESC, rowid DESC
+LIMIT 1 OFFSET ?
+`
+
+type GetTranscriptWindowCursorParams struct {
+	SessionID string `json:"session_id"`
+	Offset    int64  `json:"offset"`
+}
+
+type GetTranscriptWindowCursorRow struct {
+	CreatedAt  int64 `json:"created_at"`
+	RowID      int64 `json:"row_id"`
+	TotalCount int64 `json:"total_count"`
+}
+
+// Returns, in a SINGLE round trip, the (created_at, rowid) of the row at
+// `offset` positions back from the newest message in the session, together
+// with the session's total message count as of that same statement
+// execution (SQLite evaluates COUNT(*) OVER() over the full WHERE-matched row
+// set before LIMIT/OFFSET are applied, in the same query plan as the LIMIT 1
+// OFFSET ? row selection - both numbers come from one consistent snapshot).
+//
+// This is the fix for the cross-statement race in read_delegation_transcript.go:
+// previously Count() and ListPaginated() were two independent queries, so a
+// message inserted between them (the normal case while observing a live
+// sub-agent) could make the total and the offset-derived window disagree.
+// message.Service.ListPaginatedSnapshot calls this query FIRST to pin down a
+// single high-water-mark snapshot (the boundary row's created_at/row_id, plus
+// total), then fetches the window strictly at-or-before that boundary via
+// ListMessagesBySessionOlderThanCreatedAt + ListMessagesBySessionAtCreatedAt.
+// Any message inserted after this query executes is newer than the pinned
+// boundary and is therefore correctly excluded from both the "total" figure
+// and the follow-up window fetch - the read as a whole reflects one
+// consistent point in time rather than drifting across separate round trips.
+//
+// created_at/row_id are NULL when offset falls at or past the end of the
+// session's messages (i.e. there is no row at that position): callers must
+// treat NULL as "start of history", matching offset's existing clamp-to-empty
+// behavior in clampTranscriptWindow.
+//
+// row_id is exposed via CAST(rowid AS INTEGER): sqlc's SQLite catalog has no
+// notion of SQLite's implicit rowid column outside ORDER BY (confirmed by
+// hand: any bare `rowid` reference in a WHERE clause or plain SELECT-list
+// position fails static analysis with "column \"rowid\" does not exist",
+// while the identical reference wrapped in CAST(... AS INTEGER) in the
+// SELECT list is accepted) - see ListMessagesBySessionOlderThanCreatedAt's
+// comment for why the keyset filter itself therefore avoids rowid in a WHERE
+// clause entirely rather than fighting this further.
+func (q *Queries) GetTranscriptWindowCursor(ctx context.Context, arg GetTranscriptWindowCursorParams) (GetTranscriptWindowCursorRow, error) {
+	row := q.queryRow(ctx, q.getTranscriptWindowCursorStmt, getTranscriptWindowCursor, arg.SessionID, arg.Offset)
+	var i GetTranscriptWindowCursorRow
+	err := row.Scan(&i.CreatedAt, &i.RowID, &i.TotalCount)
+	return i, err
+}
+
 const listAllUserMessages = `-- name: ListAllUserMessages :many
 SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden, reasoning_effort, auto_resumed, background_job_notice
 FROM messages
@@ -244,6 +306,140 @@ func (q *Queries) ListMessagesBySession(ctx context.Context, sessionID string) (
 	return items, nil
 }
 
+const listMessagesBySessionAtCreatedAt = `-- name: ListMessagesBySessionAtCreatedAt :many
+SELECT
+    messages.id, messages.session_id, messages.role, messages.parts, messages.model, messages.created_at, messages.updated_at, messages.finished_at, messages.provider, messages.is_summary_message, messages.pinned, messages.hidden, messages.reasoning_effort, messages.auto_resumed, messages.background_job_notice,
+    CAST(rowid AS INTEGER) AS row_id
+FROM messages
+WHERE session_id = ?
+  AND created_at = ?
+ORDER BY rowid DESC
+`
+
+type ListMessagesBySessionAtCreatedAtParams struct {
+	SessionID string `json:"session_id"`
+	CreatedAt int64  `json:"created_at"`
+}
+
+type ListMessagesBySessionAtCreatedAtRow struct {
+	Message Message `json:"message"`
+	RowID   int64   `json:"row_id"`
+}
+
+// Second half of the keyset pagination pair (see
+// ListMessagesBySessionOlderThanCreatedAt): returns every message in the
+// session sharing the exact boundary second, WITH its rowid (via
+// CAST(rowid AS INTEGER), the one position sqlc's SQLite catalog accepts a
+// bare rowid reference in - see GetTranscriptWindowCursor's comment), so the
+// Go caller can apply the `rowid < boundary_row_id` half of the tiebreaker
+// itself and merge the result with the older-seconds query above into one
+// deterministic (created_at DESC, rowid DESC) window.
+func (q *Queries) ListMessagesBySessionAtCreatedAt(ctx context.Context, arg ListMessagesBySessionAtCreatedAtParams) ([]ListMessagesBySessionAtCreatedAtRow, error) {
+	rows, err := q.query(ctx, q.listMessagesBySessionAtCreatedAtStmt, listMessagesBySessionAtCreatedAt, arg.SessionID, arg.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListMessagesBySessionAtCreatedAtRow{}
+	for rows.Next() {
+		var i ListMessagesBySessionAtCreatedAtRow
+		if err := rows.Scan(
+			&i.Message.ID,
+			&i.Message.SessionID,
+			&i.Message.Role,
+			&i.Message.Parts,
+			&i.Message.Model,
+			&i.Message.CreatedAt,
+			&i.Message.UpdatedAt,
+			&i.Message.FinishedAt,
+			&i.Message.Provider,
+			&i.Message.IsSummaryMessage,
+			&i.Message.Pinned,
+			&i.Message.Hidden,
+			&i.Message.ReasoningEffort,
+			&i.Message.AutoResumed,
+			&i.Message.BackgroundJobNotice,
+			&i.RowID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listMessagesBySessionOlderThanCreatedAt = `-- name: ListMessagesBySessionOlderThanCreatedAt :many
+SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden, reasoning_effort, auto_resumed, background_job_notice
+FROM messages
+WHERE session_id = ?
+  AND created_at < ?
+ORDER BY created_at DESC, rowid DESC
+LIMIT ?
+`
+
+type ListMessagesBySessionOlderThanCreatedAtParams struct {
+	SessionID string `json:"session_id"`
+	CreatedAt int64  `json:"created_at"`
+	Limit     int64  `json:"limit"`
+}
+
+// First half of the keyset pagination pair used by
+// read_delegation_transcript.go: returns messages strictly OLDER (by
+// created_at second) than the cursor boundary, deterministically ordered.
+// Combined in Go with ListMessagesBySessionAtCreatedAt (which handles the
+// boundary second's exact-tie rows via the rowid tiebreaker) to reproduce the
+// same (created_at, rowid) keyset semantics as a single
+// `(created_at, rowid) < (?, ?)` comparison would, without needing rowid in a
+// WHERE clause - see GetTranscriptWindowCursor's comment for why that's
+// avoided. Because the boundary is a concrete value pinned by
+// GetTranscriptWindowCursor at the start of the read (not "the Nth row from
+// the current end"), inserting new messages at the head between calls can
+// never shift which rows this query returns: the boundary itself doesn't move.
+func (q *Queries) ListMessagesBySessionOlderThanCreatedAt(ctx context.Context, arg ListMessagesBySessionOlderThanCreatedAtParams) ([]Message, error) {
+	rows, err := q.query(ctx, q.listMessagesBySessionOlderThanCreatedAtStmt, listMessagesBySessionOlderThanCreatedAt, arg.SessionID, arg.CreatedAt, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Message{}
+	for rows.Next() {
+		var i Message
+		if err := rows.Scan(
+			&i.ID,
+			&i.SessionID,
+			&i.Role,
+			&i.Parts,
+			&i.Model,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.FinishedAt,
+			&i.Provider,
+			&i.IsSummaryMessage,
+			&i.Pinned,
+			&i.Hidden,
+			&i.ReasoningEffort,
+			&i.AutoResumed,
+			&i.BackgroundJobNotice,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listMessagesBySessionPaginated = `-- name: ListMessagesBySessionPaginated :many
 SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden, reasoning_effort, auto_resumed, background_job_notice
 FROM messages
@@ -264,6 +460,17 @@ type ListMessagesBySessionPaginatedParams struct {
 // OFFSET pagination lose/duplicate rows when the query plan shifts between
 // page fetches. rowid is SQLite's implicit monotonic insertion counter, so
 // (created_at DESC, rowid DESC) is a deterministic newest-first total order.
+//
+// NOTE: plain OFFSET is still vulnerable to a DIFFERENT instability than the
+// tie-breaker bug above: concurrent inserts at the head of the DESC order (new
+// messages from a still-running delegation) shift what a given numeric offset
+// points at between two separate calls of this query. This query remains here
+// as the plain, unprotected primitive; message.Service.ListPaginatedSnapshot
+// is the race-free caller-facing wrapper read_delegation_transcript.go
+// actually uses, built from GetTranscriptWindowCursor (pins one consistent
+// snapshot boundary) plus the keyset pair ListMessagesBySessionOlderThan-
+// CreatedAt / ListMessagesBySessionAtCreatedAt (fetches the window strictly
+// at-or-before that boundary, immune to head insertions by construction).
 func (q *Queries) ListMessagesBySessionPaginated(ctx context.Context, arg ListMessagesBySessionPaginatedParams) ([]Message, error) {
 	rows, err := q.query(ctx, q.listMessagesBySessionPaginatedStmt, listMessagesBySessionPaginated, arg.SessionID, arg.Limit, arg.Offset)
 	if err != nil {

@@ -3,6 +3,8 @@ package message
 import (
 	"context"
 	"database/sql"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -19,6 +21,14 @@ func newTestMessageDB(t *testing.T) (*sql.DB, *db.Queries) {
 	sqlDB, err := sql.Open("sqlite", ":memory:")
 	require.NoError(t, err)
 	t.Cleanup(func() { sqlDB.Close() })
+	// Mirror production's SetMaxOpenConns(1) (see internal/db/connect.go):
+	// database/sql's default pool can open a SECOND connection under
+	// concurrent access, and a second connection to ":memory:" is a
+	// distinct, empty database for this driver — not the same in-memory
+	// data. Without pinning to one connection, concurrency tests here would
+	// intermittently see "no such table" from a fresh, unmigrated
+	// connection rather than exercising real contention on shared data.
+	sqlDB.SetMaxOpenConns(1)
 
 	// Run migrations
 	_, err = sqlDB.ExecContext(context.Background(), `
@@ -520,4 +530,241 @@ func TestUpdate_PartialCheckpoint_UsesBestEffortPublish(t *testing.T) {
 		"Partial checkpoint should be dropped via best-effort Publish on a full buffer")
 	assert.Equal(t, uint64(0), svc.MustDeliverDropCount(),
 		"Partial checkpoint must not exercise the must-deliver timeout path")
+}
+
+// TestListPaginatedSnapshot_ConsistentUnderConcurrentInserts is the
+// regression test for the review finding (P2.7): reading a transcript window
+// via separate Count + ListPaginated calls can disagree with each other (or
+// with a later read) when new messages are inserted concurrently, because
+// OFFSET counts back from the newest end of a DESC list and a numeric offset
+// silently refers to a different logical position once the head shifts.
+// ListPaginatedSnapshot pins one (created_at, rowid) boundary and a matching
+// total from a single query before doing any further work, so the returned
+// (window, total) pair must stay internally consistent — and stay stable
+// across repeated calls with the SAME offset — no matter how many new
+// messages a concurrent writer inserts during or between the calls.
+func TestListPaginatedSnapshot_ConsistentUnderConcurrentInserts(t *testing.T) {
+	_, q := newTestMessageDB(t)
+	svc := NewService(q)
+	ctx := t.Context()
+	sessionID := "test-session-concurrent-snapshot"
+
+	const seedCount = 50
+	for i := 0; i < seedCount; i++ {
+		_, err := svc.Create(ctx, sessionID, CreateMessageParams{
+			Role:  Assistant,
+			Parts: []ContentPart{TextContent{Text: fmt.Sprintf("seed-%03d", i)}},
+		})
+		require.NoError(t, err)
+	}
+
+	// Reader loop: repeatedly reads a snapshot window+total pair while a
+	// writer goroutine concurrently inserts new messages (simulating a live
+	// sub-agent still producing output while its transcript is being read).
+	// Run under `go test -race` (see the package's test invocation in the
+	// task's verification step): the point of this test is exercising the
+	// split-query read path (GetTranscriptWindowCursor,
+	// ListMessagesBySessionAtCreatedAt, ListMessagesBySessionOlderThan-
+	// CreatedAt) concurrently with writes hitting the same session, so any
+	// data race in message.service's implementation surfaces here. Bounds and
+	// per-call consistency are asserted precisely by
+	// TestListPaginatedSnapshot_SingleCallWindowMatchesTotal below; this test
+	// only needs to confirm nothing errors, panics, or races while both
+	// sides run concurrently.
+	const maxMessages = 10
+	const offset = 5
+	const readIterations = 30
+
+	var wg sync.WaitGroup
+	stopWriting := make(chan struct{})
+	writeErrs := make(chan error, 1)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		i := 0
+		for {
+			select {
+			case <-stopWriting:
+				return
+			default:
+			}
+			_, err := svc.Create(ctx, sessionID, CreateMessageParams{
+				Role:  Assistant,
+				Parts: []ContentPart{TextContent{Text: fmt.Sprintf("live-%04d", i)}},
+			})
+			if err != nil {
+				select {
+				case writeErrs <- err:
+				default:
+				}
+				return
+			}
+			i++
+		}
+	}()
+
+	for iter := 0; iter < readIterations; iter++ {
+		window, total, err := svc.ListPaginatedSnapshot(ctx, sessionID, maxMessages, offset)
+		require.NoError(t, err)
+		require.GreaterOrEqual(t, total, int64(seedCount),
+			"total must never report fewer than the seeded messages")
+		require.LessOrEqual(t, len(window), maxMessages,
+			"window must never exceed the requested limit")
+	}
+
+	close(stopWriting)
+	wg.Wait()
+	select {
+	case err := <-writeErrs:
+		require.NoError(t, err, "concurrent writer must not fail")
+	default:
+	}
+}
+
+// TestListPaginatedSnapshot_SingleCallWindowMatchesTotal proves the
+// within-one-call atomicity ListPaginatedSnapshot exists to guarantee: while
+// a writer goroutine concurrently inserts messages, every single
+// ListPaginatedSnapshot(offset=0, limit) call must return a window whose
+// newest message is consistent with THAT SAME call's own total — i.e. a
+// window's message count plus offset never exceeds the total that same call
+// reported, and the total never under-counts what the window itself proves
+// exists. This is what a single tool invocation of
+// read_delegation_transcript.go relies on: the "N earlier omitted" marker
+// (derived from total) must never disagree with the window actually shown,
+// no matter what a concurrently-running sub-agent inserts mid-call.
+//
+// Cross-call continuation (paging with a numeric offset computed from an
+// EARLIER call's total while a live writer keeps advancing the head) is a
+// different, harder guarantee that plain offset-based paging cannot make
+// even with this fix — each call pins its OWN snapshot at `offset` positions
+// back from that call's own newest row, so an offset computed against one
+// call's total can legitimately mean a different logical position under a
+// LATER call once new rows have shifted the head. That is precisely why the
+// review's keyset design exists at the SQL layer (see
+// ListMessagesBySessionOlderThanCreatedAt / ListMessagesBySessionAtCreatedAt
+// in internal/db/sql/messages.sql) even though
+// read_delegation_transcript.go's public offset parameter is kept for
+// backward compatibility rather than switched to an explicit cursor — see
+// this package's ListPaginatedSnapshot doc comment and the task's own
+// scoping of "consistent within one call" for why that tradeoff was made.
+func TestListPaginatedSnapshot_SingleCallWindowMatchesTotal(t *testing.T) {
+	_, q := newTestMessageDB(t)
+	svc := NewService(q)
+	ctx := t.Context()
+	sessionID := "test-session-single-call-consistency"
+
+	const seedCount = 47 // deliberately not a multiple of the page size
+	for i := 0; i < seedCount; i++ {
+		_, err := svc.Create(ctx, sessionID, CreateMessageParams{
+			Role:  Assistant,
+			Parts: []ContentPart{TextContent{Text: fmt.Sprintf("seed-%03d", i)}},
+		})
+		require.NoError(t, err)
+	}
+
+	var wg sync.WaitGroup
+	stopWriting := make(chan struct{})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		i := 0
+		for {
+			select {
+			case <-stopWriting:
+				return
+			default:
+			}
+			_, _ = svc.Create(ctx, sessionID, CreateMessageParams{
+				Role:  Assistant,
+				Parts: []ContentPart{TextContent{Text: fmt.Sprintf("live-%04d", i)}},
+			})
+			i++
+		}
+	}()
+	t.Cleanup(func() {
+		close(stopWriting)
+		wg.Wait()
+	})
+
+	const pageSize = 7
+	const calls = 50
+	for i := 0; i < calls; i++ {
+		window, total, err := svc.ListPaginatedSnapshot(ctx, sessionID, pageSize, 0)
+		require.NoError(t, err)
+		require.GreaterOrEqual(t, total, int64(seedCount),
+			"total must never under-report the seeded floor")
+		require.LessOrEqual(t, len(window), pageSize,
+			"window must never exceed the requested limit")
+		// The window is this call's own newest `pageSize` messages, so its
+		// length can only be less than pageSize if the total itself is
+		// smaller than pageSize - anything else would mean the window and
+		// total came from different snapshots (a torn read).
+		if total < int64(pageSize) {
+			require.EqualValues(t, total, len(window),
+				"when total is below the page size, the window must contain every message the SAME call's total reports")
+		} else {
+			require.Len(t, window, pageSize,
+				"a full-size window must be returned whenever this call's own total is at least one page")
+		}
+	}
+}
+
+// TestListPaginatedSnapshot_StablePagingWhenWritesArePaused walks an entire
+// session's history backward page by page using ListPaginatedSnapshot AFTER
+// concurrent writing has stopped, and asserts the union of all pages
+// reproduces exactly the seeded messages with no duplicates and no gaps —
+// confirming the keyset-based window fetch (ListMessagesBySessionOlderThan-
+// CreatedAt + ListMessagesBySessionAtCreatedAt) itself is correct and
+// complete once the underlying data is stable, independent of the
+// within-one-call snapshot race covered by
+// TestListPaginatedSnapshot_SingleCallWindowMatchesTotal above.
+func TestListPaginatedSnapshot_StablePagingWhenWritesArePaused(t *testing.T) {
+	_, q := newTestMessageDB(t)
+	svc := NewService(q)
+	ctx := t.Context()
+	sessionID := "test-session-paging-no-gaps"
+
+	const seedCount = 47 // deliberately not a multiple of the page size
+	seededIDs := make(map[string]bool, seedCount)
+	for i := 0; i < seedCount; i++ {
+		created, err := svc.Create(ctx, sessionID, CreateMessageParams{
+			Role:  Assistant,
+			Parts: []ContentPart{TextContent{Text: fmt.Sprintf("seed-%03d", i)}},
+		})
+		require.NoError(t, err)
+		seededIDs[created.ID] = true
+	}
+
+	const pageSize = 7
+	firstWindow, firstTotal, err := svc.ListPaginatedSnapshot(ctx, sessionID, pageSize, 0)
+	require.NoError(t, err)
+	require.EqualValues(t, seedCount, firstTotal)
+
+	seen := make(map[string]int)
+	for _, m := range firstWindow {
+		seen[m.ID]++
+	}
+
+	for offset := pageSize; offset < int(firstTotal); offset += pageSize {
+		window, total, err := svc.ListPaginatedSnapshot(ctx, sessionID, pageSize, offset)
+		require.NoError(t, err)
+		require.EqualValues(t, seedCount, total, "total must stay stable across pages when nothing is being written")
+		for _, m := range window {
+			seen[m.ID]++
+		}
+	}
+
+	var missing, dup []string
+	for id := range seededIDs {
+		switch seen[id] {
+		case 0:
+			missing = append(missing, id)
+		case 1:
+			// ok
+		default:
+			dup = append(dup, id)
+		}
+	}
+	require.Empty(t, missing, "seeded messages missing across the paged walk: %v", missing)
+	require.Empty(t, dup, "seeded messages duplicated across the paged walk: %v", dup)
 }

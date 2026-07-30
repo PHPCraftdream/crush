@@ -9,13 +9,102 @@
 package deploy
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/charmbracelet/crush/internal/session"
 )
+
+// DeployLockTimeout caps how long AcquireDeployLock waits for a
+// concurrent `go run deploy.go` to finish before giving up. A deploy
+// (build.go + copying 1-2 small binaries) normally completes in well
+// under a minute; a wedged holder (killed mid-build, debugger attached)
+// must not freeze a second operator's deploy indefinitely. Mirrors the
+// same "bounded wait, not an infinite one" reasoning as
+// registerLockTimeout in internal/projects/projects.go.
+const DeployLockTimeout = 2 * time.Minute
+
+// DeployLockPath returns the path AcquireDeployLock locks against.
+//
+// A single, stable, well-known path is used — not a per-destination
+// sidecar (e.g. dst+".deploy.lock") — because resolveDests's discovered
+// destinations can legitimately differ between two invocations of
+// deploy.go: the npm-shim directory depends on wherever `crush` resolves
+// on THIS invocation's PATH, CRUSH_DEPLOY_PATH can be set for one run and
+// not another, and a first-install run has no pre-existing dst at all
+// (DefaultInstallPath is used instead). A per-dst lock would only
+// serialize two deploys that happen to resolve to the exact same dst set
+// in the exact same order — the scenario this guards against (two
+// deploys interleaving across DIFFERENT destinations, e.g. deploy A
+// replaces the npm-shim while deploy B is mid-replacing the node_modules
+// binary) would slip right past it. A single global lock instead
+// serializes step 4 (replace-all-destinations) end-to-end across ANY two
+// concurrent deploys on the same machine, regardless of what they each
+// resolve dsts to — the correctness property the review actually asked
+// for ("two deploys must never interleave their dst replacements").
+// os.TempDir() is used rather than colocating with a dst because there
+// may be zero destinations that exist yet (first install) and because
+// the lock must be discoverable before resolveDests has even run.
+func DeployLockPath() string {
+	return filepath.Join(os.TempDir(), "crush-deploy.lock")
+}
+
+// AcquireDeployLock takes an exclusive, cross-process lock guarding
+// deploy.go's step 4 (replace every resolved destination) and step 5
+// (post-replace --version verification), so two `go run deploy.go`
+// invocations racing on the same machine can never interleave their
+// per-destination renames.
+//
+// Without this lock, two concurrent deploys replacing the SAME set of
+// destinations (typical: an npm-shim sibling + the node_modules real
+// binary, kept in sync — see resolveDests) could each replace a
+// DIFFERENT subset before the other finishes, e.g.:
+//
+//	deploy A: replace dst1 -> build A
+//	deploy B: replace dst1 -> build B, replace dst2 -> build B
+//	deploy A: replace dst2 -> build A
+//	result: dst1=B, dst2=A — a mixed-version install
+//
+// Worse, replaceFile's rename-aside rollback (SwapRenameAside) can't
+// distinguish "my own swap failed" from "a sibling deploy's successful
+// swap raced mine" — without serialization, deploy A could observe a
+// transient failure caused by deploy B's own in-flight rename and roll
+// back B's already-succeeded replacement of that destination.
+//
+// A single exclusive lock around the whole replace+verify block turns
+// two concurrent deploys into a strictly sequential pair (whichever
+// acquires first runs its entire replace-all-destinations block to
+// completion before the second even starts touching a file), which is
+// sufficient to rule out interleaving without needing a multi-destination
+// transaction/manifest: every actual mutation the review is concerned
+// about (the sequence of per-dst renames in step 4) happens for one
+// deploy in full before the other's begins. A manifest recording the
+// expected BuildID per destination (as the review floats as an optional
+// extra) would let step 5's verification also catch a THIRD-PARTY writer
+// that isn't running deploy.go at all (e.g. a hand-run `cp`) — but that
+// is out of scope for what two racing `go run deploy.go` operators need,
+// adds a persistent-file format to design/version, and every dst is
+// already independently re-verified via `--version` in step 5. The lock
+// alone closes the race this review reports; the manifest is deferred as
+// unnecessary complexity for that goal.
+//
+// The lock file at DeployLockPath is never removed after Release, by the
+// same reasoning as ConfigStore.withConfigWriteLockCtx and
+// projects.Register: removing it would race a concurrent process that
+// has already reopened/relocked the same path (harmless on POSIX,
+// unsafe on Windows without FILE_SHARE_DELETE).
+func AcquireDeployLock(ctx context.Context, lockPath string) (*session.FileLock, error) {
+	lock, err := session.AcquireFileLockContext(ctx, lockPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to acquire deploy lock %q (another `go run deploy.go` may be in progress): %w", lockPath, err)
+	}
+	return lock, nil
+}
 
 // RenameAsideName returns the path dst should be moved to before a fresh
 // binary is written in its place, given a uniqueness token (normally

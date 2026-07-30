@@ -49,6 +49,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -152,6 +153,23 @@ func main() {
 		}
 	}
 
+	// 3.5. Take an exclusive, cross-process lock around steps 4 and 5 so
+	//      two `go run deploy.go` invocations racing on this machine can
+	//      never interleave their per-destination renames — see
+	//      deploy.AcquireDeployLock's doc comment for why the race matters
+	//      (mixed-version installs, and a rollback in one process clobbering
+	//      the other's successful swap) and why a single stable lock path is
+	//      used instead of a per-dst sidecar (dsts can differ between runs).
+	step("Acquiring deploy lock (%s)…", deploy.DeployLockPath())
+	lockCtx, lockCancel := context.WithTimeout(context.Background(), deploy.DeployLockTimeout)
+	defer lockCancel()
+	deployLock, err := deploy.AcquireDeployLock(lockCtx, deploy.DeployLockPath())
+	if err != nil {
+		fatal("%v", err)
+	}
+	defer deployLock.Release()
+	ok("Deploy lock acquired")
+
 	// 4. Copy with a temp + rename to make the swap atomic for each
 	//    target. Live sessions are never killed: on Unix the rename is
 	//    safe for running processes outright; on Windows replaceFile
@@ -170,7 +188,9 @@ func main() {
 	//    them all to the new build. Preparing every temp copy up front
 	//    and only then renaming would not make the renames joint-atomic
 	//    across dsts anyway, so it adds complexity without removing the
-	//    fundamental last-writer gap.
+	//    fundamental last-writer gap. What IS now ruled out (by the
+	//    deploy lock acquired above) is a SECOND deploy interleaving its
+	//    own per-dst renames with this one's — see AcquireDeployLock.
 	for _, dst := range dsts {
 		if err := replaceFile(src, dst); err != nil {
 			fatal("replace %s: %v", dst, err)
@@ -180,7 +200,9 @@ func main() {
 
 	// 5. Verify by running the newly installed binary at every
 	//    destination — catches mismatched sibling files that would
-	//    silently keep an old build alive.
+	//    silently keep an old build alive. Still under the deploy lock,
+	//    so a concurrent deploy cannot replace a dst out from under this
+	//    verification pass either.
 	for _, dst := range dsts {
 		if v, err := exec.Command(dst, "--version").CombinedOutput(); err == nil {
 			ok("Installed (%s): %s", filepath.Base(dst), strings.TrimSpace(string(v)))
@@ -371,16 +393,18 @@ func resolveDests() ([]string, error) {
 // locks the freshly written tmp), it rolls the old binary back from
 // aside to dst so the operator is never left with a MISSING binary.
 //
-// No inter-process deploy-lock is taken here, by design. The per-deploy
-// temp path (dst + ".new-<pid>-<nanos>") already eliminates file-level
-// collisions between concurrent deploys, and the rename-aside token is
-// likewise per-deploy so two deploys produce distinct aside names and
-// never clobber each other's stranded old binary. A cross-platform file
-// lock (flock on Unix, LockFileEx on Windows) would add stale-lock and
-// deadlock risk for a race — two operators running deploy.go at the same
-// instant on the same dst — that is already a benign last-writer-wins
-// (both write a valid freshly built binary) rather than corruption. Not
-// worth the complexity.
+// replaceFile itself takes no lock: the per-deploy temp path
+// (dst + ".new-<pid>-<nanos>") already eliminates file-level collisions
+// between concurrent deploys, and the rename-aside token is likewise
+// per-deploy so two deploys produce distinct aside names and never
+// clobber each other's stranded old binary. What replaceFile's own
+// per-file uniqueness does NOT prevent is two deploys interleaving their
+// renames ACROSS multiple destinations (dst1, dst2, ...), which can
+// produce a mixed-version install or a spurious rollback of a sibling
+// deploy's successful swap — see deploy.AcquireDeployLock. main() now
+// takes that cross-process lock around the ENTIRE loop that calls
+// replaceFile for every dst (plus the verification pass), so by the time
+// this function runs, only one deploy is doing so machine-wide.
 func replaceFile(src, dst string) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err

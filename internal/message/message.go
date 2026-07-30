@@ -20,6 +20,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -61,11 +62,39 @@ type Service interface {
 	// (DESC by created_at), skipping the first offset rows. It is the paginated
 	// counterpart to List so callers can read just the window they need instead
 	// of decoding the entire history.
+	//
+	// WARNING: calling this back-to-back with a separate Count call is racy
+	// under concurrent inserts (the two are independent round trips, so a
+	// message written in between can make the two disagree) - callers that
+	// need a self-consistent (window, total) pair, most notably reading a
+	// LIVE, still-growing transcript, should use ListPaginatedSnapshot instead.
 	ListPaginated(ctx context.Context, sessionID string, limit, offset int) ([]Message, error)
 	// Count returns the total number of messages stored for a session. Used by
 	// callers that page with ListPaginated to render accurate "N earlier
 	// omitted" markers without loading the full history.
 	Count(ctx context.Context, sessionID string) (int64, error)
+	// ListPaginatedSnapshot is the race-free counterpart to calling
+	// ListPaginated and Count separately: it returns a window of at most limit
+	// messages, newest-first, skipping the first offset rows, TOGETHER with
+	// the total message count - both computed from a single consistent
+	// snapshot pinned at the moment this call begins.
+	//
+	// This matters specifically for offset-based paging over a session whose
+	// message list can grow WHILE it is being read (the primary use case:
+	// read_delegation_transcript.go observing a live sub-agent delegation).
+	// Offset counts back from the newest end of a DESC-ordered list, so it is
+	// only meaningful relative to a fixed snapshot of "what the newest row
+	// is" - if new messages are inserted between reading the total and
+	// reading the window, a numeric offset silently refers to a different
+	// logical position than the one the caller computed it against,
+	// producing skipped or duplicated messages on the next read of a
+	// still-growing transcript. ListPaginatedSnapshot pins the boundary row
+	// (the row `offset` positions back from the newest, as of one atomic
+	// query) FIRST, then fetches the window strictly at-or-before that
+	// boundary via a keyset filter - so any message inserted after this call
+	// begins is correctly excluded from both the returned total and the
+	// returned window, rather than shifting either one.
+	ListPaginatedSnapshot(ctx context.Context, sessionID string, limit, offset int) (window []Message, total int64, err error)
 	ListUserMessages(ctx context.Context, sessionID string) ([]Message, error)
 	ListAllUserMessages(ctx context.Context) ([]Message, error)
 	Delete(ctx context.Context, id string) error
@@ -309,6 +338,95 @@ func (s *service) ListPaginated(ctx context.Context, sessionID string, limit, of
 
 func (s *service) Count(ctx context.Context, sessionID string) (int64, error) {
 	return s.qRead.CountMessagesBySession(ctx, sessionID)
+}
+
+// ListPaginatedSnapshot implements the race-free (window, total) pairing
+// documented on the Service interface. See that doc comment for the
+// motivating race; this comment covers the implementation.
+//
+// Step 1 pins a single high-water-mark snapshot: GetTranscriptWindowCursor
+// returns, from ONE query execution, both the session's total message count
+// and the identity (created_at, rowid) of the row `offset` positions back
+// from the newest message - i.e. exactly the first row the caller's window
+// should contain. Any message inserted after this query executes is
+// necessarily newer than that pinned row and is therefore correctly excluded
+// from everything that follows, however many further round trips it takes.
+//
+// Step 2 fetches the window using that pinned boundary as an inclusive
+// keyset cursor, split into two queries because sqlc's SQLite catalog cannot
+// validate a bare `rowid` reference in a WHERE clause (confirmed by hand;
+// see the doc comments on GetTranscriptWindowCursor/
+// ListMessagesBySessionAtCreatedAt in internal/db/sql/messages.sql for the
+// full explanation) - so the "older seconds" and "tied-second" halves of the
+// keyset filter are two separate queries, both filtering only on the real
+// `created_at` column, with the rowid tiebreaker applied in Go for the tied
+// second only (which is bounded to however many messages share one second,
+// not the whole table).
+func (s *service) ListPaginatedSnapshot(ctx context.Context, sessionID string, limit, offset int) ([]Message, int64, error) {
+	cursor, err := s.qRead.GetTranscriptWindowCursor(ctx, db.GetTranscriptWindowCursorParams{
+		SessionID: sessionID,
+		Offset:    int64(offset),
+	})
+	if errors.Is(err, sql.ErrNoRows) {
+		// offset is at or past the end of the session's history: no boundary
+		// row exists, so the window is empty. Total still needs a value -
+		// fall back to a plain count (no window race to guard against when
+		// the window itself is empty).
+		total, cerr := s.qRead.CountMessagesBySession(ctx, sessionID)
+		if cerr != nil {
+			return nil, 0, cerr
+		}
+		return []Message{}, total, nil
+	}
+	if err != nil {
+		return nil, 0, err
+	}
+
+	// Tied-second half first: every message sharing the boundary's exact
+	// created_at second, newest-rowid-first, keeping only rowid <= the
+	// boundary's own rowid (the boundary row itself must be INCLUDED - it is
+	// the first row of the window, not an exclusive fence post).
+	tied, err := s.qRead.ListMessagesBySessionAtCreatedAt(ctx, db.ListMessagesBySessionAtCreatedAtParams{
+		SessionID: sessionID,
+		CreatedAt: cursor.CreatedAt,
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+
+	dbMessages := make([]db.Message, 0, limit)
+	for _, row := range tied {
+		if row.RowID > cursor.RowID {
+			continue // newer than the boundary within the same second - excluded.
+		}
+		dbMessages = append(dbMessages, row.Message)
+		if len(dbMessages) >= limit {
+			break
+		}
+	}
+
+	// Older-seconds half: only queried if the tied-second rows didn't
+	// already fill the window, and LIMITed to exactly what's left.
+	if len(dbMessages) < limit {
+		older, err := s.qRead.ListMessagesBySessionOlderThanCreatedAt(ctx, db.ListMessagesBySessionOlderThanCreatedAtParams{
+			SessionID: sessionID,
+			CreatedAt: cursor.CreatedAt,
+			Limit:     int64(limit - len(dbMessages)),
+		})
+		if err != nil {
+			return nil, 0, err
+		}
+		dbMessages = append(dbMessages, older...)
+	}
+
+	messages := make([]Message, len(dbMessages))
+	for i, dbMessage := range dbMessages {
+		messages[i], err = s.fromDBItem(dbMessage)
+		if err != nil {
+			return nil, 0, err
+		}
+	}
+	return messages, cursor.TotalCount, nil
 }
 
 func (s *service) ListUserMessages(ctx context.Context, sessionID string) ([]Message, error) {

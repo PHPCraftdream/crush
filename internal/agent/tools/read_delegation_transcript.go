@@ -150,14 +150,21 @@ func NewReadDelegationTranscriptTool(sessions session.Service, messages message.
 			// only the requested window. Before this, messages.List decoded every
 			// row of the session before the window was applied — a multi-MiB
 			// transcript was fully materialised even when only the tail was shown.
+			//
+			// ListPaginatedSnapshot (not separate Count + ListPaginated calls) is
+			// used deliberately: this tool's primary use case is reading the
+			// transcript of a delegation that may still be RUNNING and writing new
+			// messages concurrently. Two independent round trips (count, then
+			// window) can each observe a different snapshot if a message is
+			// inserted in between, making the "N earlier omitted" marker disagree
+			// with the actual window, or making offset-based paging across two
+			// separate tool calls skip/duplicate messages as the live delegation's
+			// message list grows underneath the numeric offset. ListPaginatedSnapshot
+			// pins one consistent snapshot for both the total and the window - see
+			// its doc comment on message.Service for the full explanation.
 			maxMessages, _, offset := clampTranscriptWindow(params)
 
-			total, err := messages.Count(ctx, target)
-			if err != nil {
-				return fantasy.ToolResponse{}, fmt.Errorf("failed to count messages for session %q: %w", target, err)
-			}
-
-			window, err := messages.ListPaginated(ctx, target, maxMessages, offset)
+			window, total, err := messages.ListPaginatedSnapshot(ctx, target, maxMessages, offset)
 			if err != nil {
 				return fantasy.ToolResponse{}, fmt.Errorf("failed to list messages for session %q: %w", target, err)
 			}

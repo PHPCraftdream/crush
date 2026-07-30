@@ -105,6 +105,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.getTotalStatsStmt, err = db.PrepareContext(ctx, getTotalStats); err != nil {
 		return nil, fmt.Errorf("error preparing query GetTotalStats: %w", err)
 	}
+	if q.getTranscriptWindowCursorStmt, err = db.PrepareContext(ctx, getTranscriptWindowCursor); err != nil {
+		return nil, fmt.Errorf("error preparing query GetTranscriptWindowCursor: %w", err)
+	}
 	if q.getUsageByDayStmt, err = db.PrepareContext(ctx, getUsageByDay); err != nil {
 		return nil, fmt.Errorf("error preparing query GetUsageByDay: %w", err)
 	}
@@ -140,6 +143,12 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	}
 	if q.listMessagesBySessionStmt, err = db.PrepareContext(ctx, listMessagesBySession); err != nil {
 		return nil, fmt.Errorf("error preparing query ListMessagesBySession: %w", err)
+	}
+	if q.listMessagesBySessionAtCreatedAtStmt, err = db.PrepareContext(ctx, listMessagesBySessionAtCreatedAt); err != nil {
+		return nil, fmt.Errorf("error preparing query ListMessagesBySessionAtCreatedAt: %w", err)
+	}
+	if q.listMessagesBySessionOlderThanCreatedAtStmt, err = db.PrepareContext(ctx, listMessagesBySessionOlderThanCreatedAt); err != nil {
+		return nil, fmt.Errorf("error preparing query ListMessagesBySessionOlderThanCreatedAt: %w", err)
 	}
 	if q.listMessagesBySessionPaginatedStmt, err = db.PrepareContext(ctx, listMessagesBySessionPaginated); err != nil {
 		return nil, fmt.Errorf("error preparing query ListMessagesBySessionPaginated: %w", err)
@@ -335,6 +344,11 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing getTotalStatsStmt: %w", cerr)
 		}
 	}
+	if q.getTranscriptWindowCursorStmt != nil {
+		if cerr := q.getTranscriptWindowCursorStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing getTranscriptWindowCursorStmt: %w", cerr)
+		}
+	}
 	if q.getUsageByDayStmt != nil {
 		if cerr := q.getUsageByDayStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing getUsageByDayStmt: %w", cerr)
@@ -393,6 +407,16 @@ func (q *Queries) Close() error {
 	if q.listMessagesBySessionStmt != nil {
 		if cerr := q.listMessagesBySessionStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing listMessagesBySessionStmt: %w", cerr)
+		}
+	}
+	if q.listMessagesBySessionAtCreatedAtStmt != nil {
+		if cerr := q.listMessagesBySessionAtCreatedAtStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing listMessagesBySessionAtCreatedAtStmt: %w", cerr)
+		}
+	}
+	if q.listMessagesBySessionOlderThanCreatedAtStmt != nil {
+		if cerr := q.listMessagesBySessionOlderThanCreatedAtStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing listMessagesBySessionOlderThanCreatedAtStmt: %w", cerr)
 		}
 	}
 	if q.listMessagesBySessionPaginatedStmt != nil {
@@ -522,127 +546,133 @@ func (q *Queries) queryRow(ctx context.Context, stmt *sql.Stmt, query string, ar
 }
 
 type Queries struct {
-	db                                 DBTX
-	tx                                 *sql.Tx
-	countMessagesBySessionStmt         *sql.Stmt
-	createFileStmt                     *sql.Stmt
-	createMessageStmt                  *sql.Stmt
-	createPendingInjectStmt            *sql.Stmt
-	createSessionStmt                  *sql.Stmt
-	createSessionPermissionStmt        *sql.Stmt
-	deleteFileStmt                     *sql.Stmt
-	deleteMessageStmt                  *sql.Stmt
-	deletePendingInjectStmt            *sql.Stmt
-	deletePermissionStmt               *sql.Stmt
-	deleteSessionStmt                  *sql.Stmt
-	deleteSessionFilesStmt             *sql.Stmt
-	deleteSessionMessagesStmt          *sql.Stmt
-	getAverageResponseTimeStmt         *sql.Stmt
-	getCallTreeActivityStmt            *sql.Stmt
-	getCallTreeActivityBatchStmt       *sql.Stmt
-	getFileStmt                        *sql.Stmt
-	getFileByPathAndSessionStmt        *sql.Stmt
-	getFileReadStmt                    *sql.Stmt
-	getHourDayHeatmapStmt              *sql.Stmt
-	getLastSessionStmt                 *sql.Stmt
-	getMessageStmt                     *sql.Stmt
-	getRecentActivityStmt              *sql.Stmt
-	getSessionByIDStmt                 *sql.Stmt
-	getSessionCostAccountingStmt       *sql.Stmt
-	getToolUsageStmt                   *sql.Stmt
-	getTotalStatsStmt                  *sql.Stmt
-	getUsageByDayStmt                  *sql.Stmt
-	getUsageByDayOfWeekStmt            *sql.Stmt
-	getUsageByHourStmt                 *sql.Stmt
-	getUsageByModelStmt                *sql.Stmt
-	incrementSessionCostStmt           *sql.Stmt
-	listAllSessionPermissionsStmt      *sql.Stmt
-	listAllSessionsStmt                *sql.Stmt
-	listAllUserMessagesStmt            *sql.Stmt
-	listFilesByPathStmt                *sql.Stmt
-	listFilesBySessionStmt             *sql.Stmt
-	listLatestSessionFilesStmt         *sql.Stmt
-	listMessagesBySessionStmt          *sql.Stmt
-	listMessagesBySessionPaginatedStmt *sql.Stmt
-	listNewFilesStmt                   *sql.Stmt
-	listPendingInjectsBySessionStmt    *sql.Stmt
-	listSessionPermissionsStmt         *sql.Stmt
-	listSessionReadFilesStmt           *sql.Stmt
-	listSessionsStmt                   *sql.Stmt
-	listSubSessionsStmt                *sql.Stmt
-	listUserMessagesBySessionStmt      *sql.Stmt
-	matchSessionPermissionStmt         *sql.Stmt
-	recordFileReadStmt                 *sql.Stmt
-	renameSessionStmt                  *sql.Stmt
-	setParentCostAccountedStmt         *sql.Stmt
-	updateMessageStmt                  *sql.Stmt
-	updateMessagePinnedStmt            *sql.Stmt
-	updatePermissionEnabledStmt        *sql.Stmt
-	updateSessionModelsStmt            *sql.Stmt
-	updateSessionReasoningEffortStmt   *sql.Stmt
-	updateSessionSystemPromptStmt      *sql.Stmt
+	db                                          DBTX
+	tx                                          *sql.Tx
+	countMessagesBySessionStmt                  *sql.Stmt
+	createFileStmt                              *sql.Stmt
+	createMessageStmt                           *sql.Stmt
+	createPendingInjectStmt                     *sql.Stmt
+	createSessionStmt                           *sql.Stmt
+	createSessionPermissionStmt                 *sql.Stmt
+	deleteFileStmt                              *sql.Stmt
+	deleteMessageStmt                           *sql.Stmt
+	deletePendingInjectStmt                     *sql.Stmt
+	deletePermissionStmt                        *sql.Stmt
+	deleteSessionStmt                           *sql.Stmt
+	deleteSessionFilesStmt                      *sql.Stmt
+	deleteSessionMessagesStmt                   *sql.Stmt
+	getAverageResponseTimeStmt                  *sql.Stmt
+	getCallTreeActivityStmt                     *sql.Stmt
+	getCallTreeActivityBatchStmt                *sql.Stmt
+	getFileStmt                                 *sql.Stmt
+	getFileByPathAndSessionStmt                 *sql.Stmt
+	getFileReadStmt                             *sql.Stmt
+	getHourDayHeatmapStmt                       *sql.Stmt
+	getLastSessionStmt                          *sql.Stmt
+	getMessageStmt                              *sql.Stmt
+	getRecentActivityStmt                       *sql.Stmt
+	getSessionByIDStmt                          *sql.Stmt
+	getSessionCostAccountingStmt                *sql.Stmt
+	getToolUsageStmt                            *sql.Stmt
+	getTotalStatsStmt                           *sql.Stmt
+	getTranscriptWindowCursorStmt               *sql.Stmt
+	getUsageByDayStmt                           *sql.Stmt
+	getUsageByDayOfWeekStmt                     *sql.Stmt
+	getUsageByHourStmt                          *sql.Stmt
+	getUsageByModelStmt                         *sql.Stmt
+	incrementSessionCostStmt                    *sql.Stmt
+	listAllSessionPermissionsStmt               *sql.Stmt
+	listAllSessionsStmt                         *sql.Stmt
+	listAllUserMessagesStmt                     *sql.Stmt
+	listFilesByPathStmt                         *sql.Stmt
+	listFilesBySessionStmt                      *sql.Stmt
+	listLatestSessionFilesStmt                  *sql.Stmt
+	listMessagesBySessionStmt                   *sql.Stmt
+	listMessagesBySessionAtCreatedAtStmt        *sql.Stmt
+	listMessagesBySessionOlderThanCreatedAtStmt *sql.Stmt
+	listMessagesBySessionPaginatedStmt          *sql.Stmt
+	listNewFilesStmt                            *sql.Stmt
+	listPendingInjectsBySessionStmt             *sql.Stmt
+	listSessionPermissionsStmt                  *sql.Stmt
+	listSessionReadFilesStmt                    *sql.Stmt
+	listSessionsStmt                            *sql.Stmt
+	listSubSessionsStmt                         *sql.Stmt
+	listUserMessagesBySessionStmt               *sql.Stmt
+	matchSessionPermissionStmt                  *sql.Stmt
+	recordFileReadStmt                          *sql.Stmt
+	renameSessionStmt                           *sql.Stmt
+	setParentCostAccountedStmt                  *sql.Stmt
+	updateMessageStmt                           *sql.Stmt
+	updateMessagePinnedStmt                     *sql.Stmt
+	updatePermissionEnabledStmt                 *sql.Stmt
+	updateSessionModelsStmt                     *sql.Stmt
+	updateSessionReasoningEffortStmt            *sql.Stmt
+	updateSessionSystemPromptStmt               *sql.Stmt
 }
 
 func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 	return &Queries{
-		db:                                 tx,
-		tx:                                 tx,
-		countMessagesBySessionStmt:         q.countMessagesBySessionStmt,
-		createFileStmt:                     q.createFileStmt,
-		createMessageStmt:                  q.createMessageStmt,
-		createPendingInjectStmt:            q.createPendingInjectStmt,
-		createSessionStmt:                  q.createSessionStmt,
-		createSessionPermissionStmt:        q.createSessionPermissionStmt,
-		deleteFileStmt:                     q.deleteFileStmt,
-		deleteMessageStmt:                  q.deleteMessageStmt,
-		deletePendingInjectStmt:            q.deletePendingInjectStmt,
-		deletePermissionStmt:               q.deletePermissionStmt,
-		deleteSessionStmt:                  q.deleteSessionStmt,
-		deleteSessionFilesStmt:             q.deleteSessionFilesStmt,
-		deleteSessionMessagesStmt:          q.deleteSessionMessagesStmt,
-		getAverageResponseTimeStmt:         q.getAverageResponseTimeStmt,
-		getCallTreeActivityStmt:            q.getCallTreeActivityStmt,
-		getCallTreeActivityBatchStmt:       q.getCallTreeActivityBatchStmt,
-		getFileStmt:                        q.getFileStmt,
-		getFileByPathAndSessionStmt:        q.getFileByPathAndSessionStmt,
-		getFileReadStmt:                    q.getFileReadStmt,
-		getHourDayHeatmapStmt:              q.getHourDayHeatmapStmt,
-		getLastSessionStmt:                 q.getLastSessionStmt,
-		getMessageStmt:                     q.getMessageStmt,
-		getRecentActivityStmt:              q.getRecentActivityStmt,
-		getSessionByIDStmt:                 q.getSessionByIDStmt,
-		getSessionCostAccountingStmt:       q.getSessionCostAccountingStmt,
-		getToolUsageStmt:                   q.getToolUsageStmt,
-		getTotalStatsStmt:                  q.getTotalStatsStmt,
-		getUsageByDayStmt:                  q.getUsageByDayStmt,
-		getUsageByDayOfWeekStmt:            q.getUsageByDayOfWeekStmt,
-		getUsageByHourStmt:                 q.getUsageByHourStmt,
-		getUsageByModelStmt:                q.getUsageByModelStmt,
-		incrementSessionCostStmt:           q.incrementSessionCostStmt,
-		listAllSessionPermissionsStmt:      q.listAllSessionPermissionsStmt,
-		listAllSessionsStmt:                q.listAllSessionsStmt,
-		listAllUserMessagesStmt:            q.listAllUserMessagesStmt,
-		listFilesByPathStmt:                q.listFilesByPathStmt,
-		listFilesBySessionStmt:             q.listFilesBySessionStmt,
-		listLatestSessionFilesStmt:         q.listLatestSessionFilesStmt,
-		listMessagesBySessionStmt:          q.listMessagesBySessionStmt,
-		listMessagesBySessionPaginatedStmt: q.listMessagesBySessionPaginatedStmt,
-		listNewFilesStmt:                   q.listNewFilesStmt,
-		listPendingInjectsBySessionStmt:    q.listPendingInjectsBySessionStmt,
-		listSessionPermissionsStmt:         q.listSessionPermissionsStmt,
-		listSessionReadFilesStmt:           q.listSessionReadFilesStmt,
-		listSessionsStmt:                   q.listSessionsStmt,
-		listSubSessionsStmt:                q.listSubSessionsStmt,
-		listUserMessagesBySessionStmt:      q.listUserMessagesBySessionStmt,
-		matchSessionPermissionStmt:         q.matchSessionPermissionStmt,
-		recordFileReadStmt:                 q.recordFileReadStmt,
-		renameSessionStmt:                  q.renameSessionStmt,
-		setParentCostAccountedStmt:         q.setParentCostAccountedStmt,
-		updateMessageStmt:                  q.updateMessageStmt,
-		updateMessagePinnedStmt:            q.updateMessagePinnedStmt,
-		updatePermissionEnabledStmt:        q.updatePermissionEnabledStmt,
-		updateSessionModelsStmt:            q.updateSessionModelsStmt,
-		updateSessionReasoningEffortStmt:   q.updateSessionReasoningEffortStmt,
-		updateSessionSystemPromptStmt:      q.updateSessionSystemPromptStmt,
+		db:                                          tx,
+		tx:                                          tx,
+		countMessagesBySessionStmt:                  q.countMessagesBySessionStmt,
+		createFileStmt:                              q.createFileStmt,
+		createMessageStmt:                           q.createMessageStmt,
+		createPendingInjectStmt:                     q.createPendingInjectStmt,
+		createSessionStmt:                           q.createSessionStmt,
+		createSessionPermissionStmt:                 q.createSessionPermissionStmt,
+		deleteFileStmt:                              q.deleteFileStmt,
+		deleteMessageStmt:                           q.deleteMessageStmt,
+		deletePendingInjectStmt:                     q.deletePendingInjectStmt,
+		deletePermissionStmt:                        q.deletePermissionStmt,
+		deleteSessionStmt:                           q.deleteSessionStmt,
+		deleteSessionFilesStmt:                      q.deleteSessionFilesStmt,
+		deleteSessionMessagesStmt:                   q.deleteSessionMessagesStmt,
+		getAverageResponseTimeStmt:                  q.getAverageResponseTimeStmt,
+		getCallTreeActivityStmt:                     q.getCallTreeActivityStmt,
+		getCallTreeActivityBatchStmt:                q.getCallTreeActivityBatchStmt,
+		getFileStmt:                                 q.getFileStmt,
+		getFileByPathAndSessionStmt:                 q.getFileByPathAndSessionStmt,
+		getFileReadStmt:                             q.getFileReadStmt,
+		getHourDayHeatmapStmt:                       q.getHourDayHeatmapStmt,
+		getLastSessionStmt:                          q.getLastSessionStmt,
+		getMessageStmt:                              q.getMessageStmt,
+		getRecentActivityStmt:                       q.getRecentActivityStmt,
+		getSessionByIDStmt:                          q.getSessionByIDStmt,
+		getSessionCostAccountingStmt:                q.getSessionCostAccountingStmt,
+		getToolUsageStmt:                            q.getToolUsageStmt,
+		getTotalStatsStmt:                           q.getTotalStatsStmt,
+		getTranscriptWindowCursorStmt:               q.getTranscriptWindowCursorStmt,
+		getUsageByDayStmt:                           q.getUsageByDayStmt,
+		getUsageByDayOfWeekStmt:                     q.getUsageByDayOfWeekStmt,
+		getUsageByHourStmt:                          q.getUsageByHourStmt,
+		getUsageByModelStmt:                         q.getUsageByModelStmt,
+		incrementSessionCostStmt:                    q.incrementSessionCostStmt,
+		listAllSessionPermissionsStmt:               q.listAllSessionPermissionsStmt,
+		listAllSessionsStmt:                         q.listAllSessionsStmt,
+		listAllUserMessagesStmt:                     q.listAllUserMessagesStmt,
+		listFilesByPathStmt:                         q.listFilesByPathStmt,
+		listFilesBySessionStmt:                      q.listFilesBySessionStmt,
+		listLatestSessionFilesStmt:                  q.listLatestSessionFilesStmt,
+		listMessagesBySessionStmt:                   q.listMessagesBySessionStmt,
+		listMessagesBySessionAtCreatedAtStmt:        q.listMessagesBySessionAtCreatedAtStmt,
+		listMessagesBySessionOlderThanCreatedAtStmt: q.listMessagesBySessionOlderThanCreatedAtStmt,
+		listMessagesBySessionPaginatedStmt:          q.listMessagesBySessionPaginatedStmt,
+		listNewFilesStmt:                            q.listNewFilesStmt,
+		listPendingInjectsBySessionStmt:             q.listPendingInjectsBySessionStmt,
+		listSessionPermissionsStmt:                  q.listSessionPermissionsStmt,
+		listSessionReadFilesStmt:                    q.listSessionReadFilesStmt,
+		listSessionsStmt:                            q.listSessionsStmt,
+		listSubSessionsStmt:                         q.listSubSessionsStmt,
+		listUserMessagesBySessionStmt:               q.listUserMessagesBySessionStmt,
+		matchSessionPermissionStmt:                  q.matchSessionPermissionStmt,
+		recordFileReadStmt:                          q.recordFileReadStmt,
+		renameSessionStmt:                           q.renameSessionStmt,
+		setParentCostAccountedStmt:                  q.setParentCostAccountedStmt,
+		updateMessageStmt:                           q.updateMessageStmt,
+		updateMessagePinnedStmt:                     q.updateMessagePinnedStmt,
+		updatePermissionEnabledStmt:                 q.updatePermissionEnabledStmt,
+		updateSessionModelsStmt:                     q.updateSessionModelsStmt,
+		updateSessionReasoningEffortStmt:            q.updateSessionReasoningEffortStmt,
+		updateSessionSystemPromptStmt:               q.updateSessionSystemPromptStmt,
 	}
 }

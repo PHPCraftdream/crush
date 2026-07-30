@@ -218,6 +218,25 @@ func (s *ConfigStore) KnownProviders() []catwalk.Provider {
 	return s.loadSnapshot().knownProviders
 }
 
+// SetupAgents (re)configures the coder and task agents on the CURRENT
+// generation, through the copy-on-write updateConfig path — it does NOT
+// mutate the currently-published *Config in place (that was the P2.1 bug
+// this method used to have before being briefly removed as dead code; it
+// turned out to still be a real, load-bearing test helper — see
+// coordinator_test.go's newRoleModelTestCoordinator/newWorkerToolTestCoordinator/
+// TestBuildTools_CoderHasAskQuestion, which call this on a from-scratch
+// config where IsConfigured() is false, so config.Load's own
+// configureSelectedModels/SetupAgents call never ran and Agents would
+// otherwise stay empty). Config.SetupAgents itself only reads
+// Options/DisabledTools and assigns a fresh Agents map, so running it on a
+// clone and publishing that clone is a correct, race-free way to expose the
+// same behavior at the ConfigStore level.
+func (s *ConfigStore) SetupAgents() {
+	s.updateConfig(func(cfgCopy *Config) {
+		cfgCopy.SetupAgents()
+	})
+}
+
 // Overrides returns the runtime overrides as a value copy. Callers cannot
 // mutate the store's internal snapshot state through the returned value —
 // use SetSkipPermissionRequests for writes, which goes through the

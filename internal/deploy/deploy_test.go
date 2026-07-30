@@ -1,11 +1,14 @@
 package deploy
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -531,6 +534,136 @@ func TestNpmPlatformBinaryPath(t *testing.T) {
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
 	}
+}
+
+// TestDeployLockPath_Stable asserts DeployLockPath returns the same path
+// across calls (it must — it's the whole point of using a single
+// well-known path instead of a per-dst sidecar, so two independent `go
+// run deploy.go` invocations agree on where to contend) and that it
+// lives under os.TempDir(), not next to any particular destination.
+func TestDeployLockPath_Stable(t *testing.T) {
+	a := DeployLockPath()
+	b := DeployLockPath()
+	if a != b {
+		t.Fatalf("DeployLockPath must be stable across calls, got %q then %q", a, b)
+	}
+	wantDir := filepath.Clean(os.TempDir())
+	if gotDir := filepath.Dir(a); gotDir != wantDir {
+		t.Errorf("DeployLockPath should live directly under os.TempDir() (%q), got %q", wantDir, gotDir)
+	}
+}
+
+// TestAcquireDeployLock_SerializesConcurrentHolders is the core regression
+// test for the mixed-version-install race (review finding P2.6): it starts
+// N goroutines all racing to AcquireDeployLock on the SAME lockPath, each
+// simulating a deploy's replace-all-destinations critical section by
+// incrementing a shared counter, sleeping briefly, then decrementing it.
+// If two "deploys" ever ran their critical section concurrently, the
+// counter would observe a value > 1 at some point during the sleep — that
+// is exactly the interleaving the deploy lock exists to rule out. The test
+// asserts the counter never exceeds 1, i.e. every acquire/release pair
+// runs strictly sequentially, matching the "second deploy waits for the
+// first to fully finish, never interleaves" contract AcquireDeployLock
+// documents.
+func TestAcquireDeployLock_SerializesConcurrentHolders(t *testing.T) {
+	dir := t.TempDir()
+	lockPath := filepath.Join(dir, "deploy.lock")
+
+	const holders = 6
+	var (
+		wg          sync.WaitGroup
+		inSection   int32
+		maxObserved int32
+	)
+
+	for i := 0; i < holders; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			lock, err := AcquireDeployLock(ctx, lockPath)
+			if err != nil {
+				t.Errorf("AcquireDeployLock: %v", err)
+				return
+			}
+			defer lock.Release()
+
+			cur := atomic.AddInt32(&inSection, 1)
+			for {
+				prevMax := atomic.LoadInt32(&maxObserved)
+				if cur <= prevMax || atomic.CompareAndSwapInt32(&maxObserved, prevMax, cur) {
+					break
+				}
+			}
+			// Simulate the replace-all-destinations critical section taking
+			// measurable time, so a would-be second concurrent holder has a
+			// real window to observe/collide with this one.
+			time.Sleep(20 * time.Millisecond)
+			atomic.AddInt32(&inSection, -1)
+		}()
+	}
+	wg.Wait()
+
+	if got := atomic.LoadInt32(&maxObserved); got > 1 {
+		t.Fatalf("deploy lock failed to serialize holders: observed %d concurrent holders in the critical section, want at most 1 (this is exactly the mixed-version-install race the lock exists to prevent)", got)
+	}
+}
+
+// TestAcquireDeployLock_TimesOutWhenContended confirms AcquireDeployLock
+// respects ctx: a second caller contending on an already-held lock must
+// return a wrapped context error once ctx's deadline passes, rather than
+// blocking forever — mirroring the behavioral contract already tested for
+// the underlying primitive in internal/session/file_lock_test.go.
+func TestAcquireDeployLock_TimesOutWhenContended(t *testing.T) {
+	dir := t.TempDir()
+	lockPath := filepath.Join(dir, "deploy.lock")
+
+	holder, err := AcquireDeployLock(context.Background(), lockPath)
+	if err != nil {
+		t.Fatalf("initial AcquireDeployLock: %v", err)
+	}
+	defer holder.Release()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err = AcquireDeployLock(ctx, lockPath)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("expected AcquireDeployLock to fail while the lock is held by another caller")
+	}
+	if elapsed < 100*time.Millisecond {
+		t.Errorf("AcquireDeployLock returned too quickly (%v) — contention should be retried until ctx's deadline, not failed immediately", elapsed)
+	}
+}
+
+// TestAcquireDeployLock_SequentialAcquireRelease confirms that after a
+// holder releases, a new caller can acquire the same lockPath immediately
+// — i.e. two deploys running one after another (the common case: a
+// developer deploys, waits, deploys again) are never blocked by a stale
+// lock.
+func TestAcquireDeployLock_SequentialAcquireRelease(t *testing.T) {
+	dir := t.TempDir()
+	lockPath := filepath.Join(dir, "deploy.lock")
+
+	first, err := AcquireDeployLock(context.Background(), lockPath)
+	if err != nil {
+		t.Fatalf("first AcquireDeployLock: %v", err)
+	}
+	if err := first.Release(); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	second, err := AcquireDeployLock(ctx, lockPath)
+	if err != nil {
+		t.Fatalf("second AcquireDeployLock after release should succeed promptly, got: %v", err)
+	}
+	defer second.Release()
 }
 
 func writeExe(t *testing.T, p string) string {

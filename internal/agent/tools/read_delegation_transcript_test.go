@@ -320,8 +320,12 @@ func TestRenderDelegationTranscript_Defaults(t *testing.T) {
 }
 
 // spyMessageService wraps a message.Service and records the arguments and
-// result size of the most recent ListPaginated call, so a test can prove the
-// tool read only a bounded window from the DB instead of the whole history.
+// result size of the most recent ListPaginatedSnapshot call, so a test can
+// prove the tool read only a bounded window from the DB instead of the whole
+// history. read_delegation_transcript.go reads via ListPaginatedSnapshot (not
+// separate Count + ListPaginated calls) specifically to keep the "N earlier
+// omitted" total consistent with the returned window under concurrent
+// inserts — see ListPaginatedSnapshot's doc comment on message.Service.
 type spyMessageService struct {
 	message.Service
 	listPaginatedLimit  int
@@ -330,13 +334,13 @@ type spyMessageService struct {
 	listPaginatedCalled bool
 }
 
-func (s *spyMessageService) ListPaginated(ctx context.Context, sessionID string, limit, offset int) ([]message.Message, error) {
-	msgs, err := s.Service.ListPaginated(ctx, sessionID, limit, offset)
+func (s *spyMessageService) ListPaginatedSnapshot(ctx context.Context, sessionID string, limit, offset int) ([]message.Message, int64, error) {
+	msgs, total, err := s.Service.ListPaginatedSnapshot(ctx, sessionID, limit, offset)
 	s.listPaginatedLimit = limit
 	s.listPaginatedOffset = offset
 	s.listPaginatedLen = len(msgs)
 	s.listPaginatedCalled = true
-	return msgs, err
+	return msgs, total, err
 }
 
 // TestReadDelegationTranscript_PaginationReadsBoundedWindow proves the tool
@@ -374,9 +378,9 @@ func TestReadDelegationTranscript_PaginationReadsBoundedWindow(t *testing.T) {
 
 	// The DB query must have asked for only the window size, and received at
 	// most that many rows — not the full 1000-message history.
-	require.True(t, spy.listPaginatedCalled, "tool must read via ListPaginated, not List")
-	require.Equal(t, 10, spy.listPaginatedLimit, "ListPaginated must request only the window size")
-	require.LessOrEqual(t, spy.listPaginatedLen, 10, "ListPaginated must return at most the window size")
+	require.True(t, spy.listPaginatedCalled, "tool must read via ListPaginatedSnapshot, not List")
+	require.Equal(t, 10, spy.listPaginatedLimit, "ListPaginatedSnapshot must request only the window size")
+	require.LessOrEqual(t, spy.listPaginatedLen, 10, "ListPaginatedSnapshot must return at most the window size")
 	// The marker must still reflect the true total of 1000.
 	require.Contains(t, resp.Content, "990 earlier omitted")
 }

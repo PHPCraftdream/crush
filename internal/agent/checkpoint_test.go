@@ -57,6 +57,10 @@ func (m *mockCheckpointMsgSvc) ListPaginated(_ context.Context, _ string, _, _ i
 	return nil, nil
 }
 
+func (m *mockCheckpointMsgSvc) ListPaginatedSnapshot(_ context.Context, _ string, _, _ int) ([]message.Message, int64, error) {
+	return nil, 0, nil
+}
+
 func (m *mockCheckpointMsgSvc) Count(_ context.Context, _ string) (int64, error) {
 	return 0, nil
 }

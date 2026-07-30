@@ -80,6 +80,40 @@ type Querier interface {
 	GetSessionCostAccounting(ctx context.Context, id string) (GetSessionCostAccountingRow, error)
 	GetToolUsage(ctx context.Context) ([]GetToolUsageRow, error)
 	GetTotalStats(ctx context.Context) (GetTotalStatsRow, error)
+	// Returns, in a SINGLE round trip, the (created_at, rowid) of the row at
+	// `offset` positions back from the newest message in the session, together
+	// with the session's total message count as of that same statement
+	// execution (SQLite evaluates COUNT(*) OVER() over the full WHERE-matched row
+	// set before LIMIT/OFFSET are applied, in the same query plan as the LIMIT 1
+	// OFFSET ? row selection - both numbers come from one consistent snapshot).
+	//
+	// This is the fix for the cross-statement race in read_delegation_transcript.go:
+	// previously Count() and ListPaginated() were two independent queries, so a
+	// message inserted between them (the normal case while observing a live
+	// sub-agent) could make the total and the offset-derived window disagree.
+	// message.Service.ListPaginatedSnapshot calls this query FIRST to pin down a
+	// single high-water-mark snapshot (the boundary row's created_at/row_id, plus
+	// total), then fetches the window strictly at-or-before that boundary via
+	// ListMessagesBySessionOlderThanCreatedAt + ListMessagesBySessionAtCreatedAt.
+	// Any message inserted after this query executes is newer than the pinned
+	// boundary and is therefore correctly excluded from both the "total" figure
+	// and the follow-up window fetch - the read as a whole reflects one
+	// consistent point in time rather than drifting across separate round trips.
+	//
+	// created_at/row_id are NULL when offset falls at or past the end of the
+	// session's messages (i.e. there is no row at that position): callers must
+	// treat NULL as "start of history", matching offset's existing clamp-to-empty
+	// behavior in clampTranscriptWindow.
+	//
+	// row_id is exposed via CAST(rowid AS INTEGER): sqlc's SQLite catalog has no
+	// notion of SQLite's implicit rowid column outside ORDER BY (confirmed by
+	// hand: any bare `rowid` reference in a WHERE clause or plain SELECT-list
+	// position fails static analysis with "column \"rowid\" does not exist",
+	// while the identical reference wrapped in CAST(... AS INTEGER) in the
+	// SELECT list is accepted) - see ListMessagesBySessionOlderThanCreatedAt's
+	// comment for why the keyset filter itself therefore avoids rowid in a WHERE
+	// clause entirely rather than fighting this further.
+	GetTranscriptWindowCursor(ctx context.Context, arg GetTranscriptWindowCursorParams) (GetTranscriptWindowCursorRow, error)
 	GetUsageByDay(ctx context.Context) ([]GetUsageByDayRow, error)
 	GetUsageByDayOfWeek(ctx context.Context) ([]GetUsageByDayOfWeekRow, error)
 	GetUsageByHour(ctx context.Context) ([]GetUsageByHourRow, error)
@@ -108,12 +142,45 @@ type Querier interface {
 	// rowid is SQLite's implicit monotonic insertion counter (messages.id is a
 	// non-monotonic UUID, unsuitable as a tiebreaker).
 	ListMessagesBySession(ctx context.Context, sessionID string) ([]Message, error)
+	// Second half of the keyset pagination pair (see
+	// ListMessagesBySessionOlderThanCreatedAt): returns every message in the
+	// session sharing the exact boundary second, WITH its rowid (via
+	// CAST(rowid AS INTEGER), the one position sqlc's SQLite catalog accepts a
+	// bare rowid reference in - see GetTranscriptWindowCursor's comment), so the
+	// Go caller can apply the `rowid < boundary_row_id` half of the tiebreaker
+	// itself and merge the result with the older-seconds query above into one
+	// deterministic (created_at DESC, rowid DESC) window.
+	ListMessagesBySessionAtCreatedAt(ctx context.Context, arg ListMessagesBySessionAtCreatedAtParams) ([]ListMessagesBySessionAtCreatedAtRow, error)
+	// First half of the keyset pagination pair used by
+	// read_delegation_transcript.go: returns messages strictly OLDER (by
+	// created_at second) than the cursor boundary, deterministically ordered.
+	// Combined in Go with ListMessagesBySessionAtCreatedAt (which handles the
+	// boundary second's exact-tie rows via the rowid tiebreaker) to reproduce the
+	// same (created_at, rowid) keyset semantics as a single
+	// `(created_at, rowid) < (?, ?)` comparison would, without needing rowid in a
+	// WHERE clause - see GetTranscriptWindowCursor's comment for why that's
+	// avoided. Because the boundary is a concrete value pinned by
+	// GetTranscriptWindowCursor at the start of the read (not "the Nth row from
+	// the current end"), inserting new messages at the head between calls can
+	// never shift which rows this query returns: the boundary itself doesn't move.
+	ListMessagesBySessionOlderThanCreatedAt(ctx context.Context, arg ListMessagesBySessionOlderThanCreatedAtParams) ([]Message, error)
 	// rowid is the tie-breaker: created_at is stored in SECONDS, so a single agent
 	// turn produces dozens of rows with an identical created_at. Without a total
 	// order SQLite does not guarantee a stable order among those ties, which makes
 	// OFFSET pagination lose/duplicate rows when the query plan shifts between
 	// page fetches. rowid is SQLite's implicit monotonic insertion counter, so
 	// (created_at DESC, rowid DESC) is a deterministic newest-first total order.
+	//
+	// NOTE: plain OFFSET is still vulnerable to a DIFFERENT instability than the
+	// tie-breaker bug above: concurrent inserts at the head of the DESC order (new
+	// messages from a still-running delegation) shift what a given numeric offset
+	// points at between two separate calls of this query. This query remains here
+	// as the plain, unprotected primitive; message.Service.ListPaginatedSnapshot
+	// is the race-free caller-facing wrapper read_delegation_transcript.go
+	// actually uses, built from GetTranscriptWindowCursor (pins one consistent
+	// snapshot boundary) plus the keyset pair ListMessagesBySessionOlderThan-
+	// CreatedAt / ListMessagesBySessionAtCreatedAt (fetches the window strictly
+	// at-or-before that boundary, immune to head insertions by construction).
 	ListMessagesBySessionPaginated(ctx context.Context, arg ListMessagesBySessionPaginatedParams) ([]Message, error)
 	ListNewFiles(ctx context.Context) ([]File, error)
 	ListPendingInjectsBySession(ctx context.Context, sessionID string) ([]PendingInject, error)
