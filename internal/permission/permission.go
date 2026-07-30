@@ -117,10 +117,32 @@ type permissionService struct {
 	allowedTools          []string
 	q                     *db.Queries
 
-	// used to make sure we only process one request at a time
-	requestMu       sync.Mutex
-	activeRequest   *PermissionRequest
-	activeRequestMu sync.Mutex
+	// Fork patch (concurrency, H-4): requestMu used to serialize the whole
+	// Request() body — including the blocking wait for a human response —
+	// across ALL sessions. That was correct for the single upstream TUI
+	// (only one modal could ever be on screen, so only one Request needed
+	// to be "live" at a time), but the fork replaced the TUI with a web UI
+	// that has no such restriction, and is explicitly designed to drive N
+	// concurrent sessions (see CLAUDE.md). Under the old code, an
+	// unanswered permission prompt in session A blocked every other
+	// session's permission request from even being published until A's
+	// context expired.
+	//
+	// pendingRequests (csync.Map, keyed by permission ID) was already the
+	// real per-request synchronization primitive: each Request gets its
+	// own response channel, and Grant/Deny/GrantPersistent atomically
+	// Take() the entry for the specific ID they're resolving (see #132's
+	// fix, 43f8328f). Nothing about that requires a global lock.
+	//
+	// activeRequest previously held a single *PermissionRequest so
+	// GrantPersistent could reconstruct the full record when the
+	// production caller sends only the ID (see GrantPersistent). With
+	// requestMu gone, more than one Request can be between "publish" and
+	// "resolved" at once, so activeRequest is now keyed by permission ID
+	// (csync.Map) instead of being a single shared pointer — otherwise a
+	// second session's request would clobber the first's activeRequest
+	// entry before it's read back.
+	activeRequests *csync.Map[string, *PermissionRequest]
 
 	// runAllowlistGate gates the non-interactive auto-approve path. When
 	// its compiled allowlist IsRestricted, AutoApproveSession'd sessions
@@ -131,12 +153,10 @@ type permissionService struct {
 }
 
 func (s *permissionService) GrantPersistent(permission PermissionRequest) {
-	// The handler may send only the ID; fill in the rest from activeRequest.
-	s.activeRequestMu.Lock()
-	if s.activeRequest != nil && s.activeRequest.ID == permission.ID {
-		permission = *s.activeRequest
+	// The handler may send only the ID; fill in the rest from activeRequests.
+	if active, ok := s.activeRequests.Get(permission.ID); ok {
+		permission = *active
 	}
-	s.activeRequestMu.Unlock()
 
 	s.notificationBroker.Publish(pubsub.CreatedEvent, PermissionNotification{
 		ToolCallID: permission.ToolCallID,
@@ -159,7 +179,7 @@ func (s *permissionService) GrantPersistent(permission PermissionRequest) {
 	// rows into the in-memory cache) and the cross-session contract
 	// exercised by TestAlwaysAllow_CrossSession. MatchSessionPermission's
 	// WHERE clause (session_id = '' OR session_id = ?) handles the read.
-	// Guard: only persist if we have a valid permission (activeRequest matched).
+	// Guard: only persist if we have a valid permission (activeRequests matched).
 	if s.q != nil && permission.ToolName != "" && permission.Action != "" {
 		if err := s.q.CreateSessionPermission(context.Background(), db.CreateSessionPermissionParams{
 			ID:        uuid.New().String(),
@@ -172,11 +192,7 @@ func (s *permissionService) GrantPersistent(permission PermissionRequest) {
 		}
 	}
 
-	s.activeRequestMu.Lock()
-	if s.activeRequest != nil && s.activeRequest.ID == permission.ID {
-		s.activeRequest = nil
-	}
-	s.activeRequestMu.Unlock()
+	s.activeRequests.Del(permission.ID)
 }
 
 func (s *permissionService) Grant(permission PermissionRequest) {
@@ -191,11 +207,7 @@ func (s *permissionService) Grant(permission PermissionRequest) {
 		slog.Debug("Permission request already resolved", "id", permission.ID)
 	}
 
-	s.activeRequestMu.Lock()
-	if s.activeRequest != nil && s.activeRequest.ID == permission.ID {
-		s.activeRequest = nil
-	}
-	s.activeRequestMu.Unlock()
+	s.activeRequests.Del(permission.ID)
 }
 
 func (s *permissionService) Deny(permission PermissionRequest) {
@@ -211,11 +223,7 @@ func (s *permissionService) Deny(permission PermissionRequest) {
 		slog.Debug("Permission request already resolved", "id", permission.ID)
 	}
 
-	s.activeRequestMu.Lock()
-	if s.activeRequest != nil && s.activeRequest.ID == permission.ID {
-		s.activeRequest = nil
-	}
-	s.activeRequestMu.Unlock()
+	s.activeRequests.Del(permission.ID)
 }
 
 func (s *permissionService) Request(ctx context.Context, opts CreatePermissionRequest) (bool, error) {
@@ -240,9 +248,6 @@ func (s *permissionService) Request(ctx context.Context, opts CreatePermissionRe
 		})
 		return true, nil
 	}
-
-	s.requestMu.Lock()
-	defer s.requestMu.Unlock()
 
 	// tell the UI that a permission was requested
 	s.notificationBroker.Publish(pubsub.CreatedEvent, PermissionNotification{
@@ -322,9 +327,14 @@ func (s *permissionService) Request(ctx context.Context, opts CreatePermissionRe
 		}
 	}
 
-	s.activeRequestMu.Lock()
-	s.activeRequest = &permission
-	s.activeRequestMu.Unlock()
+	// activeRequests lets GrantPersistent reconstruct the full record from
+	// an ID-only response (see GrantPersistent). Keyed by permission ID
+	// (rather than a single shared slot) since, with requestMu gone,
+	// multiple sessions' requests can be pending here concurrently. Grant/
+	// Deny/GrantPersistent remove their own entry on the happy path; this
+	// defer is the backstop for ctx.Done() and any other early return.
+	s.activeRequests.Set(permission.ID, &permission)
+	defer s.activeRequests.Del(permission.ID)
 
 	respCh := make(chan bool, 1)
 	s.pendingRequests.Set(permission.ID, respCh)
@@ -339,11 +349,6 @@ func (s *permissionService) Request(ctx context.Context, opts CreatePermissionRe
 			ToolCallID: permission.ToolCallID,
 			Denied:     true,
 		})
-		s.activeRequestMu.Lock()
-		if s.activeRequest != nil && s.activeRequest.ID == permission.ID {
-			s.activeRequest = nil
-		}
-		s.activeRequestMu.Unlock()
 		return false, ctx.Err()
 	case granted := <-respCh:
 		return granted, nil
@@ -383,6 +388,7 @@ func NewPermissionService(ctx context.Context, workingDir string, skip bool, all
 		autoApproveSessions: make(map[string]bool),
 		allowedTools:        allowedTools,
 		pendingRequests:     csync.NewMap[string, chan bool](),
+		activeRequests:      csync.NewMap[string, *PermissionRequest](),
 		q:                   q,
 	}
 	// Fork merge note (origin/main 6b312bee "fix: potential data race on

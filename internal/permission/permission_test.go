@@ -1,11 +1,13 @@
 package permission
 
 import (
+	"context"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/charmbracelet/crush/internal/db"
+	"github.com/charmbracelet/crush/internal/pubsub"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -382,4 +384,144 @@ func TestGrant_ThenDeny_SameID_NoBlock(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("late Deny for already-resolved ID blocked: did not return within 2s")
 	}
+}
+
+// TestRequest_CrossSession_DoesNotSerialize is a regression guard for H-4:
+// permissionService.Request used to hold a single process-wide requestMu for
+// its entire body, including the blocking wait for a human response. That
+// meant an unanswered permission prompt in one session blocked every other
+// session's Request from even being published, defeating the fork's N
+// concurrent sessions / web-UI design (see CLAUDE.md).
+//
+// This starts a Request for session A and leaves it unanswered, then starts
+// a second Request for session B and asserts the second one's event is
+// published promptly — i.e. it never waited on the first session's
+// still-pending response.
+func TestRequest_CrossSession_DoesNotSerialize(t *testing.T) {
+	svc := newTestService(t, false, nil)
+	events := svc.Subscribe(t.Context())
+
+	// Session A's request is started but deliberately left unanswered for
+	// the duration of the test.
+	ctxA, cancelA := context.WithCancel(t.Context())
+	defer cancelA()
+	doneA := make(chan struct{})
+	go func() {
+		defer close(doneA)
+		svc.Request(ctxA, CreatePermissionRequest{ //nolint:errcheck
+			SessionID: "session-A", ToolName: "bash", Action: "run", Path: "/tmp",
+		})
+	}()
+
+	evA := <-events
+	require.Equal(t, "session-A", evA.Payload.SessionID)
+
+	// Session B's request must be publishable without waiting for A's
+	// response. Before the fix, this second Request blocked on requestMu
+	// (held by A's in-flight call) until the test timeout.
+	doneB := make(chan struct{})
+	go func() {
+		defer close(doneB)
+		svc.Request(t.Context(), CreatePermissionRequest{ //nolint:errcheck
+			SessionID: "session-B", ToolName: "write", Action: "run", Path: "/tmp",
+		})
+	}()
+
+	select {
+	case evB := <-events:
+		require.Equal(t, "session-B", evB.Payload.SessionID)
+		svc.Deny(evB.Payload)
+	case <-time.After(2 * time.Second):
+		t.Fatal("session B's Request never published its event: appears to be serialized behind session A's unanswered request")
+	}
+
+	select {
+	case <-doneB:
+	case <-time.After(2 * time.Second):
+		t.Fatal("session B's Request did not return after Deny")
+	}
+
+	// Unblock session A's still-pending request so its goroutine can exit.
+	svc.Deny(evA.Payload)
+	select {
+	case <-doneA:
+	case <-time.After(2 * time.Second):
+		t.Fatal("session A's Request did not return after Deny")
+	}
+}
+
+// TestGrantPersistent_ConcurrentDifferentSessions_NoCrossContamination
+// guards the activeRequests keying introduced for H-4: activeRequest used to
+// be a single shared *PermissionRequest slot, filled in by whichever Request
+// was currently inside the (now-removed) requestMu critical section.
+// activeRequests is now keyed by permission ID so two concurrent requests
+// from different sessions each get GrantPersistent'd with their own
+// tool/action/path — not whichever request happened to write the shared
+// slot last.
+func TestGrantPersistent_ConcurrentDifferentSessions_NoCrossContamination(t *testing.T) {
+	svc := newTestService(t, false, nil)
+	events := svc.Subscribe(t.Context())
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		svc.Request(t.Context(), CreatePermissionRequest{ //nolint:errcheck
+			SessionID: "session-A", ToolName: "bash", Action: "run", Path: "/tmp/a",
+		})
+	}()
+	go func() {
+		defer wg.Done()
+		svc.Request(t.Context(), CreatePermissionRequest{ //nolint:errcheck
+			SessionID: "session-B", ToolName: "write", Action: "run", Path: "/tmp/b",
+		})
+	}()
+
+	var evA, evB pubsub.Event[PermissionRequest]
+	for range 2 {
+		ev := <-events
+		switch ev.Payload.SessionID {
+		case "session-A":
+			evA = ev
+		case "session-B":
+			evB = ev
+		default:
+			t.Fatalf("unexpected session id %q", ev.Payload.SessionID)
+		}
+	}
+	require.NotEmpty(t, evA.Payload.ID)
+	require.NotEmpty(t, evB.Payload.ID)
+
+	// GrantPersistent for A, sending only the ID (the real production
+	// path) — must reconstruct A's own tool/action/path, not B's.
+	svc.GrantPersistent(PermissionRequest{ID: evA.Payload.ID})
+	svc.Deny(evB.Payload)
+	wg.Wait()
+
+	// A's grant must match A's own path only.
+	resultA, err := svc.Request(t.Context(), CreatePermissionRequest{
+		SessionID: "session-A", ToolName: "bash", Action: "run", Path: "/tmp/a",
+	})
+	require.NoError(t, err)
+	assert.True(t, resultA, "session-A's own tool/path must be auto-approved")
+
+	// B's tool/path must NOT have been persisted (it was Denied, not
+	// GrantPersistent'd) — if activeRequests cross-contaminated, A's
+	// GrantPersistent could have persisted B's path instead.
+	var resultB bool
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		resultB, _ = svc.Request(t.Context(), CreatePermissionRequest{
+			SessionID: "session-B", ToolName: "write", Action: "run", Path: "/tmp/b",
+		})
+	}()
+	select {
+	case ev := <-events:
+		svc.Deny(ev.Payload)
+	case <-time.After(2 * time.Second):
+		t.Fatal("session-B request unexpectedly auto-approved (cross-contamination) or hung")
+	}
+	wg.Wait()
+	assert.False(t, resultB, "session-B's path must not have been persisted by session-A's GrantPersistent")
 }
