@@ -195,9 +195,6 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.updateSessionSystemPromptStmt, err = db.PrepareContext(ctx, updateSessionSystemPrompt); err != nil {
 		return nil, fmt.Errorf("error preparing query UpdateSessionSystemPrompt: %w", err)
 	}
-	if q.updateSessionTitleAndUsageStmt, err = db.PrepareContext(ctx, updateSessionTitleAndUsage); err != nil {
-		return nil, fmt.Errorf("error preparing query UpdateSessionTitleAndUsage: %w", err)
-	}
 	return &q, nil
 }
 
@@ -488,11 +485,6 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing updateSessionSystemPromptStmt: %w", cerr)
 		}
 	}
-	if q.updateSessionTitleAndUsageStmt != nil {
-		if cerr := q.updateSessionTitleAndUsageStmt.Close(); cerr != nil {
-			err = fmt.Errorf("error closing updateSessionTitleAndUsageStmt: %w", cerr)
-		}
-	}
 	return err
 }
 
@@ -589,7 +581,6 @@ type Queries struct {
 	updateSessionModelsStmt            *sql.Stmt
 	updateSessionReasoningEffortStmt   *sql.Stmt
 	updateSessionSystemPromptStmt      *sql.Stmt
-	updateSessionTitleAndUsageStmt     *sql.Stmt
 }
 
 func (q *Queries) WithTx(tx *sql.Tx) *Queries {
@@ -653,6 +644,5 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		updateSessionModelsStmt:            q.updateSessionModelsStmt,
 		updateSessionReasoningEffortStmt:   q.updateSessionReasoningEffortStmt,
 		updateSessionSystemPromptStmt:      q.updateSessionSystemPromptStmt,
-		updateSessionTitleAndUsageStmt:     q.updateSessionTitleAndUsageStmt,
 	}
 }

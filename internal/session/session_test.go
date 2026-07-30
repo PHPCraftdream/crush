@@ -618,6 +618,139 @@ func TestBroadOverwriteLosesConcurrentUsage(t *testing.T) {
 		"broad read-modify-write overwriting all columns MUST have clobbered the concurrent usage update — if this is 111 the test is no longer reproducing the old bug")
 }
 
+// TestTitleGenerationDoesNotRaceMainTurnTokens is the regression guard for
+// P1.6: the title-generation goroutine (agent.go's generateTitle) used to
+// call the now-removed UpdateTitleAndUsage, which additively bumped
+// prompt_tokens/completion_tokens on top of whatever the main turn's
+// SetUsage snapshot last wrote. Since title generation runs concurrently
+// with the main turn (see agent.go Run's wg.Go around the generateTitle
+// call), the final token counters depended on which of the two finished
+// last — nondeterministic. The fix: title generation now calls Rename
+// (title only) + IncrementCost (cost only), leaving prompt_tokens/
+// completion_tokens exclusively owned by SetUsage's overwrite semantics.
+//
+// This test drives both orderings explicitly (title-finishes-first and
+// title-finishes-last) and asserts that in BOTH cases:
+//   - prompt_tokens/completion_tokens end up exactly what SetUsage wrote
+//     (title generation must never contribute to them), and
+//   - cost ends up as the SUM of the main turn's cost and the title
+//     generation's cost (both contributions must land, regardless of order).
+func TestTitleGenerationDoesNotRaceMainTurnTokens(t *testing.T) {
+	const (
+		mainPromptTokens     = int64(1000)
+		mainCompletionTokens = int64(200)
+		mainCost             = 0.05
+		titleCost            = 0.001
+	)
+
+	runOrdering := func(t *testing.T, titleFirst bool) {
+		sqlDB, q := newTestDB(t)
+		svc := NewService(q, sqlDB)
+		ctx := t.Context()
+
+		sess, err := svc.Create(ctx, "Untitled Session")
+		require.NoError(t, err)
+		sessionID := sess.ID
+
+		mainTurn := func() {
+			require.NoError(t, svc.SetUsage(ctx, sessionID, mainPromptTokens, mainCompletionTokens))
+			_, err := svc.IncrementCost(ctx, sessionID, mainCost)
+			require.NoError(t, err)
+		}
+		titleGen := func() {
+			require.NoError(t, svc.Rename(ctx, sessionID, "Generated Title"))
+			_, err := svc.IncrementCost(ctx, sessionID, titleCost)
+			require.NoError(t, err)
+		}
+
+		if titleFirst {
+			titleGen()
+			mainTurn()
+		} else {
+			mainTurn()
+			titleGen()
+		}
+
+		final, err := svc.Get(ctx, sessionID)
+		require.NoError(t, err)
+
+		assert.Equal(t, mainPromptTokens, final.PromptTokens,
+			"prompt_tokens must equal exactly what SetUsage wrote, unaffected by title generation")
+		assert.Equal(t, mainCompletionTokens, final.CompletionTokens,
+			"completion_tokens must equal exactly what SetUsage wrote, unaffected by title generation")
+		assert.InDelta(t, mainCost+titleCost, final.Cost, 1e-9,
+			"cost must include both the main turn's and title generation's contributions")
+		assert.Equal(t, "Generated Title", final.Title)
+	}
+
+	t.Run("title finishes first", func(t *testing.T) {
+		runOrdering(t, true)
+	})
+	t.Run("title finishes last", func(t *testing.T) {
+		runOrdering(t, false)
+	})
+}
+
+// TestTitleGenerationConcurrentWithMainTurn actually races the two goroutines
+// (rather than serializing them in a fixed order) using a start barrier so
+// both begin as close to simultaneously as possible, repeated across many
+// sessions. Run with -race to catch any data race, and verifies the same
+// invariants as TestTitleGenerationDoesNotRaceMainTurnTokens hold regardless
+// of true scheduling order.
+func TestTitleGenerationConcurrentWithMainTurn(t *testing.T) {
+	t.Parallel()
+	sqlDB, q := newTestDB(t)
+	sqlDB.SetMaxOpenConns(1) // production-faithful single-connection pool; see TestConcurrentRenameAndUsage_NoDataLoss.
+	svc := NewService(q, sqlDB)
+	ctx := t.Context()
+
+	const (
+		mainPromptTokens     = int64(4321)
+		mainCompletionTokens = int64(987)
+		mainCost             = 0.02
+		titleCost            = 0.0005
+		iterations           = 50
+	)
+
+	for i := 0; i < iterations; i++ {
+		sess, err := svc.Create(ctx, "Untitled Session")
+		require.NoError(t, err)
+		sessionID := sess.ID
+
+		var (
+			wg    sync.WaitGroup
+			start = make(chan struct{})
+		)
+		wg.Add(2)
+
+		go func() {
+			defer wg.Done()
+			<-start
+			require.NoError(t, svc.SetUsage(ctx, sessionID, mainPromptTokens, mainCompletionTokens))
+			_, err := svc.IncrementCost(ctx, sessionID, mainCost)
+			require.NoError(t, err)
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			require.NoError(t, svc.Rename(ctx, sessionID, "Generated Title"))
+			_, err := svc.IncrementCost(ctx, sessionID, titleCost)
+			require.NoError(t, err)
+		}()
+
+		close(start)
+		wg.Wait()
+
+		final, err := svc.Get(ctx, sessionID)
+		require.NoError(t, err)
+
+		assert.Equal(t, mainPromptTokens, final.PromptTokens, "iter %d", i)
+		assert.Equal(t, mainCompletionTokens, final.CompletionTokens, "iter %d", i)
+		assert.InDelta(t, mainCost+titleCost, final.Cost, 1e-9, "iter %d", i)
+		assert.Equal(t, "Generated Title", final.Title, "iter %d", i)
+	}
+}
+
 func countMsgsForSession(t *testing.T, ctx context.Context, sqlDB *sql.DB, sessionID string) int64 {
 	t.Helper()
 	var n int64

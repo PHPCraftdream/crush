@@ -108,10 +108,6 @@ func (m *mockSessionService) GetCallTreeActivityBatch(context.Context, []string)
 	return nil, nil
 }
 
-func (m *mockSessionService) UpdateTitleAndUsage(context.Context, string, string, int64, int64, float64) error {
-	return nil
-}
-
 func (m *mockSessionService) Rename(context.Context, string, string) error {
 	return nil
 }

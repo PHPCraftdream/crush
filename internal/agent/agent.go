@@ -2593,17 +2593,38 @@ func (a *sessionAgent) generateTitle(ctx context.Context, sessionID string, user
 		cost = 0
 	}
 
-	promptTokens := resp.TotalUsage.InputTokens + resp.TotalUsage.CacheCreationTokens
-	completionTokens := resp.TotalUsage.OutputTokens
-
-	// Atomically update only title and usage fields to avoid overriding other
-	// concurrent session updates.
-	saveErr := a.sessions.UpdateTitleAndUsage(ctx, sessionID, title, promptTokens, completionTokens, cost)
-	if saveErr != nil {
-		slog.Error("Failed to save session title and usage", "error", saveErr)
-		return
+	// Rename and cost-accrual are intentionally two separate atomic calls,
+	// not a single combined update. Title generation is a small side LLM
+	// call that runs concurrently with the main turn (see the wg.Go call
+	// site in Run): it must NOT add to prompt_tokens/completion_tokens,
+	// since those columns are a snapshot of the main conversation's current
+	// context-window size (see Service.SetUsage's doc comment) that the
+	// main turn overwrites, not a cumulative counter. If title generation
+	// added to them here, whichever of the two goroutines finishes last
+	// would nondeterministically win: SetUsage's overwrite would erase this
+	// addition, or this addition would land on top of a stale snapshot.
+	// Cost, on the other hand, IS real money spent on a real API call, and
+	// already has a dedicated atomic-additive path (IncrementCost) built
+	// exactly for this class of "charge the session from a concurrent
+	// goroutine" problem — so only cost is added here.
+	//
+	// Rename runs first: a title is the primary purpose of this function,
+	// and the deferred fallback above only fires when titleSaved is still
+	// false, so a Rename failure must leave titleSaved false to trigger the
+	// "Untitled Session" fallback. IncrementCost runs regardless of the
+	// Rename outcome so a title-generation API call is never left unbilled
+	// just because the rename itself failed for an unrelated reason (e.g. a
+	// transient DB error on that specific statement).
+	renameErr := a.sessions.Rename(ctx, sessionID, title)
+	if renameErr != nil {
+		slog.Error("Failed to save session title", "error", renameErr)
+	} else {
+		titleSaved = true
 	}
-	titleSaved = true
+
+	if _, err := a.sessions.IncrementCost(ctx, sessionID, cost); err != nil {
+		slog.Error("Failed to accrue title generation cost", "error", err)
+	}
 }
 
 func (a *sessionAgent) openrouterCost(metadata fantasy.ProviderMetadata) *float64 {

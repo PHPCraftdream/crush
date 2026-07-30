@@ -151,7 +151,6 @@ type Querier interface {
 	UpdateSessionModels(ctx context.Context, arg UpdateSessionModelsParams) error
 	UpdateSessionReasoningEffort(ctx context.Context, arg UpdateSessionReasoningEffortParams) error
 	UpdateSessionSystemPrompt(ctx context.Context, arg UpdateSessionSystemPromptParams) error
-	UpdateSessionTitleAndUsage(ctx context.Context, arg UpdateSessionTitleAndUsageParams) error
 }
 
 var _ Querier = (*Queries)(nil)

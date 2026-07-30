@@ -157,7 +157,6 @@ type Service interface {
 	// charges zero. Replaces the old in-memory baseline scheme that lost cost
 	// on sub-agent error paths, process restarts, and failed charges.
 	TransferChildCostToParent(ctx context.Context, childSessionID, parentSessionID string) error
-	UpdateTitleAndUsage(ctx context.Context, sessionID, title string, promptTokens, completionTokens int64, cost float64) error
 	UpdateModels(ctx context.Context, sessionID, largeProvider, largeModel, smallProvider, smallModel string) error
 	UpdateReasoningEffort(ctx context.Context, sessionID, largeEffort, smallEffort string) error
 	UpdateSystemPrompt(ctx context.Context, sessionID, prompt string) error
@@ -636,18 +635,6 @@ func (s *service) TransferChildCostToParent(ctx context.Context, childSessionID,
 		s.Publish(pubsub.UpdatedEvent, sess)
 	}
 	return nil
-}
-
-// UpdateTitleAndUsage updates only the title and usage fields atomically.
-// This is safer than fetching, modifying, and saving the entire session.
-func (s *service) UpdateTitleAndUsage(ctx context.Context, sessionID, title string, promptTokens, completionTokens int64, cost float64) error {
-	return s.q.UpdateSessionTitleAndUsage(ctx, db.UpdateSessionTitleAndUsageParams{
-		ID:               sessionID,
-		Title:            title,
-		PromptTokens:     promptTokens,
-		CompletionTokens: completionTokens,
-		Cost:             cost,
-	})
 }
 
 // UpdateSystemPrompt saves a custom system prompt for a session.
