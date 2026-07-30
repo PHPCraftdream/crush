@@ -370,6 +370,50 @@ func TestCrossProcess_StaleMtimeButAliveHolderStaysBusy(t *testing.T) {
 	assert.NoError(t, statErr, "lock file for a live, still-locking holder must not be removed")
 }
 
+// TestCrossProcess_SubAgentChildSessionIsProtected is the regression test
+// for P1.1 (docs/reviews/2026-07-30-project-review.md): a sub-agent runs
+// under its own CHILD session id (format "parentMessageID$$toolCallID", see
+// session.CreateAgentToolSessionID / agent.go's runSubAgent), which is a
+// completely different id from its parent's session id. Before the fix,
+// agent.Run's inter-process lock was skipped entirely for sub-agents
+// (`if !a.isSubAgent && a.dataDir != ""`), so nothing ever locked the child
+// session id at the OS level — a second crush process opening that exact
+// child session id (e.g. via `crush sessions pick`/`resume`) could acquire
+// it and stream into it concurrently with the in-process sub-agent run.
+//
+// This test doesn't invoke the agent package (that would require a full
+// fantasy.Agent harness); it proves the lock primitive itself protects a
+// child-shaped session id exactly the same way it protects a top-level one,
+// which is what agent.Run now relies on now that the isSubAgent exemption is
+// gone. A real second process holds the lock on the child id; our attempt
+// to acquire the same id must fail with SessionLockBusyError, exactly like
+// TestCrossProcess_BusyIsImmediate proves for a plain top-level session id.
+func TestCrossProcess_SubAgentChildSessionIsProtected(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns a real child process; skipped in -short")
+	}
+	dir := t.TempDir()
+
+	// Shaped exactly like session.Service.CreateAgentToolSessionID's output:
+	// fmt.Sprintf("%s$$%s", messageID, toolCallID).
+	childSessionID := "msg-parent-123$$toolcall-abc"
+
+	holder := spawnLockHolder(t, dir, childSessionID, 0 /* hold until stopped */)
+	defer holder.stop(t)
+	require.True(t, holder.locked, "helper process failed to acquire lock: %s", holder.failed)
+
+	start := time.Now()
+	_, err := TryAcquireSessionLock(dir, childSessionID)
+	elapsed := time.Since(start)
+
+	var busyErr *SessionLockBusyError
+	require.Error(t, err, "a second process must not be able to acquire the lock for an active sub-agent's child session id")
+	require.True(t, errors.As(err, &busyErr), "expected SessionLockBusyError, got %v", err)
+	assertBusyHolderPID(t, holder.pid, busyErr.HolderPID)
+	assert.Less(t, elapsed, 5*time.Second,
+		"acquire must fail fast via a real OS-lock contention check, not wait out any mtime timeout")
+}
+
 // TestCrossProcess_DeadHolderIsReclaimedPromptly is test C: a real
 // second process acquires the lock, then is killed (SIGKILL / TerminateProcess)
 // without any explicit unlock or cleanup. The OS itself releases the

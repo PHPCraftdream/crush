@@ -487,10 +487,28 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	// same session id — the accidental-double-spawn race documented in
 	// the parallel-process audit (#6 CRITICAL). The OS-level lock
 	// auto-releases on process death, so a crashed holder never leaves
-	// a stuck session id. Sub-agents skip the lock because they live
-	// inside the parent process whose lock is already held.
+	// a stuck session id.
+	//
+	// Sub-agents are NOT exempt: a sub-agent runs under its own CHILD
+	// session id (parentMessageID$$toolCallID, see
+	// session.CreateAgentToolSessionID), which is a completely different
+	// id from the parent's call.SessionID. The parent's lock only covers
+	// the parent's own session id — the child id is otherwise unlocked,
+	// so a second crush process opening that exact child session (e.g.
+	// via `crush sessions pick`/`resume`) could acquire it and stream into
+	// it concurrently with this in-process sub-agent run. Locking must
+	// happen per session id, regardless of isSubAgent.
+	//
+	// This does not introduce false-positive "already in use" errors for
+	// legitimate same-process reentrancy (e.g. the "agent" tool's
+	// resume_session_id path racing a still-active run on that same child
+	// id): the in-process a.IsSessionBusy check above already queues that
+	// case via messageQueue.Append and returns before this point is ever
+	// reached. Two sub-agent invocations spawned in parallel by fantasy's
+	// ParallelAgentTool likewise never collide here — each gets a distinct
+	// toolCallID and therefore a distinct child session id.
 	var ipcLock *session.SessionLock
-	if !a.isSubAgent && a.dataDir != "" {
+	if a.dataDir != "" {
 		lk, lockErr := session.TryAcquireSessionLock(a.dataDir, call.SessionID)
 		if lockErr != nil {
 			var busyErr *session.SessionLockBusyError
