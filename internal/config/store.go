@@ -114,11 +114,20 @@ type ConfigStore struct {
 	// lock for its full duration, so a writer can never publish a clone
 	// built from a stale generation on top of a reload that already
 	// published a newer one (the lost-update race that existed when
-	// reloadMu and writeMu were separate locks). autoReload uses TryLock
-	// on publishMu to skip a redundant reload when one is already in
-	// progress — this also covers the re-entrant call from
-	// configureProviders → RemoveConfigField → autoReload during a
-	// reload or the initial Load (which hold publishMu).
+	// reloadMu and writeMu were separate locks).
+	//
+	// autoReload's redundant-reload dedup is reloadMu.TryLock() (see
+	// reloadMu below), NOT publishMu — Load holds ONLY publishMu for its
+	// whole body, never reloadMu, so a re-entrant autoReload call from
+	// inside configureProviders (running under Load or a reload) would
+	// find reloadMu free, succeed its TryLock, and proceed into
+	// buildAndPublishReload, which acquires publishMu itself — on the
+	// SAME goroutine already holding it. sync.Mutex is not reentrant in
+	// Go, so that self-deadlocks and hangs forever. This is exactly why
+	// configureProviders must only ever call removeConfigFieldBestEffort
+	// (which never calls autoReload at all) and must NEVER call the full
+	// RemoveConfigField/SetConfigFields (which do call autoReload) from a
+	// path that runs under a held publishMu.
 	publishMu sync.Mutex
 
 	// diskWriteMu serialises the on-disk read-modify-write cycle
@@ -148,16 +157,24 @@ type ConfigStore struct {
 	// or SetProviderRuntimeConfig — for as long as the shell substitution
 	// ran (up to resolveTimeout).
 	//
-	// reloadFromDiskUnlocked takes reloadMu, builds a full candidate
-	// snapshot from local variables ONLY (no store mutation), releases
-	// reloadMu, then takes publishMu just long enough to CAS-check the
-	// generation and publish. autoReload uses TryLock on reloadMu (not
-	// publishMu) to preserve the original "skip a redundant reload when
-	// one is already in progress" behaviour without reintroducing the
-	// publishMu hold. Lock ordering when both are held: reloadMu is
-	// always released before publishMu is acquired — they are never held
-	// at the same time by the same goroutine, so there is no new
-	// deadlock ordering to reason about against publishMu → diskWriteMu.
+	// reloadFromDiskUnlocked takes reloadMu (via defer, held for its
+	// whole call), builds a full candidate snapshot from local variables
+	// ONLY (no store mutation), then — still holding reloadMu — takes
+	// publishMu just long enough to CAS-check the generation and
+	// publish. autoReload uses TryLock on reloadMu (not publishMu) to
+	// preserve the original "skip a redundant reload when one is already
+	// in progress" behaviour without reintroducing the publishMu hold
+	// during the expensive candidate-build phase.
+	//
+	// Lock ordering when both are held: reloadMu is acquired first and
+	// held THROUGH the publishMu acquisition (nested, not sequential —
+	// reloadMu is NOT released before publishMu is taken). The global
+	// order is always reloadMu → publishMu → diskWriteMu → the
+	// inter-process config file lock, consistently in every call path
+	// that touches more than one of these; there is no path that
+	// acquires them in the reverse order. It is this consistent nesting
+	// order — not any claim that the two locks are never held together —
+	// that rules out a deadlock here.
 	reloadMu sync.Mutex
 }
 
@@ -593,9 +610,14 @@ func (s *ConfigStore) removeConfigFieldAt(ctx context.Context, path, key string)
 // timeout for callers running under publishMu.
 //
 // Does NOT call autoReload — unlike RemoveConfigField, this is always
-// called from inside Load/reloadFromDiskLocked, where autoReload would be a
-// no-op re-entrant call anyway (autoReload's TryLock on publishMu fails
-// because the caller already holds it). The in-memory removal is instead
+// called from inside Load/reloadFromDiskLocked, where publishMu is held for
+// the whole call but reloadMu is NOT. autoReload's redundant-reload dedup is
+// reloadMu.TryLock() (see the reloadMu field doc), which would SUCCEED here
+// (nothing holds reloadMu), so calling autoReload from this path would be a
+// genuine, deadlocking re-entrant call — not a safe no-op — since it would
+// proceed into buildAndPublishReload and try to acquire publishMu on the
+// same goroutine that already holds it. This function must never call
+// autoReload for exactly that reason. The in-memory removal is instead
 // handled by the caller via Providers.Del immediately after, and any
 // process's next successful reload re-reads the on-disk state.
 //
