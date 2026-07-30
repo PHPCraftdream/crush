@@ -501,7 +501,14 @@ func (s *ConfigStore) SetConfigFields(scope Scope, kv map[string]any) error {
 
 	// Auto-reload to keep in-memory state fresh after config edits. Runs
 	// OUTSIDE withConfigWriteLock so its publishMu acquisition cannot
-	// deadlock (see SetConfigFields history).
+	// deadlock against diskWriteMu/the file lock (see SetConfigFields
+	// history). This alone does not make autoReload safe to call from
+	// EVERY context: a caller that reaches this point while already
+	// holding publishMu itself (Load, via configureSelectedModels ->
+	// updatePreferredModelsLocked -> SetConfigFields) would still hang
+	// here, because autoReload's own dedup guard is reloadMu.TryLock(),
+	// not publishMu — see Load's doc comment on why it now also holds
+	// reloadMu for exactly this reason.
 	if err := s.autoReload(context.Background()); err != nil {
 		// Log warning but don't fail the write - disk is already updated.
 		slog.Warn("Config file updated but failed to reload in-memory state", "error", err)

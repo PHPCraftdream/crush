@@ -136,9 +136,32 @@ func Load(workingDir, dataDir string, debug bool) (*ConfigStore, error) {
 	// Configure providers
 	valueResolver := NewShellVariableResolver(env)
 
-	// Hold publishMu during the initial load so that auto-reload triggered by
-	// config-modifying operations inside configureProviders (e.g.
-	// RemoveConfigField) is skipped instead of recursing.
+	// Hold reloadMu AND publishMu during the initial load (same acquisition
+	// order as buildAndPublishReload: reloadMu -> publishMu), so that
+	// auto-reload triggered by config-modifying operations inside
+	// configureProviders (e.g. RemoveConfigField) or configureSelectedModels
+	// (persisting a newly-selected default model via
+	// updatePreferredModelsLocked -> SetConfigFields, when a role has no
+	// model configured yet) is skipped instead of recursing.
+	//
+	// autoReload's redundant-reload dedup is reloadMu.TryLock(), not
+	// publishMu (see reloadMu's field doc) — holding only publishMu here,
+	// as this function did before, no longer makes a re-entrant autoReload
+	// call a safe no-op: it would find reloadMu free, succeed the TryLock,
+	// and hang forever trying to re-acquire publishMu on this same
+	// goroutine (sync.Mutex is not reentrant). This was a real,
+	// 100%-reproducible deadlock on any Load() call where a model role has
+	// no configured selection yet (confirmed via
+	// TestModelsBump_NonAtomModel_ReportsCleanly hanging past both a 600s
+	// and an isolated 30s test timeout with an identical stuck stack).
+	//
+	// Acquiring reloadMu here is safe with no other goroutine to race
+	// against: the *ConfigStore value doesn't exist (and so cannot be
+	// referenced by anything else) until this function constructs and
+	// returns it below, so nothing outside this call can possibly be
+	// reloading THIS store concurrently while both locks are held.
+	store.reloadMu.Lock()
+	defer store.reloadMu.Unlock()
 	store.publishMu.Lock()
 	defer store.publishMu.Unlock()
 

@@ -1048,3 +1048,85 @@ func TestProviderUpdates_ConcurrentReloadNoRace(t *testing.T) {
 	_, ok := store.Config().Providers.Get("openai")
 	require.True(t, ok, "provider must still be present after concurrent updates")
 }
+
+// TestLoad_PersistingCorrectedModelDoesNotDeadlock is the regression test
+// for a self-deadlock discovered via TestModelsBump_NonAtomModel_ReportsCleanly
+// (internal/cmd) hanging past both a 600s full-suite timeout and an isolated
+// 30s single-test timeout, with an identical stuck stack both times.
+//
+// Root cause: Load holds publishMu for its entire body. When a configured
+// model can't be resolved (GetModel returns nil), configureSelectedModels
+// persists a corrected default via updatePreferredModelLocked ->
+// updatePreferredModelsLocked -> SetConfigFields, and SetConfigFields
+// unconditionally calls autoReload after its disk write. autoReload's own
+// redundant-reload dedup is reloadMu.TryLock() (not publishMu, since commit
+// 682cf21a) — since Load didn't hold reloadMu, the re-entrant autoReload
+// call would succeed that TryLock and hang forever trying to re-acquire
+// publishMu on the same goroutine that Load already holds it on.
+//
+// Fixed by having Load also hold reloadMu for its whole body (same
+// acquisition order as buildAndPublishReload: reloadMu -> publishMu), so
+// autoReload's TryLock(reloadMu) correctly fails and skips instead of
+// recursing — restoring the original pre-682cf21a safety property using the
+// new lock.
+func TestLoad_PersistingCorrectedModelDoesNotDeadlock(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "crush.json")
+
+	isolateAllGlobalConfigPaths(t)
+	resetProviderState()
+	t.Cleanup(resetProviderState)
+
+	// The configured large/small model ("not-a-real-model") does not exist
+	// in the provider's model list, so configureSelectedModels must fall
+	// back to and persist gpt-4 (the provider's first model) — exactly the
+	// path that triggers the reentrant autoReload call.
+	//
+	// disable_default_providers is set so Providers(cfg) skips its
+	// catwalk-catalog fetch entirely (Providers() memoizes its result in a
+	// package-level sync.Once for the whole test binary, and would
+	// otherwise hit the real network/cache for a live provider list — this
+	// test needs a fully offline, deterministic provider set, since it
+	// asserts an exact fallback model id).
+	initialConfig := `{
+		"options": {"disable_default_providers": true},
+		"models": {
+			"large": {"provider": "openai", "model": "not-a-real-model"},
+			"small": {"provider": "openai", "model": "not-a-real-model"}
+		},
+		"providers": {
+			"openai": {
+				"api_key": "test-key",
+				"base_url": "https://example.invalid/v1",
+				"models": [{"id": "gpt-4", "name": "GPT-4"}]
+			}
+		}
+	}`
+	require.NoError(t, os.WriteFile(configPath, []byte(initialConfig), 0o600))
+
+	done := make(chan struct{})
+	var store *ConfigStore
+	var loadErr error
+	go func() {
+		defer close(done)
+		store, loadErr = Load(dir, dir, false)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Load hung past 10s — regression: SetConfigFields' autoReload call " +
+			"deadlocked against Load's held publishMu (see Load's doc comment in load.go)")
+	}
+
+	require.NoError(t, loadErr)
+	require.Equal(t, "openai", store.Config().Models[SelectedModelTypeLarge].Provider)
+	require.Equal(t, "gpt-4", store.Config().Models[SelectedModelTypeLarge].Model,
+		"unresolvable configured model must fall back to and persist the provider's first model")
+
+	// The corrected selection must actually have reached disk (proving the
+	// persist path really ran, not just the in-memory copy-on-write step).
+	data, err := os.ReadFile(configPath)
+	require.NoError(t, err)
+	require.Contains(t, string(data), "gpt-4")
+}
