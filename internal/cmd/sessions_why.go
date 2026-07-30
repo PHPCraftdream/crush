@@ -198,6 +198,9 @@ func explainSessionStatus(ctx context.Context, a *app.App, cwd, sessionID string
 			} else {
 				fmt.Fprintf(out, "no clean finish found (last finish: %s) — likely died mid-turn.\n", finishReasonOrUnknown(finish))
 			}
+			fmt.Fprintf(out, "If this was an unrecovered panic, grep crush.log for %q around the\n", crashLogMarker)
+			fmt.Fprintf(out, "time this session's lock went stale — Execute's top-level recover logs\n")
+			fmt.Fprintf(out, "the panic and stack trace there before the process exits.\n")
 		}
 	}
 

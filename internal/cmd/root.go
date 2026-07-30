@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -197,7 +198,46 @@ func runWebMode(cmd *cobra.Command) error {
 	return srv.Start(cmd.Context(), onReady)
 }
 
+// crashLogMarker is the fixed message text logged by Execute's top-level
+// recover before the process exits on an unrecovered panic anywhere in the
+// command tree. Kept as a named constant (rather than an inline string) so
+// `sessions why` (see its "status: crashed" branch) and this log site can't
+// silently drift apart if one side's wording changes.
+const crashLogMarker = "crush: fatal panic, exiting"
+
+// recoverAndLogPanic is Execute's top-level panic handler. It logs the
+// panic value and a full stack trace via slog.Error under crashLogMarker,
+// then re-panics with the SAME value so the process's normal crash
+// behavior (exit code, stderr trace) is unchanged for anyone watching the
+// terminal directly — this only guarantees the trace is also durably
+// logged first. Must be called via `defer recoverAndLogPanic()`, not
+// invoked directly (recover() only has an effect when called from a
+// deferred function).
+//
+// Go's default panic handler writes only to os.Stderr, never through slog
+// — for a `crush run` invocation whose stderr isn't captured by whatever
+// launched it (a backgrounded/redirected orchestrator run, the common case
+// this fork is built for), an unrecovered panic anywhere in the command
+// tree previously left crush.log with zero trace of what happened; the
+// process just silently stopped updating its session lock. This does NOT
+// change what happens to the process on a genuine panic — a real
+// programmer error should still crash loudly — it only ensures the stack
+// trace lands somewhere durable first: via whatever slog.Default()
+// currently is, which for most real crashes (occurring well after
+// setupApp's crushlog.Setup call) is already pointed at
+// <dataDir>/logs/crush.log.
+func recoverAndLogPanic() {
+	if r := recover(); r != nil {
+		slog.Error(crashLogMarker,
+			"panic", r,
+			"stack", string(debug.Stack()))
+		panic(r)
+	}
+}
+
 func Execute() {
+	defer recoverAndLogPanic()
+
 	options := []fang.Option{
 		// Fork patch: show the release-line version alongside the upstream
 		// triage watermark so `crush --version` answers "how far has upstream
