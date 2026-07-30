@@ -245,12 +245,63 @@ func (s *ConfigStore) HasConfigField(scope Scope, key string) bool {
 // config read-modify-write, so a wedged sibling crush process (debugger
 // attached, suspended shell, frozen network mount) cannot indefinitely freeze
 // parallel runs that share the same crush.json.
+//
+// This is the budget for explicit, user-triggered writes (SetConfigFields,
+// RemoveConfigField/RemoveProviderAPIKey called outside of Load/reload).
+// Callers that run INSIDE Load/reloadFromDiskLocked while holding publishMu
+// must NOT use this timeout directly — see internalConfigWriteLockTimeout.
 const configWriteLockTimeout = 30 * time.Second
+
+// internalConfigWriteLockTimeout bounds config writes issued from inside
+// configureProviders (e.g. the "drop legacy providers.anthropic OAuth
+// config" cleanup), which runs synchronously inside Load and
+// reloadFromDiskLocked while publishMu is held for the whole call. Regressed
+// by b53cbf3d: before that commit this was a same-process disk write with no
+// cross-process lock and completed in milliseconds; after it, the same call
+// can block for up to configWriteLockTimeout (30s) on the inter-process
+// sidecar lock if a sibling crush process holds it (or is wedged holding
+// it) — and because publishMu is held for the duration, EVERY reader of the
+// config store (including app startup via Load, and ReloadFromDisk,
+// SetSkipPermissionRequests, CaptureStalenessSnapshot, etc.) stalls too.
+//
+// A much shorter budget is safe here specifically because this call site
+// already tolerates failure: on timeout the on-disk key simply isn't
+// removed yet, the in-memory config is still corrected via Providers.Del
+// right after (see configureProviders), and the very next successful
+// autoReload/Load (this process or a sibling one) will retry the disk
+// cleanup. This is a best-effort cache-eviction of a deprecated on-disk
+// key, not a user-initiated write that must succeed synchronously.
+const internalConfigWriteLockTimeout = 2 * time.Second
+
+// configWriteLockStallLogThreshold is how long withConfigWriteLock waits
+// for the inter-process sidecar lock before logging a warning that the wait
+// is unusually long. This makes cross-process contention (or a wedged
+// sibling process holding the lock) diagnosable — without it, a stalled
+// config write just looks like "crush doesn't start" or "crush hangs" with
+// no signal pointing at the lock file. Logged regardless of which timeout
+// (configWriteLockTimeout or internalConfigWriteLockTimeout) is in effect,
+// and regardless of whether the wait eventually succeeds or times out.
+const configWriteLockStallLogThreshold = 500 * time.Millisecond
 
 // withConfigWriteLock runs fn while holding BOTH the in-process diskWriteMu
 // and an exclusive OS-level lock on a sidecar lock file co-located with the
-// config path (path + ".lock" — the same convention cliprovider's
-// acquireMCPConfigLock uses for the same class of cross-process config RMW).
+// config path, waiting up to configWriteLockTimeout for the OS lock. Use
+// this for explicit, user-triggered writes. Callers running inside
+// Load/reloadFromDiskLocked (i.e. anything reachable from configureProviders
+// while publishMu is held) must call withConfigWriteLockCtx with a much
+// shorter, caller-supplied timeout instead — see internalConfigWriteLockTimeout.
+func (s *ConfigStore) withConfigWriteLock(path string, fn func() error) error {
+	ctx, cancel := context.WithTimeout(context.Background(), configWriteLockTimeout)
+	defer cancel()
+	return s.withConfigWriteLockCtx(ctx, path, fn)
+}
+
+// withConfigWriteLockCtx is withConfigWriteLock parameterised on the
+// inter-process lock wait's deadline via ctx, so callers on a tight budget
+// (e.g. the config-cleanup call inside configureProviders, which runs while
+// publishMu is held for the entire Load/reloadFromDiskLocked call) can pass
+// a much shorter timeout than the default 30s. See
+// internalConfigWriteLockTimeout for why a short budget is safe there.
 //
 // diskWriteMu serialises concurrent goroutines inside THIS process; the OS
 // lock (flock on POSIX, LockFileEx on Windows, via session.FileLock)
@@ -269,13 +320,19 @@ const configWriteLockTimeout = 30 * time.Second
 // against a re-entrant caller that already holds publishMu and entered this
 // path (e.g. Load → configureProviders → RemoveConfigField). Lock ordering
 // is always diskWriteMu → inter-process file lock.
-func (s *ConfigStore) withConfigWriteLock(path string, fn func() error) error {
+func (s *ConfigStore) withConfigWriteLockCtx(ctx context.Context, path string, fn func() error) error {
 	s.diskWriteMu.Lock()
 	defer s.diskWriteMu.Unlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), configWriteLockTimeout)
-	defer cancel()
+	waitStart := time.Now()
 	lock, err := session.AcquireFileLockContext(ctx, path+".lock")
+	if wait := time.Since(waitStart); wait >= configWriteLockStallLogThreshold {
+		// Diagnosability (see configWriteLockStallLogThreshold): without
+		// this, a contended or wedged sidecar lock just looks like "crush
+		// hangs on startup" with nothing pointing at the lock file.
+		slog.Warn("Config write waited unusually long for inter-process lock",
+			"path", path+".lock", "wait", wait, "succeeded", err == nil)
+	}
 	if err != nil {
 		return fmt.Errorf("failed to lock config file %q: %w", path, err)
 	}
@@ -387,15 +444,41 @@ func (s *ConfigStore) SetConfigFields(scope Scope, kv map[string]any) error {
 // racing to edit the same crush.json cannot silently clobber each other's
 // change. After a successful write, it automatically reloads config to keep
 // in-memory state fresh.
+//
+// This waits up to the full configWriteLockTimeout (30s) for the
+// inter-process lock. Callers running inside Load/reloadFromDiskLocked
+// (i.e. under configureProviders while publishMu is held) must NOT use
+// this — use removeConfigFieldBestEffort instead, which bounds the wait
+// to internalConfigWriteLockTimeout so a contended/wedged lock cannot stall
+// the whole config subsystem. See internalConfigWriteLockTimeout's doc.
 func (s *ConfigStore) RemoveConfigField(scope Scope, key string) error {
 	path, err := s.configPath(scope)
 	if err != nil {
 		return fmt.Errorf("%s: %w", key, err)
 	}
 
-	// withConfigWriteLock serialises the read-modify-write both in-process
-	// and across processes — see SetConfigFields. Released before autoReload.
-	if err := s.withConfigWriteLock(path, func() error {
+	ctx, cancel := context.WithTimeout(context.Background(), configWriteLockTimeout)
+	defer cancel()
+	if err := s.removeConfigFieldAt(ctx, path, key); err != nil {
+		return err
+	}
+
+	// Auto-reload to keep in-memory state fresh after config edits.
+	// Runs OUTSIDE withConfigWriteLock (see SetConfigFields).
+	if err := s.autoReload(context.Background()); err != nil {
+		slog.Warn("Config file updated but failed to reload in-memory state", "error", err)
+	}
+
+	return nil
+}
+
+// removeConfigFieldAt performs the on-disk read-modify-write for
+// RemoveConfigField/removeConfigFieldBestEffort against an already-resolved
+// path, bounding the inter-process lock wait to ctx's deadline. Shared so
+// both the full-timeout public API and the short-timeout internal caller
+// (configureProviders) go through one write implementation.
+func (s *ConfigStore) removeConfigFieldAt(ctx context.Context, path, key string) error {
+	return s.withConfigWriteLockCtx(ctx, path, func() error {
 		data, err := os.ReadFile(path)
 		if err != nil {
 			return fmt.Errorf("failed to read config file: %w", err)
@@ -411,17 +494,49 @@ func (s *ConfigStore) RemoveConfigField(scope Scope, key string) error {
 			return fmt.Errorf("failed to write config file: %w", err)
 		}
 		return nil
-	}); err != nil {
-		return err
+	})
+}
+
+// removeConfigFieldBestEffort deletes a single key from the config file for
+// the given scope, bounding the inter-process lock wait to
+// internalConfigWriteLockTimeout instead of the full configWriteLockTimeout.
+//
+// Use this ONLY from call paths that run inside Load/reloadFromDiskLocked
+// while publishMu is held for the whole call (currently: the "drop legacy
+// providers.anthropic OAuth config" cleanup in configureProviders). Because
+// publishMu gates every reader of the config store (ReloadFromDisk,
+// SetSkipPermissionRequests, CaptureStalenessSnapshot, and app startup via
+// Load itself), a stall here — waiting on a sidecar lock held by a
+// contended or wedged sibling crush process — would freeze the whole config
+// subsystem for as long as the wait budget allows. Regressed by b53cbf3d,
+// which replaced a same-process, lock-free disk write with the
+// cross-process-locked withConfigWriteLock path without adjusting the
+// timeout for callers running under publishMu.
+//
+// Does NOT call autoReload — unlike RemoveConfigField, this is always
+// called from inside Load/reloadFromDiskLocked, where autoReload would be a
+// no-op re-entrant call anyway (autoReload's TryLock on publishMu fails
+// because the caller already holds it). The in-memory removal is instead
+// handled by the caller via Providers.Del immediately after, and any
+// process's next successful reload re-reads the on-disk state.
+//
+// On error (including timeout), the error is logged and swallowed: the
+// caller already tolerates this key not being removed from disk yet — the
+// in-memory state is corrected regardless, and the next successful
+// Load/reload (in this process or a sibling one) retries the disk cleanup.
+func (s *ConfigStore) removeConfigFieldBestEffort(scope Scope, key string) {
+	path, err := s.configPath(scope)
+	if err != nil {
+		slog.Warn("Skipping best-effort config field removal: no path for scope", "key", key, "error", err)
+		return
 	}
 
-	// Auto-reload to keep in-memory state fresh after config edits.
-	// Runs OUTSIDE withConfigWriteLock (see SetConfigFields).
-	if err := s.autoReload(context.Background()); err != nil {
-		slog.Warn("Config file updated but failed to reload in-memory state", "error", err)
+	ctx, cancel := context.WithTimeout(context.Background(), internalConfigWriteLockTimeout)
+	defer cancel()
+	if err := s.removeConfigFieldAt(ctx, path, key); err != nil {
+		slog.Warn("Best-effort config field removal did not complete; will retry on next reload",
+			"key", key, "path", path, "error", err)
 	}
-
-	return nil
 }
 
 // ReadModelsAtScope reads the per-scope `models.large` / `models.small` entries

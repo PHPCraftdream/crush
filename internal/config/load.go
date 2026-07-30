@@ -310,11 +310,18 @@ func (c *Config) configureProviders(ctx context.Context, store *ConfigStore, env
 		switch {
 		case p.ID == catwalk.InferenceProviderAnthropic && config.OAuthToken != nil:
 			// Claude Code subscription is not supported anymore. Remove to show onboarding.
-			// RemoveConfigField persists the deletion to disk; its auto-reload
-			// is skipped because the caller (Load / reloadFromDiskLocked) holds
-			// publishMu. The in-memory state stays consistent via Providers.Del
-			// below, and any racing reload re-reads the removal from disk.
-			store.RemoveConfigField(ScopeGlobal, "providers.anthropic")
+			// removeConfigFieldBestEffort persists the deletion to disk under a
+			// short, internal-only timeout (NOT RemoveConfigField's full 30s):
+			// this call runs inside Load/reloadFromDiskLocked while publishMu is
+			// held for the whole call, so a stall waiting on a contended or
+			// wedged sibling process's sidecar lock would freeze the entire
+			// config subsystem (including app startup) rather than just this
+			// cleanup. See internalConfigWriteLockTimeout. Its auto-reload is a
+			// no-op here regardless (the caller already holds publishMu). The
+			// in-memory state stays consistent via Providers.Del below, and any
+			// racing reload — or a future successful call to this same cleanup —
+			// re-reads/retries the removal from disk.
+			store.removeConfigFieldBestEffort(ScopeGlobal, "providers.anthropic")
 			c.Providers.Del(string(p.ID))
 			continue
 		case p.ID == catwalk.InferenceProviderCopilot && config.OAuthToken != nil:
