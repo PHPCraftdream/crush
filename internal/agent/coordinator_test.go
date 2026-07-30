@@ -964,11 +964,40 @@ func TestAutonomyEnabled(t *testing.T) {
 
 func TestSetPersistentMode(t *testing.T) {
 	coord := &coordinator{}
-	assert.False(t, coord.persistentMode, "default must be false (crush run is non-persistent)")
+	assert.False(t, coord.persistentMode.Load(), "default must be false (crush run is non-persistent)")
 	coord.SetPersistentMode(true)
-	assert.True(t, coord.persistentMode)
+	assert.True(t, coord.persistentMode.Load())
 	coord.SetPersistentMode(false)
-	assert.False(t, coord.persistentMode)
+	assert.False(t, coord.persistentMode.Load())
+}
+
+// TestSetPersistentModeConcurrentAccess is the regression test for L-8:
+// persistentMode used to be a plain bool written by SetPersistentMode and
+// read by autoResumeEligible with no synchronization. That race was
+// unreachable in practice (SetPersistentMode is only ever called once at
+// process start today), but every sibling guard in this struct
+// (allowPeakHours, activeModelRole, maxCost) is already lock/atomic-
+// protected, so a plain bool here was a silent trap for the next caller who
+// adds a second call path. This test writes and reads persistentMode from
+// many goroutines concurrently — under `go test -race` this fails loudly on
+// the old plain-bool field and passes cleanly on the atomic.Bool.
+func TestSetPersistentModeConcurrentAccess(t *testing.T) {
+	coord := &coordinator{consecutiveAutoResumes: make(map[string]int)}
+
+	const n = 50
+	var wg sync.WaitGroup
+	wg.Add(n * 2)
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			defer wg.Done()
+			coord.SetPersistentMode(i%2 == 0)
+		}(i)
+		go func() {
+			defer wg.Done()
+			_ = coord.persistentMode.Load()
+		}()
+	}
+	wg.Wait()
 }
 
 func TestGetProviderOptionsReasoningEffort(t *testing.T) {
@@ -1581,32 +1610,32 @@ func TestAutoResumeEligible(t *testing.T) {
 
 	t.Run("autonomy OFF (nil Options) is never eligible regardless of persistentMode", func(t *testing.T) {
 		cfg.Config().Options = nil
-		coord.persistentMode = true
+		coord.persistentMode.Store(true)
 		assert.False(t, coord.autoResumeEligible(sid))
 	})
 
 	t.Run("autonomy OFF (explicit false) is never eligible", func(t *testing.T) {
 		cfg.Config().Options = &config.Options{AutoResumeOnJobDone: boolPtr(false)}
-		coord.persistentMode = true
+		coord.persistentMode.Store(true)
 		assert.False(t, coord.autoResumeEligible(sid))
 	})
 
 	t.Run("autonomy ON + persistentMode false (crush run) is not eligible", func(t *testing.T) {
 		cfg.Config().Options = &config.Options{AutoResumeOnJobDone: boolPtr(true)}
-		coord.persistentMode = false
+		coord.persistentMode.Store(false)
 		assert.False(t, coord.autoResumeEligible(sid))
 	})
 
 	t.Run("autonomy ON + persistentMode true + counter below cap is eligible", func(t *testing.T) {
 		cfg.Config().Options = &config.Options{AutoResumeOnJobDone: boolPtr(true)}
-		coord.persistentMode = true
+		coord.persistentMode.Store(true)
 		coord.resetConsecutiveResume(sid)
 		assert.True(t, coord.autoResumeEligible(sid))
 	})
 
 	t.Run("at the cap (== maxConsecutiveAutoResumes) flips to not eligible", func(t *testing.T) {
 		cfg.Config().Options = &config.Options{AutoResumeOnJobDone: boolPtr(true)}
-		coord.persistentMode = true
+		coord.persistentMode.Store(true)
 		coord.resetConsecutiveResume(sid)
 		// Bump to exactly the cap; one below the cap is still eligible.
 		for i := 0; i < maxConsecutiveAutoResumes-1; i++ {

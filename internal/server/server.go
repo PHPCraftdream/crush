@@ -175,9 +175,21 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 
 // readPump reads messages from the WebSocket and dispatches them.
 func (s *Server) readPump(ctx context.Context, c *Client) {
+	// c.conn.Close() runs unconditionally in its own defer, independent of
+	// whether the unregister send below completes. Hub.Run stops reading
+	// from unregister once ctx is cancelled (see its ctx.Done() case), so
+	// on shutdown, once the buffered channel (cap 64) fills up, sending
+	// would block this goroutine forever — and with it, the deferred
+	// conn.Close() that never runs, leaking both the goroutine and the
+	// socket. Splitting the close into its own unconditional defer means
+	// the connection is always torn down even when the unregister send
+	// below is abandoned via ctx.Done().
+	defer c.conn.Close()
 	defer func() {
-		s.hub.unregister <- c
-		c.conn.Close()
+		select {
+		case s.hub.unregister <- c:
+		case <-ctx.Done():
+		}
 	}()
 
 	c.conn.SetReadLimit(maxMessageSize)

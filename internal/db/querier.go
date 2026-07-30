@@ -93,6 +93,8 @@ type Querier interface {
 	// Returns every session including children (no parent_session_id filter).
 	// Used by sessions gc to enumerate all sessions for garbage collection.
 	ListAllSessions(ctx context.Context) ([]Session, error)
+	// rowid is the tie-breaker: see ListUserMessagesBySession above - identical
+	// reasoning applies across all sessions, not just one.
 	ListAllUserMessages(ctx context.Context) ([]Message, error)
 	ListFilesByPath(ctx context.Context, path string) ([]File, error)
 	ListFilesBySession(ctx context.Context, sessionID string) ([]File, error)
@@ -122,6 +124,13 @@ type Querier interface {
 	// ordered oldest-first so callers reconstructing a fan-out get the
 	// sub-agent results in dispatch order.
 	ListSubSessions(ctx context.Context, parentSessionID sql.NullString) ([]Session, error)
+	// rowid is the tie-breaker: created_at is stored in SECONDS, so multiple user
+	// messages within the same second (e.g. rapid follow-ups) are not given a
+	// stable order by created_at alone. Same class of bug fixed for
+	// ListMessagesBySession/ListMessagesBySessionPaginated - rowid is SQLite's
+	// implicit monotonic insertion counter (messages.id is a non-monotonic UUID,
+	// unsuitable as a tiebreaker), so (created_at DESC, rowid DESC) is a
+	// deterministic newest-first total order.
 	ListUserMessagesBySession(ctx context.Context, sessionID string) ([]Message, error)
 	// Returns the row id of an enabled "always allow" rule that matches the
 	// given (sessionID, toolName, action, path) tuple, or sql.ErrNoRows.

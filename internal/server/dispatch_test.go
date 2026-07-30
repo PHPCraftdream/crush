@@ -17,8 +17,14 @@ import (
 // unrecovered panic there brings down the whole binary — every other
 // connection and in-flight agent session along with it).
 func TestDispatchRecoversPanic(t *testing.T) {
-	t.Parallel()
-
+	// Deliberately NOT t.Parallel(): this test captures process-global
+	// slog.Default() output. TestDispatchConnectionSurvivesHandlerPanic
+	// below also triggers a "ws: handler panic" log via dispatch's
+	// recover(), which always logs through whatever slog.Default()
+	// currently is - running them concurrently lets one test's panic log
+	// leak into (or crowd out) the other's captured buffer, since neither
+	// test's t.Cleanup ordering is synchronized with the other's capture
+	// window.
 	var buf syncBuffer
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
@@ -51,8 +57,9 @@ func TestDispatchRecoversPanic(t *testing.T) {
 // the H-3 fix — panic isolation is only useful if the connection (and thus
 // the rest of the session) keeps working afterwards.
 func TestDispatchConnectionSurvivesHandlerPanic(t *testing.T) {
-	t.Parallel()
-
+	// Deliberately NOT t.Parallel(): see the comment on
+	// TestDispatchRecoversPanic above - this test's panic also logs
+	// through the process-global slog.Default(), which that test captures.
 	c := newClient(newHub(), nil)
 
 	var panicked sync.WaitGroup

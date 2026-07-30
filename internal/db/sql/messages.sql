@@ -65,13 +65,22 @@ WHERE session_id = ?;
 SELECT *
 FROM messages
 WHERE session_id = ? AND role = 'user'
-ORDER BY created_at DESC;
+-- rowid is the tie-breaker: created_at is stored in SECONDS, so multiple user
+-- messages within the same second (e.g. rapid follow-ups) are not given a
+-- stable order by created_at alone. Same class of bug fixed for
+-- ListMessagesBySession/ListMessagesBySessionPaginated - rowid is SQLite's
+-- implicit monotonic insertion counter (messages.id is a non-monotonic UUID,
+-- unsuitable as a tiebreaker), so (created_at DESC, rowid DESC) is a
+-- deterministic newest-first total order.
+ORDER BY created_at DESC, rowid DESC;
 
 -- name: ListAllUserMessages :many
 SELECT *
 FROM messages
 WHERE role = 'user'
-ORDER BY created_at DESC;
+-- rowid is the tie-breaker: see ListUserMessagesBySession above - identical
+-- reasoning applies across all sessions, not just one.
+ORDER BY created_at DESC, rowid DESC;
 
 -- name: ListMessagesBySessionPaginated :many
 SELECT *

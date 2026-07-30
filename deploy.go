@@ -416,6 +416,13 @@ func replaceFile(src, dst string) error {
 	return nil
 }
 
+// copyFile copies src to dst, verifying the destination was fully and
+// durably written. dst becomes an executable binary, so a silent truncation
+// here would produce a broken install. out.Sync() catches most write
+// failures, but on some filesystems/network volumes a deferred write error
+// only surfaces from Close() itself — so Close is called explicitly (not
+// deferred) and its error is checked, rather than being swallowed by a bare
+// `defer out.Close()`.
 func copyFile(src, dst string) error {
 	in, err := os.Open(src)
 	if err != nil {
@@ -426,9 +433,13 @@ func copyFile(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	defer out.Close()
 	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
 		return err
 	}
-	return out.Sync()
+	if err := out.Sync(); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
 }

@@ -536,6 +536,19 @@ func fileMatches(ctx context.Context, filePath string, pattern *regexp.Regexp, o
 			return rerr
 		}
 
+		// If the file ends exactly at a '\n' (the common case), the previous
+		// iteration already consumed and matched that final line; this
+		// iteration's read hits io.EOF immediately with an empty lineBuf —
+		// there is no line N+1. Without this check, a pattern that matches
+		// the empty string (e.g. "a*", "^$", ".*") would fire onMatch for a
+		// phantom line past the real end of file. This is distinct from the
+		// #147 fix above: that one keeps io.EOF matchable for a genuine
+		// final line with NO trailing '\n' (lineBuf non-empty); this one
+		// only short-circuits when EOF arrives with nothing accumulated.
+		if rerr == io.EOF && lineBuf.Len() == 0 {
+			break
+		}
+
 		line := lineBuf.String()
 		line = strings.TrimSuffix(line, "\r")
 		if loc := pattern.FindStringIndex(line); loc != nil {

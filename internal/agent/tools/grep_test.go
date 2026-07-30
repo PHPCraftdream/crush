@@ -1016,3 +1016,65 @@ func TestFileMatchesDoesNotReportSpuriousMatchOnCancelledPartialLine(t *testing.
 		t.Fatal("fileMatches did not return within 10s of the cancelled context")
 	}
 }
+
+// TestFileMatchesTrailingNewlineDoesNotProduceEmptyPhantomLine is a
+// regression test for the opposite edge case from
+// TestFileMatchesDoesNotReportSpuriousMatchOnCancelledPartialLine (#147)
+// above: here the file legitimately ends with '\n', so readBoundedLine's
+// final ReadByte call consumes that trailing newline and returns (lineBuf,
+// nil) for the real last line — then the NEXT loop iteration immediately
+// hits io.EOF with an empty lineBuf (buf.Reset() ran at the top of
+// readBoundedLine, and there is nothing left to read). Before the fix, that
+// empty "line" was still handed to pattern.FindStringIndex, so a pattern
+// that matches the empty string (like "a*") reported a phantom match one
+// line past the real end of file. The fix breaks out of the loop as soon as
+// io.EOF arrives with lineBuf.Len() == 0, since that combination can only
+// mean "nothing left to read", never "line complete".
+func TestFileMatchesTrailingNewlineDoesNotProduceEmptyPhantomLine(t *testing.T) {
+	t.Parallel()
+	tempDir := t.TempDir()
+
+	// Two real lines, both ending in '\n' - no partial trailing line.
+	content := "aaa\nbbb\n"
+	path := filepath.Join(tempDir, "trailing-newline.txt")
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+	// "a*" matches the empty string, so it would also match a phantom empty
+	// line 3 if the EOF-with-empty-buffer iteration were allowed to reach
+	// FindStringIndex.
+	re := regexp.MustCompile("a*")
+
+	var lines []int
+	require.NoError(t, fileMatches(t.Context(), path, re, func(lm lineMatch) bool {
+		lines = append(lines, lm.lineNum)
+		return true
+	}))
+
+	require.Equal(t, []int{1, 2}, lines,
+		"must report exactly the two real lines, with no phantom line 3 from the "+
+			"post-trailing-newline EOF iteration")
+}
+
+// TestFileMatchesEmptyFileReportsNoMatches is a related edge case: a
+// completely empty file (0 bytes) must report zero matches even for a
+// pattern that matches the empty string, since there are no lines at all -
+// not even one. Before the fix, the single fileMatches iteration would see
+// io.EOF with an empty lineBuf and still call FindStringIndex against "",
+// reporting a phantom line 1.
+func TestFileMatchesEmptyFileReportsNoMatches(t *testing.T) {
+	t.Parallel()
+	tempDir := t.TempDir()
+
+	path := filepath.Join(tempDir, "empty.txt")
+	require.NoError(t, os.WriteFile(path, []byte{}, 0o644))
+
+	re := regexp.MustCompile("a*")
+
+	var calls int
+	require.NoError(t, fileMatches(t.Context(), path, re, func(lineMatch) bool {
+		calls++
+		return true
+	}))
+
+	require.Equal(t, 0, calls, "an empty file must never produce a match, even for a pattern matching the empty string")
+}

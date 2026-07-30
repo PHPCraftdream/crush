@@ -2,10 +2,10 @@ package session
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 )
 
@@ -58,6 +58,23 @@ func (l *FileLock) Release() error {
 	return closeErr
 }
 
+// ErrLockContended is returned (wrapped) by TryAcquireFileLock when another
+// process already holds the exclusive lock on Path. Callers should use
+// errors.As to detect this case rather than matching on the error string,
+// which is not a stable contract: an errors.As-based check keeps working
+// across any wording change to this error or to TryAcquireFileLock's
+// wrapping, whereas a substring check (the previous approach) would silently
+// misclassify a genuine contention as fatal (or vice versa) the moment
+// either message is edited, with nothing catching the mismatch at compile
+// time or in tests that don't happen to exercise that exact string.
+type ErrLockContended struct {
+	Path string
+}
+
+func (e *ErrLockContended) Error() string {
+	return fmt.Sprintf("file lock contended (%s)", e.Path)
+}
+
 // TryAcquireFileLock opens lockPath (creating it if needed) and takes an
 // exclusive non-blocking lock. Returns immediately with an error if
 // another process holds the lock. The lock file directory is created if
@@ -69,7 +86,7 @@ func TryAcquireFileLock(lockPath string) (*FileLock, error) {
 	}
 	if err := tryLockFile(f); err != nil {
 		f.Close()
-		return nil, fmt.Errorf("file lock contended (%s): %w", lockPath, err)
+		return nil, fmt.Errorf("%w: %w", &ErrLockContended{Path: lockPath}, err)
 	}
 	return &FileLock{Path: lockPath, f: f}, nil
 }
@@ -114,12 +131,11 @@ func AcquireFileLockContext(ctx context.Context, lockPath string) (*FileLock, er
 		if err == nil {
 			return l, nil
 		}
-		// Surface IO/permission errors immediately; only retry on
-		// genuine lock contention. TryAcquireFileLock wraps contention
-		// in a "file lock contended" message; everything else is fatal.
-		// We rely on this distinction by checking for the open-file
-		// failure path: if openLockFile failed, the error chain does
-		// not start with our "contended" wrapper.
+		// Surface IO/permission errors immediately; only retry on genuine
+		// lock contention. TryAcquireFileLock wraps contention in
+		// *ErrLockContended; openLockFile failures (missing dir, permission
+		// denied, etc.) don't, so isContentionError's errors.As check
+		// distinguishes the two without depending on error text.
 		if !isContentionError(err) {
 			return nil, err
 		}
@@ -139,12 +155,8 @@ func AcquireFileLockContext(ctx context.Context, lockPath string) (*FileLock, er
 // reporting that another holder has the lock (as opposed to IO or
 // permission failures that should not be retried).
 func isContentionError(err error) bool {
-	if err == nil {
-		return false
-	}
-	// TryAcquireFileLock formats contention as "file lock contended (...)".
-	// Any error containing that marker is retryable.
-	return strings.Contains(err.Error(), "file lock contended")
+	var contended *ErrLockContended
+	return errors.As(err, &contended)
 }
 
 func openLockFile(lockPath string) (*os.File, error) {

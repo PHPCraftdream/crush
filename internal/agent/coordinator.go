@@ -36,6 +36,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"charm.land/catwalk/pkg/catwalk"
@@ -316,7 +317,14 @@ type coordinator struct {
 	activeModelRole   config.SelectedModelType
 
 	// Phase 4 autonomous idle-resume guardrails.
-	persistentMode         bool           // true only for the long-lived web server; false for crush run.
+	// persistentMode: true only for the long-lived web server; false for
+	// crush run. Currently written exactly once at process start (no real
+	// race today), but every sibling field here (allowPeakHours,
+	// activeModelRole, maxCost) is already lock/atomic-guarded, so a plain
+	// bool would be a silent trap for the next caller who adds a second
+	// SetPersistentMode call path — atomic.Bool costs nothing and keeps
+	// this field consistent with its neighbors under `go test -race`.
+	persistentMode         atomic.Bool
 	autoResumeMu           sync.Mutex     // guards consecutiveAutoResumes.
 	consecutiveAutoResumes map[string]int // sessionID -> consecutive auto-resumes since last human message.
 }
@@ -425,7 +433,7 @@ func (c *coordinator) SetAllowPeakHours(allow bool) {
 // server (Phase 4 autonomous idle-resume eligibility). crush run leaves it
 // false.
 func (c *coordinator) SetPersistentMode(persistent bool) {
-	c.persistentMode = persistent
+	c.persistentMode.Store(persistent)
 }
 
 // autonomyEnabled reports whether Phase 4 auto-resume is opted in via config.
@@ -471,7 +479,7 @@ func (c *coordinator) ResetAutoResumeCounter(sessionID string) {
 // other. NEVER eligible for crush run (persistentMode stays false there).
 func (c *coordinator) autoResumeEligible(sessionID string) bool {
 	return c.autonomyEnabled() &&
-		c.persistentMode &&
+		c.persistentMode.Load() &&
 		c.consecutiveResume(sessionID) < maxConsecutiveAutoResumes
 }
 

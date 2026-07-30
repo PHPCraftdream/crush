@@ -146,9 +146,11 @@ const listAllUserMessages = `-- name: ListAllUserMessages :many
 SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden, reasoning_effort, auto_resumed, background_job_notice
 FROM messages
 WHERE role = 'user'
-ORDER BY created_at DESC
+ORDER BY created_at DESC, rowid DESC
 `
 
+// rowid is the tie-breaker: see ListUserMessagesBySession above - identical
+// reasoning applies across all sessions, not just one.
 func (q *Queries) ListAllUserMessages(ctx context.Context) ([]Message, error) {
 	rows, err := q.query(ctx, q.listAllUserMessagesStmt, listAllUserMessages)
 	if err != nil {
@@ -305,9 +307,16 @@ const listUserMessagesBySession = `-- name: ListUserMessagesBySession :many
 SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden, reasoning_effort, auto_resumed, background_job_notice
 FROM messages
 WHERE session_id = ? AND role = 'user'
-ORDER BY created_at DESC
+ORDER BY created_at DESC, rowid DESC
 `
 
+// rowid is the tie-breaker: created_at is stored in SECONDS, so multiple user
+// messages within the same second (e.g. rapid follow-ups) are not given a
+// stable order by created_at alone. Same class of bug fixed for
+// ListMessagesBySession/ListMessagesBySessionPaginated - rowid is SQLite's
+// implicit monotonic insertion counter (messages.id is a non-monotonic UUID,
+// unsuitable as a tiebreaker), so (created_at DESC, rowid DESC) is a
+// deterministic newest-first total order.
 func (q *Queries) ListUserMessagesBySession(ctx context.Context, sessionID string) ([]Message, error) {
 	rows, err := q.query(ctx, q.listUserMessagesBySessionStmt, listUserMessagesBySession, sessionID)
 	if err != nil {
