@@ -154,20 +154,31 @@ type permissionService struct {
 
 func (s *permissionService) GrantPersistent(permission PermissionRequest) {
 	// The handler may send only the ID; fill in the rest from activeRequests.
+	// This lookup must happen before Take so we still know what to publish/
+	// persist if we win the race below — activeRequests is independent of
+	// pendingRequests and reading it doesn't decide a winner.
 	if active, ok := s.activeRequests.Get(permission.ID); ok {
 		permission = *active
 	}
+
+	// Fix (P2.3): Take must run BEFORE any publish or DB write. Take is the
+	// atomic get+delete that decides which single concurrent Grant/Deny/
+	// GrantPersistent call "wins" for this ID (see #132, 43f8328f). If we
+	// published/persisted first and only then took, a losing call could
+	// still have broadcast its (wrong, non-winning) outcome to subscribers,
+	// or — for GrantPersistent specifically — written a persistent grant to
+	// the DB for a request another concurrent call had already denied.
+	respCh, ok := s.pendingRequests.Take(permission.ID)
+	if !ok {
+		slog.Debug("Permission request already resolved", "id", permission.ID)
+		return
+	}
+	respCh <- true
 
 	s.notificationBroker.Publish(pubsub.CreatedEvent, PermissionNotification{
 		ToolCallID: permission.ToolCallID,
 		Granted:    true,
 	})
-	respCh, ok := s.pendingRequests.Take(permission.ID)
-	if ok {
-		respCh <- true
-	} else {
-		slog.Debug("Permission request already resolved", "id", permission.ID)
-	}
 
 	// Fork patch (concurrency): the in-memory append was dropped — the DB
 	// is the single source of truth so other processes see this grant on
@@ -196,32 +207,36 @@ func (s *permissionService) GrantPersistent(permission PermissionRequest) {
 }
 
 func (s *permissionService) Grant(permission PermissionRequest) {
+	// Fix (P2.3): see GrantPersistent for why Take must come first.
+	respCh, ok := s.pendingRequests.Take(permission.ID)
+	if !ok {
+		slog.Debug("Permission request already resolved", "id", permission.ID)
+		return
+	}
+	respCh <- true
+
 	s.notificationBroker.Publish(pubsub.CreatedEvent, PermissionNotification{
 		ToolCallID: permission.ToolCallID,
 		Granted:    true,
 	})
-	respCh, ok := s.pendingRequests.Take(permission.ID)
-	if ok {
-		respCh <- true
-	} else {
-		slog.Debug("Permission request already resolved", "id", permission.ID)
-	}
 
 	s.activeRequests.Del(permission.ID)
 }
 
 func (s *permissionService) Deny(permission PermissionRequest) {
+	// Fix (P2.3): see GrantPersistent for why Take must come first.
+	respCh, ok := s.pendingRequests.Take(permission.ID)
+	if !ok {
+		slog.Debug("Permission request already resolved", "id", permission.ID)
+		return
+	}
+	respCh <- false
+
 	s.notificationBroker.Publish(pubsub.CreatedEvent, PermissionNotification{
 		ToolCallID: permission.ToolCallID,
 		Granted:    false,
 		Denied:     true,
 	})
-	respCh, ok := s.pendingRequests.Take(permission.ID)
-	if ok {
-		respCh <- false
-	} else {
-		slog.Debug("Permission request already resolved", "id", permission.ID)
-	}
 
 	s.activeRequests.Del(permission.ID)
 }

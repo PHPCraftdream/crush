@@ -386,6 +386,131 @@ func TestGrant_ThenDeny_SameID_NoBlock(t *testing.T) {
 	}
 }
 
+// TestGrantThenDenyRace_SingleTerminalOutcome is a regression guard for
+// P2.3: Grant/Deny/GrantPersistent used to publish their notification
+// BEFORE calling the atomic pendingRequests.Take, so a losing concurrent
+// call could still broadcast its outcome to subscribers even though it
+// lost the race to resolve respCh. Firing Grant and Deny concurrently for
+// the same ID must produce exactly one terminal (Granted or Denied)
+// notification — never both, never neither.
+func TestGrantThenDenyRace_SingleTerminalOutcome(t *testing.T) {
+	svc := newTestService(t, false, nil)
+	events := svc.Subscribe(t.Context())
+	notifications := svc.SubscribeNotifications(t.Context())
+
+	var wg sync.WaitGroup
+	var result bool
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		result, _ = svc.Request(t.Context(), CreatePermissionRequest{
+			SessionID: "s1", ToolName: "bash", Action: "run", Path: "/tmp",
+		})
+	}()
+
+	ev := <-events
+	// Drain the "requested" (unresolved) notification published by Request
+	// itself, so it isn't mistaken for a terminal outcome below.
+	initial := <-notifications
+	require.False(t, initial.Payload.Granted || initial.Payload.Denied, "unexpected terminal notification before Grant/Deny raced")
+
+	var raceWG sync.WaitGroup
+	raceWG.Add(2)
+	go func() {
+		defer raceWG.Done()
+		svc.Grant(ev.Payload)
+	}()
+	go func() {
+		defer raceWG.Done()
+		svc.Deny(ev.Payload)
+	}()
+	raceWG.Wait()
+	wg.Wait()
+
+	// Exactly one terminal notification must have been published for this
+	// tool call ID. Collect notifications with a short bounded wait since
+	// the loser must publish nothing at all.
+	terminalCount := 0
+	var lastGranted bool
+	for {
+		select {
+		case n := <-notifications:
+			if n.Payload.ToolCallID != ev.Payload.ToolCallID {
+				continue
+			}
+			if n.Payload.Granted || n.Payload.Denied {
+				terminalCount++
+				lastGranted = n.Payload.Granted
+			}
+		case <-time.After(300 * time.Millisecond):
+			goto done
+		}
+	}
+done:
+	assert.Equal(t, 1, terminalCount, "exactly one terminal notification (granted xor denied) must be published for a raced Grant/Deny on the same ID")
+	assert.Equal(t, lastGranted, result, "the published terminal notification must match the outcome the Request actually observed")
+}
+
+// TestGrantPersistentAfterDenyWins_DoesNotPersist is a regression guard for
+// P2.3: GrantPersistent used to publish its notification and write the
+// persistent grant to the DB even when it lost the pendingRequests.Take
+// race to a concurrent Deny. This verifies that once Deny has already won
+// (consumed the pending entry), a subsequent GrantPersistent call for the
+// same ID is a pure no-op: no notification, no DB row.
+func TestGrantPersistentAfterDenyWins_DoesNotPersist(t *testing.T) {
+	svc := newTestService(t, false, nil)
+	events := svc.Subscribe(t.Context())
+
+	var wg sync.WaitGroup
+	var result bool
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		result, _ = svc.Request(t.Context(), CreatePermissionRequest{
+			SessionID: "s1", ToolName: "bash", Action: "run", Path: "/tmp",
+		})
+	}()
+
+	ev := <-events
+
+	// Deny wins the race first (synchronously, before GrantPersistent runs).
+	svc.Deny(ev.Payload)
+	wg.Wait()
+	assert.False(t, result, "Request must observe Deny's outcome")
+
+	// GrantPersistent arrives late for the same ID — Take must report
+	// ok=false, so it must not publish a granted notification nor persist
+	// a grant row to the DB.
+	notifications := svc.SubscribeNotifications(t.Context())
+	svc.GrantPersistent(PermissionRequest{ID: ev.Payload.ID})
+
+	select {
+	case n := <-notifications:
+		t.Fatalf("late GrantPersistent must not publish any notification after losing the race, got %+v", n.Payload)
+	case <-time.After(300 * time.Millisecond):
+		// Expected: no notification.
+	}
+
+	// The persistent grant must not have been written: a fresh request for
+	// the exact same tool/action/path must still prompt (not auto-approve).
+	var result2 bool
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		result2, _ = svc.Request(t.Context(), CreatePermissionRequest{
+			SessionID: "s1", ToolName: "bash", Action: "run", Path: "/tmp",
+		})
+	}()
+	select {
+	case ev2 := <-events:
+		svc.Deny(ev2.Payload)
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected a fresh permission prompt (no persistent grant should have been written), but Request auto-approved or hung")
+	}
+	wg.Wait()
+	assert.False(t, result2, "GrantPersistent that lost the Take race must not have persisted a grant")
+}
+
 // TestRequest_CrossSession_DoesNotSerialize is a regression guard for H-4:
 // permissionService.Request used to hold a single process-wide requestMu for
 // its entire body, including the blocking wait for a human response. That
