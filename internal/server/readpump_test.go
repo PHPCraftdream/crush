@@ -62,9 +62,10 @@ func TestReadPumpUnregisterDoesNotBlockWhenHubStoppedReading(t *testing.T) {
 	defer srv.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	clientSide, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	clientSide, handshakeResp, err := websocket.DefaultDialer.Dial(wsURL, nil)
 	require.NoError(t, err)
 	defer clientSide.Close()
+	defer handshakeResp.Body.Close()
 
 	serverSideConn := <-connReady
 	c := newClient(hub, serverSideConn)

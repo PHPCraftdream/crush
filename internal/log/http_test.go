@@ -250,6 +250,7 @@ func TestHTTPRoundTripLogger_RequestBodyReadErrorFailsFast(t *testing.T) {
 	resp, roundTripErr := logger.RoundTrip(req)
 
 	if resp != nil {
+		resp.Body.Close()
 		t.Errorf("expected a nil response on body-read failure, got %+v", resp)
 	}
 	if roundTripErr == nil {

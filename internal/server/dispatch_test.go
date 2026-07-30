@@ -37,7 +37,7 @@ func TestDispatchRecoversPanic(t *testing.T) {
 	c.dispatch("handlePanicky", func() {
 		defer done.Done()
 		var m map[string]int
-		m["boom"] = 1 // nil map write -> panic
+		m["boom"] = 1 //nolint:staticcheck // SA5000: deliberate nil-map write to trigger a real panic for this test
 	})
 
 	// If the panic escaped dispatch's recover, the test binary itself would

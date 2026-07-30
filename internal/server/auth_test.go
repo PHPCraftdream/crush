@@ -32,28 +32,33 @@ func TestAuthIsValidToken(t *testing.T) {
 	a := newAuth()
 
 	t.Run("cookie", func(t *testing.T) {
+		t.Parallel()
 		r := httptest.NewRequest(http.MethodGet, "/ws", nil)
 		r.AddCookie(&http.Cookie{Name: cookieName, Value: a.token})
 		require.True(t, a.isValid(r))
 	})
 
 	t.Run("bearer header", func(t *testing.T) {
+		t.Parallel()
 		r := httptest.NewRequest(http.MethodGet, "/ws", nil)
 		r.Header.Set("Authorization", "Bearer "+a.token)
 		require.True(t, a.isValid(r))
 	})
 
 	t.Run("query param", func(t *testing.T) {
+		t.Parallel()
 		r := httptest.NewRequest(http.MethodGet, "/ws?token="+a.token, nil)
 		require.True(t, a.isValid(r))
 	})
 
 	t.Run("wrong token rejected", func(t *testing.T) {
+		t.Parallel()
 		r := httptest.NewRequest(http.MethodGet, "/ws?token=nope", nil)
 		require.False(t, a.isValid(r))
 	})
 
 	t.Run("no credentials rejected", func(t *testing.T) {
+		t.Parallel()
 		r := httptest.NewRequest(http.MethodGet, "/ws", nil)
 		require.False(t, a.isValid(r))
 	})
