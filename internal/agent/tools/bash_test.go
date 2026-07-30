@@ -95,6 +95,86 @@ func TestBashTool_CustomAutoBackgroundThreshold(t *testing.T) {
 	require.NoError(t, bgManager.Kill(context.Background(), meta.ShellID))
 }
 
+// TestBashTool_CtxCancelWaitsForConfirmedProcessKill is the regression test
+// for a real bug found via live testing: bash.go's ctx-cancellation branch
+// used to call bgManager.Kill(ctx, id) with the ALREADY-cancelled tool-call
+// context as Kill's own wait-for-confirmation deadline. Since that ctx was
+// already done (that's why the branch fired), Kill's internal
+// `select { case <-shell.done: ...; case <-ctx.Done(): return ctx.Err() }`
+// would take the already-ready ctx.Done() case almost immediately, so Kill
+// returned right after firing shell.cancel() WITHOUT waiting for the
+// underlying process tree to actually be confirmed torn down — racing
+// ahead of the asynchronous OS-level kill (context.AfterFunc's callback in
+// exec_windows.go/exec_unix.go runs in its own goroutine). Observed live
+// consequence: the bash.exe/subprocess tree could still be running minutes
+// after this tool call had already returned control to the agent, an
+// escalating leak across repeated cancelled tool calls.
+//
+// Fixed by using a fresh, bounded context (killConfirmationTimeout) instead
+// of the dead ctx as Kill's wait deadline. This proves: once the tool call
+// returns after a ctx cancellation, the underlying BackgroundShell must
+// already report IsDone() == true -- not just "asked to stop".
+func TestBashTool_CtxCancelWaitsForConfirmedProcessKill(t *testing.T) {
+	workingDir := t.TempDir()
+	tool := newBashToolForTest(workingDir)
+	bgManager := shell.GetBackgroundShellManager()
+
+	before := make(map[string]bool, len(bgManager.List()))
+	for _, id := range bgManager.List() {
+		before[id] = true
+	}
+
+	ctx, cancel := context.WithCancel(context.WithValue(context.Background(), SessionIDContextKey, "cancel-confirm-session"))
+
+	input, err := json.Marshal(BashParams{
+		Description: "slow command for cancel-confirmation test",
+		Command:     "sleep 5 && echo should-not-print",
+		// Generous relative to how quickly we cancel below, so the test
+		// reliably hits the ctx.Done() branch in bash.go, not the
+		// auto-background-move branch.
+		AutoBackgroundAfter: 30,
+	})
+	require.NoError(t, err)
+	call := fantasy.ToolCall{ID: "test-call", Name: BashToolName, Input: string(input)}
+
+	callDone := make(chan struct{})
+	var runErr error
+	go func() {
+		defer close(callDone)
+		_, runErr = tool.Run(ctx, call)
+	}()
+
+	// Wait for the new background shell to actually appear (bgManager.Start
+	// has registered it) and grab a stable reference to it -- Kill() removes
+	// the manager's own map entry (m.shells.Take), so we must hold this
+	// pointer ourselves to still be able to check IsDone() afterward.
+	var bgShell *shell.BackgroundShell
+	require.Eventually(t, func() bool {
+		for _, id := range bgManager.List() {
+			if before[id] {
+				continue
+			}
+			if sh, ok := bgManager.Get(id); ok {
+				bgShell = sh
+				return true
+			}
+		}
+		return false
+	}, 2*time.Second, 20*time.Millisecond, "expected a new background shell to appear for the slow command")
+
+	cancel()
+
+	select {
+	case <-callDone:
+	case <-time.After(killConfirmationTimeout + 3*time.Second):
+		t.Fatal("bash tool call did not return within killConfirmationTimeout + slack after ctx cancellation -- the fix should bound this wait, not remove it")
+	}
+
+	require.ErrorIs(t, runErr, context.Canceled)
+	require.True(t, bgShell.IsDone(),
+		"the underlying shell must be CONFIRMED done (process tree torn down) by the moment the cancelled tool call returns -- not just signalled to stop and then abandoned")
+}
+
 type recordingPermissionService struct {
 	*pubsub.Broker[permission.PermissionRequest]
 	requestCount int

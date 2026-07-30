@@ -57,6 +57,15 @@ const (
 	DefaultAutoBackgroundAfter = 60 // Commands taking longer automatically become background jobs
 	MaxOutputLength            = 30000
 	BashNoOutput               = "no output"
+
+	// killConfirmationTimeout bounds how long the ctx-cancellation branch
+	// below waits for BackgroundShellManager.Kill to confirm the shell
+	// actually stopped (its underlying process tree torn down) before this
+	// call gives up and returns anyway. Deliberately generous relative to
+	// how long a taskkill /F /T (Windows) or process-group SIGKILL (Unix)
+	// normally takes (well under a second in practice) — this exists to
+	// bound the wait, not to be tight.
+	killConfirmationTimeout = 5 * time.Second
 )
 
 //go:embed bash.md.tpl
@@ -357,9 +366,37 @@ func NewBashTool(permissions permission.Service, workingDir string, attribution 
 					stdout, stderr, done, execErr = bgShell.GetOutput()
 					break waitLoop
 				case <-ctx.Done():
-					// Incoming context was cancelled before we moved to background
-					// Kill the shell and return error
-					bgManager.Kill(ctx, bgShell.ID)
+					// Incoming context was cancelled before we moved to
+					// background — kill the shell and return error.
+					//
+					// BackgroundShellManager.Kill(waitCtx, id) cancels the
+					// shell's own context (triggering the process-group
+					// tree-kill in processGroupExecHandler, see
+					// exec_windows.go/exec_unix.go) and then blocks on
+					// <-shell.done OR <-waitCtx.Done(), whichever fires
+					// first, to give the caller a chance to actually
+					// CONFIRM the underlying process tree is gone before
+					// returning. Passing the ALREADY-cancelled `ctx` here
+					// (the tool call's own context, which is why we're in
+					// this branch at all) would make that select's second
+					// case fire instantly — Kill returns immediately after
+					// only firing shell.cancel(), racing ahead of the
+					// asynchronous OS-level kill (context.AfterFunc's
+					// callback, which runs in its own goroutine) instead of
+					// waiting for it. Live-tested consequence: the
+					// underlying bash.exe/subprocess tree could be
+					// observed still running MINUTES after this tool call
+					// had already returned control to the agent — an
+					// escalating leak across repeated tool-call
+					// cancellations (e.g. every retry of a delegated
+					// sub-agent whose tool call gets watchdog-cancelled)
+					// that degrades the whole machine over time. Using a
+					// fresh, bounded context here instead lets Kill
+					// actually wait (up to killConfirmationTimeout) for
+					// shell.done to close.
+					killCtx, killCancel := context.WithTimeout(context.Background(), killConfirmationTimeout)
+					_ = bgManager.Kill(killCtx, bgShell.ID)
+					killCancel()
 					return fantasy.ToolResponse{}, ctx.Err()
 				}
 			}
