@@ -139,7 +139,8 @@ func TestHTTPRoundTripLogger_StreamsWhenDebugDisabled(t *testing.T) {
 }
 
 // TestHTTPRoundTripLogger_StreamsAndLogsWhenDebugEnabled proves that even
-// when the debug wrapper IS installed (body wrapped in teeBody), the first
+// when the debug wrapper IS installed (body wrapped in teeBody, which only
+// happens when the LogHTTPBodies opt-in is also set — see P3.1), the first
 // chunk still streams in immediately, and the response preview is logged
 // once when the body is closed.
 func TestHTTPRoundTripLogger_StreamsAndLogsWhenDebugEnabled(t *testing.T) {
@@ -147,6 +148,10 @@ func TestHTTPRoundTripLogger_StreamsAndLogsWhenDebugEnabled(t *testing.T) {
 	t.Cleanup(func() { slog.SetDefault(prev) })
 	var logBuf bytes.Buffer
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+
+	prevFlag := LogHTTPBodies
+	LogHTTPBodies = true
+	t.Cleanup(func() { LogHTTPBodies = prevFlag })
 
 	const interChunk = 400 * time.Millisecond
 	server := chunkedServer(t, []string{"chunk-0;", "chunk-1;", "chunk-2;"}, interChunk)
@@ -190,6 +195,167 @@ func TestHTTPRoundTripLogger_StreamsAndLogsWhenDebugEnabled(t *testing.T) {
 	}
 	if !strings.Contains(logged, "chunk-0") {
 		t.Errorf("expected response preview to include chunk-0; got:\n%s", logged)
+	}
+}
+
+// TestHTTPRoundTripLogger_BodyNotLoggedByDefault proves the P3.1 fix: even
+// with slog at Debug level (the "someone passed --debug" case), request and
+// response bodies are NOT captured or logged unless the separate
+// LogHTTPBodies opt-in is also set. Only method/url/status/content_length/
+// duration should appear.
+func TestHTTPRoundTripLogger_BodyNotLoggedByDefault(t *testing.T) {
+	prevLogger := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(prevLogger) })
+	var logBuf bytes.Buffer
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+
+	prevFlag := LogHTTPBodies
+	LogHTTPBodies = false
+	t.Cleanup(func() { LogHTTPBodies = prevFlag })
+
+	const secretReq = `{"api_key": "sk-super-secret-request", "prompt": "hello"}`
+	const secretResp = `{"choices": [{"message": "hi"}], "api_key_echo": "sk-super-secret-response"}`
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(secretResp))
+	}))
+	t.Cleanup(server.Close)
+
+	client := NewHTTPClient()
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, server.URL, strings.NewReader(secretReq))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer request-secret-token")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	resp.Body.Close()
+
+	logged := logBuf.String()
+
+	if !strings.Contains(logged, "HTTP Request") || !strings.Contains(logged, "HTTP Response") {
+		t.Fatalf("expected both request/response debug lines; got:\n%s", logged)
+	}
+	if !strings.Contains(logged, "status_code=200") && !strings.Contains(logged, `status_code=200`) {
+		// status_code is logged as a plain attr; just check the value is present somewhere.
+		if !strings.Contains(logged, "200") {
+			t.Errorf("expected status code 200 to be logged; got:\n%s", logged)
+		}
+	}
+	if !strings.Contains(logged, "duration_ms") {
+		t.Errorf("expected duration_ms to be logged; got:\n%s", logged)
+	}
+	if !strings.Contains(logged, "content_length") {
+		t.Errorf("expected content_length to be logged; got:\n%s", logged)
+	}
+
+	if strings.Contains(logged, "sk-super-secret-request") {
+		t.Errorf("request body leaked into debug log when LogHTTPBodies=false:\n%s", logged)
+	}
+	if strings.Contains(logged, "sk-super-secret-response") {
+		t.Errorf("response body leaked into debug log when LogHTTPBodies=false:\n%s", logged)
+	}
+	if strings.Contains(logged, "hello") || strings.Contains(logged, "\"hi\"") {
+		t.Errorf("body content leaked into debug log when LogHTTPBodies=false:\n%s", logged)
+	}
+	if strings.Contains(logged, `"body"`) {
+		t.Errorf("a \"body\" field should not be present at all when LogHTTPBodies=false:\n%s", logged)
+	}
+}
+
+// TestHTTPRoundTripLogger_BodyLoggedWithRedactionWhenOptedIn proves that
+// when LogHTTPBodies=true, bodies ARE captured and logged, but known
+// secret-shaped JSON fields (api_key, authorization, token, secret,
+// password, etc. at any nesting depth) are redacted first.
+func TestHTTPRoundTripLogger_BodyLoggedWithRedactionWhenOptedIn(t *testing.T) {
+	prevLogger := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(prevLogger) })
+	var logBuf bytes.Buffer
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+
+	prevFlag := LogHTTPBodies
+	LogHTTPBodies = true
+	t.Cleanup(func() { LogHTTPBodies = prevFlag })
+
+	const secretReq = `{"api_key": "sk-super-secret-request", "prompt": "hello-world", "nested": {"password": "hunter2"}}`
+	const secretResp = `{"choices": [{"message": "hi-there"}], "auth": {"token": "resp-secret-tok"}}`
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(secretResp))
+	}))
+	t.Cleanup(server.Close)
+
+	client := NewHTTPClient()
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, server.URL, strings.NewReader(secretReq))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	resp.Body.Close()
+
+	logged := logBuf.String()
+
+	// Secrets must never appear verbatim.
+	if strings.Contains(logged, "sk-super-secret-request") {
+		t.Errorf("request api_key leaked unredacted:\n%s", logged)
+	}
+	if strings.Contains(logged, "hunter2") {
+		t.Errorf("nested request password leaked unredacted:\n%s", logged)
+	}
+	if strings.Contains(logged, "resp-secret-tok") {
+		t.Errorf("nested response token leaked unredacted:\n%s", logged)
+	}
+
+	// Non-sensitive content must still be present (proves body logging is
+	// genuinely on, not just silently dropping everything).
+	if !strings.Contains(logged, "hello-world") {
+		t.Errorf("expected non-sensitive request field to be logged; got:\n%s", logged)
+	}
+	if !strings.Contains(logged, "hi-there") {
+		t.Errorf("expected non-sensitive response field to be logged; got:\n%s", logged)
+	}
+
+	// The redaction marker must appear (proves redaction actually ran).
+	if !strings.Contains(logged, "[REDACTED]") {
+		t.Errorf("expected [REDACTED] marker in logged body; got:\n%s", logged)
+	}
+}
+
+// TestRedactBodySecrets_SSE proves per-line SSE redaction: each "data: {...}"
+// line's JSON payload is redacted independently.
+func TestRedactBodySecrets_SSE(t *testing.T) {
+	body := "event: message\n" +
+		`data: {"delta": "hello", "api_key": "leak-me"}` + "\n" +
+		"\n" +
+		`data: {"delta": "world"}` + "\n"
+
+	got := redactBodySecrets(body)
+
+	if strings.Contains(got, "leak-me") {
+		t.Errorf("SSE data line api_key leaked unredacted:\n%s", got)
+	}
+	if !strings.Contains(got, "hello") || !strings.Contains(got, "world") {
+		t.Errorf("SSE redaction dropped non-sensitive content:\n%s", got)
+	}
+	if !strings.Contains(got, "[REDACTED]") {
+		t.Errorf("expected [REDACTED] marker:\n%s", got)
 	}
 }
 

@@ -7,6 +7,7 @@
 // re-execs it with argv passthrough (spawnSync, argv array, never shell).
 
 const { spawnSync } = require('node:child_process');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -49,11 +50,14 @@ if (!fs.existsSync(binary)) {
 // this wrapper — see docs/plans/2026-07-29-relaunch-from-cache.md §6).
 //
 // Instead: copy the resolved binary into a per-build cache directory once,
-// then always exec the cached copy. The cache key folds in size+mtimeMs of
-// the *original* file (not just the npm package version) because deploy.go
-// can silently overwrite the platform package's binary without bumping the
-// package version — a bare-version key would keep serving a stale cached
-// build forever (see plan §6.1).
+// then always exec the cached copy. The cache key is the SHA-256 content
+// hash of the *original* file, not size+mtimeMs+version: a stat-based key
+// is spoofable — any tool that overwrites the binary in place while
+// preserving its size and mtime (e.g. a deploy/copy step that explicitly
+// sets mtime) would collide with the old key and keep serving the stale
+// cached build forever, even though the content changed (see plan §6.1
+// and P3.4 in docs/reviews). Hashing the actual bytes closes that hole:
+// the cache key can only match if the content is identical.
 //
 // The key lives in the cache *directory* name, never in the binary's own
 // file name: agentguard's Tier-3 self-block (agentguard.go) matches the
@@ -64,16 +68,7 @@ if (!fs.existsSync(binary)) {
 // behaviour: spawn `binary` straight out of node_modules.
 let launchTarget = binary;
 try {
-  const stat = fs.statSync(binary);
-  let pkgVersion = '';
-  try {
-    pkgVersion = JSON.parse(fs.readFileSync(path.join(pkgDir, 'package.json'), 'utf8')).version || '';
-  } catch (_) {
-    // package.json missing/unreadable — key still varies by size+mtime.
-  }
-
-  const keyInput = stat.size + ':' + stat.mtimeMs + ':' + pkgVersion;
-  const key = fnv1a64Hex(keyInput);
+  const key = hashFileSync(binary);
 
   const cacheRoot = resolveCacheRoot();
   const binCacheDir = path.join(cacheRoot, 'crush', 'bin');
@@ -161,20 +156,35 @@ process.exit(result.status == null ? 1 : result.status);
 
 // --- helpers -------------------------------------------------------------
 
-// Tiny 64-bit FNV-1a implementation using BigInt so it doesn't lose
-// precision the way plain `number` arithmetic would past 2^53. Returns a
-// fixed-width hex string suitable for use as a cache directory name.
-function fnv1a64Hex(str) {
-  const OFFSET_BASIS = 0xcbf29ce484222325n;
-  const PRIME = 0x100000001b3n;
-  const MASK = 0xffffffffffffffffn; // wrap to 64 bits
-
-  let hash = OFFSET_BASIS;
-  for (let i = 0; i < str.length; i++) {
-    hash ^= BigInt(str.charCodeAt(i));
-    hash = (hash * PRIME) & MASK;
+// hashFileSync returns the lowercase hex SHA-256 of the file at
+// absolutePath, computed via a stream so memory use stays flat regardless
+// of binary size (crush binaries run tens of MB) — the whole file is never
+// read into memory at once.
+//
+// Cost note: hashing runs on every invocation (see the cache-key doc
+// comment above for why a stat-based size+mtime key isn't sufficient), and
+// costs roughly the time to read the file once from disk/page-cache
+// (order of ~100ms-1s for a ~60MB binary depending on cache warmth) — cheap
+// relative to spawning a child process and negligible next to the
+// non-interactive-agent-tooling workloads this CLI targets, so no
+// cache-the-hash-itself shortcut is used: any such shortcut would have to
+// be keyed by the same spoofable size+mtime this fix exists to stop
+// trusting.
+function hashFileSync(absolutePath) {
+  const hash = crypto.createHash('sha256');
+  const fd = fs.openSync(absolutePath, 'r');
+  try {
+    const buf = Buffer.alloc(1 << 20); // 1 MiB read buffer
+    let bytesRead;
+    let position = 0;
+    while ((bytesRead = fs.readSync(fd, buf, 0, buf.length, position)) > 0) {
+      hash.update(bytesRead === buf.length ? buf : buf.subarray(0, bytesRead));
+      position += bytesRead;
+    }
+  } finally {
+    fs.closeSync(fd);
   }
-  return hash.toString(16).padStart(16, '0');
+  return hash.digest('hex');
 }
 
 // Node has no os.UserCacheDir() equivalent — compute the per-platform

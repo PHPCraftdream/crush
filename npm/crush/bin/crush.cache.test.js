@@ -104,8 +104,86 @@ function listCacheDirs(binCacheDir) {
 }
 
 // ---------------------------------------------------------------------
-// 1. Key regression: binary mutated (size/mtime) WITHOUT bumping package
-//    version must produce a NEW cache key, and the stale one must be swept.
+// 0. Content-hash regression (P3.4): binary content replaced while size AND
+//    mtime are BOTH preserved exactly must still produce a NEW cache key.
+//    This is the precise attack the size+mtime-based key could not catch —
+//    a stat-only key is indistinguishable between "unchanged file" and
+//    "same-size content swapped in with mtime explicitly restored" (e.g. a
+//    deploy/copy tool that preserves timestamps). Content hashing (SHA-256
+//    of the actual bytes) closes this: the key can only match if the bytes
+//    are identical.
+// ---------------------------------------------------------------------
+function testContentHashCatchesSameSizeSameMtimeSwap() {
+  const original = 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'; // 32 bytes
+  const swapped = 'BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB'; // 32 bytes — identical size
+  assert.strictEqual(original.length, swapped.length, 'test setup error: payloads must be the same size');
+
+  const fx = makeFixture('crush-hash-regress', { version: '0.1.7', binContent: original });
+  const binCacheDir = path.join(fx.cacheDir, 'crush', 'bin');
+
+  const r1 = runWrapper(fx);
+  assert.ok(!r1.error || r1.error.code !== 'undefined', 'first run must not throw: ' + (r1.error && r1.error.message));
+
+  const dirsAfterFirst = listCacheDirs(binCacheDir);
+  assert.strictEqual(dirsAfterFirst.length, 1, 'expected exactly 1 cache dir after first run, got: ' + JSON.stringify(dirsAfterFirst));
+  const firstKey = dirsAfterFirst[0];
+
+  // Capture the original mtime, swap the content in place (same size), then
+  // restore the original mtime — simulating a deploy/copy tool that
+  // preserves timestamps across an in-place content replacement. Compared
+  // at millisecond granularity: Node's fs.utimesSync (and the underlying
+  // OS utimes call) only accepts millisecond resolution, so it cannot
+  // perfectly round-trip a sub-millisecond mtime some filesystems report
+  // (e.g. NTFS's 100ns ticks) — that rounding is a real-world limit of any
+  // "preserve mtime" tool built on the same APIs, not specific to this
+  // test, so millisecond equality is the right (and realistic) bar here.
+  const statBefore = fs.statSync(fx.binPath);
+  fs.writeFileSync(fx.binPath, swapped);
+  fs.utimesSync(fx.binPath, statBefore.atime, statBefore.mtime);
+  const statAfter = fs.statSync(fx.binPath);
+  assert.strictEqual(statAfter.size, statBefore.size, 'test setup error: size must be identical');
+  assert.strictEqual(
+    Math.round(statAfter.mtimeMs),
+    Math.round(statBefore.mtimeMs),
+    'test setup error: mtime must be identical at millisecond granularity (this is the scenario being tested)',
+  );
+
+  const r2 = runWrapper(fx);
+  assert.ok(!r2.error || r2.error.code !== 'undefined', 'second run must not throw: ' + (r2.error && r2.error.message));
+
+  const dirsAfterSecond = listCacheDirs(binCacheDir);
+  const secondKey = dirsAfterSecond.find((k) => k !== firstKey);
+  assert.ok(
+    secondKey,
+    'REGRESSION: no new cache key appeared after content was swapped with size+mtime both preserved — ' +
+      'the cache key is still derived from size+mtime rather than content, so P3.4 is not fixed. dirs: ' +
+      JSON.stringify(dirsAfterSecond),
+  );
+
+  const secondCachedBin = path.join(binCacheDir, secondKey, BIN_NAME);
+  assert.ok(fs.existsSync(secondCachedBin), 'cached binary missing under new key: ' + secondCachedBin);
+  assert.strictEqual(
+    fs.readFileSync(secondCachedBin, 'utf8'),
+    swapped,
+    'cache entry under the new key does not contain the swapped content',
+  );
+
+  // The stale (pre-swap) cache entry must eventually be swept; give the
+  // sweep from run 2 credit even if run1's key directory briefly coexists.
+  const remaining = listCacheDirs(binCacheDir);
+  assert.ok(
+    remaining.includes(secondKey),
+    'new key missing after sweep: ' + JSON.stringify(remaining),
+  );
+
+  fs.rmSync(fx.root, { recursive: true, force: true });
+}
+
+// ---------------------------------------------------------------------
+// 1. Key regression: binary mutated (content, size, and mtime all differ)
+//    WITHOUT bumping package version must produce a NEW cache key, and the
+//    stale one must be swept. (See test 0 above for the narrower case where
+//    size+mtime are both preserved across the content swap.)
 // ---------------------------------------------------------------------
 function testKeyRegression() {
   const fx = makeFixture('crush-key-regress', { version: '0.1.7', binContent: 'fake-binary-content-v1' });
@@ -341,6 +419,7 @@ function testCacheUnavailableFallback() {
 }
 
 (async () => {
+  section('0. content-hash regression (same size+mtime, swapped content)', testContentHashCatchesSameSizeSameMtimeSwap);
   section('1. key regression (size/mtime change without version bump)', testKeyRegression);
   section('2. cache reuse (no re-copy on unchanged binary)', testCacheReuse);
   await (async () => {

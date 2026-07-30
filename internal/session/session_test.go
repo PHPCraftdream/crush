@@ -479,20 +479,33 @@ func TestConcurrentRenameAndUsage_NoDataLoss(t *testing.T) {
 		var (
 			wg    sync.WaitGroup
 			start = make(chan struct{})
+			// Errors are collected on a buffered channel rather than
+			// asserted with require.NoError inside the goroutines
+			// themselves: testing.T's FailNow/Fatal (which require.NoError
+			// calls on failure) is documented to be safe only from the
+			// test's own goroutine — calling it from a goroutine spawned by
+			// the test is undefined behavior. So each goroutine only sends
+			// its error (nil on success) and every assertion happens back
+			// in the main test goroutine below.
+			errCh = make(chan error, 2)
 		)
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
 			<-start
-			require.NoError(t, svc.Rename(ctx, sess.ID, "renamed-title"))
+			errCh <- svc.Rename(ctx, sess.ID, "renamed-title")
 		}()
 		go func() {
 			defer wg.Done()
 			<-start
-			require.NoError(t, svc.SetUsage(ctx, sess.ID, 111, 222))
+			errCh <- svc.SetUsage(ctx, sess.ID, 111, 222)
 		}()
 		close(start)
 		wg.Wait()
+		close(errCh)
+		for err := range errCh {
+			require.NoError(t, err)
+		}
 
 		got, err := svc.Get(ctx, sess.ID)
 		require.NoError(t, err)
@@ -520,20 +533,29 @@ func TestConcurrentRenameAndTodos_NoDataLoss(t *testing.T) {
 		var (
 			wg    sync.WaitGroup
 			start = make(chan struct{})
+			// See TestConcurrentRenameAndUsage_NoDataLoss for why errors are
+			// collected on a channel and asserted only in the main test
+			// goroutine, rather than calling require.NoError from inside
+			// the spawned goroutines directly.
+			errCh = make(chan error, 2)
 		)
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
 			<-start
-			require.NoError(t, svc.Rename(ctx, sess.ID, "renamed"))
+			errCh <- svc.Rename(ctx, sess.ID, "renamed")
 		}()
 		go func() {
 			defer wg.Done()
 			<-start
-			require.NoError(t, svc.SetTodos(ctx, sess.ID, newTodos, nil))
+			errCh <- svc.SetTodos(ctx, sess.ID, newTodos, nil)
 		}()
 		close(start)
 		wg.Wait()
+		close(errCh)
+		for err := range errCh {
+			require.NoError(t, err)
+		}
 
 		got, err := svc.Get(ctx, sess.ID)
 		require.NoError(t, err)
@@ -720,26 +742,36 @@ func TestTitleGenerationConcurrentWithMainTurn(t *testing.T) {
 		var (
 			wg    sync.WaitGroup
 			start = make(chan struct{})
+			// Errors are collected on a buffered channel rather than
+			// asserted with require.NoError inside the goroutines
+			// themselves; see TestConcurrentRenameAndUsage_NoDataLoss for
+			// why calling require.NoError from a spawned goroutine (not the
+			// test's own) is undefined behavior.
+			errCh = make(chan error, 4)
 		)
 		wg.Add(2)
 
 		go func() {
 			defer wg.Done()
 			<-start
-			require.NoError(t, svc.SetUsage(ctx, sessionID, mainPromptTokens, mainCompletionTokens))
+			errCh <- svc.SetUsage(ctx, sessionID, mainPromptTokens, mainCompletionTokens)
 			_, err := svc.IncrementCost(ctx, sessionID, mainCost)
-			require.NoError(t, err)
+			errCh <- err
 		}()
 		go func() {
 			defer wg.Done()
 			<-start
-			require.NoError(t, svc.Rename(ctx, sessionID, "Generated Title"))
+			errCh <- svc.Rename(ctx, sessionID, "Generated Title")
 			_, err := svc.IncrementCost(ctx, sessionID, titleCost)
-			require.NoError(t, err)
+			errCh <- err
 		}()
 
 		close(start)
 		wg.Wait()
+		close(errCh)
+		for err := range errCh {
+			require.NoError(t, err)
+		}
 
 		final, err := svc.Get(ctx, sessionID)
 		require.NoError(t, err)

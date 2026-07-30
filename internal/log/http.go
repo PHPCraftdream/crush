@@ -6,6 +6,8 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -22,6 +24,31 @@ const (
 	// problems. 16 KiB is deliberately small; full bodies are never held.
 	maxBodyPreview = 16 << 10 // 16 KiB
 )
+
+// LogHTTPBodies gates whether request/response BODIES are ever included in
+// debug logs, as opposed to just method/url/status/content_length/duration.
+//
+// Request/response bodies for LLM traffic routinely contain the system
+// prompt, the full user message history, tool output (which can include the
+// contents of files the agent read — including secrets from a .env the
+// agent was asked to inspect), and — for some providers — the API key
+// itself repeated inside a JSON field, not just the Authorization header.
+// formatHeaders (below) redacts known sensitive HEADERS, but historically
+// nothing redacted the BODY, so simply turning on --debug was enough to
+// spray all of that into crush.log at slog.Debug level.
+//
+// This is intentionally a SEPARATE opt-in from --debug/slog.LevelDebug:
+// --debug is routinely turned on to diagnose transport/timing issues and
+// must not, by itself, imply "log secrets". Body logging additionally
+// requires CRUSH_LOG_HTTP_BODIES=1 (following the existing CRUSH_* opt-in
+// env var convention used elsewhere, e.g. CRUSH_DISABLE_ANTHROPIC_CACHE,
+// CRUSH_CORE_UTILS — no new configuration mechanism introduced here).
+// Even then, known secret-shaped JSON fields are redacted before logging
+// (see redactBodySecrets).
+var LogHTTPBodies = func() bool {
+	v, _ := strconv.ParseBool(os.Getenv("CRUSH_LOG_HTTP_BODIES"))
+	return v
+}()
 
 // NewHTTPClient creates an HTTP client with debug logging and retry on 5xx errors.
 func NewHTTPClient() *http.Client {
@@ -121,17 +148,25 @@ type HTTPRoundTripLogger struct {
 //
 // When debug logging is not enabled at the current slog level, request and
 // response bodies are passed through untouched: streaming is fully preserved
-// and there is zero buffering overhead. When debug logging is enabled, a
-// bounded preview (maxBodyPreview bytes) of each body is captured — the
-// request preview up front, the response preview lazily as the caller reads
-// — and the response is logged once when its body is closed, never before
-// RoundTrip returns. The response body returned to the caller is always the
-// live stream, never a fully materialized buffer.
+// and there is zero buffering overhead.
+//
+// When debug logging IS enabled, method/url/status/content_length/duration
+// are always logged, but request/response BODIES are only captured and
+// logged when the separate LogHTTPBodies opt-in is also set — see its doc
+// comment for why this is a distinct, more dangerous switch than --debug
+// alone. When LogHTTPBodies is on, a bounded preview (maxBodyPreview bytes)
+// of each body is captured — the request preview up front, the response
+// preview lazily as the caller reads — and known secret-shaped JSON fields
+// are redacted before logging (see redactBodySecrets). The response is
+// logged once when its body is closed, never before RoundTrip returns. The
+// response body returned to the caller is always the live stream, never a
+// fully materialized buffer.
 func (h *HTTPRoundTripLogger) RoundTrip(req *http.Request) (*http.Response, error) {
 	ctx := req.Context()
 	debugEnabled := slog.Default().Enabled(ctx, slog.LevelDebug)
+	logBodies := debugEnabled && LogHTTPBodies
 
-	if debugEnabled && req.Body != nil && req.Body != http.NoBody {
+	if logBodies && req.Body != nil && req.Body != http.NoBody {
 		preview, err := io.ReadAll(io.LimitReader(req.Body, maxBodyPreview))
 		if err != nil {
 			slog.Error("HTTP request body preview failed",
@@ -147,7 +182,7 @@ func (h *HTTPRoundTripLogger) RoundTrip(req *http.Request) (*http.Response, erro
 		slog.Debug("HTTP Request",
 			"method", req.Method,
 			"url", req.URL,
-			"body", prettyBody(preview)+truncated,
+			"body", redactBodySecrets(prettyBody(preview))+truncated,
 		)
 	} else if debugEnabled {
 		slog.Debug("HTTP Request", "method", req.Method, "url", req.URL)
@@ -171,18 +206,33 @@ func (h *HTTPRoundTripLogger) RoundTrip(req *http.Request) (*http.Response, erro
 		return resp, nil
 	}
 
-	// Wrap the response body so the preview is captured as the caller
-	// reads, and the debug log is emitted once on Close (after the stream
-	// completes), not before RoundTrip returns.
 	statusCode, status := resp.StatusCode, resp.Status
 	headers := formatHeaders(resp.Header)
 	contentLength := resp.ContentLength
+
+	if !logBodies {
+		// Debug is on but body logging is not: log metadata only, without
+		// ever reading/buffering the body ourselves. The caller's stream is
+		// untouched.
+		slog.Debug("HTTP Response",
+			"status_code", statusCode,
+			"status", status,
+			"headers", headers,
+			"content_length", contentLength,
+			"duration_ms", duration.Milliseconds(),
+		)
+		return resp, nil
+	}
+
+	// Wrap the response body so the preview is captured as the caller
+	// reads, and the debug log is emitted once on Close (after the stream
+	// completes), not before RoundTrip returns.
 	resp.Body = newTeeBody(resp.Body, maxBodyPreview, func(preview string) {
 		slog.Debug("HTTP Response",
 			"status_code", statusCode,
 			"status", status,
 			"headers", headers,
-			"body", prettyBody([]byte(preview)),
+			"body", redactBodySecrets(prettyBody([]byte(preview))),
 			"content_length", contentLength,
 			"duration_ms", duration.Milliseconds(),
 		)
@@ -263,6 +313,123 @@ func prettyBody(src []byte) string {
 		return string(src)
 	}
 	return b.String()
+}
+
+// sensitiveBodyKeys are JSON object keys (matched case-insensitively, and
+// regardless of nesting depth) whose values are redacted by
+// redactBodySecrets before a body is ever logged. This list is deliberately
+// broader than formatHeaders' header list because provider request bodies
+// echo credentials in more shapes than headers do — e.g. Vertex/Bedrock
+// style bodies can carry a nested "credentials" or "apiKey" field, and
+// config.ProviderConfig's own field names (APIKey, ExtraHeaders values,
+// ExtraParams) can end up serialized into a request body for some
+// providers. Matching by substring (like formatHeaders does) keeps this
+// resilient to the "apiKey" / "api_key" / "X-Api-Key" naming variance seen
+// across providers without needing an exact enumeration.
+var sensitiveBodyKeySubstrings = []string{
+	"apikey",
+	"api_key",
+	"authorization",
+	"token",
+	"secret",
+	"password",
+	"credential",
+	"client_secret",
+	"clientsecret",
+	"private_key",
+	"privatekey",
+}
+
+func isSensitiveBodyKey(key string) bool {
+	lower := strings.ToLower(key)
+	for _, sub := range sensitiveBodyKeySubstrings {
+		if strings.Contains(lower, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// redactBodySecrets best-effort redacts known secret-shaped JSON fields
+// (see sensitiveBodyKeySubstrings) from a request/response body before it
+// is logged. It only activates when the body parses as JSON (an object,
+// array, or a value containing either); non-JSON bodies — plain text,
+// SSE streams, binary previews — are returned verbatim, since prettyBody
+// already falls back to the raw bytes for those and there is no reliable
+// generic way to redact secrets embedded in arbitrary non-JSON text
+// without both false positives and false negatives. This mirrors
+// prettyBody's own "best effort, JSON only" contract.
+//
+// SSE bodies (the common case for LLM streaming responses) are handled
+// line-by-line: each "data: {...}" line's JSON payload is redacted
+// independently, since the overall SSE body is not itself valid JSON.
+func redactBodySecrets(body string) string {
+	if body == "" {
+		return body
+	}
+
+	trimmed := strings.TrimSpace(body)
+	if strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
+		var v any
+		if err := json.Unmarshal([]byte(body), &v); err == nil {
+			redactJSONValue(v)
+			var out bytes.Buffer
+			enc := json.NewEncoder(&out)
+			enc.SetIndent("", "  ")
+			enc.SetEscapeHTML(false)
+			if err := enc.Encode(v); err == nil {
+				return strings.TrimRight(out.String(), "\n")
+			}
+		}
+		return body
+	}
+
+	// SSE stream: redact each "data: {json}" line independently, leave
+	// everything else (event:/id:/comments/blank lines) untouched.
+	lines := strings.Split(body, "\n")
+	changed := false
+	for i, line := range lines {
+		const prefix = "data: "
+		rest, ok := strings.CutPrefix(line, prefix)
+		if !ok {
+			continue
+		}
+		var v any
+		if err := json.Unmarshal([]byte(rest), &v); err != nil {
+			continue
+		}
+		redactJSONValue(v)
+		redacted, err := json.Marshal(v)
+		if err != nil {
+			continue
+		}
+		lines[i] = prefix + string(redacted)
+		changed = true
+	}
+	if !changed {
+		return body
+	}
+	return strings.Join(lines, "\n")
+}
+
+// redactJSONValue walks an arbitrary decoded JSON value in place, replacing
+// the value of any object key matched by isSensitiveBodyKey with
+// "[REDACTED]", at any nesting depth.
+func redactJSONValue(v any) {
+	switch t := v.(type) {
+	case map[string]any:
+		for k, val := range t {
+			if isSensitiveBodyKey(k) {
+				t[k] = "[REDACTED]"
+				continue
+			}
+			redactJSONValue(val)
+		}
+	case []any:
+		for _, item := range t {
+			redactJSONValue(item)
+		}
+	}
 }
 
 // formatHeaders formats HTTP headers for logging, redacting sensitive ones.
