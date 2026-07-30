@@ -238,6 +238,48 @@ func TestBuild_WorkerConfiguredWithUnknownContextWindow_NoBogusNumber(t *testing
 	require.NotRegexp(t, `\(~[^)]*\d[^)]*\)`, got, "must not render any parenthesized number for the context window when unknown")
 }
 
+// TestBuild_IOContract_ExemptsDiagnosisFromLineLimit is a prompt-regression
+// guard for review finding P3.9: the "under 4 lines of prose" rule must
+// carry an explicit, visible exemption for diagnosis/security-review/
+// handoff turns, not just an implicit one buried in a different rule — a
+// model under pressure to stay terse will otherwise compress away the
+// evidence rule 6 requires. This does not depend on WorkerAvailable.
+func TestBuild_IOContract_ExemptsDiagnosisFromLineLimit(t *testing.T) {
+	store := testConfigStore(t)
+	p := newTestCoderPrompt(t, store.WorkingDir())
+
+	got, err := p.Build(context.Background(), "large-provider", "large-model", store, false)
+	require.NoError(t, err)
+
+	require.Contains(t, got, "4 lines of prose per turn", "the line-limit rule must still be present")
+	require.Contains(t, got, "routine work", "the limit must be scoped to routine work, not every turn")
+	require.Contains(t, got, "diagnosis, security findings, and complex handoffs are exempt",
+		"the line-limit rule must explicitly exempt diagnosis/security/handoff turns, not rely on an implicit carve-out elsewhere")
+}
+
+// TestBuild_WorkerConfiguredAndSmart_VerifiesPerChunkNotJustAtEnd is a
+// prompt-regression guard for review finding P3.9's second concern: an
+// earlier draft of the orchestrator-mode rule deferred zero-trust
+// verification to a single pass "not after each individual chunk", which
+// lets errors from consecutive delegated chunks compound before anything
+// catches them. The rule must instruct verifying at each chunk's boundary.
+func TestBuild_WorkerConfiguredAndSmart_VerifiesPerChunkNotJustAtEnd(t *testing.T) {
+	store := testConfigStore(t)
+	cfg := store.Config()
+	cfg.Models[config.SelectedModelTypeWorker] = registerProvider(cfg, "worker-provider", "worker-model", 200_000)
+
+	p := newTestCoderPrompt(t, store.WorkingDir())
+
+	got, err := p.Build(context.Background(), "large-provider", "large-model", store, true)
+	require.NoError(t, err)
+
+	require.Contains(t, got, "before counting any chunk done",
+		"must instruct verifying each chunk before counting it done, not deferring to a final pass")
+	require.Contains(t, got, "each chunk's boundary", "must instruct verifying at chunk boundaries")
+	require.NotContains(t, got, "not after each individual chunk",
+		"regression: must not instruct deferring verification away from individual chunks")
+}
+
 // TestBuild_WorkerConfiguredButModelUnregistered_NoBogusNumber covers the
 // stricter case where GetModel returns nil outright (no catwalk entry at
 // all for the configured worker provider/model), not just a zero
