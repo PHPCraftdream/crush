@@ -28,9 +28,9 @@ func countMsgsForSessionCLI(t *testing.T, ctx context.Context, sqlDB *sql.DB, se
 
 // TestForkSessionCLI_HappyPath verifies the CLI fork path (forkSessionCLI,
 // invoked by `crush sessions fork`) clones the source session's models,
-// system prompt, reasoning effort, and every message into a new session, and
-// honors the CLI-specific --session / --title / --child knobs that
-// session.Service.ForkSession does not support.
+// system prompt, reasoning effort, and todos, and every message into a new
+// session, and honors the CLI-specific --session / --title / --child knobs
+// on top of the shared session.Service.ForkSessionTx.
 func TestForkSessionCLI_HappyPath(t *testing.T) {
 	t.Parallel()
 	conn, q := newTestDB(t)
@@ -42,6 +42,7 @@ func TestForkSessionCLI_HappyPath(t *testing.T) {
 	require.NoError(t, s.UpdateModels(ctx, src.ID, "provL", "modelL", "provS", "modelS"))
 	require.NoError(t, s.UpdateReasoningEffort(ctx, src.ID, "high", "low"))
 	require.NoError(t, s.UpdateSystemPrompt(ctx, src.ID, "be careful"))
+	require.NoError(t, s.SetTodos(ctx, src.ID, []session.Todo{{Content: "do thing", Status: session.TodoStatusPending}}, nil))
 
 	seedRoles := []string{"user", "assistant", "user"}
 	for i, role := range seedRoles {
@@ -51,26 +52,28 @@ func TestForkSessionCLI_HappyPath(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	forkID, count, err := forkSessionCLI(ctx, conn, src.ID, forkOptions{
+	fork, count, err := forkSessionCLI(ctx, s, src.ID, forkOptions{
 		newID:   "custom-fork-id",
 		title:   "My Fork",
 		asChild: true,
 	})
 	require.NoError(t, err)
-	require.Equal(t, "custom-fork-id", forkID)
+	require.Equal(t, "custom-fork-id", fork.ID)
 	require.EqualValues(t, 3, count)
 
-	fork, err := s.Get(ctx, forkID)
+	got, err := s.Get(ctx, fork.ID)
 	require.NoError(t, err)
-	require.Equal(t, "My Fork", fork.Title)
-	require.Equal(t, src.ID, fork.ParentSessionID)
-	require.Equal(t, "provL", fork.LargeModelProvider)
-	require.Equal(t, "modelS", fork.SmallModelID)
-	require.Equal(t, "high", fork.LargeModelReasoningEffort)
-	require.Equal(t, "low", fork.SmallModelReasoningEffort)
-	require.Equal(t, "be careful", fork.SystemPrompt)
+	require.Equal(t, "My Fork", got.Title)
+	require.Equal(t, src.ID, got.ParentSessionID)
+	require.Equal(t, "provL", got.LargeModelProvider)
+	require.Equal(t, "modelS", got.SmallModelID)
+	require.Equal(t, "high", got.LargeModelReasoningEffort)
+	require.Equal(t, "low", got.SmallModelReasoningEffort)
+	require.Equal(t, "be careful", got.SystemPrompt)
+	require.Len(t, got.Todos, 1)
+	require.Equal(t, "do thing", got.Todos[0].Content)
 
-	require.EqualValues(t, 3, countMsgsForSessionCLI(t, ctx, conn, forkID))
+	require.EqualValues(t, 3, countMsgsForSessionCLI(t, ctx, conn, fork.ID))
 }
 
 // TestForkSessionCLI_AtTruncation verifies --at N copies only the first N
@@ -90,10 +93,10 @@ func TestForkSessionCLI_AtTruncation(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	forkID, count, err := forkSessionCLI(ctx, conn, src.ID, forkOptions{atN: 2})
+	fork, count, err := forkSessionCLI(ctx, s, src.ID, forkOptions{atN: 2})
 	require.NoError(t, err)
 	require.EqualValues(t, 2, count)
-	require.EqualValues(t, 2, countMsgsForSessionCLI(t, ctx, conn, forkID))
+	require.EqualValues(t, 2, countMsgsForSessionCLI(t, ctx, conn, fork.ID))
 }
 
 // TestForkSessionCLI_AtOutOfRange verifies an out-of-range --at value is
@@ -113,11 +116,35 @@ func TestForkSessionCLI_AtOutOfRange(t *testing.T) {
 
 	before := countAllSessionsCLI(t, ctx, conn)
 
-	_, _, err = forkSessionCLI(ctx, conn, src.ID, forkOptions{atN: 5})
+	_, _, err = forkSessionCLI(ctx, s, src.ID, forkOptions{atN: 5})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "out of range")
 
 	require.Equal(t, before, countAllSessionsCLI(t, ctx, conn), "no session row should be created on validation failure")
+}
+
+// TestForkSessionCLI_EmptySourceNoAt verifies forking a source session with
+// zero messages succeeds when --at is left unset (0): the range check must
+// be skipped rather than resolving atN to 0 and rejecting it as "out of
+// range (1..0)" — a legitimate empty-source fork should not fail with an
+// error implying the user passed an invalid --at flag they never set.
+func TestForkSessionCLI_EmptySourceNoAt(t *testing.T) {
+	t.Parallel()
+	conn, q := newTestDB(t)
+	s := session.NewService(q, conn)
+	ctx := context.Background()
+
+	src, err := s.Create(ctx, "source")
+	require.NoError(t, err)
+	require.Zero(t, countMsgsForSessionCLI(t, ctx, conn, src.ID))
+
+	fork, count, err := forkSessionCLI(ctx, s, src.ID, forkOptions{})
+	require.NoError(t, err)
+	require.Zero(t, count)
+
+	got, err := s.Get(ctx, fork.ID)
+	require.NoError(t, err)
+	require.Equal(t, "source fork", got.Title)
 }
 
 // TestForkSessionCLI_MidwayFailureRollsBack arms a SQLite trigger that aborts
@@ -125,7 +152,8 @@ func TestForkSessionCLI_AtOutOfRange(t *testing.T) {
 // asserts the ENTIRE fork (new session row + every copied message) is rolled
 // back and the caller receives the error — no partial fork survives. This is
 // the CLI-path counterpart to session.TestForkSession_MidwayFailureRollsBack,
-// confirming forkSessionCLI's transaction wrapping is equally atomic.
+// confirming forkSessionCLI's shared ForkSessionTx transaction wrapping is
+// equally atomic.
 func TestForkSessionCLI_MidwayFailureRollsBack(t *testing.T) {
 	t.Parallel()
 	conn, q := newTestDB(t)
@@ -160,7 +188,7 @@ func TestForkSessionCLI_MidwayFailureRollsBack(t *testing.T) {
 	beforeSessions := countAllSessionsCLI(t, ctx, conn)
 	beforeSrcMsgs := countMsgsForSessionCLI(t, ctx, conn, src.ID)
 
-	_, _, err = forkSessionCLI(ctx, conn, src.ID, forkOptions{newID: "should-not-survive"})
+	_, _, err = forkSessionCLI(ctx, s, src.ID, forkOptions{newID: "should-not-survive"})
 	require.Error(t, err, "midway copy failure must surface as an error to the caller")
 
 	// No new session row leaked from the aborted transaction.

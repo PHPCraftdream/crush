@@ -169,7 +169,38 @@ type Service interface {
 	// point rolls back the whole clone so no half-built fork is left for a
 	// client to see; the caller receives the error instead. If title is
 	// empty it defaults to "<src title> fork". Returns the committed fork.
+	//
+	// ForkSession is a thin wrapper around ForkSessionTx with the web fork
+	// button's defaults (server-generated UUID, top-level session, every
+	// message copied). Callers that need --at truncation, a caller-chosen
+	// ID, or parent linkage (e.g. `crush sessions fork`) should call
+	// ForkSessionTx directly instead of duplicating the transaction.
 	ForkSession(ctx context.Context, srcID, title string) (Session, error)
+	// ForkSessionTx is the single transactional fork implementation shared
+	// by every fork entry point (web fork button, `crush sessions fork`).
+	// It clones srcID into a brand-new session in one DB transaction: a
+	// fresh session row copying the source's models, system prompt,
+	// reasoning effort, and todos/deleted_todos, plus the first o.LimitMsgs
+	// messages verbatim (all messages when o.LimitMsgs is 0). A failure at
+	// any point rolls back the whole clone, so no half-built fork is ever
+	// visible. Returns the committed fork and the number of messages copied.
+	//
+	// ForkOptions fields default as follows when left zero-valued:
+	//   - NewID: a fresh uuid.New().String()
+	//   - Title: "<src title> fork"
+	//   - ParentID: "" (top-level session, no parent)
+	//   - LimitMsgs: 0 means "copy every message"; otherwise it truncates to
+	//     the first LimitMsgs messages (1-indexed) and the call fails if
+	//     LimitMsgs is out of the range 1..len(source messages). An empty
+	//     source (zero messages) is always a valid fork target as long as
+	//     LimitMsgs is left at 0 — the range check is skipped in that case.
+	//
+	// Unlike ForkSession, ForkSessionTx does not publish a pubsub.CreatedEvent
+	// after commit: some callers (e.g. the CLI) run in a separate process
+	// from the one that will observe the fork, so publishing would be a
+	// silent no-op there. Callers that need the event (the web path) publish
+	// it themselves after this returns successfully.
+	ForkSessionTx(ctx context.Context, srcID string, o ForkOptions) (Session, int, error)
 
 	// CancelRequested flag: cross-process cancel signal.
 	RequestCancel(ctx context.Context, sessionID string) error
@@ -308,17 +339,53 @@ func (s *service) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
-// ForkSession clones srcID into a brand-new session in a single DB
-// transaction. It creates a fresh session row, copies the source's models,
-// system prompt, and todos, and copies every message verbatim — all inside
-// one tx so a failure at any point (e.g. the Nth message copy) rolls back
-// the new session row and every message copied so far. The caller gets an
-// error and no half-built fork is left behind. Mirrors the transactional
-// shape of Delete and TransferChildCostToParent.
+// ForkOptions carries the knobs ForkSessionTx supports beyond "copy
+// everything from srcID into a new top-level session". See the Service
+// interface doc on ForkSessionTx for the zero-value default of each field.
+type ForkOptions struct {
+	// NewID is the caller-chosen ID for the forked session. Empty means
+	// generate a fresh uuid.New().String().
+	NewID string
+	// Title is the forked session's title. Empty means "<src title> fork".
+	Title string
+	// ParentID sets the fork's parent_session_id, making it a child session
+	// (as `crush sessions fork --child` does). Empty means top-level (no
+	// parent) — the web fork button's behavior.
+	ParentID string
+	// LimitMsgs truncates the copy to the first LimitMsgs messages
+	// (1-indexed). 0 means "copy every message". A non-zero value outside
+	// 1..len(source messages) is rejected.
+	LimitMsgs int
+}
+
+// ForkSession is a thin wrapper around ForkSessionTx using the web fork
+// button's defaults: server-generated ID, top-level session, every message
+// copied. It additionally publishes a pubsub.CreatedEvent after commit,
+// since the web path and its subscribers live in the same process.
 func (s *service) ForkSession(ctx context.Context, srcID, title string) (Session, error) {
+	fork, _, err := s.ForkSessionTx(ctx, srcID, ForkOptions{Title: title})
+	if err != nil {
+		return Session{}, err
+	}
+	s.Publish(pubsub.CreatedEvent, fork)
+	return fork, nil
+}
+
+// ForkSessionTx clones srcID into a brand-new session in a single DB
+// transaction. It creates a fresh session row, copies the source's models,
+// system prompt, reasoning effort, and todos/deleted_todos, and copies the
+// first o.LimitMsgs messages (or all of them, when o.LimitMsgs is 0)
+// verbatim — all inside one tx so a failure at any point (e.g. the Nth
+// message copy) rolls back the new session row and every message copied so
+// far. The caller gets an error and no half-built fork is left behind.
+// Mirrors the transactional shape of Delete and TransferChildCostToParent.
+//
+// See the Service interface doc on ForkSessionTx for ForkOptions defaults
+// and the pubsub-publish contract (this method does NOT publish; callers do).
+func (s *service) ForkSessionTx(ctx context.Context, srcID string, o ForkOptions) (Session, int, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return Session{}, fmt.Errorf("begin fork transaction: %w", err)
+		return Session{}, 0, fmt.Errorf("begin fork transaction: %w", err)
 	}
 	defer tx.Rollback() //nolint:errcheck
 
@@ -327,24 +394,50 @@ func (s *service) ForkSession(ctx context.Context, srcID, title string) (Session
 	// Read the source inside the tx so the copy is consistent with itself.
 	src, err := qtx.GetSessionByID(ctx, srcID)
 	if err != nil {
-		return Session{}, fmt.Errorf("load source session: %w", err)
+		return Session{}, 0, fmt.Errorf("load source session: %w", err)
 	}
 
-	resolvedTitle := title
+	srcMsgs, err := qtx.ListMessagesBySession(ctx, srcID)
+	if err != nil {
+		return Session{}, 0, fmt.Errorf("list source messages: %w", err)
+	}
+
+	// LimitMsgs == 0 means "copy everything" and is always valid, including
+	// against an empty source (forking a brand-new, message-less session is
+	// a legitimate operation). A non-zero LimitMsgs must fall within
+	// 1..len(srcMsgs).
+	limit := o.LimitMsgs
+	if limit == 0 {
+		limit = len(srcMsgs)
+	} else if limit < 1 || limit > len(srcMsgs) {
+		return Session{}, 0, fmt.Errorf("--at %d is out of range (1..%d)", limit, len(srcMsgs))
+	}
+	srcMsgs = srcMsgs[:limit]
+
+	resolvedTitle := o.Title
 	if resolvedTitle == "" {
 		resolvedTitle = src.Title + " fork"
 	}
 
-	forkID := uuid.New().String()
-	if _, err := qtx.CreateSession(ctx, db.CreateSessionParams{
-		ID:    forkID,
-		Title: resolvedTitle,
-	}); err != nil {
-		return Session{}, fmt.Errorf("create forked session: %w", err)
+	forkID := o.NewID
+	if forkID == "" {
+		forkID = uuid.New().String()
 	}
 
-	// Copy the source's model selection, system prompt, and todos onto the
-	// fork via column-scoped UPDATEs routed through qtx so they share the tx.
+	createParams := db.CreateSessionParams{
+		ID:    forkID,
+		Title: resolvedTitle,
+	}
+	if o.ParentID != "" {
+		createParams.ParentSessionID = sql.NullString{String: o.ParentID, Valid: true}
+	}
+	if _, err := qtx.CreateSession(ctx, createParams); err != nil {
+		return Session{}, 0, fmt.Errorf("create forked session: %w", err)
+	}
+
+	// Copy the source's model selection, system prompt, reasoning effort,
+	// and todos onto the fork via column-scoped UPDATEs routed through qtx
+	// so they share the tx.
 	if err := qtx.UpdateSessionModels(ctx, db.UpdateSessionModelsParams{
 		LargeModelProvider: src.LargeModelProvider,
 		LargeModelID:       src.LargeModelID,
@@ -352,13 +445,20 @@ func (s *service) ForkSession(ctx context.Context, srcID, title string) (Session
 		SmallModelID:       src.SmallModelID,
 		ID:                 forkID,
 	}); err != nil {
-		return Session{}, fmt.Errorf("copy models into fork: %w", err)
+		return Session{}, 0, fmt.Errorf("copy models into fork: %w", err)
 	}
 	if err := qtx.UpdateSessionSystemPrompt(ctx, db.UpdateSessionSystemPromptParams{
 		SystemPrompt: src.SystemPrompt,
 		ID:           forkID,
 	}); err != nil {
-		return Session{}, fmt.Errorf("copy system prompt into fork: %w", err)
+		return Session{}, 0, fmt.Errorf("copy system prompt into fork: %w", err)
+	}
+	if err := qtx.UpdateSessionReasoningEffort(ctx, db.UpdateSessionReasoningEffortParams{
+		LargeModelReasoningEffort: src.LargeModelReasoningEffort,
+		SmallModelReasoningEffort: src.SmallModelReasoningEffort,
+		ID:                        forkID,
+	}); err != nil {
+		return Session{}, 0, fmt.Errorf("copy reasoning effort into fork: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE sessions SET todos = ?, deleted_todos = ?, updated_at = strftime('%s', 'now') WHERE id = ?`,
@@ -366,21 +466,22 @@ func (s *service) ForkSession(ctx context.Context, srcID, title string) (Session
 		src.DeletedTodos,
 		forkID,
 	); err != nil {
-		return Session{}, fmt.Errorf("copy todos into fork: %w", err)
+		return Session{}, 0, fmt.Errorf("copy todos into fork: %w", err)
 	}
 
-	// Copy every message verbatim. Parts is carried across as the raw JSON
-	// blob (no decode/re-encode round-trip), so the fork is a faithful copy
-	// of the source history. Any copy error aborts the whole transaction.
+	// Copy every selected message verbatim. Parts is carried across as the
+	// raw JSON blob (no decode/re-encode round-trip), so the fork is a
+	// faithful copy of the source history. Any copy error aborts the whole
+	// transaction.
 	//
 	// Deliberately no per-message pubsub.CreatedEvent here (unlike
 	// message.Service.Create, which the old non-transactional path went
 	// through): this loop writes via qtx.CreateMessage directly against the
 	// tx, bypassing the message package's Service/Broker entirely, so there
 	// is no message.Service handle available to publish through from inside
-	// session's ForkSession. Publishing would also need to wait until AFTER
-	// the commit below (a subscriber must never observe a message row from
-	// an uncommitted, possibly-rolled-back tx), which would mean re-reading
+	// ForkSessionTx. Publishing would also need to wait until AFTER the
+	// commit below (a subscriber must never observe a message row from an
+	// uncommitted, possibly-rolled-back tx), which would mean re-reading
 	// every copied message post-commit just to build event payloads.
 	// Checked whether any subscriber actually needs incremental per-message
 	// events for a fork: the only consumer is the web UI
@@ -394,10 +495,6 @@ func (s *service) ForkSession(ctx context.Context, srcID, title string) (Session
 	// complete, correct transcript. If a future subscriber needs
 	// incremental per-message fork events, publish them AFTER tx.Commit()
 	// below (loop over the re-read committed rows), not inside the tx.
-	srcMsgs, err := qtx.ListMessagesBySession(ctx, srcID)
-	if err != nil {
-		return Session{}, fmt.Errorf("list source messages: %w", err)
-	}
 	for _, m := range srcMsgs {
 		if _, err := qtx.CreateMessage(ctx, db.CreateMessageParams{
 			ID:                  uuid.New().String(),
@@ -412,22 +509,20 @@ func (s *service) ForkSession(ctx context.Context, srcID, title string) (Session
 			AutoResumed:         m.AutoResumed,
 			BackgroundJobNotice: m.BackgroundJobNotice,
 		}); err != nil {
-			return Session{}, fmt.Errorf("copy message into fork: %w", err)
+			return Session{}, 0, fmt.Errorf("copy message into fork: %w", err)
 		}
 	}
 
 	if err := tx.Commit(); err != nil {
-		return Session{}, fmt.Errorf("commit fork transaction: %w", err)
+		return Session{}, 0, fmt.Errorf("commit fork transaction: %w", err)
 	}
 
 	// Re-read the committed fork to return its final, fully-populated state.
 	fork, err := s.q.GetSessionByID(ctx, forkID)
 	if err != nil {
-		return Session{}, fmt.Errorf("reload forked session: %w", err)
+		return Session{}, 0, fmt.Errorf("reload forked session: %w", err)
 	}
-	sess := s.fromDBItem(fork)
-	s.Publish(pubsub.CreatedEvent, sess)
-	return sess, nil
+	return s.fromDBItem(fork), len(srcMsgs), nil
 }
 
 func (s *service) Get(ctx context.Context, id string) (Session, error) {

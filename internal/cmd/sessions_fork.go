@@ -2,14 +2,12 @@ package cmd
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"os"
-	"time"
 
-	"github.com/charmbracelet/crush/internal/db"
-	"github.com/google/uuid"
 	"github.com/spf13/cobra"
+
+	"github.com/charmbracelet/crush/internal/session"
 )
 
 var sessionsForkCmd = &cobra.Command{
@@ -44,15 +42,16 @@ crush sessions fork my-session-id --session new-id --title "My Fork"
 		defer a.Shutdown()
 		ctx := cmd.Context()
 
-		// resolveSessionID supports hash-prefix lookup, which the raw
-		// db.Queries path below does not — resolve the exact source ID here,
-		// then re-read it inside the transaction for a consistent snapshot.
+		// resolveSessionID supports hash-prefix lookup, which
+		// session.Service.ForkSessionTx does not — resolve the exact source
+		// ID here, then ForkSessionTx re-reads it inside the transaction for
+		// a consistent snapshot.
 		source, err := resolveSessionID(ctx, a.Sessions, args[0])
 		if err != nil {
 			return err
 		}
 
-		forkID, msgCount, err := forkSessionCLI(ctx, a.DB(), source.ID, forkOptions{
+		fork, msgCount, err := forkSessionCLI(ctx, a.Sessions, source.ID, forkOptions{
 			atN:     atN,
 			newID:   newID,
 			title:   title,
@@ -62,7 +61,7 @@ crush sessions fork my-session-id --session new-id --title "My Fork"
 			return err
 		}
 
-		fmt.Fprintf(os.Stderr, "forked session %s -> %s (copied %d messages)\n", source.ID, forkID, msgCount)
+		fmt.Fprintf(os.Stderr, "forked session %s -> %s (copied %d messages)\n", source.ID, fork.ID, msgCount)
 		return nil
 	},
 }
@@ -75,11 +74,13 @@ func init() {
 }
 
 // forkOptions carries the CLI-specific fork knobs (--at / --session / --title
-// / --child) that session.Service.ForkSession does not support: ForkSession
-// always copies every message into a brand-new top-level session with a
-// server-generated UUID and a fixed title fallback, which is exactly right
-// for the web fork button but too narrow for this command's --at truncation,
-// caller-chosen ID, and --child parent linkage.
+// / --child) that session.Service.ForkSession's zero-value defaults do not
+// cover: ForkSession always copies every message into a brand-new top-level
+// session with a server-generated UUID and a fixed title fallback, which is
+// exactly right for the web fork button but too narrow for this command's
+// --at truncation, caller-chosen ID, and --child parent linkage.
+// forkSessionCLI maps these onto session.ForkOptions and calls the shared
+// session.Service.ForkSessionTx.
 type forkOptions struct {
 	atN     int
 	newID   string
@@ -88,120 +89,38 @@ type forkOptions struct {
 }
 
 // forkSessionCLI performs the CLI fork's create-session-then-copy-messages
-// operation atomically in a single DB transaction, mirroring the shape of
-// session.Service.ForkSession (internal/session/session.go): a failure at
-// any point — including partway through the message copy loop — rolls back
-// the new session row and every message copied so far, so no half-built
-// fork is left in the database for `sessions list`/`sessions show` to find.
+// operation by delegating to session.Service.ForkSessionTx — the single
+// transactional fork implementation shared with the web fork button
+// (internal/session/session.go). This used to talk to db.Queries directly
+// with its own copy of the transaction, but that duplicated implementation
+// diverged from the web path (each independently forgot to copy a field the
+// other copied: reasoning effort here, todos there). Routing through
+// ForkSessionTx keeps both entry points copying the same column set and
+// gives the CLI the same atomicity guarantee (a failure at any point,
+// including partway through the message copy loop, rolls back the new
+// session row and every message copied so far) without re-implementing it.
 //
-// It intentionally talks to db.Queries directly rather than routing through
-// session.Service / message.Service: those services either don't expose a
-// transaction-scoped handle to callers (message.Service.Create always uses
-// its own top-level *sql.DB) or don't support the CLI's --at/--session/
-// --child knobs (session.Service.ForkSession). Message Parts are copied as
-// the raw JSON string already stored in the messages table — the same
-// approach ForkSession uses — so no decode/re-encode round-trip through
-// message.ContentPart is needed and no unexported marshalParts helper has
-// to be reused across package boundaries.
-func forkSessionCLI(ctx context.Context, sqlDB *sql.DB, srcID string, opts forkOptions) (newSessionID string, copiedCount int, err error) {
-	tx, err := sqlDB.BeginTx(ctx, nil)
+// session.Service.ForkSessionTx deliberately does not publish a
+// pubsub.CreatedEvent — this CLI invocation runs in its own process, so a
+// pubsub.Broker subscriber here would never be observed by whichever process
+// is actually serving the web UI or another `crush run`.
+func forkSessionCLI(ctx context.Context, svc session.Service, srcID string, opts forkOptions) (fork session.Session, copiedCount int, err error) {
+	fork, copiedCount, err = svc.ForkSessionTx(ctx, srcID, session.ForkOptions{
+		NewID:     opts.newID,
+		Title:     opts.title,
+		ParentID:  parentIDFor(opts, srcID),
+		LimitMsgs: opts.atN,
+	})
 	if err != nil {
-		return "", 0, fmt.Errorf("begin fork transaction: %w", err)
+		return session.Session{}, 0, err
 	}
-	defer tx.Rollback() //nolint:errcheck
+	return fork, copiedCount, nil
+}
 
-	qtx := db.New(tx)
-
-	// Read the source inside the tx so the copy is consistent with itself.
-	src, err := qtx.GetSessionByID(ctx, srcID)
-	if err != nil {
-		return "", 0, fmt.Errorf("load source session: %w", err)
-	}
-
-	srcMsgs, err := qtx.ListMessagesBySession(ctx, srcID)
-	if err != nil {
-		return "", 0, fmt.Errorf("list source messages: %w", err)
-	}
-
-	atN := opts.atN
-	if atN == 0 {
-		atN = len(srcMsgs)
-	}
-	if atN < 1 || atN > len(srcMsgs) {
-		return "", 0, fmt.Errorf("--at %d is out of range (1..%d)", atN, len(srcMsgs))
-	}
-	srcMsgs = srcMsgs[:atN]
-
-	newID := opts.newID
-	if newID == "" {
-		newID = fmt.Sprintf("%s-fork-%d", srcID, time.Now().Unix())
-	}
-
-	title := opts.title
-	if title == "" {
-		title = fmt.Sprintf("Fork of %s (at msg %d)", src.Title, atN)
-	}
-
-	createParams := db.CreateSessionParams{
-		ID:                 newID,
-		Title:              title,
-		LargeModelProvider: src.LargeModelProvider,
-		LargeModelID:       src.LargeModelID,
-		SmallModelProvider: src.SmallModelProvider,
-		SmallModelID:       src.SmallModelID,
-	}
+// parentIDFor returns srcID when --child was set, else "" (top-level fork).
+func parentIDFor(opts forkOptions, srcID string) string {
 	if opts.asChild {
-		createParams.ParentSessionID = sql.NullString{String: srcID, Valid: true}
+		return srcID
 	}
-	if _, err := qtx.CreateSession(ctx, createParams); err != nil {
-		return "", 0, fmt.Errorf("failed to create forked session: %w", err)
-	}
-
-	// Copy system prompt and reasoning effort, which CreateSession does not
-	// accept directly (mirrors ForkSession's column-scoped follow-up UPDATEs).
-	if src.SystemPrompt != "" {
-		if err := qtx.UpdateSessionSystemPrompt(ctx, db.UpdateSessionSystemPromptParams{
-			SystemPrompt: src.SystemPrompt,
-			ID:           newID,
-		}); err != nil {
-			return "", 0, fmt.Errorf("copy system prompt into fork: %w", err)
-		}
-	}
-	if src.LargeModelReasoningEffort.Valid || src.SmallModelReasoningEffort.Valid {
-		if err := qtx.UpdateSessionReasoningEffort(ctx, db.UpdateSessionReasoningEffortParams{
-			ID:                        newID,
-			LargeModelReasoningEffort: src.LargeModelReasoningEffort,
-			SmallModelReasoningEffort: src.SmallModelReasoningEffort,
-		}); err != nil {
-			return "", 0, fmt.Errorf("copy reasoning effort into fork: %w", err)
-		}
-	}
-
-	// Copy every selected message verbatim, same raw-Parts-passthrough
-	// approach as session.Service.ForkSession. Any copy error aborts the
-	// whole transaction, so a failure on message N leaves neither the new
-	// session row nor messages 1..N-1 behind.
-	for _, m := range srcMsgs {
-		if _, err := qtx.CreateMessage(ctx, db.CreateMessageParams{
-			ID:                  uuid.New().String(),
-			SessionID:           newID,
-			Role:                m.Role,
-			Parts:               m.Parts,
-			Model:               m.Model,
-			Provider:            m.Provider,
-			ReasoningEffort:     m.ReasoningEffort,
-			IsSummaryMessage:    m.IsSummaryMessage,
-			Hidden:              m.Hidden,
-			AutoResumed:         m.AutoResumed,
-			BackgroundJobNotice: m.BackgroundJobNotice,
-		}); err != nil {
-			return "", 0, fmt.Errorf("failed to copy message: %w", err)
-		}
-	}
-
-	if err := tx.Commit(); err != nil {
-		return "", 0, fmt.Errorf("commit fork transaction: %w", err)
-	}
-
-	return newID, len(srcMsgs), nil
+	return ""
 }

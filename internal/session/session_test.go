@@ -633,8 +633,12 @@ func countAllSessions(t *testing.T, ctx context.Context, sqlDB *sql.DB) int64 {
 }
 
 // TestForkSession_HappyPath verifies the transactional fork clones the
-// source session's models, system prompt, todos, and EVERY message into a
-// new session.
+// source session's models, reasoning effort, system prompt, todos, and
+// EVERY message into a new session. Reasoning effort is asserted here
+// because ForkSession (the web fork button's path) used to silently drop it
+// — a divergence from the independently-written CLI fork path, which copied
+// reasoning effort but dropped todos. Both entry points now share
+// ForkSessionTx, which copies the union of both column sets.
 func TestForkSession_HappyPath(t *testing.T) {
 	t.Parallel()
 	sqlDB, q := newTestDB(t)
@@ -644,6 +648,7 @@ func TestForkSession_HappyPath(t *testing.T) {
 	src, err := svc.Create(ctx, "source")
 	require.NoError(t, err)
 	require.NoError(t, svc.UpdateModels(ctx, src.ID, "provL", "modelL", "provS", "modelS"))
+	require.NoError(t, svc.UpdateReasoningEffort(ctx, src.ID, "high", "low"))
 	require.NoError(t, svc.UpdateSystemPrompt(ctx, src.ID, "be careful"))
 	require.NoError(t, svc.SetTodos(ctx, src.ID, []Todo{{Content: "do thing", Status: TodoStatusPending}}, nil))
 
@@ -668,8 +673,11 @@ func TestForkSession_HappyPath(t *testing.T) {
 	require.Equal(t, "source fork", fork.Title)
 	require.Equal(t, "provL", fork.LargeModelProvider)
 	require.Equal(t, "modelS", fork.SmallModelID)
+	require.Equal(t, "high", fork.LargeModelReasoningEffort)
+	require.Equal(t, "low", fork.SmallModelReasoningEffort)
 	require.Equal(t, "be careful", fork.SystemPrompt)
 	require.Len(t, fork.Todos, 1)
+	require.Equal(t, "do thing", fork.Todos[0].Content)
 
 	require.EqualValues(t, 3, countMsgsForSession(t, ctx, sqlDB, fork.ID))
 
@@ -680,6 +688,57 @@ func TestForkSession_HappyPath(t *testing.T) {
 	require.Equal(t, "assistant", rows[1].Role)
 	require.Equal(t, "user", rows[2].Role)
 	require.Equal(t, seedParts[0], rows[0].Parts)
+}
+
+// TestForkSessionTx_AtTruncationAndChild verifies ForkOptions.LimitMsgs
+// truncates the copy to the first N messages and ForkOptions.ParentID links
+// the fork as a child session — the two CLI-specific knobs (--at, --child)
+// that ForkSession's defaults do not exercise.
+func TestForkSessionTx_AtTruncationAndChild(t *testing.T) {
+	t.Parallel()
+	sqlDB, q := newTestDB(t)
+	svc := NewService(q, sqlDB)
+	ctx := t.Context()
+
+	src, err := svc.Create(ctx, "source")
+	require.NoError(t, err)
+	for i, role := range []string{"user", "assistant", "user", "assistant"} {
+		_, err := sqlDB.ExecContext(ctx,
+			`INSERT INTO messages (id, session_id, role, parts, created_at, updated_at) VALUES (?, ?, ?, '[]', ?, ?)`,
+			uuid.NewString(), src.ID, role, 100+i, 100+i)
+		require.NoError(t, err)
+	}
+
+	fork, count, err := svc.(*service).ForkSessionTx(ctx, src.ID, ForkOptions{
+		ParentID:  src.ID,
+		LimitMsgs: 2,
+	})
+	require.NoError(t, err)
+	require.EqualValues(t, 2, count)
+	require.Equal(t, src.ID, fork.ParentSessionID)
+	require.EqualValues(t, 2, countMsgsForSession(t, ctx, sqlDB, fork.ID))
+}
+
+// TestForkSessionTx_EmptySourceNoLimit verifies forking a source session
+// with zero messages succeeds when LimitMsgs is left at its zero value: the
+// range check (limit < 1 || limit > len(srcMsgs)) must be skipped for the
+// "copy everything" default rather than resolving limit to 0 and then
+// rejecting it as out of range. This is the regression covered by the CLI's
+// TestForkSessionCLI_EmptySourceNoAt for the underlying shared function.
+func TestForkSessionTx_EmptySourceNoLimit(t *testing.T) {
+	t.Parallel()
+	sqlDB, q := newTestDB(t)
+	svc := NewService(q, sqlDB)
+	ctx := t.Context()
+
+	src, err := svc.Create(ctx, "source")
+	require.NoError(t, err)
+	require.Zero(t, countMsgsForSession(t, ctx, sqlDB, src.ID))
+
+	fork, count, err := svc.(*service).ForkSessionTx(ctx, src.ID, ForkOptions{})
+	require.NoError(t, err)
+	require.Zero(t, count)
+	require.NotEqual(t, src.ID, fork.ID)
 }
 
 // TestForkSession_MidwayFailureRollsBack arms a trigger that aborts the

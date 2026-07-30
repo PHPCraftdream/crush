@@ -134,6 +134,14 @@ func (m *mockSessionService) ForkSession(_ context.Context, _ string, title stri
 	return session.Session{ID: "forked-session-id", Title: title}, nil
 }
 
+func (m *mockSessionService) ForkSessionTx(_ context.Context, _ string, o session.ForkOptions) (session.Session, int, error) {
+	title := o.Title
+	if title == "" {
+		title = "forked-session-id"
+	}
+	return session.Session{ID: "forked-session-id", Title: title, ParentSessionID: o.ParentID}, 0, nil
+}
+
 func (m *mockSessionService) CreateAgentToolSessionID(messageID, toolCallID string) string {
 	return fmt.Sprintf("%s$$%s", messageID, toolCallID)
 }
