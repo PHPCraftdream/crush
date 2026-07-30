@@ -338,6 +338,64 @@ func TestHTTPRoundTripLogger_BodyLoggedWithRedactionWhenOptedIn(t *testing.T) {
 	}
 }
 
+// TestRedactBodySecrets_TokenUsageFieldsNotRedacted proves the "token"
+// substring in sensitiveBodyKeySubstrings doesn't over-match LLM
+// token-COUNT fields, which all use the plural "tokens" (max_tokens,
+// prompt_tokens, completion_tokens, input_tokens, output_tokens,
+// cache_creation_input_tokens, max_completion_tokens, total_tokens) — every
+// one of these used to be silently replaced with the string "[REDACTED]"
+// (also corrupting its JSON type from number to string) whenever
+// CRUSH_LOG_HTTP_BODIES was on, defeating the exact usage-accounting
+// inspection that flag exists for. Credential-shaped SINGULAR "*token*"
+// fields (access_token, refresh_token, auth's nested token) must still
+// redact normally — this is not a loosening of the "token" match, only a
+// narrow exclusion for the plural/count shape.
+func TestRedactBodySecrets_TokenUsageFieldsNotRedacted(t *testing.T) {
+	body := `{
+		"max_tokens": 4096,
+		"access_token": "should-be-redacted",
+		"usage": {
+			"prompt_tokens": 10,
+			"completion_tokens": 5,
+			"total_tokens": 15,
+			"input_tokens": 10,
+			"output_tokens": 5,
+			"cache_creation_input_tokens": 2,
+			"max_completion_tokens": 8192
+		},
+		"auth": {
+			"refresh_token": "also-should-be-redacted"
+		}
+	}`
+
+	got := redactBodySecrets(body)
+
+	for _, field := range []string{
+		"\"max_tokens\": 4096",
+		"\"prompt_tokens\": 10",
+		"\"completion_tokens\": 5",
+		"\"total_tokens\": 15",
+		"\"input_tokens\": 10",
+		"\"output_tokens\": 5",
+		"\"cache_creation_input_tokens\": 2",
+		"\"max_completion_tokens\": 8192",
+	} {
+		if !strings.Contains(got, field) {
+			t.Errorf("token-count field was redacted or altered, want verbatim %q; got:\n%s", field, got)
+		}
+	}
+
+	if strings.Contains(got, "should-be-redacted") {
+		t.Errorf("credential-shaped singular *_token field leaked unredacted:\n%s", got)
+	}
+	if strings.Contains(got, "also-should-be-redacted") {
+		t.Errorf("nested credential-shaped singular *_token field leaked unredacted:\n%s", got)
+	}
+	if !strings.Contains(got, "[REDACTED]") {
+		t.Errorf("expected [REDACTED] marker for the credential fields; got:\n%s", got)
+	}
+}
+
 // TestRedactBodySecrets_SSE proves per-line SSE redaction: each "data: {...}"
 // line's JSON payload is redacted independently.
 func TestRedactBodySecrets_SSE(t *testing.T) {

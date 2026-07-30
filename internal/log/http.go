@@ -340,12 +340,37 @@ var sensitiveBodyKeySubstrings = []string{
 	"privatekey",
 }
 
+// tokenUsageKeySuffix distinguishes LLM token-COUNT fields — e.g.
+// "max_tokens", "prompt_tokens", "total_tokens", "input_tokens",
+// "cache_creation_input_tokens", "max_completion_tokens" — from
+// credential-shaped "*token*" fields like "access_token"/"refresh_token"/
+// "id_token"/"session_token". Every LLM provider request/response shape
+// this codebase talks to (Anthropic, OpenAI, Gemini, Bedrock, Vertex) uses
+// the PLURAL "tokens" exclusively for usage counts and the SINGULAR
+// "token" exclusively for credentials — none was found using a plural
+// "tokens" key to hold an actual secret value. This lets the bare "token"
+// substring below stay broad enough to catch any "*_token"/"token_*"
+// credential shape without an exact enumeration, while not redacting the
+// exact usage-accounting fields CRUSH_LOG_HTTP_BODIES is most often turned
+// on to inspect (previously every one of the examples above was silently
+// replaced with the string "[REDACTED]", corrupting both the value and its
+// JSON type).
+const tokenUsageKeySuffix = "tokens"
+
 func isSensitiveBodyKey(key string) bool {
 	lower := strings.ToLower(key)
 	for _, sub := range sensitiveBodyKeySubstrings {
-		if strings.Contains(lower, sub) {
-			return true
+		if !strings.Contains(lower, sub) {
+			continue
 		}
+		if sub == "token" && strings.HasSuffix(lower, tokenUsageKeySuffix) {
+			// Plural "tokens" — a usage count, not a credential. See
+			// tokenUsageKeySuffix's doc comment. Other substrings (secret,
+			// password, credential, ...) still redact normally even when
+			// this one doesn't fire.
+			continue
+		}
+		return true
 	}
 	return false
 }
