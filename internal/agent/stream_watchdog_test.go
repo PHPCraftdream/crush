@@ -477,3 +477,69 @@ func TestStreamWatchdog_ExemptToolInSameBatchExemptsNonExemptToo(t *testing.T) {
 	}
 	assert.Equal(t, int32(1), fired.Load())
 }
+
+// TestStreamWatchdog_SequentialBatchProgressResetsCapClock is the regression
+// test for a real bug found while live-testing the exempt-tool fix above: a
+// sub-agent running FOUR individually-fast bash steps (well under the
+// configured cap) was force-cancelled anyway, because fantasy fires every
+// OnToolCall for a step BEFORE executing any of the tools in it — so a
+// "batch" the model issued as several back-to-back tool calls (common for
+// faster/smaller models even when explicitly asked to go one at a time) is
+// indistinguishable, from the watchdog's counter alone, from true parallel
+// execution. Before this fix, toolStartedAt was set once when the FIRST
+// tool of the batch started and only reset to 0 once ALL of them had
+// finished — so toolMaxDuration bounded the batch's CUMULATIVE wall time,
+// not any single tool's runtime, and several fast sequential steps could
+// sum past the cap and get killed even though none was ever stuck.
+//
+// This proves: with toolMaxDuration = 60ms, four tools started together
+// (simulating fantasy's upfront OnToolCall batch) finish one at a time
+// ~30ms apart (each individual gap safely under the cap, but the batch's
+// total span, ~120ms, is well past it) — the watchdog must NOT fire, since
+// every gap between consecutive finishes resets the clock.
+func TestStreamWatchdog_SequentialBatchProgressResetsCapClock(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	const idle = 5 * time.Second // large — idle path must not confound this test
+	const tick = 10 * time.Millisecond
+	const toolMaxDuration = 60 * time.Millisecond
+	const stepGap = 30 * time.Millisecond // < toolMaxDuration; 4 steps sum to ~120ms > toolMaxDuration
+
+	var fired atomic.Int32
+	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(time.Duration, bool) {
+		fired.Add(1)
+	}, false, 0, toolMaxDuration)
+
+	// fantasy fires OnToolCall for every tool in the step before executing
+	// any of them — simulate that: all four "start" near-simultaneously.
+	wd.toolStarted(false)
+	wd.toolStarted(false)
+	wd.toolStarted(false)
+	wd.toolStarted(false)
+
+	// They finish one at a time, ~30ms apart — each gap is safely under the
+	// 60ms cap, but the cumulative batch span (~120ms) is not.
+	for i := 0; i < 4; i++ {
+		time.Sleep(stepGap)
+		wd.toolFinished(false)
+	}
+
+	assert.Equal(t, int32(0), fired.Load(),
+		"watchdog must not fire for a sequential batch whose individual step gaps stay under the cap, even though the cumulative span exceeds it")
+	assert.False(t, wd.stalled.Load())
+	assert.NoError(t, ctx.Err())
+
+	// A genuinely stuck tool must still be caught: after the batch above
+	// fully finishes (toolsInFlight back to 0), start one more tool and let
+	// it run well past the cap with no further progress — this must fire.
+	wd.toolStarted(false)
+	select {
+	case <-wd.done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("watchdog must still fire for a genuinely stuck tool after a healthy sequential batch")
+	}
+	assert.Equal(t, int32(1), fired.Load())
+	assert.True(t, wd.stalled.Load())
+}

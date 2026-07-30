@@ -144,11 +144,33 @@ func startStreamWatchdog(
 		}
 	}
 	toolFinished := func(exempt bool) {
-		if toolsInFlight.Add(-1) <= 0 {
+		if remaining := toolsInFlight.Add(-1); remaining <= 0 {
 			// Defensive: a missing OnToolCall (or a double result) must not
 			// leave the counter negative and silently disable the watchdog.
 			toolsInFlight.Store(0)
 			toolStartedAt.Store(0)
+		} else {
+			// Other tools from this batch are still in flight. fantasy fires
+			// every OnToolCall for a step BEFORE executing any of them, so a
+			// "batch" here is often several tool calls the model issued
+			// together but that the executor actually runs one at a time —
+			// not true parallel execution. Without this reset,
+			// toolStartedAt stays pinned to when the FIRST tool in the
+			// batch started, so toolMaxDuration bounds the batch's
+			// CUMULATIVE wall time instead of any single tool's runtime —
+			// several individually-fast sequential tool calls (e.g. four
+			// 8s bash commands under a 12s cap) could sum past the cap and
+			// get force-cancelled even though none of them was ever
+			// actually stuck (observed live: a sub-agent running four
+			// short, safely-bounded bash steps got killed by this exact
+			// accumulation). This finish is forward progress on the batch
+			// — restart the clock from now, so the cap instead bounds the
+			// gap since the LAST tool finished (or the batch started,
+			// whichever is more recent). A genuinely stuck remaining tool
+			// is still caught: if nothing finishes for a full
+			// toolMaxDuration after this reset, the next tick fires
+			// exactly as before.
+			toolStartedAt.Store(time.Now().UnixNano())
 		}
 		if exempt {
 			if exemptToolsInFlight.Add(-1) < 0 {
