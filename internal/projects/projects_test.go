@@ -1,7 +1,9 @@
 package projects
 
 import (
+	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -182,5 +184,59 @@ func TestRegisterWithExternalDataDir(t *testing.T) {
 
 	if projects[0].DataDir != "/var/data/crush/myproject" {
 		t.Errorf("Expected data_dir /var/data/crush/myproject, got %s", projects[0].DataDir)
+	}
+}
+
+// TestRegisterConcurrent reproduces M-2: two concurrent Register calls
+// against the same projects.json (simulating two parallel `crush run`
+// processes racing to register their own project at startup) must not lose
+// either write. Before the fix, Register's Load -> mutate -> Save cycle
+// released the package mutex between Load and Save, and had no
+// inter-process lock at all, so the second Save could clobber the first
+// writer's entry. Run with -race to also catch any remaining data race on
+// the in-memory list.
+func TestRegisterConcurrent(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("XDG_DATA_HOME", tmpDir)
+	t.Setenv("CRUSH_GLOBAL_DATA", filepath.Join(tmpDir, "crush"))
+
+	const n = 20
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	for i := range n {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			workingDir := fmt.Sprintf("/home/user/project%d", i)
+			dataDir := fmt.Sprintf("/home/user/project%d/.crush", i)
+			errs[i] = Register(workingDir, dataDir)
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("Register(%d) failed: %v", i, err)
+		}
+	}
+
+	projectsList, err := List()
+	if err != nil {
+		t.Fatalf("List failed: %v", err)
+	}
+
+	if len(projectsList) != n {
+		t.Fatalf("Expected %d projects after concurrent Register, got %d (lost writes)", n, len(projectsList))
+	}
+
+	seen := make(map[string]bool, n)
+	for _, p := range projectsList {
+		seen[p.Path] = true
+	}
+	for i := range n {
+		workingDir := fmt.Sprintf("/home/user/project%d", i)
+		if !seen[workingDir] {
+			t.Errorf("Expected project %s to be present after concurrent Register, but it was lost", workingDir)
+		}
 	}
 }
