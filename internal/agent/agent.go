@@ -1267,8 +1267,14 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			// A tool is about to execute — pause the stall watchdog until its
 			// result arrives (OnToolResult). fantasy fires every OnToolCall
 			// for a step before executing any tool, so the counter brackets
-			// the whole executeTools window.
-			toolStarted()
+			// the whole executeTools window. A sub-agent delegation (the
+			// `agent` tool) is exempt from the never-freeze toolMaxDuration
+			// cap — its own Run() call already runs under its OWN stream
+			// watchdog, so bounding the parent's wait a second time with the
+			// same cap meant for a single primitive tool kills healthy,
+			// still-working delegations that simply take a while (see
+			// exemptToolsInFlight's doc in stream_watchdog.go).
+			toolStarted(tc.ToolName == AgentToolName)
 			sawToolBoundary = true // Fork patch: batch 8
 			input, wasSanitized := sanitizeToolInput(tc.ToolName, tc.ToolCallID, tc.Input)
 			if wasSanitized {
@@ -1293,7 +1299,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			bumpActivity()
 			// Tool finished — resume the stall watchdog (and restart its idle
 			// window so the tool's runtime isn't counted against the provider).
-			toolFinished()
+			toolFinished(result.ToolName == AgentToolName)
 			sawToolBoundary = true // Fork patch: batch 8
 			toolResult := a.convertToToolResult(result)
 			if sanitizedToolCalls[result.ToolCallID] {

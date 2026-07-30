@@ -25,11 +25,13 @@ type streamWatchdog struct {
 	// provider legitimately sends nothing until the tool returns. Without
 	// this, any single bash command longer than idleTimeout was force-
 	// cancelled as a false stall (observed: shamir-db f1-rename-index killed
-	// at exactly 180s during a workspace clippy). Tool runtime is bounded by
-	// the bash tool's own timeout and `crush run --timeout`, not by this
-	// provider-stall watchdog.
-	toolStarted  func()
-	toolFinished func()
+	// at exactly 180s during a workspace clippy).
+	//
+	// Each takes an `exempt` bool: true for a sub-agent delegation (the
+	// `agent` tool) — see toolStarted's own doc below for why toolMaxDuration
+	// must not apply to it.
+	toolStarted  func(exempt bool)
+	toolFinished func(exempt bool)
 	// stalled reports whether THIS watchdog (not user/web cancel) is what
 	// fired the cancel. Callers use it to distinguish "user pressed
 	// Ctrl-C" from "watchdog timed out" when crafting the finish-part
@@ -80,6 +82,25 @@ func startStreamWatchdog(
 	// toolMaxDuration to bound the tool pause. Reset to 0 when all tools
 	// finish.
 	var toolStartedAt atomic.Int64
+	// exemptToolsInFlight counts currently-running tool calls that must NOT
+	// be bounded by toolMaxDuration — specifically sub-agent delegations via
+	// the `agent` tool (see AgentToolName). A delegated sub-agent's own
+	// Run() call already has its OWN stream watchdog providing never-freeze
+	// protection for whatever IT does; bounding the PARENT's wait on that
+	// same call a second time, with the same cap meant for a single
+	// primitive tool like bash, kills perfectly healthy delegations that
+	// simply take longer than toolMaxDuration to finish non-trivial work
+	// (routinely 15-30+ minutes for real tasks) — this was a real,
+	// reproducible bug: a parent's `agent` tool call was force-cancelled by
+	// this watchdog with "context canceled" while its sub-agent was still
+	// productively working, well before the sub-agent's own internal
+	// watchdog would have had reason to fire. The idle timer still pauses
+	// normally while an exempt tool is in flight (a blocked, silent
+	// delegation call is exactly the "provider legitimately sends nothing"
+	// case toolsInFlight already exists to handle) — only the toolMaxDuration
+	// hard-cap check is skipped for as long as at least one exempt tool is
+	// part of the current in-flight batch.
+	var exemptToolsInFlight atomic.Int64
 	// absoluteDeadline is the original deadline from process start.
 	absoluteDeadline := startTime.Add(idleTimeout)
 	// hardDeadline is the hard cap (e.g. 4x idleTimeout).
@@ -114,17 +135,26 @@ func startStreamWatchdog(
 		}
 	}
 
-	toolStarted := func() {
+	toolStarted := func(exempt bool) {
 		if toolsInFlight.Add(1) == 1 {
 			toolStartedAt.Store(time.Now().UnixNano())
 		}
+		if exempt {
+			exemptToolsInFlight.Add(1)
+		}
 	}
-	toolFinished := func() {
+	toolFinished := func(exempt bool) {
 		if toolsInFlight.Add(-1) <= 0 {
 			// Defensive: a missing OnToolCall (or a double result) must not
 			// leave the counter negative and silently disable the watchdog.
 			toolsInFlight.Store(0)
 			toolStartedAt.Store(0)
+		}
+		if exempt {
+			if exemptToolsInFlight.Add(-1) < 0 {
+				// Same defensive floor as toolsInFlight above.
+				exemptToolsInFlight.Store(0)
+			}
 		}
 		// Restart the idle clock fresh: the provider is about to resume, so
 		// don't count the tool's runtime against the next stall window.
@@ -146,9 +176,12 @@ func startStreamWatchdog(
 				// fresh so the idle window starts clean once the tool returns.
 				// The pause is bounded by toolMaxDuration: past it the
 				// watchdog fires with toolTimeout=true (never-freeze
-				// backstop).
+				// backstop) — UNLESS an exempt tool (a sub-agent delegation)
+				// is part of the current batch, in which case that cap is
+				// skipped entirely for as long as it's in flight (see
+				// exemptToolsInFlight's doc above).
 				if toolsInFlight.Load() > 0 {
-					if toolMaxDuration > 0 {
+					if toolMaxDuration > 0 && exemptToolsInFlight.Load() == 0 {
 						if startedAt := toolStartedAt.Load(); startedAt > 0 {
 							if elapsed := now.Sub(time.Unix(0, startedAt)); elapsed >= toolMaxDuration {
 								stalled.Store(true)
