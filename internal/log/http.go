@@ -3,6 +3,7 @@ package log
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -169,8 +170,16 @@ func (h *HTTPRoundTripLogger) RoundTrip(req *http.Request) (*http.Response, erro
 	if logBodies && req.Body != nil && req.Body != http.NoBody {
 		preview, err := io.ReadAll(io.LimitReader(req.Body, maxBodyPreview))
 		if err != nil {
-			slog.Error("HTTP request body preview failed",
-				"method", req.Method, "url", req.URL, "error", err)
+			// The preview read failed on req.Body itself — the same reader
+			// the transport is about to send over the wire — so it is now
+			// broken or partially exhausted. Silently reconstructing a
+			// body from it and proceeding (the previous behavior) risks
+			// sending a truncated/corrupted request, or failing later with
+			// a more confusing symptom than the real cause. Fail fast here
+			// instead, with the actual read error attached, matching what
+			// RoundTrip would have to report anyway once the transport hit
+			// the same broken reader.
+			return nil, fmt.Errorf("HTTP request body preview read failed: %w", err)
 		}
 		// Rebuild the full request body so nothing is lost: the captured
 		// preview followed by whatever the original stream still holds.

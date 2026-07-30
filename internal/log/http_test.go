@@ -2,6 +2,7 @@ package log
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -195,6 +196,67 @@ func TestHTTPRoundTripLogger_StreamsAndLogsWhenDebugEnabled(t *testing.T) {
 	}
 	if !strings.Contains(logged, "chunk-0") {
 		t.Errorf("expected response preview to include chunk-0; got:\n%s", logged)
+	}
+}
+
+// erroringReadCloser is an io.ReadCloser whose Read always fails, used to
+// simulate a request body that breaks partway through — e.g. a pipe whose
+// writer side errored, or a network-backed body reader that hit a transport
+// error before RoundTrip's own preview read got to it.
+type erroringReadCloser struct {
+	err error
+}
+
+func (e *erroringReadCloser) Read(p []byte) (int, error) { return 0, e.err }
+func (e *erroringReadCloser) Close() error               { return nil }
+
+// unreachableRoundTripper fails the test if RoundTrip is ever called on it —
+// used to prove the L-4 fix returns before reaching the real transport at
+// all when the body preview read fails, rather than reconstructing a body
+// from the broken reader and sending it anyway.
+type unreachableRoundTripper struct{ t *testing.T }
+
+func (u unreachableRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
+	u.t.Fatal("inner Transport.RoundTrip must not be called when the body preview read fails")
+	return nil, nil
+}
+
+// TestHTTPRoundTripLogger_RequestBodyReadErrorFailsFast proves the L-4 fix:
+// when LogHTTPBodies is on and reading the request body preview fails (the
+// body reader itself is broken, not just truncated by maxBodyPreview — a
+// LimitReader hitting its cap surfaces as a clean io.EOF, not an error),
+// RoundTrip returns the error immediately instead of logging-and-continuing
+// with a request body reconstructed from the same broken reader. Before this
+// fix, RoundTrip would log an Error line and press on into the real
+// transport with a corrupted/truncated body.
+func TestHTTPRoundTripLogger_RequestBodyReadErrorFailsFast(t *testing.T) {
+	prevFlag := LogHTTPBodies
+	LogHTTPBodies = true
+	t.Cleanup(func() { LogHTTPBodies = prevFlag })
+
+	prevLogger := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(prevLogger) })
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelDebug})))
+
+	wantErr := errors.New("simulated broken body reader")
+	logger := &HTTPRoundTripLogger{Transport: unreachableRoundTripper{t: t}}
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "http://example.invalid/", &erroringReadCloser{err: wantErr})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.ContentLength = -1 // unknown length, matches a streaming body
+
+	resp, roundTripErr := logger.RoundTrip(req)
+
+	if resp != nil {
+		t.Errorf("expected a nil response on body-read failure, got %+v", resp)
+	}
+	if roundTripErr == nil {
+		t.Fatal("expected RoundTrip to return an error when the body preview read fails")
+	}
+	if !errors.Is(roundTripErr, wantErr) {
+		t.Errorf("expected the returned error to wrap the underlying read error via errors.Is, got %v", roundTripErr)
 	}
 }
 
