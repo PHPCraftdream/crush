@@ -112,28 +112,47 @@ const staleTempFileAge = time.Hour
 // a deploy must not fail just because old garbage from a previous run
 // couldn't be cleaned up yet.
 func SweepRenameAsideLeftovers(dst string) []string {
+	// Enumerate dst's directory and match by prefix instead of using
+	// filepath.Glob(dst + ".old-*") etc.: Glob treats '[', '?', and '*' in
+	// the pattern as metacharacters, so an install path that happens to
+	// contain any of those (Glob offers no escaping mechanism) would silently
+	// match the wrong set of files — or none at all — instead of just the
+	// leftovers next to dst. os.ReadDir + strings.HasPrefix compares dst's
+	// basename literally, so it's correct regardless of what characters
+	// appear in the path.
+	dir := filepath.Dir(dst)
+	base := filepath.Base(dst)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+
 	var removed []string
-	for _, pattern := range []string{dst + ".old-*", dst + ".bak-*"} {
-		matches, err := filepath.Glob(pattern)
-		if err != nil {
-			continue
-		}
-		for _, m := range matches {
+	for _, suffix := range []string{".old-", ".bak-"} {
+		prefix := base + suffix
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasPrefix(e.Name(), prefix) {
+				continue
+			}
+			m := filepath.Join(dir, e.Name())
 			if os.Remove(m) == nil {
 				removed = append(removed, m)
 			}
 		}
 	}
-	matches, err := filepath.Glob(dst + ".new-*")
-	if err == nil {
-		for _, m := range matches {
-			fi, statErr := os.Stat(m)
-			if statErr != nil || time.Since(fi.ModTime()) < staleTempFileAge {
-				continue
-			}
-			if os.Remove(m) == nil {
-				removed = append(removed, m)
-			}
+
+	newPrefix := base + ".new-"
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasPrefix(e.Name(), newPrefix) {
+			continue
+		}
+		m := filepath.Join(dir, e.Name())
+		fi, statErr := os.Stat(m)
+		if statErr != nil || time.Since(fi.ModTime()) < staleTempFileAge {
+			continue
+		}
+		if os.Remove(m) == nil {
+			removed = append(removed, m)
 		}
 	}
 	return removed

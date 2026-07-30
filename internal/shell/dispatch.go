@@ -364,6 +364,14 @@ const defaultSystemRoot = `C:\Windows`
 // environment). A shebang interpreter resolving here is the WSL launcher,
 // not Git Bash/MSYS bash: it expects Linux-style paths and would fail on
 // the Windows-style script path we pass.
+//
+// Includes Sysnative alongside System32/SysWOW64: Sysnative is the path a
+// 32-bit process sees to reach the "real" (64-bit) System32 on 64-bit
+// Windows, via WOW64 file-system redirection. This fork is only ever built
+// 64-bit, so a 64-bit crush process never actually resolves through
+// Sysnative in practice — but listing it is cheap and future-proofs this
+// list against a 32-bit build ever existing, without relying on us to
+// remember to add it later.
 func wslLauncherPaths() []string {
 	root := os.Getenv("SystemRoot")
 	if root == "" {
@@ -374,6 +382,8 @@ func wslLauncherPaths() []string {
 		filepath.Join(root, `System32\wsl.exe`),
 		filepath.Join(root, `SysWOW64\bash.exe`),
 		filepath.Join(root, `SysWOW64\wsl.exe`),
+		filepath.Join(root, `Sysnative\bash.exe`),
+		filepath.Join(root, `Sysnative\wsl.exe`),
 	}
 }
 

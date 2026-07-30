@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/crush/internal/platform"
+	"golang.org/x/sync/singleflight"
 )
 
 var dockerMCPVersionRunner = func(ctx context.Context) error {
@@ -23,6 +24,14 @@ var dockerMCPAvailabilityCache struct {
 	checkedAt time.Time
 	known     bool
 }
+
+// dockerMCPRefreshGroup single-flights concurrent RefreshDockerMCPAvailability
+// calls so that N goroutines racing to refresh (e.g. several callers all
+// observing a stale/unknown cache at once) share a single 'docker mcp
+// version' subprocess invocation instead of each spawning their own —
+// spawning a process is comparatively expensive and there is no benefit to
+// running it more than once for callers that overlap in time.
+var dockerMCPRefreshGroup singleflight.Group
 
 // DockerMCPName is the name of the Docker MCP configuration.
 const DockerMCPName = "docker"
@@ -53,14 +62,20 @@ func DockerMCPAvailabilityCached() (available bool, known bool) {
 }
 
 // RefreshDockerMCPAvailability refreshes and caches Docker MCP availability.
+// Concurrent calls are single-flighted (see dockerMCPRefreshGroup): only one
+// 'docker mcp version' subprocess actually runs at a time, and every caller
+// that arrived while it was in flight receives its result.
 func RefreshDockerMCPAvailability() bool {
-	available := IsDockerMCPAvailable()
-	dockerMCPAvailabilityCache.mu.Lock()
-	dockerMCPAvailabilityCache.available = available
-	dockerMCPAvailabilityCache.checkedAt = time.Now()
-	dockerMCPAvailabilityCache.known = true
-	dockerMCPAvailabilityCache.mu.Unlock()
-	return available
+	v, _, _ := dockerMCPRefreshGroup.Do("refresh", func() (any, error) {
+		available := IsDockerMCPAvailable()
+		dockerMCPAvailabilityCache.mu.Lock()
+		dockerMCPAvailabilityCache.available = available
+		dockerMCPAvailabilityCache.checkedAt = time.Now()
+		dockerMCPAvailabilityCache.known = true
+		dockerMCPAvailabilityCache.mu.Unlock()
+		return available, nil
+	})
+	return v.(bool)
 }
 
 // IsDockerMCPEnabled checks if Docker MCP is already configured.

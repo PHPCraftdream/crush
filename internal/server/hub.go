@@ -127,6 +127,15 @@ type replayBuffer struct {
 }
 
 // newReplayBuffer returns an empty ring buffer with capacity maxBufferSize.
+//
+// This always allocates a maxBufferSize-length []byte slice up front (2000
+// nil pointers, ~16 KiB on 64-bit) regardless of how much traffic the hub
+// ever sees. That's a deliberate, negligible cost today because there is
+// exactly one Hub (and therefore one replayBuffer) per server process — see
+// the single newHub() call in server.go. If the hub model ever changes to
+// one-per-session (many hubs alive concurrently), this eager allocation
+// should be revisited (e.g. lazy/smaller initial capacity that grows), since
+// the per-hub cost would then multiply by the number of live sessions.
 func newReplayBuffer() replayBuffer {
 	return replayBuffer{buf: make([][]byte, maxBufferSize)}
 }
@@ -225,7 +234,13 @@ func (h *Hub) Run(ctx context.Context) {
 			}
 
 		case msg := <-h.broadcast:
-			h.buffer.push(msg) // store (skips oversized events; eviction handled inside)
+			// Return value intentionally discarded: push already logs (at
+			// debug level) when an event is rejected for exceeding
+			// replayMaxEventSize, which is the only case where it returns
+			// false. There's no additional metric consuming that signal
+			// today, so explicitly discarding it here documents that the
+			// omission is a choice, not an oversight.
+			_ = h.buffer.push(msg) // store (skips oversized events; eviction handled inside)
 
 			// Fan-out to all active clients (non-blocking; slow clients drop messages).
 			for c := range h.clients {

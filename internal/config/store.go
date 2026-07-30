@@ -478,6 +478,27 @@ func (s *ConfigStore) RemoveConfigField(scope Scope, key string) error {
 // both the full-timeout public API and the short-timeout internal caller
 // (configureProviders) go through one write implementation.
 func (s *ConfigStore) removeConfigFieldAt(ctx context.Context, path, key string) error {
+	// Skip acquiring the write lock entirely when there is no config file to
+	// edit: withConfigWriteLockCtx creates a path+".lock" sidecar (and its
+	// parent directory) as a side effect of acquiring the OS-level lock, so
+	// without this check, removing a field from a config that was never
+	// written (a clean install, or a scope whose file genuinely doesn't
+	// exist) would leave behind an empty *.lock file and directory for no
+	// reason. There is nothing to delete from a nonexistent file, so this is
+	// a legitimate no-op rather than an error.
+	//
+	// This check races benignly against a concurrent process creating path:
+	// if that happens in the narrow window between this Stat and the lock
+	// acquisition below, this call simply misses removing the key this time
+	// (the same best-effort semantics removeConfigFieldBestEffort already
+	// documents) rather than erroring or corrupting anything.
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to stat config file: %w", err)
+	}
+
 	return s.withConfigWriteLockCtx(ctx, path, func() error {
 		data, err := os.ReadFile(path)
 		if err != nil {

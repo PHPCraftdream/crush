@@ -66,6 +66,16 @@ const (
 // Start's completion goroutine. Defaults to BufferRetentionMinutes; tests
 // override it to a short duration to exercise the timer path without waiting
 // 15 minutes.
+//
+// Deliberately NOT t.Setenv-style scoped: it's a plain package-level var
+// mutated directly (e.g. `bufferRetention = 50 * time.Millisecond`) by tests
+// in this package, with no lock guarding reads/writes. That's safe only as
+// long as no test overriding it ever runs under t.Parallel() — see the
+// identical warning on isolatedModelsEnv in internal/cmd/models_use_test.go
+// and on TestIsWSLLauncher_FallsBackWhenSystemRootUnset in
+// dispatch_windows_test.go for the same pattern. If a future test needs
+// t.Parallel() here, this must first become a per-manager field (or use
+// t.Setenv-equivalent synchronization) instead of a shared package var.
 var bufferRetention = time.Duration(BufferRetentionMinutes) * time.Minute
 
 // boundedBuffer is a thread-safe, size-bounded byte sink used for a single
