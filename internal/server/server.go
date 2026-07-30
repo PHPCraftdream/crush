@@ -9,18 +9,12 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	appPkg "github.com/charmbracelet/crush/internal/app"
 	"github.com/gorilla/websocket"
 )
-
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  64 * 1024,
-	WriteBufferSize: 64 * 1024,
-	// Allow all origins for local use; tighten for production deployments.
-	CheckOrigin: func(r *http.Request) bool { return true },
-}
 
 // Server wires together the HTTP mux, the WebSocket hub, and the app.
 type Server struct {
@@ -29,6 +23,54 @@ type Server struct {
 	auth   *Auth
 	addr   string
 	static fs.FS
+
+	// port is the actual TCP port the listener bound to. It's populated once
+	// Start() binds the listener (useful when addr requested port 0), and is
+	// read by checkOrigin to validate the WebSocket handshake's Origin header
+	// against the port this server is actually reachable on.
+	port string
+}
+
+// checkOrigin validates the WebSocket handshake's Origin header. This is the
+// only thing standing between a page open in the operator's browser and full
+// control of the agent over ws://<host>:<port>/ws if it's ever wrong — the
+// session cookie's SameSite=Strict is a second layer, but browsers that don't
+// enforce SameSite, a relaxed SameSite in the future, or a token leaked into
+// ?token= would leave CheckOrigin as the only remaining guard (CSWSH).
+//
+// Non-browser clients (CLI, scripts, curl, gorilla/websocket dialers) don't
+// send an Origin header at all, so an empty Origin is accepted — this is the
+// fork's primary non-interactive use case and must keep working.
+//
+// Browser-originated requests are accepted only from http://localhost:<port>
+// or http://127.0.0.1:<port> (and http://[::1]:<port> when applicable),
+// where <port> is the port this server actually bound to. This intentionally
+// ignores scheme upgrades to https and ignores whatever host the operator
+// passed via --host: the WS endpoint is meant to be reached from a browser
+// running on the same machine, regardless of which interface the listener is
+// bound to (e.g. -H 0.0.0.0 still serves a UI meant to be opened at
+// localhost).
+func (s *Server) checkOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		// Non-browser client: CLI, script, curl, or a WS library that never
+		// sets Origin. Browsers always send this header for cross-origin
+		// (and same-origin) WS handshakes, so an empty value can't come from
+		// a page in a browser.
+		return true
+	}
+
+	allowed := []string{
+		"http://localhost:" + s.port,
+		"http://127.0.0.1:" + s.port,
+		"http://[::1]:" + s.port,
+	}
+	for _, a := range allowed {
+		if strings.EqualFold(origin, a) {
+			return true
+		}
+	}
+	return false
 }
 
 // New creates a Server. Pass a nil staticFS to proxy the dev server instead.
@@ -53,6 +95,13 @@ func (s *Server) Start(ctx context.Context, onReady func(addr string)) error {
 	ln, err := lc.Listen(ctx, "tcp", s.addr)
 	if err != nil {
 		return err
+	}
+
+	// Record the actual bound port (resolves "host:0" to whatever the OS
+	// picked) so checkOrigin can validate the WS handshake's Origin header
+	// against the port this server is really reachable on.
+	if _, port, splitErr := net.SplitHostPort(ln.Addr().String()); splitErr == nil {
+		s.port = port
 	}
 
 	go s.hub.Run(ctx)
@@ -105,6 +154,11 @@ func (s *Server) Start(ctx context.Context, onReady func(addr string)) error {
 
 // handleWS upgrades the connection and runs the client read/write pumps.
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
+	upgrader := websocket.Upgrader{
+		ReadBufferSize:  64 * 1024,
+		WriteBufferSize: 64 * 1024,
+		CheckOrigin:     s.checkOrigin,
+	}
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		slog.Debug("ws: upgrade failed", "err", err)

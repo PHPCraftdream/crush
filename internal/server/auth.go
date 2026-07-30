@@ -2,9 +2,11 @@ package server
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -28,6 +30,19 @@ func newAuth() *Auth {
 // Token returns the human-visible token string to print in the terminal.
 func (a *Auth) Token() string { return a.token }
 
+// secureCompare reports whether got equals want using a constant-time
+// comparison, so a timing side-channel can't be used to guess the auth token
+// one character at a time. subtle.ConstantTimeCompare requires equal-length
+// slices (it returns 0, i.e. unequal, for mismatched lengths without a timing
+// leak of its own — Go's runtime doesn't short-circuit on len() checks), so a
+// length mismatch is treated as "not equal" up front without calling into it.
+func secureCompare(got, want string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
+}
+
 // HandleAuth handles POST /auth — validates the submitted token and sets a
 // session cookie on success.
 func (a *Auth) HandleAuth(w http.ResponseWriter, r *http.Request) {
@@ -42,7 +57,7 @@ func (a *Auth) HandleAuth(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	if body.Token != a.token {
+	if !secureCompare(body.Token, a.token) {
 		http.Error(w, "invalid token", http.StatusUnauthorized)
 		return
 	}
@@ -86,15 +101,16 @@ func (a *Auth) Middleware(next http.Handler) http.Handler {
 //   - ?token=<token> query parameter (for WebSocket clients)
 func (a *Auth) isValid(r *http.Request) bool {
 	// Cookie (primary method for browser clients).
-	if c, err := r.Cookie(cookieName); err == nil && c.Value == a.token {
+	if c, err := r.Cookie(cookieName); err == nil && secureCompare(c.Value, a.token) {
 		return true
 	}
 	// Authorization header (Bearer token).
-	if auth := r.Header.Get("Authorization"); auth == "Bearer "+a.token {
+	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") &&
+		secureCompare(strings.TrimPrefix(auth, "Bearer "), a.token) {
 		return true
 	}
 	// Query parameter (fallback for WS where headers are hard to set).
-	if r.URL.Query().Get("token") == a.token {
+	if secureCompare(r.URL.Query().Get("token"), a.token) {
 		return true
 	}
 	return false
