@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	hyperp "github.com/charmbracelet/crush/internal/agent/hyper"
 	"github.com/charmbracelet/crush/internal/csync"
 	"github.com/charmbracelet/crush/internal/oauth"
 	"github.com/stretchr/testify/require"
@@ -137,6 +138,55 @@ func TestConfigStore_RuntimeOverrides_SetterPublishesNewGeneration(t *testing.T)
 	store.SetSkipPermissionRequests(true)
 
 	require.True(t, store.Overrides().SkipPermissionRequests)
+}
+
+// TestConfigStore_UpdateAgentAllowedTools_PublishesNewGenerationWithoutMutatingOldSnapshot
+// pins the copy-on-write contract of UpdateAgentAllowedTools: a *Config
+// pointer captured via Config() BEFORE the call must NOT observe the
+// change (it's a distinct, frozen generation), while a Config() call AFTER
+// sees the update. This is the regression test for the bug UpdateAgentAllowedTools
+// replaces — the old disableToolsInConfig wrote straight into
+// cfg.Agents[id] on the currently-published *Config, which meant any
+// reader holding that same pointer from before the call would see the
+// mutation retroactively.
+func TestConfigStore_UpdateAgentAllowedTools_PublishesNewGenerationWithoutMutatingOldSnapshot(t *testing.T) {
+	t.Parallel()
+
+	store := newTestConfigStore(testStoreOpts{
+		config: &Config{
+			Agents: map[string]Agent{
+				AgentCoder: {
+					ID:           AgentCoder,
+					AllowedTools: []string{"view", "grep", "agent", "agentic_fetch", "bash", "edit"},
+				},
+			},
+		},
+	})
+
+	// Capture the *Config pointer BEFORE the mutation, simulating a
+	// concurrent reader that read Config() earlier and is still holding
+	// that pointer (e.g. mid-turn).
+	oldCfg := store.Config()
+	oldTools := oldCfg.Agents[AgentCoder].AllowedTools
+
+	store.UpdateAgentAllowedTools(AgentCoder, []string{"view", "grep", "bash", "edit"})
+
+	// The old snapshot's Config must be completely unaffected: neither its
+	// Agents map entry nor the AllowedTools slice it pointed to should
+	// have changed underneath the earlier reader.
+	require.Equal(t, []string{"view", "grep", "agent", "agentic_fetch", "bash", "edit"}, oldCfg.Agents[AgentCoder].AllowedTools,
+		"a *Config captured before UpdateAgentAllowedTools must not observe the mutation")
+	require.Equal(t, []string{"view", "grep", "agent", "agentic_fetch", "bash", "edit"}, oldTools,
+		"the AllowedTools slice captured before the call must not be touched in place")
+
+	// A fresh Config() call after the mutation sees the new generation.
+	newCfg := store.Config()
+	require.Equal(t, []string{"view", "grep", "bash", "edit"}, newCfg.Agents[AgentCoder].AllowedTools,
+		"Config() after UpdateAgentAllowedTools must see the new generation")
+
+	// The two *Config pointers must be distinct — proof that a new
+	// generation was published rather than the old one mutated in place.
+	require.NotSame(t, oldCfg, newCfg, "UpdateAgentAllowedTools must publish a new *Config, not mutate the old one")
 }
 
 func TestGlobalWorkspaceDir(t *testing.T) {
@@ -789,6 +839,155 @@ func TestSetProviderRuntimeConfig_VisibleImmediatelyAndDiscardedByReload(t *test
 	require.True(t, ok)
 	require.Equal(t, "disk-key", pc3.APIKey,
 		"reload must rebuild Providers from disk, discarding runtime-only updates")
+}
+
+// TestRefreshOAuthToken_SurvivesReloadDuringNetworkCall is the regression
+// test for the P2.1 finding: RefreshOAuthToken used to capture the
+// Providers *csync.Map ONCE at the top of the function and write the
+// refreshed token into that same captured map at the very end, AFTER the
+// network round-trip (copilotRefreshTokenFn / hyperExchangeTokenFn). Every
+// reload allocates a brand new *csync.Map (see SetProviderRuntimeConfig's
+// doc comment), so if a reload published a new generation while the
+// network call was in flight, the final write landed in the OLD,
+// already-orphaned map — invisible to any reader of the current snapshot.
+//
+// This test overrides hyperExchangeTokenFn (restored via t.Cleanup) to
+// block until the test goroutine has published a new generation (simulating
+// a concurrent reload), THEN return the refreshed token — reproducing "a
+// reload happened while we were waiting on the network" deterministically,
+// without a real HTTP call and without relying on hyper.BaseURL()'s
+// process-wide sync.OnceValue memoization (see
+// TestProviders_ConcurrentErrorCollection_NotLost's caveat in
+// provider_test.go for why that path can't be redirected safely per-test).
+//
+// The store is built via newTestConfigStore with no workingDir, so
+// RefreshOAuthToken's own SetConfigFields call at the end succeeds in
+// writing to globalDataPath but its trailing autoReload is skipped (see
+// autoReload's "workingDir == "" " guard) — this is deliberate: if
+// autoReload ran, it would re-read the very token RefreshOAuthToken just
+// persisted to disk and transparently re-sync the in-memory Providers map,
+// self-healing the exact bug this test targets and making the buggy and
+// fixed code indistinguishable from the test's perspective. Skipping it
+// isolates what we actually want to observe: whether RefreshOAuthToken's
+// OWN in-memory write landed in the orphaned pre-reload map or the current
+// one — independent of any later disk-driven resync.
+func TestRefreshOAuthToken_SurvivesReloadDuringNetworkCall(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "crush.json")
+	require.NoError(t, os.WriteFile(configPath, []byte("{}"), 0o600))
+
+	oldToken := &oauth.Token{
+		AccessToken:  "old-access-token",
+		RefreshToken: "refresh-token-1",
+		ExpiresIn:    3600,
+		ExpiresAt:    time.Now().Add(-time.Hour).Unix(), // expired, forces refresh
+	}
+	providers := csync.NewMap[string, ProviderConfig]()
+	providers.Set(hyperp.Name, ProviderConfig{
+		ID:         hyperp.Name,
+		Name:       "Hyper",
+		APIKey:     oldToken.AccessToken,
+		OAuthToken: oldToken,
+	})
+
+	store := newTestConfigStore(testStoreOpts{
+		config: &Config{
+			Providers: providers,
+		},
+		globalDataPath: configPath,
+	})
+
+	mapBeforeReload := store.Config().Providers
+
+	// Override the network call: signal reachedNetworkCall as soon as
+	// RefreshOAuthToken has entered it (proof that it already captured
+	// `providers := s.loadSnapshot().config.Providers` at the top of the
+	// function, since that capture happens strictly before this call), then
+	// block until the test has published a new generation (simulating a
+	// concurrent reload), THEN return the refreshed token. Without this
+	// handshake, the goroutine below racing the reload published right
+	// after it could lose the race and observe the NEW generation from the
+	// start — which would make this test pass even against the buggy code,
+	// since there would be no orphaned map involved at all.
+	reachedNetworkCall := make(chan struct{})
+	reloadDone := make(chan struct{})
+	origFn := hyperExchangeTokenFn
+	hyperExchangeTokenFn = func(ctx context.Context, refreshToken string) (*oauth.Token, error) {
+		close(reachedNetworkCall)
+		<-reloadDone
+		return &oauth.Token{
+			AccessToken:  "new-access-token",
+			RefreshToken: "refresh-token-2",
+			ExpiresIn:    3600,
+			ExpiresAt:    time.Now().Add(time.Hour).Unix(),
+		}, nil
+	}
+	t.Cleanup(func() { hyperExchangeTokenFn = origFn })
+
+	refreshErrCh := make(chan error, 1)
+	go func() {
+		refreshErrCh <- store.RefreshOAuthToken(context.Background(), ScopeGlobal, hyperp.Name)
+	}()
+
+	select {
+	case <-reachedNetworkCall:
+	case <-time.After(10 * time.Second):
+		t.Fatal("RefreshOAuthToken did not reach the network call in time")
+	}
+
+	// Simulate a concurrent reload publishing a new generation with a
+	// BRAND NEW Providers map (containing the pre-refresh provider config,
+	// exactly as a real reload rebuilding from the same on-disk state
+	// would) while the refresh call above is blocked inside
+	// hyperExchangeTokenFn. This reproduces the exact "orphaned map"
+	// scenario the fix addresses: RefreshOAuthToken captured
+	// mapBeforeReload before this point (guaranteed by the handshake
+	// above), but the current generation now points at a different map.
+	newProviders := csync.NewMap[string, ProviderConfig]()
+	newProviders.Set(hyperp.Name, ProviderConfig{
+		ID:         hyperp.Name,
+		Name:       "Hyper",
+		APIKey:     oldToken.AccessToken,
+		OAuthToken: oldToken,
+	})
+	store.publishMu.Lock()
+	next := store.loadSnapshot().clone()
+	cfgCopy := *next.config
+	cfgCopy.Providers = newProviders
+	next.config = &cfgCopy
+	store.publishLocked(next)
+	store.publishMu.Unlock()
+
+	mapAfterReload := store.Config().Providers
+	require.NotSame(t, mapBeforeReload, mapAfterReload,
+		"sanity check: the simulated reload must publish a brand new Providers map")
+
+	close(reloadDone)
+
+	select {
+	case err := <-refreshErrCh:
+		require.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("RefreshOAuthToken did not return in time")
+	}
+
+	// The refreshed token must be visible in the CURRENTLY published
+	// snapshot, not lost in the pre-reload map RefreshOAuthToken captured
+	// at its start.
+	finalPC, ok := store.Config().Providers.Get(hyperp.Name)
+	require.True(t, ok)
+	require.Equal(t, "new-access-token", finalPC.APIKey,
+		"refreshed token must be visible in the current generation, not dropped into an orphaned map")
+	require.Equal(t, "new-access-token", finalPC.OAuthToken.AccessToken)
+	require.Equal(t, "refresh-token-2", finalPC.OAuthToken.RefreshToken)
+
+	// mapBeforeReload (the orphaned pre-reload map) must NOT have received
+	// the refreshed token — that's the exact failure mode of the bug: a
+	// write into a map no reader can reach anymore.
+	orphanedPC, ok := mapBeforeReload.Get(hyperp.Name)
+	require.True(t, ok)
+	require.Equal(t, "old-access-token", orphanedPC.APIKey,
+		"the orphaned pre-reload map must be untouched by RefreshOAuthToken's write")
 }
 
 // TestProviderUpdates_ConcurrentReloadNoRace runs SetProviderRuntimeConfig

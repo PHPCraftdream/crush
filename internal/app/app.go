@@ -215,6 +215,15 @@ func (app *App) disableSubAgentToolsInConfig() {
 // `agent` tool while keeping `agentic_fetch` stripped, without
 // duplicating the filter loop.
 //
+// Reads the currently-published config via Config() (read-only, per its
+// documented contract) to compute the filtered tool list, then applies the
+// change through ConfigStore.UpdateAgentAllowedTools, which publishes it as
+// a new generation via the copy-on-write path instead of writing directly
+// into cfg.Agents[...] on the already-published *Config — see
+// UpdateAgentAllowedTools's doc comment for why that in-place write was a
+// contract violation (a concurrent reader holding the old *Config would see
+// the mutation retroactively).
+//
 // Fork patch (orchestrator UX, plan phase 2): bypass restores `agent` only.
 func (app *App) disableToolsInConfig(toolNames []string) {
 	cfg := app.config.Config()
@@ -232,8 +241,7 @@ func (app *App) disableToolsInConfig(toolNames []string) {
 		}
 		filtered = append(filtered, t)
 	}
-	coder.AllowedTools = filtered
-	cfg.Agents[config.AgentCoder] = coder
+	app.config.UpdateAgentAllowedTools(config.AgentCoder, filtered)
 }
 
 // shouldBypassSubAgentBan decides whether the `crush run` default

@@ -218,11 +218,6 @@ func (s *ConfigStore) KnownProviders() []catwalk.Provider {
 	return s.loadSnapshot().knownProviders
 }
 
-// SetupAgents configures the coder and task agents on the config.
-func (s *ConfigStore) SetupAgents() {
-	s.loadSnapshot().config.SetupAgents()
-}
-
 // Overrides returns the runtime overrides as a value copy. Callers cannot
 // mutate the store's internal snapshot state through the returned value —
 // use SetSkipPermissionRequests for writes, which goes through the
@@ -817,6 +812,34 @@ func (s *ConfigStore) SetSelectedModelRuntime(modelType SelectedModelType, model
 	})
 }
 
+// UpdateAgentAllowedTools replaces the given agent's AllowedTools in memory
+// ONLY (not persisted to disk), via the same copy-on-write publish path as
+// every other in-memory-only mutator (see SetSelectedModelRuntime,
+// SetProviderRuntimeConfig). The change is published as a new generation
+// instead of mutating whatever *Config a concurrent reader currently holds
+// via Config() in place.
+//
+// It exists for callers like app.disableToolsInConfig (`crush run`'s
+// sub-agent ban / smart+worker bypass), which used to do
+// cfg := app.config.Config(); cfg.Agents[id] = agent — writing straight into
+// the map backing the currently-published snapshot. Config() is documented
+// as read-only after load; any reader that captured a *Config pointer before
+// that write (e.g. a concurrent goroutine mid-turn) would see the mutated
+// AllowedTools retroactively, and any reader that captures one after would
+// see it too even though no new generation was actually published. Routing
+// through updateConfig instead clones Agents (a map, so updateConfig's
+// shallow top-level *Config copy alone does not protect it — mutate is
+// responsible for cloning nested maps, see updateConfig's doc comment)
+// before writing the single entry, so old snapshots are left untouched.
+func (s *ConfigStore) UpdateAgentAllowedTools(agentID string, tools []string) {
+	s.updateConfig(func(cfgCopy *Config) {
+		cfgCopy.Agents = maps.Clone(cfgCopy.Agents)
+		agent := cfgCopy.Agents[agentID]
+		agent.AllowedTools = tools
+		cfgCopy.Agents[agentID] = agent
+	})
+}
+
 // SetCompactMode sets the compact mode setting and persists it.
 func (s *ConfigStore) SetCompactMode(scope Scope, enabled bool) error {
 	s.updateConfig(func(cfgCopy *Config) {
@@ -962,6 +985,20 @@ func (s *ConfigStore) SetProviderRuntimeConfig(providerID string, pc ProviderCon
 	s.loadSnapshot().config.Providers.Set(providerID, pc)
 }
 
+// copilotRefreshTokenFn and hyperExchangeTokenFn indirect the two external
+// OAuth refresh calls used by RefreshOAuthToken below. They default to the
+// real network-calling implementations; tests override them (package-private,
+// restored via t.Cleanup) to simulate a slow refresh call — e.g. one that
+// blocks until a concurrent ReloadFromDisk has published a new generation —
+// without making a real network call or depending on hyper.BaseURL()'s
+// process-wide sync.OnceValue memoization (see the caveat on
+// TestProviders_ConcurrentErrorCollection_NotLost in provider_test.go for why
+// that value cannot be safely redirected per-test).
+var (
+	copilotRefreshTokenFn = copilot.RefreshToken
+	hyperExchangeTokenFn  = hyper.ExchangeToken
+)
+
 // RefreshOAuthToken refreshes the OAuth token for the given provider.
 // Before making an external refresh request, it checks the config file on
 // disk to see if another Crush session has already refreshed the token. If
@@ -994,9 +1031,9 @@ func (s *ConfigStore) RefreshOAuthToken(ctx context.Context, scope Scope, provid
 	var refreshErr error
 	switch providerID {
 	case string(catwalk.InferenceProviderCopilot):
-		refreshedToken, refreshErr = copilot.RefreshToken(ctx, providerConfig.OAuthToken.RefreshToken)
+		refreshedToken, refreshErr = copilotRefreshTokenFn(ctx, providerConfig.OAuthToken.RefreshToken)
 	case hyperp.Name:
-		refreshedToken, refreshErr = hyper.ExchangeToken(ctx, providerConfig.OAuthToken.RefreshToken)
+		refreshedToken, refreshErr = hyperExchangeTokenFn(ctx, providerConfig.OAuthToken.RefreshToken)
 	default:
 		return fmt.Errorf("OAuth refresh not supported for provider %s", providerID)
 	}
@@ -1023,7 +1060,16 @@ func (s *ConfigStore) RefreshOAuthToken(ctx context.Context, scope Scope, provid
 		providerConfig.SetupGitHubCopilot()
 	}
 
-	providers.Set(providerID, providerConfig)
+	// Re-capture the Providers map here instead of reusing the `providers`
+	// local captured at the top of this function: copilot.RefreshToken /
+	// hyper.ExchangeToken above made a network round-trip, and a concurrent
+	// reload could have published a brand new *csync.Map (every reload
+	// allocates a fresh one, see SetProviderRuntimeConfig's doc comment)
+	// while that call was in flight. Writing into the stale `providers`
+	// local would land in an already-orphaned map invisible to any reader
+	// of the current snapshot — exactly the bug applyToken already avoids
+	// by re-loading the snapshot immediately before its Set.
+	s.loadSnapshot().config.Providers.Set(providerID, providerConfig)
 
 	if err := s.SetConfigFields(scope, map[string]any{
 		fmt.Sprintf("providers.%s.api_key", providerID): refreshedToken.AccessToken,
