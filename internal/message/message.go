@@ -131,7 +131,18 @@ func NewService(q db.Querier) Service {
 // WAL-mode read-only pool here so transcript pagination and message listing
 // run concurrently with the single writer connection instead of queuing
 // behind it. Passing a nil qRead behaves exactly like NewService.
-func NewServiceWithReader(q db.Querier, qRead db.Querier) Service {
+//
+// qRead is deliberately the concrete *db.Queries type, not the db.Querier
+// interface: a nil *db.Queries boxed into a db.Querier interface value is
+// itself non-nil (Go's typed-nil-in-interface gotcha — the interface has a
+// type descriptor even though the underlying pointer is nil), which would
+// make the "if qRead != nil" fallback below never fire. That is exactly
+// the case internal/app.New hits whenever db.ConnectRead fails and
+// deliberately passes a nil *db.Queries reader intending to fall back to
+// the writer (see app.go's doc comment on that path) — with the interface
+// type, this method would silently install the typed-nil as qRead instead
+// of falling back, and every subsequent s.qRead.* call would nil-dereference.
+func NewServiceWithReader(q db.Querier, qRead *db.Queries) Service {
 	svc := NewService(q).(*service)
 	if qRead != nil {
 		svc.qRead = qRead
@@ -363,6 +374,22 @@ func (s *service) Count(ctx context.Context, sessionID string) (int64, error) {
 // second only (which is bounded to however many messages share one second,
 // not the whole table).
 func (s *service) ListPaginatedSnapshot(ctx context.Context, sessionID string, limit, offset int) ([]Message, int64, error) {
+	if limit <= 0 {
+		// Defensive: the only caller (read_delegation_transcript.go's
+		// clampTranscriptWindow) always clamps to a positive default before
+		// calling in, so this is unreached in production today. But
+		// make([]db.Message, 0, limit) below panics for a negative limit,
+		// and limit == 0 would otherwise still return exactly one row (the
+		// tied-second loop appends before checking len(dbMessages) >=
+		// limit) instead of the zero rows a caller asking for "0 messages"
+		// should get.
+		total, err := s.qRead.CountMessagesBySession(ctx, sessionID)
+		if err != nil {
+			return nil, 0, err
+		}
+		return []Message{}, total, nil
+	}
+
 	cursor, err := s.qRead.GetTranscriptWindowCursor(ctx, db.GetTranscriptWindowCursorParams{
 		SessionID: sessionID,
 		Offset:    int64(offset),

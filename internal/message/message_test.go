@@ -768,3 +768,81 @@ func TestListPaginatedSnapshot_StablePagingWhenWritesArePaused(t *testing.T) {
 	require.Empty(t, missing, "seeded messages missing across the paged walk: %v", missing)
 	require.Empty(t, dup, "seeded messages duplicated across the paged walk: %v", dup)
 }
+
+// TestNewServiceWithReader_NilConcreteQueriesFallsBackToWriter is the
+// regression test for @oh's review finding 7 (docs/reviews review-of-review,
+// task #175): NewServiceWithReader's qRead parameter must be the concrete
+// *db.Queries type, not the db.Querier interface, because a nil *db.Queries
+// boxed into a db.Querier interface value is itself non-nil (Go's
+// typed-nil-in-interface gotcha) — with the old interface-typed signature,
+// passing a nil *db.Queries (exactly what internal/app.New does whenever
+// db.ConnectRead fails and degrades to the writer) would silently install
+// the typed-nil as qRead instead of falling back to q, and every subsequent
+// s.qRead.* call would nil-dereference. This proves passing a nil
+// *db.Queries falls back to the writer and every read path stays usable.
+func TestNewServiceWithReader_NilConcreteQueriesFallsBackToWriter(t *testing.T) {
+	_, q := newTestMessageDB(t)
+	ctx := t.Context()
+	sessionID := "test-session-nil-reader-fallback"
+
+	var nilReader *db.Queries // exactly what internal/app.New passes on a failed db.ConnectRead
+	svc := NewServiceWithReader(q, nilReader)
+
+	created, err := svc.Create(ctx, sessionID, CreateMessageParams{
+		Role:  Assistant,
+		Parts: []ContentPart{TextContent{Text: "hello"}},
+	})
+	require.NoError(t, err)
+
+	// Every one of these calls goes through s.qRead internally (see the
+	// service struct's doc comment) — if the typed-nil bug were present,
+	// each would nil-dereference instead of returning normally.
+	got, err := svc.Get(ctx, created.ID)
+	require.NoError(t, err, "Get must fall back to the writer connection, not nil-dereference a typed-nil qRead")
+	require.Equal(t, created.ID, got.ID)
+
+	list, err := svc.List(ctx, sessionID)
+	require.NoError(t, err)
+	require.Len(t, list, 1)
+
+	count, err := svc.Count(ctx, sessionID)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, count)
+
+	window, total, err := svc.ListPaginatedSnapshot(ctx, sessionID, 10, 0)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, total)
+	require.Len(t, window, 1)
+}
+
+// TestListPaginatedSnapshot_NonPositiveLimit is the regression test for
+// @oh's review finding 11 (docs/reviews review-of-review, task #175):
+// ListPaginatedSnapshot must not panic on a negative limit
+// (make([]db.Message, 0, limit) panics for negative capacity) and must
+// return zero messages for limit == 0 (the tied-second loop previously
+// appended one row before checking len(dbMessages) >= limit, so limit == 0
+// returned exactly one row instead of none). Both are unreachable in
+// production today — the only caller, read_delegation_transcript.go's
+// clampTranscriptWindow, always clamps to a positive default — but this
+// guards the defensive fix added for exactly that reason.
+func TestListPaginatedSnapshot_NonPositiveLimit(t *testing.T) {
+	_, q := newTestMessageDB(t)
+	svc := NewService(q)
+	ctx := t.Context()
+	sessionID := "test-session-nonpositive-limit"
+
+	for i := 0; i < 5; i++ {
+		_, err := svc.Create(ctx, sessionID, CreateMessageParams{
+			Role:  Assistant,
+			Parts: []ContentPart{TextContent{Text: fmt.Sprintf("seed-%d", i)}},
+		})
+		require.NoError(t, err)
+	}
+
+	for _, limit := range []int{0, -1, -100} {
+		window, total, err := svc.ListPaginatedSnapshot(ctx, sessionID, limit, 0)
+		require.NoError(t, err, "limit=%d must not error", limit)
+		require.Empty(t, window, "limit=%d must return zero messages, not panic or return a partial window", limit)
+		require.EqualValues(t, 5, total, "limit=%d must still report the correct total count", limit)
+	}
+}
