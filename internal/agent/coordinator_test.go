@@ -1663,6 +1663,60 @@ func TestResetAutoResumeCounter(t *testing.T) {
 	assert.Equal(t, 0, coord.consecutiveResume(sid))
 }
 
+// TestRunAutoResumeRecovered_Panic proves that a panic raised anywhere
+// inside runFn (standing in for the Phase 4 auto-resume closure over c.Run
+// in notifyBackgroundJobDone, which re-enters the full synchronous
+// tool-dispatch chain) is recovered rather than crashing the process. This
+// goroutine is spawned independently of BackgroundShell.OnDone's own
+// recover(), so it needs its own — without it, a panic here (e.g. from a
+// tool call made during the auto-resumed turn) would kill the whole crush
+// process with no log output, at an arbitrary time after the triggering
+// background job finished.
+func TestRunAutoResumeRecovered_Panic(t *testing.T) {
+	done := make(chan struct{})
+	panicking := func(ctx context.Context) (*fantasy.AgentResult, error) {
+		defer close(done)
+		panic("boom: simulated panic inside Phase 4 auto-resume Run")
+	}
+
+	// Run on its own goroutine, same as production, so an unrecovered panic
+	// would take down the test binary rather than just this function.
+	go runAutoResumeRecovered(t.Context(), "sess-1", "shell-1", panicking)
+
+	select {
+	case <-done:
+		// Expected: runFn ran (and panicked) without crashing the test
+		// process — reaching this line at all is the core assertion.
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for panicking runFn to run — goroutine likely died silently")
+	}
+}
+
+// TestRunAutoResumeRecovered_NormalErrorUnaffected verifies the existing,
+// expected error-handling path (a normal Go error returned by runFn, e.g.
+// because the session was already closed) is completely untouched by the
+// new recover() — it must not be misclassified as a panic or swallowed
+// differently than before.
+func TestRunAutoResumeRecovered_NormalErrorUnaffected(t *testing.T) {
+	called := make(chan struct{})
+	erroring := func(ctx context.Context) (*fantasy.AgentResult, error) {
+		defer close(called)
+		return nil, assert.AnError
+	}
+
+	// Must return promptly (no panic, no goroutine involved needed here
+	// since erroring doesn't panic) and must not itself panic.
+	require.NotPanics(t, func() {
+		runAutoResumeRecovered(t.Context(), "sess-2", "shell-2", erroring)
+	})
+
+	select {
+	case <-called:
+	default:
+		t.Fatal("runFn was not invoked")
+	}
+}
+
 // newRoleModelTestCoordinator builds a coordinator wired with distinct Large,
 // Small, and (optionally) Worker model slots, each backed by its own
 // offline-safe openai-type provider (building an openai.Provider only

@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"runtime/debug"
 	"slices"
 	"sort"
 	"strings"
@@ -909,6 +910,69 @@ func cancelledRunError(runErr error, finalReason, finalErrTitle, finalErrDetails
 	return &runIncompleteError{reason: "cancelled"}
 }
 
+// agentTurnResponse carries the outcome of one asynchronous
+// AgentCoordinator.Run call back to RunNonInteractive's event loop, via the
+// done channel below runAgentTurnRecovered writes into.
+type agentTurnResponse struct {
+	result *fantasy.AgentResult
+	err    error
+}
+
+// runAgentTurnRecovered runs runFn (normally app.AgentCoordinator.Run) on the
+// calling goroutine and always sends exactly one agentTurnResponse into done,
+// including when runFn panics.
+//
+// Without this, a panic anywhere inside AgentCoordinator.Run — which
+// includes every tool call it executes synchronously, e.g. bash, edit,
+// grep, or a sub-agent delegation via the `agent` tool (runSubAgent calls
+// params.Agent.Run synchronously on this same call stack, see
+// coordinator.go's runSubAgent) — would crash the entire crush.exe process
+// via Go's default panic handler, which writes only to os.Stderr and never
+// through slog. For `crush run` invocations whose stderr isn't captured by
+// whatever launched them, that's a silent death with zero log output. It
+// also left RunNonInteractive's `case result := <-done` select blocked
+// forever, since nothing would ever send on the channel.
+//
+// This mirrors the panic-isolation pattern already used for WebSocket
+// handlers in internal/server/hub.go (runRecovered / Client.dispatch): log
+// via slog.Error with a full stack trace, then report a normal error result
+// instead of letting the panic propagate.
+func runAgentTurnRecovered(
+	ctx context.Context,
+	sessionID, prompt string,
+	runFn func(ctx context.Context, sessionID, prompt string) (*fantasy.AgentResult, error),
+	done chan<- agentTurnResponse,
+) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("agent turn panic",
+				"session_id", sessionID,
+				"panic", r,
+				"stack", string(debug.Stack()))
+			done <- agentTurnResponse{
+				err: fmt.Errorf("agent turn panicked (recovered, see crush.log for stack trace): %v", r),
+			}
+		}
+	}()
+
+	result, err := runFn(ctx, sessionID, prompt)
+	if err != nil {
+		done <- agentTurnResponse{
+			err: fmt.Errorf("failed to start agent processing stream: %w", err),
+		}
+		return
+	}
+	if result == nil {
+		done <- agentTurnResponse{
+			err: fmt.Errorf("failed to start agent processing stream: %w", agent.ErrSessionBusy),
+		}
+		return
+	}
+	done <- agentTurnResponse{
+		result: result,
+	}
+}
+
 func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt string, overrides RunOverrides, hideSpinner bool, mode RunMode, continueSessionID string, useLast bool) error {
 	largeModel := overrides.LargeModel
 	smallModel := overrides.SmallModel
@@ -1141,30 +1205,11 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt 
 		}()
 	}
 
-	type response struct {
-		result *fantasy.AgentResult
-		err    error
-	}
-	done := make(chan response, 1)
+	done := make(chan agentTurnResponse, 1)
 
-	go func(ctx context.Context, sessionID, prompt string) {
-		result, err := app.AgentCoordinator.Run(ctx, sessionID, prompt)
-		if err != nil {
-			done <- response{
-				err: fmt.Errorf("failed to start agent processing stream: %w", err),
-			}
-			return
-		}
-		if result == nil {
-			done <- response{
-				err: fmt.Errorf("failed to start agent processing stream: %w", agent.ErrSessionBusy),
-			}
-			return
-		}
-		done <- response{
-			result: result,
-		}
-	}(ctx, sess.ID, prompt)
+	go runAgentTurnRecovered(ctx, sess.ID, prompt, func(ctx context.Context, sessionID, prompt string) (*fantasy.AgentResult, error) {
+		return app.AgentCoordinator.Run(ctx, sessionID, prompt)
+	}, done)
 
 	messageEvents := app.Messages.Subscribe(ctx)
 	messageReadBytes := make(map[string]int)

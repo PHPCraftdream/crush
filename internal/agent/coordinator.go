@@ -33,6 +33,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"slices"
 	"strings"
 	"sync"
@@ -2129,21 +2130,18 @@ func (c *coordinator) notifyBackgroundJobDone(sessionID string, sh *shell.Backgr
 		slog.Info("Phase 4: auto-resuming session on background job completion",
 			"session_id", sessionID, "shell_id", sh.ID,
 			"consecutive", c.consecutiveResume(sessionID))
-		go func() {
-			// Detached + cancelable: outlives the OnDone goroutine; the turn's
-			// own watchdog/Cancel(sessionID) governs its lifetime, so NO short
-			// timeout here (unlike the InjectMessage path — a turn can be long).
-			// Tag the context so the persisted user message is marked
-			// AutoResumed and rendered with a badge in the web UI. Also tag it
-			// as a BackgroundJobNotice so the web shows the notice badge (an
-			// auto-resume is also a job-completion notice).
-			ctx := context.WithValue(context.Background(), autoResumedCtxKey{}, true)
-			ctx = context.WithValue(ctx, backgroundJobNoticeCtxKey{}, true)
-			if _, err := c.Run(ctx, sessionID, summary); err != nil {
-				slog.Debug("Phase 4 auto-resume run failed (session likely closed)",
-					"session_id", sessionID, "shell_id", sh.ID, "err", err)
-			}
-		}()
+		// Detached + cancelable: outlives the OnDone goroutine; the turn's
+		// own watchdog/Cancel(sessionID) governs its lifetime, so NO short
+		// timeout here (unlike the InjectMessage path — a turn can be long).
+		// Tag the context so the persisted user message is marked
+		// AutoResumed and rendered with a badge in the web UI. Also tag it
+		// as a BackgroundJobNotice so the web shows the notice badge (an
+		// auto-resume is also a job-completion notice).
+		ctx := context.WithValue(context.Background(), autoResumedCtxKey{}, true)
+		ctx = context.WithValue(ctx, backgroundJobNoticeCtxKey{}, true)
+		go runAutoResumeRecovered(ctx, sessionID, sh.ID, func(ctx context.Context) (*fantasy.AgentResult, error) {
+			return c.Run(ctx, sessionID, summary)
+		})
 		return
 	}
 
@@ -2158,6 +2156,35 @@ func (c *coordinator) notifyBackgroundJobDone(sessionID string, sh *shell.Backgr
 			"session_id", sessionID,
 			"shell_id", sh.ID,
 			"err", err)
+	}
+}
+
+// runAutoResumeRecovered runs runFn (normally a closure over c.Run for the
+// Phase 4 auto-resume turn) with panic isolation, on the calling goroutine.
+// Callers spawn this in its own goroutine (see notifyBackgroundJobDone)
+// because it is independent of the BackgroundShell.OnDone goroutine that
+// triggers it — OnDone's own recover() does not cover a panic raised in
+// here, since by the time this runs it is a sibling goroutine, not a child
+// call of OnDone's callback.
+//
+// runFn re-enters the full synchronous tool-dispatch chain (same call shape
+// as app.go's RunNonInteractive goroutine, see runAgentTurnRecovered there),
+// so any tool call made during this auto-resumed turn could panic exactly
+// like it could during a human-initiated turn. Without this recover, such a
+// panic would crash the whole crush process with no log output, at an
+// arbitrary time long after the triggering background job completed.
+func runAutoResumeRecovered(ctx context.Context, sessionID, shellID string, runFn func(ctx context.Context) (*fantasy.AgentResult, error)) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("Phase 4 auto-resume run panic",
+				"session_id", sessionID, "shell_id", shellID,
+				"panic", r, "stack", string(debug.Stack()))
+		}
+	}()
+
+	if _, err := runFn(ctx); err != nil {
+		slog.Debug("Phase 4 auto-resume run failed (session likely closed)",
+			"session_id", sessionID, "shell_id", shellID, "err", err)
 	}
 }
 

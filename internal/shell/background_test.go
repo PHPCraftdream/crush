@@ -541,6 +541,56 @@ func TestBackgroundShell_OnDone_FiresOnKill(t *testing.T) {
 	}
 }
 
+// TestBackgroundShell_OnDone_PanicRecovered proves that a panic inside the
+// fn passed to OnDone is recovered (logged) rather than crashing the
+// process. OnDone's goroutine is independent of whatever turn started the
+// background job (see the doc comment on OnDone) — production code passes
+// the agent package's notifyBackgroundJobDone here, which can itself start
+// a fresh top-level turn, so an unrecovered panic here would previously
+// have taken down the whole crush process with no log output.
+func TestBackgroundShell_OnDone_PanicRecovered(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	workingDir := t.TempDir()
+	manager := newBackgroundShellManager()
+
+	bgShell, err := manager.Start(ctx, workingDir, nil, "echo hi", "")
+	require.NoError(t, err)
+
+	// Register a second, well-behaved OnDone callback AFTER the panicking
+	// one to confirm the panic in the first callback's own goroutine does
+	// not prevent other independent OnDone registrations from firing (each
+	// OnDone call spawns its own goroutine, so this also incidentally
+	// documents that independence).
+	panicked := make(chan struct{})
+	bgShell.OnDone(func() {
+		defer close(panicked)
+		panic("boom: simulated OnDone callback panic")
+	})
+
+	fired := make(chan struct{})
+	bgShell.OnDone(func() { close(fired) })
+
+	select {
+	case <-panicked:
+		// Expected: the panicking callback ran (and panicked) without
+		// bringing down the test process — reaching this line at all is
+		// the core assertion.
+	case <-time.After(3 * time.Second):
+		t.Fatal("panicking OnDone callback never ran")
+	}
+
+	select {
+	case <-fired:
+		// Expected: unrelated OnDone registration still fires normally.
+	case <-time.After(3 * time.Second):
+		t.Fatal("sibling OnDone callback did not fire after a panic in another OnDone callback")
+	}
+
+	_ = manager.Kill(t.Context(), bgShell.ID)
+}
+
 // TestBackgroundShell_Elapsed confirms Elapsed reports a non-zero duration
 // once StartTime is set, and zero when it is not.
 func TestBackgroundShell_Elapsed(t *testing.T) {

@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
+	"runtime/debug"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -362,7 +364,25 @@ func (m *BackgroundShellManager) Start(ctx context.Context, workingDir string, b
 		// stdout/stderr is freed after bufferRetention even if no further
 		// bash task ever calls Cleanup. releaseBuffers is guarded by
 		// bufReleased, so a later Cleanup or duplicate fire is a no-op.
-		time.AfterFunc(bufferRetention, bgShell.releaseBuffers)
+		//
+		// time.AfterFunc runs its callback on its own goroutine with no
+		// panic isolation of its own; releaseBuffers itself is a simple
+		// atomic-swap-guarded buffer reset with no known panic surface, but
+		// wrap it defensively anyway — the cost of an unnecessary recover()
+		// here is negligible next to a silent process crash if that ever
+		// changes.
+		time.AfterFunc(bufferRetention, func() {
+			defer func() {
+				if r := recover(); r != nil {
+					slog.Error("background shell releaseBuffers panic",
+						"shell_id", bgShell.ID,
+						"command", bgShell.Command,
+						"panic", r,
+						"stack", string(debug.Stack()))
+				}
+			}()
+			bgShell.releaseBuffers()
+		})
 	}()
 
 	return bgShell, nil
@@ -539,12 +559,29 @@ func (bs *BackgroundShell) releaseBuffers() {
 // is already done when OnDone is called, fn runs promptly. fn runs on its own
 // goroutine — it must not block. Used by higher layers (the agent) to react to
 // a backgrounded command finishing without internal/shell importing them.
+//
+// This goroutine is independent of whatever turn started the background job
+// — it can fire long after that turn (and any panic-recovery wrapping it)
+// has already returned, so it needs its own panic isolation. fn is normally
+// the agent package's notifyBackgroundJobDone, which can itself start a
+// fresh top-level turn (Phase 4 auto-resume); an unrecovered panic here
+// would otherwise crash the whole crush process with no log output, exactly
+// like the goroutine in app.go's RunNonInteractive this mirrors.
 func (bs *BackgroundShell) OnDone(fn func()) {
 	if fn == nil {
 		return
 	}
 	go func() {
 		<-bs.done
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Error("background shell OnDone callback panic",
+					"shell_id", bs.ID,
+					"command", bs.Command,
+					"panic", r,
+					"stack", string(debug.Stack()))
+			}
+		}()
 		fn()
 	}()
 }
