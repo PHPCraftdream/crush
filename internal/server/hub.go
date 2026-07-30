@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"runtime/debug"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -16,6 +17,18 @@ const (
 	maxMessageSize = 20 * 1024 * 1024 // 20 MB — supports image attachments
 	sendBufSize    = 512
 	maxBufferSize  = 2000 // max events to replay to new clients
+
+	// maxConcurrentHandlersPerConn bounds how many handleX goroutines a single
+	// WebSocket connection may have in flight at once. Each handler can hold a
+	// SQLite connection and/or call into the agent coordinator, so an unbounded
+	// client (malicious or buggy UI firing thousands of messages) would
+	// otherwise be able to exhaust the process's goroutine pool and DB
+	// connections. 12 is generous headroom above realistic UI concurrency (a
+	// handful of tabs each issuing a couple of in-flight requests) while still
+	// capping worst-case blast radius per connection; acquiring the semaphore
+	// applies natural backpressure to readPump once the cap is hit, so excess
+	// frames simply wait to be dispatched instead of spawning more goroutines.
+	maxConcurrentHandlersPerConn = 12
 
 	// replayByteBudget bounds the total bytes held in the replay buffer across all
 	// events. Normal traffic (small JSON deltas) fits ~2000 events well under 8 MiB,
@@ -39,6 +52,56 @@ type Client struct {
 	hub  *Hub
 	conn *websocket.Conn
 	send chan []byte
+
+	// sem bounds the number of concurrently running handleX goroutines
+	// spawned for THIS connection (see maxConcurrentHandlersPerConn). It is
+	// a counting semaphore implemented as a buffered channel: acquire sends
+	// a token, release receives one.
+	sem chan struct{}
+}
+
+// newClient constructs a Client with its per-connection handler semaphore
+// initialised. Always use this instead of a bare &Client{} literal so the
+// semaphore is never nil.
+func newClient(hub *Hub, conn *websocket.Conn) *Client {
+	return &Client{
+		hub:  hub,
+		conn: conn,
+		send: make(chan []byte, sendBufSize),
+		sem:  make(chan struct{}, maxConcurrentHandlersPerConn),
+	}
+}
+
+// dispatch runs fn in a new goroutine, subject to two protections:
+//
+//   - Concurrency limit: acquires a slot from the connection's semaphore
+//     before spawning, blocking the CALLER (readPump, via handleIncoming)
+//     once maxConcurrentHandlersPerConn handlers are already in flight for
+//     this connection. This is deliberate backpressure — once the cap is
+//     hit, further inbound frames simply wait to be dispatched rather than
+//     spawning unbounded goroutines.
+//   - Panic isolation: recovers any panic inside fn, logs it (with a stack
+//     trace) instead of propagating it. Without this, a nil-deref or
+//     out-of-range index triggered by an unexpected payload in ANY handler
+//     would crash the entire crush web process, taking down every other
+//     connection and in-flight agent session with it.
+//
+// name is a short identifier (typically the WS command type or handler
+// function name) used only for logging.
+func (c *Client) dispatch(name string, fn func()) {
+	c.sem <- struct{}{}
+	go func() {
+		defer func() { <-c.sem }()
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Error("ws: handler panic",
+					"handler", name,
+					"panic", r,
+					"stack", string(debug.Stack()))
+			}
+		}()
+		fn()
+	}()
 }
 
 // replayBuffer is a fixed-capacity ring buffer of broadcast events.

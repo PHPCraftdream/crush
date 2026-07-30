@@ -111,11 +111,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	c := &Client{
-		hub:  s.hub,
-		conn: conn,
-		send: make(chan []byte, sendBufSize),
-	}
+	c := newClient(s.hub, conn)
 	s.hub.register <- c
 
 	// Start write pump in background; read pump blocks this goroutine.
@@ -139,8 +135,10 @@ func (s *Server) readPump(ctx context.Context, c *Client) {
 
 	// Fork merge note (origin/main 9c35ee01 "fix(server): recover from handler panics"):
 	// upstream wraps the REST mux with recoverHandler; our WebSocket loop reads
-	// frames directly. The equivalent in our architecture would be a recover()
-	// inside handleIncoming or this for-loop — see CHANGELOG.fork.md section 4.A.
+	// frames directly. The equivalent in our architecture is Client.dispatch
+	// (hub.go), which recovers panics around every `go handleX(...)` spawned
+	// from handleIncoming and bounds per-connection concurrency — see
+	// CHANGELOG.fork.md section 4.A.
 	for {
 		_, raw, err := c.conn.ReadMessage()
 		if err != nil {
