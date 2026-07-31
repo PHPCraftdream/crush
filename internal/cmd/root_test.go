@@ -3,8 +3,10 @@ package cmd
 import (
 	"bytes"
 	"log/slog"
+	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -63,4 +65,91 @@ func TestRecoverAndLogPanic_NoPanicIsANoop(t *testing.T) {
 
 	require.False(t, strings.Contains(logBuf.String(), crashLogMarker),
 		"recoverAndLogPanic must not log anything when nothing panicked")
+}
+
+// withStdin temporarily replaces os.Stdin for the duration of a test.
+func withStdin(t *testing.T, f *os.File) {
+	t.Helper()
+	prev := os.Stdin
+	os.Stdin = f
+	t.Cleanup(func() { os.Stdin = prev })
+}
+
+// TestMaybePrependStdin_RegularFileReadsImmediately pins the unchanged
+// `< file` behavior: a regular file is fully available immediately and
+// must be read and prepended with no bound.
+func TestMaybePrependStdin_RegularFileReadsImmediately(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "stdin-*.txt")
+	require.NoError(t, err)
+	_, err = f.WriteString("piped content")
+	require.NoError(t, err)
+	_, err = f.Seek(0, 0)
+	require.NoError(t, err)
+	t.Cleanup(func() { f.Close() })
+	withStdin(t, f)
+
+	got, err := MaybePrependStdin("the prompt")
+	require.NoError(t, err)
+	require.Equal(t, "piped content\n\nthe prompt", got)
+}
+
+// TestMaybePrependStdin_NamedPipeWithDataReadsIt confirms a `|` pipe that
+// writes and closes promptly still gets prepended, same as before this
+// change.
+func TestMaybePrependStdin_NamedPipeWithDataReadsIt(t *testing.T) {
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	t.Cleanup(func() { r.Close() })
+	withStdin(t, r)
+
+	_, err = w.WriteString("piped content")
+	require.NoError(t, err)
+	require.NoError(t, w.Close())
+
+	got, err := MaybePrependStdin("the prompt")
+	require.NoError(t, err)
+	require.Equal(t, "piped content\n\nthe prompt", got)
+}
+
+// TestMaybePrependStdin_NamedPipeNeverClosesDoesNotHang is the regression
+// test for the incident that motivated this change: an operator (or a
+// launcher script) invoked `crush run` with a positional prompt and no
+// explicit `< file` redirect. stdin resolved to a dangling pipe — nothing
+// written, never closed — and io.ReadAll blocked forever, well before
+// --timeout's context deadline is even wired up, leaving the process
+// alive with zero visible session for hours. MaybePrependStdin must give
+// up after stdinReadGrace and proceed with just the original prompt
+// instead of hanging.
+func TestMaybePrependStdin_NamedPipeNeverClosesDoesNotHang(t *testing.T) {
+	prevGrace := stdinReadGrace
+	stdinReadGrace = 50 * time.Millisecond
+	t.Cleanup(func() { stdinReadGrace = prevGrace })
+
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		r.Close()
+		w.Close() // never written to, never closed by the "writer" itself
+	})
+	withStdin(t, r)
+
+	done := make(chan struct {
+		got string
+		err error
+	}, 1)
+	go func() {
+		got, err := MaybePrependStdin("the prompt")
+		done <- struct {
+			got string
+			err error
+		}{got, err}
+	}()
+
+	select {
+	case res := <-done:
+		require.NoError(t, res.err)
+		require.Equal(t, "the prompt", res.got, "must fall back to the bare prompt, not hang or corrupt it")
+	case <-time.After(2 * time.Second):
+		t.Fatal("MaybePrependStdin hung past stdinReadGrace — it must never block indefinitely on a dangling pipe")
+	}
 }

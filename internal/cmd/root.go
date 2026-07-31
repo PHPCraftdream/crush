@@ -359,6 +359,22 @@ func setupApp(cmd *cobra.Command) (*app.App, error) {
 	return appInstance, nil
 }
 
+// stdinReadGrace bounds how long MaybePrependStdin waits for a named pipe
+// to produce data before giving up on it. A `< file` redirect (regular
+// file) is always fully available immediately and is read directly with
+// no bound. A `|` pipe, though, can be connected to a writer that never
+// sends anything and never closes — observed in practice when a
+// background shell job's stdin fd is left open but unused (e.g. a
+// launcher that runs `crush run "$(...)"` without an explicit `< file`
+// redirect, so the process's stdin resolves to a dangling pipe instead of
+// a closed/empty one). io.ReadAll would then block forever: this happens
+// BEFORE --timeout's context deadline is even wired up, and without an
+// explicit --timeout the hard-kill backstop defaults to 6h — so crush
+// would sit doing nothing, invisible to `sessions list` (no session row
+// exists yet), for hours. crush must never hang like that regardless of
+// how it was invoked.
+var stdinReadGrace = 3 * time.Second
+
 func MaybePrependStdin(prompt string) (string, error) {
 	if term.IsTerminal(os.Stdin.Fd()) {
 		return prompt, nil
@@ -367,15 +383,45 @@ func MaybePrependStdin(prompt string) (string, error) {
 	if err != nil {
 		return prompt, err
 	}
-	// Check if stdin is a named pipe ( | ) or regular file ( < ).
-	if fi.Mode()&os.ModeNamedPipe == 0 && !fi.Mode().IsRegular() {
+	switch {
+	case fi.Mode().IsRegular():
+		// `< file`: fully available immediately, no risk of blocking.
+		bts, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return prompt, err
+		}
+		return string(bts) + "\n\n" + prompt, nil
+	case fi.Mode()&os.ModeNamedPipe != 0:
+		// `|` (or an inherited pipe fd from a background launcher): race
+		// the read against stdinReadGrace instead of trusting the pipe to
+		// ever close. The reader goroutine is intentionally leaked on
+		// timeout — Go can't cancel a blocked pipe Read — but that's a
+		// single goroutine for the life of the process, not a hang.
+		type stdinResult struct {
+			bts []byte
+			err error
+		}
+		ch := make(chan stdinResult, 1)
+		go func() {
+			bts, err := io.ReadAll(os.Stdin)
+			ch <- stdinResult{bts, err}
+		}()
+		select {
+		case r := <-ch:
+			if r.err != nil {
+				return prompt, r.err
+			}
+			return string(r.bts) + "\n\n" + prompt, nil
+		case <-time.After(stdinReadGrace):
+			slog.Warn(
+				"stdin is a pipe that produced no data within the grace window — proceeding without it",
+				"grace", stdinReadGrace,
+			)
+			return prompt, nil
+		}
+	default:
 		return prompt, nil
 	}
-	bts, err := io.ReadAll(os.Stdin)
-	if err != nil {
-		return prompt, err
-	}
-	return string(bts) + "\n\n" + prompt, nil
 }
 
 func ResolveCwd(cmd *cobra.Command) (string, error) {
