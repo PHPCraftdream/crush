@@ -253,15 +253,15 @@ func (app *App) disableToolsInConfig(toolNames []string) {
 // Fork patch (orchestrator UX, plan phase 2): the orchestrator design (a smart
 // parent delegating hands-on work to cheap worker sub-agents) depends on
 // the `agent` tool being available. The ban exists to stop an
-// unsupervised `crush run` from silently fanning out — but when the
-// operator asked for the strong/smart role AND configured a worker
-// model, that fan-out IS the point, so the ban would otherwise block the
-// very feature it was configured for.
+// unsupervised `crush run` from silently fanning out — but when a Worker
+// model is configured, that fan-out IS the point, so the ban would
+// otherwise block the very feature it was configured for. This applies
+// regardless of whether `--agents single` was passed explicitly or left
+// unset: a configured worker means the operator's intent is delegation,
+// and `--agents single` alone (with no worker unconfigured to back it)
+// is not a strong enough signal to override that.
 //
 // Bypasses only when ALL of:
-//   - agentsExplicit is false: the operator did NOT pass --agents
-//     explicitly. An explicit `--agents single` is a direct instruction
-//     and always wins — see the agentsExplicit guard below.
 //   - role == SelectedModelTypeLarge: the run declared --role smart.
 //     --role fast (or worker/reviewer) never bypasses; we don't
 //     second-guess an explicit non-large role choice.
@@ -271,10 +271,7 @@ func (app *App) disableToolsInConfig(toolNames []string) {
 //     stands. This is the single most important case: worker NOT
 //     configured + role smart + flags unset must keep sub-agents
 //     disabled exactly as today.
-func shouldBypassSubAgentBan(agentsExplicit bool, role config.SelectedModelType, cfg *config.Config) bool {
-	if agentsExplicit {
-		return false
-	}
+func shouldBypassSubAgentBan(role config.SelectedModelType, cfg *config.Config) bool {
 	if role != config.SelectedModelTypeLarge {
 		return false
 	}
@@ -738,16 +735,7 @@ type RunOverrides struct {
 	// (markdown fence + prose preamble removal); the unstripped
 	// original is preserved in runResult.AssistantNotes.
 	DisableSubAgents bool
-	// AgentsModeExplicit records whether the operator passed --agents
-	// explicitly on this invocation, as opposed to DisableSubAgents
-	// being true only because --agents was left unset (the implicit
-	// default). The two produce the same DisableSubAgents=true today,
-	// but only the implicit case is eligible for the smart+worker
-	// bypass in RunNonInteractive (shouldBypassSubAgentBan) — an
-	// explicit `--agents single` is a direct instruction from the
-	// operator and always wins. Fork patch (orchestrator UX, plan phase 2).
-	AgentsModeExplicit bool
-	StripJSONFences    bool
+	StripJSONFences  bool
 	// AggregationMode controls how sub-agent fan-out output reaches
 	// the orchestrator. "" / "summary" = upstream default (parent
 	// composes a wrap-up, sub-agent details live in the DB only).
@@ -1029,17 +1017,18 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt 
 	// process — exit drops the change), so this is safe even though
 	// it touches the global config. See run.go and run_format.go.
 	//
-	// Plan phase 2 exception: when the ban is only in effect because --agents
-	// was left unset (not an explicit `--agents single`), and this run
-	// is --role smart with a Worker model configured, restore ONLY the
-	// `agent` tool — see shouldBypassSubAgentBan. `agentic_fetch` stays
-	// stripped either way: it's a separate concern (web-fetch
-	// delegation that always runs on the small model, see
+	// Plan phase 2 exception: when this run is --role smart with a Worker
+	// model configured, restore ONLY the `agent` tool — see
+	// shouldBypassSubAgentBan. This applies even if the operator passed
+	// `--agents single` explicitly: a configured worker means delegation
+	// is the intended workflow. `agentic_fetch` stays stripped either
+	// way: it's a separate concern (web-fetch delegation that always
+	// runs on the small model, see
 	// internal/agent/agentic_fetch_tool.go's "Use small model for both"
 	// comment) and has nothing to do with delegating hands-on work to a
 	// worker.
 	if overrides.DisableSubAgents {
-		if shouldBypassSubAgentBan(overrides.AgentsModeExplicit, overrides.ModelRole, app.config.Config()) {
+		if shouldBypassSubAgentBan(overrides.ModelRole, app.config.Config()) {
 			app.disableToolsInConfig([]string{"agentic_fetch"})
 		} else {
 			app.disableSubAgentToolsInConfig()

@@ -50,10 +50,11 @@ Four roles exist:
                       then run on worker, get a work-capable toolset
                       (edit/multiedit/write/bash/todos/download/fetch/
                       ask_question), and the default sub-agent ban below
-                      is lifted so the orchestrator can delegate at all
-                      (an explicit --agents single still wins). The smart
-                      agent's system prompt also gains an "Orchestrator
-                      mode" nudge to delegate in context-sized chunks
+                      is lifted so the orchestrator can delegate at all —
+                      even against an explicit --agents single, since a
+                      configured worker means delegation is the intent.
+                      The smart agent's system prompt also gains an
+                      "Orchestrator mode" nudge to delegate in context-sized chunks
                       instead of implementing inline.
   reviewer           optional, no alias; the strongest slot, for explicit
                       review invocations. Never auto-selected anywhere —
@@ -131,6 +132,11 @@ Sub-agent policy:
                                              the model EXECUTES instead of
                                              re-delegating.
                             single        -- same as the default, explicit.
+                                             Still yields to a configured
+                                             Worker model under --role smart
+                                             (see "worker" above) — a
+                                             configured worker means
+                                             delegation is the intent.
                             agent-allow   -- opt in: tools present, the
                                              model decides whether to use
                                              them.
@@ -403,14 +409,6 @@ crush run --restrict-run --role fast \
 			formatFlag, _      = cmd.Flags().GetString("format")
 			agentsMode, _      = cmd.Flags().GetString("agents")
 			aggregationMode, _ = cmd.Flags().GetString("aggregation")
-			// Fork patch (orchestrator UX, plan phase 2): distinguishes "operator
-			// explicitly wrote --agents single" from "flag left unset" —
-			// both currently resolve agentsMode to "" / "single" and set
-			// agentsDisable below, but only the unset case is eligible for
-			// the smart+worker bypass in app.RunNonInteractive
-			// (shouldBypassSubAgentBan). An explicit --agents single must
-			// always be honoured.
-			agentsExplicit = cmd.Flags().Changed("agents")
 			// Fork patch: batch 8 — timeout extension flags.
 			timeoutExtendsOnProgress, _ = cmd.Flags().GetBool("timeout-extends-on-progress")
 			timeoutHardCap, _           = cmd.Flags().GetString("timeout-hard-cap")
@@ -575,8 +573,10 @@ crush run --restrict-run --role fast \
 		defer cancel()
 
 		// Optional hard deadline. The agent run gets context.DeadlineExceeded
-		// instead of context.Canceled, and the in-flight assistant message
-		// finishes with FinishReasonCanceled, just like an explicit cancel.
+		// instead of context.Canceled; agent.go's Run() distinguishes the two
+		// (see isRunTimeout there) so the in-flight assistant message finishes
+		// with a clear "Run timeout exceeded" error instead of being
+		// misreported as a generic provider failure or an unlabeled cancel.
 		var installedHardKill *time.Timer
 		if timeoutDur > 0 {
 			var timeoutCancel context.CancelFunc
@@ -714,7 +714,6 @@ crush run --restrict-run --role fast \
 			RoleLarge:                roleLarge,
 			ModelRole:                modelType,
 			DisableSubAgents:         agentsDisable,
-			AgentsModeExplicit:       agentsExplicit,
 			StripJSONFences:          formatFlag == "json" || strings.HasPrefix(formatFlag, "json-schema:"),
 			AggregationMode:          aggregationMode,
 			TimeoutExtendsOnProgress: timeoutExtendsOnProgress, // Fork patch: batch 8

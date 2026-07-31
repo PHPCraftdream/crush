@@ -11,17 +11,10 @@ import (
 // TestShouldBypassSubAgentBan is the table-level test for the Фаза 2
 // decision logic (docs/plans/2026-07-26-orchestrator-worker-e2e.md): the
 // default `crush run` sub-agent ban is bypassed for the `agent` tool
-// ONLY when --agents was left unset, --role resolved to smart/large, and
-// a Worker model slot is configured with a non-empty Model.
-//
-// Matrix: {agents unset, agents single (explicit), agents agent-allow,
-// agents with-agents} x {worker configured, not configured} x {role
-// smart, role fast}. Only "agents unset" is a real DisableSubAgents=true
-// case in run.go (agent-allow/with-agents never set DisableSubAgents at
-// all), but shouldBypassSubAgentBan is exercised across the whole
-// explicit/role/worker cube anyway since it's a pure function and the
-// other combinations pin "explicit always wins" / "role must be large"
-// regardless of how DisableSubAgents was derived upstream.
+// whenever --role resolved to smart/large AND a Worker model slot is
+// configured with a non-empty Model — regardless of whether --agents
+// single was passed explicitly or left unset, since a configured worker
+// means delegation is the operator's intent either way.
 func TestShouldBypassSubAgentBan(t *testing.T) {
 	t.Parallel()
 
@@ -41,103 +34,67 @@ func TestShouldBypassSubAgentBan(t *testing.T) {
 	}
 
 	tests := []struct {
-		name     string
-		explicit bool // true == operator passed --agents (e.g. "single") directly
-		role     config.SelectedModelType
-		cfg      *config.Config
-		want     bool
+		name string
+		role config.SelectedModelType
+		cfg  *config.Config
+		want bool
 	}{
 		// --- The single most important case ---
 		{
-			name:     "worker NOT configured + role smart + flags unset => sub-agents still disabled, exactly as today",
-			explicit: false,
-			role:     config.SelectedModelTypeLarge,
-			cfg:      workerNotConfigured,
-			want:     false,
+			name: "worker NOT configured + role smart => sub-agents still disabled, exactly as today",
+			role: config.SelectedModelTypeLarge,
+			cfg:  workerNotConfigured,
+			want: false,
 		},
 
-		// --- agents unset (implicit default) x worker configured x role ---
+		// --- worker configured x role ---
 		{
-			name:     "agents unset, worker configured, role smart => bypass",
-			explicit: false,
-			role:     config.SelectedModelTypeLarge,
-			cfg:      workerConfigured,
-			want:     true,
+			name: "worker configured, role smart => bypass (covers both --agents unset and explicit --agents single)",
+			role: config.SelectedModelTypeLarge,
+			cfg:  workerConfigured,
+			want: true,
 		},
 		{
-			name:     "agents unset, worker configured, role fast => no bypass (non-large role never bypasses)",
-			explicit: false,
-			role:     config.SelectedModelTypeSmall,
-			cfg:      workerConfigured,
-			want:     false,
+			name: "worker configured, role fast => no bypass (non-large role never bypasses)",
+			role: config.SelectedModelTypeSmall,
+			cfg:  workerConfigured,
+			want: false,
 		},
 
-		// --- agents unset x worker with empty Model (not really configured) ---
+		// --- worker with empty Model (not really configured) ---
 		{
-			name:     "agents unset, worker present but Model empty, role smart => no bypass",
-			explicit: false,
-			role:     config.SelectedModelTypeLarge,
-			cfg:      workerConfiguredEmptyModel,
-			want:     false,
-		},
-
-		// --- explicit --agents single always wins, regardless of worker/role ---
-		{
-			name:     "explicit --agents single, worker configured, role smart => explicit wins, no bypass",
-			explicit: true,
-			role:     config.SelectedModelTypeLarge,
-			cfg:      workerConfigured,
-			want:     false,
-		},
-		{
-			name:     "explicit --agents single, worker configured, role fast => explicit wins, no bypass",
-			explicit: true,
-			role:     config.SelectedModelTypeSmall,
-			cfg:      workerConfigured,
-			want:     false,
-		},
-		{
-			name:     "explicit --agents single, worker NOT configured, role smart => explicit wins, no bypass",
-			explicit: true,
-			role:     config.SelectedModelTypeLarge,
-			cfg:      workerNotConfigured,
-			want:     false,
-		},
-		{
-			name:     "explicit --agents single, worker NOT configured, role fast => explicit wins, no bypass",
-			explicit: true,
-			role:     config.SelectedModelTypeSmall,
-			cfg:      workerNotConfigured,
-			want:     false,
+			name: "worker present but Model empty, role smart => no bypass",
+			role: config.SelectedModelTypeLarge,
+			cfg:  workerConfiguredEmptyModel,
+			want: false,
 		},
 
 		// --- nil config guard ---
 		{
-			name:     "nil config never bypasses",
-			explicit: false,
-			role:     config.SelectedModelTypeLarge,
-			cfg:      nil,
-			want:     false,
+			name: "nil config never bypasses",
+			role: config.SelectedModelTypeLarge,
+			cfg:  nil,
+			want: false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got := shouldBypassSubAgentBan(tt.explicit, tt.role, tt.cfg)
+			got := shouldBypassSubAgentBan(tt.role, tt.cfg)
 			assert.Equal(t, tt.want, got)
 		})
 	}
 }
 
 // TestShouldBypassSubAgentBan_BackwardCompatRequiresWorkerCondition proves
-// that dropping the "worker configured" condition (c) from the predicate
+// that dropping the "worker configured" condition from the predicate
 // would break the backward-compatibility guarantee: without it, a bare
 // `crush run --role smart` (no worker configured at all — today's most
 // common invocation) would incorrectly bypass the sub-agent ban. This
-// test documents/pins condition (c) by re-deriving the two-condition
-// (explicit, role-only) predicate inline and showing it disagrees with
-// shouldBypassSubAgentBan on exactly the backward-compat case.
+// test documents/pins that condition by re-deriving the role-only
+// predicate inline and showing it disagrees with shouldBypassSubAgentBan
+// on exactly the backward-compat case.
 func TestShouldBypassSubAgentBan_BackwardCompatRequiresWorkerCondition(t *testing.T) {
 	t.Parallel()
 
@@ -146,22 +103,19 @@ func TestShouldBypassSubAgentBan_BackwardCompatRequiresWorkerCondition(t *testin
 	}
 
 	// Real predicate: worker not configured => never bypass.
-	got := shouldBypassSubAgentBan(false, config.SelectedModelTypeLarge, workerNotConfigured)
+	got := shouldBypassSubAgentBan(config.SelectedModelTypeLarge, workerNotConfigured)
 	require.False(t, got, "worker not configured must never bypass the ban")
 
-	// Predicate with condition (c) dropped, i.e. only (explicit, role)
-	// checked, mirroring what shouldBypassSubAgentBan would degrade to.
-	withoutWorkerCheck := func(explicit bool, role config.SelectedModelType) bool {
-		if explicit {
-			return false
-		}
+	// Predicate with the worker check dropped, i.e. only role checked,
+	// mirroring what shouldBypassSubAgentBan would degrade to.
+	withoutWorkerCheck := func(role config.SelectedModelType) bool {
 		return role == config.SelectedModelTypeLarge
 	}
-	brokenResult := withoutWorkerCheck(false, config.SelectedModelTypeLarge)
+	brokenResult := withoutWorkerCheck(config.SelectedModelTypeLarge)
 	require.True(t, brokenResult,
-		"dropping condition (c) would incorrectly bypass the ban for a bare --role smart with no worker configured")
+		"dropping the worker check would incorrectly bypass the ban for a bare --role smart with no worker configured")
 	require.NotEqual(t, got, brokenResult,
-		"the real predicate and the condition-(c)-dropped predicate must disagree on the backward-compat case")
+		"the real predicate and the worker-check-dropped predicate must disagree on the backward-compat case")
 }
 
 // TestDisableToolsInConfig_StripsExactlyNamedTools is the focused test on
