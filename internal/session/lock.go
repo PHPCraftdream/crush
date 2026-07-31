@@ -91,6 +91,7 @@ func TryAcquireSessionLockWithTimeout(dataDir, sessionID string, timeoutSec int6
 		// Append the timeout on the second line; reader handles missing line gracefully.
 		_, _ = fmt.Fprintf(lk.f, "%d\n", timeoutSec)
 		_ = lk.f.Sync()
+		writePIDSidecar(lk.Path, lk.HolderPID, timeoutSec)
 	}
 	return lk, nil
 }
@@ -178,6 +179,7 @@ func acquireSessionLockFile(path string) (*SessionLock, error) {
 	_, _ = f.Seek(0, 0)
 	_, _ = fmt.Fprintf(f, "%d\n", myPID)
 	_ = f.Sync()
+	writePIDSidecar(path, myPID, 0)
 
 	// Touch the file now so mtime is fresh from the start. mtime is a
 	// diagnostic aid only (surfaced via InspectSessionLock / `sessions
@@ -362,24 +364,62 @@ func InspectSessionLock(dataDir, sessionID string, liveThreshold time.Duration) 
 	}
 }
 
-// readLockFile returns (PID, timeoutSec) from a lock file. Both default to 0
-// on any parse error — backward compatible with old one-line files.
+// pidSidecarPath returns the companion, never-locked file that carries a
+// live copy of the PID/timeout normally stamped into the lock file itself.
+// See readLockFile's doc comment for why this sidecar exists.
+func pidSidecarPath(lockPath string) string {
+	return lockPath + ".pid"
+}
+
+// writePIDSidecar (re)writes the sidecar file next to a session lock with
+// the holder's PID and (optionally) its --timeout budget in seconds,
+// mirroring what's stamped into the lock file itself. Unlike the lock
+// file, this file is opened, written, and closed immediately — no lock is
+// ever held on it — so any other process can read it with a plain
+// os.ReadFile at any time, including while the lock file's own mandatory
+// Windows range-lock makes IT unreadable (see readLockFile).
+//
+// Best-effort: a write failure only degrades diagnosability (PID shown as
+// 0 to a concurrent reader) and is logged, never returned as an error —
+// the OS lock on the primary file remains the sole source of truth for
+// correctness, exactly like the mtime heartbeat.
+func writePIDSidecar(lockPath string, pid int, timeoutSec int64) {
+	content := strconv.Itoa(pid) + "\n"
+	if timeoutSec > 0 {
+		content += strconv.FormatInt(timeoutSec, 10) + "\n"
+	}
+	if err := os.WriteFile(pidSidecarPath(lockPath), []byte(content), 0o644); err != nil {
+		slog.Warn("session lock: failed to write PID sidecar", "path", lockPath, "err", err)
+	}
+}
+
+// readLockFile returns (PID, timeoutSec) for a session lock. Both default
+// to 0 on any parse error — backward compatible with old one-line files.
 //
 // Windows note: tryLockFile takes a LockFileEx exclusive lock over the
 // WHOLE file for the entire lifetime of the holder. Unlike POSIX advisory
 // locks, Windows enforces this as a MANDATORY lock — any plain read from a
 // different handle/process into that byte range (which is exactly what
-// os.ReadFile does here) fails with a sharing/lock violation for as long as
-// the holder is alive, not just during a brief write race. So on Windows,
-// (0, 0) from this function for an ACTIVELY RUNNING session is the norm,
-// not the exception — callers that gate a "crashed" verdict on `pid > 0`
-// alone will misdiagnose every live session on Windows. Always fall back to
-// heartbeat freshness (mtime age vs LockStaleDuration) before concluding a
-// session is dead; see readLockHolderPID's callers in internal/cmd.
+// os.ReadFile does) fails with a sharing/lock violation for as long as the
+// holder is alive, not just during a brief write race. So reading the lock
+// file itself would return (0, 0) for an ACTIVELY RUNNING session on
+// Windows — not because the PID is unknown, but because the mandatory lock
+// blocks the read outright. `sessions kill` hitting exactly this case (a
+// genuinely live holder) used to be unable to read a PID to kill at all.
+//
+// To fix that, TryAcquireSessionLock also stamps the same PID/timeout into
+// a sidecar file (pidSidecarPath) that is never locked. Prefer that
+// sidecar; fall back to the primary lock file only when no sidecar exists
+// (an old lock file predating this change, or — in tests — a lock file
+// written directly via os.WriteFile rather than through
+// TryAcquireSessionLock).
 func readLockFile(path string) (int, int64) {
-	bts, err := os.ReadFile(path)
+	bts, err := os.ReadFile(pidSidecarPath(path))
 	if err != nil {
-		return 0, 0
+		bts, err = os.ReadFile(path)
+		if err != nil {
+			return 0, 0
+		}
 	}
 	lines := strings.Split(strings.TrimSpace(string(bts)), "\n")
 	pid := 0

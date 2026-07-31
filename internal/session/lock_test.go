@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -271,22 +270,17 @@ func TestLockPathStructure(t *testing.T) {
 }
 
 // assertBusyHolderPID checks the HolderPID reported in a SessionLockBusyError
-// against the real holder's PID, accounting for a documented Windows-only
-// limitation: tryLockFile's LockFileEx takes a MANDATORY lock on the whole
-// file for the holder's lifetime, so a contending process's os.ReadFile of
-// that same file (which is exactly what readLockHolderPID does) fails with
-// a sharing/lock violation and reports PID 0 — not because the PID is
-// unknown, but because Windows won't let a second handle read the range
-// while the mandatory lock is held. See readLockFile's doc comment. POSIX
-// advisory locks don't have this problem, so on non-Windows we assert the
-// exact PID.
+// against the real holder's PID. Windows note: tryLockFile's LockFileEx
+// takes a MANDATORY lock on the whole lock file for the holder's lifetime,
+// so a contending process's os.ReadFile of that same file would normally
+// fail with a sharing/lock violation and report PID 0 — not because the
+// PID is unknown, but because Windows won't let a second handle read the
+// range while the mandatory lock is held. TryAcquireSessionLock works
+// around this by also stamping the PID into a never-locked sidecar file
+// (see readLockFile's doc comment), so on every OS — including Windows —
+// a busy error must now report the real holder PID.
 func assertBusyHolderPID(t *testing.T, wantPID, gotPID int) {
 	t.Helper()
-	if runtime.GOOS == "windows" {
-		assert.True(t, gotPID == 0 || gotPID == wantPID,
-			"on Windows, HolderPID is expected to read back as 0 while the mandatory lock is held (or, if read timing allows it, the real PID); got %d, holder is %d", gotPID, wantPID)
-		return
-	}
 	assert.Equal(t, wantPID, gotPID)
 }
 
@@ -451,4 +445,38 @@ func TestCrossProcess_DeadHolderIsReclaimedPromptly(t *testing.T) {
 	assert.Less(t, elapsed, 5*time.Second,
 		"reclaim of a dead holder's lock must happen promptly via OS lock, not via any mtime wait")
 	require.NoError(t, lk.Release())
+}
+
+// TestCrossProcess_ReadLockPIDWorksWhileHolderIsAlive is the direct
+// regression test for the `crush sessions kill` failure this was written
+// to fix: an operator ran `crush sessions kill <id>` against a genuinely
+// live, still-running session on Windows and got "lock has no readable
+// PID; removing file only" followed by a sharing-violation error trying
+// to delete the still-open lock file — sessions kill could never identify
+// (let alone kill) the exact class of holder it exists to kill.
+//
+// Root cause: on Windows, LockFileEx's mandatory whole-file lock makes a
+// plain os.ReadFile of the primary lock file fail while a live holder has
+// it open, so ReadLockPID (which sessions kill calls) always saw PID 0
+// for a genuinely alive session — not just a dead/stale one. The fix
+// stamps the same PID into a companion, never-locked sidecar file that a
+// contending process CAN always read. This test spawns a real second
+// process holding the lock and asserts ReadLockPID — the exact function
+// `crush sessions kill` uses — returns its real PID while it is still
+// alive and still holding the lock, on every OS.
+func TestCrossProcess_ReadLockPIDWorksWhileHolderIsAlive(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns a real child process; skipped in -short")
+	}
+	dir := t.TempDir()
+
+	holder := spawnLockHolder(t, dir, "kill-target", 0 /* hold until stopped */)
+	defer holder.stop(t)
+	require.True(t, holder.locked, "helper process failed to acquire lock: %s", holder.failed)
+	require.True(t, IsProcessAlive(holder.pid), "helper process must be alive for this test to be meaningful")
+
+	path := lockPathFor(dir, "kill-target")
+	got := ReadLockPID(path)
+	assert.Equal(t, holder.pid, got,
+		"ReadLockPID (what `crush sessions kill` calls) must be able to name a genuinely live holder's PID, not just a dead one")
 }
