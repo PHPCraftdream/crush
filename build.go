@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"strings"
 	"time"
 )
 
@@ -52,8 +53,57 @@ func main() {
 	// should still report itself as a local dev build (commit hash +
 	// fork base version, see internal/version/version.go), not spoof a
 	// numbered release.
-	ldflags := fmt.Sprintf("-s -w -X=github.com/charmbracelet/crush/internal/version.BuildID=%s", buildTime)
+	//
+	// Also stamp the commit hash and a readable build time so
+	// `crush --version` can prove which source tree a binary came from.
+	// Without them the version line is byte-identical for every build of a
+	// release line, so "is the deployed binary actually current?" cannot be
+	// answered from the binary itself — a question that got answered wrong
+	// more than once. Note -trimpath drops the VCS metadata the toolchain
+	// would otherwise embed, so the hash is injected explicitly instead of
+	// relying on debug.ReadBuildInfo. Best-effort: a build outside a git
+	// checkout still succeeds, just without the commit component.
+	const versionPkg = "github.com/charmbracelet/crush/internal/version"
+	ldflags := fmt.Sprintf(
+		"-s -w -X=%s.BuildID=%s -X=%s.BuildTime=%s",
+		versionPkg, buildTime,
+		versionPkg, time.Now().Format("2006-01-02_15:04:05"),
+	)
+	if commit := gitShortCommit(root); commit != "" {
+		ldflags += fmt.Sprintf(" -X=%s.Commit=%s", versionPkg, commit)
+	}
 	run(root, "go", "build", "-trimpath", "-ldflags", ldflags, "-o", out, ".")
 
 	fmt.Printf("✓ Done → %s\n", out)
+}
+
+// gitShortCommit returns the short HEAD hash for the checkout at dir, with a
+// "-dirty" suffix when the working tree has uncommitted changes — a dev build
+// from a modified tree is NOT the same artifact as its commit, and silently
+// labelling it as that commit is precisely the kind of false provenance this
+// stamping exists to prevent.
+//
+// Returns "" on any failure (no git, not a checkout, git error) so the build
+// still succeeds without the commit component rather than failing outright.
+func gitShortCommit(dir string) string {
+	out, err := gitOutput(dir, "rev-parse", "--short=8", "HEAD")
+	if err != nil || out == "" {
+		return ""
+	}
+	if status, statusErr := gitOutput(dir, "status", "--porcelain"); statusErr == nil && status != "" {
+		out += "-dirty"
+	}
+	return out
+}
+
+// gitOutput runs a git command in dir and returns its trimmed stdout. Unlike
+// run() it does not abort the build on failure — provenance is best-effort.
+func gitOutput(dir string, args ...string) (string, error) {
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
 }

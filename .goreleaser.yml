@@ -71,7 +71,16 @@ builds:
       - goos: windows
         goarch: arm
     ldflags:
-      - -s -w -X github.com/charmbracelet/crush/internal/version.Version={{.Version}}
+      # Fork patch: also stamp commit + build time so `crush --version`
+      # proves which source tree a released binary came from
+      # (VersionLine's provenance suffix, internal/version/version.go).
+      # -trimpath below strips the VCS metadata the toolchain would
+      # otherwise embed, so both are injected explicitly rather than
+      # relying on debug.ReadBuildInfo. Kept as ONE list item (not split
+      # across several) since goreleaser passes each ldflags entry as its
+      # own separate `-ldflags` flag to `go build`, and repeated
+      # `-ldflags` flags don't accumulate — only the last one would apply.
+      - -s -w -X github.com/charmbracelet/crush/internal/version.Version={{.Version}} -X github.com/charmbracelet/crush/internal/version.Commit={{.ShortCommit}} -X github.com/charmbracelet/crush/internal/version.BuildTime={{.Date}}
     flags:
       - -trimpath
 

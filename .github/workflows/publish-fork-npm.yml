@@ -108,7 +108,17 @@ jobs:
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
           set -euo pipefail
-          LDFLAGS="-s -w -X github.com/charmbracelet/crush/internal/version.Version=${GO_VERSION_STRING}"
+          # Also stamp commit + build time so `crush --version` proves which
+          # source tree a published binary came from (VersionLine's
+          # provenance suffix, internal/version/version.go). -trimpath below
+          # strips the VCS metadata the toolchain would otherwise embed, so
+          # both are injected explicitly rather than relying on
+          # debug.ReadBuildInfo. GITHUB_SHA is always the tag's commit here —
+          # this job only runs from a tag push or an explicit dispatch against
+          # one, never against a moving branch ref.
+          BUILD_COMMIT="${GITHUB_SHA:0:8}"
+          BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          LDFLAGS="-s -w -X github.com/charmbracelet/crush/internal/version.Version=${GO_VERSION_STRING} -X github.com/charmbracelet/crush/internal/version.Commit=${BUILD_COMMIT} -X github.com/charmbracelet/crush/internal/version.BuildTime=${BUILD_TIME}"
           # target triples: <node_os> <node_arch> <GOOS> <GOARCH> <bin>
           TARGETS="
           linux x64   linux   amd64 crush

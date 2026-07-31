@@ -10,9 +10,71 @@ import (
 
 func TestVersionLine(t *testing.T) {
 	t.Parallel()
-	want := forkBaseVersion + "@" + strings.TrimPrefix(UpstreamTriagedVersion, "v")
-	require.Equal(t, want, VersionLine())
+	releaseLine := forkBaseVersion + "@" + strings.TrimPrefix(UpstreamTriagedVersion, "v")
+	require.True(t, strings.HasPrefix(VersionLine(), releaseLine),
+		"VersionLine must start with the release-line summary, got %q", VersionLine())
 	require.False(t, strings.HasPrefix(VersionLine(), "v"), "VersionLine must not carry a \"v\" prefix")
+}
+
+// TestBuildProvenanceSuffix pins the provenance tail appended to VersionLine.
+// It exists because the release-line part alone ("0.1.7@0.87.0") is identical
+// for every build of that line, so a deployed binary carried no evidence of
+// which source tree produced it — making "is the running binary actually built
+// from current source?" unanswerable from the binary itself, a question that
+// got answered wrong more than once. Each component must be OMITTED (not
+// printed as "unknown") when unavailable, so builds without VCS metadata still
+// read cleanly.
+func TestBuildProvenanceSuffix(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		commit    string
+		buildTime string
+		want      string
+	}{
+		{
+			name:      "both present",
+			commit:    "c34a7334aabbccdd1122334455667788",
+			buildTime: "2026-07-31_16:24:26",
+			want:      " (c34a7334, built 2026-07-31_16:24:26)",
+		},
+		{
+			name:      "full 40-char hash is shortened",
+			commit:    "0123456789abcdef0123456789abcdef01234567",
+			buildTime: "",
+			want:      " (01234567)",
+		},
+		{
+			name:      "already-short hash is left alone",
+			commit:    "abc123",
+			buildTime: "",
+			want:      " (abc123)",
+		},
+		{
+			name:      "build time only",
+			commit:    "unknown",
+			buildTime: "2026-07-31_16:24:26",
+			want:      " (built 2026-07-31_16:24:26)",
+		},
+		{
+			name:      "nothing known yields no suffix at all",
+			commit:    "unknown",
+			buildTime: "",
+			want:      "",
+		},
+		{
+			name:      "empty commit is treated as unknown",
+			commit:    "",
+			buildTime: "",
+			want:      "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			require.Equal(t, tt.want, buildProvenanceSuffix(tt.commit, tt.buildTime))
+		})
+	}
 }
 
 func TestDeriveDevVersion(t *testing.T) {

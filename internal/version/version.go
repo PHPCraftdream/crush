@@ -35,14 +35,58 @@ const UpstreamTriagedVersion = "v0.87.0"
 
 // VersionLine is what `crush --version`/`crush version` prints: the fork's
 // release-line version and how far upstream has been triaged, joined by "@"
-// with no "v" prefixes. Deliberately built from forkBaseVersion and
+// with no "v" prefixes, followed by this specific build's provenance —
+// short commit hash and build time — e.g.
+//
+//	0.1.7@0.87.0 (c34a7334, built 2026-07-31 16:24:26)
+//
+// The release-line part is deliberately built from forkBaseVersion and
 // UpstreamTriagedVersion directly rather than from the package-level Version
 // var — Version carries a commit hash on local dev builds and a "v" prefix on
-// release builds, neither of which belongs in this one human-facing summary
-// line. Other consumers of Version (user agent, telemetry, MCP handshake,
+// release builds, neither of which belongs in this human-facing summary.
+// Other consumers of Version (user agent, telemetry, MCP handshake,
 // FullVersion for the web UI) are untouched by this.
+//
+// The provenance suffix exists because the release-line part alone is
+// identical across every build of that line: a deployed binary was
+// indistinguishable from any other, so "is this binary actually built from
+// the current source?" could not be answered from the binary itself. Each
+// component is omitted when genuinely unknown rather than printed as
+// "unknown", so the line stays clean for builds that carry no VCS metadata.
 func VersionLine() string {
-	return forkBaseVersion + "@" + strings.TrimPrefix(UpstreamTriagedVersion, "v")
+	line := forkBaseVersion + "@" + strings.TrimPrefix(UpstreamTriagedVersion, "v")
+	return line + buildProvenanceSuffix(Commit, BuildTime)
+}
+
+// buildProvenanceSuffix formats the " (<commit>, built <time>)" tail of
+// VersionLine. Split out as a pure function so the omit-when-unknown rules are
+// unit-testable without mutating package-level build vars.
+func buildProvenanceSuffix(commit, buildTime string) string {
+	var parts []string
+	if commit != "" && commit != "unknown" {
+		parts = append(parts, shortCommit(commit))
+	}
+	if buildTime != "" && buildTime != "unknown" {
+		parts = append(parts, "built "+buildTime)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return " (" + strings.Join(parts, ", ") + ")"
+}
+
+// shortCommitLen is how many hex characters of a commit hash to show — the
+// git default for `--short`, long enough to be unambiguous in practice and
+// short enough to keep the version line readable.
+const shortCommitLen = 8
+
+// shortCommit truncates a full 40-char VCS revision to shortCommitLen, and
+// leaves anything already shorter (e.g. an ldflags-injected short hash) alone.
+func shortCommit(commit string) string {
+	if len(commit) > shortCommitLen {
+		return commit[:shortCommitLen]
+	}
+	return commit
 }
 
 // Build-time parameters set via -ldflags. These act as overrides: when a
@@ -66,6 +110,22 @@ var (
 	// loop rebuilds the binary, the browser tab may still be talking to the
 	// previous process. BuildID gives the WUI a cheap freshness signal.
 	BuildID = ""
+
+	// BuildTime is the human-readable moment this binary was linked, injected
+	// via ldflags by build.go (and left empty for plain `go build`/`go run`).
+	//
+	// It exists because `crush --version` used to print only the release-line
+	// summary ("0.1.7@0.87.0"), which is IDENTICAL for every build of that
+	// line — so a deployed binary carried no evidence of which source tree it
+	// came from. Answering "is the binary I'm running actually the one I just
+	// built?" then came down to guesswork or memory, and got answered wrong
+	// more than once. Together with Commit this makes provenance readable at
+	// a glance.
+	//
+	// When not injected, init() derives it from the executable's own mtime —
+	// the same signal deriveBuildID already uses, and accurate for any
+	// locally-built binary.
+	BuildTime = ""
 )
 
 // FullVersion is consumed by the web UI's status bar.
@@ -117,6 +177,27 @@ func init() {
 	if BuildID == "" {
 		BuildID = deriveBuildID()
 	}
+	if BuildTime == "" {
+		BuildTime = deriveBuildTime()
+	}
+}
+
+// deriveBuildTime reports when the running executable was last written, used
+// as BuildTime for builds that don't inject it via ldflags. For a locally
+// built binary that IS the build time; for a downloaded release it is when
+// the file landed on disk, which is still a strictly better provenance signal
+// than nothing. Returns "" (not "unknown") on failure so VersionLine simply
+// omits the field rather than printing a placeholder.
+func deriveBuildTime() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	fi, err := os.Stat(exe)
+	if err != nil {
+		return ""
+	}
+	return fi.ModTime().Format("2006-01-02 15:04:05")
 }
 
 // resolveVersion decides the final Version and Commit from the ldflags-provided
