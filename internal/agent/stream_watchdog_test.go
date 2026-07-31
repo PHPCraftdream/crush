@@ -25,7 +25,7 @@ func TestStreamWatchdog_BumpKeepsItAlive(t *testing.T) {
 	var fired atomic.Int32
 	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(time.Duration, bool) {
 		fired.Add(1)
-	}, false, 0, 0)
+	}, false, 0, 0, 0)
 	// Bump every 20ms for ~300ms — well past idle*3 worth of ticks.
 	// Watchdog must NOT fire.
 	stop := time.After(300 * time.Millisecond)
@@ -58,7 +58,7 @@ func TestStreamWatchdog_FiresOnNoActivity(t *testing.T) {
 	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(observedIdle time.Duration, _ bool) {
 		fired.Add(1)
 		firedIdle.Store(int64(observedIdle))
-	}, false, 0, 0)
+	}, false, 0, 0, 0)
 
 	// Wait long enough for the watchdog to fire on its own.
 	select {
@@ -84,7 +84,7 @@ func TestStreamWatchdog_ExitsCleanlyOnCtxCancel(t *testing.T) {
 	var fired atomic.Int32
 	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(time.Duration, bool) {
 		fired.Add(1)
-	}, false, 0, 0)
+	}, false, 0, 0, 0)
 
 	// Cancel ctx externally — watchdog must exit promptly without firing.
 	time.Sleep(40 * time.Millisecond)
@@ -110,7 +110,7 @@ func TestStreamWatchdog_BumpAfterFireIsHarmless(t *testing.T) {
 	const idle = 30 * time.Millisecond
 	const tick = 5 * time.Millisecond
 
-	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(time.Duration, bool) {}, false, 0, 0)
+	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(time.Duration, bool) {}, false, 0, 0, 0)
 
 	// Let it fire.
 	<-wd.done
@@ -139,7 +139,7 @@ func TestStreamWatchdog_PausedDuringToolExecution(t *testing.T) {
 	var fired atomic.Int32
 	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(time.Duration, bool) {
 		fired.Add(1)
-	}, false, 0, 0)
+	}, false, 0, 0, 0)
 	// A tool starts and runs WAY past idleTimeout with zero provider
 	// activity — the watchdog must NOT fire.
 	wd.toolStarted(false)
@@ -175,7 +175,7 @@ func TestStreamWatchdog_PauseCountsParallelTools(t *testing.T) {
 	var fired atomic.Int32
 	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(time.Duration, bool) {
 		fired.Add(1)
-	}, false, 0, 0)
+	}, false, 0, 0, 0)
 	// Two parallel tool calls in flight; finishing ONE must keep the
 	// watchdog paused (counter still > 0).
 	wd.toolStarted(false)
@@ -204,7 +204,7 @@ func TestStreamWatchdog_ExtendsOnProgress(t *testing.T) {
 	var fired atomic.Int32
 	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(time.Duration, bool) {
 		fired.Add(1)
-	}, true, hardCap, 0)
+	}, true, hardCap, 0, 0)
 	defer func() {
 		cancel()
 		<-wd.done
@@ -240,7 +240,7 @@ func TestStreamWatchdog_ExtendsOnProgress_FiresWhenIdle(t *testing.T) {
 	var fired atomic.Int32
 	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(time.Duration, bool) {
 		fired.Add(1)
-	}, true, hardCap, 0)
+	}, true, hardCap, 0, 0)
 
 	// Bump once to extend, then stop.
 	wd.bump()
@@ -268,7 +268,7 @@ func TestStreamWatchdog_HardCapRespected(t *testing.T) {
 	var fired atomic.Int32
 	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(time.Duration, bool) {
 		fired.Add(1)
-	}, true, hardCap, 0)
+	}, true, hardCap, 0, 0)
 
 	start := time.Now()
 
@@ -307,6 +307,7 @@ func TestStreamWatchdog_ToolPauseBoundedByCap(t *testing.T) {
 	const idle = 5 * time.Second // large — idle path must NOT fire
 	const tick = 10 * time.Millisecond
 	const toolMaxDuration = 60 * time.Millisecond
+	const exemptCap = toolMaxDuration // no exempt tools started in this test
 
 	var fired atomic.Int32
 	var firedToolTimeout atomic.Bool
@@ -315,7 +316,7 @@ func TestStreamWatchdog_ToolPauseBoundedByCap(t *testing.T) {
 		fired.Add(1)
 		firedToolTimeout.Store(toolTimeout)
 		firedElapsed.Store(int64(elapsed))
-	}, false, 0, toolMaxDuration)
+	}, false, 0, toolMaxDuration, exemptCap)
 
 	// A tool starts and runs past toolMaxDuration with zero provider
 	// activity. The watchdog must fire with toolTimeout==true.
@@ -345,13 +346,14 @@ func TestStreamWatchdog_ToolPauseUnderCapDoesNotFire(t *testing.T) {
 	const idle = 60 * time.Millisecond
 	const tick = 10 * time.Millisecond
 	const toolMaxDuration = 5 * time.Second // generous — well above the tool runtime
+	const exemptCap = toolMaxDuration       // no exempt tools started in this test
 
 	var fired atomic.Int32
 	var firedToolTimeout atomic.Bool
 	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(_ time.Duration, toolTimeout bool) {
 		fired.Add(1)
 		firedToolTimeout.Store(toolTimeout)
-	}, false, 0, toolMaxDuration)
+	}, false, 0, toolMaxDuration, exemptCap)
 	defer func() {
 		cancel()
 		<-wd.done
@@ -379,19 +381,28 @@ func TestStreamWatchdog_ToolPauseUnderCapDoesNotFire(t *testing.T) {
 	assert.True(t, wd.stalled.Load())
 }
 
-// TestStreamWatchdog_ExemptToolNotBoundedByCap is the regression test for a
-// real, reproducible bug: a sub-agent delegation via the `agent` tool was
-// force-cancelled by the PARENT's own stream watchdog with a generic
+// TestStreamWatchdog_ExemptToolUsesLargerCapNotNoCap pins BOTH halves of the
+// exempt-tool contract, which a previous revision got half right and half
+// catastrophically wrong.
+//
+// Half one (the original bug): a sub-agent delegation via the `agent` tool
+// was force-cancelled by the PARENT's own stream watchdog with a generic
 // "context canceled" error while the sub-agent was still productively
-// working — the same toolMaxDuration cap meant for a single primitive tool
-// (bash, edit, ...) was also being applied to the parent's wait on an
-// entire nested sub-agent conversation, which routinely takes far longer
-// than that cap for non-trivial work. The sub-agent's OWN Run() call
-// already runs under its own stream watchdog, so a SECOND, tighter bound on
-// the parent's side is both redundant and actively harmful. This proves an
-// exempt tool (toolStarted(true)) is never killed by toolMaxDuration, no
-// matter how long it stays in flight.
-func TestStreamWatchdog_ExemptToolNotBoundedByCap(t *testing.T) {
+// working — the toolMaxDuration cap meant for a single primitive tool (bash,
+// edit, ...) was also being applied to the parent's wait on an entire nested
+// sub-agent conversation, which routinely takes far longer. So an exempt
+// tool must NOT be bounded by that short cap.
+//
+// Half two (the fix's own regression, which this test now guards): the first
+// attempt at half one skipped the cap check ENTIRELY for exempt tools. Since
+// the tool-in-flight branch also short-circuits every other deadline check,
+// that left the watchdog structurally unable to fire by any condition while
+// a delegation was in flight — an unbounded parent wait, which is exactly
+// how a wedged child froze a whole process for 15+ minutes with no error and
+// no diagnostics. The correct shape is a LARGER cap, never NO cap.
+//
+// So: no fire before exemptCap, guaranteed fire after it.
+func TestStreamWatchdog_ExemptToolUsesLargerCapNotNoCap(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -399,11 +410,12 @@ func TestStreamWatchdog_ExemptToolNotBoundedByCap(t *testing.T) {
 	const idle = 60 * time.Millisecond // idle path must NOT fire either
 	const tick = 10 * time.Millisecond
 	const toolMaxDuration = 60 * time.Millisecond // tiny — would fire almost immediately for a non-exempt tool
+	const exemptCap = 800 * time.Millisecond      // generous sub-agent bound: far above toolMaxDuration, still finite
 
 	var fired atomic.Int32
 	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(time.Duration, bool) {
 		fired.Add(1)
-	}, false, 0, toolMaxDuration)
+	}, false, 0, toolMaxDuration, exemptCap)
 
 	// An exempt (sub-agent delegation) tool starts and runs WAY past
 	// toolMaxDuration with zero provider activity — the watchdog must NOT
@@ -411,31 +423,35 @@ func TestStreamWatchdog_ExemptToolNotBoundedByCap(t *testing.T) {
 	wd.toolStarted(true)
 	time.Sleep(toolMaxDuration * 5)
 	assert.Equal(t, int32(0), fired.Load(),
-		"watchdog must not fire for an exempt tool even well past toolMaxDuration")
+		"watchdog must not fire for an exempt tool merely past the short toolMaxDuration")
 	assert.False(t, wd.stalled.Load())
 	assert.NoError(t, ctx.Err())
 
-	// Once the exempt tool finishes, the watchdog must resume normal idle
-	// behavior (proving exemption is scoped to while the tool is in flight,
-	// not a permanent disable).
-	wd.toolFinished(true)
+	// ...but the exempt tool stays in flight, silent, past exemptCap too.
+	// THIS is the half that must still fire: "generous" is not "infinite".
+	// Without this the parent waits forever on a wedged child.
 	select {
 	case <-wd.done:
-	case <-time.After(idle + 300*time.Millisecond):
-		t.Fatal("watchdog must resume firing on idle once the exempt tool finishes")
+	case <-time.After(exemptCap + 500*time.Millisecond):
+		t.Fatal("watchdog MUST fire once an exempt tool exceeds exemptToolMaxDuration — an unbounded parent wait is how a wedged sub-agent freezes the whole process")
 	}
 	assert.Equal(t, int32(1), fired.Load())
-	assert.True(t, wd.stalled.Load())
+	assert.True(t, wd.stalled.Load(), "firing on the exempt cap must mark the turn stalled")
+	assert.Error(t, ctx.Err(), "firing must cancel the turn's context")
 }
 
 // TestStreamWatchdog_ExemptToolInSameBatchExemptsNonExemptToo verifies the
 // batch-level semantics documented on exemptToolsInFlight: when an exempt
 // tool (sub-agent delegation) is part of the SAME in-flight batch as a
-// regular tool (parallel tool calls), the whole batch is exempted from
-// toolMaxDuration — not just the exempt one. This is a deliberate,
-// documented simplification (the watchdog tracks one shared toolStartedAt
-// for the whole batch, not a per-tool timer), and errs toward not killing a
-// batch that includes a legitimate long-running delegation.
+// regular tool (parallel tool calls), the WHOLE batch is bounded by the
+// generous exemptToolMaxDuration rather than the short toolMaxDuration —
+// not just the exempt call itself. This is a deliberate, documented
+// simplification (the watchdog tracks one shared toolStartedAt for the whole
+// batch, not a per-tool timer), and errs toward not killing a batch that
+// includes a legitimate long-running delegation. Note "bounded by the larger
+// cap", not "unbounded": see
+// TestStreamWatchdog_ExemptToolUsesLargerCapNotNoCap for why that
+// distinction is the whole point.
 func TestStreamWatchdog_ExemptToolInSameBatchExemptsNonExemptToo(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(t.Context())
@@ -444,11 +460,12 @@ func TestStreamWatchdog_ExemptToolInSameBatchExemptsNonExemptToo(t *testing.T) {
 	const idle = 60 * time.Millisecond
 	const tick = 10 * time.Millisecond
 	const toolMaxDuration = 60 * time.Millisecond
+	const exemptCap = 800 * time.Millisecond // generous sub-agent bound: far above toolMaxDuration, still finite
 
 	var fired atomic.Int32
 	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(time.Duration, bool) {
 		fired.Add(1)
-	}, false, 0, toolMaxDuration)
+	}, false, 0, toolMaxDuration, exemptCap)
 
 	// Two parallel tool calls: one regular (bash-shaped), one exempt
 	// (agent-shaped). Both must be protected for as long as the exempt one
@@ -505,12 +522,13 @@ func TestStreamWatchdog_SequentialBatchProgressResetsCapClock(t *testing.T) {
 	const idle = 5 * time.Second // large — idle path must not confound this test
 	const tick = 10 * time.Millisecond
 	const toolMaxDuration = 60 * time.Millisecond
+	const exemptCap = toolMaxDuration     // no exempt tools started in this test
 	const stepGap = 30 * time.Millisecond // < toolMaxDuration; 4 steps sum to ~120ms > toolMaxDuration
 
 	var fired atomic.Int32
 	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(time.Duration, bool) {
 		fired.Add(1)
-	}, false, 0, toolMaxDuration)
+	}, false, 0, toolMaxDuration, exemptCap)
 
 	// fantasy fires OnToolCall for every tool in the step before executing
 	// any of them — simulate that: all four "start" near-simultaneously.

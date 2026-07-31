@@ -40,6 +40,7 @@ import (
 	"github.com/charmbracelet/crush/internal/agent/tools/mcp"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/csync"
+	crushlog "github.com/charmbracelet/crush/internal/log"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/pubsub"
 	"github.com/charmbracelet/crush/internal/session"
@@ -443,6 +444,35 @@ func (a *sessionAgent) effectiveToolMaxDuration() time.Duration {
 	return toolMaxDuration
 }
 
+// effectiveExemptToolMaxDuration resolves the never-freeze backstop applied
+// to EXEMPT tool calls — i.e. sub-agent delegations via the "agent" tool,
+// which the parent waits on synchronously and which legitimately run far
+// longer than any primitive tool.
+//
+// It is deliberately a separate, much more generous bound rather than "no
+// bound": an unbounded parent wait means a wedged child hangs the parent
+// forever, producing no error, no finish part and no diagnostics. Precedence:
+//
+//  1. orchestratorToolExecutionMaxDefault (45m) — the default. Note this
+//     applies whenever an `agent` call is actually in flight, unlike
+//     effectiveToolMaxDuration's rule (2), which only reaches the same value
+//     when a Worker model happens to be configured
+//     (coordinator.workerSubAgentActive). A run that delegates WITHOUT a
+//     configured Worker used to fall back to the 15m primitive-tool cap and
+//     get its healthy delegations killed; keying off the in-flight call
+//     itself is what actually matches the delegation's cost profile.
+//  2. a.toolMaxDuration (> 0) — the EXPLICIT OPERATOR OVERRIDE, from
+//     Options.StreamToolTimeoutSeconds. Wins unconditionally, in either
+//     direction, matching effectiveToolMaxDuration's rule (3): operator
+//     intent outranks both heuristics, and a single knob that shortens
+//     everything is what makes this path testable at second-scale.
+func (a *sessionAgent) effectiveExemptToolMaxDuration() time.Duration {
+	if a.toolMaxDuration > 0 {
+		return a.toolMaxDuration
+	}
+	return orchestratorToolExecutionMaxDefault
+}
+
 // logProviderWarnings emits each fantasy CallWarning from a step at WARN
 // level. Without this, warnings such as malformed-tool-call input
 // sanitization are silently dropped and never reach the logs. Optional
@@ -643,10 +673,22 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 		idleTimeout = a.streamIdleTimeout
 	}
 	toolMaxDuration := a.effectiveToolMaxDuration()
+	exemptToolMaxDuration := a.effectiveExemptToolMaxDuration()
 	var watchdogToolTimeout atomic.Bool
 	wd := startStreamWatchdog(
 		genCtx, cancel, idleTimeout, streamWatchdogTick,
 		func(elapsed time.Duration, toolTimeout bool) {
+			// The watchdog firing IS the hang, caught at the only moment the
+			// evidence still exists. Capture every goroutine's stack now:
+			// pprof is gated behind CRUSH_PROFILE (so it can't be turned on
+			// after the fact) and release builds strip symbols (so a debugger
+			// attach yields nothing and merely kills the process). Without
+			// this, every production hang is diagnosed by guesswork.
+			if dumpPath, dumpErr := crushlog.DumpGoroutines("stream watchdog fired"); dumpErr != nil {
+				slog.Warn("agent: failed to write goroutine dump for watchdog fire", "err", dumpErr)
+			} else {
+				slog.Warn("agent: wrote goroutine dump for watchdog fire", "path", dumpPath)
+			}
 			if toolTimeout {
 				watchdogToolTimeout.Store(true)
 				slog.Warn(
@@ -656,6 +698,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 					"model", largeModel.ModelCfg.Model,
 					"elapsed", elapsed.String(),
 					"cap", toolMaxDuration.String(),
+					"sub_agent_cap", exemptToolMaxDuration.String(),
 				)
 				return
 			}
@@ -671,6 +714,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 		a.timeoutExtendsOnProgress, // Fork patch: batch 8
 		a.timeoutHardCap,           // Fork patch: batch 8
 		toolMaxDuration,            // never-freeze backstop
+		exemptToolMaxDuration,      // never-freeze backstop for sub-agent delegations
 	)
 	bumpActivity := wd.bump
 	// toolStarted/toolFinished bracket tool execution so the watchdog pauses

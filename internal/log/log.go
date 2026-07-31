@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
@@ -21,6 +22,11 @@ var (
 
 func Setup(logFile string, debug bool, ws ...io.Writer) {
 	initOnce.Do(func() {
+		// Remember where logs live so DumpGoroutines can drop hang dumps
+		// next to crush.log without threading config through every caller.
+		if logFile != "" {
+			logDir.Store(filepath.Dir(logFile))
+		}
 		// Fork patch (concurrency): MaxBackups was 0 upstream, which
 		// effectively disabled rotation — once a process reached MaxSize
 		// the file grew indefinitely. Under parallel `crush run` the
