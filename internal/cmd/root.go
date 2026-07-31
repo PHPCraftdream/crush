@@ -397,13 +397,22 @@ func MaybePrependStdin(prompt string) (string, error) {
 		// ever close. The reader goroutine is intentionally leaked on
 		// timeout — Go can't cancel a blocked pipe Read — but that's a
 		// single goroutine for the life of the process, not a hang.
+		//
+		// Capture os.Stdin into a local BEFORE spawning the goroutine: the
+		// goroutine reads it lazily (whenever the scheduler runs it), so
+		// reading the live package-level os.Stdin from inside the
+		// goroutine would race any later reassignment of that variable —
+		// caught by -race via this exact test's own withStdin(t, ...)
+		// helper reassigning os.Stdin in t.Cleanup while a prior test's
+		// leaked goroutine was still reading it.
+		stdin := os.Stdin
 		type stdinResult struct {
 			bts []byte
 			err error
 		}
 		ch := make(chan stdinResult, 1)
 		go func() {
-			bts, err := io.ReadAll(os.Stdin)
+			bts, err := io.ReadAll(stdin)
 			ch <- stdinResult{bts, err}
 		}()
 		select {
