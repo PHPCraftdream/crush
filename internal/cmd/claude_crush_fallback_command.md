@@ -1,5 +1,5 @@
 ---
-description: Register a local sub-agent to fall back to when `crush` becomes unusable — peak-hours refusal or hard quota limit — and switch to it automatically, without asking, the moment either fires
+description: Register a local sub-agent to fall back to when `crush` becomes unusable — peak-hours refusal or hard quota limit — switch to it automatically the moment either fires, and switch back on user request or once the peak-hours window closes
 ---
 
 `/crush-fallback <agent>` **arms** a fallback: it names the local `Agent` sub-agent type (e.g. `sh`, `oh`, `fm`) to use *if and when* `crush` becomes unusable. It does **NOT** switch anything right now.
