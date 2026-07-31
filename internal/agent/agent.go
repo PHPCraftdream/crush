@@ -1595,6 +1595,14 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 		isHyper := largeModel.ModelCfg.Provider == hyper.Name
 		isCancelErr := errors.Is(err, context.Canceled)
 		isWatchdogStall := isCancelErr && wd.stalled.Load()
+		// `crush run --timeout` bounds the whole invocation via
+		// context.WithTimeout on the root ctx (run.go); when it fires
+		// mid-turn, ctx.Err() is context.DeadlineExceeded, NOT
+		// context.Canceled, so isCancelErr above never catches it. Without
+		// this branch it fell into the generic `else` below as "Provider
+		// Error" with a bare "context deadline exceeded" — indistinguishable
+		// from a real provider failure and useless to `sessions why`.
+		isRunTimeout := errors.Is(err, context.DeadlineExceeded)
 		// currentAssistant is only ever reassigned (never set back to nil)
 		// by PrepareStep, under sessionLock. agent.Stream has already
 		// returned by this point so no streaming callback can race this
@@ -1729,6 +1737,12 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			}
 		} else if isCancelErr {
 			currentAssistant.AddFinish(message.FinishReasonCanceled, "User canceled request", "")
+		} else if isRunTimeout {
+			currentAssistant.AddFinish(
+				message.FinishReasonError,
+				"Run timeout exceeded",
+				"The run's --timeout deadline expired while this turn was still in flight (e.g. a long tool call or sub-agent delegation). Re-run into the same --session id with a larger --timeout to continue from here.",
+			)
 		} else if isHyper && errors.As(err, &providerErr) && providerErr.StatusCode == http.StatusUnauthorized {
 			currentAssistant.AddFinish(message.FinishReasonError, "Unauthorized", `Please re-authenticate with Hyper. You can also run "crush auth" to re-authenticate.`)
 		} else if isHyper && errors.As(err, &providerErr) && providerErr.StatusCode == http.StatusPaymentRequired {
