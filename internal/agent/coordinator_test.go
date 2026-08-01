@@ -882,6 +882,65 @@ func TestUpdateParentSessionCost(t *testing.T) {
 	})
 }
 
+// TestRunSubAgentCostSurvivesCancelledParentContext is the regression test
+// for the 2026-07-30 incident ("Failed to update parent session cost"
+// error="begin transaction: context deadline exceeded"): a sub-agent that
+// finishes AFTER its parent's ctx was already cancelled (stream watchdog
+// timeout, or a user Ctrl-C) must still have its spend transferred to the
+// parent. Before the fix, runSubAgent called updateParentSessionCost with
+// the same (now-cancelled) ctx used for the whole turn, so BeginTx failed
+// immediately with context.Canceled, the transfer was skipped, and — since
+// this child is never resumed again — that cost was gone for good.
+func TestRunSubAgentCostSurvivesCancelledParentContext(t *testing.T) {
+	const providerID = "test-provider"
+	providerCfg := config.ProviderConfig{ID: providerID}
+
+	env := testEnv(t)
+	coord := newTestCoordinator(t, env, providerID, providerCfg)
+
+	parentSession, err := env.sessions.Create(t.Context(), "Parent")
+	require.NoError(t, err)
+
+	// ctx is cancelled from WITHIN the mock agent's Run, i.e. after session
+	// creation (which needs a live ctx and is not what we're testing) has
+	// already completed, but before runSubAgent gets to the cost-transfer
+	// step that runs right after Run() returns. This mirrors the real
+	// incident: the parent's stream watchdog (or a user Ctrl-C) fires while
+	// the child sub-agent call is in flight, and the child still manages to
+	// persist its cost and return a result before the cancellation is
+	// observed anywhere else — but the cost-transfer that runs immediately
+	// after must not be handed the now-dead ctx.
+	ctx, cancel := context.WithCancel(t.Context())
+
+	agent := newMockAgent(providerID, 4096, func(runCtx context.Context, call SessionAgentCall) (*fantasy.AgentResult, error) {
+		// Child incurs cost while ctx is still live...
+		if _, err := env.sessions.IncrementCost(runCtx, call.SessionID, 0.09); err != nil {
+			return nil, err
+		}
+		// ...then the parent's watchdog fires, cancelling ctx right before
+		// this call returns — simulating cancellation racing the child's
+		// completion.
+		cancel()
+		return agentResultWithText("done"), nil
+	})
+
+	resp, err := coord.runSubAgent(ctx, subAgentParams{
+		Agent:          agent,
+		SessionID:      parentSession.ID,
+		AgentMessageID: "msg-1",
+		ToolCallID:     "call-1",
+		Prompt:         "test",
+		SessionTitle:   "Test",
+	})
+	require.NoError(t, err, "runSubAgent itself must not fail just because the parent ctx was cancelled")
+	require.False(t, resp.IsError, "sub-agent response must not be an error just because the parent ctx was cancelled: %v", resp)
+
+	updatedParent, err := env.sessions.Get(t.Context(), parentSession.ID)
+	require.NoError(t, err)
+	assert.InDelta(t, 0.09, updatedParent.Cost, 1e-9,
+		"the child's cost must still be transferred to the parent despite the cancelled parent ctx")
+}
+
 // boolPtr is a tiny helper for building *bool config values in tests.
 func boolPtr(b bool) *bool { return &b }
 

@@ -2503,7 +2503,20 @@ func (c *coordinator) runSubAgent(ctx context.Context, params subAgentParams) (f
 	// uncharged delta persists in (child.cost - child.parent_cost_accounted)
 	// and is recovered on the next successful call. The previous code skipped
 	// the charge on the generic-error path, permanently losing that cost.
-	if costErr := c.updateParentSessionCost(ctx, session.ID, params.SessionID); costErr != nil {
+	//
+	// Detached timeout, same pattern as agent.go's error-path flush (see
+	// agent.go's flushCtx uses): ctx may already be cancelled here — by the
+	// parent's stream watchdog or a user Ctrl-C — since this runs after the
+	// child's own Run() returns. Charging the parent is a single short DB
+	// transaction, not tied to the run that just ended, so it must survive
+	// that cancellation rather than fail immediately with "begin
+	// transaction: context canceled" and silently drop the child's spend
+	// (recovery only happens if this same child is ever charged again,
+	// which is not guaranteed for a one-shot sub-agent).
+	costCtx, costCancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+	costErr := c.updateParentSessionCost(costCtx, session.ID, params.SessionID)
+	costCancel()
+	if costErr != nil {
 		slog.Warn(
 			"Failed to update parent session cost",
 			"child_session", session.ID,
