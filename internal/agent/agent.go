@@ -142,6 +142,20 @@ const (
 // slow. A var (not const) so tests can shrink it instead of waiting it out.
 var sessionPreambleMaxDuration = 60 * time.Second
 
+// titleGenerationMaxDuration bounds how long the background title-generation
+// goroutine (launched from runTurn, awaited by its `defer wg.Wait()`) is
+// allowed to run. Title generation is a best-effort cosmetic side call
+// (a.generateTitle tries up to two models, each a blocking agent.Stream with
+// no timeout of its own) and must never be able to hold runTurn — and
+// therefore Run() — open past its own turn. Its context is derived from
+// genCtx so the stream watchdog's cancellation already covers it; this timer
+// is the independent backstop for the case where genCtx's cancellation, for
+// whatever reason, doesn't propagate (e.g. a provider stuck outside of
+// context-aware I/O). Generous relative to a title's actual cost (a handful
+// of tokens) so it only ever trips when something is genuinely wedged. A var
+// (not const) so tests can shrink it instead of waiting it out.
+var titleGenerationMaxDuration = 2 * time.Minute
+
 var userAgent = fmt.Sprintf("Charm-Crush/%s (https://charm.land/crush)", version.Version)
 
 //go:embed templates/title.md
@@ -686,24 +700,18 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall) (res 
 		return nil, fmt.Errorf("failed to get session messages: %w", err), SessionAgentCall{}, false
 	}
 
-	var wg sync.WaitGroup
 	// Generate the title on the first message — OR self-heal on a later turn
 	// when the session is still nameless. Title generation is best-effort and
 	// a transient provider blip (z.ai overload, a token-limit truncation) on
 	// turn 1 used to doom the session to "Untitled Session" forever, since it
 	// only ever fired at len(msgs)==0. Retrying while the title is still
 	// empty/default lets the next message recover it; it stops the moment a
-	// real title lands.
+	// real title lands. needsTitle is decided here (before the preamble ctx
+	// is cancelled below) but the goroutine itself is launched further down,
+	// after genCtx exists — see the wg.Go call site near genCtx's creation.
 	needsTitle := len(msgs) == 0 ||
 		currentSession.Title == "" ||
 		currentSession.Title == DefaultSessionName
-	if needsTitle {
-		titleCtx := ctx // Copy to avoid race with ctx reassignment below.
-		wg.Go(func() {
-			a.generateTitle(titleCtx, call.SessionID, call.Prompt)
-		})
-	}
-	defer wg.Wait()
 
 	// Add the user message to the session. Skip creation when the call
 	// references a message that already exists in the DB (interrupt-inject
@@ -731,6 +739,26 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall) (res 
 	// owned and released by Run(), not per-turn — see the removed
 	// `defer a.activeRequests.Del(call.SessionID)` note below.
 	a.activeRequests.Set(call.SessionID, cancel)
+
+	var wg sync.WaitGroup
+	if needsTitle {
+		// Derived from genCtx (not the outer ctx runTurn was called with) so
+		// the stream watchdog cancelling genCtx — idle timeout, tool
+		// timeout, hard cap — also cuts off an in-flight title generation
+		// instead of leaving it to run on an unbounded parent context. Also
+		// independently capped by titleGenerationMaxDuration as a backstop:
+		// generateTitle's two model attempts are each a blocking
+		// agent.Stream with no timeout of their own, so a provider that
+		// never returns (hung connection, stream never closed) must not be
+		// able to keep the deferred wg.Wait() below from returning even if
+		// genCtx's own cancellation somehow doesn't unblock it.
+		titleCtx, titleCancel := context.WithTimeout(genCtx, titleGenerationMaxDuration)
+		wg.Go(func() {
+			defer titleCancel()
+			a.generateTitle(titleCtx, call.SessionID, call.Prompt)
+		})
+	}
+	defer wg.Wait()
 
 	// Stream-progress watchdog (see streamWatchdog doc in stream_watchdog.go
 	// for the invariant). Every fantasy stream callback below calls
