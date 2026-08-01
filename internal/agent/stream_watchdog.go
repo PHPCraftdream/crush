@@ -71,6 +71,28 @@ type streamWatchdog struct {
 // every tool in flight, sub-agent delegations included — see toolStarted's
 // doc on the streamWatchdog struct for why a single generous cap replaced
 // the old plain-vs-exempt split.
+//
+// Fork patch: parent/child cancellation race — toolCleanupGrace adds a
+// fixed, tool-agnostic buffer ON TOP of toolMaxDuration before this
+// watchdog is allowed to fire on the tool-pause path. It exists because a
+// tool call that is itself an `agent`-tool delegation runs a full nested
+// Run()/runTurn() with its OWN stream watchdog, started only once the
+// delegation actually begins executing (after init, DB preamble, etc.) —
+// strictly LATER than this (the parent's) watchdog started counting from
+// OnToolCall. Both watchdogs are configured with the same toolMaxDuration
+// (see toolExecutionMaxDefault's doc for why a two-tier, tool-name-keyed
+// cap was rejected), so without a grace period the parent's clock, having
+// a head start, always reaches the cap first and cancels genCtx — which
+// cascades into the child's ctx — before the child's OWN watchdog ever
+// gets to fire on ITS cap and let the child unwind cleanly (write its
+// finish part, transfer cost to the parent session per task #197, dump
+// goroutines for diagnostics). toolCleanupGrace is added uniformly to
+// EVERY tool-in-flight, not selected by tool name/kind — it is a
+// structural allowance for "this watchdog is the OUTER one waiting on a
+// tool that may itself be watchdog-protected and need to unwind," not a
+// special case for the `agent` tool specifically. A plain (non-delegating)
+// tool that runs past toolMaxDuration+toolCleanupGrace is still caught,
+// just toolCleanupGrace later than before.
 func startStreamWatchdog(
 	ctx context.Context,
 	cancel context.CancelFunc,
@@ -79,6 +101,7 @@ func startStreamWatchdog(
 	extendsOnProgress bool,
 	hardCap time.Duration,
 	toolMaxDuration time.Duration,
+	toolCleanupGrace time.Duration,
 ) streamWatchdog {
 	var last atomic.Int64
 	startTime := time.Now()
@@ -199,7 +222,16 @@ func startStreamWatchdog(
 					// leash than anything else, and nothing gets no leash.
 					if toolMaxDuration > 0 {
 						if startedAt := toolStartedAt.Load(); startedAt > 0 {
-							if elapsed := now.Sub(time.Unix(0, startedAt)); elapsed >= toolMaxDuration {
+							// toolCleanupGrace gives a nested (child) watchdog —
+							// e.g. inside an `agent`-tool delegation — a window to
+							// fire on its OWN toolMaxDuration and unwind cleanly
+							// before this (outer) watchdog force-cancels the whole
+							// batch. See the doc comment on toolCleanupGrace in
+							// startStreamWatchdog's signature for why this is a
+							// uniform, tool-agnostic buffer rather than a special
+							// case keyed on tool name.
+							effectiveCap := toolMaxDuration + toolCleanupGrace
+							if elapsed := now.Sub(time.Unix(0, startedAt)); elapsed >= effectiveCap {
 								stalled.Store(true)
 								cancel()
 								if onFire != nil {

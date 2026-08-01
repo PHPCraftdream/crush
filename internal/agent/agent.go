@@ -111,6 +111,33 @@ const (
 	// bound the wait, not to bound it tightly.
 	toolExecutionMaxDefault = 45 * time.Minute
 
+	// toolCleanupGraceDefault is a fixed buffer added ON TOP of
+	// toolMaxDuration before the stream watchdog is allowed to force-cancel
+	// a tool-in-flight. It exists for the parent/child cancellation race
+	// created by toolExecutionMaxDefault's unification above: a tool call
+	// that is itself an `agent`-tool delegation runs a nested Run()/runTurn()
+	// with its own stream watchdog, started strictly LATER than the
+	// parent's (the parent starts timing from OnToolCall — the moment it
+	// decided to delegate; the child starts timing only once its own turn
+	// actually begins executing, after init and the DB preamble). Both
+	// watchdogs share the same toolMaxDuration, so the parent's clock — with
+	// its head start — would always reach the cap first and cancel genCtx,
+	// which cascades into the child's ctx, before the child's own watchdog
+	// ever gets a chance to fire on ITS cap and unwind cleanly (finish part,
+	// cost transfer per task #197, goroutine dump). This grace is applied
+	// uniformly to every tool-in-flight regardless of kind — it is not a
+	// tool-name-keyed special case (that pattern was deliberately rejected
+	// above); it just gives whichever tool is running a little extra runway
+	// past its nominal cap, which is harmless for a plain tool and decisive
+	// for a delegation. 90s comfortably exceeds the actual parent/child
+	// start-time skew (typically sub-second to low seconds) while covering
+	// the child's own bounded cleanup costs (detached cost-transfer timeout
+	// is 15s per task #197, plus finish-part write and goroutine dump).
+	// Configurable via Options.ToolCleanupGrace for tests; 0 falls back to
+	// this default rather than disabling the grace, since an accidental
+	// zero would silently reopen the race this constant exists to close.
+	toolCleanupGraceDefault = 90 * time.Second
+
 	// defaultCheckpointInterval is the default coalescing interval for
 	// mid-stream DB flushes of in-progress assistant text. When > 0,
 	// the auto-checkpoint ticker writes the Parts to DB at most once
@@ -295,6 +322,12 @@ type sessionAgent struct {
 	// OVERRIDE (Options.StreamToolTimeoutSeconds) and, when set, always
 	// wins over the built-in default, in either direction.
 	toolMaxDuration time.Duration
+	// toolCleanupGrace is the buffer added on top of the resolved
+	// toolMaxDuration before the watchdog force-cancels a tool-in-flight —
+	// see toolCleanupGraceDefault's doc for why this exists (parent/child
+	// delegation cancellation race). 0 = use toolCleanupGraceDefault; tests
+	// may override to a small value via SessionAgentOptions.ToolCleanupGrace.
+	toolCleanupGrace time.Duration
 
 	// messageQueue and injectQueue are per-session FIFO queues. They use
 	// csync.KeyedQueue (not csync.Map[string, []T]) because every real
@@ -384,6 +417,14 @@ type SessionAgentOptions struct {
 	// ALWAYS wins over the built-in default — plumbed from
 	// Options.StreamToolTimeoutSeconds in the coordinator.
 	ToolMaxDuration time.Duration
+	// ToolCleanupGrace overrides toolCleanupGraceDefault when > 0 — the
+	// buffer added on top of the resolved tool-max-duration before the
+	// watchdog force-cancels a tool-in-flight, giving a nested (child)
+	// watchdog inside an `agent`-tool delegation a chance to fire on its
+	// own cap and unwind cleanly first. See toolCleanupGraceDefault's doc
+	// for the full rationale. 0 = use the built-in default; primarily
+	// exposed for tests that want a short grace instead of waiting it out.
+	ToolCleanupGrace time.Duration
 	// PeakHoursCheck, when non-nil, is called once per step to re-check
 	// whether the large model's provider has entered its peak_hours
 	// window mid-turn. See the field doc on sessionAgent.peakHoursCheck.
@@ -415,6 +456,7 @@ func NewSessionAgent(
 		timeoutExtendsOnProgress: opts.TimeoutExtendsOnProgress,
 		timeoutHardCap:           opts.TimeoutHardCap,
 		toolMaxDuration:          opts.ToolMaxDuration,
+		toolCleanupGrace:         opts.ToolCleanupGrace,
 		peakHoursCheck:           opts.PeakHoursCheck,
 	}
 }
@@ -443,6 +485,20 @@ func (a *sessionAgent) effectiveToolMaxDuration() time.Duration {
 		toolMaxDuration = a.toolMaxDuration
 	}
 	return toolMaxDuration
+}
+
+// effectiveToolCleanupGrace resolves the buffer added on top of
+// effectiveToolMaxDuration before the stream watchdog force-cancels a
+// tool-in-flight. See toolCleanupGraceDefault's doc for why this exists.
+// 0 falls back to the default rather than disabling the grace — an
+// accidentally-zero override would silently reopen the parent/child
+// cancellation race this exists to close.
+func (a *sessionAgent) effectiveToolCleanupGrace() time.Duration {
+	toolCleanupGrace := toolCleanupGraceDefault
+	if a.toolCleanupGrace > 0 {
+		toolCleanupGrace = a.toolCleanupGrace
+	}
+	return toolCleanupGrace
 }
 
 // logProviderWarnings emits each fantasy CallWarning from a step at WARN
@@ -771,6 +827,7 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall) (res 
 		idleTimeout = a.streamIdleTimeout
 	}
 	toolMaxDuration := a.effectiveToolMaxDuration()
+	toolCleanupGrace := a.effectiveToolCleanupGrace()
 	var watchdogToolTimeout atomic.Bool
 	wd := startStreamWatchdog(
 		genCtx, cancel, idleTimeout, streamWatchdogTick,
@@ -810,6 +867,7 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall) (res 
 		a.timeoutExtendsOnProgress, // Fork patch: batch 8
 		a.timeoutHardCap,           // Fork patch: batch 8
 		toolMaxDuration,            // never-freeze backstop, applies to every tool
+		toolCleanupGrace,           // buffer for a nested watchdog to unwind first
 	)
 	bumpActivity := wd.bump
 	// toolStarted/toolFinished bracket tool execution so the watchdog pauses
