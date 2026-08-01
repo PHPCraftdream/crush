@@ -1021,93 +1021,50 @@ func TestSetTimeoutOptions(t *testing.T) {
 	assert.Equal(t, 30*time.Second, agent.timeoutHardCap)
 }
 
-// TestEffectiveToolMaxDuration_NonOrchestratorRun is the regression case: a
-// plain run (no orchestratorActive hook at all — the common case for
-// sub-agents and any caller that never wires it, plus the shape a
-// non-orchestrator top-level run takes before this fix) must still get
-// caught at exactly the original toolExecutionMaxDefault (15m). This proves
-// the fix does not weaken the watchdog's original purpose: a genuinely hung
-// bash/edit/MCP tool call in a normal run is still bounded at ~15 minutes.
-func TestEffectiveToolMaxDuration_NonOrchestratorRun(t *testing.T) {
+// TestEffectiveToolMaxDuration_Default proves the unified cap: with no
+// explicit operator override, every run — sub-agent or top-level,
+// orchestrating a delegation or not — gets exactly toolExecutionMaxDefault.
+// There used to be a separate, larger cap reserved for a top-level run
+// orchestrating a worker delegation; that split was removed (see
+// toolExecutionMaxDefault's doc) because it produced its own false cutoffs
+// — a sub-agent's OWN plain tool call (a slow build/test inside its turn)
+// still only got the short cap. One value, no special-casing.
+func TestEffectiveToolMaxDuration_Default(t *testing.T) {
 	env := testEnv(t)
 	sa := testSessionAgent(env, nil, nil, "test prompt")
 	agent := sa.(*sessionAgent)
 
-	require.Nil(t, agent.orchestratorActive, "orchestratorActive must be unset by default (sub-agents, or callers that don't wire it)")
 	require.Zero(t, agent.toolMaxDuration, "no explicit operator override by default")
 
 	got := agent.effectiveToolMaxDuration()
 	assert.Equal(t, toolExecutionMaxDefault, got,
-		"a non-orchestrator run must keep the original 15-minute never-freeze backstop for a genuinely stuck tool")
-}
-
-// TestEffectiveToolMaxDuration_OrchestratorRun proves the fix: when
-// orchestratorActive reports true (this run is orchestrating a worker
-// delegation via the "agent" tool — coordinator.workerSubAgentActive()) and
-// no explicit operator override is set, the watchdog's never-freeze backstop
-// must use the longer orchestratorToolExecutionMaxDefault (45m) instead of
-// the plain 15-minute default. This is the scenario from the live bug
-// report: a worker legitimately doing hands-on work (read/edit/bash) via a
-// single "agent" tool call used to be force-cancelled at 15 minutes; under
-// the fix it survives well past that point.
-func TestEffectiveToolMaxDuration_OrchestratorRun(t *testing.T) {
-	env := testEnv(t)
-	sa := testSessionAgent(env, nil, nil, "test prompt")
-	agent := sa.(*sessionAgent)
-	agent.orchestratorActive = func() bool { return true }
-
-	got := agent.effectiveToolMaxDuration()
-	assert.Equal(t, orchestratorToolExecutionMaxDefault, got,
-		"an orchestrator run must use the longer backstop so a legitimate worker delegation isn't killed at 15 minutes")
-	assert.Greater(t, got, toolExecutionMaxDefault,
-		"the orchestrator default must actually be longer than the plain default, or this fix does nothing")
-	// Sanity: a call that would have been cancelled at the old 15-minute
-	// default (e.g. 20 minutes of hands-on worker time) must fit comfortably
-	// under the new backstop.
-	assert.Greater(t, got, 20*time.Minute,
-		"the scenario from the bug report (worker running past 15m) must survive under the new default")
+		"every run must get the same never-freeze backstop by default, regardless of orchestrator/sub-agent status")
 }
 
 // TestEffectiveToolMaxDuration_OperatorOverrideWins verifies
 // Options.StreamToolTimeoutSeconds (a.toolMaxDuration) always wins over the
-// orchestrator-aware default, in BOTH directions: an operator override
-// shorter than the orchestrator default must still apply (the operator may
-// deliberately want a tighter leash), and one longer must also apply. Must
-// not remove or bypass the existing explicit-operator-override behavior.
+// built-in default, in both directions.
 func TestEffectiveToolMaxDuration_OperatorOverrideWins(t *testing.T) {
-	t.Run("operator override shorter than orchestrator default wins", func(t *testing.T) {
+	t.Run("operator override shorter than the default wins", func(t *testing.T) {
 		env := testEnv(t)
 		sa := testSessionAgent(env, nil, nil, "test prompt")
 		agent := sa.(*sessionAgent)
-		agent.orchestratorActive = func() bool { return true }
-		agent.toolMaxDuration = 5 * time.Minute // shorter than both defaults
+		agent.toolMaxDuration = 5 * time.Minute // shorter than the default
 
 		got := agent.effectiveToolMaxDuration()
 		assert.Equal(t, 5*time.Minute, got,
-			"an explicit operator override shorter than the orchestrator default must still win")
+			"an explicit operator override shorter than the default must still win")
 	})
 
-	t.Run("operator override longer than orchestrator default wins", func(t *testing.T) {
+	t.Run("operator override longer than the default wins", func(t *testing.T) {
 		env := testEnv(t)
 		sa := testSessionAgent(env, nil, nil, "test prompt")
 		agent := sa.(*sessionAgent)
-		agent.orchestratorActive = func() bool { return true }
-		agent.toolMaxDuration = 90 * time.Minute // longer than orchestratorToolExecutionMaxDefault
+		agent.toolMaxDuration = 90 * time.Minute // longer than toolExecutionMaxDefault
 
 		got := agent.effectiveToolMaxDuration()
 		assert.Equal(t, 90*time.Minute, got,
-			"an explicit operator override longer than the orchestrator default must still win")
-	})
-
-	t.Run("operator override wins even in a non-orchestrator run", func(t *testing.T) {
-		env := testEnv(t)
-		sa := testSessionAgent(env, nil, nil, "test prompt")
-		agent := sa.(*sessionAgent)
-		agent.toolMaxDuration = 42 * time.Minute // no orchestratorActive at all
-
-		got := agent.effectiveToolMaxDuration()
-		assert.Equal(t, 42*time.Minute, got,
-			"an explicit operator override must win regardless of orchestrator state")
+			"an explicit operator override longer than the default must still win")
 	})
 }
 

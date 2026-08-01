@@ -27,11 +27,18 @@ type streamWatchdog struct {
 	// cancelled as a false stall (observed: shamir-db f1-rename-index killed
 	// at exactly 180s during a workspace clippy).
 	//
-	// Each takes an `exempt` bool: true for a sub-agent delegation (the
-	// `agent` tool) — see toolStarted's own doc below for why toolMaxDuration
-	// must not apply to it.
-	toolStarted  func(exempt bool)
-	toolFinished func(exempt bool)
+	// A single toolMaxDuration bounds the pause regardless of which tool is
+	// in flight — including a sub-agent delegation via the `agent` tool.
+	// There used to be a separate, larger cap just for delegations, but
+	// distinguishing "exempt" from "plain" tools this way produced its own
+	// false cutoffs: a sub-agent's OWN plain tool call (a slow build/test
+	// inside its turn) hit the shorter plain cap just as often as a parent
+	// waiting on a delegation hit the old short cap. One generous cap for
+	// every tool avoids both failure modes at the cost of a genuinely wedged
+	// tool taking longer to get caught — an acceptable tradeoff since the
+	// point is to bound the wait, not to bound it tightly.
+	toolStarted  func()
+	toolFinished func()
 	// stalled reports whether THIS watchdog (not user/web cancel) is what
 	// fired the cancel. Callers use it to distinguish "user pressed
 	// Ctrl-C" from "watchdog timed out" when crafting the finish-part
@@ -60,7 +67,10 @@ type streamWatchdog struct {
 //
 // Fork patch: never-freeze backstop — toolMaxDuration bounds the tool
 // pause. Past it the watchdog fires with toolTimeout=true so the turn
-// ends instead of hanging forever on a stuck tool.
+// ends instead of hanging forever on a stuck tool. One cap applies to
+// every tool in flight, sub-agent delegations included — see toolStarted's
+// doc on the streamWatchdog struct for why a single generous cap replaced
+// the old plain-vs-exempt split.
 func startStreamWatchdog(
 	ctx context.Context,
 	cancel context.CancelFunc,
@@ -69,7 +79,6 @@ func startStreamWatchdog(
 	extendsOnProgress bool,
 	hardCap time.Duration,
 	toolMaxDuration time.Duration,
-	exemptToolMaxDuration time.Duration,
 ) streamWatchdog {
 	var last atomic.Int64
 	startTime := time.Now()
@@ -83,26 +92,6 @@ func startStreamWatchdog(
 	// toolMaxDuration to bound the tool pause. Reset to 0 when all tools
 	// finish.
 	var toolStartedAt atomic.Int64
-	// exemptToolsInFlight counts currently-running tool calls that must be
-	// bounded by exemptToolMaxDuration rather than the (much shorter)
-	// primitive-tool toolMaxDuration — specifically sub-agent delegations via
-	// the `agent` tool (see AgentToolName). Bounding the PARENT's wait on a
-	// delegation with the cap meant for a single primitive tool like bash
-	// kills perfectly healthy delegations that simply take longer to finish
-	// non-trivial work (routinely 15-30+ minutes for real tasks) — that was a
-	// real, reproducible bug: a parent's `agent` tool call was force-cancelled
-	// with "context canceled" while its sub-agent was still productively
-	// working, well before the sub-agent's own internal watchdog would have
-	// had reason to fire.
-	//
-	// The fix for that is a LARGER cap, not the ABSENCE of one. A sub-agent
-	// has its own watchdog for what it does inside its own stream, but that
-	// covers neither a child wedged outside its stream (blocked on a shared
-	// process-wide resource, say) nor the parent's own wait. If the parent's
-	// wait is unbounded, a wedged child freezes the parent forever with no
-	// error and no diagnostics — see the tick loop below for the incident
-	// this caused.
-	var exemptToolsInFlight atomic.Int64
 	// absoluteDeadline is the original deadline from process start.
 	absoluteDeadline := startTime.Add(idleTimeout)
 	// hardDeadline is the hard cap (e.g. 4x idleTimeout).
@@ -137,15 +126,12 @@ func startStreamWatchdog(
 		}
 	}
 
-	toolStarted := func(exempt bool) {
+	toolStarted := func() {
 		if toolsInFlight.Add(1) == 1 {
 			toolStartedAt.Store(time.Now().UnixNano())
 		}
-		if exempt {
-			exemptToolsInFlight.Add(1)
-		}
 	}
-	toolFinished := func(exempt bool) {
+	toolFinished := func() {
 		if remaining := toolsInFlight.Add(-1); remaining <= 0 {
 			// Defensive: a missing OnToolCall (or a double result) must not
 			// leave the counter negative and silently disable the watchdog.
@@ -174,12 +160,6 @@ func startStreamWatchdog(
 			// exactly as before.
 			toolStartedAt.Store(time.Now().UnixNano())
 		}
-		if exempt {
-			if exemptToolsInFlight.Add(-1) < 0 {
-				// Same defensive floor as toolsInFlight above.
-				exemptToolsInFlight.Store(0)
-			}
-		}
 		// Restart the idle clock fresh: the provider is about to resume, so
 		// don't count the tool's runtime against the next stall window.
 		last.Store(time.Now().UnixNano())
@@ -201,33 +181,25 @@ func startStreamWatchdog(
 				// The pause is bounded: past the applicable cap the watchdog
 				// fires with toolTimeout=true (never-freeze backstop).
 				if toolsInFlight.Load() > 0 {
-					// Pick the cap for the current batch. An exempt tool (a
-					// sub-agent delegation) gets the LARGER exemptToolMaxDuration
-					// instead of the primitive-tool cap — but it is still a
-					// bound, never "no bound at all".
-					//
-					// A previous revision skipped the cap check entirely while
-					// an exempt tool was in flight. Because the `continue`
-					// below also bypasses every other deadline check, that made
-					// the watchdog structurally unable to fire by ANY condition
-					// for as long as a delegation was in flight — an unbounded
-					// parent wait. That is how a wedged child silently freezes
-					// the whole process: no error, no finish part, no
-					// diagnostics, just a live process producing nothing
-					// (observed: four concurrent `agent` calls in flight, then
-					// 15+ minutes of total silence with the process still
-					// alive). It also directly contradicted
-					// orchestratorToolExecutionMaxDefault's documented intent
-					// ("Still bounded (not infinite) so a genuinely wedged
-					// sub-agent eventually gets force-cancelled instead of
-					// hanging the parent turn forever").
-					activeCap := toolMaxDuration
-					if exemptToolsInFlight.Load() > 0 {
-						activeCap = exemptToolMaxDuration
-					}
-					if activeCap > 0 {
+					// One cap for the whole batch, regardless of which kind of
+					// tool is in it — including a sub-agent delegation via the
+					// `agent` tool. Two earlier revisions got this wrong in
+					// opposite directions: applying the short primitive-tool cap
+					// to a delegation force-cancelled healthy sub-agent work
+					// that legitimately runs long; skipping the cap entirely
+					// for delegations (and letting the `continue` below bypass
+					// every other deadline check too) left the watchdog
+					// structurally unable to fire AT ALL while a delegation was
+					// in flight — an unbounded parent wait, which is how a
+					// wedged child silently froze the whole process (observed:
+					// four concurrent `agent` calls in flight, then 15+ minutes
+					// of total silence with the process still alive, no error,
+					// no finish part, no diagnostics). A single generous cap
+					// applied uniformly avoids both: nothing gets a shorter
+					// leash than anything else, and nothing gets no leash.
+					if toolMaxDuration > 0 {
 						if startedAt := toolStartedAt.Load(); startedAt > 0 {
-							if elapsed := now.Sub(time.Unix(0, startedAt)); elapsed >= activeCap {
+							if elapsed := now.Sub(time.Unix(0, startedAt)); elapsed >= toolMaxDuration {
 								stalled.Store(true)
 								cancel()
 								if onFire != nil {

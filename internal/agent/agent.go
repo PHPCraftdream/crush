@@ -89,34 +89,27 @@ const (
 	streamWatchdogTick = 30 * time.Second
 
 	// toolExecutionMaxDefault is the never-freeze backstop: the maximum
-	// wall-clock a single tool may run while the stream watchdog is
-	// paused (between OnToolCall and OnToolResult) before the watchdog
-	// force-cancels the turn. Bash auto-backgrounds at 60s and Phase 1b
-	// bounds job_output, so this only catches truly stuck tools (hung MCP
-	// tools, blocking job_output --wait on a deadlocked process).
+	// wall-clock a single tool may run while the stream watchdog is paused
+	// (between OnToolCall and OnToolResult) before the watchdog force-
+	// cancels the turn. Bash auto-backgrounds at 60s and Phase 1b bounds
+	// job_output, so this only catches truly stuck tools (hung MCP tools,
+	// blocking job_output --wait on a deadlocked process, or a sub-agent
+	// delegation via the "agent" tool that never returns).
 	// Configurable via Options.StreamToolTimeoutSeconds.
 	//
-	// Does NOT apply as-is to orchestrator runs (see
-	// orchestratorToolExecutionMaxDefault below) — a `--role smart` run
-	// with a Worker configured routes the "agent" tool through a fully
-	// synchronous fantasy.Agent.Run call with no auto-backgrounding escape
-	// hatch (unlike bash/job_output), so a worker doing real hands-on work
-	// legitimately runs past 15 minutes.
-	toolExecutionMaxDefault = 15 * time.Minute
-
-	// orchestratorToolExecutionMaxDefault is the never-freeze backstop used
-	// instead of toolExecutionMaxDefault when this run is orchestrating
-	// (workerSubAgentActive() — Large/"smart" role driving the run AND a
-	// Worker model configured, see coordinator.go). Delegating a real chunk
-	// of hands-on work (read/edit/bash/test) to a worker sub-agent is
-	// expected to legitimately take much longer than a single direct tool
-	// call — the watchdog must not mistake that for a hung tool. Still
-	// bounded (not infinite) so a genuinely wedged sub-agent eventually
-	// gets force-cancelled instead of hanging the parent turn forever.
-	// An explicit Options.StreamToolTimeoutSeconds always overrides this
-	// (and the plain default above) — operator intent outranks this
-	// heuristic in both directions.
-	orchestratorToolExecutionMaxDefault = 45 * time.Minute
+	// One value applies uniformly to every tool, including a sub-agent
+	// delegation — there used to be a separate, larger cap
+	// (orchestratorToolExecutionMaxDefault, 45m) reserved for delegations
+	// while plain tools kept a shorter one (15m). That split caused its own
+	// false cutoffs: a sub-agent's OWN plain tool call (a slow build/test
+	// inside ITS turn, not a delegation) still only got the short cap, so
+	// legitimate long-running work inside a sub-agent kept getting killed
+	// just as often as a parent waiting on a delegation used to be killed
+	// by the old single 15m cap. Unifying to one generous value avoids
+	// both directions of false cutoff at the cost of a genuinely wedged
+	// tool taking longer to get caught — worth it since the point is to
+	// bound the wait, not to bound it tightly.
+	toolExecutionMaxDefault = 45 * time.Minute
 
 	// defaultCheckpointInterval is the default coalescing interval for
 	// mid-stream DB flushes of in-progress assistant text. When > 0,
@@ -132,6 +125,22 @@ const (
 	// long streams, retries, and tool execution.
 	peakHoursPollInterval = 10 * time.Second
 )
+
+// sessionPreambleMaxDuration bounds the DB preamble at the top of Run() —
+// sessions.Get, getSessionMessages, createUserMessage — all of which route
+// through the single-writer sql.DB connection (SetMaxOpenConns(1) in
+// internal/db/connect.go). The stream watchdog is not started until AFTER
+// this preamble, so before this fix a stuck writer connection (a concurrent
+// sub-agent's own preamble wedged on it, etc.) hung the whole turn invisibly
+// and unboundedly: no watchdog running yet means no cancellation, no timeout
+// log line, nothing — just a process that sits there with a "SessionAgent.Run:
+// starting" log line and never another. Observed live: PID 28908 logged that
+// line for a sub-agent session and then went silent for 10+ minutes while the
+// lock heartbeat kept ticking (heartbeat is independent of actual progress —
+// see task #192). This cap is generous — normal SQLite reads/writes take low
+// milliseconds — so tripping it means something is genuinely wedged, not
+// slow. A var (not const) so tests can shrink it instead of waiting it out.
+var sessionPreambleMaxDuration = 60 * time.Second
 
 var userAgent = fmt.Sprintf("Charm-Crush/%s (https://charm.land/crush)", version.Version)
 
@@ -268,24 +277,10 @@ type sessionAgent struct {
 	// toolMaxDuration bounds the watchdog's tool-pause (never-freeze
 	// backstop). Past it the watchdog fires with a distinct "tool timeout"
 	// reason so the agent turn ends instead of hanging on a stuck tool.
-	// 0 = use toolExecutionMaxDefault (or orchestratorToolExecutionMaxDefault
-	// when orchestratorActive() is true — see that field below). This is the
-	// EXPLICIT OPERATOR OVERRIDE (Options.StreamToolTimeoutSeconds) and, when
-	// set, always wins over both built-in defaults, in either direction.
+	// 0 = use toolExecutionMaxDefault. This is the EXPLICIT OPERATOR
+	// OVERRIDE (Options.StreamToolTimeoutSeconds) and, when set, always
+	// wins over the built-in default, in either direction.
 	toolMaxDuration time.Duration
-	// orchestratorActive, when non-nil, is called fresh at the start of each
-	// Run() to decide whether this run is currently orchestrating (Large/
-	// "smart" role driving the run AND a Worker model configured — mirrors
-	// coordinator.workerSubAgentActive()). When it returns true and no
-	// explicit toolMaxDuration override is set, Run() uses
-	// orchestratorToolExecutionMaxDefault instead of toolExecutionMaxDefault
-	// as the watchdog's never-freeze backstop, since a legitimate worker
-	// delegation via the "agent" tool routinely runs longer than a plain
-	// tool call. nil (e.g. sub-agents, or callers that don't set it) means
-	// "never orchestrating" — falls back to today's behavior. Plumbed from
-	// SessionAgentOptions.OrchestratorActive, set only on the top-level
-	// coder agent in coordinator.buildAgent.
-	orchestratorActive func() bool
 
 	// messageQueue and injectQueue are per-session FIFO queues. They use
 	// csync.KeyedQueue (not csync.Map[string, []T]) because every real
@@ -359,19 +354,11 @@ type SessionAgentOptions struct {
 	// ToolMaxDuration bounds the watchdog's tool-pause (never-freeze
 	// backstop). Past it the watchdog fires with a "tool timeout" reason
 	// so the turn ends instead of hanging on a stuck tool. 0 = use the
-	// built-in toolExecutionMaxDefault (15m) or, when OrchestratorActive
-	// reports true, orchestratorToolExecutionMaxDefault (45m). Explicitly
-	// set (> 0), this ALWAYS wins over both built-in defaults — plumbed
-	// from Options.StreamToolTimeoutSeconds in the coordinator, i.e.
-	// operator intent always outranks the orchestrator heuristic.
+	// built-in toolExecutionMaxDefault (45m), applied uniformly to every
+	// tool including sub-agent delegations. Explicitly set (> 0), this
+	// ALWAYS wins over the built-in default — plumbed from
+	// Options.StreamToolTimeoutSeconds in the coordinator.
 	ToolMaxDuration time.Duration
-	// OrchestratorActive, when non-nil, is consulted fresh on every Run()
-	// to decide whether this run is currently orchestrating a worker (see
-	// sessionAgent.orchestratorActive doc). Plumbed from
-	// coordinator.workerSubAgentActive() for the top-level coder agent
-	// only; sub-agents leave this nil since they cannot spawn further
-	// sub-workers (see the "agent" tool exclusion in workerToolNames).
-	OrchestratorActive func() bool
 	// PeakHoursCheck, when non-nil, is called once per step to re-check
 	// whether the large model's provider has entered its peak_hours
 	// window mid-turn. See the field doc on sessionAgent.peakHoursCheck.
@@ -403,7 +390,6 @@ func NewSessionAgent(
 		timeoutExtendsOnProgress: opts.TimeoutExtendsOnProgress,
 		timeoutHardCap:           opts.TimeoutHardCap,
 		toolMaxDuration:          opts.ToolMaxDuration,
-		orchestratorActive:       opts.OrchestratorActive,
 		peakHoursCheck:           opts.PeakHoursCheck,
 	}
 }
@@ -417,60 +403,21 @@ func (a *sessionAgent) SetTimeoutOptions(extendsOnProgress bool, hardCap time.Du
 
 // effectiveToolMaxDuration resolves the stream watchdog's never-freeze
 // backstop (the max wall-clock a single tool may run while the watchdog is
-// paused between OnToolCall/OnToolResult) for THIS Run() call, in strict
-// precedence order:
+// paused between OnToolCall/OnToolResult) for THIS Run() call. One value
+// applies to every tool, including a sub-agent delegation via the "agent"
+// tool — see toolExecutionMaxDefault's doc for why a plain/orchestrator
+// split was removed in favor of a single generous cap. Precedence:
 //
-//  1. toolExecutionMaxDefault (15m) — the baseline for a plain, non-
-//     orchestrating run: bash/edit/a stuck MCP tool must still be caught at
-//     (or near) today's default.
-//  2. orchestratorToolExecutionMaxDefault (45m) — used INSTEAD of (1) when
-//     a.orchestratorActive is non-nil and reports true (this run is
-//     currently orchestrating a worker delegation via the "agent" tool,
-//     see coordinator.workerSubAgentActive). Extracted as its own method,
-//     rather than inlined in Run(), so the precedence rules are unit-
-//     testable without needing a full agent.Stream harness.
-//  3. a.toolMaxDuration (> 0) — the EXPLICIT OPERATOR OVERRIDE, from
+//  1. toolExecutionMaxDefault (45m) — the baseline.
+//  2. a.toolMaxDuration (> 0) — the EXPLICIT OPERATOR OVERRIDE, from
 //     Options.StreamToolTimeoutSeconds. Applied last, unconditionally, so
-//     it always wins over both (1) and (2) — in either direction (an
-//     operator may set it shorter OR longer than the orchestrator default).
+//     it always wins over (1) in either direction.
 func (a *sessionAgent) effectiveToolMaxDuration() time.Duration {
 	toolMaxDuration := toolExecutionMaxDefault
-	if a.orchestratorActive != nil && a.orchestratorActive() {
-		toolMaxDuration = orchestratorToolExecutionMaxDefault
-	}
 	if a.toolMaxDuration > 0 {
 		toolMaxDuration = a.toolMaxDuration
 	}
 	return toolMaxDuration
-}
-
-// effectiveExemptToolMaxDuration resolves the never-freeze backstop applied
-// to EXEMPT tool calls — i.e. sub-agent delegations via the "agent" tool,
-// which the parent waits on synchronously and which legitimately run far
-// longer than any primitive tool.
-//
-// It is deliberately a separate, much more generous bound rather than "no
-// bound": an unbounded parent wait means a wedged child hangs the parent
-// forever, producing no error, no finish part and no diagnostics. Precedence:
-//
-//  1. orchestratorToolExecutionMaxDefault (45m) — the default. Note this
-//     applies whenever an `agent` call is actually in flight, unlike
-//     effectiveToolMaxDuration's rule (2), which only reaches the same value
-//     when a Worker model happens to be configured
-//     (coordinator.workerSubAgentActive). A run that delegates WITHOUT a
-//     configured Worker used to fall back to the 15m primitive-tool cap and
-//     get its healthy delegations killed; keying off the in-flight call
-//     itself is what actually matches the delegation's cost profile.
-//  2. a.toolMaxDuration (> 0) — the EXPLICIT OPERATOR OVERRIDE, from
-//     Options.StreamToolTimeoutSeconds. Wins unconditionally, in either
-//     direction, matching effectiveToolMaxDuration's rule (3): operator
-//     intent outranks both heuristics, and a single knob that shortens
-//     everything is what makes this path testable at second-scale.
-func (a *sessionAgent) effectiveExemptToolMaxDuration() time.Duration {
-	if a.toolMaxDuration > 0 {
-		return a.toolMaxDuration
-	}
-	return orchestratorToolExecutionMaxDefault
 }
 
 // logProviderWarnings emits each fantasy CallWarning from a step at WARN
@@ -613,13 +560,21 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	)
 
 	sessionLock := sync.Mutex{}
-	currentSession, err := a.sessions.Get(ctx, call.SessionID)
+
+	// Bounded: see sessionPreambleMaxDuration doc. No watchdog is running
+	// yet at this point in Run(), so an unbounded ctx here can hang the
+	// turn forever with zero diagnostics if the single DB writer connection
+	// is wedged.
+	preambleCtx, preambleCancel := context.WithTimeout(ctx, sessionPreambleMaxDuration)
+	currentSession, err := a.sessions.Get(preambleCtx, call.SessionID)
 	if err != nil {
+		preambleCancel()
 		return nil, fmt.Errorf("failed to get session: %w", err)
 	}
 
-	msgs, err := a.getSessionMessages(ctx, currentSession)
+	msgs, err := a.getSessionMessages(preambleCtx, currentSession)
 	if err != nil {
+		preambleCancel()
 		return nil, fmt.Errorf("failed to get session messages: %w", err)
 	}
 
@@ -648,11 +603,13 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	// signalling this process). Creating it again would duplicate it in
 	// history — the referenced message is already the newest user message.
 	if call.ExistingMessageID == "" {
-		_, err = a.createUserMessage(ctx, call)
+		_, err = a.createUserMessage(preambleCtx, call)
 		if err != nil {
+			preambleCancel()
 			return nil, err
 		}
 	}
+	preambleCancel()
 
 	// Add the session to the context.
 	ctx = context.WithValue(ctx, tools.SessionIDContextKey, call.SessionID)
@@ -673,7 +630,6 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 		idleTimeout = a.streamIdleTimeout
 	}
 	toolMaxDuration := a.effectiveToolMaxDuration()
-	exemptToolMaxDuration := a.effectiveExemptToolMaxDuration()
 	var watchdogToolTimeout atomic.Bool
 	wd := startStreamWatchdog(
 		genCtx, cancel, idleTimeout, streamWatchdogTick,
@@ -698,7 +654,6 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 					"model", largeModel.ModelCfg.Model,
 					"elapsed", elapsed.String(),
 					"cap", toolMaxDuration.String(),
-					"sub_agent_cap", exemptToolMaxDuration.String(),
 				)
 				return
 			}
@@ -713,8 +668,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 		},
 		a.timeoutExtendsOnProgress, // Fork patch: batch 8
 		a.timeoutHardCap,           // Fork patch: batch 8
-		toolMaxDuration,            // never-freeze backstop
-		exemptToolMaxDuration,      // never-freeze backstop for sub-agent delegations
+		toolMaxDuration,            // never-freeze backstop, applies to every tool
 	)
 	bumpActivity := wd.bump
 	// toolStarted/toolFinished bracket tool execution so the watchdog pauses
@@ -1311,14 +1265,10 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			// A tool is about to execute — pause the stall watchdog until its
 			// result arrives (OnToolResult). fantasy fires every OnToolCall
 			// for a step before executing any tool, so the counter brackets
-			// the whole executeTools window. A sub-agent delegation (the
-			// `agent` tool) is exempt from the never-freeze toolMaxDuration
-			// cap — its own Run() call already runs under its OWN stream
-			// watchdog, so bounding the parent's wait a second time with the
-			// same cap meant for a single primitive tool kills healthy,
-			// still-working delegations that simply take a while (see
-			// exemptToolsInFlight's doc in stream_watchdog.go).
-			toolStarted(tc.ToolName == AgentToolName)
+			// the whole executeTools window. The same toolMaxDuration cap
+			// bounds every tool, including a sub-agent delegation (the
+			// `agent` tool) — see toolExecutionMaxDefault's doc in agent.go.
+			toolStarted()
 			sawToolBoundary = true // Fork patch: batch 8
 			input, wasSanitized := sanitizeToolInput(tc.ToolName, tc.ToolCallID, tc.Input)
 			if wasSanitized {
@@ -1343,7 +1293,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			bumpActivity()
 			// Tool finished — resume the stall watchdog (and restart its idle
 			// window so the tool's runtime isn't counted against the provider).
-			toolFinished(result.ToolName == AgentToolName)
+			toolFinished()
 			sawToolBoundary = true // Fork patch: batch 8
 			toolResult := a.convertToToolResult(result)
 			if sanitizedToolCalls[result.ToolCallID] {
