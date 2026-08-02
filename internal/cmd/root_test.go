@@ -207,3 +207,110 @@ func TestMaybePrependStdin_NamedPipeSlowCloseKeepsData(t *testing.T) {
 		t.Fatal("MaybePrependStdin hung waiting for EOF after already seeing data — it must read through to EOF once the producer proved it's alive")
 	}
 }
+
+// TestMaybePrependStdin_NamedPipeGoesSilentAfterFirstByteDoesNotHang is the
+// regression test for the bug @oh's review found in the previous fix
+// (task #199 / commit 6e7e1dc6): that version bounded only the FIRST read
+// against stdinReadGrace, then read the rest of the stream to EOF with NO
+// further timeout. A producer that writes some data and then goes silent
+// forever — never sending more, never closing the pipe — proved that
+// "no further timeout" reintroduced the exact indefinite hang
+// stdinReadGrace was created to prevent. MaybePrependStdin must instead
+// bound EVERY gap between chunks by stdinReadGrace, so it always returns in
+// bounded time (using the already-shrunk stdinReadGrace) with whatever
+// partial data the producer already sent, never hanging just because the
+// pipe itself never closes.
+func TestMaybePrependStdin_NamedPipeGoesSilentAfterFirstByteDoesNotHang(t *testing.T) {
+	prevGrace := stdinReadGrace
+	stdinReadGrace = 50 * time.Millisecond
+	t.Cleanup(func() { stdinReadGrace = prevGrace })
+
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		r.Close()
+		w.Close() // never closed by the "writer" itself — it just goes quiet
+	})
+	withStdin(t, r)
+
+	const payload = "here is one chunk, then the producer never says another word and never closes"
+	_, err = w.WriteString(payload)
+	require.NoError(t, err)
+
+	done := make(chan struct {
+		got string
+		err error
+	}, 1)
+	go func() {
+		got, err := MaybePrependStdin("the prompt")
+		done <- struct {
+			got string
+			err error
+		}{got, err}
+	}()
+
+	select {
+	case res := <-done:
+		require.NoError(t, res.err)
+		require.Equal(t, payload+"\n\nthe prompt", res.got,
+			"must return the partial data already received once the producer goes idle, not hang forever waiting for more")
+	case <-time.After(2 * time.Second):
+		t.Fatal("MaybePrependStdin hung after receiving one chunk and then the producer going silent forever — the idle timeout must bound EVERY gap between chunks, not just the wait for the first byte")
+	}
+}
+
+// TestMaybePrependStdin_NamedPipeIdleTimerResetsPerChunk proves the idle
+// timeout genuinely resets on every chunk received, rather than being a
+// single absolute deadline measured from the start of the read. The
+// producer writes several bursts, each separated by a pause shorter than
+// stdinReadGrace, then closes. If the implementation used one deadline from
+// the start instead of a true per-chunk idle reset, a long enough total
+// elapsed time (sum of the pauses) would trip the grace window and truncate
+// the data even though no individual gap ever exceeded it.
+func TestMaybePrependStdin_NamedPipeIdleTimerResetsPerChunk(t *testing.T) {
+	prevGrace := stdinReadGrace
+	stdinReadGrace = 150 * time.Millisecond
+	t.Cleanup(func() { stdinReadGrace = prevGrace })
+
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	t.Cleanup(func() { r.Close() })
+	withStdin(t, r)
+
+	done := make(chan struct {
+		got string
+		err error
+	}, 1)
+	go func() {
+		got, err := MaybePrependStdin("the prompt")
+		done <- struct {
+			got string
+			err error
+		}{got, err}
+	}()
+
+	// Three bursts, each pause well under stdinReadGrace (150ms), but the
+	// bursts together span ~240ms total — longer than a single grace
+	// window from the start would allow, proving the timer resets per chunk.
+	const burst1 = "burst-one-"
+	const burst2 = "burst-two-"
+	const burst3 = "burst-three"
+	_, err = w.WriteString(burst1)
+	require.NoError(t, err)
+	time.Sleep(80 * time.Millisecond)
+	_, err = w.WriteString(burst2)
+	require.NoError(t, err)
+	time.Sleep(80 * time.Millisecond)
+	_, err = w.WriteString(burst3)
+	require.NoError(t, err)
+	require.NoError(t, w.Close())
+
+	select {
+	case res := <-done:
+		require.NoError(t, res.err)
+		require.Equal(t, burst1+burst2+burst3+"\n\nthe prompt", res.got,
+			"all bursts must survive: no individual gap between them exceeded stdinReadGrace, so the idle timer must have reset each time")
+	case <-time.After(2 * time.Second):
+		t.Fatal("MaybePrependStdin hung reading multiple bursts separated by pauses shorter than stdinReadGrace")
+	}
+}

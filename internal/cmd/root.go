@@ -392,84 +392,112 @@ func MaybePrependStdin(prompt string) (string, error) {
 		}
 		return string(bts) + "\n\n" + prompt, nil
 	case fi.Mode()&os.ModeNamedPipe != 0:
-		// `|` (or an inherited pipe fd from a background launcher): race the
-		// FIRST read against stdinReadGrace instead of trusting the pipe to
-		// ever close. The reader goroutine is intentionally leaked on
-		// timeout — Go can't cancel a blocked pipe Read — but that's a
-		// single goroutine for the life of the process, not a hang.
+		// `|` (or an inherited pipe fd from a background launcher): read in
+		// chunks and race EACH chunk against an IDLE timeout of
+		// stdinReadGrace, resetting the clock every time a new chunk
+		// arrives. This bounds the total time MaybePrependStdin can block to
+		// "stdinReadGrace since the last byte seen", no matter how long the
+		// producer has already been streaming — as opposed to a bound on
+		// only the first byte, which left a producer that writes once and
+		// then goes silent forever (no EOF, no more data, no close) able to
+		// hang this call indefinitely. The reader goroutine is intentionally
+		// leaked if the producer truly never sends anything and never closes
+		// — Go can't cancel a blocked pipe Read — but that's a single
+		// goroutine for the life of the process, not a hang of
+		// MaybePrependStdin/crush run itself.
 		//
-		// The grace window only bounds how long we wait for the FIRST byte.
-		// Once a producer proves it's alive by sending at least one chunk,
-		// we read it through to EOF with no further timeout — same
-		// contract as the regular-file case, since an actively streaming
-		// producer is no longer the "dangling pipe, nobody home" scenario
-		// stdinReadGrace exists to guard against. This replaces an earlier
-		// version of this fix that raced io.ReadAll (of the WHOLE stream)
-		// against stdinReadGrace: if the producer wrote data but hadn't
-		// closed the pipe within the grace window, the timeout branch fired
-		// and silently discarded everything already buffered in the
-		// (still-running) goroutine, while logging a misleading "produced no
-		// data" even though data existed.
+		// This replaces two earlier, each individually broken, versions of
+		// this fix:
+		//  1. Racing io.ReadAll of the WHOLE stream against stdinReadGrace: a
+		//     producer that wrote data but hadn't closed the pipe within the
+		//     grace window caused the timeout branch to fire and silently
+		//     discard everything already buffered, while logging a
+		//     misleading "produced no data".
+		//  2. Bounding only the FIRST read, then reading to EOF with no
+		//     further timeout: a producer that sent one chunk and then fell
+		//     silent forever (without closing) hung forever, since nothing
+		//     bounded the *rest* of the read.
 		//
 		// Capture os.Stdin into a local BEFORE spawning the goroutine: the
 		// goroutine reads it lazily (whenever the scheduler runs it), so
-		// reading the live package-level os.Stdin from inside the
-		// goroutine would race any later reassignment of that variable —
-		// caught by -race via this exact test's own withStdin(t, ...)
-		// helper reassigning os.Stdin in t.Cleanup while a prior test's
-		// leaked goroutine was still reading it.
+		// reading the live package-level os.Stdin from inside the goroutine
+		// would race any later reassignment of that variable — caught by
+		// -race via this exact test's own withStdin(t, ...) helper
+		// reassigning os.Stdin in t.Cleanup while a prior test's leaked
+		// goroutine was still reading it.
 		stdin := os.Stdin
-		type firstResult struct {
-			buf []byte
-			n   int
-			err error
+		type chunkResult struct {
+			data []byte
+			err  error
 		}
-		type restResult struct {
-			bts []byte
-			err error
-		}
-		firstCh := make(chan firstResult, 1)
-		restCh := make(chan restResult, 1)
+		chunkCh := make(chan chunkResult, 1)
 		go func() {
 			buf := make([]byte, 32*1024)
-			n, err := stdin.Read(buf)
-			firstCh <- firstResult{buf: buf, n: n, err: err}
-			if err != nil {
-				// EOF (or a real error) on the very first read — nothing
-				// more to do; the select below handles it without consulting
-				// restCh.
-				return
-			}
-			// The producer sent at least one chunk: it's alive. Read the
-			// remainder through to EOF with no further timeout.
-			bts, err := io.ReadAll(stdin)
-			restCh <- restResult{bts, err}
-		}()
-		select {
-		case first := <-firstCh:
-			if first.n == 0 {
-				if first.err != nil && first.err != io.EOF {
-					return prompt, first.err
+			for {
+				n, err := stdin.Read(buf)
+				if n == 0 && err == nil {
+					// Spurious wakeup per the io.Reader contract: not EOF, not
+					// data, not an idle producer — just retry.
+					continue
 				}
-				return prompt, nil
+				var data []byte
+				if n > 0 {
+					data = make([]byte, n)
+					copy(data, buf[:n])
+				}
+				chunkCh <- chunkResult{data: data, err: err}
+				if err != nil {
+					// EOF, or a genuine non-EOF error: either way the goroutine
+					// is done — the last chunk (if any) already went out above.
+					return
+				}
 			}
-			var rest restResult
-			if first.err == nil {
-				rest = <-restCh
+		}()
+		var sb strings.Builder
+		for {
+			select {
+			case chunk := <-chunkCh:
+				sb.Write(chunk.data)
+				switch {
+				case chunk.err == nil:
+					// More to come — looping re-enters select, which
+					// implicitly resets the idle timer.
+					continue
+				case chunk.err == io.EOF:
+					if sb.Len() == 0 {
+						return prompt, nil
+					}
+					return sb.String() + "\n\n" + prompt, nil
+				default:
+					// n>0 with a non-EOF error is a legal io.Reader result:
+					// don't lose the bytes already collected, and don't fail
+					// the whole call over it — log and return what we have,
+					// same as a clean EOF.
+					slog.Warn(
+						"stdin pipe read failed after receiving some data — proceeding with what was read",
+						"error", chunk.err,
+						"bytes", sb.Len(),
+					)
+					if sb.Len() == 0 {
+						return prompt, nil
+					}
+					return sb.String() + "\n\n" + prompt, nil
+				}
+			case <-time.After(stdinReadGrace):
+				if sb.Len() == 0 {
+					slog.Warn(
+						"stdin is a pipe that produced no data within the grace window — proceeding without it",
+						"grace", stdinReadGrace,
+					)
+					return prompt, nil
+				}
+				slog.Warn(
+					"stdin pipe went idle after receiving some data — proceeding with partial data",
+					"bytes", sb.Len(),
+					"grace", stdinReadGrace,
+				)
+				return sb.String() + "\n\n" + prompt, nil
 			}
-			if rest.err != nil {
-				return prompt, rest.err
-			}
-			var sb strings.Builder
-			sb.Write(first.buf[:first.n])
-			sb.Write(rest.bts)
-			return sb.String() + "\n\n" + prompt, nil
-		case <-time.After(stdinReadGrace):
-			slog.Warn(
-				"stdin is a pipe that produced no data within the grace window — proceeding without it",
-				"grace", stdinReadGrace,
-			)
-			return prompt, nil
 		}
 	default:
 		return prompt, nil
