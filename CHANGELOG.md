@@ -10,6 +10,33 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+An independent review of the batch below (task-276 investigation + the
+multi-agent stability review) found four more issues in the fixes
+themselves, closed in the same way:
+
+- **The parent/child delegation cleanup grace didn't actually change
+  the race it fixed** — the 90s grace was added to both the parent's
+  wait AND the child sub-agent's own watchdog identically, so it
+  canceled out of the "child fires first" inequality algebraically
+  and the parent still always won. The grace now applies only to a
+  top-level (delegating) session; a sub-agent, which can never itself
+  be waiting on a further nested delegation, gets none — so its own
+  stuck-tool detection fires strictly before the parent's.
+- **`crush sessions reset --force` had the same stale-PID kill bug
+  just fixed for `sessions kill`** — a sibling code path that read a
+  lock file's recorded PID and killed it unconditionally, missed by
+  the original fix because it lives in a different file. Now routes
+  through the same probe-before-kill helper.
+- **A web `/cancel` during a queued turn's DB preamble could silently
+  no-op** — the turn loop's cancel function was only re-registered
+  once, before the first turn; from the second queued turn onward, a
+  cancel request during that turn's DB preamble found a spent,
+  already-fired cancel func from the previous turn and did nothing.
+  Now re-armed before every turn.
+- A second, near-identical `t.Parallel()` + mutable-package-global
+  pattern (title-generation's own timeout, not the DB-preamble one
+  fixed earlier) was converted to the same per-agent injectable field.
+
 Concurrency and reliability hardening, found via an independent
 external code review of the hot-swap-binary work and verified/fixed
 one at a time:
