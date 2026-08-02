@@ -109,22 +109,24 @@ picks the conversation back up exactly where `ask_question` left off.
 
 ## Orchestrator mode — and why a worker's question is NOT your problem
 
-When `--role smart` is used, a `worker` model is configured (`crush
-models use ... --worker <model>`), and `--agents` was left unset (not
-explicitly passed), the launched `crush run` auto-lifts its default
-sub-agent ban for the `agent` tool specifically — `agentic_fetch` stays
-banned either way, that's an unrelated concern. Crush's own coder model
-is then instructed (an "Orchestrator mode" rule in its system prompt) to
-delegate hands-on work — editing, writing, running commands — to worker
-sub-agents via the `agent` tool in chunks sized to fit the worker's
-context window, rather than editing everything itself, and to treat
-every worker's report as a CLAIM: re-check the actual diff/test result
-zero-trust, not just trust the worker's "done".
+When `--role smart` is used and a `worker` model is configured (`crush
+models use ... --worker <model>`), the launched `crush run` auto-lifts
+its default sub-agent ban for the `agent` tool specifically —
+`agentic_fetch` stays banned either way, that's an unrelated concern.
+Crush's own coder model is then instructed (an "Orchestrator mode" rule
+in its system prompt) to delegate hands-on work — editing, writing,
+running commands — to worker sub-agents via the `agent` tool in chunks
+sized to fit the worker's context window, rather than editing everything
+itself, and to treat every worker's report as a CLAIM: re-check the
+actual diff/test result zero-trust, not just trust the worker's "done".
 
-**An explicit `--agents single` always overrides this and wins**,
-regardless of whether a worker is configured — sub-agent fan-out stays
-off. Orchestrator mode only ever auto-activates when you leave
-`--agents` unset.
+**A configured worker always wins this, even over an explicit `--agents
+single`.** Passing `--agents single` does NOT force single-agent mode
+when a worker is configured for `--role smart` — the `agent` tool gets
+restored regardless. `--agents single` only has teeth when no worker is
+configured (or the run isn't `--role smart`). Don't rely on `--agents
+single` as a hard guarantee against delegation; if you genuinely need
+that guarantee, don't configure a worker for the run.
 
 **The one distinction you must never blur:** a worker sub-agent calling
 `ask_question` mid-delegation is completely different from the
