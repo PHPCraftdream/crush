@@ -284,11 +284,46 @@ func printWatchInterrupted(w io.Writer) {
 	fmt.Fprintln(w, "\n(interrupted — session still running)")
 }
 
-// liveLockMaxAge is the threshold for considering a lock file "alive".
-// The session heartbeat touches the lock every 10s; we add a 10s grace
-// window so a missed tick during a slow GC pause / disk sync does not
-// look like a dead process. Matches session.lockStaleDuration in spirit.
+// liveLockMaxAge is the threshold for considering a lock file "alive" by
+// mtime alone. The session heartbeat touches the lock every 10s; we add a
+// 10s grace window so a missed tick during a slow GC pause / disk sync does
+// not look like a dead process. Matches session.lockStaleDuration in spirit.
+//
+// Task #222: this threshold alone is no longer sufficient proof of death.
+// The heartbeat's mtime touch is now gated on real RecordActivity() calls
+// (task #214/#222), so a session blocked on a single long-running tool call
+// can go up to toolExecutionMaxDefault (45 minutes in production) with the
+// lock mtime never refreshing, while streamWatchdogTick (30s, see
+// internal/agent/agent.go) means even the per-tick recordActivity fix does
+// not guarantee a touch inside every 20s window — there's a transient
+// window right after each tick where up to 30s can pass untouched. See
+// combinedLockLiveness for the PID-liveness fallback that closes this gap.
 const liveLockMaxAge = 20 * time.Second
+
+// combinedLockLiveness reports whether a lock should be treated as "alive"
+// for watch's end-detection purposes, combining two independent signals so
+// neither one's blind spot alone can produce a false "session ended":
+//
+//   - mtimeFresh: the heartbeat touched the file within liveLockMaxAge.
+//     Fast and cheap, but — per task #222 — can go stale on a perfectly
+//     healthy session that's blocked in a single long tool call, since the
+//     heartbeat's touch is now gated on recorded activity rather than an
+//     unconditional timer.
+//   - pidAlive: the PID recorded in the lock file is still a live OS
+//     process (session.IsProcessAlive). Immune to the activity-gating
+//     blind spot above, but doesn't by itself prove THIS session is what
+//     the PID is doing (a crashed holder whose PID got reused would give a
+//     false positive) — which is why mtimeFresh remains the primary,
+//     faster-to-go-stale-and-thus-safer-in-the-common-case signal, with
+//     pidAlive as the fallback that only matters when mtime already looks
+//     stale.
+//
+// Kept as its own tiny pure function (no app/filesystem/clock — the caller
+// resolves both booleans first) so combining them is independently
+// unit-testable, same spirit as isSessionFinishedFromState.
+func combinedLockLiveness(mtimeFresh, pidAlive bool) bool {
+	return mtimeFresh || pidAlive
+}
 
 // isSessionFinished reports whether a live-tail loop should exit. Returns
 // the end reason as a short human label so the summary block can show
@@ -300,14 +335,26 @@ func isSessionFinished(ctx context.Context, a *app.App, sessionID, locksDir stri
 	msgs, msgsErr := a.Messages.List(ctx, sessionID)
 	lockPath := filepath.Join(locksDir, "session-"+sanitiseSessionIDForFilename(sessionID)+".lock")
 
-	// Distinguish "alive" (file exists and was touched recently — process
-	// is still heartbeating) from "stale or missing" (file gone, or file
-	// present but mtime older than the heartbeat window — holder crashed
-	// or detached). Only "alive" should block the end signals.
-	var lockAlive bool
+	// Distinguish "alive" (file exists and was touched recently, OR its
+	// recorded PID is still a live OS process — see combinedLockLiveness)
+	// from "stale or missing" (file gone, mtime old AND the PID is dead or
+	// unreadable — holder crashed or detached). Only "alive" should block
+	// the end signals.
+	var mtimeFresh bool
+	var lockExists bool
 	if info, err := os.Stat(lockPath); err == nil {
-		lockAlive = time.Since(info.ModTime()) < liveLockMaxAge
+		lockExists = true
+		mtimeFresh = time.Since(info.ModTime()) < liveLockMaxAge
 	}
+	var pidAlive bool
+	if lockExists && !mtimeFresh {
+		// Only worth the extra probe when mtime already looks stale — the
+		// common case (mtime fresh) never needs it.
+		if pid := session.ReadLockPID(lockPath); pid > 0 {
+			pidAlive = session.IsProcessAlive(pid)
+		}
+	}
+	lockAlive := combinedLockLiveness(mtimeFresh, pidAlive)
 
 	done, reason := isSessionFinishedFromState(sess, sessErr, msgs, msgsErr, lockAlive)
 

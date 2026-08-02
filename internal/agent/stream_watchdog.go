@@ -93,6 +93,23 @@ type streamWatchdog struct {
 // special case for the `agent` tool specifically. A plain (non-delegating)
 // tool that runs past toolMaxDuration+toolCleanupGrace is still caught,
 // just toolCleanupGrace later than before.
+//
+// Fork patch: task #222 — recordActivity, if non-nil, is invoked on every
+// bump() (harmless duplication with the caller's own notify, see bump's
+// doc) AND, critically, once per tick while a tool is genuinely in flight
+// and still under its cap (see the toolsInFlight branch below). Without
+// the latter, a session blocked on a single long-running tool call (e.g.
+// a 45-minute toolExecutionMaxDefault-bounded sub-agent delegation)
+// recorded ZERO activity for the tool's entire duration — bumpActivity
+// only fires from fantasy stream callbacks, none of which fire while a
+// tool is synchronously executing. That starved SessionLock's
+// activity-gated heartbeat (RecordActivity/task #214) for up to 45
+// minutes on a perfectly healthy session, which several consumers
+// (`sessions locks` auto-delete, `sessions watch` liveness) mistake for a
+// dead holder. recordActivity is typically wired to the same
+// notifyActivity(genCtx) callback runTurn already composes via
+// withActivityNotify, so this requires no new plumbing beyond passing it
+// through.
 func startStreamWatchdog(
 	ctx context.Context,
 	cancel context.CancelFunc,
@@ -102,6 +119,7 @@ func startStreamWatchdog(
 	hardCap time.Duration,
 	toolMaxDuration time.Duration,
 	toolCleanupGrace time.Duration,
+	recordActivity func(),
 ) streamWatchdog {
 	var last atomic.Int64
 	startTime := time.Now()
@@ -131,6 +149,9 @@ func startStreamWatchdog(
 	bump := func() {
 		now := time.Now()
 		last.Store(now.UnixNano())
+		if recordActivity != nil {
+			recordActivity()
+		}
 		if extendsOnProgress {
 			// Extend the absolute deadline, capped at hardDeadline.
 			newDeadline := now.Add(idleTimeout)
@@ -255,6 +276,15 @@ func startStreamWatchdog(
 						return
 					}
 					last.Store(now.UnixNano())
+					// A tool is in flight AND still under its cap — that is
+					// legitimate ongoing activity, not silence. Record it every
+					// tick, not just at toolStarted/toolFinished transitions, so
+					// SessionLock's activity-gated heartbeat (see recordActivity's
+					// doc above) keeps ticking for the tool's whole duration
+					// instead of going dark for up to toolMaxDuration.
+					if recordActivity != nil {
+						recordActivity()
+					}
 					continue
 				}
 				lastActivity := time.Unix(0, last.Load())

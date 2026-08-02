@@ -25,7 +25,7 @@ func TestStreamWatchdog_BumpKeepsItAlive(t *testing.T) {
 	var fired atomic.Int32
 	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(time.Duration, bool) {
 		fired.Add(1)
-	}, false, 0, 0, 0)
+	}, false, 0, 0, 0, nil)
 	// Bump every 20ms for ~300ms — well past idle*3 worth of ticks.
 	// Watchdog must NOT fire.
 	stop := time.After(300 * time.Millisecond)
@@ -58,7 +58,7 @@ func TestStreamWatchdog_FiresOnNoActivity(t *testing.T) {
 	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(observedIdle time.Duration, _ bool) {
 		fired.Add(1)
 		firedIdle.Store(int64(observedIdle))
-	}, false, 0, 0, 0)
+	}, false, 0, 0, 0, nil)
 
 	// Wait long enough for the watchdog to fire on its own.
 	select {
@@ -84,7 +84,7 @@ func TestStreamWatchdog_ExitsCleanlyOnCtxCancel(t *testing.T) {
 	var fired atomic.Int32
 	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(time.Duration, bool) {
 		fired.Add(1)
-	}, false, 0, 0, 0)
+	}, false, 0, 0, 0, nil)
 
 	// Cancel ctx externally — watchdog must exit promptly without firing.
 	time.Sleep(40 * time.Millisecond)
@@ -110,7 +110,7 @@ func TestStreamWatchdog_BumpAfterFireIsHarmless(t *testing.T) {
 	const idle = 30 * time.Millisecond
 	const tick = 5 * time.Millisecond
 
-	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(time.Duration, bool) {}, false, 0, 0, 0)
+	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(time.Duration, bool) {}, false, 0, 0, 0, nil)
 
 	// Let it fire.
 	<-wd.done
@@ -139,7 +139,7 @@ func TestStreamWatchdog_PausedDuringToolExecution(t *testing.T) {
 	var fired atomic.Int32
 	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(time.Duration, bool) {
 		fired.Add(1)
-	}, false, 0, 0, 0)
+	}, false, 0, 0, 0, nil)
 	// A tool starts and runs WAY past idleTimeout with zero provider
 	// activity — the watchdog must NOT fire.
 	wd.toolStarted()
@@ -175,7 +175,7 @@ func TestStreamWatchdog_PauseCountsParallelTools(t *testing.T) {
 	var fired atomic.Int32
 	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(time.Duration, bool) {
 		fired.Add(1)
-	}, false, 0, 0, 0)
+	}, false, 0, 0, 0, nil)
 	// Two parallel tool calls in flight; finishing ONE must keep the
 	// watchdog paused (counter still > 0).
 	wd.toolStarted()
@@ -204,7 +204,7 @@ func TestStreamWatchdog_ExtendsOnProgress(t *testing.T) {
 	var fired atomic.Int32
 	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(time.Duration, bool) {
 		fired.Add(1)
-	}, true, hardCap, 0, 0)
+	}, true, hardCap, 0, 0, nil)
 	defer func() {
 		cancel()
 		<-wd.done
@@ -240,7 +240,7 @@ func TestStreamWatchdog_ExtendsOnProgress_FiresWhenIdle(t *testing.T) {
 	var fired atomic.Int32
 	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(time.Duration, bool) {
 		fired.Add(1)
-	}, true, hardCap, 0, 0)
+	}, true, hardCap, 0, 0, nil)
 
 	// Bump once to extend, then stop.
 	wd.bump()
@@ -268,7 +268,7 @@ func TestStreamWatchdog_HardCapRespected(t *testing.T) {
 	var fired atomic.Int32
 	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(time.Duration, bool) {
 		fired.Add(1)
-	}, true, hardCap, 0, 0)
+	}, true, hardCap, 0, 0, nil)
 
 	start := time.Now()
 
@@ -318,7 +318,7 @@ func TestStreamWatchdog_HardCapRespectedWithoutExtendsOnProgress(t *testing.T) {
 	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(_ time.Duration, toolTimeout bool) {
 		fired.Add(1)
 		firedToolTimeout.Store(toolTimeout)
-	}, false, hardCap, 0, 0)
+	}, false, hardCap, 0, 0, nil)
 
 	start := time.Now()
 
@@ -376,7 +376,7 @@ func TestStreamWatchdog_HardCapRespectedWithToolInFlight(t *testing.T) {
 	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(_ time.Duration, toolTimeout bool) {
 		fired.Add(1)
 		firedToolTimeout.Store(toolTimeout)
-	}, false, hardCap, toolMaxDuration, 0)
+	}, false, hardCap, toolMaxDuration, 0, nil)
 
 	// A tool starts and stays in flight — never finishes — while the hard
 	// cap elapses. The watchdog must fire purely from hardCap, not from the
@@ -422,7 +422,7 @@ func TestStreamWatchdog_ToolPauseBoundedByCap(t *testing.T) {
 		fired.Add(1)
 		firedToolTimeout.Store(toolTimeout)
 		firedElapsed.Store(int64(elapsed))
-	}, false, 0, toolMaxDuration, 0)
+	}, false, 0, toolMaxDuration, 0, nil)
 
 	// A tool starts and runs past toolMaxDuration with zero provider
 	// activity. The watchdog must fire with toolTimeout==true.
@@ -458,7 +458,7 @@ func TestStreamWatchdog_ToolPauseUnderCapDoesNotFire(t *testing.T) {
 	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(_ time.Duration, toolTimeout bool) {
 		fired.Add(1)
 		firedToolTimeout.Store(toolTimeout)
-	}, false, 0, toolMaxDuration, 0)
+	}, false, 0, toolMaxDuration, 0, nil)
 	defer func() {
 		cancel()
 		<-wd.done
@@ -518,7 +518,7 @@ func TestStreamWatchdog_SequentialBatchProgressResetsCapClock(t *testing.T) {
 	var fired atomic.Int32
 	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(time.Duration, bool) {
 		fired.Add(1)
-	}, false, 0, toolMaxDuration, 0)
+	}, false, 0, toolMaxDuration, 0, nil)
 
 	// fantasy fires OnToolCall for every tool in the step before executing
 	// any of them — simulate that: all four "start" near-simultaneously.
@@ -581,7 +581,7 @@ func TestStreamWatchdog_ToolCleanupGraceDelaysFire(t *testing.T) {
 		fired.Add(1)
 		firedToolTimeout.Store(toolTimeout)
 		firedElapsed.Store(int64(elapsed))
-	}, false, 0, toolMaxDuration, toolCleanupGrace)
+	}, false, 0, toolMaxDuration, toolCleanupGrace, nil)
 
 	wd.toolStarted()
 
@@ -633,7 +633,7 @@ func TestStreamWatchdog_ToolFinishesWithinGraceNeverFires(t *testing.T) {
 	var fired atomic.Int32
 	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(time.Duration, bool) {
 		fired.Add(1)
-	}, false, 0, toolMaxDuration, toolCleanupGrace)
+	}, false, 0, toolMaxDuration, toolCleanupGrace, nil)
 	defer func() {
 		cancel()
 		<-wd.done
@@ -654,4 +654,58 @@ func TestStreamWatchdog_ToolFinishesWithinGraceNeverFires(t *testing.T) {
 			"even though it ran past bare toolMaxDuration")
 	assert.False(t, wd.stalled.Load())
 	assert.NoError(t, ctx.Err())
+}
+
+// TestStreamWatchdog_RecordActivityCalledOnEveryToolInFlightTick is the
+// regression test for task #222: a tool running synchronously (no fantasy
+// stream callbacks fire while it's in flight) used to record ZERO activity
+// for its entire duration — bump() is only called from stream callbacks and
+// from toolFinished's idle-clock reset, neither of which fire WHILE a long
+// tool is still running. With toolExecutionMaxDefault at 45 minutes in
+// production, that left SessionLock's activity-gated heartbeat dark for up
+// to 45 minutes on a perfectly healthy session (see RecordActivity's doc in
+// internal/session/lock.go). This proves recordActivity is now invoked once
+// per tick for the entire time a tool is in flight and still under its cap
+// — not just at toolStarted/toolFinished — by simulating a tool running past
+// what would have been the old activity gap (several multiples of `tick`)
+// and asserting recordActivity fired many times, continuously, throughout.
+func TestStreamWatchdog_RecordActivityCalledOnEveryToolInFlightTick(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	const idle = 5 * time.Second // large — idle path must not confound this test
+	const tick = 10 * time.Millisecond
+	const toolMaxDuration = 5 * time.Second // generous — tool must not be cut off
+
+	var recordCalls atomic.Int32
+	var fired atomic.Int32
+	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(time.Duration, bool) {
+		fired.Add(1)
+	}, false, 0, toolMaxDuration, 0, func() {
+		recordCalls.Add(1)
+	})
+	defer func() {
+		cancel()
+		<-wd.done
+	}()
+
+	// A tool starts and stays in flight for well more than the old activity
+	// gap (several ticks) with zero stream callbacks — simulating a single
+	// long-running tool call (e.g. a bounded sub-agent delegation).
+	wd.toolStarted()
+	const simulatedToolRuntime = 15 * tick
+	time.Sleep(simulatedToolRuntime)
+
+	assert.Equal(t, int32(0), fired.Load(), "watchdog must not fire while the tool is under its cap")
+
+	// recordActivity must have been invoked repeatedly WHILE the tool was in
+	// flight — proving the heartbeat kept advancing throughout the tool's
+	// execution, not just once at toolStarted.
+	calls := recordCalls.Load()
+	assert.Greater(t, calls, int32(5),
+		"recordActivity must be called on every tick a tool is in flight and under its cap, "+
+			"not just at toolStarted/toolFinished transitions")
+
+	wd.toolFinished()
 }

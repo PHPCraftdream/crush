@@ -1067,11 +1067,13 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 		a.timeoutHardCap,           // Fork patch: batch 8
 		toolMaxDuration,            // never-freeze backstop, applies to every tool
 		toolCleanupGrace,           // buffer for a nested watchdog to unwind first
+		func() { notifyActivity(genCtx) }, // task #222: keep the OS-lock heartbeat
+		// alive from tool-in-flight ticks too, not just stream callbacks —
+		// see startStreamWatchdog's recordActivity doc.
 	)
-	bumpActivity := func() {
-		wd.bump()
-		notifyActivity(genCtx)
-	}
+	// The watchdog now calls recordActivity (== notifyActivity(genCtx))
+	// internally on every bump(), so this wrapper can be just wd.bump.
+	bumpActivity := wd.bump
 	// toolStarted/toolFinished bracket tool execution so the watchdog pauses
 	// its idle timer while a (possibly long) tool runs — see streamWatchdog.
 	toolStarted := wd.toolStarted
@@ -2411,10 +2413,22 @@ func (a *sessionAgent) runSummarizeCore(ctx context.Context, sessionID string, o
 			return callContext, prepared, nil
 		},
 		OnReasoningDelta: func(id string, text string) error {
+			// task #222: propagate summarize-stream progress into the
+			// activity-notify chain composed by runTurn's shouldSummarize
+			// branch (genCtx there descends from a ctx that already carries
+			// withActivityNotify — see that branch's call into
+			// runSummarizeCore). Reuses the existing mechanism with zero new
+			// plumbing: when runSummarizeCore is instead called from the
+			// standalone runSummarize (manual /compact), ctx carries no
+			// activity-notify value and this is correctly a no-op — that
+			// caller never holds sessionID's OS lock in the first place (see
+			// runSummarize's doc comment), so there is nothing to protect.
+			notifyActivity(ctx)
 			summaryMessage.AppendReasoningContent(text)
 			return a.messages.Update(genCtx, summaryMessage)
 		},
 		OnReasoningEnd: func(id string, reasoning fantasy.ReasoningContent) error {
+			notifyActivity(ctx)
 			// Handle anthropic signature.
 			if anthropicData, ok := reasoning.ProviderMetadata["anthropic"]; ok {
 				if signature, ok := anthropicData.(*anthropic.ReasoningOptionMetadata); ok && signature.Signature != "" {
@@ -2425,6 +2439,7 @@ func (a *sessionAgent) runSummarizeCore(ctx context.Context, sessionID string, o
 			return a.messages.Update(genCtx, summaryMessage)
 		},
 		OnTextDelta: func(id, text string) error {
+			notifyActivity(ctx)
 			summaryMessage.AppendContent(text)
 			return a.messages.Update(genCtx, summaryMessage)
 		},

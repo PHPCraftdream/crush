@@ -44,6 +44,35 @@ func TestPrintWatchInterrupted_Message(t *testing.T) {
 	assert.NotContains(t, out, "--- session ended ---", "interrupt notice must not look like the end summary")
 }
 
+// TestCombinedLockLiveness_MtimeFreshAlone proves the common case: a fresh
+// heartbeat touch alone is enough to call the lock alive, regardless of
+// pidAlive (which the caller only bothers computing when mtime already
+// looks stale — see isSessionFinished).
+func TestCombinedLockLiveness_MtimeFreshAlone(t *testing.T) {
+	assert.True(t, combinedLockLiveness(true, false))
+}
+
+// TestCombinedLockLiveness_PidAliveFallback is the regression test for task
+// #222: since the heartbeat's mtime touch is now gated on real
+// RecordActivity() calls (task #214/#222), a perfectly healthy session
+// blocked on a single long-running tool call can have a stale mtime while
+// its recorded PID is still genuinely alive. combinedLockLiveness must treat
+// that as alive too, not just a fresh mtime — otherwise `sessions watch`
+// falsely reports "session finished, reason: lock_released" for a session
+// that is still actively running.
+func TestCombinedLockLiveness_PidAliveFallback(t *testing.T) {
+	assert.True(t, combinedLockLiveness(false, true),
+		"a live PID must count as alive even when mtime is stale")
+}
+
+// TestCombinedLockLiveness_NeitherSignal_NotAlive is the negative
+// counterpart: with mtime stale AND the PID dead (or unreadable), the lock
+// must be treated as genuinely not alive — the conservative default that
+// lets watch actually terminate on a real crash.
+func TestCombinedLockLiveness_NeitherSignal_NotAlive(t *testing.T) {
+	assert.False(t, combinedLockLiveness(false, false))
+}
+
 // In the tests below, the last lockAlive argument follows the new
 // semantics: it's true ONLY when the lock heartbeat is fresh (process
 // is verifiably alive). When the lock is missing OR stale (mtime older

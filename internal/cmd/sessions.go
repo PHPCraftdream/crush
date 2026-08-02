@@ -930,6 +930,42 @@ func lockPulseStatus(ageSec int64) string {
 	}
 }
 
+// lockHolderProvablyDead decides, via a real OS-level lock attempt, whether
+// the lock file at lockPath under dataDir/locks/session-<id>.lock may safely
+// be auto-deleted. Mirrors sessions_kill.go's probeThenKillHolder — same
+// "don't trust mtime alone, prove it via the real OS lock" discipline (task
+// #222 hardening).
+//
+// Why mtime alone stopped being safe here: task #214/#222 gated the
+// heartbeat's mtime-touch on real RecordActivity() calls instead of an
+// unconditional 10s timer. A session blocked on a single long-running tool
+// call (bounded by toolExecutionMaxDefault, up to 45 minutes) can now go
+// well past the old 60s auto-delete threshold with zero recorded activity
+// while still being completely healthy and still holding the real OS lock.
+// Unconditionally os.Remove-ing the path in that case does NOT revoke the
+// live holder's flock/LockFileEx (advisory locks are bound to the inode,
+// not the path) — it just lets a SECOND process create a fresh inode at the
+// same path and believe it owns the session, producing two simultaneous
+// owners of one session id (see the package doc on session.SessionLock).
+//
+// Returns true only when TryAcquireSessionLock itself succeeds — i.e. we
+// just proved, at the kernel level, that nobody holds the lock right now.
+// The lock we acquired to prove that is released immediately. Any other
+// outcome (busy error, or an unidentified failure) is treated as "do not
+// delete" — the conservative default, since a false "provably dead" is what
+// causes the two-owners bug, while a false "still alive" merely means the
+// stale entry lingers one more `sessions locks` invocation.
+func lockHolderProvablyDead(dataDir, sessionID string) bool {
+	lk, err := session.TryAcquireSessionLock(dataDir, sessionID)
+	if err != nil {
+		// Busy (a real holder exists) or an unidentified probe failure —
+		// neither is proof of death. Do not delete.
+		return false
+	}
+	_ = lk.Release()
+	return true
+}
+
 func sessionsLocksCmdRun(cmd *cobra.Command, args []string) error {
 	asJSON, _ := cmd.Flags().GetBool("json")
 	staleOnly, _ := cmd.Flags().GetBool("stale-only")
@@ -992,13 +1028,30 @@ func sessionsLocksCmdRun(cmd *cobra.Command, args []string) error {
 
 		lockPath := filepath.Join(locksDir, entry.Name())
 
-		// Auto-delete locks older than 1 minute — heartbeat would have
-		// touched the file every 10s if the holder were alive.
+		// Auto-delete candidate: mtime older than 1 minute. mtime alone is
+		// NO LONGER proof of death (task #222) — the heartbeat's mtime touch
+		// is now gated on RecordActivity, so a session blocked on a single
+		// long-running tool call (up to toolExecutionMaxDefault, 45 minutes)
+		// can look stale here while still being completely healthy and still
+		// holding the real OS lock. Before deleting, prove it via a real
+		// OS-level lock attempt (lockHolderProvablyDead) — same discipline
+		// as sessions_kill.go's probeThenKillHolder. Unlinking a path out
+		// from under a live holder's flock/LockFileEx does not revoke it
+		// (advisory locks are bound to the inode, not the path); it just
+		// lets a second process create a fresh inode at the same path and
+		// believe it owns the session — two owners of one session id.
 		if age > autoDeleteAfter {
-			if err := os.Remove(lockPath); err == nil {
-				fmt.Fprintf(os.Stderr, "removed stale lock %s (age %ds)\n", entry.Name(), int(age.Seconds()))
+			if lockHolderProvablyDead(filepath.Join(cwd, ".crush"), sessionID) {
+				if err := os.Remove(lockPath); err == nil {
+					fmt.Fprintf(os.Stderr, "removed stale lock %s (age %ds, holder provably dead)\n", entry.Name(), int(age.Seconds()))
+				}
+				continue
 			}
-			continue
+			// mtime looks stale but the real OS lock is still held (or the
+			// probe was inconclusive) — do NOT delete. Fall through and
+			// display it like any other lock; its Pulse will read "offline"
+			// so operators still see it's not heartbeating, without risking
+			// a second process reclaiming a session that is still alive.
 		}
 
 		pulseSec := int64(age.Seconds())
