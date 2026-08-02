@@ -295,6 +295,59 @@ loop:
 		"watchdog must fire near the hard cap")
 }
 
+// TestStreamWatchdog_HardCapRespectedWithoutExtendsOnProgress is the
+// regression test for a real bug: the hardCap check used to live ONLY
+// inside the `if extendsOnProgress` branch of the idle-path check, so when
+// extendsOnProgress is false (the default — operator did not pass
+// --timeout-extends-on-progress) an explicitly configured --timeout-hard-cap
+// was never enforced as long as the provider kept the stream alive with
+// regular chunks: idle never reached idleTimeout, and the hardCap check was
+// unreachable on that path. This proves the fix: even with extendsOnProgress
+// false and bump() called continuously (idle never approaches idleTimeout),
+// the watchdog must still fire at the hard cap.
+func TestStreamWatchdog_HardCapRespectedWithoutExtendsOnProgress(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(t.Context())
+
+	const idle = 80 * time.Millisecond
+	const tick = 10 * time.Millisecond
+	const hardCap = 200 * time.Millisecond
+
+	var fired atomic.Int32
+	var firedToolTimeout atomic.Bool
+	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(_ time.Duration, toolTimeout bool) {
+		fired.Add(1)
+		firedToolTimeout.Store(toolTimeout)
+	}, false, hardCap, 0, 0)
+
+	start := time.Now()
+
+	// Bump rapidly — more often than idleTimeout — so the idle-only check
+	// would NEVER fire on its own. The hard cap must still kill it.
+	stop := time.After(500 * time.Millisecond)
+loop:
+	for {
+		select {
+		case <-wd.done:
+			break loop
+		case <-stop:
+			t.Fatal("watchdog should have fired at hard cap despite continuous activity")
+		case <-time.After(10 * time.Millisecond):
+			wd.bump()
+		}
+	}
+
+	elapsed := time.Since(start)
+	assert.Equal(t, int32(1), fired.Load(), "watchdog must fire at hard cap")
+	assert.True(t, wd.stalled.Load())
+	assert.False(t, firedToolTimeout.Load(),
+		"the hard-cap fire outside tool-in-flight must report toolTimeout=false")
+	// The hard cap is 200ms with a tick of 10ms, so it should fire
+	// somewhere between 200-250ms.
+	assert.LessOrEqual(t, elapsed, 350*time.Millisecond,
+		"watchdog must fire near the hard cap")
+}
+
 // TestStreamWatchdog_ToolPauseBoundedByCap verifies the never-freeze
 // backstop: when toolMaxDuration > 0 and a tool stays in flight past that
 // cap, the watchdog fires with toolTimeout==true instead of pausing

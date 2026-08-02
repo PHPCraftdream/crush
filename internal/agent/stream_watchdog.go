@@ -260,9 +260,36 @@ func startStreamWatchdog(
 				lastActivity := time.Unix(0, last.Load())
 				idle := now.Sub(lastActivity)
 
+				// An EXPLICITLY configured hard cap must actually be hard: it
+				// bounds the whole turn regardless of extendsOnProgress. This
+				// check is UNCONDITIONAL — hoisted above the
+				// extendsOnProgress branch — because a provider that keeps
+				// the stream alive with regular chunks (bump() called often
+				// enough that idle never reaches idleTimeout) would otherwise
+				// let the turn run forever when extendsOnProgress is false
+				// (the default): the idle-only check below never fires, and
+				// the old hardCap check lived exclusively inside the
+				// extendsOnProgress branch, so --timeout-hard-cap was
+				// silently ignored on the non-extending path. toolTimeout is
+				// false here — this is a wall-clock turn limit, not a stuck
+				// tool (that case is handled, with toolTimeout=true, in the
+				// toolsInFlight branch above).
+				if hardCap > 0 && now.After(hardDeadline) {
+					stalled.Store(true)
+					cancel()
+					if onFire != nil {
+						onFire(idle, false)
+					}
+					return
+				}
+
 				if extendsOnProgress {
 					// Effective deadline: max(absoluteDeadline,
 					// lastActivity+idleTimeout), capped at hardDeadline.
+					// hardDeadline is not re-checked here — the unconditional
+					// check above already covers it — but effectiveDeadline
+					// is still capped at hardDeadline so extension never
+					// reports a deadline past the hard cap.
 					effectiveDeadline := absoluteDeadline
 					extended := lastActivity.Add(idleTimeout)
 					if extended.After(effectiveDeadline) {
