@@ -185,9 +185,19 @@ func (c *coordinator) agenticFetchTool(_ context.Context, client *http.Client) (
 				SystemPrompt:         systemPrompt,
 				DisableAutoSummarize: c.cfg.Config().Options.DisableAutoSummarize,
 				IsYolo:               c.permissions.SkipRequests(),
-				Sessions:             c.sessions,
-				Messages:             c.messages,
-				Tools:                fetchTools,
+				// IsSubAgent: true — this agent runs via runSubAgent below,
+				// so it must be classified as a sub-agent for
+				// effectiveToolCleanupGrace() (see agent.go, task #205) to
+				// give it NO grace on its own watchdog. Left unset (false)
+				// here made this nested delegation invisible to that
+				// distinction: it was treated as top-level, so it got the
+				// same 90s grace as the actual parent — recreating #200's
+				// symmetric-cancel-out bug specifically for the
+				// agentic_fetch path. Found by @oh's review.
+				IsSubAgent: true,
+				Sessions:   c.sessions,
+				Messages:   c.messages,
+				Tools:      fetchTools,
 			})
 
 			return c.runSubAgent(ctx, subAgentParams{
