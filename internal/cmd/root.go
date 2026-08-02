@@ -359,8 +359,8 @@ func setupApp(cmd *cobra.Command) (*app.App, error) {
 	return appInstance, nil
 }
 
-// stdinReadGrace bounds how long MaybePrependStdin waits for a named pipe
-// to produce data before giving up on it. A `< file` redirect (regular
+// stdinReadGraceDefault bounds how long MaybePrependStdin waits for a named
+// pipe to produce data before giving up on it. A `< file` redirect (regular
 // file) is always fully available immediately and is read directly with
 // no bound. A `|` pipe, though, can be connected to a writer that never
 // sends anything and never closes — observed in practice when a
@@ -373,9 +373,37 @@ func setupApp(cmd *cobra.Command) (*app.App, error) {
 // would sit doing nothing, invisible to `sessions list` (no session row
 // exists yet), for hours. crush must never hang like that regardless of
 // how it was invoked.
-var stdinReadGrace = 3 * time.Second
+//
+// It is a const (not a mutable package var) so tests inject a shorter grace
+// via the parameterized maybePrependStdin below instead of mutating shared
+// state — a mutable package var here would be the same
+// test-isolation footgun already eliminated elsewhere in this session
+// (internal/agent/agent.go's sessionPreambleMaxDuration /
+// titleGenerationMaxDuration): fine only as long as no test using it ever
+// gains t.Parallel(), and silently racy the moment one does.
+const stdinReadGraceDefault = 3 * time.Second
 
+// stdinChunkResult is one Read() result from the pipe-reading goroutine in
+// maybePrependStdin: either some data, an error (io.EOF or otherwise), or
+// both (a legal final io.Reader result).
+type stdinChunkResult struct {
+	data []byte
+	err  error
+}
+
+// MaybePrependStdin is the public entry point used by run.go. It always
+// applies stdinReadGraceDefault as the idle-timeout bound for `|` pipes; see
+// maybePrependStdin for the actual logic and stdinReadGraceDefault's doc
+// comment for why the grace duration is threaded through as a parameter
+// rather than read from a package var.
 func MaybePrependStdin(prompt string) (string, error) {
+	return maybePrependStdin(prompt, stdinReadGraceDefault)
+}
+
+// maybePrependStdin implements MaybePrependStdin with the idle-timeout grace
+// duration passed explicitly, so tests can use a short grace without
+// mutating shared package state.
+func maybePrependStdin(prompt string, grace time.Duration) (string, error) {
 	if term.IsTerminal(os.Stdin.Fd()) {
 		return prompt, nil
 	}
@@ -393,22 +421,21 @@ func MaybePrependStdin(prompt string) (string, error) {
 		return string(bts) + "\n\n" + prompt, nil
 	case fi.Mode()&os.ModeNamedPipe != 0:
 		// `|` (or an inherited pipe fd from a background launcher): read in
-		// chunks and race EACH chunk against an IDLE timeout of
-		// stdinReadGrace, resetting the clock every time a new chunk
-		// arrives. This bounds the total time MaybePrependStdin can block to
-		// "stdinReadGrace since the last byte seen", no matter how long the
-		// producer has already been streaming — as opposed to a bound on
-		// only the first byte, which left a producer that writes once and
-		// then goes silent forever (no EOF, no more data, no close) able to
-		// hang this call indefinitely. The reader goroutine is intentionally
-		// leaked if the producer truly never sends anything and never closes
-		// — Go can't cancel a blocked pipe Read — but that's a single
-		// goroutine for the life of the process, not a hang of
-		// MaybePrependStdin/crush run itself.
+		// chunks and race EACH chunk against an IDLE timeout of grace,
+		// resetting the clock every time a new chunk arrives. This bounds
+		// the total time maybePrependStdin can block to "grace since the
+		// last byte seen", no matter how long the producer has already been
+		// streaming — as opposed to a bound on only the first byte, which
+		// left a producer that writes once and then goes silent forever (no
+		// EOF, no more data, no close) able to hang this call indefinitely.
+		// The reader goroutine is intentionally leaked if the producer truly
+		// never sends anything and never closes — Go can't cancel a blocked
+		// pipe Read — but that's a single goroutine for the life of the
+		// process, not a hang of maybePrependStdin/crush run itself.
 		//
 		// This replaces two earlier, each individually broken, versions of
 		// this fix:
-		//  1. Racing io.ReadAll of the WHOLE stream against stdinReadGrace: a
+		//  1. Racing io.ReadAll of the WHOLE stream against grace: a
 		//     producer that wrote data but hadn't closed the pipe within the
 		//     grace window caused the timeout branch to fire and silently
 		//     discard everything already buffered, while logging a
@@ -418,6 +445,20 @@ func MaybePrependStdin(prompt string) (string, error) {
 		//     silent forever (without closing) hung forever, since nothing
 		//     bounded the *rest* of the read.
 		//
+		// DELIBERATE TRADEOFF, not an accidental gap: when the idle timeout
+		// fires (or a non-EOF read error occurs) after SOME data was already
+		// read, this function proceeds with that partial data rather than
+		// treating it as an error. The alternative — discarding partial data
+		// or failing the call — was tried first (see broken version 1 above)
+		// and is worse: it throws away real input the producer did manage to
+		// send. But a truncated stdin can silently look like complete stdin
+		// to whatever consumes the returned prompt (typically fed straight
+		// to a model), so any partial-data return path below appends an
+		// explicit, model-readable marker noting the input may be
+		// incomplete — see the "may be truncated" note in the timeout and
+		// non-EOF-error branches. The clean-EOF path (chunk.err == io.EOF)
+		// never gets this marker: that data is complete, not a truncation.
+		//
 		// Capture os.Stdin into a local BEFORE spawning the goroutine: the
 		// goroutine reads it lazily (whenever the scheduler runs it), so
 		// reading the live package-level os.Stdin from inside the goroutine
@@ -426,11 +467,7 @@ func MaybePrependStdin(prompt string) (string, error) {
 		// reassigning os.Stdin in t.Cleanup while a prior test's leaked
 		// goroutine was still reading it.
 		stdin := os.Stdin
-		type chunkResult struct {
-			data []byte
-			err  error
-		}
-		chunkCh := make(chan chunkResult, 1)
+		chunkCh := make(chan stdinChunkResult, 1)
 		go func() {
 			buf := make([]byte, 32*1024)
 			for {
@@ -445,7 +482,7 @@ func MaybePrependStdin(prompt string) (string, error) {
 					data = make([]byte, n)
 					copy(data, buf[:n])
 				}
-				chunkCh <- chunkResult{data: data, err: err}
+				chunkCh <- stdinChunkResult{data: data, err: err}
 				if err != nil {
 					// EOF, or a genuine non-EOF error: either way the goroutine
 					// is done — the last chunk (if any) already went out above.
@@ -454,54 +491,102 @@ func MaybePrependStdin(prompt string) (string, error) {
 			}
 		}()
 		var sb strings.Builder
+		// handleChunk processes one received stdinChunkResult against the
+		// in-progress sb buffer. It returns (result, done):
+		//  - done == true means the caller should return result immediately.
+		//  - done == false means "more to come, keep looping" (chunk.err ==
+		//    nil); result is meaningless in that case.
+		// Shared by both the main chunk<-chunkCh case and the boundary-race
+		// drain in the timeout branch below, so the two call sites can never
+		// drift out of sync on how an EOF/error/more-data chunk is handled.
+		handleChunk := func(chunk stdinChunkResult) (result string, done bool) {
+			sb.Write(chunk.data)
+			switch {
+			case chunk.err == nil:
+				// More to come — caller should keep looping, which
+				// implicitly resets the idle timer.
+				return "", false
+			case chunk.err == io.EOF:
+				if sb.Len() == 0 {
+					return prompt, true
+				}
+				// Clean EOF: this is complete data, not a truncation — no
+				// truncation marker.
+				return sb.String() + "\n\n" + prompt, true
+			default:
+				// n>0 with a non-EOF error is a legal io.Reader result:
+				// don't lose the bytes already collected, and don't fail
+				// the whole call over it — log and return what we have,
+				// same as a clean EOF, but marked as possibly-truncated
+				// since a read error is not proof the stream was complete.
+				slog.Warn(
+					"stdin pipe read failed after receiving some data — proceeding with what was read",
+					"error", chunk.err,
+					"bytes", sb.Len(),
+				)
+				if sb.Len() == 0 {
+					return prompt, true
+				}
+				return sb.String() + stdinTruncationNote(grace, sb.Len()) + "\n\n" + prompt, true
+			}
+		}
 		for {
 			select {
 			case chunk := <-chunkCh:
-				sb.Write(chunk.data)
-				switch {
-				case chunk.err == nil:
-					// More to come — looping re-enters select, which
-					// implicitly resets the idle timer.
-					continue
-				case chunk.err == io.EOF:
-					if sb.Len() == 0 {
-						return prompt, nil
-					}
-					return sb.String() + "\n\n" + prompt, nil
-				default:
-					// n>0 with a non-EOF error is a legal io.Reader result:
-					// don't lose the bytes already collected, and don't fail
-					// the whole call over it — log and return what we have,
-					// same as a clean EOF.
-					slog.Warn(
-						"stdin pipe read failed after receiving some data — proceeding with what was read",
-						"error", chunk.err,
-						"bytes", sb.Len(),
-					)
-					if sb.Len() == 0 {
-						return prompt, nil
-					}
-					return sb.String() + "\n\n" + prompt, nil
+				if result, done := handleChunk(chunk); done {
+					return result, nil
 				}
-			case <-time.After(stdinReadGrace):
+				continue
+			case <-time.After(grace):
+				// Boundary race: a chunk may have become ready on chunkCh at
+				// almost the exact same instant the timer did — select picks
+				// pseudo-randomly between simultaneously-ready cases, so
+				// without this check a chunk that arrived right at the
+				// deadline could be silently dropped even though the
+				// producer was not actually idle. One non-blocking check is
+				// enough: chunkCh is capacity-1 buffered and only one send
+				// happens per loop iteration.
+				select {
+				case chunk := <-chunkCh:
+					if result, done := handleChunk(chunk); done {
+						return result, nil
+					}
+					continue // got real data just in time — not idle, keep looping
+				default:
+					// Genuinely idle — no chunk raced in.
+				}
 				if sb.Len() == 0 {
 					slog.Warn(
 						"stdin is a pipe that produced no data within the grace window — proceeding without it",
-						"grace", stdinReadGrace,
+						"grace", grace,
 					)
 					return prompt, nil
 				}
 				slog.Warn(
 					"stdin pipe went idle after receiving some data — proceeding with partial data",
 					"bytes", sb.Len(),
-					"grace", stdinReadGrace,
+					"grace", grace,
 				)
-				return sb.String() + "\n\n" + prompt, nil
+				return sb.String() + stdinTruncationNote(grace, sb.Len()) + "\n\n" + prompt, nil
 			}
 		}
 	default:
 		return prompt, nil
 	}
+}
+
+// stdinTruncationNote returns a marker appended to partial stdin content
+// returned on a non-clean-EOF path (idle timeout or a non-EOF read error
+// after some data was already read). It exists so the model that receives
+// the resulting prompt — not just a human tailing stderr, which `crush run`
+// invocations typically don't have watched — can tell the stdin section may
+// be an arbitrary mid-stream cut rather than complete input, and reason
+// accordingly instead of silently trusting truncated data as whole.
+func stdinTruncationNote(grace time.Duration, bytesRead int) string {
+	return fmt.Sprintf(
+		"\n\n[NOTE: stdin input may be truncated — the producer went idle for over %s after %d bytes and was not fully read]",
+		grace, bytesRead,
+	)
 }
 
 func ResolveCwd(cmd *cobra.Command) (string, error) {
