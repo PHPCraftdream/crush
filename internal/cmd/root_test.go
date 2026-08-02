@@ -2,6 +2,8 @@ package cmd
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -356,6 +358,30 @@ func TestMaybePrependStdin_IdleTimeoutTruncationCarriesNote(t *testing.T) {
 		"the truncation marker should be concrete about the grace window that elapsed")
 }
 
+// TestStdinTruncationNote_WordingReflectsSuppliedReason is the regression
+// test for the review finding that stdinTruncationNote's wording was
+// hardcoded to describe idleness ("the producer went idle for over %s")
+// even when called from the non-EOF-read-error branch of handleChunk, where
+// the actual cause was a genuine I/O error unrelated to idle timing. This
+// pins that the note text is driven entirely by the caller-supplied reason
+// string, so the idle-timeout call site and the read-error call site each
+// produce accurate, distinguishable wording instead of the read-error path
+// wrongly claiming idleness.
+func TestStdinTruncationNote_WordingReflectsSuppliedReason(t *testing.T) {
+	idleNote := stdinTruncationNote("the producer went idle for over 3s", 42)
+	require.Contains(t, idleNote, "idle", "the idle-timeout reason must be reflected verbatim in the note")
+	require.NotContains(t, idleNote, "read error",
+		"the idle-timeout note must not claim a read error occurred")
+
+	readErr := errors.New("broken pipe")
+	readErrReason := fmt.Sprintf("a read error occurred (%v)", readErr)
+	errNote := stdinTruncationNote(readErrReason, 42)
+	require.Contains(t, errNote, "read error", "the read-error reason must be reflected in the note")
+	require.Contains(t, errNote, "broken pipe", "the actual underlying error must be visible in the note")
+	require.NotContains(t, errNote, "went idle",
+		"the read-error note must not falsely claim the producer went idle — the cause was an I/O error, not idle timing")
+}
+
 // TestMaybePrependStdin_CleanEOFHasNoTruncationNote is the companion
 // negative case for TestMaybePrependStdin_IdleTimeoutTruncationCarriesNote:
 // a clean EOF (the producer wrote data and then genuinely closed the pipe)
@@ -408,26 +434,41 @@ func TestMaybePrependStdin_CleanEOFHasNoTruncationNote(t *testing.T) {
 // non-blocking receive on a buffered channel), is what this suite relies on
 // instead.
 
-// TestMaybePrependStdin_TimeoutDrainHelperHandlesBufferedChunk exercises the
-// follow-up 2 drain-check logic in isolation, without relying on real-world
-// timing: it proves that IF a chunk is sitting in a capacity-1 buffered
-// channel at the moment the idle-timeout branch is entered, a single
-// non-blocking receive (the same shape as the drain check added to
-// maybePrependStdin's timeout branch) successfully retrieves it rather than
-// treating the channel as empty. This deterministically pins the core
-// correctness property the fix depends on: a non-blocking receive on a
-// capacity-1 buffered channel with a pending send always succeeds.
-func TestMaybePrependStdin_TimeoutDrainHelperHandlesBufferedChunk(t *testing.T) {
+// TestMaybePrependStdin_DrainPendingChunkRetrievesBufferedChunk exercises the
+// follow-up 2 drain-check logic by calling the actual production helper,
+// drainPendingChunk, rather than a hand-rolled duplicate of its select
+// statement (an earlier version of this test — flagged in review as
+// tautological, since it only asserted Go's channel semantics and would
+// have passed identically even if the drain check were deleted from
+// maybePrependStdin's timeout branch — reimplemented the select inline
+// instead of calling the helper). It proves that IF a chunk is sitting in a
+// capacity-1 buffered channel (matching production: chunkCh is always
+// created with capacity 1) at the moment the idle-timeout branch is
+// entered, drainPendingChunk successfully retrieves it rather than treating
+// the channel as empty. Because this calls the exact function
+// maybePrependStdin's timeout branch calls, it would genuinely fail if the
+// drain were ever accidentally removed or broken in a refactor — see the
+// sibling TestMaybePrependStdin_DrainPendingChunkReportsEmptyChannel for the
+// negative case.
+func TestMaybePrependStdin_DrainPendingChunkRetrievesBufferedChunk(t *testing.T) {
 	chunkCh := make(chan stdinChunkResult, 1)
 	chunkCh <- stdinChunkResult{data: []byte("buffered chunk"), err: io.EOF}
 
-	// This mirrors exactly the non-blocking drain performed at the top of
-	// the `case <-time.After(grace):` branch in maybePrependStdin.
-	select {
-	case chunk := <-chunkCh:
-		require.Equal(t, []byte("buffered chunk"), chunk.data)
-		require.ErrorIs(t, chunk.err, io.EOF)
-	default:
-		t.Fatal("non-blocking receive must retrieve a chunk already sitting in the capacity-1 buffered channel, not treat it as empty")
-	}
+	chunk, ok := drainPendingChunk(chunkCh)
+	require.True(t, ok, "drainPendingChunk must report ok=true when a chunk is already buffered")
+	require.Equal(t, []byte("buffered chunk"), chunk.data)
+	require.ErrorIs(t, chunk.err, io.EOF)
+}
+
+// TestMaybePrependStdin_DrainPendingChunkReportsEmptyChannel is the negative
+// companion: with nothing pending on chunkCh, drainPendingChunk must not
+// block and must report ok=false, so maybePrependStdin's timeout branch
+// correctly falls through to "genuinely idle" instead of waiting or
+// fabricating a chunk.
+func TestMaybePrependStdin_DrainPendingChunkReportsEmptyChannel(t *testing.T) {
+	chunkCh := make(chan stdinChunkResult, 1)
+
+	chunk, ok := drainPendingChunk(chunkCh)
+	require.False(t, ok, "drainPendingChunk must report ok=false on an empty channel, not block or fabricate a chunk")
+	require.Equal(t, stdinChunkResult{}, chunk, "the returned chunk must be the zero value when nothing was pending")
 }

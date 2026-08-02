@@ -391,6 +391,22 @@ type stdinChunkResult struct {
 	err  error
 }
 
+// drainPendingChunk does one non-blocking receive on chunkCh, returning
+// (chunk, true) if something was ready, or (zero value, false) if the
+// channel was genuinely empty at the moment of the check. Used by
+// maybePrependStdin's timeout branch to catch a chunk that raced in at
+// almost the exact instant the idle timer fired, so that boundary case
+// doesn't silently drop real data — see the "Boundary race" comment at its
+// call site for the full rationale.
+func drainPendingChunk(chunkCh <-chan stdinChunkResult) (stdinChunkResult, bool) {
+	select {
+	case chunk := <-chunkCh:
+		return chunk, true
+	default:
+		return stdinChunkResult{}, false
+	}
+}
+
 // MaybePrependStdin is the public entry point used by run.go. It always
 // applies stdinReadGraceDefault as the idle-timeout bound for `|` pipes; see
 // maybePrependStdin for the actual logic and stdinReadGraceDefault's doc
@@ -527,7 +543,8 @@ func maybePrependStdin(prompt string, grace time.Duration) (string, error) {
 				if sb.Len() == 0 {
 					return prompt, true
 				}
-				return sb.String() + stdinTruncationNote(grace, sb.Len()) + "\n\n" + prompt, true
+				readErrReason := fmt.Sprintf("a read error occurred (%v)", chunk.err)
+				return sb.String() + stdinTruncationNote(readErrReason, sb.Len()) + "\n\n" + prompt, true
 			}
 		}
 		for {
@@ -546,15 +563,13 @@ func maybePrependStdin(prompt string, grace time.Duration) (string, error) {
 				// producer was not actually idle. One non-blocking check is
 				// enough: chunkCh is capacity-1 buffered and only one send
 				// happens per loop iteration.
-				select {
-				case chunk := <-chunkCh:
+				if chunk, ok := drainPendingChunk(chunkCh); ok {
 					if result, done := handleChunk(chunk); done {
 						return result, nil
 					}
 					continue // got real data just in time — not idle, keep looping
-				default:
-					// Genuinely idle — no chunk raced in.
 				}
+				// Genuinely idle — no chunk raced in.
 				if sb.Len() == 0 {
 					slog.Warn(
 						"stdin is a pipe that produced no data within the grace window — proceeding without it",
@@ -567,7 +582,8 @@ func maybePrependStdin(prompt string, grace time.Duration) (string, error) {
 					"bytes", sb.Len(),
 					"grace", grace,
 				)
-				return sb.String() + stdinTruncationNote(grace, sb.Len()) + "\n\n" + prompt, nil
+				idleReason := fmt.Sprintf("the producer went idle for over %s", grace)
+				return sb.String() + stdinTruncationNote(idleReason, sb.Len()) + "\n\n" + prompt, nil
 			}
 		}
 	default:
@@ -582,10 +598,16 @@ func maybePrependStdin(prompt string, grace time.Duration) (string, error) {
 // invocations typically don't have watched — can tell the stdin section may
 // be an arbitrary mid-stream cut rather than complete input, and reason
 // accordingly instead of silently trusting truncated data as whole.
-func stdinTruncationNote(grace time.Duration, bytesRead int) string {
+//
+// reason must describe WHY the read stopped short (e.g. "the producer went
+// idle for over 3s" or "a read error occurred (<err>)") — the two call
+// sites (idle timeout, non-EOF read error) have different, non-interchangeable
+// causes, so the caller supplies the accurate wording rather than this
+// function assuming idleness.
+func stdinTruncationNote(reason string, bytesRead int) string {
 	return fmt.Sprintf(
-		"\n\n[NOTE: stdin input may be truncated — the producer went idle for over %s after %d bytes and was not fully read]",
-		grace, bytesRead,
+		"\n\n[NOTE: stdin input may be truncated — %s after %d bytes and was not fully read]",
+		reason, bytesRead,
 	)
 }
 
