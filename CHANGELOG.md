@@ -10,6 +10,53 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+A separate review flagged the session heartbeat as reporting "alive"
+for a fully deadlocked process (no real progress, mtime still fresh)
+and a backlog of eight lower-priority follow-ups from the stability
+review below. Closed together, one task/commit at a time:
+
+- **Session heartbeat now reflects real activity, not a blind timer**
+  — the lock-file heartbeat touched its mtime on every 10s tick
+  unconditionally, so a wedged session with zero forward progress
+  still looked alive to diagnostics forever. It's now gated on actual
+  activity recorded since the previous tick (`SessionLock.RecordActivity`),
+  and that activity signal is wired through the agent's normal turn
+  loop (every stream callback) and propagated up through a
+  delegation chain, so a parent session's heartbeat correctly stays
+  alive purely from a sub-agent's real progress while the parent is
+  blocked waiting on it — not just during the parent's own stream
+  callbacks.
+- Added missing regression coverage for the queued-message-continues-
+  after-summarize/compact behavior (both the mid-turn auto-compact
+  path and the standalone `/compact` path), which had zero tests.
+- Fixed a pre-existing, unrelated data race in a stream-watchdog test
+  helper (an unsynchronized counter shared between the test goroutine
+  and a fake HTTP handler goroutine).
+- **A stuck-tool timeout could be misreported as the wrong kind of
+  timeout** — when `--timeout-hard-cap` fired while a tool happened to
+  be in flight, the watchdog reported it as a tool-specific timeout
+  ("a tool ran too long") instead of the actual cause (the turn's
+  overall wall-clock limit), producing a misleading finish message
+  that blamed the tool and cited the wrong duration.
+- **`sessions kill` and `sessions reset --force` ignored a configured
+  data directory** — both hardcoded the lock/data path to `<cwd>/.crush`,
+  so an operator using `--data-dir` or a project's `data_directory`
+  config silently got "no lock file found" instead of the rescue these
+  commands exist to perform. Both now resolve the actual configured
+  data directory.
+- Three follow-ups to the stdin idle-timeout fix: partial stdin
+  content returned after the producer goes idle now carries an
+  explicit marker (visible to the model, not just a log line) noting
+  it may be truncated; a narrow boundary race that could silently drop
+  a chunk arriving at almost the same instant the idle timer fired is
+  now guarded against; and a test-only mutable-package-global pattern
+  was replaced with dependency injection.
+- Removed a tautological sessions-kill test that never called the
+  function it claimed to test, and documented (without attempting to
+  structurally close, out of proportion for a manual rescue CLI) a
+  narrow residual PID-reuse race between proving a session is held and
+  actually killing its holder.
+
 An independent review of the batch below (task-276 investigation + the
 multi-agent stability review) found four more issues in the fixes
 themselves, closed in the same way:
