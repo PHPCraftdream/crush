@@ -749,6 +749,26 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	// original ctx) is passed through so runCancel — registered as the
 	// busy slot's CancelFunc — actually reaches every turn's genCtx.
 	for {
+		// Re-arm activeRequests with runCancel (the live, whole-call cancel
+		// func) before every turn, not just the first. tryReserveSession
+		// already set it once before this loop started, but runTurn
+		// overwrites the map entry with its own per-turn `cancel` (derived
+		// from runCtx) partway through — see the Set call near genCtx's
+		// creation. Once that turn returns, its `cancel` is spent (already
+		// invoked via defer) and the map entry left behind is a dead
+		// placeholder: calling it does nothing. From here until the next
+		// runTurn call reaches its own activeRequests.Set — i.e. for the
+		// whole of the next turn's DB preamble — a concurrent
+		// Cancel(sessionID) would silently no-op instead of interrupting
+		// anything. Setting runCancel again here closes that window: it's
+		// still live (only runCancel's own defer at the top of Run cancels
+		// it), and since every turn's genCtx is derived from runCtx,
+		// invoking it cancels the in-flight preamble/turn same as before.
+		// Redundant but harmless on the very first iteration (tryReserveSession
+		// already stored this exact func); csync.Map.Set is a plain
+		// overwrite, not additive, so setting the same value twice is a
+		// no-op in effect.
+		a.activeRequests.Set(call.SessionID, runCancel)
 		result, err, next, hasNext := a.runTurn(runCtx, call)
 		if !hasNext {
 			return result, err
