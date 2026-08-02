@@ -172,3 +172,103 @@ verified one at a time in the same way as the batch above:
   lines of prose" rule now explicitly exempts diagnosis/security-review/
   handoff turns instead of relying on an implicit carve-out in a
   different rule.
+
+A concurrent sub-agent hang investigation (task-276) and a follow-up
+independent stability review (`docs/reviews/2026-08-01-multi-agent-stability-review.md`,
+range `66c4d062..e9544a8f`) turned up a chain of related lifecycle,
+watchdog, and process-safety issues, all fixed and verified one at a
+time in the same way as the batches above:
+
+- **`crush run` could hang forever on a named pipe with no data
+  buffered yet** — `MaybePrependStdin` used to block indefinitely on
+  `io.ReadAll(os.Stdin)` for an inherited/piped stdin fd that never
+  closes. It's now bounded by a grace window for the first byte, with
+  the leaked reader goroutine documented as an accepted single-
+  goroutine cost, not a hang.
+- **...and then that fix silently dropped data a slow-but-real
+  producer had already sent** — the first version raced the WHOLE
+  read against the grace window, so a producer that wrote real data
+  but hadn't closed the pipe within it lost everything, with the log
+  actively claiming "produced no data" even though data existed.
+  `stdinReadGrace` now only bounds the wait for the *first* byte; once
+  a producer proves it's alive, the rest is read to EOF with no
+  further timeout.
+- **A wedged sub-agent delegation could freeze the whole parent
+  process with zero diagnostics** — an earlier fix that exempted
+  sub-agent delegations from the stream watchdog's tool-execution cap
+  removed the cap entirely instead of raising it, so a hung child
+  could block the parent's turn forever with no error, no finish
+  part, and no goroutine dump. The watchdog now applies one generous,
+  always-finite cap (`toolExecutionMaxDefault`, 45m) to every tool,
+  including delegations — never no cap at all — and captures a full
+  goroutine dump to disk the moment it actually fires, so the next
+  occurrence is diagnosable without a live debugger attach (which, on
+  a stripped release binary, can only kill the process, not inspect
+  it).
+- **`crush sessions kill`/`ReadLockPID` couldn't identify a live
+  Windows holder** — `LockFileEx`'s mandatory whole-file lock made a
+  plain file read of the lock file fail for any genuinely live
+  holder, so `sessions kill` on a live session used to see PID 0. A
+  never-locked `.pid` sidecar file, written alongside the lock, is now
+  the primary read path.
+- **`crush -v` printed the same version string for every build** —
+  `Commit`/`BuildTime` are now stamped into every build path
+  (local dev build, goreleaser, the npm publish workflow) via
+  `-ldflags`, so a deployed binary's provenance is identifiable.
+- **`Run()`'s DB preamble had no timeout** — `sessions.Get`/
+  `getSessionMessages`/`createUserMessage` ran on an unbounded context
+  before the stream watchdog even starts, so a wedged single-writer
+  SQLite connection (`SetMaxOpenConns(1)`) could hang a turn
+  invisibly, with no watchdog running yet to catch it. Now bounded by
+  a 60s timeout, injectable per-agent for tests instead of a shared
+  package var.
+- **`Run()` deadlocked on its own session lock while draining a
+  queued message** — three call sites recursed into `a.Run(...)` from
+  inside `Run`'s own still-executing stack frame, before the prior
+  turn's `defer ipcLock.Release()` had run; since the inter-process
+  lock isn't reentrant even within one process, the recursive call
+  collided with its own parent and failed with "session already in
+  use," silently dropping the queued message. Replaced with an
+  explicit turn loop that reuses one lock acquisition across every
+  queued turn. A related non-atomic busy-check/registration race
+  (two concurrent `Run()` calls for the same session could both
+  observe "not busy") was closed with an atomic check-and-claim.
+- **A hung title-generation call could hold `Run()` open forever** —
+  the background title goroutine ran on the raw, unbounded context
+  instead of the per-turn context the stream watchdog actually
+  cancels, so a stuck title provider blocked `Run()`'s return even
+  after the main turn's own watchdog and the new DB-preamble timeout
+  had both already fired correctly. Title generation is now derived
+  from the turn's own cancellable context plus an independent 2-minute
+  backstop.
+- **A cancelled turn could permanently lose a sub-agent's spend** —
+  the child-to-parent cost transfer ran on the same context as the
+  whole turn, so a watchdog firing or a user Ctrl-C right as the
+  child finished made the transfer's `BeginTx` fail immediately;
+  the failure was only logged, and a one-shot sub-agent never invoked
+  again meant that spend was gone from the parent's ledger for good.
+  The transfer now runs on a short, cancel-immune detached timeout.
+- **`sessions kill` could kill an unrelated process on a stale PID** —
+  a cleanly-released lock left its old PID sitting in the lock
+  file/sidecar; if the OS later recycled that PID for an unrelated
+  process, `sessions kill` would force-kill it on trust alone. Release
+  now clears the PID metadata while it still holds the lock, and
+  `sessions kill` probes for a real OS-level lock before ever touching
+  a PID — only a genuine contention error triggers the kill.
+- **A parent delegation could be cancelled before its child had a
+  chance to clean up** — after the tool-cap unification above, both
+  the parent's wait and the child's own turn shared the identical
+  cap, but the parent's clock starts counting earlier (from the
+  moment it decides to delegate) than the child's own watchdog (which
+  starts once the delegation is actually executing) — so the parent
+  always won the race and force-cancelled the whole delegation before
+  the child could persist its finish part, cost transfer, or
+  diagnostics. The parent's wait now gets an additional 90s cleanup
+  grace on top of the shared cap, so the child always gets a chance
+  to unwind on its own terms first.
+- **`--timeout-hard-cap` wasn't hard without
+  `--timeout-extends-on-progress`** — the wall-clock hard-cap check
+  outside of tool execution only ran inside the progress-extension
+  branch; with that flag off (the default) and a provider that kept
+  the stream alive with regular activity, an explicit hard cap was
+  silently ignored. The check is now unconditional.
