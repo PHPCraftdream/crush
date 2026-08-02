@@ -37,6 +37,27 @@ themselves, closed in the same way:
   pattern (title-generation's own timeout, not the DB-preamble one
   fixed earlier) was converted to the same per-agent injectable field.
 
+Two more, explicit product decisions/fixes:
+
+- **`--agents single` vs. a configured Worker** — confirmed as
+  intentional: a configured Worker model always wins over an explicit
+  `--agents single` (unchanged runtime behavior). What WAS wrong was
+  the documentation: the `--agents` flag's `--help` text, an inline
+  code comment, and the installed `/crush` slash-command guide all
+  flatly claimed `--agents single` was an absolute guarantee against
+  delegation — the literal opposite of the real behavior, and
+  actively misleading for an orchestrating agent deciding how to
+  invoke `crush run`. All three corrected, no behavior changed.
+- **stdin named-pipe read could hang indefinitely again** — the
+  previous fix (above) bounded only the wait for the *first* byte,
+  then read to EOF with no further timeout at all; a producer that
+  wrote one chunk and then went silent forever (no close, no more
+  data) hung `crush run` indefinitely. Replaced with a real idle
+  timeout applied to the whole read, chunk by chunk, that resets on
+  every chunk received — `crush run` can now only ever block for
+  "the grace window since the last byte was seen," never longer,
+  regardless of how the pipe behaves afterward.
+
 Concurrency and reliability hardening, found via an independent
 external code review of the hot-swap-binary work and verified/fixed
 one at a time:
