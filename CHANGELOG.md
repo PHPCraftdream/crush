@@ -32,12 +32,23 @@ review below. Closed together, one task/commit at a time:
 - Fixed a pre-existing, unrelated data race in a stream-watchdog test
   helper (an unsynchronized counter shared between the test goroutine
   and a fake HTTP handler goroutine).
-- **A stuck-tool timeout could be misreported as the wrong kind of
-  timeout** — when `--timeout-hard-cap` fired while a tool happened to
-  be in flight, the watchdog reported it as a tool-specific timeout
-  ("a tool ran too long") instead of the actual cause (the turn's
-  overall wall-clock limit), producing a misleading finish message
-  that blamed the tool and cited the wrong duration.
+- **A `--timeout-hard-cap` fire could be misreported as the wrong kind
+  of timeout, in two steps.** First, when the hard cap fired while a
+  tool happened to be in flight, the watchdog internally misclassified
+  it as a tool-specific timeout (reporting `toolTimeout=true` even
+  though the never-freeze tool-pause backstop never fired) — fixed by
+  correcting that boolean so the hard-cap-with-tool-in-flight case
+  agreed with the plain hard-cap-on-idle case. That fix alone wasn't
+  enough: both cases then collapsed into the SAME "not a tool timeout"
+  signal as a genuine provider idle-stall, so the user-facing finish
+  message still had only two branches ("Tool timeout" / "Stream
+  stalled") and every hard-cap fire fell into "Stream stalled" —
+  falsely blaming the provider and citing `idleTimeout` instead of the
+  hard cap that actually fired. The watchdog now carries a three-way
+  cause (tool timeout / hard cap / idle stall) all the way through to
+  the finish message, which gets its own "Turn timeout" title citing
+  the actual configured `--timeout-hard-cap` duration and blames
+  neither the provider nor a tool.
 - **`sessions kill` and `sessions reset --force` ignored a configured
   data directory** — both hardcoded the lock/data path to `<cwd>/.crush`,
   so an operator using `--data-dir` or a project's `data_directory`

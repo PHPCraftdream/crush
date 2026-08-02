@@ -1027,10 +1027,10 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 	}
 	toolMaxDuration := a.effectiveToolMaxDuration()
 	toolCleanupGrace := a.effectiveToolCleanupGrace()
-	var watchdogToolTimeout atomic.Bool
+	var watchdogCauseVal atomic.Int32 // stores watchdogCause
 	wd := startStreamWatchdog(
 		genCtx, cancel, idleTimeout, streamWatchdogTick,
-		func(elapsed time.Duration, toolTimeout bool) {
+		func(elapsed time.Duration, cause watchdogCause) {
 			// The watchdog firing IS the hang, caught at the only moment the
 			// evidence still exists. Capture every goroutine's stack now:
 			// pprof is gated behind CRUSH_PROFILE (so it can't be turned on
@@ -1042,8 +1042,9 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 			} else {
 				slog.Warn("agent: wrote goroutine dump for watchdog fire", "path", dumpPath)
 			}
-			if toolTimeout {
-				watchdogToolTimeout.Store(true)
+			watchdogCauseVal.Store(int32(cause))
+			switch cause {
+			case causeToolTimeout:
 				slog.Warn(
 					"agent: watchdog firing — tool execution exceeded cap, force-cancelling",
 					"session_id", call.SessionID,
@@ -1052,16 +1053,25 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 					"elapsed", elapsed.String(),
 					"cap", toolMaxDuration.String(),
 				)
-				return
+			case causeHardCap:
+				slog.Warn(
+					"agent: watchdog firing — turn exceeded --timeout-hard-cap, force-cancelling",
+					"session_id", call.SessionID,
+					"provider", largeModel.ModelCfg.Provider,
+					"model", largeModel.ModelCfg.Model,
+					"elapsed", elapsed.String(),
+					"hard_cap", a.timeoutHardCap.String(),
+				)
+			default:
+				slog.Warn(
+					"agent: stream watchdog firing — no provider activity, force-cancelling",
+					"session_id", call.SessionID,
+					"provider", largeModel.ModelCfg.Provider,
+					"model", largeModel.ModelCfg.Model,
+					"idle_duration", elapsed.String(),
+					"threshold", idleTimeout.String(),
+				)
 			}
-			slog.Warn(
-				"agent: stream watchdog firing — no provider activity, force-cancelling",
-				"session_id", call.SessionID,
-				"provider", largeModel.ModelCfg.Provider,
-				"model", largeModel.ModelCfg.Model,
-				"idle_duration", elapsed.String(),
-				"threshold", idleTimeout.String(),
-			)
 		},
 		a.timeoutExtendsOnProgress, // Fork patch: batch 8
 		a.timeoutHardCap,           // Fork patch: batch 8
@@ -2125,25 +2135,14 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 				"session_id", call.SessionID,
 				"provider", largeModel.ModelCfg.Provider,
 			)
-			if watchdogToolTimeout.Load() {
-				currentAssistant.AddFinish(
-					message.FinishReasonError,
-					"Tool timeout",
-					fmt.Sprintf(
-						"A tool ran for over %s without returning and was auto-cancelled by the watchdog to keep the agent responsive. Re-run the step; if it's a long job, poll its status instead of blocking.",
-						toolMaxDuration,
-					),
-				)
-			} else {
-				currentAssistant.AddFinish(
-					message.FinishReasonError,
-					"Stream stalled",
-					fmt.Sprintf(
-						"Provider %q stopped sending streaming data for over %s — the request was auto-cancelled by the stream watchdog. Retry the prompt; if it keeps happening, try a different model or provider.",
-						largeModel.ModelCfg.Provider, idleTimeout,
-					),
-				)
-			}
+			title, body := watchdogFinishMessage(
+				watchdogCause(watchdogCauseVal.Load()),
+				toolMaxDuration,
+				a.timeoutHardCap,
+				idleTimeout,
+				largeModel.ModelCfg.Provider,
+			)
+			currentAssistant.AddFinish(message.FinishReasonError, title, body)
 		} else if isCancelErr {
 			currentAssistant.AddFinish(message.FinishReasonCanceled, "User canceled request", "")
 		} else if isRunTimeout {

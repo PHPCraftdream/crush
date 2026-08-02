@@ -2,9 +2,47 @@ package agent
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sync/atomic"
 	"time"
+)
+
+// watchdogCause identifies WHY the watchdog fired, so callers can attribute
+// the resulting user-facing finish message to the actual cause instead of
+// collapsing every non-tool-timeout fire into a single "stream stalled"
+// bucket.
+//
+// Fork patch: task #223 — split out of a single `toolTimeout bool` that
+// could only distinguish "a tool ran too long" from "everything else". That
+// left a genuine --timeout-hard-cap fire (whether or not a tool happened to
+// be in flight) indistinguishable from a real provider idle-stall: both
+// passed toolTimeout=false, so agent.go's onFire callback always reported
+// "Stream stalled" — blaming the provider for silence even when the
+// provider was fine and the turn simply hit its own configured wall-clock
+// ceiling. See CHANGELOG.md for the two-step history: 77c1104a fixed the
+// boolean misclassification (hard-cap-with-tool-in-flight no longer claimed
+// toolTimeout=true), and this type finishes the job by giving the hard-cap
+// case its own identity so the finish message can name the real cause.
+type watchdogCause int
+
+const (
+	// causeIdleStall means the provider stopped sending data for
+	// idleTimeout (or the extendsOnProgress-extended deadline derived from
+	// it) with no tool in flight. This is the only cause that should ever
+	// produce a "Stream stalled" / provider-blaming message.
+	causeIdleStall watchdogCause = iota
+	// causeToolTimeout means a tool (including a sub-agent delegation) ran
+	// past toolMaxDuration (+ toolCleanupGrace) while in flight — the
+	// never-freeze backstop. This is the only cause that should ever
+	// produce a "Tool timeout" message.
+	causeToolTimeout
+	// causeHardCap means the turn hit the operator-configured
+	// --timeout-hard-cap wall-clock ceiling, independent of provider
+	// activity or tool state — the tool-in-flight state at the moment it
+	// fired is incidental, not the cause. Must never be reported as either
+	// causeIdleStall or causeToolTimeout.
+	causeHardCap
 )
 
 // streamWatchdog implements the "Codec must surface control" invariant for
@@ -56,8 +94,12 @@ type streamWatchdog struct {
 // onFire, if non-nil, is invoked AFTER stalled is set to true and BEFORE
 // cancel() — typically used to emit a slog.Warn with diagnostic context the
 // watchdog itself does not have (session ID, model, provider, etc.). The
-// toolTimeout bool is true when the fire was triggered by a tool exceeding
-// toolMaxDuration (rather than by provider idle).
+// watchdogCause identifies which of the three fire conditions triggered:
+// causeToolTimeout when a tool exceeded toolMaxDuration (the never-freeze
+// backstop), causeHardCap when the turn hit --timeout-hard-cap (regardless
+// of whether a tool happened to be in flight at the time), or causeIdleStall
+// when the provider genuinely stopped sending data for idleTimeout with no
+// tool in flight.
 //
 // Fork patch: batch 8 — extendsOnProgress + hardCap parameters.
 // When extendsOnProgress is true, every bump() also extends the effective
@@ -66,7 +108,7 @@ type streamWatchdog struct {
 // while still bounding the worst case.
 //
 // Fork patch: never-freeze backstop — toolMaxDuration bounds the tool
-// pause. Past it the watchdog fires with toolTimeout=true so the turn
+// pause. Past it the watchdog fires with cause=causeToolTimeout so the turn
 // ends instead of hanging forever on a stuck tool. One cap applies to
 // every tool in flight, sub-agent delegations included — see toolStarted's
 // doc on the streamWatchdog struct for why a single generous cap replaced
@@ -114,7 +156,7 @@ func startStreamWatchdog(
 	ctx context.Context,
 	cancel context.CancelFunc,
 	idleTimeout, tick time.Duration,
-	onFire func(elapsed time.Duration, toolTimeout bool),
+	onFire func(elapsed time.Duration, cause watchdogCause),
 	extendsOnProgress bool,
 	hardCap time.Duration,
 	toolMaxDuration time.Duration,
@@ -223,7 +265,7 @@ func startStreamWatchdog(
 				// long compile/test is expected, not a stall. Keep `last`
 				// fresh so the idle window starts clean once the tool returns.
 				// The pause is bounded: past the applicable cap the watchdog
-				// fires with toolTimeout=true (never-freeze backstop).
+				// fires with cause=causeToolTimeout (never-freeze backstop).
 				if toolsInFlight.Load() > 0 {
 					// One cap for the whole batch, regardless of which kind of
 					// tool is in it — including a sub-agent delegation via the
@@ -256,7 +298,7 @@ func startStreamWatchdog(
 								stalled.Store(true)
 								cancel()
 								if onFire != nil {
-									onFire(elapsed, true)
+									onFire(elapsed, causeToolTimeout)
 								}
 								return
 							}
@@ -271,7 +313,7 @@ func startStreamWatchdog(
 						stalled.Store(true)
 						cancel()
 						if onFire != nil {
-							onFire(now.Sub(startTime), false)
+							onFire(now.Sub(startTime), causeHardCap)
 						}
 						return
 					}
@@ -300,19 +342,21 @@ func startStreamWatchdog(
 				// (the default): the idle-only check below never fires, and
 				// the old hardCap check lived exclusively inside the
 				// extendsOnProgress branch, so --timeout-hard-cap was
-				// silently ignored on the non-extending path. toolTimeout is
-				// false here — this is a wall-clock turn limit, not a stuck
-				// tool. The hardCap check inside the toolsInFlight branch
-				// above reports toolTimeout=false for the same reason: it's
-				// the same wall-clock-hard-cap concept, just checked while a
-				// tool happens to be in flight. Only the never-freeze
-				// tool-pause backstop (also in the toolsInFlight branch)
-				// legitimately reports toolTimeout=true.
+				// silently ignored on the non-extending path. cause is
+				// causeHardCap here — this is a wall-clock turn limit, not a
+				// stuck tool and not provider idle. The hardCap check inside
+				// the toolsInFlight branch above reports causeHardCap for the
+				// same reason: it's the same wall-clock-hard-cap concept,
+				// just checked while a tool happens to be in flight. Only the
+				// never-freeze tool-pause backstop (also in the toolsInFlight
+				// branch) legitimately reports causeToolTimeout, and only the
+				// two idle checks below (extendsOnProgress and plain) report
+				// causeIdleStall.
 				if hardCap > 0 && now.After(hardDeadline) {
 					stalled.Store(true)
 					cancel()
 					if onFire != nil {
-						onFire(idle, false)
+						onFire(idle, causeHardCap)
 					}
 					return
 				}
@@ -336,7 +380,7 @@ func startStreamWatchdog(
 						stalled.Store(true)
 						cancel()
 						if onFire != nil {
-							onFire(idle, false)
+							onFire(idle, causeIdleStall)
 						}
 						return
 					}
@@ -347,7 +391,7 @@ func startStreamWatchdog(
 						stalled.Store(true)
 						cancel()
 						if onFire != nil {
-							onFire(idle, false)
+							onFire(idle, causeIdleStall)
 						}
 						return
 					}
@@ -361,5 +405,42 @@ func startStreamWatchdog(
 		toolFinished: toolFinished,
 		stalled:      &stalled,
 		done:         done,
+	}
+}
+
+// watchdogFinishMessage maps a watchdogCause to the (title, body) pair
+// recorded via AddFinish on the assistant message the user sees. Extracted
+// as a pure function (task #223) so the cause-to-message mapping is
+// directly unit-testable without needing to drive a full runTurn.
+//
+// Each cause gets its OWN title and cites its OWN configured duration —
+// never another cause's duration — so the message never misattributes the
+// fire to the wrong subsystem:
+//   - causeToolTimeout → "Tool timeout", cites toolMaxDuration. A specific
+//     tool call (or sub-agent delegation) ran too long.
+//   - causeHardCap → "Turn timeout", cites hardCap (a.timeoutHardCap). The
+//     turn's own operator-configured wall-clock ceiling fired — independent
+//     of whether a tool happened to be in flight at that moment. Must NOT
+//     be phrased as blaming the provider (that's causeIdleStall's job) or a
+//     tool (that's causeToolTimeout's job).
+//   - anything else (causeIdleStall) → "Stream stalled", cites idleTimeout
+//     and names the provider. The provider genuinely stopped sending data.
+func watchdogFinishMessage(cause watchdogCause, toolMaxDuration, hardCap, idleTimeout time.Duration, provider string) (title, body string) {
+	switch cause {
+	case causeToolTimeout:
+		return "Tool timeout", fmt.Sprintf(
+			"A tool ran for over %s without returning and was auto-cancelled by the watchdog to keep the agent responsive. Re-run the step; if it's a long job, poll its status instead of blocking.",
+			toolMaxDuration,
+		)
+	case causeHardCap:
+		return "Turn timeout", fmt.Sprintf(
+			"The turn exceeded its configured --timeout-hard-cap of %s and was auto-cancelled by the stream watchdog. This is the overall wall-clock limit for a single turn, not a provider stall or a stuck tool. Re-run with a larger --timeout-hard-cap if the turn genuinely needs more time.",
+			hardCap,
+		)
+	default: // causeIdleStall
+		return "Stream stalled", fmt.Sprintf(
+			"Provider %q stopped sending streaming data for over %s — the request was auto-cancelled by the stream watchdog. Retry the prompt; if it keeps happening, try a different model or provider.",
+			provider, idleTimeout,
+		)
 	}
 }
