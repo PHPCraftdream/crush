@@ -58,17 +58,13 @@ func hangingSSEServer(release <-chan struct{}) *httptest.Server {
 //
 // This test drives Run() with a working large-model SSE server (completes
 // normally) and a title (small-model) SSE server whose handler blocks
-// forever without writing a byte. It shrinks titleGenerationMaxDuration so
-// the backstop timeout fires quickly instead of the test needing to wait
-// out a production-sized bound, and asserts Run() still returns within a
-// generous wall-clock budget with a successful main-turn result — proving
-// the best-effort, cosmetic title generation can never hold up the turn it
-// rides along with.
+// forever without writing a byte. It sets SessionAgentOptions.
+// TitleGenerationMaxDuration on this agent instance so the backstop timeout
+// fires quickly instead of the test needing to wait out a production-sized
+// bound, and asserts Run() still returns within a generous wall-clock budget
+// with a successful main-turn result — proving the best-effort, cosmetic
+// title generation can never hold up the turn it rides along with.
 func TestRun_TitleProviderHangs_DoesNotBlockRunForever(t *testing.T) {
-	prevTitleMax := titleGenerationMaxDuration
-	titleGenerationMaxDuration = 500 * time.Millisecond
-	t.Cleanup(func() { titleGenerationMaxDuration = prevTitleMax })
-
 	env := testEnv(t)
 
 	sess, err := env.sessions.Create(t.Context(), "")
@@ -111,14 +107,15 @@ func TestRun_TitleProviderHangs_DoesNotBlockRunForever(t *testing.T) {
 		CatwalkCfg: catwalk.Model{ContextWindow: 200000, DefaultMaxTokens: 1000},
 	}
 	a := NewSessionAgent(SessionAgentOptions{
-		LargeModel:           model,
-		SmallModel:           smallModel,
-		SystemPrompt:         "you are a probe",
-		IsYolo:               true,
-		Sessions:             env.sessions,
-		Messages:             env.messages,
-		Tools:                []fantasy.AgentTool{},
-		DisableAutoSummarize: true,
+		LargeModel:                 model,
+		SmallModel:                 smallModel,
+		SystemPrompt:               "you are a probe",
+		IsYolo:                     true,
+		Sessions:                   env.sessions,
+		Messages:                   env.messages,
+		Tools:                      []fantasy.AgentTool{},
+		DisableAutoSummarize:       true,
+		TitleGenerationMaxDuration: 500 * time.Millisecond,
 	})
 
 	resultCh := make(chan struct {

@@ -183,19 +183,21 @@ const (
 // resolved at Run()-time via effectiveSessionPreambleMaxDuration below.
 const sessionPreambleMaxDurationDefault = 60 * time.Second
 
-// titleGenerationMaxDuration bounds how long the background title-generation
-// goroutine (launched from runTurn, awaited by its `defer wg.Wait()`) is
-// allowed to run. Title generation is a best-effort cosmetic side call
-// (a.generateTitle tries up to two models, each a blocking agent.Stream with
-// no timeout of its own) and must never be able to hold runTurn — and
-// therefore Run() — open past its own turn. Its context is derived from
-// genCtx so the stream watchdog's cancellation already covers it; this timer
-// is the independent backstop for the case where genCtx's cancellation, for
-// whatever reason, doesn't propagate (e.g. a provider stuck outside of
-// context-aware I/O). Generous relative to a title's actual cost (a handful
-// of tokens) so it only ever trips when something is genuinely wedged. A var
-// (not const) so tests can shrink it instead of waiting it out.
-var titleGenerationMaxDuration = 2 * time.Minute
+// titleGenerationMaxDurationDefault bounds how long the background
+// title-generation goroutine (launched from runTurn, awaited by its `defer
+// wg.Wait()`) is allowed to run. Title generation is a best-effort cosmetic
+// side call (a.generateTitle tries up to two models, each a blocking
+// agent.Stream with no timeout of its own) and must never be able to hold
+// runTurn — and therefore Run() — open past its own turn. Its context is
+// derived from genCtx so the stream watchdog's cancellation already covers
+// it; this timer is the independent backstop for the case where genCtx's
+// cancellation, for whatever reason, doesn't propagate (e.g. a provider
+// stuck outside of context-aware I/O). Generous relative to a title's actual
+// cost (a handful of tokens) so it only ever trips when something is
+// genuinely wedged. Overridden per-agent via
+// SessionAgentOptions.TitleGenerationMaxDuration, resolved at runTurn-time
+// via effectiveTitleGenerationMaxDuration below.
+const titleGenerationMaxDurationDefault = 2 * time.Minute
 
 var userAgent = fmt.Sprintf("Charm-Crush/%s (https://charm.land/crush)", version.Version)
 
@@ -352,6 +354,13 @@ type sessionAgent struct {
 	// via SessionAgentOptions.SessionPreambleMaxDuration instead of mutating
 	// shared state.
 	sessionPreambleMaxDuration time.Duration
+	// titleGenerationMaxDuration bounds the background title-generation
+	// goroutine for THIS agent — see titleGenerationMaxDurationDefault's doc
+	// for the full rationale. 0 = use titleGenerationMaxDurationDefault;
+	// tests may override to a small value via
+	// SessionAgentOptions.TitleGenerationMaxDuration instead of mutating
+	// shared state.
+	titleGenerationMaxDuration time.Duration
 
 	// messageQueue and injectQueue are per-session FIFO queues. They use
 	// csync.KeyedQueue (not csync.Map[string, []T]) because every real
@@ -464,6 +473,12 @@ type SessionAgentOptions struct {
 	// rationale. 0 = use the built-in default; primarily exposed for tests
 	// that want a short bound instead of waiting out the real one.
 	SessionPreambleMaxDuration time.Duration
+	// TitleGenerationMaxDuration overrides titleGenerationMaxDurationDefault
+	// when > 0 — the bound on the background title-generation goroutine. See
+	// titleGenerationMaxDurationDefault's doc for the full rationale. 0 = use
+	// the built-in default; primarily exposed for tests that want a short
+	// bound instead of waiting out the real one.
+	TitleGenerationMaxDuration time.Duration
 }
 
 func NewSessionAgent(
@@ -494,6 +509,7 @@ func NewSessionAgent(
 		toolCleanupGrace:           opts.ToolCleanupGrace,
 		peakHoursCheck:             opts.PeakHoursCheck,
 		sessionPreambleMaxDuration: opts.SessionPreambleMaxDuration,
+		titleGenerationMaxDuration: opts.TitleGenerationMaxDuration,
 	}
 }
 
@@ -572,6 +588,18 @@ func (a *sessionAgent) effectiveSessionPreambleMaxDuration() time.Duration {
 		sessionPreambleMaxDuration = a.sessionPreambleMaxDuration
 	}
 	return sessionPreambleMaxDuration
+}
+
+// effectiveTitleGenerationMaxDuration resolves the bound on the background
+// title-generation goroutine for THIS agent. See
+// titleGenerationMaxDurationDefault's doc for why this exists. 0 falls back
+// to the default.
+func (a *sessionAgent) effectiveTitleGenerationMaxDuration() time.Duration {
+	titleGenerationMaxDuration := titleGenerationMaxDurationDefault
+	if a.titleGenerationMaxDuration > 0 {
+		titleGenerationMaxDuration = a.titleGenerationMaxDuration
+	}
+	return titleGenerationMaxDuration
 }
 
 // logProviderWarnings emits each fantasy CallWarning from a step at WARN
@@ -895,13 +923,13 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall) (res 
 		// the stream watchdog cancelling genCtx — idle timeout, tool
 		// timeout, hard cap — also cuts off an in-flight title generation
 		// instead of leaving it to run on an unbounded parent context. Also
-		// independently capped by titleGenerationMaxDuration as a backstop:
-		// generateTitle's two model attempts are each a blocking
+		// independently capped by effectiveTitleGenerationMaxDuration as a
+		// backstop: generateTitle's two model attempts are each a blocking
 		// agent.Stream with no timeout of their own, so a provider that
 		// never returns (hung connection, stream never closed) must not be
 		// able to keep the deferred wg.Wait() below from returning even if
 		// genCtx's own cancellation somehow doesn't unblock it.
-		titleCtx, titleCancel := context.WithTimeout(genCtx, titleGenerationMaxDuration)
+		titleCtx, titleCancel := context.WithTimeout(genCtx, a.effectiveTitleGenerationMaxDuration())
 		wg.Go(func() {
 			defer titleCancel()
 			a.generateTitle(titleCtx, call.SessionID, call.Prompt)
