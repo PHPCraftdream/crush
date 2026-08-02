@@ -1145,15 +1145,21 @@ func TestEffectiveToolCleanupGrace_ExplicitOverrideWinsForTopLevel(t *testing.T)
 		"an explicit override must win even for a top-level session")
 }
 
-// TestEffectiveToolCleanupGrace_ChildWinsCancellationRace is the
-// end-to-end regression test proving the actual race is resolved, not
-// just the two effectiveToolCleanupGrace return values in isolation: given
-// a realistic parent/child start-time skew (delta), the child sub-agent's
-// own watchdog (no grace) must always fire strictly before the parent's
-// watchdog (default grace), for any delta comfortably under
-// toolCleanupGraceDefault (90s) — i.e. delta + toolMaxDuration <
-// toolMaxDuration + toolCleanupGraceDefault.
-func TestEffectiveToolCleanupGrace_ChildWinsCancellationRace(t *testing.T) {
+// TestEffectiveToolCleanupGrace_ChildWinsCancellationRace_EarlyWedge proves
+// the race is resolved for the case toolCleanupGraceDefault actually
+// guarantees: the child's tool call wedges EARLY — within
+// toolCleanupGraceDefault of the parent delegating — e.g. the child hangs
+// during its own init/DB preamble, or on close to the first tool it runs.
+// `delta` here models pure parent/child watchdog START skew (init + DB
+// preamble before the child's watchdog even begins counting), which really
+// is sub-second to low seconds in practice — NOT how long the child worked
+// before hitting its stuck tool. See the companion test
+// _LateWedgeParentStillWinsKnownLimitation for the case this grace does
+// NOT cover, and toolCleanupGraceDefault's doc comment in agent.go for the
+// full, honest scope (found overstated by an @oh review of this fix; the
+// doc and this test were both corrected together rather than leaving a
+// passing-but-misleading test behind).
+func TestEffectiveToolCleanupGrace_ChildWinsCancellationRace_EarlyWedge(t *testing.T) {
 	env := testEnv(t)
 
 	parentSA := testSessionAgent(env, nil, nil, "parent prompt")
@@ -1168,9 +1174,11 @@ func TestEffectiveToolCleanupGrace_ChildWinsCancellationRace(t *testing.T) {
 	parent.toolMaxDuration = toolMaxDuration
 	child.toolMaxDuration = toolMaxDuration
 
-	// Realistic parent/child start-time skew: the child's own watchdog
+	// Realistic parent/child WATCHDOG-START skew: the child's own watchdog
 	// starts only once its turn actually begins executing (after init and
-	// the DB preamble) — strictly later than the parent's OnToolCall.
+	// the DB preamble) — strictly later than the parent's OnToolCall. This
+	// models a child whose stuck tool is (at latest) the first one it runs,
+	// not one it hits after working productively for a while.
 	for _, delta := range []time.Duration{0, time.Second, 10 * time.Second, 60 * time.Second} {
 		delegationStart := time.Now()
 		childToolStart := delegationStart.Add(delta)
@@ -1183,6 +1191,58 @@ func TestEffectiveToolCleanupGrace_ChildWinsCancellationRace(t *testing.T) {
 				"watchdog can unwind cleanly before the parent cancels genCtx out from under it",
 			delta, childFireAt, parentFireAt)
 	}
+}
+
+// TestEffectiveToolCleanupGrace_LateWedgeParentStillWinsKnownLimitation
+// documents, as a passing (not failing) test, the case
+// toolCleanupGraceDefault does NOT cover: a child that works productively
+// for a while — its own watchdog resetting on every tool-call boundary,
+// same as the parent's — and only wedges LATE, deep into its turn, well
+// past toolCleanupGraceDefault after the parent delegated. In that case the
+// parent's watchdog (which counts from the original OnToolCall, not from
+// the child's last progress) still fires and force-cancels the delegation
+// FIRST, exactly like before task #205's fix. This is accepted, not a bug:
+// the parent still terminates correctly and task #197 already made the
+// cost-transfer step cancel-immune, so the only loss on this path is
+// diagnostic quality (the child's own finish part / goroutine dump), not
+// correctness. A structural fix would require the child to push progress
+// signals that reset the PARENT's watchdog too — not implemented. This test
+// exists so a future reader sees an explicit, intentional boundary instead
+// of silently discovering it in production.
+func TestEffectiveToolCleanupGrace_LateWedgeParentStillWinsKnownLimitation(t *testing.T) {
+	env := testEnv(t)
+
+	parentSA := testSessionAgent(env, nil, nil, "parent prompt")
+	parent := parentSA.(*sessionAgent)
+	parent.isSubAgent = false
+
+	childSA := testSessionAgent(env, nil, nil, "child prompt")
+	child := childSA.(*sessionAgent)
+	child.isSubAgent = true
+
+	const toolMaxDuration = 45 * time.Minute
+	parent.toolMaxDuration = toolMaxDuration
+	child.toolMaxDuration = toolMaxDuration
+
+	// The child worked productively for well over toolCleanupGraceDefault
+	// (90s) before its own watchdog even started timing the tool call that
+	// eventually wedges — e.g. several minutes of real edits/tests before a
+	// hung bash command. skew (watchdog-start delay) is realistic and
+	// small; workDuration (prior productive work) is what pushes the
+	// child's effective fire time past the parent's.
+	const skew = 2 * time.Second
+	const workDuration = 5 * time.Minute
+	delegationStart := time.Now()
+	childToolStart := delegationStart.Add(skew).Add(workDuration)
+
+	parentFireAt := delegationStart.Add(parent.effectiveToolMaxDuration() + parent.effectiveToolCleanupGrace())
+	childFireAt := childToolStart.Add(child.effectiveToolMaxDuration() + child.effectiveToolCleanupGrace())
+
+	assert.Truef(t, parentFireAt.Before(childFireAt),
+		"known limitation: for a late wedge (skew+workDuration=%s, past toolCleanupGraceDefault=%s), "+
+			"the parent (%s) still fires before the child (%s) — this is the case toolCleanupGraceDefault "+
+			"does not cover, see its doc comment in agent.go",
+		skew+workDuration, toolCleanupGraceDefault, parentFireAt, childFireAt)
 }
 
 // TestCleanTitle pins the normalisation that decides whether a model's title

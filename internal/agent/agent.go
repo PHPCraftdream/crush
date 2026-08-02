@@ -129,13 +129,37 @@ const (
 	// tool-name-keyed special case (that pattern was deliberately rejected
 	// above); it just gives whichever tool is running a little extra runway
 	// past its nominal cap, which is harmless for a plain tool and decisive
-	// for a delegation. 90s comfortably exceeds the actual parent/child
-	// start-time skew (typically sub-second to low seconds) while covering
-	// the child's own bounded cleanup costs (detached cost-transfer timeout
-	// is 15s per task #197, plus finish-part write and goroutine dump).
-	// Configurable via Options.ToolCleanupGrace for tests; 0 falls back to
-	// this default rather than disabling the grace, since an accidental
-	// zero would silently reopen the race this constant exists to close.
+	// for a delegation. Configurable via Options.ToolCleanupGrace for tests;
+	// 0 falls back to this default rather than disabling the grace, since an
+	// accidental zero would silently reopen the race this constant exists
+	// to close.
+	//
+	// HONEST SCOPE (found overstated by an @oh review of task #205's own
+	// fix — corrected here rather than in a follow-up commit that could go
+	// unread): 90s only guarantees the child wins the race against the
+	// PARENT'S watchdog start skew — the gap between the parent's OnToolCall
+	// and the child's own watchdog starting (init + DB preamble), which
+	// really is sub-second to low seconds. It does NOT bound how long the
+	// child may productively work before the tool call that actually wedges
+	// starts. Concretely: parent fires at delegationStart + M + 90s; child
+	// fires at (delegationStart + skew + workDuration) + M, where
+	// workDuration is the child's own prior productive work before hitting
+	// its stuck tool — unbounded, since the child's watchdog resets on every
+	// tool-call boundary (see toolFinished's doc below). The child wins only
+	// when skew + workDuration < 90s, i.e. only when the child wedges
+	// EARLY (near-immediately after being delegated to) — the common "child
+	// worked productively for minutes, THEN wedged deep into its turn" case
+	// is NOT covered: the parent still force-cancels it first. What this
+	// grace DOES guarantee unconditionally: the parent never fires before
+	// its own toolMaxDuration+90s has elapsed since delegating, giving any
+	// child that happens to wedge quickly (the case this was originally
+	// observed in) real runway to clean up. A structural fix for the general
+	// case would need the child to push progress signals the parent's own
+	// watchdog resets on — not implemented; tracked as a follow-up, not a
+	// release blocker, since the practical loss on the uncovered path is
+	// diagnostic quality (finish part / goroutine dump), not correctness —
+	// the parent still terminates, and task #197 already made the
+	// cost-transfer step itself cancel-immune.
 	//
 	// Fork patch, task #205: this default is applied ONLY to a NON-sub-agent
 	// (top-level) session — see effectiveToolCleanupGrace's doc. Applying it
@@ -144,11 +168,12 @@ const (
 	// both sides, the 90s cancels out of the "child must fire before parent"
 	// inequality algebraically, leaving the parent's head start (from
 	// OnToolCall, before the child's own watchdog even starts) as the only
-	// deciding factor — so the parent always still won. A sub-agent can
-	// never itself be waiting on a nested `agent`-tool delegation (the
-	// `agent` tool is excluded from workerToolNames for sub-agents — see
-	// buildToolsAgentConfig), so it is always the deepest watchdog in the
-	// chain and never needs runway to let a nested watchdog go first.
+	// deciding factor — so the parent always still won regardless of how
+	// early the child wedged. A sub-agent can never itself be waiting on a
+	// nested `agent`-tool delegation (the `agent` tool is excluded from
+	// workerToolNames for sub-agents — see buildToolsAgentConfig), so it is
+	// always the deepest watchdog in the chain and never needs runway to let
+	// a nested watchdog go first.
 	toolCleanupGraceDefault = 90 * time.Second
 
 	// defaultCheckpointInterval is the default coalescing interval for
