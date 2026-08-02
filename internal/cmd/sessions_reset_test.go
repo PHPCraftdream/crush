@@ -34,6 +34,44 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// isolateConfigEnvForTests sets XDG_DATA_HOME/CRUSH_GLOBAL_DATA,
+// XDG_CONFIG_HOME/CRUSH_GLOBAL_CONFIG, and CRUSH_PROVIDER_CACHE_ONLY to
+// throwaway directories under a fresh t.TempDir(), and points the default
+// slog logger at io.Discard — the isolation this repo's CLAUDE.md documents
+// as mandatory (not optional) for any test that reaches config.Load /
+// config.Init / config.ResolveDataDirectory, since those read real config
+// paths from the environment (GlobalConfig / GlobalConfigData) unless
+// explicitly isolated. Without this, a test can silently read from or write
+// to the operator's real global config/data — confirmed to have happened
+// before.
+//
+// Returns the base tmp dir so callers can derive their own subdirectories
+// (e.g. a configured --data-dir that lives outside it, or a workDir to
+// os.Chdir into) without colliding with the env dirs this helper already
+// created.
+func isolateConfigEnvForTests(t *testing.T) (tmp string) {
+	t.Helper()
+	config.ResetProviderCacheForTests()
+
+	tmp = t.TempDir()
+
+	dataDir := filepath.Join(tmp, "global-data")
+	require.NoError(t, os.MkdirAll(dataDir, 0o755))
+	t.Setenv("XDG_DATA_HOME", dataDir)
+	t.Setenv("CRUSH_GLOBAL_DATA", dataDir)
+
+	configDir := filepath.Join(tmp, "config")
+	require.NoError(t, os.MkdirAll(configDir, 0o755))
+	t.Setenv("XDG_CONFIG_HOME", configDir)
+	t.Setenv("CRUSH_GLOBAL_CONFIG", configDir)
+	t.Setenv("CRUSH_PROVIDER_CACHE_ONLY", "1")
+
+	crushlog.Setup("", false)
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	return tmp
+}
+
 // isolatedResetEnv stands up a full app (same setupApp path `crush sessions
 // reset` uses) in an isolated data dir/cwd, mirroring isolatedModelsEnv /
 // runProvidersCmdInIsolatedApp's harness. Unlike those two, sessionsResetCmd's
@@ -49,22 +87,7 @@ import (
 // block writes/reads).
 func isolatedResetEnv(t *testing.T) (a *app.App, cwd string) {
 	t.Helper()
-	config.ResetProviderCacheForTests()
-
-	tmp := t.TempDir()
-	dataDir := filepath.Join(tmp, "data")
-	require.NoError(t, os.MkdirAll(dataDir, 0o755))
-	t.Setenv("XDG_DATA_HOME", dataDir)
-	t.Setenv("CRUSH_GLOBAL_DATA", dataDir)
-
-	configDir := filepath.Join(tmp, "config")
-	require.NoError(t, os.MkdirAll(configDir, 0o755))
-	t.Setenv("XDG_CONFIG_HOME", configDir)
-	t.Setenv("CRUSH_GLOBAL_CONFIG", configDir)
-	t.Setenv("CRUSH_PROVIDER_CACHE_ONLY", "1")
-
-	crushlog.Setup("", false)
-	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	tmp := isolateConfigEnvForTests(t)
 
 	workDir := t.TempDir()
 	orig, err := os.Getwd()
@@ -163,22 +186,7 @@ func resetSessionCmdFlags() *cobra.Command {
 // sessions.go's --force block, not just present on the flag set.
 func isolatedResetEnvWithConfiguredDataDir(t *testing.T) (a *app.App, workDir, dataDir string) {
 	t.Helper()
-	config.ResetProviderCacheForTests()
-
-	tmp := t.TempDir()
-	globalData := filepath.Join(tmp, "global-data")
-	require.NoError(t, os.MkdirAll(globalData, 0o755))
-	t.Setenv("XDG_DATA_HOME", globalData)
-	t.Setenv("CRUSH_GLOBAL_DATA", globalData)
-
-	configDir := filepath.Join(tmp, "config")
-	require.NoError(t, os.MkdirAll(configDir, 0o755))
-	t.Setenv("XDG_CONFIG_HOME", configDir)
-	t.Setenv("CRUSH_GLOBAL_CONFIG", configDir)
-	t.Setenv("CRUSH_PROVIDER_CACHE_ONLY", "1")
-
-	crushlog.Setup("", false)
-	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	tmp := isolateConfigEnvForTests(t)
 
 	workDir = t.TempDir()
 	orig, err := os.Getwd()

@@ -63,18 +63,21 @@ func sessionsKillCmdRun(cmd *cobra.Command, args []string) error {
 	// Resolve the data directory the same lightweight way `stats` does:
 	// honor --data-dir first, then the project's configured
 	// data_directory, and only fall back to <cwd>/.crush if neither is
-	// set. config.Init is pure config resolution (no DB connection), so
-	// it stays safe to use from a rescue command that must keep working
-	// even when the DB/app is stuck.
+	// set. config.ResolveDataDirectory is pure, local, filesystem-only
+	// config resolution (no network fetch, no DB connection, no config
+	// persistence side effects), so it stays safe to use from a rescue
+	// command that must keep working even when the network/DB/app is
+	// stuck.
+	//
+	// Always use the resolved value, never the raw --data-dir flag
+	// string directly: a RELATIVE --data-dir must be resolved against
+	// --cwd (like setupApp/sessions.go's reset --force does), not
+	// against the process's actual cwd, which can differ. See task #224
+	// finding 1.
 	dataDirFlag, _ := cmd.Flags().GetString("data-dir")
-	debug, _ := cmd.Flags().GetBool("debug")
-	cfg, err := config.Init(cwd, dataDirFlag, debug)
+	dataDir, err := config.ResolveDataDirectory(cwd, dataDirFlag)
 	if err != nil {
-		return fmt.Errorf("failed to initialize config: %w", err)
-	}
-	dataDir := dataDirFlag
-	if dataDir == "" {
-		dataDir = cfg.Config().Options.DataDirectory
+		return fmt.Errorf("failed to resolve data directory: %w", err)
 	}
 
 	lockPath := filepath.Join(dataDir, "locks", "session-"+sanitiseSessionIDForFilename(id)+".lock")

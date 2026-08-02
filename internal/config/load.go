@@ -199,6 +199,43 @@ func Load(workingDir, dataDir string, debug bool) (*ConfigStore, error) {
 	return store, nil
 }
 
+// ResolveDataDirectory resolves the effective data directory (honoring
+// --data-dir / the project's configured data_directory, defaulting to
+// <workingDir>/.crush) WITHOUT the network/provider-fetch/persist side
+// effects Load performs — safe for rescue commands (sessions kill/reset
+// --force) that must keep working even when the network or DB is
+// unreachable.
+//
+// This intentionally stops after the same pure, local, filesystem-only
+// steps Load itself performs before its first network call (Providers):
+// load the config files, then setDefaults, which fully resolves
+// cfg.Options.DataDirectory. Everything after that in Load — Providers
+// (network fetch under a 45s timeout), configureProviders,
+// configureSelectedModels (which can persist a corrected model selection
+// to the operator's real global config) — never runs here.
+//
+// Known gap vs. Load/setupApp's full resolution: this does NOT apply the
+// workspace-config-merge step (Load's "Load workspace config last" block,
+// which reads <data_directory>/crush.json and can override
+// data_directory at workspace scope). That merge itself depends on
+// data_directory already being resolved, and re-running it here would
+// mean re-parsing another JSON file and re-applying setDefaults — edging
+// back toward Load's complexity for a case rescue commands are unlikely
+// to hit in practice (a workspace-scoped override of data_directory
+// itself). Accepted as a narrow, documented tradeoff in favor of "always
+// resolves without network/DB dependencies".
+func ResolveDataDirectory(workingDir, dataDir string) (string, error) {
+	configPaths := lookupConfigs(workingDir)
+
+	cfg, _, err := loadFromConfigPaths(configPaths)
+	if err != nil {
+		return "", fmt.Errorf("failed to load config from paths %v: %w", configPaths, err)
+	}
+
+	cfg.setDefaults(workingDir, dataDir)
+	return cfg.Options.DataDirectory, nil
+}
+
 // mustMarshalConfig marshals the config to JSON bytes, returning empty JSON on
 // error.
 func mustMarshalConfig(cfg *Config) []byte {
