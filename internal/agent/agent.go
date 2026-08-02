@@ -2094,7 +2094,13 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 			}
 			content := "There was an error while executing the tool"
 			if isWatchdogStall {
-				content = fmt.Sprintf("Tool call was cancelled: the provider stream stalled for >%s and the watchdog aborted the turn.", idleTimeout)
+				content = watchdogToolResultMessage(
+					watchdogCause(watchdogCauseVal.Load()),
+					toolMaxDuration,
+					a.timeoutHardCap,
+					idleTimeout,
+					largeModel.ModelCfg.Provider,
+				)
 			} else if isCancelErr {
 				content = "Error: user cancelled assistant tool calling"
 			}

@@ -1079,6 +1079,57 @@ func TestWatchdogFinishMessage_AllThreeCausesDistinct(t *testing.T) {
 	assert.Contains(t, idleBody, provider, "idle-stall body must name the provider — it genuinely is the cause here")
 }
 
+// TestWatchdogToolResultMessage_ReflectsRealCause is the regression test for
+// task #227 (same root-cause family as task #223's watchdogFinishMessage
+// split): the synthetic tool-result content built for the model when a tool
+// call is still unfinished at watchdog-fire time used to unconditionally
+// read "the provider stream stalled for >idleTimeout" regardless of the
+// real cause — so even after 7b48f75a fixed the HUMAN-facing finish
+// message, the MODEL was still told the wrong story on a genuine hard-cap
+// or tool-timeout fire. This proves watchdogToolResultMessage — what
+// agent.go's runTurn now delegates to instead of a hardcoded string — gives
+// each cause distinct, correctly-attributed wording:
+//   - causeHardCap must NOT mention "provider" or cite idleTimeout; it must
+//     cite the actual hardCap duration.
+//   - causeToolTimeout must NOT mention "provider" or cite idleTimeout; it
+//     must cite the actual toolMaxDuration.
+//   - causeIdleStall is the only cause allowed to blame the provider and
+//     cite idleTimeout.
+func TestWatchdogToolResultMessage_ReflectsRealCause(t *testing.T) {
+	const toolMaxDuration = 45 * time.Minute
+	const hardCap = 20 * time.Minute
+	const idleTimeout = 3 * time.Minute
+	const provider = "anthropic"
+
+	t.Run("hard cap does not blame the provider or cite idleTimeout", func(t *testing.T) {
+		msg := watchdogToolResultMessage(causeHardCap, toolMaxDuration, hardCap, idleTimeout, provider)
+		assert.NotContains(t, msg, provider, "must not name the provider at all — it did not cause this")
+		assert.NotContains(t, msg, idleTimeout.String(), "must not cite idleTimeout — that's not the duration that fired")
+		assert.Contains(t, msg, hardCap.String(), "must cite the actual --timeout-hard-cap duration that fired")
+	})
+
+	t.Run("tool timeout does not blame the provider or cite idleTimeout", func(t *testing.T) {
+		msg := watchdogToolResultMessage(causeToolTimeout, toolMaxDuration, hardCap, idleTimeout, provider)
+		assert.NotContains(t, msg, provider, "must not name the provider at all — it did not cause this")
+		assert.NotContains(t, msg, idleTimeout.String(), "must not cite idleTimeout — that's not the duration that fired")
+		assert.Contains(t, msg, toolMaxDuration.String(), "must cite the actual toolMaxDuration that fired")
+	})
+
+	t.Run("idle stall is the only cause that blames the provider", func(t *testing.T) {
+		msg := watchdogToolResultMessage(causeIdleStall, toolMaxDuration, hardCap, idleTimeout, provider)
+		assert.Contains(t, msg, idleTimeout.String(), "idle-stall must cite idleTimeout — the provider genuinely is the cause here")
+	})
+
+	t.Run("all three causes produce distinct messages", func(t *testing.T) {
+		hardCapMsg := watchdogToolResultMessage(causeHardCap, toolMaxDuration, hardCap, idleTimeout, provider)
+		toolMsg := watchdogToolResultMessage(causeToolTimeout, toolMaxDuration, hardCap, idleTimeout, provider)
+		idleMsg := watchdogToolResultMessage(causeIdleStall, toolMaxDuration, hardCap, idleTimeout, provider)
+		assert.NotEqual(t, hardCapMsg, toolMsg)
+		assert.NotEqual(t, toolMsg, idleMsg)
+		assert.NotEqual(t, hardCapMsg, idleMsg)
+	})
+}
+
 // TestEffectiveToolMaxDuration_Default proves the unified cap: with no
 // explicit operator override, every run — sub-agent or top-level,
 // orchestrating a delegation or not — gets exactly toolExecutionMaxDefault.

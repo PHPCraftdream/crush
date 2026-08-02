@@ -779,3 +779,82 @@ func TestStreamWatchdog_RecordActivityCalledOnEveryToolInFlightTick(t *testing.T
 
 	wd.toolFinished()
 }
+
+// TestStreamWatchdog_OnFireCompletesBeforeCancel is the regression test for
+// task #227: startStreamWatchdog's doc comment says onFire is invoked AFTER
+// stalled is set to true and BEFORE cancel(), but until this fix all 5 fire
+// sites actually did `stalled.Store(true); cancel(); onFire(...)` — the
+// OPPOSITE order. That let a second goroutine blocked on <-ctx.Done() race
+// ahead and observe cancellation before onFire (which, in agent.go, stores
+// the real watchdogCause AFTER a slow disk-writing goroutine dump) had
+// finished recording anything — silently defeating task #223's cause
+// attribution on a genuine hard-cap/tool-timeout fire.
+//
+// This proves the fix deterministically (no time.Sleep guessing): onFire
+// blocks on a channel until the test goroutine has confirmed ctx is NOT YET
+// Done, then signals onFire to proceed and records the moment it returns.
+// The test asserts, via a channel handshake instead of timing, that
+// ctx.Done() cannot be observed as closed until AFTER onFire has fully
+// returned.
+func TestStreamWatchdog_OnFireCompletesBeforeCancel(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	const idle = 20 * time.Millisecond
+	const tick = 5 * time.Millisecond
+
+	// onFireEntered is closed the instant onFire starts running.
+	onFireEntered := make(chan struct{})
+	// releaseOnFire is closed by the test goroutine once it has confirmed
+	// ctx is still NOT Done — only then is onFire allowed to return.
+	releaseOnFire := make(chan struct{})
+	// onFireReturned is closed right after onFire returns, i.e. right
+	// before the watchdog goroutine calls cancel().
+	onFireReturned := make(chan struct{})
+
+	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(time.Duration, watchdogCause) {
+		close(onFireEntered)
+		<-releaseOnFire
+		close(onFireReturned)
+	}, false, 0, 0, 0, nil)
+
+	// Wait for onFire to start.
+	select {
+	case <-onFireEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("onFire was never invoked")
+	}
+
+	// While onFire is blocked (has not returned), ctx must NOT be Done yet
+	// — cancel() must not have run. This is the deterministic core of the
+	// assertion: sampled precisely while onFire is known to still be
+	// in-flight, not via a timing guess.
+	select {
+	case <-ctx.Done():
+		t.Fatal("ctx was cancelled before onFire returned — cancel() must run strictly after onFire completes")
+	default:
+		// Good: ctx is still live while onFire is blocked.
+	}
+	assert.NoError(t, ctx.Err(), "ctx must not be cancelled while onFire is still running")
+
+	// Now let onFire finish, and confirm ctx becomes Done only afterward.
+	close(releaseOnFire)
+
+	select {
+	case <-onFireReturned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("onFire never returned after being released")
+	}
+
+	// ctx.Done() must become observable (cancel() called) after onFire
+	// returned. Poll done deterministically via the watchdog's own done
+	// channel, which only closes after the fire-site's cancel()+return.
+	select {
+	case <-wd.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("watchdog goroutine never exited after onFire returned")
+	}
+	assert.Error(t, ctx.Err(), "ctx must be cancelled after onFire returned")
+	assert.True(t, wd.stalled.Load())
+}

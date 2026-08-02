@@ -296,10 +296,10 @@ func startStreamWatchdog(
 							effectiveCap := toolMaxDuration + toolCleanupGrace
 							if elapsed := now.Sub(time.Unix(0, startedAt)); elapsed >= effectiveCap {
 								stalled.Store(true)
-								cancel()
 								if onFire != nil {
 									onFire(elapsed, causeToolTimeout)
 								}
+								cancel()
 								return
 							}
 						}
@@ -311,10 +311,10 @@ func startStreamWatchdog(
 					// must not trip it.
 					if hardCap > 0 && now.After(hardDeadline) {
 						stalled.Store(true)
-						cancel()
 						if onFire != nil {
 							onFire(now.Sub(startTime), causeHardCap)
 						}
+						cancel()
 						return
 					}
 					last.Store(now.UnixNano())
@@ -354,10 +354,10 @@ func startStreamWatchdog(
 				// causeIdleStall.
 				if hardCap > 0 && now.After(hardDeadline) {
 					stalled.Store(true)
-					cancel()
 					if onFire != nil {
 						onFire(idle, causeHardCap)
 					}
+					cancel()
 					return
 				}
 
@@ -378,10 +378,10 @@ func startStreamWatchdog(
 					}
 					if now.After(effectiveDeadline) {
 						stalled.Store(true)
-						cancel()
 						if onFire != nil {
 							onFire(idle, causeIdleStall)
 						}
+						cancel()
 						return
 					}
 				} else {
@@ -389,10 +389,10 @@ func startStreamWatchdog(
 					// activity exceeds idleTimeout.
 					if idle >= idleTimeout {
 						stalled.Store(true)
-						cancel()
 						if onFire != nil {
 							onFire(idle, causeIdleStall)
 						}
+						cancel()
 						return
 					}
 				}
@@ -443,4 +443,23 @@ func watchdogFinishMessage(cause watchdogCause, toolMaxDuration, hardCap, idleTi
 			provider, idleTimeout,
 		)
 	}
+}
+
+// watchdogToolResultMessage maps a watchdogCause to the tool-result content
+// recorded for any tool call still unfinished when the watchdog fired. This
+// is the MODEL-facing counterpart of watchdogFinishMessage: the human sees
+// the AddFinish (title, body) pair, but the model only sees whatever text we
+// put in this synthetic tool result, so it needs its own cause-aware wording
+// rather than reusing watchdogFinishMessage's longer human-oriented body.
+//
+// Before this (task #227, same root-cause family as task #223's
+// watchdogFinishMessage split), this call site hardcoded "the provider
+// stream stalled for >idleTimeout" unconditionally — so a hard-cap or
+// tool-timeout fire told the MODEL the wrong story even after 7b48f75a
+// fixed the human-facing message. Reuses watchdogFinishMessage's (title,
+// body) pair as the source of truth for cause-specific wording/duration so
+// the two call sites can never drift apart on what each cause means.
+func watchdogToolResultMessage(cause watchdogCause, toolMaxDuration, hardCap, idleTimeout time.Duration, provider string) string {
+	title, body := watchdogFinishMessage(cause, toolMaxDuration, hardCap, idleTimeout, provider)
+	return fmt.Sprintf("Tool call was cancelled: %s — %s", title, body)
 }
