@@ -58,6 +58,27 @@ Two more, explicit product decisions/fixes:
   "the grace window since the last byte was seen," never longer,
   regardless of how the pipe behaves afterward.
 
+A second, independent review of the fixes above (this time targeting
+the follow-up commits themselves, not the original batch) found two
+more things:
+
+- **The `agentic_fetch` tool's own nested delegation wasn't
+  classified as a sub-agent** — it runs through the same delegation
+  path as a real worker sub-agent, but its `SessionAgent` never set
+  `IsSubAgent`, so it was invisible to the parent/child cleanup-grace
+  fix above and quietly kept the old symmetric-cancel-out bug on that
+  one path. One-line fix.
+- **The cleanup-grace fix's own documentation overstated what it
+  guarantees** — it only protects a child that wedges *early*
+  (roughly within the grace window of being delegated to); a child
+  that works productively for a while and only wedges deep into its
+  turn still loses the race to the parent's watchdog, same as before
+  that fix. Not a correctness issue (the parent still terminates
+  correctly, and cost accounting is already cancel-immune, see
+  above) — just a claim that needed correcting before someone trusted
+  it. Documented as an explicit, tested, known limitation instead of
+  a silently overstated guarantee.
+
 Concurrency and reliability hardening, found via an independent
 external code review of the hot-swap-binary work and verified/fixed
 one at a time:
