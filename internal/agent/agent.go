@@ -136,6 +136,19 @@ const (
 	// Configurable via Options.ToolCleanupGrace for tests; 0 falls back to
 	// this default rather than disabling the grace, since an accidental
 	// zero would silently reopen the race this constant exists to close.
+	//
+	// Fork patch, task #205: this default is applied ONLY to a NON-sub-agent
+	// (top-level) session — see effectiveToolCleanupGrace's doc. Applying it
+	// to a sub-agent's own watchdog as well (task #200's original fix) made
+	// the race worse, not better: with identical toolMaxDuration+grace on
+	// both sides, the 90s cancels out of the "child must fire before parent"
+	// inequality algebraically, leaving the parent's head start (from
+	// OnToolCall, before the child's own watchdog even starts) as the only
+	// deciding factor — so the parent always still won. A sub-agent can
+	// never itself be waiting on a nested `agent`-tool delegation (the
+	// `agent` tool is excluded from workerToolNames for sub-agents — see
+	// buildToolsAgentConfig), so it is always the deepest watchdog in the
+	// chain and never needs runway to let a nested watchdog go first.
 	toolCleanupGraceDefault = 90 * time.Second
 
 	// defaultCheckpointInterval is the default coalescing interval for
@@ -326,8 +339,11 @@ type sessionAgent struct {
 	// toolCleanupGrace is the buffer added on top of the resolved
 	// toolMaxDuration before the watchdog force-cancels a tool-in-flight —
 	// see toolCleanupGraceDefault's doc for why this exists (parent/child
-	// delegation cancellation race). 0 = use toolCleanupGraceDefault; tests
-	// may override to a small value via SessionAgentOptions.ToolCleanupGrace.
+	// delegation cancellation race) and effectiveToolCleanupGrace's doc for
+	// full precedence. 0 = no explicit override: falls back to
+	// toolCleanupGraceDefault for a top-level session, or to 0 (no grace)
+	// for a sub-agent session (task #205). Tests may set a small explicit
+	// value via SessionAgentOptions.ToolCleanupGrace, which always wins.
 	toolCleanupGrace time.Duration
 	// sessionPreambleMaxDuration bounds Run()'s DB preamble (sessions.Get,
 	// getSessionMessages, createUserMessage) for THIS agent — see
@@ -425,13 +441,18 @@ type SessionAgentOptions struct {
 	// ALWAYS wins over the built-in default — plumbed from
 	// Options.StreamToolTimeoutSeconds in the coordinator.
 	ToolMaxDuration time.Duration
-	// ToolCleanupGrace overrides toolCleanupGraceDefault when > 0 — the
-	// buffer added on top of the resolved tool-max-duration before the
-	// watchdog force-cancels a tool-in-flight, giving a nested (child)
-	// watchdog inside an `agent`-tool delegation a chance to fire on its
-	// own cap and unwind cleanly first. See toolCleanupGraceDefault's doc
-	// for the full rationale. 0 = use the built-in default; primarily
-	// exposed for tests that want a short grace instead of waiting it out.
+	// ToolCleanupGrace overrides the resolved grace when > 0 — the buffer
+	// added on top of the resolved tool-max-duration before the watchdog
+	// force-cancels a tool-in-flight, giving a nested (child) watchdog
+	// inside an `agent`-tool delegation a chance to fire on its own cap and
+	// unwind cleanly first. See toolCleanupGraceDefault's and
+	// effectiveToolCleanupGrace's docs for the full rationale. 0 = no
+	// explicit override: the built-in default (toolCleanupGraceDefault)
+	// applies only to a top-level (non-sub-agent) session; a sub-agent
+	// session gets 0 (no grace) by default, since it can never itself be
+	// waiting on a nested delegation (task #205). Primarily exposed for
+	// tests that want a short, non-zero grace instead of waiting out the
+	// real default.
 	ToolCleanupGrace time.Duration
 	// PeakHoursCheck, when non-nil, is called once per step to re-check
 	// whether the large model's provider has entered its peak_hours
@@ -505,15 +526,40 @@ func (a *sessionAgent) effectiveToolMaxDuration() time.Duration {
 // effectiveToolCleanupGrace resolves the buffer added on top of
 // effectiveToolMaxDuration before the stream watchdog force-cancels a
 // tool-in-flight. See toolCleanupGraceDefault's doc for why this exists.
-// 0 falls back to the default rather than disabling the grace — an
-// accidentally-zero override would silently reopen the parent/child
-// cancellation race this exists to close.
+// Precedence:
+//
+//  1. a.toolCleanupGrace (> 0) — an EXPLICIT OPERATOR OVERRIDE (or test
+//     override via SessionAgentOptions.ToolCleanupGrace). Checked FIRST and
+//     applied unconditionally, so it wins even for a sub-agent that
+//     explicitly opts back in.
+//  2. Otherwise: toolCleanupGraceDefault (90s) for a top-level (non-sub-agent)
+//     session, or 0 (no grace) for a sub-agent session.
+//
+// Fork patch, task #205 (reopens #200): the grace exists ONLY to let a
+// nested (child) sub-agent watchdog fire on its OWN cap and unwind cleanly
+// before the PARENT's watchdog (whose clock started earlier — at OnToolCall
+// for the `agent`-tool delegation, before the child's own turn has even
+// begun executing) force-cancels genCtx out from under it. Giving the
+// SAME grace to the sub-agent's own watchdog (task #200's original,
+// symmetric fix) defeated that purpose: with identical
+// toolMaxDuration+grace on both sides, the 90s cancels out of the
+// "child must fire before parent" inequality algebraically, so the
+// parent's unconditional head start remained the only deciding factor and
+// it still always won the race. A sub-agent can never itself be waiting on
+// a nested `agent`-tool delegation — the `agent` tool is excluded from
+// workerToolNames for sub-agents (see coordinator.go's
+// buildToolsAgentConfig/workerToolNames), so a sub-agent is always the
+// deepest watchdog in the chain and never needs runway for a nested one to
+// go first. Only a top-level (!isSubAgent) session's watchdog is ever the
+// one waiting on a delegation, so only it gets the default grace.
 func (a *sessionAgent) effectiveToolCleanupGrace() time.Duration {
-	toolCleanupGrace := toolCleanupGraceDefault
 	if a.toolCleanupGrace > 0 {
-		toolCleanupGrace = a.toolCleanupGrace
+		return a.toolCleanupGrace
 	}
-	return toolCleanupGrace
+	if a.isSubAgent {
+		return 0
+	}
+	return toolCleanupGraceDefault
 }
 
 // effectiveSessionPreambleMaxDuration resolves the bound on Run()'s DB

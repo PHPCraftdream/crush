@@ -1068,6 +1068,123 @@ func TestEffectiveToolMaxDuration_OperatorOverrideWins(t *testing.T) {
 	})
 }
 
+// TestEffectiveToolCleanupGrace_TopLevelGetsDefault proves a top-level
+// (non-sub-agent) session — the one whose watchdog may be waiting on an
+// `agent`-tool delegation and needs to give the child's own watchdog a
+// chance to fire first — gets toolCleanupGraceDefault with no explicit
+// override configured.
+func TestEffectiveToolCleanupGrace_TopLevelGetsDefault(t *testing.T) {
+	env := testEnv(t)
+	sa := testSessionAgent(env, nil, nil, "test prompt")
+	agent := sa.(*sessionAgent)
+	agent.isSubAgent = false
+
+	require.Zero(t, agent.toolCleanupGrace, "no explicit operator override by default")
+
+	got := agent.effectiveToolCleanupGrace()
+	assert.Equal(t, toolCleanupGraceDefault, got,
+		"a top-level session must get the default grace so a nested child watchdog gets a chance to fire first")
+}
+
+// TestEffectiveToolCleanupGrace_SubAgentGetsNoGrace is the task #205
+// regression test: it proves the asymmetry that actually closes the
+// parent/child cancellation race. Task #200's original fix applied
+// toolCleanupGraceDefault symmetrically to BOTH the parent and the child
+// sub-agent's own watchdog, which cancels out of the "child fires before
+// parent" inequality algebraically and leaves the parent's unconditional
+// head start (it starts timing at OnToolCall, before the child's own turn
+// has even begun executing) as the sole deciding factor — so the parent
+// still always won. A sub-agent can never itself be waiting on a further
+// nested `agent`-tool delegation (excluded from workerToolNames for
+// sub-agents), so it is always the deepest watchdog in the chain and must
+// get NO grace: it should fire at bare toolMaxDuration, strictly before the
+// parent's toolMaxDuration+90s.
+func TestEffectiveToolCleanupGrace_SubAgentGetsNoGrace(t *testing.T) {
+	env := testEnv(t)
+	sa := testSessionAgent(env, nil, nil, "test prompt")
+	agent := sa.(*sessionAgent)
+	agent.isSubAgent = true
+
+	require.Zero(t, agent.toolCleanupGrace, "no explicit operator override by default")
+
+	got := agent.effectiveToolCleanupGrace()
+	assert.Zero(t, got,
+		"a sub-agent's own watchdog must get no grace — it is always the deepest watchdog "+
+			"in the chain and must fire at bare toolMaxDuration, strictly before the parent's "+
+			"toolMaxDuration+90s, to win the parent/child cancellation race")
+}
+
+// TestEffectiveToolCleanupGrace_ExplicitOverrideWinsForSubAgent verifies the
+// explicit operator/test override (SessionAgentOptions.ToolCleanupGrace)
+// still wins even for a sub-agent that opts back into a non-zero grace —
+// the isSubAgent-based default only applies when no override is set.
+func TestEffectiveToolCleanupGrace_ExplicitOverrideWinsForSubAgent(t *testing.T) {
+	env := testEnv(t)
+	sa := testSessionAgent(env, nil, nil, "test prompt")
+	agent := sa.(*sessionAgent)
+	agent.isSubAgent = true
+	agent.toolCleanupGrace = 5 * time.Second
+
+	got := agent.effectiveToolCleanupGrace()
+	assert.Equal(t, 5*time.Second, got,
+		"an explicit override must win even for a sub-agent session")
+}
+
+// TestEffectiveToolCleanupGrace_ExplicitOverrideWinsForTopLevel verifies the
+// explicit operator/test override also wins for a top-level session,
+// consistent with effectiveToolMaxDuration's override precedence.
+func TestEffectiveToolCleanupGrace_ExplicitOverrideWinsForTopLevel(t *testing.T) {
+	env := testEnv(t)
+	sa := testSessionAgent(env, nil, nil, "test prompt")
+	agent := sa.(*sessionAgent)
+	agent.isSubAgent = false
+	agent.toolCleanupGrace = 5 * time.Second
+
+	got := agent.effectiveToolCleanupGrace()
+	assert.Equal(t, 5*time.Second, got,
+		"an explicit override must win even for a top-level session")
+}
+
+// TestEffectiveToolCleanupGrace_ChildWinsCancellationRace is the
+// end-to-end regression test proving the actual race is resolved, not
+// just the two effectiveToolCleanupGrace return values in isolation: given
+// a realistic parent/child start-time skew (delta), the child sub-agent's
+// own watchdog (no grace) must always fire strictly before the parent's
+// watchdog (default grace), for any delta comfortably under
+// toolCleanupGraceDefault (90s) — i.e. delta + toolMaxDuration <
+// toolMaxDuration + toolCleanupGraceDefault.
+func TestEffectiveToolCleanupGrace_ChildWinsCancellationRace(t *testing.T) {
+	env := testEnv(t)
+
+	parentSA := testSessionAgent(env, nil, nil, "parent prompt")
+	parent := parentSA.(*sessionAgent)
+	parent.isSubAgent = false
+
+	childSA := testSessionAgent(env, nil, nil, "child prompt")
+	child := childSA.(*sessionAgent)
+	child.isSubAgent = true
+
+	const toolMaxDuration = 45 * time.Minute
+	parent.toolMaxDuration = toolMaxDuration
+	child.toolMaxDuration = toolMaxDuration
+
+	// Realistic parent/child start-time skew: the child's own watchdog
+	// starts only once its turn actually begins executing (after init and
+	// the DB preamble) — strictly later than the parent's OnToolCall.
+	for _, delta := range []time.Duration{0, time.Second, 10 * time.Second, 60 * time.Second} {
+		delegationStart := time.Now()
+		childToolStart := delegationStart.Add(delta)
+
+		parentFireAt := delegationStart.Add(parent.effectiveToolMaxDuration() + parent.effectiveToolCleanupGrace())
+		childFireAt := childToolStart.Add(child.effectiveToolMaxDuration() + child.effectiveToolCleanupGrace())
+
+		assert.Truef(t, childFireAt.Before(parentFireAt),
+			"delta=%s: child must fire (%s) strictly before parent (%s) so the child's own "+
+				"watchdog can unwind cleanly before the parent cancels genCtx out from under it",
+			delta, childFireAt, parentFireAt)
+	}
+}
+
 // TestCleanTitle pins the normalisation that decides whether a model's title
 // response is usable: a length-truncated but non-empty response yields a
 // title; a think-only or whitespace-only response yields "" (a real miss).
