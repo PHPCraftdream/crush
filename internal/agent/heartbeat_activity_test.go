@@ -32,12 +32,23 @@ import (
 // `before` within one heartbeat interval plus slack. Blocks for slightly
 // over session.lockHeartbeatInterval (10s) — same real-time cost the
 // existing session package tests already pay.
-func heartbeatMtimeAdvances(t *testing.T, lk *session.SessionLock, before time.Time) bool {
-	t.Helper()
+//
+// Returns a plain (bool, error) instead of asserting internally: testify's
+// require.* calls t.FailNow(), which does runtime.Goexit() — safe only on
+// the test's own goroutine. TestWithActivityNotify_ChainPropagatesToAllAncestors
+// calls this from three spawned goroutines; if os.Stat failed there, the
+// goroutine would die without ever sending on its results channel, and the
+// test would hang until the package-level timeout instead of failing
+// cleanly with a clear message (task #226). Callers on any goroutine must
+// assert on the returned error themselves, on the goroutine that actually
+// owns *testing.T assertions (the main test goroutine).
+func heartbeatMtimeAdvances(lk *session.SessionLock, before time.Time) (bool, error) {
 	time.Sleep(12 * time.Second) // lockHeartbeatInterval (10s, unexported) + slack
 	info, err := os.Stat(lk.Path)
-	require.NoError(t, err)
-	return info.ModTime().After(before)
+	if err != nil {
+		return false, err
+	}
+	return info.ModTime().After(before), nil
 }
 
 func mustAcquireLock(t *testing.T, id string) *session.SessionLock {
@@ -64,7 +75,9 @@ func TestWithActivityNotify_SingleLevel(t *testing.T) {
 	ctx := withActivityNotify(context.Background(), lk)
 	notifyActivity(ctx)
 
-	assert.True(t, heartbeatMtimeAdvances(t, lk, before),
+	advanced, err := heartbeatMtimeAdvances(lk, before)
+	require.NoError(t, err)
+	assert.True(t, advanced,
 		"lk's heartbeat must touch mtime after notifyActivity recorded activity on it")
 }
 
@@ -101,31 +114,42 @@ func TestWithActivityNotify_ChainPropagatesToAllAncestors(t *testing.T) {
 
 	// All three ancestor locks must observe activity from this one call —
 	// checked concurrently so the three real-time waits overlap instead of
-	// serializing into a 36s test.
+	// serializing into a 36s test. Each goroutine only computes
+	// (ok, err) and sends it back; every testify assertion happens below
+	// on the main test goroutine (task #226 — require.*/assert.* must
+	// never run on a goroutine other than the test's own).
 	results := make(chan struct {
 		name string
 		ok   bool
+		err  error
 	}, 3)
 	go func() {
+		ok, err := heartbeatMtimeAdvances(lkGrandparent, beforeGP)
 		results <- struct {
 			name string
 			ok   bool
-		}{"grandparent", heartbeatMtimeAdvances(t, lkGrandparent, beforeGP)}
+			err  error
+		}{"grandparent", ok, err}
 	}()
 	go func() {
+		ok, err := heartbeatMtimeAdvances(lkParent, beforeP)
 		results <- struct {
 			name string
 			ok   bool
-		}{"parent", heartbeatMtimeAdvances(t, lkParent, beforeP)}
+			err  error
+		}{"parent", ok, err}
 	}()
 	go func() {
+		ok, err := heartbeatMtimeAdvances(lkChild, beforeC)
 		results <- struct {
 			name string
 			ok   bool
-		}{"child", heartbeatMtimeAdvances(t, lkChild, beforeC)}
+			err  error
+		}{"child", ok, err}
 	}()
 	for range 3 {
 		r := <-results
+		require.NoError(t, r.err, "%s: os.Stat failed", r.name)
 		assert.True(t, r.ok, "%s lock's heartbeat must have recorded activity from the single grandchild-level notifyActivity call", r.name)
 	}
 }
@@ -323,6 +347,8 @@ func TestParentHeartbeat_StaysAliveFromSubAgentActivity(t *testing.T) {
 	assert.False(t, resp.IsError, "sub-agent run must succeed: %v", resp.Content)
 	assert.Equal(t, int64(1), callCount.Load(), "expected exactly one main-turn request to the child's stream")
 
-	assert.True(t, heartbeatMtimeAdvances(t, parentLk, before),
+	advanced, err := heartbeatMtimeAdvances(parentLk, before)
+	require.NoError(t, err)
+	assert.True(t, advanced,
 		"parent lock's heartbeat mtime must advance purely from the sub-agent's activity, propagated via withActivityNotify/notifyActivity through the ctx runSubAgent forwards unmodified into the child's Run()/runTurn()")
 }
