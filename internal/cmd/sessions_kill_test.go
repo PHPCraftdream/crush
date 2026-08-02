@@ -350,3 +350,61 @@ func (h *killTestLockHolder) stop() {
 	}
 	_ = h.cmd.Wait()
 }
+
+// TestSessionsKillCmdRun_HonorsConfiguredDataDir is the regression test for
+// task #219: sessionsKillCmdRun used to hardcode the lock/data path as
+// filepath.Join(cwd, ".crush"), completely ignoring --data-dir. This test
+// points --data-dir at a directory that is deliberately NOT <cwd>/.crush,
+// writes a real lock file (naming this test process's own PID, mirroring
+// the stale-PID pattern used elsewhere in this file) at the path the FIX
+// computes (<configured-data-dir>/locks/session-<id>.lock), and runs the
+// real sessionsKillCmd.RunE. Before the fix this would print "no lock file
+// at <cwd>/.crush/locks/..." (wrong path) and no-op; after the fix it must
+// find the lock at the configured location and remove it.
+func TestSessionsKillCmdRun_HonorsConfiguredDataDir(t *testing.T) {
+	workDir := t.TempDir()
+	orig, err := os.Getwd()
+	require.NoError(t, err)
+	require.NoError(t, os.Chdir(workDir))
+	t.Cleanup(func() { _ = os.Chdir(orig) })
+
+	// Deliberately outside workDir entirely, so filepath.Join(cwd, ".crush")
+	// can never accidentally coincide with this path.
+	configuredDataDir := filepath.Join(t.TempDir(), "elsewhere-data")
+
+	ensureRootFlagStandIns(sessionsKillCmd, configuredDataDir)
+	if f := sessionsKillCmd.Flags().Lookup("cwd"); f == nil {
+		sessionsKillCmd.Flags().StringP("cwd", "c", "", "")
+	}
+	require.NoError(t, sessionsKillCmd.Flags().Set("cwd", ""))
+	require.NoError(t, sessionsKillCmd.Flags().Set("keep-lock", "false"))
+	require.NoError(t, sessionsKillCmd.Flags().Set("wait", "2s"))
+	sessionsKillCmd.SetContext(context.Background())
+
+	const sessionID = "configured-datadir-id"
+	lockDir := filepath.Join(configuredDataDir, "locks")
+	require.NoError(t, os.MkdirAll(lockDir, 0o755))
+	lockPath := filepath.Join(lockDir, "session-"+sanitiseSessionIDForFilename(sessionID)+".lock")
+	require.NoError(t, os.WriteFile(lockPath, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0o644))
+
+	// Sanity: the WRONG (pre-fix) path must not exist, so a false pass via
+	// "no lock file at <wrong path>" being silently treated as success is
+	// impossible to confuse with the real assertion below.
+	wrongPath := filepath.Join(workDir, ".crush", "locks", "session-"+sanitiseSessionIDForFilename(sessionID)+".lock")
+	_, wrongStatErr := os.Stat(wrongPath)
+	require.True(t, os.IsNotExist(wrongStatErr))
+
+	stderr := captureStderr(t, func() {
+		runErr := sessionsKillCmd.RunE(sessionsKillCmd, []string{sessionID})
+		require.NoError(t, runErr)
+	})
+	t.Logf("sessions kill stderr:\n%s", stderr)
+
+	require.NotContains(t, stderr, "no lock file at",
+		"fix must find the lock at the --data-dir-configured location, not report it missing")
+	require.Contains(t, stderr, configuredDataDir,
+		"report must reference the configured data dir's lock path, not a cwd-based guess")
+
+	_, statErr := os.Stat(lockPath)
+	require.True(t, os.IsNotExist(statErr), "lock file at the configured data dir must be removed")
+}

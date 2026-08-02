@@ -355,18 +355,19 @@ crush sessions reset pr-42 --force
 		// actually found) goes through taskkill /F /T which also
 		// terminates the spawned CLI subprocess tree.
 		if force {
-			cwd, err := ResolveCwd(cmd)
-			if err == nil {
-				lockPath := filepath.Join(cwd, ".crush", "locks", "session-"+sanitiseSessionIDForFilename(sess.ID)+".lock")
-				if _, statErr := os.Stat(lockPath); statErr == nil {
-					dataDir := filepath.Join(cwd, ".crush")
-					pid := session.ReadLockPID(lockPath)
-					fmt.Fprint(os.Stderr, probeThenKillHolder(dataDir, sess.ID, pid, 5*time.Second))
-					if err := removeLockWithRetry(lockPath, 5*time.Second); err != nil {
-						fmt.Fprintf(os.Stderr, "warning: could not remove lock %s: %v\n", lockPath, err)
-					} else {
-						fmt.Fprintf(os.Stderr, "removed lock %s\n", lockPath)
-					}
+			// Use the data directory setupApp already resolved onto `a`
+			// (honors --data-dir and the project's configured
+			// data_directory) instead of recomputing a cwd-based guess —
+			// see task #219.
+			dataDir := a.Config().Options.DataDirectory
+			lockPath := filepath.Join(dataDir, "locks", "session-"+sanitiseSessionIDForFilename(sess.ID)+".lock")
+			if _, statErr := os.Stat(lockPath); statErr == nil {
+				pid := session.ReadLockPID(lockPath)
+				fmt.Fprint(os.Stderr, probeThenKillHolder(dataDir, sess.ID, pid, 5*time.Second))
+				if err := removeLockWithRetry(lockPath, 5*time.Second); err != nil {
+					fmt.Fprintf(os.Stderr, "warning: could not remove lock %s: %v\n", lockPath, err)
+				} else {
+					fmt.Fprintf(os.Stderr, "removed lock %s\n", lockPath)
 				}
 			}
 		}

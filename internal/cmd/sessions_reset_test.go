@@ -153,6 +153,110 @@ func resetSessionCmdFlags() *cobra.Command {
 // sessionsResetCmd.RunE's --force block writes to via fmt.Fprint(os.Stderr,
 // ...), mirroring sessions_kill.go's own reporting.
 
+// isolatedResetEnvWithConfiguredDataDir mirrors isolatedResetEnv but points
+// --data-dir at a directory that is deliberately NOT <workDir>/.crush — the
+// exact gap task #219 exists to close. isolatedResetEnv always leaves
+// --data-dir empty, so config.Load's default-to-<cwd>/.crush path silently
+// makes "configured data dir" and "cwd/.crush" coincide, and the existing
+// reset --force tests could never have caught a hardcoded cwd/.crush
+// computation. This helper proves --data-dir is genuinely honored by
+// sessions.go's --force block, not just present on the flag set.
+func isolatedResetEnvWithConfiguredDataDir(t *testing.T) (a *app.App, workDir, dataDir string) {
+	t.Helper()
+	config.ResetProviderCacheForTests()
+
+	tmp := t.TempDir()
+	globalData := filepath.Join(tmp, "global-data")
+	require.NoError(t, os.MkdirAll(globalData, 0o755))
+	t.Setenv("XDG_DATA_HOME", globalData)
+	t.Setenv("CRUSH_GLOBAL_DATA", globalData)
+
+	configDir := filepath.Join(tmp, "config")
+	require.NoError(t, os.MkdirAll(configDir, 0o755))
+	t.Setenv("XDG_CONFIG_HOME", configDir)
+	t.Setenv("CRUSH_GLOBAL_CONFIG", configDir)
+	t.Setenv("CRUSH_PROVIDER_CACHE_ONLY", "1")
+
+	crushlog.Setup("", false)
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	workDir = t.TempDir()
+	orig, err := os.Getwd()
+	require.NoError(t, err)
+	require.NoError(t, os.Chdir(workDir))
+
+	// The configured data dir lives entirely outside workDir, so
+	// filepath.Join(workDir, ".crush") (the pre-fix hardcoded guess) can
+	// never accidentally coincide with it.
+	dataDir = filepath.Join(tmp, "configured-elsewhere-data")
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	ensureRootFlagStandIns(sessionsResetCmd, dataDir)
+	sessionsResetCmd.SetContext(ctx)
+
+	built, err := setupApp(sessionsResetCmd)
+	require.NoError(t, err)
+	require.Equal(t, dataDir, built.Config().Options.DataDirectory,
+		"test setup assumption: resolved DataDirectory must equal the --data-dir we configured")
+
+	t.Cleanup(func() {
+		built.Shutdown()
+		_ = os.Chdir(orig)
+		cancel()
+		_ = db.Release(tmp)
+		waitForSQLiteHandleRelease(t, tmp)
+		waitForSQLiteHandleRelease(t, workDir)
+	})
+
+	return built, workDir, dataDir
+}
+
+// TestSessionsReset_ForceHonorsConfiguredDataDir is the regression test for
+// task #219: sessions.go's --force block used to compute
+// filepath.Join(cwd, ".crush") for both the lock path and the dataDir passed
+// to probeThenKillHolder, ignoring --data-dir entirely. This test creates a
+// session against a data dir that is NOT <cwd>/.crush, writes the lock file
+// at the CONFIGURED location (mirroring the stale-PID pattern used by
+// TestSessionsReset_ForceDoesNotKillStalePID), runs the real
+// sessionsResetCmd.RunE with --force, and asserts the lock at the configured
+// path was found and removed — proving the fix reads
+// a.Config().Options.DataDirectory instead of recomputing cwd/.crush.
+func TestSessionsReset_ForceHonorsConfiguredDataDir(t *testing.T) {
+	a, _, dataDir := isolatedResetEnvWithConfiguredDataDir(t)
+
+	ctx := context.Background()
+	sess, err := a.Sessions.CreateWithID(ctx, "reset-force-configured-datadir", "regression title")
+	require.NoError(t, err)
+
+	lockDir := filepath.Join(dataDir, "locks")
+	require.NoError(t, os.MkdirAll(lockDir, 0o755))
+	lockPath := filepath.Join(lockDir, "session-"+sanitiseSessionIDForFilename(sess.ID)+".lock")
+	require.NoError(t, os.WriteFile(lockPath, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0o644))
+
+	require.True(t, session.IsProcessAlive(os.Getpid()))
+
+	require.NoError(t, resetSessionCmdFlags().Flags().Set("force", "true"))
+	stderr := captureStderr(t, func() {
+		err := sessionsResetCmd.RunE(sessionsResetCmd, []string{sess.ID})
+		require.NoError(t, err)
+	})
+	t.Logf("reset --force stderr:\n%s", stderr)
+
+	require.NotContains(t, stderr, "warning: could not remove lock",
+		"fix must find and remove the lock at the configured data dir, not miss it")
+	require.Contains(t, stderr, dataDir,
+		"report must reference the configured data dir's lock path, not a cwd-based guess")
+
+	// Stale-PID safety must still hold at the configured location: our own
+	// live test process must never be killed.
+	require.True(t, session.IsProcessAlive(os.Getpid()),
+		"reset --force must never kill the calling test process via a stale lock-file PID")
+
+	_, statErr := os.Stat(lockPath)
+	require.True(t, os.IsNotExist(statErr), "lock file at the configured data dir must be removed")
+}
+
 // TestSessionsReset_ForceStillKillsLiveHolder is the "didn't break the happy
 // path" companion, mirroring TestProbeThenKillHolder_LiveHolderStillKilled:
 // a real second process genuinely holds the session's OS lock, so reset
