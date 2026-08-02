@@ -25,7 +25,20 @@ review below. Closed together, one task/commit at a time:
   delegation chain, so a parent session's heartbeat correctly stays
   alive purely from a sub-agent's real progress while the parent is
   blocked waiting on it — not just during the parent's own stream
-  callbacks.
+  callbacks. A follow-up review caught a real gap in this fix: the
+  activity signal only covered stream callbacks, not a tool actually
+  *executing* — a healthy session blocked on one long tool call (up to
+  45 minutes) recorded zero activity for its whole duration, which
+  `sessions locks`' auto-delete (age > 60s) and `sessions watch`'s
+  liveness check (age > 20s) both still read as "the process is dead."
+  `sessions locks` could then delete a *live* session's lock file
+  (unlinking a still-held OS lock lets a second process create a fresh
+  one at the same path — two processes, one session id) and
+  `sessions watch` could print a false "session finished" summary for
+  a session still actively working. Fixed: the watchdog now records
+  activity on every tick a tool is in flight and healthy, not just at
+  start/finish; both commands additionally verify against the real OS
+  lock / process liveness before trusting a stale-looking mtime.
 - Added missing regression coverage for the queued-message-continues-
   after-summarize/compact behavior (both the mid-turn auto-compact
   path and the standalone `/compact` path), which had zero tests.
@@ -54,14 +67,23 @@ review below. Closed together, one task/commit at a time:
   so an operator using `--data-dir` or a project's `data_directory`
   config silently got "no lock file found" instead of the rescue these
   commands exist to perform. Both now resolve the actual configured
-  data directory.
+  data directory. A follow-up review found the fix still diverged from
+  `reset --force` for a *relative* `--data-dir` combined with `--cwd`
+  (resolved against the wrong base directory) and depended on a config
+  load path that made a 45s network call and could write to the
+  operator's real global config as a side effect of just killing a
+  stuck lock — both fixed; `sessions kill` now resolves the data
+  directory the same way `reset --force` does, without any network or
+  config-persistence dependency.
 - Three follow-ups to the stdin idle-timeout fix: partial stdin
   content returned after the producer goes idle now carries an
   explicit marker (visible to the model, not just a log line) noting
   it may be truncated; a narrow boundary race that could silently drop
   a chunk arriving at almost the same instant the idle timer fired is
   now guarded against; and a test-only mutable-package-global pattern
-  was replaced with dependency injection.
+  was replaced with dependency injection. The truncation marker also
+  wrongly claimed "the producer went idle" when the real cause was a
+  read error — it now names the actual cause.
 - Removed a tautological sessions-kill test that never called the
   function it claimed to test, and documented (without attempting to
   structurally close, out of proportion for a manual rescue CLI) a
