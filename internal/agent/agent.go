@@ -153,9 +153,9 @@ const (
 	peakHoursPollInterval = 10 * time.Second
 )
 
-// sessionPreambleMaxDuration bounds the DB preamble at the top of Run() —
-// sessions.Get, getSessionMessages, createUserMessage — all of which route
-// through the single-writer sql.DB connection (SetMaxOpenConns(1) in
+// sessionPreambleMaxDurationDefault bounds the DB preamble at the top of
+// Run() — sessions.Get, getSessionMessages, createUserMessage — all of which
+// route through the single-writer sql.DB connection (SetMaxOpenConns(1) in
 // internal/db/connect.go). The stream watchdog is not started until AFTER
 // this preamble, so before this fix a stuck writer connection (a concurrent
 // sub-agent's own preamble wedged on it, etc.) hung the whole turn invisibly
@@ -166,8 +166,9 @@ const (
 // lock heartbeat kept ticking (heartbeat is independent of actual progress —
 // see task #192). This cap is generous — normal SQLite reads/writes take low
 // milliseconds — so tripping it means something is genuinely wedged, not
-// slow. A var (not const) so tests can shrink it instead of waiting it out.
-var sessionPreambleMaxDuration = 60 * time.Second
+// slow. Overridden per-agent via SessionAgentOptions.SessionPreambleMaxDuration,
+// resolved at Run()-time via effectiveSessionPreambleMaxDuration below.
+const sessionPreambleMaxDurationDefault = 60 * time.Second
 
 // titleGenerationMaxDuration bounds how long the background title-generation
 // goroutine (launched from runTurn, awaited by its `defer wg.Wait()`) is
@@ -328,6 +329,13 @@ type sessionAgent struct {
 	// delegation cancellation race). 0 = use toolCleanupGraceDefault; tests
 	// may override to a small value via SessionAgentOptions.ToolCleanupGrace.
 	toolCleanupGrace time.Duration
+	// sessionPreambleMaxDuration bounds Run()'s DB preamble (sessions.Get,
+	// getSessionMessages, createUserMessage) for THIS agent — see
+	// sessionPreambleMaxDurationDefault's doc for the full rationale. 0 = use
+	// sessionPreambleMaxDurationDefault; tests may override to a small value
+	// via SessionAgentOptions.SessionPreambleMaxDuration instead of mutating
+	// shared state.
+	sessionPreambleMaxDuration time.Duration
 
 	// messageQueue and injectQueue are per-session FIFO queues. They use
 	// csync.KeyedQueue (not csync.Map[string, []T]) because every real
@@ -429,35 +437,42 @@ type SessionAgentOptions struct {
 	// whether the large model's provider has entered its peak_hours
 	// window mid-turn. See the field doc on sessionAgent.peakHoursCheck.
 	PeakHoursCheck func() error
+	// SessionPreambleMaxDuration overrides sessionPreambleMaxDurationDefault
+	// when > 0 — the bound on Run()'s DB preamble before the stream watchdog
+	// starts. See sessionPreambleMaxDurationDefault's doc for the full
+	// rationale. 0 = use the built-in default; primarily exposed for tests
+	// that want a short bound instead of waiting out the real one.
+	SessionPreambleMaxDuration time.Duration
 }
 
 func NewSessionAgent(
 	opts SessionAgentOptions,
 ) SessionAgent {
 	return &sessionAgent{
-		largeModel:               csync.NewValue(opts.LargeModel),
-		smallModel:               csync.NewValue(opts.SmallModel),
-		systemPromptPrefix:       csync.NewValue(opts.SystemPromptPrefix),
-		systemPrompt:             csync.NewValue(opts.SystemPrompt),
-		isSubAgent:               opts.IsSubAgent,
-		sessions:                 opts.Sessions,
-		messages:                 opts.Messages,
-		disableAutoSummarize:     opts.DisableAutoSummarize,
-		tools:                    csync.NewSliceFrom(opts.Tools),
-		isYolo:                   opts.IsYolo,
-		notify:                   opts.Notify,
-		messageQueue:             csync.NewKeyedQueue[SessionAgentCall](),
-		injectQueue:              csync.NewKeyedQueue[message.Message](),
-		activeRequests:           csync.NewMap[string, context.CancelFunc](),
-		summarizeQueue:           csync.NewMap[string, fantasy.ProviderOptions](),
-		streamIdleTimeout:        opts.StreamIdleTimeout,
-		dataDir:                  opts.DataDirectory,
-		checkpointInterval:       opts.CheckpointInterval,
-		timeoutExtendsOnProgress: opts.TimeoutExtendsOnProgress,
-		timeoutHardCap:           opts.TimeoutHardCap,
-		toolMaxDuration:          opts.ToolMaxDuration,
-		toolCleanupGrace:         opts.ToolCleanupGrace,
-		peakHoursCheck:           opts.PeakHoursCheck,
+		largeModel:                 csync.NewValue(opts.LargeModel),
+		smallModel:                 csync.NewValue(opts.SmallModel),
+		systemPromptPrefix:         csync.NewValue(opts.SystemPromptPrefix),
+		systemPrompt:               csync.NewValue(opts.SystemPrompt),
+		isSubAgent:                 opts.IsSubAgent,
+		sessions:                   opts.Sessions,
+		messages:                   opts.Messages,
+		disableAutoSummarize:       opts.DisableAutoSummarize,
+		tools:                      csync.NewSliceFrom(opts.Tools),
+		isYolo:                     opts.IsYolo,
+		notify:                     opts.Notify,
+		messageQueue:               csync.NewKeyedQueue[SessionAgentCall](),
+		injectQueue:                csync.NewKeyedQueue[message.Message](),
+		activeRequests:             csync.NewMap[string, context.CancelFunc](),
+		summarizeQueue:             csync.NewMap[string, fantasy.ProviderOptions](),
+		streamIdleTimeout:          opts.StreamIdleTimeout,
+		dataDir:                    opts.DataDirectory,
+		checkpointInterval:         opts.CheckpointInterval,
+		timeoutExtendsOnProgress:   opts.TimeoutExtendsOnProgress,
+		timeoutHardCap:             opts.TimeoutHardCap,
+		toolMaxDuration:            opts.ToolMaxDuration,
+		toolCleanupGrace:           opts.ToolCleanupGrace,
+		peakHoursCheck:             opts.PeakHoursCheck,
+		sessionPreambleMaxDuration: opts.SessionPreambleMaxDuration,
 	}
 }
 
@@ -499,6 +514,18 @@ func (a *sessionAgent) effectiveToolCleanupGrace() time.Duration {
 		toolCleanupGrace = a.toolCleanupGrace
 	}
 	return toolCleanupGrace
+}
+
+// effectiveSessionPreambleMaxDuration resolves the bound on Run()'s DB
+// preamble (sessions.Get, getSessionMessages, createUserMessage) for THIS
+// agent. See sessionPreambleMaxDurationDefault's doc for why this exists.
+// 0 falls back to the default.
+func (a *sessionAgent) effectiveSessionPreambleMaxDuration() time.Duration {
+	sessionPreambleMaxDuration := sessionPreambleMaxDurationDefault
+	if a.sessionPreambleMaxDuration > 0 {
+		sessionPreambleMaxDuration = a.sessionPreambleMaxDuration
+	}
+	return sessionPreambleMaxDuration
 }
 
 // logProviderWarnings emits each fantasy CallWarning from a step at WARN
@@ -739,11 +766,11 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall) (res 
 
 	sessionLock := sync.Mutex{}
 
-	// Bounded: see sessionPreambleMaxDuration doc. No watchdog is running
-	// yet at this point in Run(), so an unbounded ctx here can hang the
-	// turn forever with zero diagnostics if the single DB writer connection
-	// is wedged.
-	preambleCtx, preambleCancel := context.WithTimeout(ctx, sessionPreambleMaxDuration)
+	// Bounded: see sessionPreambleMaxDurationDefault doc. No watchdog is
+	// running yet at this point in Run(), so an unbounded ctx here can hang
+	// the turn forever with zero diagnostics if the single DB writer
+	// connection is wedged.
+	preambleCtx, preambleCancel := context.WithTimeout(ctx, a.effectiveSessionPreambleMaxDuration())
 	currentSession, err := a.sessions.Get(preambleCtx, call.SessionID)
 	if err != nil {
 		preambleCancel()

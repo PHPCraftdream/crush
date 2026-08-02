@@ -43,12 +43,9 @@ func (b *blockingForeverSessionService) Get(ctx context.Context, id string) (ses
 func TestRun_PreambleWedgedDBCall_BoundedNotInfinite(t *testing.T) {
 	t.Parallel()
 
-	prevMax := sessionPreambleMaxDuration
-	sessionPreambleMaxDuration = 200 * time.Millisecond
-	t.Cleanup(func() { sessionPreambleMaxDuration = prevMax })
-
 	dataDir := t.TempDir()
 	a := newLockTestSessionAgent(dataDir, false /* isSubAgent */)
+	a.sessionPreambleMaxDuration = 200 * time.Millisecond
 	fakeSessions := &blockingForeverSessionService{entered: make(chan struct{})}
 	a.sessions = fakeSessions
 
