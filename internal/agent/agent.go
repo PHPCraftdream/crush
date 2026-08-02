@@ -1086,10 +1086,13 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 	// claimed once and released once by Run(), covering every turn in the
 	// loop — a per-turn Del here would drop the reservation between queued
 	// turns, reopening the exact race tryReserveSession exists to close.
-	// The explicit a.activeRequests.Del(call.SessionID) calls later in this
-	// function (cancel-drain and end-of-turn queue-check) are intentional
-	// mid-loop releases immediately followed by a queue check — see their
-	// comments — not the general per-turn cleanup this one used to be.
+	// runTurn itself never calls a.activeRequests.Del(call.SessionID) at
+	// all — only Run()'s own releaseSessionReservation does, exactly once,
+	// after the whole turn loop ends (see Run()'s defer). Earlier revisions
+	// of this comment described mid-loop Del(call.SessionID) calls inside
+	// runTurn (a cancel-drain path and an end-of-turn queue-check); both
+	// were removed when the turn loop was extracted into Run() — this
+	// comment previously went stale describing code that no longer exists.
 	//
 	// Fork merge note (origin/main 6938dedd "perf: batch streaming message
 	// updates"): upstream introduced a debounced flush layer in
