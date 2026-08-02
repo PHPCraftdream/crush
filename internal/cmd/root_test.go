@@ -153,3 +153,57 @@ func TestMaybePrependStdin_NamedPipeNeverClosesDoesNotHang(t *testing.T) {
 		t.Fatal("MaybePrependStdin hung past stdinReadGrace — it must never block indefinitely on a dangling pipe")
 	}
 }
+
+// TestMaybePrependStdin_NamedPipeSlowCloseKeepsData is the regression test
+// for the data-loss bug in the original stdinReadGrace fix (bea57a9b): that
+// version raced io.ReadAll of the WHOLE stream against stdinReadGrace, so a
+// producer that wrote real data but took longer than stdinReadGrace to
+// close the pipe caused the timeout branch to fire — silently discarding
+// every byte the still-running goroutine had already buffered, while
+// logging the misleading "produced no data" message even though data
+// existed. MaybePrependStdin must now only bound the wait for the FIRST
+// byte; once the producer proves it's alive, the data it already sent must
+// survive even if the close is slow.
+func TestMaybePrependStdin_NamedPipeSlowCloseKeepsData(t *testing.T) {
+	prevGrace := stdinReadGrace
+	stdinReadGrace = 50 * time.Millisecond
+	t.Cleanup(func() { stdinReadGrace = prevGrace })
+
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	t.Cleanup(func() { r.Close() })
+	withStdin(t, r)
+
+	const payload = "some real data written promptly, but the pipe stays open past the grace window"
+	_, err = w.WriteString(payload)
+	require.NoError(t, err)
+
+	done := make(chan struct {
+		got string
+		err error
+	}, 1)
+	go func() {
+		got, err := MaybePrependStdin("the prompt")
+		done <- struct {
+			got string
+			err error
+		}{got, err}
+	}()
+
+	// Give MaybePrependStdin's first-byte read a chance to complete, then
+	// wait well past stdinReadGrace before closing — proving the write
+	// already happened and was seen before the grace window expired, and
+	// that the eventual close (not the grace timer) is what unblocks the
+	// full read.
+	time.Sleep(200 * time.Millisecond)
+	require.NoError(t, w.Close())
+
+	select {
+	case res := <-done:
+		require.NoError(t, res.err)
+		require.Equal(t, payload+"\n\nthe prompt", res.got,
+			"data written before the grace window expired must not be silently discarded just because the pipe closed late")
+	case <-time.After(2 * time.Second):
+		t.Fatal("MaybePrependStdin hung waiting for EOF after already seeing data — it must read through to EOF once the producer proved it's alive")
+	}
+}
