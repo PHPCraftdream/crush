@@ -59,6 +59,13 @@ type SessionLock struct {
 	f       *os.File
 	stop    chan struct{} // closed by Release to stop the heartbeat goroutine
 	release sync.Once     // Fork patch: review-fix — prevents double-close panic on concurrent Release()
+
+	// active is set by RecordActivity and consumed by the heartbeat
+	// goroutine on each tick. See RecordActivity's doc comment: the
+	// heartbeat's mtime touch is gated on real activity, not a blind
+	// timer, so a genuinely wedged process (no forward progress) stops
+	// looking alive to diagnostics after one interval.
+	active atomic.Bool
 }
 
 // SessionLockBusyError is returned by TryAcquireSessionLock when the
@@ -192,9 +199,10 @@ func acquireSessionLockFile(path string) (*SessionLock, error) {
 	}
 
 	stop := make(chan struct{})
-	go heartbeat(path, stop)
+	lk := &SessionLock{Path: path, HolderPID: myPID, f: f, stop: stop}
+	go heartbeat(path, stop, &lk.active)
 
-	return &SessionLock{Path: path, HolderPID: myPID, f: f, stop: stop}, nil
+	return lk, nil
 }
 
 // Release stops the heartbeat, unlocks and closes the lock file.
@@ -237,6 +245,28 @@ func (l *SessionLock) Release() error {
 	return releaseErr
 }
 
+// RecordActivity marks that the holder made real progress since the last
+// heartbeat tick, so the next tick will actually touch the lock file's
+// mtime. Safe to call concurrently from multiple goroutines (backed by
+// atomic.Bool) — this is intentional: task #214 wires this in from the
+// agent's turn loop and from cross-goroutine watchdog callbacks, both of
+// which may fire from goroutines other than the one that holds the lock.
+//
+// Calling this on a nil *SessionLock or after Release is a harmless
+// no-op; the heartbeat goroutine has already exited in the latter case,
+// so no tick will ever consume the flag.
+//
+// This is purely an input to the diagnostics-only heartbeat described in
+// the package doc — recording (or not recording) activity never has any
+// bearing on lock acquisition/release/reclaim, which remains decided
+// solely by the real OS lock.
+func (l *SessionLock) RecordActivity() {
+	if l == nil {
+		return
+	}
+	l.active.Store(true)
+}
+
 // clearHolderMetadata wipes the PID/timeout previously stamped into the
 // lock file's own content and removes the never-locked sidecar file,
 // so a cleanly-released lock does not leave a stale, plausible-looking
@@ -262,21 +292,31 @@ func clearHolderMetadata(path string, f *os.File) {
 	}
 }
 
-// heartbeat touches the lock file every lockHeartbeatInterval to signal
-// the holder is still alive. Stops when done is closed.
+// heartbeat touches the lock file every lockHeartbeatInterval, but ONLY
+// if RecordActivity was called on the owning SessionLock at least once
+// since the previous tick. Stops when done is closed.
 //
 // This is diagnostics only ("something might be wrong if this goes
 // stale") — see the package doc on SessionLock and acquireSessionLockFile.
 // It must never be treated as the source of truth for whether the lock
 // may be reclaimed; only actually winning the OS lock decides that.
 //
-// Chtimes errors are logged (not silently dropped) but do not stop the
-// heartbeat loop and do not mark us as dead — a transient/read-only-FS
-// Chtimes failure while we are alive and still hold the OS lock must
-// never cause another process to conclude it can steal the session.
-// Logging is throttled so a persistently-failing filesystem doesn't spam
-// the log once every tick for the lifetime of a long session.
-func heartbeat(path string, done <-chan struct{}) {
+// Gating on activity is itself a deliberate design requirement, not an
+// optimization: a session that is fully wedged (stuck goroutine, no
+// forward progress) must NOT keep presenting a live-looking mtime
+// forever — that was a diagnostic false positive. See RecordActivity.
+// Skipping a tick because there was no activity is a normal, expected
+// outcome, not an error condition, so it does not touch failCount or log
+// anything.
+//
+// Chtimes errors (when a touch IS attempted) are logged (not silently
+// dropped) but do not stop the heartbeat loop and do not mark us as dead
+// — a transient/read-only-FS Chtimes failure while we are alive and
+// still hold the OS lock must never cause another process to conclude it
+// can steal the session. Logging is throttled so a persistently-failing
+// filesystem doesn't spam the log once every tick for the lifetime of a
+// long session.
+func heartbeat(path string, done <-chan struct{}, active *atomic.Bool) {
 	t := time.NewTicker(lockHeartbeatInterval)
 	defer t.Stop()
 	var failCount atomic.Int64
@@ -285,6 +325,13 @@ func heartbeat(path string, done <-chan struct{}) {
 		case <-done:
 			return
 		case <-t.C:
+			// Consume ("swap to false") the activity recorded since the
+			// last tick. This is the sole gate: no activity this window
+			// means no Chtimes this tick, and the window resets either
+			// way for the next tick.
+			if !active.Swap(false) {
+				continue
+			}
 			now := time.Now()
 			if err := os.Chtimes(path, now, now); err != nil {
 				n := failCount.Add(1)

@@ -244,14 +244,102 @@ func TestHeartbeatTouchesFile(t *testing.T) {
 	require.NoError(t, err)
 	before := info1.ModTime()
 
+	// The heartbeat is gated on real activity (see RecordActivity's doc
+	// comment and #213) — with no recorded activity, the tick is skipped.
+	// Record activity so this tick is expected to touch the file; the
+	// no-activity case is covered separately by
+	// TestHeartbeat_NoActivity_DoesNotTouchMtime.
+	lk.RecordActivity()
+
 	// Wait slightly longer than one heartbeat tick.
 	time.Sleep(lockHeartbeatInterval + 2*time.Second)
 
 	info2, err := os.Stat(lk.Path)
 	require.NoError(t, err)
-	assert.True(t, info2.ModTime().After(before), "heartbeat must have touched the file")
+	assert.True(t, info2.ModTime().After(before), "heartbeat must have touched the file when activity was recorded")
 
 	require.NoError(t, lk.Release())
+}
+
+// TestHeartbeat_NoActivity_DoesNotTouchMtime is the core regression test
+// for #213: gate the heartbeat on real activity, not a blind timer. If
+// RecordActivity is never called, a full heartbeat interval must pass
+// with the lock file's mtime untouched — a genuinely wedged holder (no
+// forward progress) must stop looking alive to diagnostics, instead of
+// the old behavior where a plain ticker kept touching mtime forever
+// regardless of whether the process was making progress.
+func TestHeartbeat_NoActivity_DoesNotTouchMtime(t *testing.T) {
+	dir := t.TempDir()
+	lk, err := TryAcquireSessionLock(dir, "audit-A")
+	require.NoError(t, err)
+	defer lk.Release()
+
+	info1, err := os.Stat(lk.Path)
+	require.NoError(t, err)
+	before := info1.ModTime()
+
+	// Deliberately do NOT call lk.RecordActivity(). Wait slightly longer
+	// than one heartbeat tick so the ticker branch has definitely fired
+	// at least once.
+	time.Sleep(lockHeartbeatInterval + 2*time.Second)
+
+	info2, err := os.Stat(lk.Path)
+	require.NoError(t, err)
+	assert.Equal(t, before, info2.ModTime(),
+		"heartbeat must NOT touch the lock file's mtime when no activity was recorded during the interval")
+}
+
+// TestHeartbeat_RecordActivity_TouchesMtimeOnNextTick proves the positive
+// case of the same gate: calling RecordActivity at any point during an
+// interval causes the NEXT tick to touch mtime, exactly like the old
+// unconditional behavior did — the gate only removes updates during
+// genuinely idle intervals, it doesn't break the live/active case.
+func TestHeartbeat_RecordActivity_TouchesMtimeOnNextTick(t *testing.T) {
+	dir := t.TempDir()
+	lk, err := TryAcquireSessionLock(dir, "audit-A")
+	require.NoError(t, err)
+	defer lk.Release()
+
+	info1, err := os.Stat(lk.Path)
+	require.NoError(t, err)
+	before := info1.ModTime()
+
+	// Record activity partway through the interval, simulating a turn
+	// loop calling RecordActivity() as it makes progress.
+	time.Sleep(1 * time.Second)
+	lk.RecordActivity()
+
+	time.Sleep(lockHeartbeatInterval + 2*time.Second)
+
+	info2, err := os.Stat(lk.Path)
+	require.NoError(t, err)
+	assert.True(t, info2.ModTime().After(before),
+		"heartbeat must touch the lock file's mtime on the next tick after RecordActivity was called")
+}
+
+// TestRecordActivity_ConcurrentSafe proves RecordActivity is safe to call
+// from many goroutines simultaneously, without racing the heartbeat
+// goroutine that concurrently reads/resets the same flag. This matters
+// because #214 wires RecordActivity in from both the agent's turn loop
+// and cross-goroutine watchdog callbacks — never a single well-defined
+// caller. Run with -race to be meaningful.
+func TestRecordActivity_ConcurrentSafe(t *testing.T) {
+	dir := t.TempDir()
+	lk, err := TryAcquireSessionLock(dir, "audit-A")
+	require.NoError(t, err)
+	defer lk.Release()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 20; j++ {
+				lk.RecordActivity()
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 func TestLockPathStructure(t *testing.T) {
