@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -92,13 +93,13 @@ type probeToolParams struct{}
 // TestProbe_CheckpointStallIsPerStep drives a two-step run (tool call, then
 // final text) to establish whether the stall is once-per-turn or once-per-step.
 func TestProbe_CheckpointStallIsPerStep(t *testing.T) {
-	var calls int
+	var calls atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
+		n := calls.Add(1)
 		w.Header().Set("Content-Type", "text/event-stream")
 		fl, _ := w.(http.Flusher)
 		var chunks []string
-		if calls == 1 {
+		if n == 1 {
 			chunks = []string{
 				`{"id":"c1","object":"chat.completion.chunk","created":1,"model":"probe","choices":[{"index":0,"delta":{"role":"assistant","content":"let me check"},"finish_reason":null}]}`,
 				`{"id":"c1","object":"chat.completion.chunk","created":1,"model":"probe","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"probe_tool","arguments":"{}"}}]},"finish_reason":null}]}`,
@@ -169,6 +170,6 @@ func TestProbe_CheckpointStallIsPerStep(t *testing.T) {
 	elapsed := time.Since(start)
 	require.NoError(t, err)
 
-	t.Logf("PROBE: two-step run took %s across %d provider calls (server-side stream is ~750ms)", elapsed, calls)
+	t.Logf("PROBE: two-step run took %s across %d provider calls (server-side stream is ~750ms)", elapsed, calls.Load())
 	require.Less(t, elapsed, 2*time.Second, "two-step run stalled")
 }
