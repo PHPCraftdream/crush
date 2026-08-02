@@ -250,7 +250,7 @@ func startStreamWatchdog(
 						stalled.Store(true)
 						cancel()
 						if onFire != nil {
-							onFire(now.Sub(startTime), true)
+							onFire(now.Sub(startTime), false)
 						}
 						return
 					}
@@ -272,8 +272,12 @@ func startStreamWatchdog(
 				// extendsOnProgress branch, so --timeout-hard-cap was
 				// silently ignored on the non-extending path. toolTimeout is
 				// false here — this is a wall-clock turn limit, not a stuck
-				// tool (that case is handled, with toolTimeout=true, in the
-				// toolsInFlight branch above).
+				// tool. The hardCap check inside the toolsInFlight branch
+				// above reports toolTimeout=false for the same reason: it's
+				// the same wall-clock-hard-cap concept, just checked while a
+				// tool happens to be in flight. Only the never-freeze
+				// tool-pause backstop (also in the toolsInFlight branch)
+				// legitimately reports toolTimeout=true.
 				if hardCap > 0 && now.After(hardDeadline) {
 					stalled.Store(true)
 					cancel()

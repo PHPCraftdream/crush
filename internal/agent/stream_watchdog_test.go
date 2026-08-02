@@ -348,6 +348,53 @@ loop:
 		"watchdog must fire near the hard cap")
 }
 
+// TestStreamWatchdog_HardCapRespectedWithToolInFlight is the regression test
+// for a real bug: the explicit hardCap check inside the toolsInFlight branch
+// (the one immediately below the never-freeze toolMaxDuration backstop)
+// unconditionally reported toolTimeout=true to onFire, even though it is the
+// SAME wall-clock --timeout-hard-cap check as the one on the idle path (which
+// correctly reports toolTimeout=false). A hard-cap fire while a tool merely
+// happens to be in flight is not a stuck tool — it is the operator's overall
+// turn limit — but the misclassification made the resulting user-facing
+// message blame "the tool" and cite toolMaxDuration instead of the actual
+// --timeout-hard-cap cause. This proves the fix: with a small hardCap and a
+// generous toolMaxDuration (so the never-freeze backstop does not fire
+// first), the watchdog must still fire at the hard cap while a tool is in
+// flight, and must report toolTimeout=false.
+func TestStreamWatchdog_HardCapRespectedWithToolInFlight(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	const idle = 5 * time.Second // large — idle path must not be relevant
+	const tick = 10 * time.Millisecond
+	const hardCap = 200 * time.Millisecond
+	const toolMaxDuration = 5 * time.Second // generous — must not fire before hardCap
+
+	var fired atomic.Int32
+	var firedToolTimeout atomic.Bool
+	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(_ time.Duration, toolTimeout bool) {
+		fired.Add(1)
+		firedToolTimeout.Store(toolTimeout)
+	}, false, hardCap, toolMaxDuration, 0)
+
+	// A tool starts and stays in flight — never finishes — while the hard
+	// cap elapses. The watchdog must fire purely from hardCap, not from the
+	// toolMaxDuration backstop.
+	wd.toolStarted()
+
+	select {
+	case <-wd.done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("watchdog should have fired at hard cap despite a tool being in flight")
+	}
+
+	assert.Equal(t, int32(1), fired.Load(), "watchdog must fire at hard cap")
+	assert.True(t, wd.stalled.Load())
+	assert.False(t, firedToolTimeout.Load(),
+		"the hard-cap fire while a tool is in flight must still report toolTimeout=false — this is a wall-clock turn limit, not a stuck tool")
+}
+
 // TestStreamWatchdog_ToolPauseBoundedByCap verifies the never-freeze
 // backstop: when toolMaxDuration > 0 and a tool stays in flight past that
 // cap, the watchdog fires with toolTimeout==true instead of pausing
