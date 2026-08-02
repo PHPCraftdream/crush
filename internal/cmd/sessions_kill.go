@@ -134,6 +134,25 @@ func sessionsKillCmdRun(cmd *cobra.Command, args []string) error {
 //     — this preserves existing behavior for callers/tests that never
 //     exercised the probe path and avoids turning an unrelated IO hiccup
 //     into "sessions kill now refuses to do anything".
+//
+// What this does NOT solve: a residual PID-reuse TOCTOU (time-of-check-to-
+// time-of-use) window between "probe proved contention" and "the PID is
+// actually killed". The busy-error branch above proves someone holds the
+// lock at the moment TryAcquireSessionLock ran, but forceKillHolder then
+// makes its own separate IsProcessAlive + KillProcess syscalls at a later
+// moment — not one atomic operation with the probe, and not atomic with
+// each other either. In principle the OS could recycle that exact PID for
+// an unrelated process in the gap between the probe and the kill (or even
+// between forceKillHolder's own liveness check and its kill call, however
+// small that gap is). Closing this fully would require retaining an
+// OS-level handle to the process at probe time and killing through that
+// handle rather than by PID number again later — Windows' HANDLE model
+// could support this, POSIX plain PIDs fundamentally can't without extra
+// platform-specific plumbing (e.g. Linux pidfd), and this is a
+// cross-platform CLI. Given this command's scope — a manual rescue tool an
+// operator runs deliberately, not an unattended automated killer — that
+// structural fix is not implemented; the window is accepted as a narrow,
+// known limitation rather than something silently assumed to be airtight.
 func probeThenKillHolder(dataDir, sessionID string, pid int, wait time.Duration) string {
 	lk, err := session.TryAcquireSessionLock(dataDir, sessionID)
 	if err == nil {

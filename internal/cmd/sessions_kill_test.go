@@ -156,42 +156,15 @@ func TestProbeThenKillHolder_LiveHolderStillKilled(t *testing.T) {
 	assert.False(t, session.IsProcessAlive(holder.pid), "a genuinely live holder must still be killed")
 }
 
-// TestProbeThenKillHolder_SanityRevertKillsWrongProcess is the
-// "roll-it-back-and-watch-it-fail" sanity check requested for this fix: it
-// calls forceKillHolder DIRECTLY (bypassing probeThenKillHolder entirely),
-// reproducing exactly the pre-fix, unconditional behavior. It asserts that
-// this unconditional path DOES try to kill/report on a PID that has no
-// live OS lock behind it at all — i.e. proves the old code path is the one
-// the probe exists to prevent. This does not spawn a real unrelated victim
-// process (that would be unsafe in a shared test run); instead it reuses
-// the same "stale PID == our own process" setup as
-// TestProbeThenKillHolder_StalePIDNotKilled and shows that without the
-// probe gate, forceKillHolder would report our own PID as a kill target
-// purely because the file said so — the exact defect this task fixes.
-func TestProbeThenKillHolder_SanityRevertKillsWrongProcess(t *testing.T) {
-	dir := t.TempDir()
-	dataDir := filepath.Join(dir, ".crush")
-
-	lk, err := session.TryAcquireSessionLock(dataDir, "sanity-id")
-	require.NoError(t, err)
-	require.NoError(t, lk.Release())
-
-	lockPath := filepath.Join(dataDir, "locks", "session-sanity-id.lock")
-	require.NoError(t, os.WriteFile(lockPath, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0o644))
-
-	pid := session.ReadLockPID(lockPath)
-	require.Equal(t, os.Getpid(), pid, "stale file must still name our own PID for this sanity check to be meaningful")
-
-	// This is the OLD, unconditional behavior with no probe gate — it
-	// treats the PID from the file as gospel and would try to kill it.
-	// session.IsProcessAlive(pid) is true here (it's us), so
-	// forceKillHolder's live-process branch is exactly what would fire —
-	// demonstrating the bug this task closes. We do not actually let it
-	// call session.KillProcess on ourselves; asserting the branch it would
-	// take is sufficient proof without terminating the test binary.
-	require.True(t, session.IsProcessAlive(pid),
-		"pre-fix code would reach forceKillHolder's live-process branch and attempt to kill this test process")
-}
+// Old-vs-new behavior (pre-fix unconditional kill vs. the probe gate that
+// replaced it) is already fully demonstrated by two other tests working
+// together, without needing a third, non-calling "sanity revert" test that
+// can't safely exercise the real kill path against its own PID:
+//   - TestForceKillHolder_LiveProcess shows forceKillHolder unconditionally
+//     kills whatever live PID it's handed — the OLD, ungated danger.
+//   - TestProbeThenKillHolder_StalePIDNotKilled shows the NEW
+//     probeThenKillHolder gate refuses to touch a stale PID when no real
+//     OS lock is held.
 
 func TestForceKillHolder_LiveProcess(t *testing.T) {
 	var cmd *exec.Cmd
