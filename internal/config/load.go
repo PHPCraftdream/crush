@@ -214,16 +214,15 @@ func Load(workingDir, dataDir string, debug bool) (*ConfigStore, error) {
 // configureSelectedModels (which can persist a corrected model selection
 // to the operator's real global config) — never runs here.
 //
-// Known gap vs. Load/setupApp's full resolution: this does NOT apply the
-// workspace-config-merge step (Load's "Load workspace config last" block,
-// which reads <data_directory>/crush.json and can override
-// data_directory at workspace scope). That merge itself depends on
-// data_directory already being resolved, and re-running it here would
-// mean re-parsing another JSON file and re-applying setDefaults — edging
-// back toward Load's complexity for a case rescue commands are unlikely
-// to hit in practice (a workspace-scoped override of data_directory
-// itself). Accepted as a narrow, documented tradeoff in favor of "always
-// resolves without network/DB dependencies".
+// Does NOT apply Load's workspace-config-merge step (Load's "Load
+// workspace config last" block) — but this is not actually a gap:
+// Load's own merge snapshots cfg.Options.DataDirectory BEFORE merging in
+// the workspace file, then re-runs setDefaults with that pre-merge value
+// afterward (see the "Preserve defaults that setDefaults already
+// applied" comment above), which unconditionally restores the pre-merge
+// DataDirectory. Load itself can never honor a workspace-scoped
+// data_directory override either — the two resolutions are equivalent
+// for this field, not an approximation.
 func ResolveDataDirectory(workingDir, dataDir string) (string, error) {
 	configPaths := lookupConfigs(workingDir)
 
