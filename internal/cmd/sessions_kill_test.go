@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -262,14 +263,30 @@ func TestHelperKillTestLockHold(t *testing.T) {
 }
 
 type killTestLockHolder struct {
-	cmd *exec.Cmd
-	pid int
+	cmd    *exec.Cmd
+	pid    int
+	stdinW io.WriteCloser
 }
 
 // spawnKillTestLockHolder starts a real child process that holds a
 // session lock on (dataDir, sessionID) via session.TryAcquireSessionLock,
 // blocking until stop() kills it. Blocks until the child reports it
 // actually holds the lock.
+//
+// c.Stdin is deliberately wired to a pipe this function itself controls
+// (stdinW), rather than left nil. exec.Cmd treats a nil Stdin as "read from
+// the null device" — and reading from the null device returns EOF
+// immediately, not "block forever". TestHelperKillTestLockHold's blocking
+// read (`os.Stdin.Read(buf)`) therefore returned immediately with a nil
+// Stdin, so the child released its lock and exited right after printing
+// "LOCKED", instead of staying alive until stop() explicitly killed it. That
+// was invisible to callers who probe the lock immediately after spawn
+// returns (the child's own exit hadn't yet propagated to the OS lock
+// release), but any caller doing a bit more work first — e.g. a second
+// setupApp() call — could lose the race and see "no live holder" against a
+// holder that looked alive moments earlier. Giving the child a real pipe
+// that only closes in stop() makes "blocking until stop()" the helper's
+// doc comment promises actually true.
 func spawnKillTestLockHolder(t *testing.T, dataDir, sessionID string) *killTestLockHolder {
 	t.Helper()
 
@@ -289,7 +306,15 @@ func spawnKillTestLockHolder(t *testing.T, dataDir, sessionID string) *killTestL
 	require.NoError(t, err)
 	c.Stderr = nil
 
+	stdinR, stdinW, err := os.Pipe()
+	require.NoError(t, err)
+	c.Stdin = stdinR
+
 	require.NoError(t, c.Start())
+	// The child inherited its own copy of the read end via fork/exec; close
+	// our reference so the pipe's only remaining open end is stdinW, which
+	// stop() closes to signal the child.
+	_ = stdinR.Close()
 
 	lineCh := make(chan string, 1)
 	go func() {
@@ -313,10 +338,13 @@ func spawnKillTestLockHolder(t *testing.T, dataDir, sessionID string) *killTestL
 		t.Fatalf("timed out waiting for kill-test helper process to report lock status")
 	}
 
-	return &killTestLockHolder{cmd: c, pid: c.Process.Pid}
+	return &killTestLockHolder{cmd: c, pid: c.Process.Pid, stdinW: stdinW}
 }
 
 func (h *killTestLockHolder) stop() {
+	if h.stdinW != nil {
+		_ = h.stdinW.Close()
+	}
 	if h.cmd.Process != nil {
 		_ = h.cmd.Process.Kill()
 	}

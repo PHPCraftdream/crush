@@ -345,18 +345,23 @@ crush sessions reset pr-42 --force
 		// already in use" because the previous holder crashed without
 		// releasing.
 		//
-		// Uses the shared forceKillHolder + removeLockWithRetry helpers
-		// (defined in sessions_kill.go) so kill / wait-for-death /
-		// retry-remove behaves identically here and in `sessions kill`.
-		// On Windows the kill goes through taskkill /F /T which also
+		// Uses the shared probeThenKillHolder + removeLockWithRetry
+		// helpers (defined in sessions_kill.go) so kill / wait-for-death /
+		// retry-remove behaves identically here and in `sessions kill`:
+		// probeThenKillHolder first attempts a real OS-level lock
+		// acquisition before trusting the PID recorded in the lock file,
+		// so a stale/recycled PID from an already-exited holder is never
+		// blindly killed. On Windows the kill (when a live holder is
+		// actually found) goes through taskkill /F /T which also
 		// terminates the spawned CLI subprocess tree.
 		if force {
 			cwd, err := ResolveCwd(cmd)
 			if err == nil {
 				lockPath := filepath.Join(cwd, ".crush", "locks", "session-"+sanitiseSessionIDForFilename(sess.ID)+".lock")
 				if _, statErr := os.Stat(lockPath); statErr == nil {
+					dataDir := filepath.Join(cwd, ".crush")
 					pid := session.ReadLockPID(lockPath)
-					fmt.Fprint(os.Stderr, forceKillHolder(pid, 5*time.Second))
+					fmt.Fprint(os.Stderr, probeThenKillHolder(dataDir, sess.ID, pid, 5*time.Second))
 					if err := removeLockWithRetry(lockPath, 5*time.Second); err != nil {
 						fmt.Fprintf(os.Stderr, "warning: could not remove lock %s: %v\n", lockPath, err)
 					} else {
