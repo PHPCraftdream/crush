@@ -199,6 +199,21 @@ func acquireSessionLockFile(path string) (*SessionLock, error) {
 
 // Release stops the heartbeat, unlocks and closes the lock file.
 // Safe to call on nil. Idempotent and concurrency-safe.
+//
+// Before actually unlocking, it wipes the PID it stamped into both the
+// primary lock file and the sidecar (see clearHolderMetadata). This
+// matters for `crush sessions kill`: without it, a process that exits
+// cleanly (Release() runs, e.g. via a normal `defer`) leaves its old PID
+// sitting in the lock file/sidecar on disk. If the OS later reuses that
+// PID number for a completely unrelated process — routine on a busy
+// CI/dev box — a later `sessions kill <id>` invocation would read a
+// "plausible" PID from the stale file and forcibly kill that unrelated
+// process. Clearing the metadata here, while we still hold the OS lock
+// (so no concurrent reader can observe a half-written state), removes
+// that stale PID before it can be mistaken for a live holder. The lock
+// FILE itself is deliberately left in place — see acquireSessionLockFile
+// and the package doc for why unlinking the path is unsafe/unnecessary;
+// only its content is cleared.
 func (l *SessionLock) Release() error {
 	if l == nil {
 		return nil
@@ -209,6 +224,7 @@ func (l *SessionLock) Release() error {
 			close(l.stop)
 		}
 		if l.f != nil {
+			clearHolderMetadata(l.Path, l.f)
 			unlockErr := unlockFile(l.f)
 			closeErr := l.f.Close()
 			if unlockErr != nil {
@@ -219,6 +235,31 @@ func (l *SessionLock) Release() error {
 		}
 	})
 	return releaseErr
+}
+
+// clearHolderMetadata wipes the PID/timeout previously stamped into the
+// lock file's own content and removes the never-locked sidecar file,
+// so a cleanly-released lock does not leave a stale, plausible-looking
+// PID behind for a later `sessions kill`/`sessions why` to misread as a
+// live holder (see Release's doc comment). Called only while we still
+// hold the OS lock on f, so this can't race a concurrent reader trying
+// to observe a consistent state via the sidecar or the primary file.
+//
+// Best-effort: any failure here only degrades diagnosability (same
+// posture as writePIDSidecar) and must never block Release from
+// actually unlocking/closing the file — a stuck holder that can't be
+// released would be strictly worse than a stale PID left on disk.
+func clearHolderMetadata(path string, f *os.File) {
+	if err := f.Truncate(0); err != nil {
+		slog.Warn("session lock: failed to clear lock file content on release", "path", path, "err", err)
+	} else if _, err := f.Seek(0, 0); err != nil {
+		slog.Warn("session lock: failed to seek lock file to start on release", "path", path, "err", err)
+	} else {
+		_ = f.Sync()
+	}
+	if err := os.Remove(pidSidecarPath(path)); err != nil && !os.IsNotExist(err) {
+		slog.Warn("session lock: failed to remove PID sidecar on release", "path", path, "err", err)
+	}
 }
 
 // heartbeat touches the lock file every lockHeartbeatInterval to signal

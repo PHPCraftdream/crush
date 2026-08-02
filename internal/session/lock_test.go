@@ -25,17 +25,16 @@ func TestTryAcquireSessionLock_HappyPath(t *testing.T) {
 	_, statErr := os.Stat(lk.Path)
 	assert.NoError(t, statErr)
 
-	// Verify PID was stamped into the file — only readable after we
-	// release (Windows file-sharing semantics: a concurrent reader on
-	// the same path while we hold an exclusive lock may see an empty
-	// view depending on OS-level cache). In production this is fine
-	// because the contending crush process gets the busy-error path,
-	// reads the file AFTER our handle is closed, and sees the PID.
+	// After a clean Release, the lock FILE stays on disk (see
+	// acquireSessionLockFile/package doc for why unlinking the path is
+	// unsafe), but the PID metadata it carried must be gone — see
+	// Release's doc comment. A cleanly-exited holder must not leave a
+	// PID behind that a later `sessions kill` could misread as a live
+	// holder once the OS recycles that PID number for an unrelated
+	// process (see clearHolderMetadata).
 	require.NoError(t, lk.Release())
-	bts, err := os.ReadFile(lk.Path)
-	require.NoError(t, err)
-	assert.Contains(t, string(bts), "\n",
-		"after release, lock file must contain PID line so the next holder can name us in its busy error")
+	assert.Equal(t, 0, ReadLockPID(lk.Path),
+		"after release, the lock file/sidecar must not carry the old holder's PID")
 }
 
 func TestTryAcquireSessionLock_ReleaseAllowsReacquire(t *testing.T) {

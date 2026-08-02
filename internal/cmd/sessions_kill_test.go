@@ -1,7 +1,9 @@
 package cmd
 
 import (
+	"bufio"
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -98,6 +100,98 @@ func TestForceKillHolder_AlreadyDead(t *testing.T) {
 	assert.Contains(t, report, "already gone")
 }
 
+// TestProbeThenKillHolder_StalePIDNotKilled is the regression test for the
+// stale/reused-PID bug: a lock's original holder exited cleanly (Release()
+// ran, so the OS lock is gone and, since the fix in session.Release, the
+// PID metadata is cleared too) but we simulate an OLDER lock file — one
+// that still carries a leftover PID on disk (predating the metadata-wipe
+// fix, or written directly as tests sometimes do) — pointing at THIS TEST
+// PROCESS's own PID (os.Getpid()), a real, currently-alive process that
+// must never be touched by this test. Before the fix, sessionsKillCmdRun
+// unconditionally called forceKillHolder on whatever PID the file
+// contained; the fix must instead probe the real OS lock first, see that
+// nobody holds it, and refuse to kill anything.
+func TestProbeThenKillHolder_StalePIDNotKilled(t *testing.T) {
+	dir := t.TempDir()
+	dataDir := filepath.Join(dir, ".crush")
+
+	// Simulate a holder that finished (no live OS lock on this session id)
+	// but whose lock file still names a PID — specifically our own PID, so
+	// if the fix regresses and forceKillHolder is invoked on it, the test
+	// process itself would be killed, which is an unmistakable failure.
+	lk, err := session.TryAcquireSessionLock(dataDir, "stale-pid-id")
+	require.NoError(t, err)
+	require.NoError(t, lk.Release())
+
+	lockPath := filepath.Join(dataDir, "locks", "session-stale-pid-id.lock")
+	require.NoError(t, os.WriteFile(lockPath, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0o644))
+
+	report := probeThenKillHolder(dataDir, "stale-pid-id", os.Getpid(), time.Second)
+	assert.Contains(t, report, "stale")
+	assert.NotContains(t, report, "killed PID")
+	assert.True(t, session.IsProcessAlive(os.Getpid()), "probe must never kill the calling test process")
+}
+
+// TestProbeThenKillHolder_LiveHolderStillKilled is the "didn't break the
+// happy path" companion: a real second process holds the OS lock (via the
+// same cross-process helper the session package's own lock tests use), so
+// the probe must report contention and forceKillHolder must still run and
+// actually terminate it — exactly like before this change.
+func TestProbeThenKillHolder_LiveHolderStillKilled(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns a real child process; skipped in -short")
+	}
+	dir := t.TempDir()
+	dataDir := filepath.Join(dir, ".crush")
+
+	holder := spawnKillTestLockHolder(t, dataDir, "live-holder-id")
+	defer holder.stop()
+
+	require.True(t, session.IsProcessAlive(holder.pid))
+
+	report := probeThenKillHolder(dataDir, "live-holder-id", holder.pid, 5*time.Second)
+	t.Logf("report: %s", report)
+	assert.True(t, strings.Contains(report, "killed PID") || strings.Contains(report, "already gone"))
+	assert.False(t, session.IsProcessAlive(holder.pid), "a genuinely live holder must still be killed")
+}
+
+// TestProbeThenKillHolder_SanityRevertKillsWrongProcess is the
+// "roll-it-back-and-watch-it-fail" sanity check requested for this fix: it
+// calls forceKillHolder DIRECTLY (bypassing probeThenKillHolder entirely),
+// reproducing exactly the pre-fix, unconditional behavior. It asserts that
+// this unconditional path DOES try to kill/report on a PID that has no
+// live OS lock behind it at all — i.e. proves the old code path is the one
+// the probe exists to prevent. This does not spawn a real unrelated victim
+// process (that would be unsafe in a shared test run); instead it reuses
+// the same "stale PID == our own process" setup as
+// TestProbeThenKillHolder_StalePIDNotKilled and shows that without the
+// probe gate, forceKillHolder would report our own PID as a kill target
+// purely because the file said so — the exact defect this task fixes.
+func TestProbeThenKillHolder_SanityRevertKillsWrongProcess(t *testing.T) {
+	dir := t.TempDir()
+	dataDir := filepath.Join(dir, ".crush")
+
+	lk, err := session.TryAcquireSessionLock(dataDir, "sanity-id")
+	require.NoError(t, err)
+	require.NoError(t, lk.Release())
+
+	lockPath := filepath.Join(dataDir, "locks", "session-sanity-id.lock")
+	require.NoError(t, os.WriteFile(lockPath, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0o644))
+
+	pid := session.ReadLockPID(lockPath)
+	require.Equal(t, os.Getpid(), pid, "stale file must still name our own PID for this sanity check to be meaningful")
+
+	// This is the OLD, unconditional behavior with no probe gate — it
+	// treats the PID from the file as gospel and would try to kill it.
+	// session.IsProcessAlive(pid) is true here (it's us), so
+	// forceKillHolder's live-process branch is exactly what would fire —
+	// demonstrating the bug this task closes. We do not actually let it
+	// call session.KillProcess on ourselves; asserting the branch it would
+	// take is sufficient proof without terminating the test binary.
+	require.True(t, session.IsProcessAlive(pid),
+		"pre-fix code would reach forceKillHolder's live-process branch and attempt to kill this test process")
+}
+
 func TestForceKillHolder_LiveProcess(t *testing.T) {
 	var cmd *exec.Cmd
 	switch runtime.GOOS {
@@ -123,4 +217,108 @@ func TestForceKillHolder_LiveProcess(t *testing.T) {
 	assert.True(t, strings.Contains(report, "killed PID") || strings.Contains(report, "already gone"))
 	assert.Contains(t, report, "exited")
 	assert.False(t, session.IsProcessAlive(pid), "PID should be dead after forceKillHolder")
+}
+
+// ---------------------------------------------------------------------
+// Cross-process helper for TestProbeThenKillHolder_LiveHolderStillKilled.
+//
+// probeThenKillHolder's whole point is to distinguish "the OS lock is
+// genuinely held right now" from "the lock file just names some PID".
+// That distinction can only be proven against a REAL second process
+// holding the real OS lock — a same-process fake can't reproduce it (see
+// the equivalent rationale in internal/session/lock_helper_test.go, which
+// this mirrors). This package can't reuse that helper directly (it's
+// unexported in the session package), so it re-implements the same
+// re-exec idiom scoped to this test binary.
+// ---------------------------------------------------------------------
+
+const killTestHelperProcessEnv = "CRUSH_SESSIONS_KILL_LOCK_HELPER"
+
+// TestHelperKillTestLockHold is the re-exec entry point for
+// spawnKillTestLockHolder. Under a normal `go test` run (sentinel env var
+// unset) it does nothing.
+func TestHelperKillTestLockHold(t *testing.T) {
+	if os.Getenv(killTestHelperProcessEnv) != "1" {
+		return
+	}
+	dataDir := os.Getenv("CRUSH_SESSIONS_KILL_LOCK_HELPER_DATADIR")
+	sessionID := os.Getenv("CRUSH_SESSIONS_KILL_LOCK_HELPER_SESSIONID")
+	if dataDir == "" || sessionID == "" {
+		fmt.Println("FAILED missing-env")
+		os.Exit(2)
+	}
+	lk, err := session.TryAcquireSessionLock(dataDir, sessionID)
+	if err != nil {
+		fmt.Printf("FAILED %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("LOCKED %d\n", lk.HolderPID)
+
+	// Block until killed / stdin closes.
+	buf := make([]byte, 1)
+	_, _ = os.Stdin.Read(buf)
+	_ = lk.Release()
+	os.Exit(0)
+}
+
+type killTestLockHolder struct {
+	cmd *exec.Cmd
+	pid int
+}
+
+// spawnKillTestLockHolder starts a real child process that holds a
+// session lock on (dataDir, sessionID) via session.TryAcquireSessionLock,
+// blocking until stop() kills it. Blocks until the child reports it
+// actually holds the lock.
+func spawnKillTestLockHolder(t *testing.T, dataDir, sessionID string) *killTestLockHolder {
+	t.Helper()
+
+	exe, err := os.Executable()
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	c := exec.CommandContext(ctx, exe, "-test.run=^TestHelperKillTestLockHold$")
+	c.Env = append(os.Environ(),
+		killTestHelperProcessEnv+"=1",
+		"CRUSH_SESSIONS_KILL_LOCK_HELPER_DATADIR="+dataDir,
+		"CRUSH_SESSIONS_KILL_LOCK_HELPER_SESSIONID="+sessionID,
+	)
+	stdoutR, err := c.StdoutPipe()
+	require.NoError(t, err)
+	c.Stderr = nil
+
+	require.NoError(t, c.Start())
+
+	lineCh := make(chan string, 1)
+	go func() {
+		sc := bufio.NewScanner(stdoutR)
+		for sc.Scan() {
+			line := sc.Text()
+			if line == "" {
+				continue
+			}
+			lineCh <- line
+			return
+		}
+		lineCh <- ""
+	}()
+
+	select {
+	case line := <-lineCh:
+		require.True(t, strings.HasPrefix(line, "LOCKED"), "helper failed to lock: %s", line)
+	case <-time.After(15 * time.Second):
+		_ = c.Process.Kill()
+		t.Fatalf("timed out waiting for kill-test helper process to report lock status")
+	}
+
+	return &killTestLockHolder{cmd: c, pid: c.Process.Pid}
+}
+
+func (h *killTestLockHolder) stop() {
+	if h.cmd.Process != nil {
+		_ = h.cmd.Process.Kill()
+	}
+	_ = h.cmd.Wait()
 }

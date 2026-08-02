@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -68,8 +69,9 @@ func sessionsKillCmdRun(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("stat lock: %w", err)
 	}
 
+	dataDir := filepath.Join(cwd, ".crush")
 	pid := session.ReadLockPID(lockPath)
-	killReport := forceKillHolder(pid, wait)
+	killReport := probeThenKillHolder(dataDir, id, pid, wait)
 	fmt.Fprint(os.Stderr, killReport)
 
 	if keepLock {
@@ -82,6 +84,68 @@ func sessionsKillCmdRun(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Fprintf(os.Stderr, "removed lock %s\n", lockPath)
 	return nil
+}
+
+// probeThenKillHolder decides, via a real OS-level lock attempt, whether
+// the PID recorded in the lock file is still a genuine live holder before
+// handing off to forceKillHolder.
+//
+// Why: the lock file's PID is metadata, not proof. A holder that exited
+// cleanly runs Release(), which now clears that metadata (see
+// session.SessionLock.Release), but an OLD lock file predating that fix,
+// or one whose Release() never ran (process crashed and the file was left
+// mid-write, or something wrote the file directly, as tests sometimes do)
+// can still carry a stale PID. If the OS has since recycled that PID
+// number for a totally unrelated process — routine on a busy CI/dev box —
+// blindly kill(pid)-ing it would take out an innocent process.
+//
+// The only authoritative signal for "is anyone actually still holding
+// this lock" is attempting to take the real OS lock ourselves:
+//   - If TryAcquireSessionLock SUCCEEDS, nobody holds the lock right now,
+//     full stop (see the package doc on SessionLock) — the recorded PID,
+//     if any, is stale/dead/reused. We must NOT touch that PID. Release
+//     our probe lock immediately (we don't want to hold the session) and
+//     report the lock as dead so the caller can proceed straight to
+//     removing the lock file.
+//   - If it reports *session.SessionLockBusyError, someone genuinely
+//     holds the OS lock right now — the classic case this command exists
+//     for (a stuck/orphaned live crush process) — proceed to
+//     forceKillHolder exactly as before.
+//   - Any other error (permission denied, IO error, etc.) is NOT proof of
+//     either state; fall back to the previous unconditional behavior
+//     (kill whatever PID was recorded) rather than silently doing nothing
+//     — this preserves existing behavior for callers/tests that never
+//     exercised the probe path and avoids turning an unrelated IO hiccup
+//     into "sessions kill now refuses to do anything".
+func probeThenKillHolder(dataDir, sessionID string, pid int, wait time.Duration) string {
+	lk, err := session.TryAcquireSessionLock(dataDir, sessionID)
+	if err == nil {
+		// We just proved nobody holds the OS lock. Whatever PID is
+		// recorded in the file is stale — do not kill it.
+		_ = lk.Release()
+		var sb strings.Builder
+		if pid > 0 {
+			fmt.Fprintf(&sb, "lock probe acquired the lock: PID %d is stale (holder already gone); not killing anything\n", pid)
+		} else {
+			sb.WriteString("lock probe acquired the lock: no live holder; nothing to kill\n")
+		}
+		return sb.String()
+	}
+	var busyErr *session.SessionLockBusyError
+	if errors.As(err, &busyErr) {
+		// A real process holds the OS lock right now. Prefer the PID the
+		// probe itself identified (it reads the never-locked sidecar,
+		// see readLockFile's doc comment) but fall back to the
+		// caller-supplied one for safety.
+		livePID := busyErr.HolderPID
+		if livePID <= 0 {
+			livePID = pid
+		}
+		return forceKillHolder(livePID, wait)
+	}
+	// Unidentified probe failure — not proof of either state. Preserve
+	// prior behavior rather than refusing to act.
+	return forceKillHolder(pid, wait)
 }
 
 // forceKillHolder kills the PID (no-op for pid<=0) and waits up to `wait`
