@@ -1045,27 +1045,40 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 			// rather than this callback racing its own cancel()).
 			watchdogCauseVal.Store(int32(cause))
 			// The watchdog firing IS the hang, caught at the only moment the
-			// evidence still exists. Capture every goroutine's stack now:
-			// pprof is gated behind CRUSH_PROFILE (so it can't be turned on
-			// after the fact) and release builds strip symbols (so a debugger
-			// attach yields nothing and merely kills the process). Without
-			// this, every production hang is diagnosed by guesswork.
+			// evidence still exists. Capture every goroutine's stack now,
+			// SYNCHRONOUSLY: pprof is gated behind CRUSH_PROFILE (so it can't
+			// be turned on after the fact) and release builds strip symbols
+			// (so a debugger attach yields nothing and merely kills the
+			// process). Without this, every production hang is diagnosed by
+			// guesswork.
 			//
-			// Dispatched async and NOT awaited: DumpGoroutines does a
-			// synchronous os.WriteFile with no timeout of its own (see its
-			// doc in internal/log/goroutine_dump.go). Since onFire now runs
+			// CaptureGoroutineStack does no I/O — it's runtime.Stack plus a
+			// string header — so it cannot block on a stuck disk, and running
+			// it synchronously here is what guarantees the snapshot reflects
+			// the actual moment of the hang. Capturing it from an async
+			// goroutine instead (as an earlier version of this fix did) would
+			// let it run AFTER cancel()/unwind had already started — or, if
+			// the process exited or was force-killed first, never run at
+			// all — defeating the entire point of a diagnostic taken "at the
+			// only moment it is still available" (see the doc comment on
+			// CaptureGoroutineStack).
+			stackDump := crushlog.CaptureGoroutineStack("stream watchdog fired")
+			// Only the WRITE is dispatched async and NOT awaited:
+			// WriteGoroutineDump does a synchronous os.WriteFile with no
+			// timeout of its own (see its doc in
+			// internal/log/goroutine_dump.go). Since onFire now runs
 			// strictly before cancel(), awaiting a write that hangs (e.g. the
 			// log directory sits on a stuck network/SMB mount) would mean
 			// cancel() never runs, agent.Stream never unblocks, and runTurn's
 			// deferred <-wd.done blocks forever — a full process freeze,
 			// exactly the failure mode this watchdog exists to prevent. The
 			// dump is best-effort diagnostics only; nothing downstream needs
-			// it to complete before the turn can safely unwind, so firing it
-			// off and returning immediately preserves the evidence-gathering
-			// without putting an unbounded disk write on cancellation's
-			// critical path.
+			// the write to complete before the turn can safely unwind, so
+			// firing it off and returning immediately preserves the already-
+			// captured evidence without putting an unbounded disk write on
+			// cancellation's critical path.
 			go func() {
-				if dumpPath, dumpErr := crushlog.DumpGoroutines("stream watchdog fired"); dumpErr != nil {
+				if dumpPath, dumpErr := crushlog.WriteGoroutineDump(stackDump); dumpErr != nil {
 					slog.Warn("agent: failed to write goroutine dump for watchdog fire", "err", dumpErr)
 				} else {
 					slog.Warn("agent: wrote goroutine dump for watchdog fire", "path", dumpPath)

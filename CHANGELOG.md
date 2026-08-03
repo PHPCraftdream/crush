@@ -445,7 +445,15 @@ lower-severity issues, closed the same way:
   to disk synchronously before `cancel()` ran, so a hung/slow disk
   write could itself block cancellation indefinitely. The fire cause
   is now recorded first, then the (unawaited) dump write runs on its
-  own goroutine, off the critical path to `cancel()`.
+  own goroutine, off the critical path to `cancel()`. A follow-up
+  review found that fix went too far: dispatching the *entire* dump
+  (including `runtime.Stack`'s goroutine-stack capture, not just the
+  disk write) to an async goroutine meant the capture itself could
+  race a fast unwind and record post-cancellation state instead of
+  the actual hang, or never run at all if the process exited first.
+  The stack capture (fast, no I/O, cannot block on disk) now runs
+  synchronously in `onFire`, at the moment the hang is detected;
+  only the write to disk is dispatched asynchronously.
 - **Five more CLI commands ignored a configured data directory** —
   `sessions list`'s status column, `sessions reap`, `sessions watch`,
   `sessions why`, and `queue` all independently hardcoded or
