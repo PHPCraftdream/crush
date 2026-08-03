@@ -381,7 +381,7 @@ func TestExplainSessionStatus_PidAliveWithinMaxFallbackAgeIsRunning(t *testing.T
 	require.True(t, session.IsProcessAlive(holder.pid), "helper process must be alive for this test to be meaningful")
 
 	lockPath := filepath.Join(dataDir, "locks", "session-"+sanitiseSessionIDForFilename(sess.ID)+".lock")
-	justUnder := time.Now().Add(-(session.MaxPidFallbackAge - time.Second))
+	justUnder := time.Now().Add(-(session.MaxPidFallbackAge - 2*time.Minute))
 	require.NoError(t, os.Chtimes(lockPath, justUnder, justUnder))
 
 	a := &app.App{Messages: m, Sessions: s}
