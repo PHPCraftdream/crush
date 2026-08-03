@@ -1,10 +1,13 @@
 package agent
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1037,13 +1040,14 @@ func TestSessionAgent_HandleWatchdogFire_StoresCauseAndDispatchesDumpAsync(t *te
 	}
 	crushlog.SetLogDirForTest(t, deepDir)
 
+	largeModel := Model{
+		ModelCfg: config.SelectedModel{
+			Provider: "test-provider",
+			Model:    "test-model",
+		},
+	}
 	a := &sessionAgent{
-		largeModel: csync.NewValue(Model{
-			ModelCfg: config.SelectedModel{
-				Provider: "test-provider",
-				Model:    "test-model",
-			},
-		}),
+		largeModel:     csync.NewValue(largeModel),
 		timeoutHardCap: 5 * time.Second,
 	}
 
@@ -1058,7 +1062,7 @@ func TestSessionAgent_HandleWatchdogFire_StoresCauseAndDispatchesDumpAsync(t *te
 	var elapsedCall time.Duration
 	go func() {
 		start := time.Now()
-		a.handleWatchdogFire(causeToolTimeout, 7*time.Second, sessionID, &watchdogCauseVal, toolMaxDuration, idleTimeout)
+		a.handleWatchdogFire(causeToolTimeout, 7*time.Second, sessionID, &watchdogCauseVal, toolMaxDuration, idleTimeout, largeModel)
 		elapsedCall = time.Since(start)
 		close(callReturned)
 	}()
@@ -1098,4 +1102,103 @@ func TestSessionAgent_HandleWatchdogFire_StoresCauseAndDispatchesDumpAsync(t *te
 	assert.Contains(t, string(content), "stream watchdog fired",
 		"the dump must carry the reason handleWatchdogFire passes to crushlog.CaptureGoroutineStack")
 	assert.Contains(t, string(content), "goroutine ", "the dump must contain real goroutine stacks")
+}
+
+// lockedBuffer is a concurrency-safe bytes.Buffer sink for slog.TextHandler,
+// needed because handleWatchdogFire dispatches an async goroutine that also
+// calls slog.Warn while the test reads the buffer.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// TestSessionAgent_HandleWatchdogFire_UsesPassedLargeModelSnapshot is the
+// regression test for task #252. Task #243 (b55d701a) extracted runTurn's
+// onFire closure into the named handleWatchdogFire method and claimed the
+// extraction was "byte-for-byte the same logic". It was not: the original
+// closure CAPTURED largeModel — the runTurn local taken ONCE at turn start
+// (agent.go: `largeModel := a.largeModel.Get()`, before the turn loop) — so
+// the diagnostic slog.Warn always named the model the turn STARTED with.
+// The extraction instead re-read a.largeModel.Get() inside the method, at
+// fire time. a.largeModel is MUTABLE during a turn: sessionAgent.SetModels
+// is called from coordinator.UpdateModels and the web-UI override path, so a
+// model switch mid-turn (provider A hangs, user switches to provider B in
+// the web UI, watchdog fires after the switch) would log provider B as the
+// one that hung — misattributing the diagnostic. This affects ONLY the
+// diagnostic log, not the user-facing finish message, hence LOW severity.
+//
+// This test proves the fix: it calls handleWatchdogFire with an explicit
+// largeModel parameter whose Provider/Model differ from a.largeModel's
+// CURRENT value, and asserts the captured diagnostic log names the PASSED
+// snapshot, not the live field. Because the diagnostic goes through slog
+// (not a return value), the default slog.Logger is temporarily swapped for a
+// TextHandler writing to a mutex-guarded buffer.
+func TestSessionAgent_HandleWatchdogFire_UsesPassedLargeModelSnapshot(t *testing.T) {
+	// Redirect the goroutine-dump dir so the async WriteGoroutineDump inside
+	// handleWatchdogFire does not pollute the real log dir; a shallow tempdir
+	// also keeps that write near-instant.
+	crushlog.SetLogDirForTest(t, t.TempDir())
+
+	// a.largeModel's CURRENT value — what the BUGGY code would read at fire
+	// time via a.largeModel.Get().
+	a := &sessionAgent{
+		largeModel: csync.NewValue(Model{
+			ModelCfg: config.SelectedModel{
+				Provider: "current-provider",
+				Model:    "current-model",
+			},
+		}),
+		timeoutHardCap: 5 * time.Second,
+	}
+
+	// The SNAPSHOT runTurn would pass in — taken once at turn start. Simulate
+	// a mid-turn model switch by making it differ from a.largeModel's value.
+	snapshotModel := Model{
+		ModelCfg: config.SelectedModel{
+			Provider: "snapshot-provider",
+			Model:    "snapshot-model",
+		},
+	}
+
+	// Capture slog output: swap the default logger for a TextHandler over a
+	// mutex-guarded buffer. handleWatchdogFire's own async dump-write
+	// goroutine calls slog.Warn too, so the sink must be concurrency-safe.
+	var logBuf lockedBuffer
+	prevDefault := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	defer slog.SetDefault(prevDefault)
+
+	var watchdogCauseVal atomic.Int32
+	a.handleWatchdogFire(
+		causeIdleStall, 42*time.Second, "sess-252-test",
+		&watchdogCauseVal, 5*time.Second, 3*time.Minute,
+		snapshotModel,
+	)
+
+	require.Equal(t, int32(causeIdleStall), watchdogCauseVal.Load(),
+		"cause must still be stored regardless of the model-source fix")
+
+	logged := logBuf.String()
+	assert.Contains(t, logged, "provider=snapshot-provider",
+		"the diagnostic log must name the largeModel SNAPSHOT passed to handleWatchdogFire "+
+			"(the runTurn value captured once at turn start), not the live a.largeModel field — "+
+			"a mid-turn model switch (SetModels via web-UI) must not rewrite which provider/model the watchdog blames")
+	assert.Contains(t, logged, "model=snapshot-model",
+		"the diagnostic log must name the snapshot model, not the live field")
+	assert.NotContains(t, logged, "current-provider",
+		"the live a.largeModel.Provider (current-provider) must NOT appear — it reflects a model switch that happened AFTER the turn started, not the model that actually hung")
+	assert.NotContains(t, logged, "current-model",
+		"the live a.largeModel.Model (current-model) must NOT appear in the diagnostic")
 }

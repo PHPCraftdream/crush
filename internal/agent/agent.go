@@ -889,6 +889,13 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 // toolMaxDuration/idleTimeout are likewise runTurn locals (the resolved,
 // possibly-overridden effective durations for THIS turn) rather than
 // sessionAgent fields, so they are passed explicitly instead of read off a.
+// largeModel is the SAME kind of runTurn-local snapshot (taken once at turn
+// start, agent.go: `largeModel := a.largeModel.Get()`), NOT a fresh re-read
+// of a.largeModel here: a.largeModel is mutable mid-turn via SetModels
+// (coordinator.UpdateModels / web-UI override path), so re-reading at fire
+// time would name the model the user SWITCHED TO after the hang started
+// rather than the one that actually hung (task #252 — the #243 extraction
+// regressed exactly this by re-reading a.largeModel.Get() here).
 //
 // INVARIANT (task #227 + #232, preserved verbatim by this extraction): the
 // cause is stored FIRST, synchronously, before any other work in this
@@ -908,6 +915,7 @@ func (a *sessionAgent) handleWatchdogFire(
 	sessionID string,
 	watchdogCauseVal *atomic.Int32,
 	toolMaxDuration, idleTimeout time.Duration,
+	largeModel Model,
 ) {
 	watchdogCauseVal.Store(int32(cause))
 	// The watchdog firing IS the hang, caught at the only moment the
@@ -946,7 +954,6 @@ func (a *sessionAgent) handleWatchdogFire(
 			slog.Warn("agent: wrote goroutine dump for watchdog fire", "path", dumpPath)
 		}
 	}()
-	largeModel := a.largeModel.Get()
 	switch cause {
 	case causeToolTimeout:
 		slog.Warn(
@@ -1140,12 +1147,12 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 		// a test-local copy of this shape that could silently drift from
 		// what agent.go actually does.
 		func(elapsed time.Duration, cause watchdogCause) {
-			a.handleWatchdogFire(cause, elapsed, call.SessionID, &watchdogCauseVal, toolMaxDuration, idleTimeout)
+			a.handleWatchdogFire(cause, elapsed, call.SessionID, &watchdogCauseVal, toolMaxDuration, idleTimeout, largeModel)
 		},
-		a.timeoutExtendsOnProgress, // Fork patch: batch 8
-		a.timeoutHardCap,           // Fork patch: batch 8
-		toolMaxDuration,            // never-freeze backstop, applies to every tool
-		toolCleanupGrace,           // buffer for a nested watchdog to unwind first
+		a.timeoutExtendsOnProgress,        // Fork patch: batch 8
+		a.timeoutHardCap,                  // Fork patch: batch 8
+		toolMaxDuration,                   // never-freeze backstop, applies to every tool
+		toolCleanupGrace,                  // buffer for a nested watchdog to unwind first
 		func() { notifyActivity(genCtx) }, // task #222: keep the OS-lock heartbeat
 		// alive from tool-in-flight ticks too, not just stream callbacks —
 		// see startStreamWatchdog's recordActivity doc.
