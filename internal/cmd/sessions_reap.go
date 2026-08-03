@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/session"
 	"github.com/spf13/cobra"
 )
@@ -50,7 +51,20 @@ func sessionsReapCmdRun(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	locksDir := filepath.Join(cwd, ".crush", "locks")
+	// Resolve the data directory the same lightweight way `sessions kill`
+	// does (task #219/#224): honor --data-dir first, then the project's
+	// configured data_directory, and only fall back to <cwd>/.crush if
+	// neither is set. This command is purely filesystem-based (no DB,
+	// no provider config), so config.ResolveDataDirectory's pure, local
+	// resolution is used instead of pulling in the full setupApp. See
+	// task #233 — the same cwd-hardcoding bug class as #219/#224/#231.
+	dataDirFlag, _ := cmd.Flags().GetString("data-dir")
+	dataDir, err := config.ResolveDataDirectory(cwd, dataDirFlag)
+	if err != nil {
+		return fmt.Errorf("failed to resolve data directory: %w", err)
+	}
+
+	locksDir := filepath.Join(dataDir, "locks")
 	entries, err := os.ReadDir(locksDir)
 	if err != nil {
 		if os.IsNotExist(err) {

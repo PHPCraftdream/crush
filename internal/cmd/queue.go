@@ -191,10 +191,15 @@ reason) are written back to the queue.`,
 		if err != nil {
 			return err
 		}
-		dataDir, _ := cmd.Flags().GetString("data-dir")
-		if dataDir == "" {
-			dataDir = filepath.Join(cwd, ".crush")
-		}
+
+		// Use the already-resolved data directory from setupApp (honors
+		// --data-dir AND any configured data_directory), not a re-read of
+		// the raw --data-dir flag with a cwd-based fallback — the same
+		// "prefer the raw flag" anti-pattern task #224 fixed in
+		// sessions_kill.go (finding 1). A relative --data-dir combined
+		// with a non-default --cwd used to diverge from what setupApp
+		// itself resolved. See task #233.
+		dataDir := a.Config().Options.DataDirectory
 
 		// Acquire the queue lock.
 		lockPath := filepath.Join(dataDir, "queue.lock")

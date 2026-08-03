@@ -60,30 +60,42 @@ func sessionsWhyCmdRun(cmd *cobra.Command, args []string) error {
 	}
 	defer a.Shutdown()
 
-	cwd, err := ResolveCwd(cmd)
-	if err != nil {
-		return err
-	}
-
 	sess, err := resolveSessionID(cmd.Context(), a.Sessions, args[0])
 	if err != nil {
 		return err
 	}
 
-	return explainSessionStatus(cmd.Context(), a, cwd, sess.ID, os.Stdout)
+	// explainSessionStatus's second-to-last string parameter is the root
+	// whose "<root>/.crush/locks" subtree holds the session's lock file —
+	// historically named cwd because setupApp's --data-dir-aware
+	// resolution wasn't wired through here. Pass the already-resolved data
+	// directory instead of the raw --cwd value so `sessions why` honors
+	// --data-dir / a configured data_directory like `sessions list` /
+	// `sessions locks` / `sessions watch` do (task #233 — same
+	// cwd-hardcoding bug class as #219/#224/#231).
+	return explainSessionStatus(cmd.Context(), a, a.Config().Options.DataDirectory, sess.ID, os.Stdout)
 }
 
 // explainSessionStatus writes a terse, plain-text explanation of why the
 // session has the status it has. It is the testable core of
-// `crush sessions why`: it takes the app services, the cwd (for the locks
-// dir), the session id, and an output writer, so tests can drive it with a
-// hand-built *app.App and a t.TempDir() without spinning up cobra.
+// `crush sessions why`: it takes the app services, the resolved data
+// directory (for the locks dir), the session id, and an output writer, so
+// tests can drive it with a hand-built *app.App and a t.TempDir() without
+// spinning up cobra.
+//
+// dataDir is the crush data directory itself (e.g. what
+// a.Config().Options.DataDirectory resolves to — honoring --data-dir / a
+// configured data_directory), NOT the project cwd: the lock file lives at
+// <dataDir>/locks/session-<id>.lock, one level shallower than the old
+// <cwd>/.crush/locks layout this parameter used to assume. See task #233
+// (same cwd-hardcoding bug class as #219/#224/#231): the caller used to
+// pass the raw --cwd value here, ignoring --data-dir entirely.
 //
 // It deliberately mirrors the two-step status computation that
 // `sessions list` uses (computeSessionStatuses → reclassifyCrashedAsDone)
 // but for a single session, and adds the "at rest" case those helpers
 // don't represent (they only return entries for sessions that HAVE a lock).
-func explainSessionStatus(ctx context.Context, a *app.App, cwd, sessionID string, out io.Writer) error {
+func explainSessionStatus(ctx context.Context, a *app.App, dataDir, sessionID string, out io.Writer) error {
 	msgs, err := a.Messages.List(ctx, sessionID)
 	if err != nil {
 		return fmt.Errorf("failed to list messages for session %s: %w", sessionID, err)
@@ -91,7 +103,7 @@ func explainSessionStatus(ctx context.Context, a *app.App, cwd, sessionID string
 
 	// Lock state — same path / parse logic as computeSessionStatuses and
 	// sessionsLocksCmdRun, but for the single session we care about.
-	lockPath := filepath.Join(cwd, ".crush", "locks", "session-"+sanitiseSessionIDForFilename(sessionID)+".lock")
+	lockPath := filepath.Join(dataDir, "locks", "session-"+sanitiseSessionIDForFilename(sessionID)+".lock")
 	var (
 		hasLock  bool
 		pid      int

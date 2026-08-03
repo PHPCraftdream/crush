@@ -16,13 +16,17 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// writeLockFile creates a session lock file under tmpDir/.crush/locks/ holding
-// the given PID (second line = optional timeout seconds), and returns the tmpDir
-// so it can be passed to explainSessionStatus as cwd.
+// writeLockFile creates a session lock file under tmpDir/locks/ holding
+// the given PID (second line = optional timeout seconds), and returns the
+// tmpDir so it can be passed to explainSessionStatus as its dataDir
+// parameter — explainSessionStatus resolves the lock at
+// <dataDir>/locks/session-<id>.lock (task #233 fix; previously this helper
+// nested an extra ".crush" level to match the pre-fix <cwd>/.crush/locks
+// layout).
 func writeLockFile(t *testing.T, sessionID string, pid int) string {
 	t.Helper()
 	tmpDir := t.TempDir()
-	locksDir := filepath.Join(tmpDir, ".crush", "locks")
+	locksDir := filepath.Join(tmpDir, "locks")
 	require.NoError(t, os.MkdirAll(locksDir, 0o755))
 	lockPath := filepath.Join(locksDir, "session-"+sanitiseSessionIDForFilename(sessionID)+".lock")
 	require.NoError(t, os.WriteFile(lockPath, []byte(strconv.Itoa(pid)+"\n"), 0o644))
@@ -254,7 +258,7 @@ func TestExplainSessionStatus_Crashed_PIDUnreadableStaleHeartbeat(t *testing.T) 
 	require.NoError(t, err)
 
 	cwd := writeLockFile(t, sess.ID, 0)
-	lockPath := filepath.Join(cwd, ".crush", "locks", "session-"+sanitiseSessionIDForFilename(sess.ID)+".lock")
+	lockPath := filepath.Join(cwd, "locks", "session-"+sanitiseSessionIDForFilename(sess.ID)+".lock")
 	old := time.Now().Add(-30 * time.Second)
 	require.NoError(t, os.Chtimes(lockPath, old, old))
 

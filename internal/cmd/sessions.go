@@ -79,7 +79,7 @@ crush sessions list --json | jq 'select(.message_count > 0)'
 		// session is at rest. The lock dir read is one syscall + N
 		// directory entries; the PID liveness check is the same cheap
 		// per-PID probe `sessions reap` uses.
-		statusByID := computeSessionStatuses(cmd)
+		statusByID := computeSessionStatuses(a)
 
 		// A dead-PID lock can mean two things: a genuine mid-turn crash,
 		// or a `crush run` that finished cleanly (last assistant turn
@@ -142,12 +142,16 @@ crush sessions list --json | jq 'select(.message_count > 0)'
 // PID from another process fails for as long as the session is alive (see
 // the Windows note on session.readLockFile) — without the heartbeat
 // fallback, every live session on Windows would misreport as "crashed".
-func computeSessionStatuses(cmd *cobra.Command) map[string]string {
-	cwd, err := ResolveCwd(cmd)
-	if err != nil {
+//
+// Takes the already-booted *app.App (rather than re-deriving the data
+// directory from --cwd) so it honors --data-dir / a configured
+// data_directory the same way `sessions locks` does — see task #233,
+// the same cwd-hardcoding bug class as task #219/#224/#231.
+func computeSessionStatuses(a *app.App) map[string]string {
+	if a == nil {
 		return nil
 	}
-	locksDir := filepath.Join(cwd, ".crush", "locks")
+	locksDir := filepath.Join(a.Config().Options.DataDirectory, "locks")
 	entries, err := os.ReadDir(locksDir)
 	if err != nil {
 		return nil

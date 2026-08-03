@@ -68,12 +68,11 @@ func sessionsWatchCmdRun(cmd *cobra.Command, args []string) error {
 	}
 	defer a.Shutdown()
 
-	cwd, err := ResolveCwd(cmd)
-	if err != nil {
-		return err
-	}
-
-	locksDir := filepath.Join(cwd, ".crush", "locks")
+	// Resolve the locks directory from the already-booted app's config
+	// (honors --data-dir / a configured data_directory), not a raw
+	// cwd-based guess — same fix as `sessions locks` (task #231). See
+	// task #233.
+	locksDir := filepath.Join(a.Config().Options.DataDirectory, "locks")
 	ctx := cmd.Context()
 
 	var sessionID string
