@@ -503,8 +503,11 @@ lower-severity issues, closed the same way:
   re-implementing the check, and `sessions list` applies the same
   60-minute bound (exported as `session.MaxPidFallbackAge`)
   independently, since its "trust a confirmed-alive PID unconditionally"
-  shape isn't a drop-in match for `InspectSessionLock`'s. All three
-  known copies of this check are now bounded.
+  shape isn't a drop-in match for `InspectSessionLock`'s. A further review
+  pass found a FOURTH independent copy in `sessions why`'s status explainer
+  (the very command meant to diagnose this verdict) with the same unbounded
+  trust; it now applies the same `session.MaxPidFallbackAge` bound too. All
+  four known copies of this check are now bounded.
 - De-duplicated four independently-hardcoded copies of the
   "Stream stalled" finish-title string in internal/agent (the retry
   logic's own constant, the watchdog's actual production value, and

@@ -50,15 +50,19 @@ const LockStaleDuration = lockStaleDuration
 // performs, instead of calling InspectSessionLock itself (e.g. because they
 // need a "running"/"crashed" classification shape InspectSessionLock's
 // LockState doesn't return, or only have a locks-directory entry in hand
-// rather than a (dataDir, sessionID) pair). Task #241: two such independent
-// copies — internal/cmd/sessions_watch.go's isSessionFinished (now migrated
-// to call InspectSessionLock directly) and internal/cmd/sessions.go's
-// computeSessionStatuses (kept independent — see that function's doc
-// comment for why) — were found to trust a live-looking PID forever, with
-// no bound of their own, even though InspectSessionLock had already been
-// bounded for task #235. Exporting the same constant, rather than letting
-// each site hand-roll its own duration, keeps the bound doctrinally in sync
-// across every "PID reuse can't pin liveness forever" check in the codebase.
+// rather than a (dataDir, sessionID) pair). Task #241/#250: three such
+// independent copies — internal/cmd/sessions_watch.go's isSessionFinished
+// (now migrated to call InspectSessionLock directly),
+// internal/cmd/sessions.go's computeSessionStatuses (kept independent — see
+// that function's doc comment for why), and internal/cmd/sessions_why.go's
+// explainSessionStatus (same "trust pid>0 unconditionally" shape as
+// computeSessionStatuses — the very command meant to explain a session's
+// verdict, found unbounded in a later review pass) — were found to trust a
+// live-looking PID forever, with no bound of their own, even though
+// InspectSessionLock had already been bounded for task #235. Exporting the
+// same constant, rather than letting each site hand-roll its own duration,
+// keeps the bound doctrinally in sync across every "PID reuse can't pin
+// liveness forever" check in the codebase.
 const MaxPidFallbackAge = maxPidFallbackAge
 
 // SessionLock is an inter-process exclusive lock for a single session ID.

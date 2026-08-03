@@ -123,7 +123,21 @@ func explainSessionStatus(ctx context.Context, a *app.App, dataDir, sessionID st
 		// note), so pid == 0 is the norm for a live session there, not a
 		// sign of death. Only in that unreadable case do we fall back to
 		// heartbeat freshness.
+		//
+		// A CONFIRMED-alive PID is trusted only within
+		// session.MaxPidFallbackAge of the lock's mtime — past that, the
+		// lock is old enough that no genuinely healthy holder could still
+		// be running it, so a currently-alive PID is far more likely an OS
+		// PID-reuse coincidence than the original holder (task #250, the
+		// same fix tasks #235/#241 already applied to InspectSessionLock,
+		// sessions_watch.go and computeSessionStatuses). Without this bound,
+		// `sessions why` would say "running / lock held by live PID N" for
+		// the very same session `sessions list` already correctly reports as
+		// crashed/done — directly contradicting the verdict this command
+		// exists to explain.
 		switch {
+		case pid > 0 && time.Since(st.ModTime()) >= session.MaxPidFallbackAge:
+			pidAlive = false
 		case pid > 0:
 			pidAlive = session.IsProcessAlive(pid)
 		default:

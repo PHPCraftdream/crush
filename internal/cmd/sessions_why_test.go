@@ -303,3 +303,92 @@ func TestExplainSessionStatus_ErrorFinishSurfacesErrorText(t *testing.T) {
 	require.Contains(t, out, "error")
 	require.Contains(t, out, "upstream 502: bad gateway")
 }
+
+// TestExplainSessionStatus_PidReuseBeyondMaxFallbackAgeIsNotRunning is the
+// regression test for task #250: explainSessionStatus (backing
+// `crush sessions why`) was the FOURTH independent copy of the "trust a
+// confirmed-alive PID unconditionally, with no bound on lock age" check that
+// tasks #235/#241 had already bounded in the other three copies
+// (InspectSessionLock, sessions_watch.go, sessions.go). A `crush run` killed
+// with SIGKILL/taskkill /F leaves its PID in the lock file without
+// releasing; hours later the OS can recycle that exact PID number for a
+// completely unrelated, currently-running process. Before this fix,
+// `sessions list` (already bounded) would correctly show crashed/done, but
+// `crush sessions why` — the command whose ONLY job is to explain that very
+// verdict — would say "running / lock held by live PID N", directly
+// contradicting `sessions list` for the same session.
+//
+// A real second process (spawnKillTestLockHolder, the same cross-process
+// harness sessions_kill_test.go uses) stands in for "the OS reused this
+// exact PID number" — it is genuinely alive throughout, so this proves the
+// AGE bound, not merely a dead-PID false negative. The lock file's mtime is
+// back-dated past session.MaxPidFallbackAge to simulate a lock abandoned
+// long enough ago that its recorded PID can no longer be trusted.
+func TestExplainSessionStatus_PidReuseBeyondMaxFallbackAgeIsNotRunning(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns a real child process; skipped in -short")
+	}
+
+	conn, q := newTestDB(t)
+	s := session.NewService(q, conn)
+	m := message.NewService(q)
+
+	sess, err := s.Create(context.Background(), "why-status-pid-reuse")
+	require.NoError(t, err)
+
+	dataDir := t.TempDir()
+	holder := spawnKillTestLockHolder(t, dataDir, sess.ID)
+	defer holder.stop()
+	require.True(t, session.IsProcessAlive(holder.pid), "helper process must be alive for this test to be meaningful")
+
+	lockPath := filepath.Join(dataDir, "locks", "session-"+sanitiseSessionIDForFilename(sess.ID)+".lock")
+	staleTime := time.Now().Add(-(session.MaxPidFallbackAge + 5*time.Second))
+	require.NoError(t, os.Chtimes(lockPath, staleTime, staleTime),
+		"back-dating mtime past MaxPidFallbackAge to simulate a lock abandoned long enough ago that its recorded PID can no longer be trusted, even though it currently resolves to a live process")
+
+	a := &app.App{Messages: m, Sessions: s}
+	var buf bytes.Buffer
+	require.NoError(t, explainSessionStatus(context.Background(), a, dataDir, sess.ID, &buf))
+
+	out := buf.String()
+	require.NotContains(t, out, "status: running",
+		"a lock older than MaxPidFallbackAge must not be reported running just because its recorded PID currently belongs to a live (but unrelated) process — this is the core #250 fix; sessions why must agree with sessions list")
+	require.Contains(t, out, "status: crashed",
+		"with no clean assistant finish, the bound-forced dead verdict must surface as crashed, matching what sessions list shows for the same session")
+}
+
+// TestExplainSessionStatus_PidAliveWithinMaxFallbackAgeIsRunning is the
+// non-regression companion: a live PID within MaxPidFallbackAge of the
+// lock's mtime must still be reported "running", exactly like before this
+// fix — the bound must only kick in once the lock is genuinely old. Uses a
+// real second process (not the test's own PID) so it guards the same
+// cross-process path the regression test does.
+func TestExplainSessionStatus_PidAliveWithinMaxFallbackAgeIsRunning(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns a real child process; skipped in -short")
+	}
+
+	conn, q := newTestDB(t)
+	s := session.NewService(q, conn)
+	m := message.NewService(q)
+
+	sess, err := s.Create(context.Background(), "why-status-pid-fresh")
+	require.NoError(t, err)
+
+	dataDir := t.TempDir()
+	holder := spawnKillTestLockHolder(t, dataDir, sess.ID)
+	defer holder.stop()
+	require.True(t, session.IsProcessAlive(holder.pid), "helper process must be alive for this test to be meaningful")
+
+	lockPath := filepath.Join(dataDir, "locks", "session-"+sanitiseSessionIDForFilename(sess.ID)+".lock")
+	justUnder := time.Now().Add(-(session.MaxPidFallbackAge - time.Second))
+	require.NoError(t, os.Chtimes(lockPath, justUnder, justUnder))
+
+	a := &app.App{Messages: m, Sessions: s}
+	var buf bytes.Buffer
+	require.NoError(t, explainSessionStatus(context.Background(), a, dataDir, sess.ID, &buf))
+
+	out := buf.String()
+	require.Contains(t, out, "status: running",
+		"a live PID just under MaxPidFallbackAge must still be trusted as running")
+}
