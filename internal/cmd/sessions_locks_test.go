@@ -1,7 +1,10 @@
 package cmd
 
 import (
+	"bytes"
+	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -11,6 +14,31 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// captureStdout runs f while capturing os.Stdout output. Mirrors
+// claude_init_test.go's captureStderr / models_use_test.go's inline
+// stdout-pipe pattern, factored out here since sessionsLocksCmdRun writes
+// its table (and --json output) to os.Stdout, not os.Stderr.
+func captureStdout(t *testing.T, f func()) string {
+	t.Helper()
+	old := os.Stdout
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	os.Stdout = w
+	defer func() { os.Stdout = old }()
+
+	var buf bytes.Buffer
+	done := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(&buf, r)
+		close(done)
+	}()
+
+	f()
+	_ = w.Close()
+	<-done
+	return buf.String()
+}
 
 func TestSessionsLocks_CreateLockFile(t *testing.T) {
 	t.Parallel()
@@ -128,4 +156,151 @@ func TestLockHolderProvablyDead_NoRealHolder_ReportsDead(t *testing.T) {
 
 	dead := lockHolderProvablyDead(dataDir, "abandoned-id")
 	assert.True(t, dead, "a lock file with no real OS-level holder must be reported as provably dead")
+}
+
+// TestSessionsLocksCmdRun_HonorsConfiguredDataDir is the regression test for
+// task #231 finding 1: sessionsLocksCmdRun computed locksDir (and the
+// lockHolderProvablyDead probe's dataDir) as filepath.Join(cwd, ".crush",
+// ...), completely ignoring --data-dir / a configured data_directory, even
+// though setupApp(cmd) had already resolved the correct value onto `a`.
+// This is the same bug class task #219/#224 already fixed for `sessions
+// kill` / `sessions reset --force` (see
+// TestSessionsKillCmdRun_HonorsConfiguredDataDir in sessions_kill_test.go,
+// whose isolation pattern this test mirrors), left unfixed for `sessions
+// locks`.
+//
+// This points --data-dir at a directory deliberately outside cwd, seeds a
+// real lock file at the path the FIX computes
+// (<configured-data-dir>/locks/session-<id>.lock), and runs the real
+// sessionsLocksCmd.RunE. Before the fix this prints "(no locks)" (having
+// looked in the wrong, cwd-based directory); after the fix it must list the
+// seeded session.
+func TestSessionsLocksCmdRun_HonorsConfiguredDataDir(t *testing.T) {
+	// sessionsLocksCmdRun resolves the data directory via setupApp ->
+	// config.Load/config.Init, which read real config paths from the
+	// environment unless isolated — see isolateConfigEnvForTests's doc
+	// comment (task #224 finding 3).
+	tmp := isolateConfigEnvForTests(t)
+
+	workDir := t.TempDir()
+	orig, err := os.Getwd()
+	require.NoError(t, err)
+	require.NoError(t, os.Chdir(workDir))
+	t.Cleanup(func() { _ = os.Chdir(orig) })
+
+	// Deliberately outside workDir entirely, so filepath.Join(cwd, ".crush")
+	// can never accidentally coincide with this path.
+	configuredDataDir := filepath.Join(tmp, "elsewhere-data")
+
+	ensureRootFlagStandIns(sessionsLocksCmd, configuredDataDir)
+	if f := sessionsLocksCmd.Flags().Lookup("cwd"); f == nil {
+		sessionsLocksCmd.Flags().StringP("cwd", "c", "", "")
+	}
+	require.NoError(t, sessionsLocksCmd.Flags().Set("cwd", ""))
+	require.NoError(t, sessionsLocksCmd.Flags().Set("json", "false"))
+	require.NoError(t, sessionsLocksCmd.Flags().Set("stale-only", "false"))
+	sessionsLocksCmd.SetContext(context.Background())
+
+	const sessionID = "configured-datadir-locks-id"
+	lockDir := filepath.Join(configuredDataDir, "locks")
+	require.NoError(t, os.MkdirAll(lockDir, 0o755))
+	lockPath := filepath.Join(lockDir, "session-"+sessionID+".lock")
+	require.NoError(t, os.WriteFile(lockPath, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0o644))
+
+	// Fresh mtime so the auto-delete-if-stale path (age > 60s) never
+	// triggers and this test's assertion is about listing, not survival.
+	now := time.Now()
+	require.NoError(t, os.Chtimes(lockPath, now, now))
+
+	// Sanity: the WRONG (pre-fix) path must not exist, so "(no locks)"
+	// being printed can never be confused with a real find.
+	wrongPath := filepath.Join(workDir, ".crush", "locks", "session-"+sessionID+".lock")
+	_, wrongStatErr := os.Stat(wrongPath)
+	require.True(t, os.IsNotExist(wrongStatErr))
+
+	stdout := captureStdout(t, func() {
+		runErr := sessionsLocksCmd.RunE(sessionsLocksCmd, nil)
+		require.NoError(t, runErr)
+	})
+	t.Logf("sessions locks stdout:\n%s", stdout)
+
+	require.NotContains(t, stdout, "(no locks)",
+		"fix must find the lock at the --data-dir-configured location, not report none found")
+	require.Contains(t, stdout, sessionID,
+		"listing must include the session seeded at the configured data dir")
+}
+
+// TestSessionsLocksCmdRun_ReadsPIDViaSidecarFallback is the regression test
+// for task #231 finding 2: sessionsLocksCmdRun read the PID column via a raw
+// os.ReadFile(lockPath) + fmt.Sscanf, instead of the shared
+// session.ReadLockPID helper used everywhere else in this codebase (e.g.
+// sessions_kill.go's --force block). session.ReadLockPID (internal/session/
+// lock.go's readLockFile) prefers the companion PID sidecar file
+// (pidSidecarPath / writePIDSidecar) over the lock file's own content
+// specifically because, on Windows, a live holder's mandatory LockFileEx
+// range-lock can make the lock file's own content unreadable to a concurrent
+// reader — the sidecar is written unlocked so it's always readable.
+//
+// Exercising the genuinely-unreadable-on-Windows case cross-platform isn't
+// practical (that requires a real second process holding an OS range-lock,
+// which is what TestLockHolderProvablyDead_StaleMtimeButLiveHolder_NotDeleted
+// already spawns for a different assertion). Instead this test proves the
+// mechanism the fix actually wires in: the sidecar is authoritative even
+// when it DISAGREES with the raw lock file content (which the old
+// Sscanf-based code could only ever have read). If sessionsLocksCmdRun ever
+// regresses back to raw-parsing the lock file, this test catches it by
+// asserting the sidecar's PID — not the lock file's stale/garbage content —
+// is what ends up in the PID column.
+func TestSessionsLocksCmdRun_ReadsPIDViaSidecarFallback(t *testing.T) {
+	tmp := isolateConfigEnvForTests(t)
+
+	workDir := t.TempDir()
+	orig, err := os.Getwd()
+	require.NoError(t, err)
+	require.NoError(t, os.Chdir(workDir))
+	t.Cleanup(func() { _ = os.Chdir(orig) })
+
+	dataDir := filepath.Join(tmp, "sidecar-data")
+	ensureRootFlagStandIns(sessionsLocksCmd, dataDir)
+	if f := sessionsLocksCmd.Flags().Lookup("cwd"); f == nil {
+		sessionsLocksCmd.Flags().StringP("cwd", "c", "", "")
+	}
+	require.NoError(t, sessionsLocksCmd.Flags().Set("cwd", ""))
+	require.NoError(t, sessionsLocksCmd.Flags().Set("json", "false"))
+	require.NoError(t, sessionsLocksCmd.Flags().Set("stale-only", "false"))
+	sessionsLocksCmd.SetContext(context.Background())
+
+	const sessionID = "sidecar-fallback-id"
+	const sidecarPID = 424242
+	const staleLockContentPID = 111111 // deliberately different from sidecarPID
+
+	lockDir := filepath.Join(dataDir, "locks")
+	require.NoError(t, os.MkdirAll(lockDir, 0o755))
+	lockPath := filepath.Join(lockDir, "session-"+sessionID+".lock")
+	// The lock file's own content: a garbage/stale PID a raw Sscanf-based
+	// reader would have returned.
+	require.NoError(t, os.WriteFile(lockPath, []byte(fmt.Sprintf("%d\n", staleLockContentPID)), 0o644))
+	// The sidecar: what session.ReadLockPID actually prefers. Written via
+	// the same mechanism TryAcquireSessionLock uses in production
+	// (pidSidecarPath(lockPath) = lockPath + ".pid").
+	require.NoError(t, os.WriteFile(lockPath+".pid", []byte(fmt.Sprintf("%d\n", sidecarPID)), 0o644))
+
+	now := time.Now()
+	require.NoError(t, os.Chtimes(lockPath, now, now))
+
+	// Confirm session.ReadLockPID itself resolves to the sidecar value —
+	// this is the exact helper the fix wires sessionsLocksCmdRun to call.
+	require.Equal(t, sidecarPID, session.ReadLockPID(lockPath),
+		"session.ReadLockPID must prefer the sidecar over the lock file's own content")
+
+	stdout := captureStdout(t, func() {
+		runErr := sessionsLocksCmd.RunE(sessionsLocksCmd, nil)
+		require.NoError(t, runErr)
+	})
+	t.Logf("sessions locks stdout:\n%s", stdout)
+
+	require.Contains(t, stdout, fmt.Sprintf("%d", sidecarPID),
+		"PID column must reflect the sidecar-resolved PID (session.ReadLockPID), not the raw lock-file content")
+	require.NotContains(t, stdout, fmt.Sprintf("\t%d\t", staleLockContentPID),
+		"PID column must not fall back to a raw Sscanf of the lock file's own content when a sidecar disagrees")
 }

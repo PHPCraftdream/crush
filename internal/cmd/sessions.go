@@ -1040,12 +1040,12 @@ func sessionsLocksCmdRun(cmd *cobra.Command, args []string) error {
 	}
 	defer a.Shutdown()
 
-	cwd, err := ResolveCwd(cmd)
-	if err != nil {
-		return err
-	}
-
-	locksDir := filepath.Join(cwd, ".crush", "locks")
+	// Use the data directory setupApp already resolved onto `a` (honors
+	// --data-dir and the project's configured data_directory) instead of
+	// recomputing a cwd-based guess — see task #219/#224, and task #231
+	// (this exact function was left unfixed when those landed).
+	dataDir := a.Config().Options.DataDirectory
+	locksDir := filepath.Join(dataDir, "locks")
 	entries, err := os.ReadDir(locksDir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -1105,7 +1105,7 @@ func sessionsLocksCmdRun(cmd *cobra.Command, args []string) error {
 		// lets a second process create a fresh inode at the same path and
 		// believe it owns the session — two owners of one session id.
 		if age > autoDeleteAfter {
-			if lockHolderProvablyDead(filepath.Join(cwd, ".crush"), sessionID) {
+			if lockHolderProvablyDead(dataDir, sessionID) {
 				if err := os.Remove(lockPath); err == nil {
 					fmt.Fprintf(os.Stderr, "removed stale lock %s (age %ds, holder provably dead)\n", entry.Name(), int(age.Seconds()))
 				}
@@ -1142,9 +1142,12 @@ func sessionsLocksCmdRun(cmd *cobra.Command, args []string) error {
 			continue
 		}
 
-		pidBytes, _ := os.ReadFile(lockPath)
-		pid := 0
-		fmt.Sscanf(strings.TrimSpace(string(pidBytes)), "%d", &pid)
+		// session.ReadLockPID (not a raw os.ReadFile+Sscanf) so a live
+		// holder's PID is still readable on Windows, where the holder's
+		// mandatory LockFileEx range-lock can make the lock file's own
+		// content unreadable to this process — see readLockFile's sidecar
+		// fallback (internal/session/lock.go) and task #231.
+		pid := session.ReadLockPID(lockPath)
 		budgetSec := session.ReadLockTimeoutSec(lockPath)
 
 		// Approximate acquire time: mtime when pulse was fresh.
