@@ -105,10 +105,11 @@ func explainSessionStatus(ctx context.Context, a *app.App, dataDir, sessionID st
 	// sessionsLocksCmdRun, but for the single session we care about.
 	lockPath := filepath.Join(dataDir, "locks", "session-"+sanitiseSessionIDForFilename(sessionID)+".lock")
 	var (
-		hasLock  bool
-		pid      int
-		pidAlive bool
-		heartAge time.Duration
+		hasLock          bool
+		pid              int
+		pidAlive         bool
+		pidBoundExceeded bool
+		heartAge         time.Duration
 	)
 	if st, statErr := os.Stat(lockPath); statErr == nil {
 		hasLock = true
@@ -137,6 +138,13 @@ func explainSessionStatus(ctx context.Context, a *app.App, dataDir, sessionID st
 		// exists to explain.
 		switch {
 		case pid > 0 && time.Since(st.ModTime()) >= session.MaxPidFallbackAge:
+			// Age bound forced pidAlive=false even though the PID number may
+			// currently belong to a live, unrelated process (OS reuse). Track
+			// this so the reason text below doesn't claim a factually-alive PID
+			// "is not alive" — the bound from #250 fixed the verdict but left
+			// the explanation text factually wrong in exactly the reuse case
+			// (task #256).
+			pidBoundExceeded = true
 			pidAlive = false
 		case pid > 0:
 			pidAlive = session.IsProcessAlive(pid)
@@ -208,9 +216,20 @@ func explainSessionStatus(ctx context.Context, a *app.App, dataDir, sessionID st
 		// any orchestrator parsing the first line gets the OPPOSITE verdict
 		// from `sessions list` for the same session. The genuinely-crashed
 		// case (no clean finish) stays "status: crashed".
+		// Pick the "why dead" phrasing by cause. A genuinely-dead PID
+		// really isn't alive, but when the age bound (pidBoundExceeded)
+		// forced this branch the recorded PID number may currently belong
+		// to an unrelated, LIVE process (OS reuse). Claiming it "is not
+		// alive" there would contradict what tasklist/ps shows the operator
+		// — the very contradiction task #250's verdict fix was meant to
+		// remove, caught surviving here in the explanation text (#256).
+		holderDeadReason := fmt.Sprintf("lock file exists but holder PID %d is not alive", pid)
+		if pidBoundExceeded {
+			holderDeadReason = fmt.Sprintf("lock file is older than MaxPidFallbackAge (%s); its recorded PID %d is no longer trustworthy (likely OS PID reuse) — treating the holder as dead", formatDurationShort(session.MaxPidFallbackAge), pid)
+		}
 		if finish != nil && finish.Reason == message.FinishReasonEndTurn {
 			fmt.Fprintf(out, "status: done (stale lock)\n")
-			fmt.Fprintf(out, "reason: lock file exists but holder PID %d is not alive; last assistant message finished cleanly (end_turn).\n", pid)
+			fmt.Fprintf(out, "reason: %s; last assistant message finished cleanly (end_turn).\n", holderDeadReason)
 			fmt.Fprintf(out, "\n")
 			fmt.Fprintf(out, "NOTE: this matches the reclassification \"sessions list\" applies via\n")
 			fmt.Fprintf(out, "reclassifyCrashedAsDone — likely a stale lock from a process that exited\n")
@@ -218,7 +237,7 @@ func explainSessionStatus(ctx context.Context, a *app.App, dataDir, sessionID st
 			fmt.Fprintf(out, "Treat as done.\n")
 		} else {
 			fmt.Fprintf(out, "status: crashed\n")
-			fmt.Fprintf(out, "reason: lock file exists but holder PID %d is not alive.\n", pid)
+			fmt.Fprintf(out, "reason: %s.\n", holderDeadReason)
 			if lastAssistant == nil {
 				fmt.Fprintf(out, "no assistant message with a clean finish — likely died mid-turn.\n")
 			} else {

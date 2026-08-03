@@ -355,6 +355,10 @@ func TestExplainSessionStatus_PidReuseBeyondMaxFallbackAgeIsNotRunning(t *testin
 		"a lock older than MaxPidFallbackAge must not be reported running just because its recorded PID currently belongs to a live (but unrelated) process — this is the core #250 fix; sessions why must agree with sessions list")
 	require.Contains(t, out, "status: crashed",
 		"with no clean assistant finish, the bound-forced dead verdict must surface as crashed, matching what sessions list shows for the same session")
+	require.Contains(t, out, "no longer trustworthy",
+		"the bound-triggered reason must explain the recorded PID is untrusted due to age/PID reuse — not claim it is dead")
+	require.NotContains(t, out, "is not alive",
+		"the recorded PID is factually alive in this scenario (OS reuse, via spawnKillTestLockHolder) — claiming 'is not alive' would be the same factual lie task #250's verdict fix was meant to remove, relocated to the reason text (#256)")
 }
 
 // TestExplainSessionStatus_PidAliveWithinMaxFallbackAgeIsRunning is the
@@ -391,4 +395,8 @@ func TestExplainSessionStatus_PidAliveWithinMaxFallbackAgeIsRunning(t *testing.T
 	out := buf.String()
 	require.Contains(t, out, "status: running",
 		"a live PID just under MaxPidFallbackAge must still be trusted as running")
+	require.NotContains(t, out, "no longer trustworthy",
+		"a fresh live PID within the bound must not trigger the PID-reuse/untrusted wording")
+	require.NotContains(t, out, "is not alive",
+		"a running session must not show any dead-case phrasing")
 }
