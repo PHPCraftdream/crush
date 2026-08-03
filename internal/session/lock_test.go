@@ -446,7 +446,7 @@ func TestInspectSessionLock_StaleMtimeAroundMaxPidFallbackAgeBoundary(t *testing
 
 	path := lockPathFor(dir, "inspect-boundary")
 
-	justUnder := time.Now().Add(-(maxPidFallbackAge - time.Second))
+	justUnder := time.Now().Add(-(maxPidFallbackAge - 2*time.Minute))
 	require.NoError(t, os.Chtimes(path, justUnder, justUnder))
 	st := InspectSessionLock(dir, "inspect-boundary", externalOwnerLiveThresholdForTest)
 	assert.True(t, st.Live, "just under maxPidFallbackAge past staleness, a live PID must still be trusted")

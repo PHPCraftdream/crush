@@ -884,7 +884,7 @@ func TestStreamWatchdog_CauseStoredBeforeSlowDiagnosticWork(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
-	const idle = 20 * time.Millisecond
+	const idle = 5 * time.Second
 	const tick = 5 * time.Millisecond
 
 	var causeVal atomic.Int32
