@@ -425,14 +425,40 @@ type LockState struct {
 	Exists bool          // lock file is present on disk
 	PID    int           // PID written into the lock file (0 if unreadable)
 	Age    time.Duration // time since the last heartbeat touch (mtime)
-	Live   bool          // Age < liveThreshold — a healthy owner is touching it
+	// Live reports whether the lock holder is still (probably) alive.
+	// Primarily Age < liveThreshold — a healthy owner is touching the
+	// heartbeat. But per task #228, mtime alone is not sufficient: the
+	// heartbeat's mtime touch is gated on real RecordActivity() calls
+	// (task #213/#214), and the stream watchdog that drives those calls
+	// during a tool-in-flight only fires roughly every 30s (task #222,
+	// streamWatchdogTick) — larger than the 20s liveThreshold callers
+	// typically pass. That leaves a real window where a perfectly healthy
+	// session blocked on one long tool call looks stale by mtime alone.
+	// When mtime looks stale, InspectSessionLock falls back to a real PID
+	// liveness probe (session.IsProcessAlive) before concluding the
+	// holder is dead — same principle sessions_watch.go's
+	// combinedLockLiveness already established for the `sessions watch`
+	// consumer.
+	Live bool
 }
 
 // InspectSessionLock reads the lock file for `sessionID` under `dataDir`
 // without acquiring it. Safe to call from any process — no side effects.
 // `liveThreshold` defines how fresh the heartbeat must be to count as
-// "live" (callers typically pass 20s — the same expiry the heartbeat
-// loop uses; see TryAcquireSessionLock comments).
+// "live" by mtime alone (callers typically pass 20s — the same expiry the
+// heartbeat loop uses; see TryAcquireSessionLock comments).
+//
+// mtime freshness is only the fast path, not the whole story — see the
+// Live field's doc comment on LockState for why: task #228 found that a
+// healthy, tool-busy session can transiently look stale by mtime alone
+// (heartbeat is activity-gated, the stream watchdog's tick that supplies
+// that activity can be slower than liveThreshold). When mtime already
+// looks stale, this falls back to probing whether the recorded PID is
+// still a live OS process (session.IsProcessAlive) before reporting
+// Live: false — mirroring the same "don't trust mtime alone" fallback
+// sessions_watch.go's combinedLockLiveness already uses. The PID probe is
+// only attempted once mtime is already stale, so the common case (mtime
+// fresh) pays no extra cost.
 func InspectSessionLock(dataDir, sessionID string, liveThreshold time.Duration) LockState {
 	if dataDir == "" || sessionID == "" {
 		return LockState{}
@@ -444,11 +470,20 @@ func InspectSessionLock(dataDir, sessionID string, liveThreshold time.Duration) 
 	}
 	pid := ReadLockPID(path)
 	age := time.Since(st.ModTime())
+	live := age < liveThreshold
+	if !live && pid > 0 {
+		// mtime looks stale — task #228: fall back to a real PID liveness
+		// check before concluding the holder is dead, since the
+		// heartbeat's mtime touch is now gated on real activity and a
+		// healthy session blocked on one long tool call can look stale
+		// here even though it is still genuinely running.
+		live = IsProcessAlive(pid)
+	}
 	return LockState{
 		Exists: true,
 		PID:    pid,
 		Age:    age,
-		Live:   age < liveThreshold,
+		Live:   live,
 	}
 }
 

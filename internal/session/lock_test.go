@@ -342,6 +342,106 @@ func TestRecordActivity_ConcurrentSafe(t *testing.T) {
 	wg.Wait()
 }
 
+// TestInspectSessionLock_FreshMtimeIsLiveFastPath proves the existing
+// "mtime fresh" fast path is unaffected by the task #228 PID-fallback
+// change: immediately after acquiring a lock, mtime is fresh, so Live must
+// be true without needing (or attempting) any PID probe.
+func TestInspectSessionLock_FreshMtimeIsLiveFastPath(t *testing.T) {
+	dir := t.TempDir()
+	lk, err := TryAcquireSessionLock(dir, "inspect-fresh")
+	require.NoError(t, err)
+	defer lk.Release()
+
+	st := InspectSessionLock(dir, "inspect-fresh", externalOwnerLiveThresholdForTest)
+	assert.True(t, st.Exists)
+	assert.True(t, st.Live, "a freshly acquired lock's mtime must be well within the live threshold")
+	assert.Equal(t, os.Getpid(), st.PID)
+}
+
+// TestInspectSessionLock_StaleMtimeButLivePIDIsStillLive is the core
+// regression test for task #228: a lock's heartbeat mtime is now gated on
+// real RecordActivity() calls (task #213/#214), and the stream watchdog
+// that supplies those calls while a tool is in flight only fires roughly
+// every 30s (task #222) — larger than the 20s liveThreshold most callers
+// pass. That leaves a real window where a perfectly healthy, tool-busy
+// session looks mtime-stale even though it's still genuinely running. A
+// real second process holds the lock (spawnLockHolder, mirroring the
+// pattern used throughout this file / sessions_kill_test.go's
+// spawnKillTestLockHolder) so the PID-liveness fallback is exercised
+// against a genuinely live OS process, not a same-process fake. We
+// back-date the lock file's mtime past the threshold to simulate the
+// heartbeat lagging behind a long tool call, then assert
+// InspectSessionLock still reports Live: true via the PID fallback.
+func TestInspectSessionLock_StaleMtimeButLivePIDIsStillLive(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns a real child process; skipped in -short")
+	}
+	dir := t.TempDir()
+
+	holder := spawnLockHolder(t, dir, "inspect-stale-live", 0 /* hold until stopped */)
+	defer holder.stop(t)
+	require.True(t, holder.locked, "helper process failed to acquire lock: %s", holder.failed)
+
+	path := lockPathFor(dir, "inspect-stale-live")
+	staleTime := time.Now().Add(-(externalOwnerLiveThresholdForTest + 5*time.Second))
+	require.NoError(t, os.Chtimes(path, staleTime, staleTime),
+		"back-dating mtime to simulate a heartbeat lagging behind one long tool call on an otherwise-healthy session")
+
+	require.True(t, IsProcessAlive(holder.pid), "helper process must still be alive for this test to be meaningful")
+
+	st := InspectSessionLock(dir, "inspect-stale-live", externalOwnerLiveThresholdForTest)
+	assert.True(t, st.Exists)
+	assert.Equal(t, holder.pid, st.PID)
+	assert.True(t, st.Live, "a stale mtime must not override a genuinely live PID holder — this is the core #228 fix")
+}
+
+// TestInspectSessionLock_StaleMtimeAndDeadPIDIsNotLive is the conservative
+// companion to the fix above: when mtime is stale AND the recorded PID is
+// genuinely dead, InspectSessionLock must still report Live: false. The
+// PID-fallback must not regress the correct "actually dead" case into a
+// false positive.
+func TestInspectSessionLock_StaleMtimeAndDeadPIDIsNotLive(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "locks", "session-inspect-stale-dead.lock")
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+
+	// PID 0x7FFFFFFE is virtually guaranteed not to be a running process
+	// (same sentinel TestTryAcquireSessionLock_OrphanPIDIsCleared uses).
+	require.NoError(t, os.WriteFile(path, []byte("2147483646\n"), 0o644))
+	staleTime := time.Now().Add(-(externalOwnerLiveThresholdForTest + 5*time.Second))
+	require.NoError(t, os.Chtimes(path, staleTime, staleTime))
+
+	st := InspectSessionLock(dir, "inspect-stale-dead", externalOwnerLiveThresholdForTest)
+	assert.True(t, st.Exists)
+	assert.False(t, st.Live, "a stale mtime with a genuinely dead PID must still report Live: false")
+}
+
+// TestInspectSessionLock_StaleMtimeAndUnreadablePIDIsNotLive covers the
+// sibling conservative case: mtime is stale and the lock file has no
+// readable PID at all (PID 0). There is nothing to probe, so this must
+// fall straight through to Live: false, exactly like the pure-mtime
+// behavior did before task #228.
+func TestInspectSessionLock_StaleMtimeAndUnreadablePIDIsNotLive(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "locks", "session-inspect-stale-nopid.lock")
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+
+	require.NoError(t, os.WriteFile(path, []byte(""), 0o644))
+	staleTime := time.Now().Add(-(externalOwnerLiveThresholdForTest + 5*time.Second))
+	require.NoError(t, os.Chtimes(path, staleTime, staleTime))
+
+	st := InspectSessionLock(dir, "inspect-stale-nopid", externalOwnerLiveThresholdForTest)
+	assert.True(t, st.Exists)
+	assert.Equal(t, 0, st.PID)
+	assert.False(t, st.Live, "a stale mtime with no readable PID must report Live: false")
+}
+
+// externalOwnerLiveThresholdForTest mirrors internal/server/handlers.go's
+// externalOwnerLiveThreshold (20s) — the actual threshold InspectSessionLock
+// is called with in production. Duplicated here (rather than imported) to
+// avoid this low-level package depending on internal/server.
+const externalOwnerLiveThresholdForTest = 20 * time.Second
+
 func TestLockPathStructure(t *testing.T) {
 	dir := t.TempDir()
 	lk, err := TryAcquireSessionLock(dir, "audit-A")

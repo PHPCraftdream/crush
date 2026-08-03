@@ -673,15 +673,25 @@ func handleDeleteOtherSessions(ctx context.Context, a *appPkg.App, c *Client, ms
 
 // externalOwnerLiveThreshold mirrors the heartbeat expiry used by the lock
 // acquisition path: a lock whose mtime is fresher than this is treated as a
-// live external owner. The lock-renewer touches the file every ~10s, so 20s
-// gives one missed tick of slack without flipping foreign-owned sessions
-// in and out of read-only mode.
+// live external owner by the mtime fast path. The lock-renewer touches the
+// file every ~10s, so 20s gives one missed tick of slack without flipping
+// foreign-owned sessions in and out of read-only mode.
+//
+// This is no longer the whole story (task #228): InspectSessionLock (which
+// both annotator functions below call) falls back to a real PID liveness
+// probe when mtime looks stale past this threshold, so a session blocked on
+// one long tool call — whose heartbeat mtime can lag past 20s, since it's
+// gated on activity ticks from the stream watchdog which fire roughly every
+// 30s (task #222) — is still correctly reported as live rather than
+// flickering to "not externally owned" and back.
 const externalOwnerLiveThreshold = 20 * time.Second
 
 // annotateExternalOwnership fills OwnedExternal/OwnedByPID for every session
-// in the slice. Only flags sessions whose live lock holder is a DIFFERENT
-// process — sessions held by us are owned-but-not-external (the UI keeps
-// full controls). Sessions with no lock or only a stale lock are left clean.
+// in the slice. Only flags sessions whose live lock holder (mtime freshness,
+// falling back to real PID liveness when mtime looks stale — see
+// InspectSessionLock) is a DIFFERENT process — sessions held by us are
+// owned-but-not-external (the UI keeps full controls). Sessions with no
+// lock, or a lock that is both mtime-stale and PID-dead, are left clean.
 func annotateExternalOwnership(a *appPkg.App, sessions []session.Session) {
 	dataDir := externalOwnershipDataDir(a)
 	if dataDir == "" {
@@ -701,7 +711,8 @@ func annotateExternalOwnership(a *appPkg.App, sessions []session.Session) {
 // AnnotateSessionExternalOwnership is the single-session variant used by the
 // session pubsub bridge in events.go and by every handler that broadcasts a
 // fresh Session payload over WS. Exported so events.go can reach it without
-// duplicating the lock-inspection logic.
+// duplicating the lock-inspection logic. See annotateExternalOwnership's doc
+// comment for the mtime-plus-PID-fallback liveness semantics (task #228).
 func AnnotateSessionExternalOwnership(a *appPkg.App, s *session.Session) {
 	if s == nil {
 		return
