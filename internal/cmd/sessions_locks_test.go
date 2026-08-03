@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -228,6 +229,153 @@ func TestSessionsLocksCmdRun_HonorsConfiguredDataDir(t *testing.T) {
 		"fix must find the lock at the --data-dir-configured location, not report none found")
 	require.Contains(t, stdout, sessionID,
 		"listing must include the session seeded at the configured data dir")
+}
+
+// TestSessionsLocksCmdRun_RemoveFailureAfterProvablyDead_Surfaced is the
+// regression test for task #234: sessionsLocksCmdRun's auto-delete branch
+// used to silently swallow an os.Remove failure after
+// lockHolderProvablyDead(dataDir, sessionID) had already proven the holder
+// dead — `if err := os.Remove(lockPath); err == nil { ...report... };
+// continue` — printing nothing on the error path and unconditionally
+// `continue`-ing, so the entry vanished from the listing entirely with zero
+// operator-visible signal anything went wrong.
+//
+// This matters because lockHolderProvablyDead's own probe-then-release
+// cycle (TryAcquireSessionLock/Release) truncates the lock file's content
+// and freshens its mtime as a side effect of proving death (see that
+// function's doc comment). If the immediately-following os.Remove then
+// fails — a real, if narrow, possibility on Windows, whose lock files are
+// opened without FILE_SHARE_DELETE — the file is left behind with a wiped
+// PID and a FRESH mtime, which every PID-fallback/mtime-based liveness
+// consumer in this codebase would read as LIVE, even though the holder was
+// just proven dead moments earlier.
+//
+// This is a REAL end-to-end repro, not a synthetic error: a plain
+// os.OpenFile handle held open on the lock file from this same test process
+// is sufficient to make a subsequent os.Remove fail with a genuine sharing
+// violation on Windows (confirmed directly: opening a file, taking no OS
+// advisory lock at all, and calling os.Remove on it while the handle stays
+// open fails the same way). Crucially this share-mode delete-block is
+// independent of the LockFileEx advisory lock lockHolderProvablyDead
+// acquires and releases — so the probe itself still succeeds and reports
+// "provably dead" (the held-open handle doesn't contend for the advisory
+// lock), while the caller's subsequent os.Remove on the same path still
+// fails because of the open handle. That is exactly the fix's target
+// scenario: Remove fails AFTER lockHolderProvablyDead already returned true.
+func TestSessionsLocksCmdRun_RemoveFailureAfterProvablyDead_Surfaced(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("relies on Windows delete-sharing semantics (no FILE_SHARE_DELETE) to force a real os.Remove failure deterministically")
+	}
+
+	tmp := isolateConfigEnvForTests(t)
+
+	workDir := t.TempDir()
+	orig, err := os.Getwd()
+	require.NoError(t, err)
+	require.NoError(t, os.Chdir(workDir))
+	t.Cleanup(func() { _ = os.Chdir(orig) })
+
+	dataDir := filepath.Join(tmp, "remove-fail-data")
+	ensureRootFlagStandIns(sessionsLocksCmd, dataDir)
+	if f := sessionsLocksCmd.Flags().Lookup("cwd"); f == nil {
+		sessionsLocksCmd.Flags().StringP("cwd", "c", "", "")
+	}
+	require.NoError(t, sessionsLocksCmd.Flags().Set("cwd", ""))
+	require.NoError(t, sessionsLocksCmd.Flags().Set("json", "false"))
+	require.NoError(t, sessionsLocksCmd.Flags().Set("stale-only", "false"))
+	sessionsLocksCmd.SetContext(context.Background())
+
+	const sessionID = "remove-fail-provably-dead-id"
+	lockDir := filepath.Join(dataDir, "locks")
+	require.NoError(t, os.MkdirAll(lockDir, 0o755))
+	lockPath := filepath.Join(lockDir, "session-"+sessionID+".lock")
+	require.NoError(t, os.WriteFile(lockPath, []byte(fmt.Sprintf("%d\n", 999999)), 0o644))
+
+	// Backdate well past the 60s auto-delete threshold so the auto-delete
+	// branch is entered.
+	oldTime := time.Now().Add(-5 * time.Minute)
+	require.NoError(t, os.Chtimes(lockPath, oldTime, oldTime))
+
+	// Sanity: nobody holds the real OS lock, so lockHolderProvablyDead must
+	// report true — this test is about what happens to the SUBSEQUENT
+	// os.Remove, not about the probe itself. NOTE: this precondition call
+	// itself performs a full acquire+release cycle, which (like the real
+	// probe inside sessionsLocksCmdRun) freshens the lock file's mtime as a
+	// side effect (see lockHolderProvablyDead's doc comment) — so the mtime
+	// must be re-backdated afterward, or the real run below would see a
+	// fresh mtime and never enter the auto-delete branch at all.
+	require.True(t, lockHolderProvablyDead(dataDir, sessionID),
+		"precondition: probe must report the holder provably dead before this test's Remove-failure scenario is meaningful")
+	require.NoError(t, os.Chtimes(lockPath, oldTime, oldTime))
+
+	// Hold a plain, unlocked handle open on the lock file. This blocks
+	// os.Remove via Windows delete-sharing (confirmed independent of the
+	// LockFileEx advisory lock the probe above already took and released).
+	blocker, err := os.OpenFile(lockPath, os.O_RDWR, 0o644)
+	require.NoError(t, err)
+	defer blocker.Close()
+
+	stdout, stderr := captureStdoutAndStderr(t, func() {
+		runErr := sessionsLocksCmd.RunE(sessionsLocksCmd, nil)
+		require.NoError(t, runErr)
+	})
+	t.Logf("sessions locks stdout:\n%s", stdout)
+	t.Logf("sessions locks stderr:\n%s", stderr)
+
+	require.Contains(t, stderr, "warning: could not remove provably-dead lock",
+		"a Remove failure after lockHolderProvablyDead returned true must be surfaced, never silently swallowed")
+	require.Contains(t, stderr, "session-"+sessionID+".lock")
+
+	// The entry must still show up in the listing (fell through to the
+	// normal display path) rather than silently vanishing, since the file
+	// genuinely still exists on disk with misleadingly fresh-looking
+	// metadata.
+	require.Contains(t, stdout, sessionID,
+		"a lock whose removal failed must still appear in the listing, not silently vanish")
+
+	// The file must still be on disk (Remove genuinely failed).
+	require.FileExists(t, lockPath)
+}
+
+// captureStdoutAndStderr runs f while capturing both os.Stdout and
+// os.Stderr, mirroring captureStdout/captureStderr individually. Needed
+// here because the fix under test writes to BOTH streams in one invocation
+// (the warning to stderr, the listing to stdout) and both must be asserted
+// on from the same run.
+func captureStdoutAndStderr(t *testing.T, f func()) (stdout string, stderr string) {
+	t.Helper()
+	oldOut, oldErr := os.Stdout, os.Stderr
+
+	outR, outW, err := os.Pipe()
+	require.NoError(t, err)
+	errR, errW, err := os.Pipe()
+	require.NoError(t, err)
+
+	os.Stdout = outW
+	os.Stderr = errW
+	defer func() {
+		os.Stdout = oldOut
+		os.Stderr = oldErr
+	}()
+
+	var outBuf, errBuf bytes.Buffer
+	doneOut := make(chan struct{})
+	doneErr := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(&outBuf, outR)
+		close(doneOut)
+	}()
+	go func() {
+		_, _ = io.Copy(&errBuf, errR)
+		close(doneErr)
+	}()
+
+	f()
+	_ = outW.Close()
+	_ = errW.Close()
+	<-doneOut
+	<-doneErr
+	return outBuf.String(), errBuf.String()
 }
 
 // TestSessionsLocksCmdRun_ReadsPIDViaSidecarFallback is the regression test

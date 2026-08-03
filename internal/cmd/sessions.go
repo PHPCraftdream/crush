@@ -1112,16 +1112,41 @@ func sessionsLocksCmdRun(cmd *cobra.Command, args []string) error {
 		// believe it owns the session — two owners of one session id.
 		if age > autoDeleteAfter {
 			if lockHolderProvablyDead(dataDir, sessionID) {
-				if err := os.Remove(lockPath); err == nil {
+				if err := os.Remove(lockPath); err != nil {
+					// Do NOT silently swallow this (task #234). A failed
+					// Remove here is not a harmless no-op: lockHolderProvablyDead's
+					// own acquire+release probe (see its doc comment) truncates
+					// the lock file's content and freshens its mtime as part of
+					// proving death, moments before this Remove runs. If the
+					// Remove then fails (e.g. a Windows sharing-violation window
+					// from a concurrent opener), the file is left behind with a
+					// wiped PID AND a fresh mtime — which every PID-fallback/
+					// mtime-based liveness consumer below (and in isSessionLockAlive
+					// / InspectSessionLock / computeSessionStatuses) would read as
+					// LIVE for the next heartbeat-stale window, even though this
+					// probe JUST proved the holder dead. Silently `continue`-ing
+					// also made the entry vanish from this listing entirely, so an
+					// operator had zero signal anything was wrong. Surface the
+					// failure, then fall through to the normal display path below
+					// instead of `continue`-ing: age is already > autoDeleteAfter
+					// (60s), which lockPulseStatus always classifies as "offline"
+					// (>20s), so the entry is correctly shown as stale/offline
+					// rather than silently dropped from the listing while its
+					// stale file lingers on disk.
+					fmt.Fprintf(os.Stderr, "warning: could not remove provably-dead lock %s: %v\n", entry.Name(), err)
+				} else {
 					fmt.Fprintf(os.Stderr, "removed stale lock %s (age %ds, holder provably dead)\n", entry.Name(), int(age.Seconds()))
+					continue
 				}
-				continue
 			}
 			// mtime looks stale but the real OS lock is still held (or the
-			// probe was inconclusive) — do NOT delete. Fall through and
-			// display it like any other lock; its Pulse will read "offline"
-			// so operators still see it's not heartbeating, without risking
-			// a second process reclaiming a session that is still alive.
+			// probe was inconclusive), or the provably-dead lock's removal
+			// itself failed — do NOT delete (or it's already gone from disk
+			// in the success case above, which already `continue`d). Fall
+			// through and display it like any other lock; its Pulse will
+			// read "offline" so operators still see it's not heartbeating,
+			// without risking a second process reclaiming a session that is
+			// still alive.
 		}
 
 		pulseSec := int64(age.Seconds())
