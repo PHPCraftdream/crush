@@ -1061,6 +1061,14 @@ func lockHolderProvablyDead(dataDir, sessionID string) bool {
 	return true
 }
 
+// preAutoDeleteRemoveHook is a test-only seam for sessionsLocksCmdRun's
+// auto-delete branch. When non-nil, it is called synchronously between
+// lockHolderProvablyDead proving a holder dead and the os.Remove call,
+// allowing a test to deterministically reproduce the TOCTOU window where a
+// concurrent process removes the lock file between the probe and the Remove.
+// Always nil in production.
+var preAutoDeleteRemoveHook func(lockPath string)
+
 func sessionsLocksCmdRun(cmd *cobra.Command, args []string) error {
 	asJSON, _ := cmd.Flags().GetBool("json")
 	staleOnly, _ := cmd.Flags().GetBool("stale-only")
@@ -1137,6 +1145,9 @@ func sessionsLocksCmdRun(cmd *cobra.Command, args []string) error {
 		// believe it owns the session — two owners of one session id.
 		if age > autoDeleteAfter {
 			if lockHolderProvablyDead(dataDir, sessionID) {
+				if preAutoDeleteRemoveHook != nil {
+					preAutoDeleteRemoveHook(lockPath)
+				}
 				err := os.Remove(lockPath)
 				switch {
 				case err == nil, errors.Is(err, fs.ErrNotExist):

@@ -337,54 +337,30 @@ func TestSessionsLocksCmdRun_RemoveFailureAfterProvablyDead_Surfaced(t *testing.
 	require.FileExists(t, lockPath)
 }
 
-// TestSessionsLocksCmdRun_RemoveRaceWithConcurrentDelete_TreatedAsSuccess is
-// the regression test for task #244: task #234's fix (see
-// TestSessionsLocksCmdRun_RemoveFailureAfterProvablyDead_Surfaced above)
-// correctly stopped silently swallowing a genuine os.Remove failure after
-// lockHolderProvablyDead proved the holder dead, but it over-corrected — it
-// treated EVERY os.Remove error as worthy of a stderr warning plus a
-// fall-through to the display path, including fs.ErrNotExist. That specific
-// error means a concurrent process (`sessions reap`, `sessions kill`,
-// `sessions reset --force`, or another parallel `sessions locks` racing the
-// same auto-delete path — this function's own doc comment on
-// lockHolderProvablyDead calls this exact TOCTOU window out as gap #1,
-// "single-digit milliseconds" wide but real) already removed the file
-// between this call's lockHolderProvablyDead probe and its own os.Remove.
-// The goal ("stale lock gone from disk") is already achieved, so ENOENT
-// here is success, not failure — printing a warning is a false positive,
-// and falling through to the display path shows a phantom row (PID 0,
-// offline, age from a now-stale cached DirEntry.Info()) for a file that no
-// longer exists.
+// TestSessionsLocksCmdRun_ConcurrentDeleteBeforeRemove_ENOENTIsSuccess is
+// the deterministic regression test for task #244: task #234's fix (see
+// TestSessionsLocksCmdRun_RemoveFailureAfterProvablyDead_Surfaced) correctly
+// stopped silently swallowing a genuine os.Remove failure after
+// lockHolderProvablyDead proved the holder dead, but over-corrected by
+// treating EVERY os.Remove error — including fs.ErrNotExist — as
+// warning-worthy. fs.ErrNotExist means a concurrent process (`sessions reap`,
+// `sessions kill`, `sessions reset --force`, or another parallel `sessions
+// locks` racing the same auto-delete path) already removed the file between
+// lockHolderProvablyDead's probe and this Remove call. The goal ("stale lock
+// gone from disk") is already achieved, so ENOENT here is success, not
+// failure.
 //
-// This is a REAL end-to-end repro of that exact TOCTOU window, not a
-// synthetic error: a background goroutine plays the "concurrent remover"
-// role, racing sessionsLocksCmdRun's own internal os.Remove call for the
-// same path, the same way a second real `sessions reap`/`kill`/`locks`
-// process would. Two things make this deterministic rather than a coin
-// flip:
-//
-//  1. The racer does not start attempting removal until it observes the
-//     lock file's mtime move off the backdated oldTime — the same
-//     Chtimes(path, now, now) acquireSessionLockFile performs while still
-//     holding the file open, partway through the real run's
-//     lockHolderProvablyDead probe (internal/session/lock.go). Starting any
-//     earlier would let the racer win before the real run even reaches
-//     os.ReadDir, which would test nothing (the entry would never be
-//     listed at all, let alone reach the auto-delete branch).
-//  2. Once triggered, the racer retries os.Remove in a tight loop rather
-//     than trying once: while the probe still holds the file open (mid
-//     truncate/PID-write/Sync, before Release closes the handle), an
-//     os.Remove attempt genuinely fails with a transient Windows sharing
-//     violation — that is not the scenario under test and must not abort
-//     the racer early. It keeps retrying past that until the attempt that
-//     finally lands either wins outright (the racer unlinks the file
-//     first) or loses to sessionsLocksCmdRun's own os.Remove call.
-//
-// Whichever side loses that race observes fs.ErrNotExist — this test
-// asserts the production code path (sessionsLocksCmdRun, not the racer)
-// handles that outcome as success, regardless of which of the two actually
-// performed the unlink.
-func TestSessionsLocksCmdRun_RemoveRaceWithConcurrentDelete_TreatedAsSuccess(t *testing.T) {
+// Unlike the original version of this test (commit ba797493), which relied on
+// a probabilistic goroutine race and could pass via the err==nil branch
+// (production code removing the file first) without ever exercising the
+// fs.ErrNotExist branch the fix targets, this version uses a test-only seam
+// (preAutoDeleteRemoveHook) to deterministically delete the lock file BETWEEN
+// lockHolderProvablyDead returning true and the os.Remove call, guaranteeing
+// os.Remove always observes fs.ErrNotExist. This makes the regression
+// assertion deterministic: reverting fix #244 (dropping the
+// errors.Is(err, fs.ErrNotExist) case) causes this test to fail 100% of the
+// time, not just when a coin flip lands the right way.
+func TestSessionsLocksCmdRun_ConcurrentDeleteBeforeRemove_ENOENTIsSuccess(t *testing.T) {
 	tmp := isolateConfigEnvForTests(t)
 
 	workDir := t.TempDir()
@@ -393,7 +369,7 @@ func TestSessionsLocksCmdRun_RemoveRaceWithConcurrentDelete_TreatedAsSuccess(t *
 	require.NoError(t, os.Chdir(workDir))
 	t.Cleanup(func() { _ = os.Chdir(orig) })
 
-	dataDir := filepath.Join(tmp, "remove-race-data")
+	dataDir := filepath.Join(tmp, "concurrent-delete-data")
 	ensureRootFlagStandIns(sessionsLocksCmd, dataDir)
 	if f := sessionsLocksCmd.Flags().Lookup("cwd"); f == nil {
 		sessionsLocksCmd.Flags().StringP("cwd", "c", "", "")
@@ -403,7 +379,7 @@ func TestSessionsLocksCmdRun_RemoveRaceWithConcurrentDelete_TreatedAsSuccess(t *
 	require.NoError(t, sessionsLocksCmd.Flags().Set("stale-only", "false"))
 	sessionsLocksCmd.SetContext(context.Background())
 
-	const sessionID = "remove-race-concurrent-delete-id"
+	const sessionID = "concurrent-delete-enoent-id"
 	lockDir := filepath.Join(dataDir, "locks")
 	require.NoError(t, os.MkdirAll(lockDir, 0o755))
 	lockPath := filepath.Join(lockDir, "session-"+sessionID+".lock")
@@ -424,79 +400,122 @@ func TestSessionsLocksCmdRun_RemoveRaceWithConcurrentDelete_TreatedAsSuccess(t *
 		"precondition: probe must report the holder provably dead before this test's race scenario is meaningful")
 	// The precondition probe's own Release() already truncated the file to
 	// empty (see clearHolderMetadata) — restore non-empty placeholder
-	// content so the racer goroutine below can use "content just became
-	// empty" as a signal specific to the REAL run's internal probe, not a
-	// stale leftover from this precondition call.
+	// content so the test is meaningful (file exists before hook deletes it).
 	require.NoError(t, os.WriteFile(lockPath, []byte(fmt.Sprintf("%d\n", 999999)), 0o644))
 	require.NoError(t, os.Chtimes(lockPath, oldTime, oldTime))
 
-	// Background "concurrent remover". See the doc comment above for why it
-	// waits for the mtime to move before attempting anything, and why it
-	// retries past transient sharing violations instead of giving up after
-	// one attempt. Bounded by an overall deadline so a bug that removes
-	// this race entirely (e.g. the probe never running) can't hang the
-	// test.
-	racerDone := make(chan struct{})
-	go func() {
-		defer close(racerDone)
-		deadline := time.Now().Add(10 * time.Second)
-
-		// Phase 1: wait for the real run's probe to signal it is in
-		// flight (mtime moves off the backdated oldTime) or for the file
-		// to disappear entirely (main run somehow already removed it).
-		for time.Now().Before(deadline) {
-			fi, statErr := os.Stat(lockPath)
-			if statErr != nil {
-				if os.IsNotExist(statErr) {
-					return
-				}
-				runtime.Gosched()
-				continue
-			}
-			if !fi.ModTime().Equal(oldTime) {
-				break
-			}
-			runtime.Gosched()
-		}
-
-		// Phase 2: the probe is in flight (or already finished) — start
-		// racing for the actual removal.
-		for time.Now().Before(deadline) {
-			err := os.Remove(lockPath)
-			if err == nil || os.IsNotExist(err) {
-				return
-			}
-			// Busy-poll deliberately: the real TOCTOU window this
-			// reproduces is documented as single-digit milliseconds wide
-			// (see lockHolderProvablyDead's doc comment, gap #1) — any
-			// fixed sleep interval risks missing it entirely.
-			runtime.Gosched()
-		}
-	}()
-	t.Cleanup(func() { <-racerDone })
+	// Install the test seam: delete the file between the probe and
+	// os.Remove, deterministically forcing os.Remove to observe
+	// fs.ErrNotExist — the exact TOCTOU window fix #244 targets.
+	hookFired := false
+	origHook := preAutoDeleteRemoveHook
+	preAutoDeleteRemoveHook = func(path string) {
+		require.Equal(t, lockPath, path)
+		require.NoError(t, os.Remove(path))
+		hookFired = true
+	}
+	t.Cleanup(func() { preAutoDeleteRemoveHook = origHook })
 
 	stdout, stderr := captureStdoutAndStderr(t, func() {
 		runErr := sessionsLocksCmd.RunE(sessionsLocksCmd, nil)
 		require.NoError(t, runErr)
 	})
-	<-racerDone
 	t.Logf("sessions locks stdout:\n%s", stdout)
 	t.Logf("sessions locks stderr:\n%s", stderr)
 
+	// CRITICAL: the hook MUST have fired — this proves the auto-delete
+	// branch was reached and the file was deleted before os.Remove. Without
+	// this assertion, a bug that skips auto-delete entirely would pass
+	// silently.
+	require.True(t, hookFired,
+		"preAutoDeleteRemoveHook must fire; the auto-delete branch was not reached")
+
 	require.NotContains(t, stderr, "warning: could not remove provably-dead lock",
-		"a concurrent-delete race (fs.ErrNotExist) must never be surfaced as a warning — the removal goal was already achieved by someone else")
+		"a concurrent-delete (fs.ErrNotExist) must never be surfaced as a warning — the removal goal was already achieved by someone else")
 	require.Contains(t, stderr, "removed stale lock",
 		"an ENOENT race must still report the normal success message, exactly like an uncontested removal")
 	require.Contains(t, stderr, "session-"+sessionID+".lock")
 
-	// No phantom row: the file is gone (by construction, one of the two
-	// racing removers succeeded), so it must not appear in the listing.
+	// No phantom row: the file is gone, so it must not appear in the listing.
 	require.NotContains(t, stdout, sessionID,
-		"a lock removed via the ENOENT race must not leave a phantom row in the listing")
+		"a lock removed via the ENOENT path must not leave a phantom row in the listing")
 
-	// The file must genuinely be gone (whichever of the two removers won).
+	// The file must genuinely be gone.
 	_, statErr := os.Stat(lockPath)
 	require.True(t, os.IsNotExist(statErr), "lock file must be gone after the race, regardless of which side actually unlinked it")
+}
+
+// TestSessionsLocksCmdRun_AutoDeleteRemovesStaleLock is the happy-path
+// companion to TestSessionsLocksCmdRun_ConcurrentDeleteBeforeRemove_ENOENTIsSuccess:
+// when the production code's own os.Remove succeeds (err == nil, no concurrent
+// deletion), the stale lock must be reported as removed and must not appear in
+// the listing. This covers the other branch of the same switch case that the
+// ENOENT test does not exercise, ensuring both success paths are covered
+// separately rather than conflated by a single probabilistic test.
+func TestSessionsLocksCmdRun_AutoDeleteRemovesStaleLock(t *testing.T) {
+	tmp := isolateConfigEnvForTests(t)
+
+	workDir := t.TempDir()
+	orig, err := os.Getwd()
+	require.NoError(t, err)
+	require.NoError(t, os.Chdir(workDir))
+	t.Cleanup(func() { _ = os.Chdir(orig) })
+
+	dataDir := filepath.Join(tmp, "auto-delete-data")
+	ensureRootFlagStandIns(sessionsLocksCmd, dataDir)
+	if f := sessionsLocksCmd.Flags().Lookup("cwd"); f == nil {
+		sessionsLocksCmd.Flags().StringP("cwd", "c", "", "")
+	}
+	require.NoError(t, sessionsLocksCmd.Flags().Set("cwd", ""))
+	require.NoError(t, sessionsLocksCmd.Flags().Set("json", "false"))
+	require.NoError(t, sessionsLocksCmd.Flags().Set("stale-only", "false"))
+	sessionsLocksCmd.SetContext(context.Background())
+
+	const sessionID = "auto-delete-stale-id"
+	lockDir := filepath.Join(dataDir, "locks")
+	require.NoError(t, os.MkdirAll(lockDir, 0o755))
+	lockPath := filepath.Join(lockDir, "session-"+sessionID+".lock")
+	require.NoError(t, os.WriteFile(lockPath, []byte(fmt.Sprintf("%d\n", 999999)), 0o644))
+
+	// Backdate well past the 60s auto-delete threshold so the auto-delete
+	// branch is entered.
+	oldTime := time.Now().Add(-5 * time.Minute)
+	require.NoError(t, os.Chtimes(lockPath, oldTime, oldTime))
+
+	// Sanity: nobody holds the real OS lock, so lockHolderProvablyDead must
+	// report true. Like TestSessionsLocksCmdRun_RemoveFailureAfterProvablyDead_Surfaced,
+	// this precondition call itself performs a full acquire+release cycle
+	// (freshening mtime as a side effect), so the mtime must be re-backdated
+	// afterward or the real run below would never enter the auto-delete
+	// branch at all.
+	require.True(t, lockHolderProvablyDead(dataDir, sessionID),
+		"precondition: probe must report the holder provably dead before this test's race scenario is meaningful")
+	// The precondition probe's own Release() already truncated the file to
+	// empty (see clearHolderMetadata) — restore non-empty placeholder
+	// content so the test is meaningful (file exists before auto-delete).
+	require.NoError(t, os.WriteFile(lockPath, []byte(fmt.Sprintf("%d\n", 999999)), 0o644))
+	require.NoError(t, os.Chtimes(lockPath, oldTime, oldTime))
+
+	stdout, stderr := captureStdoutAndStderr(t, func() {
+		runErr := sessionsLocksCmd.RunE(sessionsLocksCmd, nil)
+		require.NoError(t, runErr)
+	})
+	t.Logf("sessions locks stdout:\n%s", stdout)
+	t.Logf("sessions locks stderr:\n%s", stderr)
+
+	require.NotContains(t, stderr, "warning: could not remove provably-dead lock",
+		"a successful os.Remove (err == nil) must never be surfaced as a warning")
+	require.Contains(t, stderr, "removed stale lock",
+		"a successful os.Remove must report the normal success message")
+	require.Contains(t, stderr, "session-"+sessionID+".lock")
+
+	// No phantom row: the file is gone, so it must not appear in the listing.
+	require.NotContains(t, stdout, sessionID,
+		"a lock removed via the err==nil path must not leave a phantom row in the listing")
+
+	// The file must genuinely be gone.
+	_, statErr := os.Stat(lockPath)
+	require.True(t, os.IsNotExist(statErr), "lock file must be gone after auto-delete")
 }
 
 // captureStdoutAndStderr runs f while capturing both os.Stdout and
