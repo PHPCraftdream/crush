@@ -1059,11 +1059,8 @@ func TestSessionAgent_HandleWatchdogFire_StoresCauseAndDispatchesDumpAsync(t *te
 	const idleTimeout = 3 * time.Minute
 
 	callReturned := make(chan struct{})
-	var elapsedCall time.Duration
 	go func() {
-		start := time.Now()
 		a.handleWatchdogFire(causeToolTimeout, 7*time.Second, sessionID, &watchdogCauseVal, toolMaxDuration, idleTimeout, largeModel)
-		elapsedCall = time.Since(start)
 		close(callReturned)
 	}()
 
@@ -1078,30 +1075,49 @@ func TestSessionAgent_HandleWatchdogFire_StoresCauseAndDispatchesDumpAsync(t *te
 		"handleWatchdogFire must store the real fired cause, not leave the zero value, "+
 			"by the time it returns — this is what runTurn's error path reads to build the finish message")
 
-	// (2) The call must have returned well before the deliberately-slowed
-	// real write could possibly have finished — proving the write runs on
-	// its own goroutine rather than being awaited inline.
-	assert.Less(t, elapsedCall, 100*time.Millisecond,
-		"handleWatchdogFire must return promptly; the goroutine dump WRITE is dispatched async and must not be awaited "+
-			"(the real write target was deliberately slowed to hundreds of ms via a deeply nested os.MkdirAll path)")
+	pattern := filepath.Join(deepDir, "goroutines-"+strconv.Itoa(os.Getpid())+"-*.txt")
+
+	// (2) The method must have returned BEFORE the deliberately-slowed write
+	// could have finished. WriteGoroutineDump's 300-segment os.MkdirAll takes
+	// hundreds of ms, so if handleWatchdogFire had awaited the write inline the
+	// dump file would already exist here. Checking its absence immediately after
+	// return proves the write was dispatched on its own goroutine — directly,
+	// without a timing budget that the now-synchronous CaptureGoroutineStack
+	// (runtime.Stack over every goroutine plus a grow-and-retry loop; see task
+	// #242 / internal/log/goroutine_dump.go) would make both large and variable,
+	// scaling with live goroutine count (worse in a full-package run than under
+	// an isolated -run filter).
+	immediate, _ := filepath.Glob(pattern)
+	assert.Empty(t, immediate,
+		"handleWatchdogFire must return before the slow dump write completes; "+
+			"a file present this early means the write was awaited inline, not dispatched async")
 
 	// (3) The real write must still complete shortly after and land actual
-	// goroutine-stack content on disk — proving the async dispatch
-	// genuinely happened rather than being silently skipped.
-	pattern := filepath.Join(deepDir, "goroutines-"+strconv.Itoa(os.Getpid())+"-*.txt")
+	// goroutine-stack content on disk — proving the async dispatch genuinely
+	// happened rather than being silently skipped. The content check lives
+	// INSIDE the predicate (not after it) so the poll waits for the file to
+	// contain real data, not merely to exist: os.WriteFile creates the file
+	// before writing its ~1 MiB body, so a naive existence-only poll can
+	// observe a zero-byte file mid-write and pass on empty content.
+	var dumpContent []byte
 	var matches []string
 	require.Eventually(t, func() bool {
 		var err error
 		matches, err = filepath.Glob(pattern)
-		return err == nil && len(matches) > 0
-	}, 5*time.Second, 20*time.Millisecond, "expected a goroutine dump file to appear matching %s", pattern)
+		if err != nil || len(matches) == 0 {
+			return false
+		}
+		dumpContent, err = os.ReadFile(matches[0])
+		if err != nil {
+			return false
+		}
+		return bytes.Contains(dumpContent, []byte("stream watchdog fired")) &&
+			bytes.Contains(dumpContent, []byte("goroutine "))
+	}, 5*time.Second, 20*time.Millisecond, "expected a goroutine dump with real content to appear matching %s", pattern)
 	require.Len(t, matches, 1, "expected exactly one dump file from this call")
-
-	content, err := os.ReadFile(matches[0])
-	require.NoError(t, err)
-	assert.Contains(t, string(content), "stream watchdog fired",
+	assert.Contains(t, string(dumpContent), "stream watchdog fired",
 		"the dump must carry the reason handleWatchdogFire passes to crushlog.CaptureGoroutineStack")
-	assert.Contains(t, string(content), "goroutine ", "the dump must contain real goroutine stacks")
+	assert.Contains(t, string(dumpContent), "goroutine ", "the dump must contain real goroutine stacks")
 }
 
 // lockedBuffer is a concurrency-safe bytes.Buffer sink for slog.TextHandler,
