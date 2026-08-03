@@ -8,6 +8,19 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added
+
+- **`crush models use --large`/`--small`** — the two positional args
+  (`crush models use <large> <small>`) always set large and small
+  together, so there was no way to change just the fast/small model (or
+  just the smart/large one) without retyping the other. `--large` and
+  `--small` now exist alongside the already-independent `--worker`/
+  `--reviewer` flags, so any of the four slots can be set on its own —
+  e.g. `crush models use --small glm4_7_flash`. The positional form and
+  the `--large`/`--small` flags are mutually exclusive per call (mixing
+  them is rejected with a clear error, rather than silently preferring
+  one).
+
 ### Fixed
 
 A separate review flagged the session heartbeat as reporting "alive"

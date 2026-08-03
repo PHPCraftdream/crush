@@ -294,6 +294,148 @@ func TestModelsUse_TwoPositionalRegression(t *testing.T) {
 	assert.NotContains(t, content, `"reviewer"`)
 }
 
+// TestModelsUse_SmallFlagOnly_LeavesLargeUntouched is the regression test for
+// task #249: previously the only way to change the small ("fast") slot was
+// the two-positional form, which always rewrote large too — there was no way
+// to touch just one of large/small. --small (mirroring the existing
+// --worker/--reviewer pattern) must set ONLY the small slot, leaving large
+// (and worker/reviewer) exactly as they were before the call.
+func TestModelsUse_SmallFlagOnly_LeavesLargeUntouched(t *testing.T) {
+	globalPath := isolatedModelsEnv(t)
+
+	resetModelsUseFlags(t)
+	_, runErr := runModelsCmd(t, modelsUseCmd, "glm5_1", "glm5_turbo")
+	require.NoError(t, runErr)
+
+	resetModelsUseFlags(t)
+	_, runErr = runModelsCmd(t, modelsUseCmd, "--small", "glm4_7_flash")
+	require.NoError(t, runErr)
+
+	data, err := os.ReadFile(globalPath)
+	require.NoError(t, err)
+	// Parse the active "models" object specifically rather than grepping raw
+	// content: "recent_models" is a separate MRU history that legitimately
+	// keeps older values around (that's its entire purpose) alongside the
+	// current "models" object, so a raw-content NotContains would wrongly
+	// flag that unrelated history array.
+	var doc struct {
+		Models map[string]json.RawMessage `json:"models"`
+	}
+	require.NoError(t, json.Unmarshal(data, &doc))
+
+	assert.Contains(t, string(doc.Models["large"]), `"glm-5.1"`, "large must be untouched by a --small-only call")
+	assert.Contains(t, string(doc.Models["small"]), `"glm-4.7-flash"`, "small must reflect the new --small value")
+	assert.NotContains(t, string(doc.Models["small"]), `"glm-5-turbo"`, "the active small slot must not still be the OLD value")
+}
+
+// TestModelsUse_LargeFlagOnly_LeavesSmallUntouched is the --large mirror of
+// the test above.
+func TestModelsUse_LargeFlagOnly_LeavesSmallUntouched(t *testing.T) {
+	globalPath := isolatedModelsEnv(t)
+
+	resetModelsUseFlags(t)
+	_, runErr := runModelsCmd(t, modelsUseCmd, "glm5_1", "glm5_turbo")
+	require.NoError(t, runErr)
+
+	resetModelsUseFlags(t)
+	_, runErr = runModelsCmd(t, modelsUseCmd, "--large", "glm4_7_flash")
+	require.NoError(t, runErr)
+
+	data, err := os.ReadFile(globalPath)
+	require.NoError(t, err)
+	// See TestModelsUse_SmallFlagOnly_LeavesLargeUntouched for why this
+	// parses the active "models" object rather than grepping raw content.
+	var doc struct {
+		Models map[string]json.RawMessage `json:"models"`
+	}
+	require.NoError(t, json.Unmarshal(data, &doc))
+
+	assert.Contains(t, string(doc.Models["large"]), `"glm-4.7-flash"`, "large must reflect the new --large value")
+	assert.Contains(t, string(doc.Models["small"]), `"glm-5-turbo"`, "small must be untouched by a --large-only call")
+	assert.NotContains(t, string(doc.Models["large"]), `"glm-5.1"`, "the active large slot must not still be the OLD value")
+}
+
+// TestModelsUse_LargeAndSmallFlagsTogether covers setting both via flags in
+// one call (still without touching worker/reviewer), as distinct from the
+// positional form.
+func TestModelsUse_LargeAndSmallFlagsTogether(t *testing.T) {
+	globalPath := isolatedModelsEnv(t)
+
+	resetModelsUseFlags(t)
+	_, runErr := runModelsCmd(t, modelsUseCmd, "--large", "glm5_1", "--small", "glm5_turbo")
+	require.NoError(t, runErr)
+
+	data, err := os.ReadFile(globalPath)
+	require.NoError(t, err)
+	content := string(data)
+
+	assert.Contains(t, content, `"glm-5.1"`)
+	assert.Contains(t, content, `"glm-5-turbo"`)
+	assert.NotContains(t, content, `"worker"`)
+	assert.NotContains(t, content, `"reviewer"`)
+}
+
+// TestModelsUse_PositionalAndLargeFlagConflict_Rejected proves the two forms
+// (positional <large> <small> vs. --large/--small flags) cannot be mixed —
+// silently preferring one over the other would be worse than refusing.
+func TestModelsUse_PositionalAndLargeFlagConflict_Rejected(t *testing.T) {
+	isolatedModelsEnv(t)
+
+	resetModelsUseFlags(t)
+	_, runErr := runModelsCmd(t, modelsUseCmd, "glm5_1", "glm5_turbo", "--large", "glm4_7_flash")
+	require.Error(t, runErr)
+	assert.Contains(t, runErr.Error(), "cannot combine positional")
+}
+
+// TestModelsUse_OnePositionalArg_RejectedAsAmbiguous proves a single
+// positional arg (neither the old 2-arg form nor the new 0-arg-plus-flags
+// form) is rejected with a clear message rather than silently guessing which
+// slot it was meant for.
+func TestModelsUse_OnePositionalArg_RejectedAsAmbiguous(t *testing.T) {
+	isolatedModelsEnv(t)
+
+	resetModelsUseFlags(t)
+	_, runErr := runModelsCmd(t, modelsUseCmd, "glm5_1")
+	require.Error(t, runErr)
+	assert.Contains(t, runErr.Error(), "got 1")
+}
+
+// TestModelsUse_NoArgsNoFlags_RejectedAsNoOp proves calling `models use` with
+// nothing at all (no positional args, no --large/--small/--worker/--reviewer
+// flags) fails clearly instead of silently doing nothing.
+func TestModelsUse_NoArgsNoFlags_RejectedAsNoOp(t *testing.T) {
+	isolatedModelsEnv(t)
+
+	resetModelsUseFlags(t)
+	_, runErr := runModelsCmd(t, modelsUseCmd)
+	require.Error(t, runErr)
+	assert.Contains(t, runErr.Error(), "nothing to set")
+}
+
+// TestModelsUse_WorkerOnlyViaFlags_NoPositionals proves --worker/--reviewer
+// alone (no large/small at all, positional or flag) still works exactly as
+// before — the new large/small flags must not have disturbed the existing
+// worker/reviewer-only use case.
+func TestModelsUse_WorkerOnlyViaFlags_NoPositionals(t *testing.T) {
+	globalPath := isolatedModelsEnv(t)
+
+	resetModelsUseFlags(t)
+	_, runErr := runModelsCmd(t, modelsUseCmd, "glm5_1", "glm5_turbo")
+	require.NoError(t, runErr)
+
+	resetModelsUseFlags(t)
+	_, runErr = runModelsCmd(t, modelsUseCmd, "--worker", "glm4_7_flash")
+	require.NoError(t, runErr)
+
+	data, err := os.ReadFile(globalPath)
+	require.NoError(t, err)
+	content := string(data)
+
+	assert.Contains(t, content, `"glm-5.1"`, "large must be untouched")
+	assert.Contains(t, content, `"glm-5-turbo"`, "small must be untouched")
+	assert.Contains(t, content, `"glm-4.7-flash"`, "worker must reflect the new value")
+}
+
 func TestModelsUse_WorkerAndReviewerFlags(t *testing.T) {
 	globalPath := isolatedModelsEnv(t)
 
@@ -891,7 +1033,7 @@ func TestModelsUnset_UnknownSlotFailsCleanly(t *testing.T) {
 // commands are package-level vars, shared across all tests in this file).
 func resetModelsUseFlags(t *testing.T) {
 	t.Helper()
-	for _, fl := range []string{"global", "local", "worker", "reviewer"} {
+	for _, fl := range []string{"global", "local", "large", "small", "worker", "reviewer"} {
 		if f := modelsUseCmd.Flags().Lookup(fl); f != nil {
 			_ = f.Value.Set(f.DefValue)
 		}

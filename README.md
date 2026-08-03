@@ -396,6 +396,7 @@ slot for delegated sub-task work — see orchestrator mode above) and
 crush models list             # show available atoms + raw provider/model ids (reads cache; no network)
 crush models list --refresh   # force a network refresh of provider data before listing
 crush models use <large> <small> [--worker <atom>] [--reviewer <atom>] [--global | --local]
+crush models use --small <atom>   # set just one slot — --large/--small/--worker/--reviewer are all independent
 crush models state             # what's effective + per-scope breakdown (alias: `show`)
 crush models efforts [model]   # explain reasoning-effort levels and how to set them
 crush models bump <role> up|down  # step a role's effort by one level
@@ -449,6 +450,12 @@ crush models use openai/gpt-5@high zai/glm-5-turbo   # raw provider/model fallba
 
 # Also set worker/reviewer in the same call (independent of large/small)
 crush models use opus-high haiku-low --worker glm5_turbo --reviewer opus-max
+
+# Change ONE slot only, leaving the other three exactly as they are —
+# --large/--small work just like --worker/--reviewer always have. The two
+# positional args and --large/--small are mutually exclusive per call.
+crush models use --small glm4_7_flash
+crush models use --large opus-high
 
 # Discover effort levels for a specific model (or run with no arg for the
 # full per-provider overview, including the Z.AI graduated-vs-boolean split)
