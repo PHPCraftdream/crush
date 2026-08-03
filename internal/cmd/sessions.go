@@ -147,6 +147,20 @@ crush sessions list --json | jq 'select(.message_count > 0)'
 // directory from --cwd) so it honors --data-dir / a configured
 // data_directory the same way `sessions locks` does — see task #233,
 // the same cwd-hardcoding bug class as task #219/#224/#231.
+//
+// Deliberately does NOT delegate to session.InspectSessionLock (unlike
+// sessions_watch.go's isSessionFinished, task #241): InspectSessionLock's
+// shape is "mtime fresh is the fast path; only when mtime already looks
+// stale, fall back to probing the PID". This function's shape is the
+// opposite — a CONFIRMED pid > 0 is trusted unconditionally, mtime is only
+// the fallback for an unreadable/ambiguous PID (pid <= 0, the Windows norm
+// for a live session) — so the two are not interchangeable without
+// changing behavior here. The pid > 0 branch below is bounded by
+// session.MaxPidFallbackAge for the same reason InspectSessionLock is
+// (task #235/#241): without a bound, a lock abandoned by a killed/crashed
+// `crush run` whose recorded PID the OS later recycles for an unrelated,
+// currently-running process would report "running" forever, with
+// `sessions list`'s STATUS column never self-healing to "crashed"/"done".
 func computeSessionStatuses(a *app.App) map[string]string {
 	if a == nil {
 		return nil
@@ -165,14 +179,23 @@ func computeSessionStatuses(a *app.App) map[string]string {
 		sessionID := strings.TrimSuffix(strings.TrimPrefix(name, "session-"), ".lock")
 		path := filepath.Join(locksDir, name)
 		pid := session.ReadLockPID(path)
+		info, statErr := entry.Info()
 		// A CONFIRMED-dead PID (pid > 0 but not alive) is trustworthy on
 		// its own. pid <= 0 is ambiguous — "unreadable", not necessarily
 		// dead (see the Windows note on session.readLockFile) — so only
-		// then do we fall back to heartbeat freshness.
+		// then do we fall back to heartbeat freshness. A CONFIRMED-alive
+		// PID is trusted only within session.MaxPidFallbackAge of the
+		// lock's mtime — past that, the lock is old enough that no
+		// genuinely healthy holder could still be running it, so a
+		// currently-alive PID is far more likely to be an OS PID-reuse
+		// coincidence than the original holder (task #241).
 		var alive bool
-		if pid > 0 {
+		switch {
+		case pid > 0 && statErr == nil && time.Since(info.ModTime()) >= session.MaxPidFallbackAge:
+			alive = false
+		case pid > 0:
 			alive = session.IsProcessAlive(pid)
-		} else if info, statErr := entry.Info(); statErr == nil {
+		case statErr == nil:
 			alive = time.Since(info.ModTime()) <= session.LockStaleDuration
 		}
 		if alive {

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -68,11 +67,14 @@ func sessionsWatchCmdRun(cmd *cobra.Command, args []string) error {
 	}
 	defer a.Shutdown()
 
-	// Resolve the locks directory from the already-booted app's config
+	// Resolve the data directory from the already-booted app's config
 	// (honors --data-dir / a configured data_directory), not a raw
 	// cwd-based guess — same fix as `sessions locks` (task #231). See
-	// task #233.
-	locksDir := filepath.Join(a.Config().Options.DataDirectory, "locks")
+	// task #233. Threaded through as dataDir (not a pre-joined locksDir)
+	// so isSessionFinished can hand it straight to
+	// session.InspectSessionLock, which derives its own locks/session-*.lock
+	// path — see isSessionFinished's doc comment.
+	dataDir := a.Config().Options.DataDirectory
 	ctx := cmd.Context()
 
 	var sessionID string
@@ -93,7 +95,7 @@ func sessionsWatchCmdRun(cmd *cobra.Command, args []string) error {
 		sessionID = picked
 	}
 
-	return liveTailSession(ctx, a, sessionID, locksDir, interval)
+	return liveTailSession(ctx, a, sessionID, dataDir, interval)
 }
 
 func init() {
@@ -104,7 +106,7 @@ func init() {
 // polls for new messages until the session ends. See the command Long
 // description for the end-detection signals. On exit it prints a final
 // summary block (duration, cost, tokens, ended_reason).
-func liveTailSession(ctx context.Context, a *app.App, sessionID, locksDir string, interval time.Duration) error {
+func liveTailSession(ctx context.Context, a *app.App, sessionID, dataDir string, interval time.Duration) error {
 	if interval <= 0 {
 		interval = time.Second
 	}
@@ -172,7 +174,7 @@ func liveTailSession(ctx context.Context, a *app.App, sessionID, locksDir string
 
 		// Check for end first so we print a summary even when there are
 		// no new messages to emit on this tick.
-		st, reason := isSessionFinished(ctx, a, sessionID, locksDir)
+		st, reason := isSessionFinished(ctx, a, sessionID, dataDir)
 		if st.lockAlive {
 			sawLiveLock = true
 		}
@@ -329,31 +331,26 @@ func combinedLockLiveness(mtimeFresh, pidAlive bool) bool {
 // it next to "reason:". I/O-doing wrapper; the pure decision lives in
 // isSessionFinishedFromState so it is unit-testable without an app /
 // filesystem.
-func isSessionFinished(ctx context.Context, a *app.App, sessionID, locksDir string) (watchState, string) {
+//
+// Lock liveness is delegated entirely to session.InspectSessionLock (task
+// #241) rather than re-implementing the "mtime fresh, else fall back to a
+// bounded PID-liveness probe" check locally. This file used to hand-roll
+// that exact check (mtimeFresh/pidAlive/combinedLockLiveness below) without
+// ever bounding the PID fallback, so a lock abandoned by a killed/crashed
+// `crush run` whose recorded PID the OS later recycled for an unrelated
+// process would report lockAlive: true forever — isSessionFinishedFromState
+// would then never see a false lockAlive, and `sessions watch` would hang
+// on a session that in fact ended hours earlier. InspectSessionLock already
+// carries the fix for that (maxPidFallbackAge, task #235); calling it here
+// closes the same gap without a second, independently-maintained copy of
+// the bound. combinedLockLiveness itself is left in place (still exercised
+// by its own unit tests) as it remains an accurate description of the OR
+// semantics InspectSessionLock's Live field encodes internally.
+func isSessionFinished(ctx context.Context, a *app.App, sessionID, dataDir string) (watchState, string) {
 	sess, sessErr := a.Sessions.Get(ctx, sessionID)
 	msgs, msgsErr := a.Messages.List(ctx, sessionID)
-	lockPath := filepath.Join(locksDir, "session-"+sanitiseSessionIDForFilename(sessionID)+".lock")
 
-	// Distinguish "alive" (file exists and was touched recently, OR its
-	// recorded PID is still a live OS process — see combinedLockLiveness)
-	// from "stale or missing" (file gone, mtime old AND the PID is dead or
-	// unreadable — holder crashed or detached). Only "alive" should block
-	// the end signals.
-	var mtimeFresh bool
-	var lockExists bool
-	if info, err := os.Stat(lockPath); err == nil {
-		lockExists = true
-		mtimeFresh = time.Since(info.ModTime()) < liveLockMaxAge
-	}
-	var pidAlive bool
-	if lockExists && !mtimeFresh {
-		// Only worth the extra probe when mtime already looks stale — the
-		// common case (mtime fresh) never needs it.
-		if pid := session.ReadLockPID(lockPath); pid > 0 {
-			pidAlive = session.IsProcessAlive(pid)
-		}
-	}
-	lockAlive := combinedLockLiveness(mtimeFresh, pidAlive)
+	lockAlive := session.InspectSessionLock(dataDir, sessionID, liveLockMaxAge).Live
 
 	done, reason := isSessionFinishedFromState(sess, sessErr, msgs, msgsErr, lockAlive)
 

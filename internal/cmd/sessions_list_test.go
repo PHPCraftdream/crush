@@ -7,9 +7,12 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/charmbracelet/crush/internal/app"
 	"github.com/charmbracelet/crush/internal/db"
+	"github.com/charmbracelet/crush/internal/session"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -115,4 +118,73 @@ func TestSessionsListCmdRun_StatusHonorsConfiguredDataDir(t *testing.T) {
 			"STATUS column must show running — fix must look up the lock at the configured data dir, not a cwd-based guess")
 	}
 	require.True(t, found, "expected to find the seeded session's row in the table output")
+}
+
+// TestComputeSessionStatuses_PidReuseBeyondMaxFallbackAgeIsNotRunning is the
+// regression test for task #241: computeSessionStatuses trusted a
+// CONFIRMED-alive recorded PID unconditionally, with no bound on how old the
+// lock file itself could be. A `crush run` killed with SIGKILL leaves its
+// PID in the lock file without releasing; hours later the OS can recycle
+// that exact PID number for a completely unrelated, currently-running
+// process. Before this fix, `sessions list` would report that session's
+// STATUS as "running" forever — the crash never self-heals to "crashed"/
+// "done" the way task #235 already fixed for session.InspectSessionLock.
+//
+// A real second process (spawnKillTestLockHolder, the same cross-process
+// harness sessions_kill_test.go uses) stands in for "the OS reused this
+// exact PID number" — it is genuinely alive throughout, so this proves the
+// AGE bound, not merely a dead-PID false negative. The lock file's mtime is
+// back-dated past session.MaxPidFallbackAge to simulate a lock abandoned
+// long enough ago that its recorded PID can no longer be trusted.
+func TestComputeSessionStatuses_PidReuseBeyondMaxFallbackAgeIsNotRunning(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns a real child process; skipped in -short")
+	}
+	a, _, dataDir := isolatedListEnvWithConfiguredDataDir(t)
+
+	ctx := context.Background()
+	sess, err := a.Sessions.CreateWithID(ctx, "list-status-pid-reuse", "regression title")
+	require.NoError(t, err)
+
+	holder := spawnKillTestLockHolder(t, dataDir, sess.ID)
+	defer holder.stop()
+	require.True(t, session.IsProcessAlive(holder.pid), "helper process must be alive for this test to be meaningful")
+
+	lockPath := filepath.Join(dataDir, "locks", "session-"+sanitiseSessionIDForFilename(sess.ID)+".lock")
+	staleTime := time.Now().Add(-(session.MaxPidFallbackAge + 5*time.Second))
+	require.NoError(t, os.Chtimes(lockPath, staleTime, staleTime),
+		"back-dating mtime past MaxPidFallbackAge to simulate a lock abandoned long enough ago that its recorded PID can no longer be trusted, even though it currently resolves to a live process")
+
+	statuses := computeSessionStatuses(a)
+	require.NotNil(t, statuses)
+	assert.Equal(t, "crashed", statuses[sess.ID],
+		"a lock older than MaxPidFallbackAge must not be reported running just because its recorded PID currently belongs to a live (but unrelated) process — this is the core #241 fix")
+}
+
+// TestComputeSessionStatuses_PidAliveWithinMaxFallbackAgeIsRunning is the
+// non-regression companion: a live PID within MaxPidFallbackAge of the
+// lock's mtime must still be reported "running", exactly like before this
+// fix — the bound must only kick in once the lock is genuinely old.
+func TestComputeSessionStatuses_PidAliveWithinMaxFallbackAgeIsRunning(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns a real child process; skipped in -short")
+	}
+	a, _, dataDir := isolatedListEnvWithConfiguredDataDir(t)
+
+	ctx := context.Background()
+	sess, err := a.Sessions.CreateWithID(ctx, "list-status-pid-fresh", "regression title")
+	require.NoError(t, err)
+
+	holder := spawnKillTestLockHolder(t, dataDir, sess.ID)
+	defer holder.stop()
+	require.True(t, session.IsProcessAlive(holder.pid), "helper process must be alive for this test to be meaningful")
+
+	lockPath := filepath.Join(dataDir, "locks", "session-"+sanitiseSessionIDForFilename(sess.ID)+".lock")
+	justUnder := time.Now().Add(-(session.MaxPidFallbackAge - time.Second))
+	require.NoError(t, os.Chtimes(lockPath, justUnder, justUnder))
+
+	statuses := computeSessionStatuses(a)
+	require.NotNil(t, statuses)
+	assert.Equal(t, "running", statuses[sess.ID],
+		"a live PID just under MaxPidFallbackAge must still be trusted as running")
 }

@@ -465,7 +465,16 @@ lower-severity issues, closed the same way:
   on how stale the mtime could be before that fallback stopped being
   trusted; a sufficiently old lock whose PID got recycled by the OS
   for an unrelated process would read as live indefinitely. The
-  fallback is now bounded to 60 minutes.
+  fallback is now bounded to 60 minutes. A follow-up review pass found
+  two more independent copies of the exact same unbounded check —
+  `sessions watch`'s end-of-session detection and `sessions list`'s
+  STATUS column — that hadn't received the bound; `sessions watch` now
+  delegates to the same, now-bounded `InspectSessionLock` instead of
+  re-implementing the check, and `sessions list` applies the same
+  60-minute bound (exported as `session.MaxPidFallbackAge`)
+  independently, since its "trust a confirmed-alive PID unconditionally"
+  shape isn't a drop-in match for `InspectSessionLock`'s. All three
+  known copies of this check are now bounded.
 - De-duplicated four independently-hardcoded copies of the
   "Stream stalled" finish-title string (the retry logic's own
   constant, the watchdog's actual production value, and two tests)

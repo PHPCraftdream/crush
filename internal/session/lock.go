@@ -44,6 +44,23 @@ const (
 // "actively held" (see readLockFile).
 const LockStaleDuration = lockStaleDuration
 
+// MaxPidFallbackAge is the exported view of maxPidFallbackAge, for callers
+// outside this package that independently re-implement the same "stale
+// mtime -> fall back to trusting a live PID" liveness check InspectSessionLock
+// performs, instead of calling InspectSessionLock itself (e.g. because they
+// need a "running"/"crashed" classification shape InspectSessionLock's
+// LockState doesn't return, or only have a locks-directory entry in hand
+// rather than a (dataDir, sessionID) pair). Task #241: two such independent
+// copies — internal/cmd/sessions_watch.go's isSessionFinished (now migrated
+// to call InspectSessionLock directly) and internal/cmd/sessions.go's
+// computeSessionStatuses (kept independent — see that function's doc
+// comment for why) — were found to trust a live-looking PID forever, with
+// no bound of their own, even though InspectSessionLock had already been
+// bounded for task #235. Exporting the same constant, rather than letting
+// each site hand-roll its own duration, keeps the bound doctrinally in sync
+// across every "PID reuse can't pin liveness forever" check in the codebase.
+const MaxPidFallbackAge = maxPidFallbackAge
+
 // SessionLock is an inter-process exclusive lock for a single session ID.
 // Acquired around the entire `sessionAgent.Run()` call so two crush
 // processes can never write into the same session simultaneously.
