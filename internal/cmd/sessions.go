@@ -3,8 +3,10 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1135,31 +1137,54 @@ func sessionsLocksCmdRun(cmd *cobra.Command, args []string) error {
 		// believe it owns the session — two owners of one session id.
 		if age > autoDeleteAfter {
 			if lockHolderProvablyDead(dataDir, sessionID) {
-				if err := os.Remove(lockPath); err != nil {
+				err := os.Remove(lockPath)
+				switch {
+				case err == nil, errors.Is(err, fs.ErrNotExist):
+					// errors.Is(err, fs.ErrNotExist) (task #244): a concurrent
+					// process — `sessions reap`, `sessions kill`, `sessions
+					// reset --force`, or another parallel `sessions locks`
+					// racing the same auto-delete path — may have already
+					// removed this exact file between lockHolderProvablyDead's
+					// probe above and this Remove call. The goal of this
+					// Remove ("the stale lock file is gone from disk") is
+					// already achieved in that case; it is not a failure.
+					// Treating ENOENT as an error here (as task #234's fix
+					// briefly did) produced a false "warning: could not
+					// remove..." on stderr plus a phantom display-path row
+					// below for a file that no longer exists (PID 0, offline,
+					// age computed from the stale cached entry.Info()) —
+					// exactly the false positive an orchestrating script
+					// polling `sessions locks` alongside a concurrent
+					// `sessions kill` would hit. Report success and move on,
+					// same as the pre-#234 behavior for this specific case.
+					fmt.Fprintf(os.Stderr, "removed stale lock %s (age %ds, holder provably dead)\n", entry.Name(), int(age.Seconds()))
+					continue
+				default:
 					// Do NOT silently swallow this (task #234). A failed
 					// Remove here is not a harmless no-op: lockHolderProvablyDead's
 					// own acquire+release probe (see its doc comment) truncates
 					// the lock file's content and freshens its mtime as part of
 					// proving death, moments before this Remove runs. If the
-					// Remove then fails (e.g. a Windows sharing-violation window
-					// from a concurrent opener), the file is left behind with a
-					// wiped PID AND a fresh mtime — which every PID-fallback/
-					// mtime-based liveness consumer below (and in isSessionLockAlive
-					// / InspectSessionLock / computeSessionStatuses) would read as
-					// LIVE for the next heartbeat-stale window, even though this
-					// probe JUST proved the holder dead. Silently `continue`-ing
-					// also made the entry vanish from this listing entirely, so an
-					// operator had zero signal anything was wrong. Surface the
-					// failure, then fall through to the normal display path below
-					// instead of `continue`-ing: age is already > autoDeleteAfter
-					// (60s), which lockPulseStatus always classifies as "offline"
+					// Remove then fails for a REAL reason (e.g. a Windows
+					// sharing-violation window from a concurrent opener that
+					// still holds the file open, or permission denied — NOT
+					// the file already being gone, which is handled above),
+					// the file is left behind with a wiped PID AND a fresh
+					// mtime — which every PID-fallback/mtime-based liveness
+					// consumer below (and in isSessionLockAlive /
+					// InspectSessionLock / computeSessionStatuses) would read
+					// as LIVE for the next heartbeat-stale window, even though
+					// this probe JUST proved the holder dead. Silently
+					// `continue`-ing also made the entry vanish from this
+					// listing entirely, so an operator had zero signal
+					// anything was wrong. Surface the failure, then fall
+					// through to the normal display path below instead of
+					// `continue`-ing: age is already > autoDeleteAfter (60s),
+					// which lockPulseStatus always classifies as "offline"
 					// (>20s), so the entry is correctly shown as stale/offline
 					// rather than silently dropped from the listing while its
 					// stale file lingers on disk.
 					fmt.Fprintf(os.Stderr, "warning: could not remove provably-dead lock %s: %v\n", entry.Name(), err)
-				} else {
-					fmt.Fprintf(os.Stderr, "removed stale lock %s (age %ds, holder provably dead)\n", entry.Name(), int(age.Seconds()))
-					continue
 				}
 			}
 			// mtime looks stale but the real OS lock is still held (or the

@@ -458,7 +458,16 @@ lower-severity issues, closed the same way:
   lingering open handle on Windows), the entry disappeared from the
   listing with no warning either way. It now surfaces a warning and
   falls through to the normal display path instead of silently
-  dropping the entry.
+  dropping the entry. A follow-up review caught an over-correction in
+  that same fix: it treated *every* removal failure as worth warning
+  about, including the file already being gone (`fs.ErrNotExist`) —
+  which happens routinely when a concurrent `sessions reap`/`kill`/
+  `reset --force`, or another parallel `sessions locks` invocation,
+  wins the race to delete the same stale lock first. That specific
+  case is the removal's goal already being met by someone else, not a
+  failure, so it's now reported as the normal success message (no
+  warning, no phantom row for the vanished file) — the warning and
+  display fallback are reserved for genuine removal errors.
 - **A reused PID could pin a session's liveness indicator "alive"
   forever** — `InspectSessionLock`'s fallback to real process liveness
   when the heartbeat mtime looks stale (see above) had no upper bound
