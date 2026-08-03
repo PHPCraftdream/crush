@@ -493,8 +493,12 @@ lower-severity issues, closed the same way:
   shape isn't a drop-in match for `InspectSessionLock`'s. All three
   known copies of this check are now bounded.
 - De-duplicated four independently-hardcoded copies of the
-  "Stream stalled" finish-title string (the retry logic's own
-  constant, the watchdog's actual production value, and two tests)
-  into one source of truth, so a future reword of either side can no
-  longer silently break transparent stall-retry matching without a
-  test catching it.
+  "Stream stalled" finish-title string in internal/agent (the retry
+  logic's own constant, the watchdog's actual production value, and
+  two tests) into one source of truth, so a future reword of either
+  side can no longer silently break transparent stall-retry matching
+  without a test catching it. A fifth, cross-language copy in the web
+  UI (web/src/components/Message.tsx — TypeScript can't import the Go
+  constant) is intentionally not merged; it's kept in sync by a
+  comment cross-reference on both sides rather than wiring the
+  literal through the WS/JSON protocol (LOW severity).

@@ -196,6 +196,16 @@ const (
 	// streamStalledFinishTitle is the canonical Message field that
 	// agent.Run writes on a watchdog stall. Match against this exact
 	// string when deciding whether to retry.
+	//
+	// CROSS-LANGUAGE SYNC: a fifth copy of this literal lives in the
+	// web UI, since TypeScript can't import this Go constant. See the
+	// `part.Message === "Stream stalled"` check in
+	// web/src/components/Message.tsx — it renders a stalled
+	// turn-after-partial-work as a soft amber StreamPausedBlock
+	// instead of a red failure block. If this literal ever changes,
+	// update that TS check too. The two are intentionally not wired
+	// through the WS/JSON protocol (LOW severity; a comment
+	// cross-reference is the agreed sync mechanism).
 	streamStalledFinishTitle = "Stream stalled"
 )
 

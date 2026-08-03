@@ -1273,6 +1273,16 @@ const Part = memo(function Part({ part, index, isUser, messageID, thinkingDone, 
       // provider just went quiet on the tail and the watchdog cut the stream.
       // Render that case as a soft amber "paused" notice so the user sees the
       // work above as legitimate, not framed inside a scary red failure block.
+      //
+      // CROSS-LANGUAGE SYNC: this "Stream stalled" literal mirrors
+      // Go-side `streamStalledFinishTitle` in
+      // internal/agent/coordinator.go — the single source of truth
+      // that agent.Run writes and the retry logic matches against.
+      // TypeScript can't import the Go constant, so the two are kept
+      // in sync by comment cross-reference, not via the WS/JSON
+      // protocol. If the Go literal ever changes, update it here too,
+      // or this paused-block branch silently stops matching and a
+      // stalled turn renders as a red FinishErrorBlock instead.
       if (part.Reason === "error" && part.Message === "Stream stalled" && partialWorkDone) {
         return <StreamPausedBlock details={part.Details} />;
       }
