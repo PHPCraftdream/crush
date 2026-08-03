@@ -507,7 +507,13 @@ lower-severity issues, closed the same way:
   pass found a FOURTH independent copy in `sessions why`'s status explainer
   (the very command meant to diagnose this verdict) with the same unbounded
   trust; it now applies the same `session.MaxPidFallbackAge` bound too. All
-  four known copies of this check are now bounded.
+  four known copies of this check are now bounded. A later pass found the
+  fourth copy's fix left the printed *reason text* factually wrong in
+  exactly the PID-reuse case it targets — it said the recorded PID "is not
+  alive" when that PID was, in fact, genuinely alive (just untrusted due to
+  lock age). `sessions why` now gives that case its own accurate wording
+  ("no longer trustworthy — likely OS PID reuse") instead of reusing the
+  genuinely-dead-PID phrasing.
 - De-duplicated four independently-hardcoded copies of the
   "Stream stalled" finish-title string in internal/agent (the retry
   logic's own constant, the watchdog's actual production value, and
@@ -518,3 +524,15 @@ lower-severity issues, closed the same way:
   constant) is intentionally not merged; it's kept in sync by a
   comment cross-reference on both sides rather than wiring the
   literal through the WS/JSON protocol (LOW severity).
+- Two of this batch's own regression tests (the `crush models use
+  --large`/`--small` PID-fallback test-timing margins, and a stream-watchdog
+  test whose 100ms timing budget went stale once its diagnostic capture
+  became synchronous by design) were themselves flaky under `-race` load;
+  both are now deterministic — one via a wider margin, the other via a
+  direct file-presence check instead of a timing budget that a widened
+  timeout would have made unable to catch its own regression. Also fixed a
+  read-before-write race in the same watchdog test (polled for a dump
+  file's existence rather than its content, occasionally reading it
+  mid-write) and made a probabilistic ENOENT-race regression test
+  deterministic via a test-only hook instead of a goroutine race that could
+  pass even against a reverted fix.
