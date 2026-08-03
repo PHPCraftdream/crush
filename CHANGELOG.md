@@ -436,3 +436,39 @@ time in the same way as the batches above:
   branch; with that flag off (the default) and a provider that kept
   the stream alive with regular activity, an explicit hard cap was
   silently ignored. The check is now unconditional.
+
+A third independent review pass over this same batch found five more,
+lower-severity issues, closed the same way:
+
+- **The watchdog's own goroutine-dump-on-fire could re-introduce the
+  hang it was added to diagnose** — `onFire` wrote the diagnostic dump
+  to disk synchronously before `cancel()` ran, so a hung/slow disk
+  write could itself block cancellation indefinitely. The fire cause
+  is now recorded first, then the (unawaited) dump write runs on its
+  own goroutine, off the critical path to `cancel()`.
+- **Five more CLI commands ignored a configured data directory** —
+  `sessions list`'s status column, `sessions reap`, `sessions watch`,
+  `sessions why`, and `queue` all independently hardcoded or
+  preferred a raw `--data-dir` flag over the resolved config, the
+  same class of bug already fixed for `sessions kill`/`reset --force`/
+  `sessions locks`. All five now use the same resolved data directory.
+- **A failed lock cleanup in `sessions locks`' auto-delete path
+  vanished silently** — when a lock was proven to belong to a dead
+  holder but the subsequent file removal itself failed (e.g. a
+  lingering open handle on Windows), the entry disappeared from the
+  listing with no warning either way. It now surfaces a warning and
+  falls through to the normal display path instead of silently
+  dropping the entry.
+- **A reused PID could pin a session's liveness indicator "alive"
+  forever** — `InspectSessionLock`'s fallback to real process liveness
+  when the heartbeat mtime looks stale (see above) had no upper bound
+  on how stale the mtime could be before that fallback stopped being
+  trusted; a sufficiently old lock whose PID got recycled by the OS
+  for an unrelated process would read as live indefinitely. The
+  fallback is now bounded to 60 minutes.
+- De-duplicated four independently-hardcoded copies of the
+  "Stream stalled" finish-title string (the retry logic's own
+  constant, the watchdog's actual production value, and two tests)
+  into one source of truth, so a future reword of either side can no
+  longer silently break transparent stall-retry matching without a
+  test catching it.
