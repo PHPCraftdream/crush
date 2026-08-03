@@ -15,6 +15,35 @@ import (
 // in which case DumpGoroutines falls back to the OS temp dir.
 var logDir atomic.Value // string
 
+// SetLogDirForTest points WriteGoroutineDump's target directory at dir for
+// the duration of the calling test, restoring the previous value via
+// t.Cleanup. Exists so tests OUTSIDE this package (e.g.
+// internal/agent's stream-watchdog-fire tests) can redirect where a REAL
+// crushlog.WriteGoroutineDump call lands — including at a deliberately slow
+// (deeply nested, not-yet-created) path — without needing Setup's
+// process-wide sync.Once or reaching into this package's unexported logDir
+// directly. Safe to call from any test package; not for production use.
+func SetLogDirForTest(t testingTB, dir string) {
+	t.Helper()
+	prev := logDir.Load()
+	logDir.Store(dir)
+	t.Cleanup(func() {
+		if s, ok := prev.(string); ok {
+			logDir.Store(s)
+		} else {
+			logDir.Store("")
+		}
+	})
+}
+
+// testingTB is the minimal subset of testing.TB this package needs, so
+// SetLogDirForTest can accept *testing.T (or *testing.B) without importing
+// the "testing" package into non-test production code.
+type testingTB interface {
+	Helper()
+	Cleanup(func())
+}
+
 // maxGoroutineDumpBytes caps how large a dump may grow. A wedged process
 // with a few hundred goroutines lands well under a megabyte; the cap only
 // exists so a pathological goroutine leak can't try to allocate unbounded

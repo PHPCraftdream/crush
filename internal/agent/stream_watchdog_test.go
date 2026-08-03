@@ -2,10 +2,16 @@ package agent
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/charmbracelet/crush/internal/config"
+	"github.com/charmbracelet/crush/internal/csync"
+	crushlog "github.com/charmbracelet/crush/internal/log"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -991,4 +997,105 @@ func TestStreamWatchdog_AsyncDiagnosticWorkDoesNotDelayCancel(t *testing.T) {
 		t.Fatal("watchdog goroutine never exited — a hung async diagnostic write must not block it")
 	}
 	assert.True(t, wd.stalled.Load())
+}
+
+// TestSessionAgent_HandleWatchdogFire_StoresCauseAndDispatchesDumpAsync is
+// the regression test for task #243. TestStreamWatchdog_CauseStoredBeforeSlowDiagnosticWork
+// and TestStreamWatchdog_AsyncDiagnosticWorkDoesNotDelayCancel (task #232,
+// above) only prove that a TEST-LOCAL COPY of onFire's shape behaves as
+// documented — neither one builds a *sessionAgent or calls the real
+// production method, so reverting agent.go's actual ordering left both of
+// those tests green (they test the copy, not the original). This test closes
+// that gap by calling sessionAgent.handleWatchdogFire directly — the exact
+// method runTurn's onFire closure dispatches to (see agent.go) — with no
+// watchdog, no turn, no VCR involved.
+//
+// The write is the REAL crushlog.WriteGoroutineDump (not a fake), so to make
+// "the write is dispatched async and does not delay the return" a
+// deterministic, non-flaky assertion rather than a timing guess against an
+// ordinarily near-instant local disk write, this test redirects
+// crushlog's dump directory (via the exported crushlog.SetLogDirForTest
+// seam) at a deeply nested, not-yet-existing directory. os.MkdirAll walking
+// ~300 missing path segments measurably slows the real write (hundreds of ms,
+// verified empirically) while leaving the code path completely unmodified —
+// giving a wide, reliable margin between "the call returned" and "the slow
+// real write finished" without faking any production logic.
+//
+// It proves, against the REAL method:
+//  1. watchdogCauseVal is stored with the real fired cause by the time
+//     handleWatchdogFire returns (this is the field runTurn's post-stream
+//     error path reads via watchdogCause(watchdogCauseVal.Load()) to decide
+//     the user-facing finish message and tool-result text).
+//  2. The method returns BEFORE the slow real write has completed — proving
+//     the write is genuinely dispatched on its own goroutine, not awaited.
+//  3. The write nonetheless completes shortly after and lands real,
+//     readable goroutine-stack content on disk.
+func TestSessionAgent_HandleWatchdogFire_StoresCauseAndDispatchesDumpAsync(t *testing.T) {
+	deepDir := t.TempDir()
+	for i := range 300 {
+		deepDir = filepath.Join(deepDir, "nested"+strconv.Itoa(i))
+	}
+	crushlog.SetLogDirForTest(t, deepDir)
+
+	a := &sessionAgent{
+		largeModel: csync.NewValue(Model{
+			ModelCfg: config.SelectedModel{
+				Provider: "test-provider",
+				Model:    "test-model",
+			},
+		}),
+		timeoutHardCap: 5 * time.Second,
+	}
+
+	var watchdogCauseVal atomic.Int32
+	watchdogCauseVal.Store(int32(causeIdleStall)) // zero value; must be overwritten
+
+	const sessionID = "sess-243-test"
+	const toolMaxDuration = 5 * time.Second
+	const idleTimeout = 3 * time.Minute
+
+	callReturned := make(chan struct{})
+	var elapsedCall time.Duration
+	go func() {
+		start := time.Now()
+		a.handleWatchdogFire(causeToolTimeout, 7*time.Second, sessionID, &watchdogCauseVal, toolMaxDuration, idleTimeout)
+		elapsedCall = time.Since(start)
+		close(callReturned)
+	}()
+
+	select {
+	case <-callReturned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handleWatchdogFire did not return — it must not block on the async goroutine-dump write")
+	}
+
+	// (1) The real cause must be stored by the time the call returns.
+	assert.Equal(t, int32(causeToolTimeout), watchdogCauseVal.Load(),
+		"handleWatchdogFire must store the real fired cause, not leave the zero value, "+
+			"by the time it returns — this is what runTurn's error path reads to build the finish message")
+
+	// (2) The call must have returned well before the deliberately-slowed
+	// real write could possibly have finished — proving the write runs on
+	// its own goroutine rather than being awaited inline.
+	assert.Less(t, elapsedCall, 100*time.Millisecond,
+		"handleWatchdogFire must return promptly; the goroutine dump WRITE is dispatched async and must not be awaited "+
+			"(the real write target was deliberately slowed to hundreds of ms via a deeply nested os.MkdirAll path)")
+
+	// (3) The real write must still complete shortly after and land actual
+	// goroutine-stack content on disk — proving the async dispatch
+	// genuinely happened rather than being silently skipped.
+	pattern := filepath.Join(deepDir, "goroutines-"+strconv.Itoa(os.Getpid())+"-*.txt")
+	var matches []string
+	require.Eventually(t, func() bool {
+		var err error
+		matches, err = filepath.Glob(pattern)
+		return err == nil && len(matches) > 0
+	}, 5*time.Second, 20*time.Millisecond, "expected a goroutine dump file to appear matching %s", pattern)
+	require.Len(t, matches, 1, "expected exactly one dump file from this call")
+
+	content, err := os.ReadFile(matches[0])
+	require.NoError(t, err)
+	assert.Contains(t, string(content), "stream watchdog fired",
+		"the dump must carry the reason handleWatchdogFire passes to crushlog.CaptureGoroutineStack")
+	assert.Contains(t, string(content), "goroutine ", "the dump must contain real goroutine stacks")
 }

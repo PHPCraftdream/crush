@@ -875,6 +875,109 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	}
 }
 
+// handleWatchdogFire is runTurn's stream-watchdog onFire callback, pulled out
+// into a named method (task #243) so a unit test can invoke the REAL
+// production logic directly — constructing a minimal *sessionAgent and
+// calling this method with a synthetic watchdogCauseVal — instead of only
+// exercising a test-local copy of this shape that could silently drift from
+// what runTurn actually wires up. The onFire closure inside runTurn is now
+// just a thin dispatch: `func(elapsed, cause) { a.handleWatchdogFire(...) }`.
+//
+// watchdogCauseVal is runTurn's local atomic.Int32 (not a sessionAgent
+// field: it is genuinely per-turn state, reset fresh on every call), passed
+// in by pointer so this method can store into the caller's copy.
+// toolMaxDuration/idleTimeout are likewise runTurn locals (the resolved,
+// possibly-overridden effective durations for THIS turn) rather than
+// sessionAgent fields, so they are passed explicitly instead of read off a.
+//
+// INVARIANT (task #227 + #232, preserved verbatim by this extraction): the
+// cause is stored FIRST, synchronously, before any other work in this
+// method. startStreamWatchdog invokes onFire strictly before cancel(), so
+// whatever this method does before returning is on the critical path to
+// unblocking agent.Stream. If the OUTER ctx is also cancelled independently
+// of this watchdog (Ctrl-C, a --timeout firing at the same moment) while
+// this method is still running, the main goroutine reading watchdogCauseVal
+// after observing stalled==true must never see the zero value
+// (causeIdleStall) for what was actually a hard-cap/tool-timeout fire — that
+// would misreport the cause via a DIFFERENT race than the one #227 fixed
+// (external cancellation racing this callback, rather than this callback
+// racing its own cancel()).
+func (a *sessionAgent) handleWatchdogFire(
+	cause watchdogCause,
+	elapsed time.Duration,
+	sessionID string,
+	watchdogCauseVal *atomic.Int32,
+	toolMaxDuration, idleTimeout time.Duration,
+) {
+	watchdogCauseVal.Store(int32(cause))
+	// The watchdog firing IS the hang, caught at the only moment the
+	// evidence still exists. Capture every goroutine's stack now,
+	// SYNCHRONOUSLY: pprof is gated behind CRUSH_PROFILE (so it can't be
+	// turned on after the fact) and release builds strip symbols (so a
+	// debugger attach yields nothing and merely kills the process). Without
+	// this, every production hang is diagnosed by guesswork.
+	//
+	// CaptureGoroutineStack does no I/O — it's runtime.Stack plus a string
+	// header — so it cannot block on a stuck disk, and running it
+	// synchronously here is what guarantees the snapshot reflects the
+	// actual moment of the hang. Capturing it from an async goroutine
+	// instead (as an earlier version of this fix did) would let it run
+	// AFTER cancel()/unwind had already started — or, if the process exited
+	// or was force-killed first, never run at all — defeating the entire
+	// point of a diagnostic taken "at the only moment it is still
+	// available" (see the doc comment on CaptureGoroutineStack).
+	stackDump := crushlog.CaptureGoroutineStack("stream watchdog fired")
+	// Only the WRITE is dispatched async and NOT awaited: WriteGoroutineDump
+	// does a synchronous os.WriteFile with no timeout of its own (see its
+	// doc in internal/log/goroutine_dump.go). Since onFire now runs
+	// strictly before cancel(), awaiting a write that hangs (e.g. the log
+	// directory sits on a stuck network/SMB mount) would mean cancel()
+	// never runs, agent.Stream never unblocks, and runTurn's deferred
+	// <-wd.done blocks forever — a full process freeze, exactly the failure
+	// mode this watchdog exists to prevent. The dump is best-effort
+	// diagnostics only; nothing downstream needs the write to complete
+	// before the turn can safely unwind, so firing it off and returning
+	// immediately preserves the already-captured evidence without putting
+	// an unbounded disk write on cancellation's critical path.
+	go func() {
+		if dumpPath, dumpErr := crushlog.WriteGoroutineDump(stackDump); dumpErr != nil {
+			slog.Warn("agent: failed to write goroutine dump for watchdog fire", "err", dumpErr)
+		} else {
+			slog.Warn("agent: wrote goroutine dump for watchdog fire", "path", dumpPath)
+		}
+	}()
+	largeModel := a.largeModel.Get()
+	switch cause {
+	case causeToolTimeout:
+		slog.Warn(
+			"agent: watchdog firing — tool execution exceeded cap, force-cancelling",
+			"session_id", sessionID,
+			"provider", largeModel.ModelCfg.Provider,
+			"model", largeModel.ModelCfg.Model,
+			"elapsed", elapsed.String(),
+			"cap", toolMaxDuration.String(),
+		)
+	case causeHardCap:
+		slog.Warn(
+			"agent: watchdog firing — turn exceeded --timeout-hard-cap, force-cancelling",
+			"session_id", sessionID,
+			"provider", largeModel.ModelCfg.Provider,
+			"model", largeModel.ModelCfg.Model,
+			"elapsed", elapsed.String(),
+			"hard_cap", a.timeoutHardCap.String(),
+		)
+	default:
+		slog.Warn(
+			"agent: stream watchdog firing — no provider activity, force-cancelling",
+			"session_id", sessionID,
+			"provider", largeModel.ModelCfg.Provider,
+			"model", largeModel.ModelCfg.Model,
+			"idle_duration", elapsed.String(),
+			"threshold", idleTimeout.String(),
+		)
+	}
+}
+
 // runTurn executes exactly one agent turn (one call into fantasy's
 // agent.Stream, plus all of Run's surrounding bookkeeping: DB preamble,
 // stream watchdog, checkpointing, error/cancel handling, and auto-summarize
@@ -1030,89 +1133,14 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 	var watchdogCauseVal atomic.Int32 // stores watchdogCause
 	wd := startStreamWatchdog(
 		genCtx, cancel, idleTimeout, streamWatchdogTick,
+		// The closure itself is deliberately a thin dispatch to a named
+		// method (task #243): a unit test can construct a minimal
+		// *sessionAgent and call handleWatchdogFire directly, exercising
+		// the REAL cause-store/dump-capture/dump-write ordering instead of
+		// a test-local copy of this shape that could silently drift from
+		// what agent.go actually does.
 		func(elapsed time.Duration, cause watchdogCause) {
-			// Store the cause FIRST, before anything else in this callback.
-			// startStreamWatchdog invokes onFire strictly before cancel() (task
-			// #227), so whatever this closure does before returning is on the
-			// critical path to unblocking agent.Stream. If the OUTER ctx is
-			// also cancelled independently of this watchdog (Ctrl-C, a
-			// --timeout firing at the same moment) while onFire is still
-			// running, the main goroutine reading watchdogCauseVal after
-			// observing stalled==true must never see the zero value
-			// (causeIdleStall) for what was actually a hard-cap/tool-timeout
-			// fire — that would misreport the cause via a DIFFERENT race than
-			// the one #227 fixed (external cancellation racing this callback,
-			// rather than this callback racing its own cancel()).
-			watchdogCauseVal.Store(int32(cause))
-			// The watchdog firing IS the hang, caught at the only moment the
-			// evidence still exists. Capture every goroutine's stack now,
-			// SYNCHRONOUSLY: pprof is gated behind CRUSH_PROFILE (so it can't
-			// be turned on after the fact) and release builds strip symbols
-			// (so a debugger attach yields nothing and merely kills the
-			// process). Without this, every production hang is diagnosed by
-			// guesswork.
-			//
-			// CaptureGoroutineStack does no I/O — it's runtime.Stack plus a
-			// string header — so it cannot block on a stuck disk, and running
-			// it synchronously here is what guarantees the snapshot reflects
-			// the actual moment of the hang. Capturing it from an async
-			// goroutine instead (as an earlier version of this fix did) would
-			// let it run AFTER cancel()/unwind had already started — or, if
-			// the process exited or was force-killed first, never run at
-			// all — defeating the entire point of a diagnostic taken "at the
-			// only moment it is still available" (see the doc comment on
-			// CaptureGoroutineStack).
-			stackDump := crushlog.CaptureGoroutineStack("stream watchdog fired")
-			// Only the WRITE is dispatched async and NOT awaited:
-			// WriteGoroutineDump does a synchronous os.WriteFile with no
-			// timeout of its own (see its doc in
-			// internal/log/goroutine_dump.go). Since onFire now runs
-			// strictly before cancel(), awaiting a write that hangs (e.g. the
-			// log directory sits on a stuck network/SMB mount) would mean
-			// cancel() never runs, agent.Stream never unblocks, and runTurn's
-			// deferred <-wd.done blocks forever — a full process freeze,
-			// exactly the failure mode this watchdog exists to prevent. The
-			// dump is best-effort diagnostics only; nothing downstream needs
-			// the write to complete before the turn can safely unwind, so
-			// firing it off and returning immediately preserves the already-
-			// captured evidence without putting an unbounded disk write on
-			// cancellation's critical path.
-			go func() {
-				if dumpPath, dumpErr := crushlog.WriteGoroutineDump(stackDump); dumpErr != nil {
-					slog.Warn("agent: failed to write goroutine dump for watchdog fire", "err", dumpErr)
-				} else {
-					slog.Warn("agent: wrote goroutine dump for watchdog fire", "path", dumpPath)
-				}
-			}()
-			switch cause {
-			case causeToolTimeout:
-				slog.Warn(
-					"agent: watchdog firing — tool execution exceeded cap, force-cancelling",
-					"session_id", call.SessionID,
-					"provider", largeModel.ModelCfg.Provider,
-					"model", largeModel.ModelCfg.Model,
-					"elapsed", elapsed.String(),
-					"cap", toolMaxDuration.String(),
-				)
-			case causeHardCap:
-				slog.Warn(
-					"agent: watchdog firing — turn exceeded --timeout-hard-cap, force-cancelling",
-					"session_id", call.SessionID,
-					"provider", largeModel.ModelCfg.Provider,
-					"model", largeModel.ModelCfg.Model,
-					"elapsed", elapsed.String(),
-					"hard_cap", a.timeoutHardCap.String(),
-				)
-			default:
-				slog.Warn(
-					"agent: stream watchdog firing — no provider activity, force-cancelling",
-					"session_id", call.SessionID,
-					"provider", largeModel.ModelCfg.Provider,
-					"model", largeModel.ModelCfg.Model,
-					"idle_duration", elapsed.String(),
-					"threshold", idleTimeout.String(),
-				)
-			}
+			a.handleWatchdogFire(cause, elapsed, call.SessionID, &watchdogCauseVal, toolMaxDuration, idleTimeout)
 		},
 		a.timeoutExtendsOnProgress, // Fork patch: batch 8
 		a.timeoutHardCap,           // Fork patch: batch 8
