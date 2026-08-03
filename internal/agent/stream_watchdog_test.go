@@ -858,3 +858,137 @@ func TestStreamWatchdog_OnFireCompletesBeforeCancel(t *testing.T) {
 	assert.Error(t, ctx.Err(), "ctx must be cancelled after onFire returned")
 	assert.True(t, wd.stalled.Load())
 }
+
+// TestStreamWatchdog_CauseStoredBeforeSlowDiagnosticWork is the regression
+// test for task #232 issue 1. It mirrors agent.go's actual onFire closure
+// shape: store the fire cause FIRST, synchronously, then do the (potentially
+// slow) diagnostic work. Because task #227 made onFire run strictly before
+// cancel(), an external cancellation of ctx (independent of this watchdog —
+// e.g. user Ctrl-C, a --timeout racing the same instant) could previously be
+// observed by another goroutine while the cause store hadn't happened yet
+// if the cause store came after the slow work, misattributing the fire.
+//
+// This test proves the ordering deterministically (no time.Sleep guessing):
+// the simulated diagnostic work blocks on a channel, and the test asserts
+// the cause is already readable as the real fired cause WHILE that
+// diagnostic work is still blocked — not just after onFire eventually
+// returns.
+func TestStreamWatchdog_CauseStoredBeforeSlowDiagnosticWork(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	const idle = 20 * time.Millisecond
+	const tick = 5 * time.Millisecond
+
+	var causeVal atomic.Int32
+	causeVal.Store(int32(causeIdleStall)) // zero value; must be overwritten by the real cause
+
+	diagnosticWorkEntered := make(chan struct{})
+	releaseDiagnosticWork := make(chan struct{})
+
+	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(_ time.Duration, cause watchdogCause) {
+		// Mirrors agent.go's onFire: store the cause FIRST, synchronously,
+		// before any slow diagnostic work.
+		causeVal.Store(int32(cause))
+		close(diagnosticWorkEntered)
+		<-releaseDiagnosticWork
+	},
+		false, 0,
+		1*time.Millisecond, // toolMaxDuration: tiny, so a tool-in-flight fires with causeToolTimeout
+		0, nil)
+
+	// Put a tool in flight so the watchdog fires with causeToolTimeout, not
+	// causeIdleStall — this makes the assertion meaningful: if the store
+	// were still reachable only after the slow work, we'd see the zero
+	// value (causeIdleStall) instead.
+	wd.toolStarted()
+
+	select {
+	case <-diagnosticWorkEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("onFire's diagnostic work was never entered")
+	}
+
+	// While the diagnostic work is still blocked, the cause must already be
+	// the real fired cause (causeToolTimeout), not the zero value.
+	assert.Equal(t, int32(causeToolTimeout), causeVal.Load(),
+		"cause must be stored before the slow diagnostic work runs, so a concurrent reader "+
+			"never observes the zero value for a real tool-timeout/hard-cap fire")
+
+	close(releaseDiagnosticWork)
+	select {
+	case <-wd.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("watchdog goroutine never exited")
+	}
+}
+
+// TestStreamWatchdog_AsyncDiagnosticWorkDoesNotDelayCancel is the regression
+// test for task #232 issue 2. Since task #227, onFire runs strictly before
+// cancel() on every fire path — so a slow or hung disk write inside onFire
+// (DumpGoroutines in production, see internal/log/goroutine_dump.go, has no
+// timeout of its own) would previously delay cancel() by however long the
+// write takes, or block it forever if the write hangs. agent.go's fix
+// dispatches the diagnostic work in its own goroutine and returns from
+// onFire immediately, without awaiting it.
+//
+// This test proves that pattern deterministically: onFire launches a
+// goroutine that blocks on a channel the test never closes (simulating a
+// permanently hung write) and returns immediately. The watchdog's own
+// cancel()+done must complete promptly regardless — proving the hang can
+// never delay cancellation, not just that it usually doesn't.
+func TestStreamWatchdog_AsyncDiagnosticWorkDoesNotDelayCancel(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	const idle = 20 * time.Millisecond
+	const tick = 5 * time.Millisecond
+
+	// neverReleased is intentionally never closed, simulating a diagnostic
+	// write that hangs forever (e.g. a stuck network/SMB mount).
+	neverReleased := make(chan struct{})
+	diagnosticStarted := make(chan struct{})
+	t.Cleanup(func() {
+		// Let the leaked goroutine exit at test end rather than leaking past
+		// this test (it would otherwise block until process exit).
+		close(neverReleased)
+	})
+
+	onFireReturned := make(chan struct{})
+	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(time.Duration, watchdogCause) {
+		go func() {
+			close(diagnosticStarted)
+			<-neverReleased // never closed by the test — simulates a hung write
+		}()
+		close(onFireReturned)
+	}, false, 0, 0, 0, nil)
+
+	// onFire must return promptly even though the diagnostic goroutine it
+	// launched will never finish.
+	select {
+	case <-onFireReturned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("onFire did not return — async diagnostic work must not be awaited")
+	}
+	select {
+	case <-diagnosticStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the diagnostic goroutine was never scheduled")
+	}
+
+	// cancel()/done must complete promptly — NOT blocked on the permanently
+	// hung diagnostic goroutine.
+	select {
+	case <-ctx.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("ctx was never cancelled — a hung async diagnostic write must not block cancel()")
+	}
+	select {
+	case <-wd.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("watchdog goroutine never exited — a hung async diagnostic write must not block it")
+	}
+	assert.True(t, wd.stalled.Load())
+}

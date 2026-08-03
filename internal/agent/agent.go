@@ -1031,18 +1031,46 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 	wd := startStreamWatchdog(
 		genCtx, cancel, idleTimeout, streamWatchdogTick,
 		func(elapsed time.Duration, cause watchdogCause) {
+			// Store the cause FIRST, before anything else in this callback.
+			// startStreamWatchdog invokes onFire strictly before cancel() (task
+			// #227), so whatever this closure does before returning is on the
+			// critical path to unblocking agent.Stream. If the OUTER ctx is
+			// also cancelled independently of this watchdog (Ctrl-C, a
+			// --timeout firing at the same moment) while onFire is still
+			// running, the main goroutine reading watchdogCauseVal after
+			// observing stalled==true must never see the zero value
+			// (causeIdleStall) for what was actually a hard-cap/tool-timeout
+			// fire — that would misreport the cause via a DIFFERENT race than
+			// the one #227 fixed (external cancellation racing this callback,
+			// rather than this callback racing its own cancel()).
+			watchdogCauseVal.Store(int32(cause))
 			// The watchdog firing IS the hang, caught at the only moment the
 			// evidence still exists. Capture every goroutine's stack now:
 			// pprof is gated behind CRUSH_PROFILE (so it can't be turned on
 			// after the fact) and release builds strip symbols (so a debugger
 			// attach yields nothing and merely kills the process). Without
 			// this, every production hang is diagnosed by guesswork.
-			if dumpPath, dumpErr := crushlog.DumpGoroutines("stream watchdog fired"); dumpErr != nil {
-				slog.Warn("agent: failed to write goroutine dump for watchdog fire", "err", dumpErr)
-			} else {
-				slog.Warn("agent: wrote goroutine dump for watchdog fire", "path", dumpPath)
-			}
-			watchdogCauseVal.Store(int32(cause))
+			//
+			// Dispatched async and NOT awaited: DumpGoroutines does a
+			// synchronous os.WriteFile with no timeout of its own (see its
+			// doc in internal/log/goroutine_dump.go). Since onFire now runs
+			// strictly before cancel(), awaiting a write that hangs (e.g. the
+			// log directory sits on a stuck network/SMB mount) would mean
+			// cancel() never runs, agent.Stream never unblocks, and runTurn's
+			// deferred <-wd.done blocks forever — a full process freeze,
+			// exactly the failure mode this watchdog exists to prevent. The
+			// dump is best-effort diagnostics only; nothing downstream needs
+			// it to complete before the turn can safely unwind, so firing it
+			// off and returning immediately preserves the evidence-gathering
+			// without putting an unbounded disk write on cancellation's
+			// critical path.
+			go func() {
+				if dumpPath, dumpErr := crushlog.DumpGoroutines("stream watchdog fired"); dumpErr != nil {
+					slog.Warn("agent: failed to write goroutine dump for watchdog fire", "err", dumpErr)
+				} else {
+					slog.Warn("agent: wrote goroutine dump for watchdog fire", "path", dumpPath)
+				}
+			}()
 			switch cause {
 			case causeToolTimeout:
 				slog.Warn(

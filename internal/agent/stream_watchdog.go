@@ -101,6 +101,17 @@ type streamWatchdog struct {
 // when the provider genuinely stopped sending data for idleTimeout with no
 // tool in flight.
 //
+// INVARIANT (task #227 + #232): every fire site below calls onFire strictly
+// BEFORE cancel(), never after — so onFire sits directly on the critical
+// path to cancellation. onFire MUST NOT block for an unbounded time: cancel()
+// does not run until onFire returns, so a slow or hung onFire (e.g. a
+// diagnostic write to a stuck disk/network mount) delays or — if truly
+// unbounded — permanently prevents ctx from ever being cancelled, which in
+// turn means callers blocked on <-wd.done (the documented contract just
+// above) never unblock either. Any work inside onFire that is not itself
+// bounded (a fixed timeout, or dispatched async and not awaited) must not be
+// placed here.
+//
 // Fork patch: batch 8 — extendsOnProgress + hardCap parameters.
 // When extendsOnProgress is true, every bump() also extends the effective
 // deadline to max(absoluteDeadline, now+idleTimeout), capped at hardCap
