@@ -126,17 +126,61 @@ func TestIsSessionLockAlive_FreshHeartbeatWithoutReadablePID(t *testing.T) {
 	require.True(t, isSessionLockAlive(dataDir, "running"))
 }
 
-func TestIsSessionLockAlive_StaleHeartbeat(t *testing.T) {
+// TestIsSessionLockAlive_StaleMtimeButLivePIDIsStillLive is the isSessionLockAlive-
+// level regression test for task #229 (same root cause as task #228's
+// session.InspectSessionLock fix, and task #222's sessions_watch.go
+// combinedLockLiveness fix): a lock's heartbeat mtime is now gated on real
+// RecordActivity() calls (task #213/#214), and the stream watchdog that
+// supplies those calls while a tool is in flight only fires roughly every
+// 30s (task #222) — larger than isSessionLockAlive's 20s threshold. That
+// leaves a real window where a perfectly healthy, tool-busy session looks
+// mtime-stale even though it's still genuinely running. A real second
+// process holds the lock (spawnKillTestLockHolder, mirroring the pattern
+// sessions_kill_test.go already established) so the PID-liveness fallback
+// inherited from session.InspectSessionLock is exercised against a
+// genuinely live OS process, not a same-process fake. We back-date the lock
+// file's mtime past the threshold to simulate the heartbeat lagging behind
+// a long tool call, then assert isSessionLockAlive still reports true via
+// the PID fallback.
+func TestIsSessionLockAlive_StaleMtimeButLivePIDIsStillLive(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns a real child process; skipped in -short")
+	}
+
+	dataDir := t.TempDir()
+	holder := spawnKillTestLockHolder(t, dataDir, "inject-stale-live")
+	defer holder.stop()
+
+	lockPath := filepath.Join(dataDir, "locks", "session-inject-stale-live.lock")
+	staleTime := time.Now().Add(-(isSessionLockAliveThreshold + 5*time.Second))
+	require.NoError(t, os.Chtimes(lockPath, staleTime, staleTime),
+		"back-dating mtime to simulate a heartbeat lagging behind one long tool call on an otherwise-healthy session")
+
+	require.True(t, session.IsProcessAlive(holder.pid), "helper process must still be alive for this test to be meaningful")
+
+	require.True(t, isSessionLockAlive(dataDir, "inject-stale-live"),
+		"a stale mtime must not override a genuinely live PID holder — this is the core #229 fix")
+}
+
+// TestIsSessionLockAlive_StaleMtimeAndDeadPIDIsNotLive is the conservative
+// companion to the fix above: when mtime is stale AND the recorded PID is
+// genuinely dead, isSessionLockAlive must still report false. The PID
+// fallback must not regress the correct "actually dead" case into a false
+// positive.
+func TestIsSessionLockAlive_StaleMtimeAndDeadPIDIsNotLive(t *testing.T) {
 	t.Parallel()
 
 	dataDir := t.TempDir()
 	locksDir := filepath.Join(dataDir, "locks")
 	require.NoError(t, os.MkdirAll(locksDir, 0o755))
 
-	lockPath := filepath.Join(locksDir, "session-stale.lock")
-	require.NoError(t, os.WriteFile(lockPath, []byte("12345\n"), 0o644))
-	stale := time.Now().Add(-25 * time.Second)
-	require.NoError(t, os.Chtimes(lockPath, stale, stale))
+	lockPath := filepath.Join(locksDir, "session-inject-stale-dead.lock")
+	// PID 0x7FFFFFFE is virtually guaranteed not to be a running process
+	// (same sentinel internal/session/lock_test.go's
+	// TestInspectSessionLock_StaleMtimeAndDeadPIDIsNotLive uses).
+	require.NoError(t, os.WriteFile(lockPath, []byte("2147483646\n"), 0o644))
+	staleTime := time.Now().Add(-(isSessionLockAliveThreshold + 5*time.Second))
+	require.NoError(t, os.Chtimes(lockPath, staleTime, staleTime))
 
-	require.False(t, isSessionLockAlive(dataDir, "stale"))
+	require.False(t, isSessionLockAlive(dataDir, "inject-stale-dead"))
 }

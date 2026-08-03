@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/charmbracelet/crush/internal/message"
@@ -186,18 +185,29 @@ func doInject(
 	return sess, msg, nil
 }
 
+// isSessionLockAliveThreshold mirrors lockPulseStatus's (sessions.go) "offline"
+// cutoff of 20s, and internal/server/handlers.go's externalOwnerLiveThreshold —
+// so the mtime-fresh fast path below behaves identically to before this was
+// rewritten to delegate to session.InspectSessionLock.
+const isSessionLockAliveThreshold = 20 * time.Second
+
 // isSessionLockAlive reports whether a live process currently holds this
-// session's lock. The heartbeat mtime is authoritative: on Windows the
-// exclusive lock prevents reading the PID while the holder is alive, so a
-// fresh lock with PID 0 still means "running".
+// session's lock. It delegates to session.InspectSessionLock, which checks
+// the heartbeat mtime as a fast path and, only when that mtime already looks
+// stale, falls back to a real session.IsProcessAlive(pid) probe before
+// concluding the holder is dead (task #228: the heartbeat's mtime touch is
+// gated on real activity, and the stream watchdog tick that supplies that
+// activity during a long tool call can lag past this threshold even for a
+// perfectly healthy session).
+//
+// On Windows, the exclusive lock prevents reading the PID while the holder
+// is alive, so a fresh lock with PID 0 is unaffected by the PID fallback —
+// InspectSessionLock only attempts the PID probe once mtime is already
+// stale, so a fresh lock with an unreadable PID still reports Live: true via
+// the mtime fast path alone.
 func isSessionLockAlive(dataDir, sessionID string) bool {
 	if dataDir == "" || sessionID == "" {
 		return false
 	}
-	lockPath := filepath.Join(dataDir, "locks", "session-"+sanitiseSessionIDForFilename(sessionID)+".lock")
-	info, err := os.Stat(lockPath)
-	if err != nil {
-		return false
-	}
-	return lockPulseStatus(int64(time.Since(info.ModTime()).Seconds())) != "offline"
+	return session.InspectSessionLock(dataDir, sessionID, isSessionLockAliveThreshold).Live
 }
