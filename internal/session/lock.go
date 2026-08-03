@@ -16,6 +16,23 @@ import (
 const (
 	lockHeartbeatInterval = 10 * time.Second
 	lockStaleDuration     = 20 * time.Second
+
+	// maxPidFallbackAge bounds how long InspectSessionLock trusts a live
+	// PID over a stale heartbeat mtime, before falling back to
+	// mtime-only liveness. Without this bound, a reused PID (the OS
+	// recycling the exact PID number a genuinely-dead holder's lock
+	// file recorded) would make Live report true forever, with no
+	// self-heal path short of a manual `sessions kill`/`sessions reap`.
+	// Set comfortably above internal/agent's toolExecutionMaxDefault (45
+	// minutes as of this writing — the maximum a single tool call,
+	// including a sub-agent delegation, can legitimately run before the
+	// stream watchdog force-cancels it), so a genuinely long-but-healthy
+	// tool call is never mistaken for PID reuse. internal/session does
+	// not import internal/agent (that would be a layering violation) —
+	// this constant is deliberately independent and must be kept
+	// roughly in sync by hand if toolExecutionMaxDefault ever changes
+	// meaningfully.
+	maxPidFallbackAge = 60 * time.Minute
 )
 
 // LockStaleDuration is the exported view of lockStaleDuration, for callers
@@ -438,7 +455,11 @@ type LockState struct {
 	// liveness probe (session.IsProcessAlive) before concluding the
 	// holder is dead — same principle sessions_watch.go's
 	// combinedLockLiveness already established for the `sessions watch`
-	// consumer.
+	// consumer. That PID-liveness fallback is itself bounded by
+	// maxPidFallbackAge (60m): once a stale lock is older than that, a
+	// live-looking PID is no longer trusted and Live falls back to
+	// mtime-only, so an OS PID reused by an unrelated process long after
+	// the real holder died can't pin Live: true forever.
 	Live bool
 }
 
@@ -459,6 +480,16 @@ type LockState struct {
 // sessions_watch.go's combinedLockLiveness already uses. The PID probe is
 // only attempted once mtime is already stale, so the common case (mtime
 // fresh) pays no extra cost.
+//
+// The PID-fallback itself is bounded by maxPidFallbackAge (60 minutes):
+// once the lock's mtime is older than that, a live-looking PID is no
+// longer trusted and Live falls back to mtime-only, even if the recorded
+// PID happens to currently belong to some live OS process. Without this
+// bound, a stale lock left behind by a killed/crashed holder would
+// report Live: true forever the moment the OS happened to recycle that
+// exact PID number for an unrelated process — turning a false-negative
+// fix (task #228) into an unbounded false-positive. See maxPidFallbackAge's
+// doc comment for how the bound was chosen.
 func InspectSessionLock(dataDir, sessionID string, liveThreshold time.Duration) LockState {
 	if dataDir == "" || sessionID == "" {
 		return LockState{}
@@ -471,12 +502,16 @@ func InspectSessionLock(dataDir, sessionID string, liveThreshold time.Duration) 
 	pid := ReadLockPID(path)
 	age := time.Since(st.ModTime())
 	live := age < liveThreshold
-	if !live && pid > 0 {
+	if !live && pid > 0 && age < maxPidFallbackAge {
 		// mtime looks stale — task #228: fall back to a real PID liveness
 		// check before concluding the holder is dead, since the
 		// heartbeat's mtime touch is now gated on real activity and a
 		// healthy session blocked on one long tool call can look stale
-		// here even though it is still genuinely running.
+		// here even though it is still genuinely running. Bounded by
+		// maxPidFallbackAge (task #235) so a PID the OS has since recycled
+		// for an unrelated process can't keep reporting Live: true forever
+		// once the lock is old enough that no genuinely healthy holder
+		// could still be running.
 		live = IsProcessAlive(pid)
 	}
 	return LockState{

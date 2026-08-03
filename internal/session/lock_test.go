@@ -395,6 +395,68 @@ func TestInspectSessionLock_StaleMtimeButLivePIDIsStillLive(t *testing.T) {
 	assert.True(t, st.Live, "a stale mtime must not override a genuinely live PID holder — this is the core #228 fix")
 }
 
+// TestInspectSessionLock_StaleMtimeBeyondMaxPidFallbackAgeIsNotLive is the
+// core regression test for task #235: task #228's PID-liveness fallback has
+// no time bound of its own, so a lock left behind by a killed/crashed
+// holder would report Live: true forever the moment the OS happened to
+// recycle that exact PID number for some unrelated, currently-running
+// process. This proves the maxPidFallbackAge bound closes that gap: once
+// the lock's mtime is older than maxPidFallbackAge, InspectSessionLock must
+// fall back to mtime-only liveness (Live: false) even though the recorded
+// PID currently belongs to a genuinely live OS process (a real second
+// process, via spawnLockHolder, standing in for "the OS reused this exact
+// PID number").
+func TestInspectSessionLock_StaleMtimeBeyondMaxPidFallbackAgeIsNotLive(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns a real child process; skipped in -short")
+	}
+	dir := t.TempDir()
+
+	holder := spawnLockHolder(t, dir, "inspect-stale-beyond-bound", 0 /* hold until stopped */)
+	defer holder.stop(t)
+	require.True(t, holder.locked, "helper process failed to acquire lock: %s", holder.failed)
+
+	path := lockPathFor(dir, "inspect-stale-beyond-bound")
+	staleTime := time.Now().Add(-(maxPidFallbackAge + 5*time.Second))
+	require.NoError(t, os.Chtimes(path, staleTime, staleTime),
+		"back-dating mtime past maxPidFallbackAge to simulate a lock left behind long enough ago that its recorded PID can no longer be trusted, even though it currently resolves to a live process")
+
+	require.True(t, IsProcessAlive(holder.pid), "helper process must still be alive for this test to be meaningful — proves the bound, not merely a dead PID")
+
+	st := InspectSessionLock(dir, "inspect-stale-beyond-bound", externalOwnerLiveThresholdForTest)
+	assert.True(t, st.Exists)
+	assert.Equal(t, holder.pid, st.PID)
+	assert.False(t, st.Live, "a lock older than maxPidFallbackAge must fall back to mtime-only liveness even when its recorded PID is currently alive — this is the core #235 fix")
+}
+
+// TestInspectSessionLock_StaleMtimeAroundMaxPidFallbackAgeBoundary is a
+// boundary companion to the test above: just under maxPidFallbackAge past
+// staleness, the PID fallback must still apply (Live: true); just over it,
+// the bound must kick in (Live: false). Exercises the exact `age <
+// maxPidFallbackAge` comparison in InspectSessionLock.
+func TestInspectSessionLock_StaleMtimeAroundMaxPidFallbackAgeBoundary(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns a real child process; skipped in -short")
+	}
+	dir := t.TempDir()
+
+	holder := spawnLockHolder(t, dir, "inspect-boundary", 0 /* hold until stopped */)
+	defer holder.stop(t)
+	require.True(t, holder.locked, "helper process failed to acquire lock: %s", holder.failed)
+
+	path := lockPathFor(dir, "inspect-boundary")
+
+	justUnder := time.Now().Add(-(maxPidFallbackAge - time.Second))
+	require.NoError(t, os.Chtimes(path, justUnder, justUnder))
+	st := InspectSessionLock(dir, "inspect-boundary", externalOwnerLiveThresholdForTest)
+	assert.True(t, st.Live, "just under maxPidFallbackAge past staleness, a live PID must still be trusted")
+
+	justOver := time.Now().Add(-(maxPidFallbackAge + time.Second))
+	require.NoError(t, os.Chtimes(path, justOver, justOver))
+	st = InspectSessionLock(dir, "inspect-boundary", externalOwnerLiveThresholdForTest)
+	assert.False(t, st.Live, "just over maxPidFallbackAge past staleness, a live PID must no longer be trusted")
+}
+
 // TestInspectSessionLock_StaleMtimeAndDeadPIDIsNotLive is the conservative
 // companion to the fix above: when mtime is stale AND the recorded PID is
 // genuinely dead, InspectSessionLock must still report Live: false. The
