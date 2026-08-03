@@ -1044,7 +1044,7 @@ func TestWatchdogFinishMessage_HardCapDoesNotBlameProviderOrTool(t *testing.T) {
 	title, body := watchdogFinishMessage(causeHardCap, toolMaxDuration, hardCap, idleTimeout, provider)
 
 	assert.Equal(t, "Turn timeout", title, "hard-cap fire must get its own title, not reuse Tool timeout/Stream stalled")
-	assert.NotEqual(t, "Stream stalled", title)
+	assert.NotEqual(t, streamStalledFinishTitle, title)
 	assert.NotContains(t, body, "Provider", "must not blame the provider for a wall-clock ceiling it had nothing to do with")
 	assert.NotContains(t, body, provider, "must not name the provider at all — it did not cause this")
 	assert.NotContains(t, body, idleTimeout.String(), "must not cite idleTimeout — that's not the duration that fired")
@@ -1069,7 +1069,7 @@ func TestWatchdogFinishMessage_AllThreeCausesDistinct(t *testing.T) {
 
 	assert.Equal(t, "Tool timeout", toolTitle)
 	assert.Equal(t, "Turn timeout", hardCapTitle)
-	assert.Equal(t, "Stream stalled", idleTitle)
+	assert.Equal(t, streamStalledFinishTitle, idleTitle)
 	assert.NotEqual(t, toolTitle, hardCapTitle)
 	assert.NotEqual(t, hardCapTitle, idleTitle)
 	assert.NotEqual(t, toolTitle, idleTitle)
@@ -1077,6 +1077,32 @@ func TestWatchdogFinishMessage_AllThreeCausesDistinct(t *testing.T) {
 	assert.Contains(t, toolBody, toolMaxDuration.String(), "tool-timeout body must cite toolMaxDuration")
 	assert.Contains(t, idleBody, idleTimeout.String(), "idle-stall body must cite idleTimeout")
 	assert.Contains(t, idleBody, provider, "idle-stall body must name the provider — it genuinely is the cause here")
+}
+
+// TestWatchdogFinishMessage_IdleStallTitleMatchesRetryConstant is the
+// regression test for task #236: "Stream stalled" used to be hardcoded
+// independently in watchdogFinishMessage's causeIdleStall branch AND in
+// coordinator.go's streamStalledFinishTitle constant (the value
+// shouldRetryTurn's finish-part matching compares against to decide
+// whether a stall qualifies for transparent streamStallRetriesDefault
+// retry). Two independently-maintained copies of the same string meant a
+// future reword of one — e.g. for clarity or i18n — could silently break
+// the retry match with no test catching it, since every existing test
+// compared watchdogFinishMessage's output against ITS OWN separate
+// hardcoded literal rather than against the actual constant coordinator.go
+// reads. This test cross-references the two directly: if
+// watchdogFinishMessage's idle-stall title and streamStalledFinishTitle
+// ever diverge again, this assertion — not a hardcoded string — is what
+// catches it.
+func TestWatchdogFinishMessage_IdleStallTitleMatchesRetryConstant(t *testing.T) {
+	const toolMaxDuration = 45 * time.Minute
+	const hardCap = 20 * time.Minute
+	const idleTimeout = 3 * time.Minute
+	const provider = "anthropic"
+
+	title, _ := watchdogFinishMessage(causeIdleStall, toolMaxDuration, hardCap, idleTimeout, provider)
+
+	assert.Equal(t, streamStalledFinishTitle, title, "watchdogFinishMessage's idle-stall title must match coordinator.go's streamStalledFinishTitle exactly, or transparent stall-retry silently stops matching")
 }
 
 // TestWatchdogToolResultMessage_ReflectsRealCause is the regression test for

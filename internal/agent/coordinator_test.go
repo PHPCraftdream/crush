@@ -1262,7 +1262,7 @@ func TestShouldRetryStalledMessage(t *testing.T) {
 
 	stalledFinish := message.Finish{
 		Reason:  message.FinishReasonError,
-		Message: "Stream stalled",
+		Message: streamStalledFinishTitle,
 	}
 
 	t.Run("no finish part returns false", func(t *testing.T) {

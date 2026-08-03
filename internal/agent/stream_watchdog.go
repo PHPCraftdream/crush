@@ -449,7 +449,7 @@ func watchdogFinishMessage(cause watchdogCause, toolMaxDuration, hardCap, idleTi
 			hardCap,
 		)
 	default: // causeIdleStall
-		return "Stream stalled", fmt.Sprintf(
+		return streamStalledFinishTitle, fmt.Sprintf(
 			"Provider %q stopped sending streaming data for over %s — the request was auto-cancelled by the stream watchdog. Retry the prompt; if it keeps happening, try a different model or provider.",
 			provider, idleTimeout,
 		)
