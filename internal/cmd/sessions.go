@@ -432,8 +432,10 @@ it appears stale (process not running or lock older than 10 minutes).
 
 Lock files are typically acquired when a session is running and released
 when the run completes. Stale locks can accumulate if processes crash
-without cleanup. This command does NOT delete locks automatically — use
-external cleanup if needed.
+without cleanup. This command DOES auto-delete a lock once it has proven
+(via a real OS-level lock probe, not just its mtime age) that no live
+process actually holds it — see the note below for the exact discipline
+and its narrow, documented residual risk windows.
 
 Note: entries that merely LOOK stale by mtime (older than 60s) but that a
 real OS-level lock probe proves are still held are never deleted — only a

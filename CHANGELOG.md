@@ -39,19 +39,21 @@ review below. Closed together, one task/commit at a time:
   activity on every tick a tool is in flight and healthy, not just at
   start/finish; both commands additionally verify against the real OS
   lock / process liveness before trusting a stale-looking mtime. A
-  further review pass found the same stale-mtime blind spot in three
-  more places: the web UI's session-ownership indicator could flicker
-  off during a long tool call (letting the composer re-enable and a
-  send fail with "already in use," or the live tail stop following);
+  further review pass found the same stale-mtime blind spot in two more
+  places: the web UI's session-ownership indicator could flicker off
+  during a long tool call (letting the composer re-enable and a send
+  fail with "already in use," or the live tail stop following); and
   `sessions inject --json` could report a running session as
-  `persisted-offline`; and `sessions locks` itself still ignored a
-  configured `--data-dir`/`data_directory` and read a lock's PID in a
-  way that missed the Windows PID-sidecar fallback. All three now fall
-  back to a real process-liveness check when the heartbeat mtime looks
-  stale, matching `sessions locks`/`sessions watch`'s existing fix; a
-  residual, narrow TOCTOU window in the auto-delete probe (proving a
-  lock is dead, then removing it as a separate step) is now explicitly
-  documented rather than silently assumed airtight.
+  `persisted-offline`. Both now fall back to a real process-liveness
+  check when the heartbeat mtime looks stale, matching `sessions
+  locks`/`sessions watch`'s existing fix. Separately, `sessions locks`
+  itself still ignored a configured `--data-dir`/`data_directory` (the
+  same class of bug already fixed for `sessions kill`/`reset --force`)
+  and read a lock's PID in a way that missed the Windows PID-sidecar
+  fallback — both fixed. A residual, narrow TOCTOU window in the
+  auto-delete probe (proving a lock is dead, then removing it as a
+  separate step) is now explicitly documented rather than silently
+  assumed airtight.
 - Added missing regression coverage for the queued-message-continues-
   after-summarize/compact behavior (both the mid-turn auto-compact
   path and the standalone `/compact` path), which had zero tests.
