@@ -435,6 +435,24 @@ when the run completes. Stale locks can accumulate if processes crash
 without cleanup. This command does NOT delete locks automatically — use
 external cleanup if needed.
 
+Note: entries that merely LOOK stale by mtime (older than 60s) but that a
+real OS-level lock probe proves are still held are never deleted — only a
+lock file with no live OS-level holder is auto-removed (see
+lockHolderProvablyDead's doc comment for the full discipline and its two
+documented, narrow residual windows: a post-probe TOCTOU on removal, and
+brief probe-induced contention with a concurrent "crush run" starting on
+the exact same session id). This auto-delete runs unconditionally, on
+every invocation, on every stale-looking entry — it is not gated behind an
+opt-in flag. That was a deliberate call (task #230): the contention window
+per entry is a single lock acquire+release cycle (well under what a
+"crush run" start already tolerates elsewhere), it only collides with a
+run starting on that exact session id in that exact instant, and this
+default (auto-pruning stale entries) predates task #230 and is what
+existing scripts already depend on. Adding a --prune/--auto-delete flag
+to gate it was considered and rejected as over-engineering a rare,
+already-narrow edge case; revisit only if the collision is ever observed
+in practice, not preemptively.
+
 Use --stale-only to filter to suspicious locks. Use --json for NDJSON
 output suitable for metrics collection or automation.`,
 	Example: `
@@ -955,6 +973,52 @@ func lockPulseStatus(ageSec int64) string {
 // delete" — the conservative default, since a false "provably dead" is what
 // causes the two-owners bug, while a false "still alive" merely means the
 // stale entry lingers one more `sessions locks` invocation.
+//
+// What this does NOT solve (task #230, narrower follow-ups to #222): two
+// related gaps remain, both real but far narrower than the unconditional
+// os.Remove this function replaced.
+//
+//  1. Residual TOCTOU between probe and removal. This function proves
+//     "nobody holds the lock" and releases immediately; it does not itself
+//     remove the file. Its caller (sessionsLocksCmdRun) calls os.Remove
+//     afterward, as a separate, non-atomic step. In the gap between this
+//     function's Release() and the caller's os.Remove(), a fresh
+//     `crush run --session <id>` can legitimately re-acquire the same
+//     session id and start writing — and the caller would then unlink
+//     that new, live holder's lock file, reproducing (in a window on the
+//     order of a syscall or two, not the original unbounded-mtime window)
+//     the exact two-owners scenario this hardening exists to prevent.
+//     Closing this fully would mean holding the OS lock across the
+//     os.Remove itself (return the still-held *session.SessionLock to the
+//     caller instead of releasing here, remove the path while holding it,
+//     then release). That was deliberately NOT done: this package's sibling
+//     session.FileLock.Release doc comment already documents why removing a
+//     path while a lock on it is held is cross-platform-fragile — POSIX
+//     unlink of a locked-but-open file is harmless (flock is keyed off the
+//     inode), but the lock files here are opened without FILE_SHARE_DELETE
+//     on Windows, so a concurrent opener's handle can make the delete fail
+//     with a sharing violation, or a successful delete can race a
+//     subsequent opener into creating a distinct file object at the same
+//     path while an older locked one still exists — i.e. the fix risks
+//     reintroducing a shaped version of the same two-owners bug on Windows
+//     specifically, in exchange for closing a gap that is already down to
+//     single-digit milliseconds. Not worth it here; the window is accepted
+//     and documented instead.
+//  2. Probe-induced transient contention. Proving death takes a real
+//     exclusive OS lock (open + LockFileEx/flock + truncate + PID write +
+//     Sync + sidecar write + Chtimes, then release) on every lock file
+//     `sessions locks` inspects that looks older than autoDeleteAfter. A
+//     `crush run` legitimately starting on that exact session id during
+//     that brief window gets a hard "already in use" abort with no retry.
+//     This is why the fix for (1) above is not simply "hold the lock
+//     longer" — extending how long the probe holds the OS lock would widen
+//     this exact contention window, trading one narrow risk for a wider
+//     one. Given how narrow the window already is (a single acquire+release
+//     cycle, not the run's full lifetime) and that it only collides with a
+//     `crush run` starting on the SAME session id in that SAME instant,
+//     this is accepted as-is rather than gated behind a flag — see
+//     sessionsLocksCmdRun's doc comment for the fuller default-behavior
+//     tradeoff.
 func lockHolderProvablyDead(dataDir, sessionID string) bool {
 	lk, err := session.TryAcquireSessionLock(dataDir, sessionID)
 	if err != nil {
