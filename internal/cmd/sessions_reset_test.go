@@ -156,9 +156,12 @@ func TestSessionsReset_ForceDoesNotKillStalePID(t *testing.T) {
 	require.True(t, session.IsProcessAlive(os.Getpid()),
 		"reset --force must never kill the calling test process via a stale lock-file PID")
 
-	// Lock file must still be removed (the non-kill path still cleans up).
-	_, statErr := os.Stat(lockPath)
-	require.True(t, os.IsNotExist(statErr), "lock file should be removed even when no live holder was found")
+	// reset --force now HOLDS the OS lock through the DB reset and releases
+	// afterward; it deliberately does NOT remove the lock file (an empty lock
+	// file with no held OS lock is harmless — see internal/session/lock.go's
+	// Release). The file is expected to remain on disk.
+	require.FileExists(t, lockPath,
+		"reset --force must leave the lock file in place (held+released), not unlink it")
 }
 
 // resetSessionCmdFlags ensures the --force flag exists and is reset to its
@@ -251,8 +254,8 @@ func TestSessionsReset_ForceHonorsConfiguredDataDir(t *testing.T) {
 	})
 	t.Logf("reset --force stderr:\n%s", stderr)
 
-	require.NotContains(t, stderr, "warning: could not remove lock",
-		"fix must find and remove the lock at the configured data dir, not miss it")
+	require.NotContains(t, stderr, "could not determine lock state",
+		"reset --force must acquire the lock at the configured data dir rather than fail closed")
 	require.Contains(t, stderr, dataDir,
 		"report must reference the configured data dir's lock path, not a cwd-based guess")
 
@@ -261,8 +264,9 @@ func TestSessionsReset_ForceHonorsConfiguredDataDir(t *testing.T) {
 	require.True(t, session.IsProcessAlive(os.Getpid()),
 		"reset --force must never kill the calling test process via a stale lock-file PID")
 
-	_, statErr := os.Stat(lockPath)
-	require.True(t, os.IsNotExist(statErr), "lock file at the configured data dir must be removed")
+	// reset --force holds+releases the lock; it does NOT remove the file.
+	require.FileExists(t, lockPath,
+		"lock file at the configured data dir is held+released, not removed")
 }
 
 // TestSessionsReset_ForceStillKillsLiveHolder is the "didn't break the happy

@@ -82,11 +82,26 @@ func TestRemoveLockWithRetry(t *testing.T) {
 	assert.NoError(t, removeLockWithRetry(filepath.Join(dir, "missing.lock"), 0))
 }
 
+// TestForceKillHolder_InvalidPID pins the fail-closed contract for the
+// "live holder, unusable PID" case.
+//
+// forceKillHolder is reached ONLY from the busy branch of
+// probeThenKillHolder / acquireSessionLockForReset — after the OS has just
+// proven a live holder exists. A pid<=0 there means "a holder exists and we
+// cannot identify it", NOT "nobody holds the lock". An earlier draft asserted
+// ConfirmedDead==true here with the rationale "pid<=0: no live holder", which
+// pinned a false claim as a contract: ConfirmedDead is the single field every
+// destructive follow-up is gated on, so a spurious true is precisely how a
+// live holder's lock file gets unlinked and two owners appear.
 func TestForceKillHolder_InvalidPID(t *testing.T) {
-	report := forceKillHolder(0, time.Second)
-	assert.Contains(t, report, "no readable PID")
-	report = forceKillHolder(-5, time.Second)
-	assert.Contains(t, report, "no readable PID")
+	kr := forceKillHolder(0, time.Second)
+	assert.Contains(t, kr.Report, "no usable PID")
+	assert.False(t, kr.ConfirmedDead,
+		"a live holder was proven to exist by the caller's probe; an unreadable PID cannot upgrade that to 'confirmed dead'")
+	assert.Equal(t, holderUnidentified, kr.State)
+	kr = forceKillHolder(-5, time.Second)
+	assert.Contains(t, kr.Report, "no usable PID")
+	assert.False(t, kr.ConfirmedDead)
 }
 
 func TestForceKillHolder_AlreadyDead(t *testing.T) {
@@ -98,8 +113,10 @@ func TestForceKillHolder_AlreadyDead(t *testing.T) {
 		cmd = exec.CommandContext(context.Background(), "true")
 	}
 	require.NoError(t, cmd.Run())
-	report := forceKillHolder(cmd.Process.Pid, time.Second)
-	assert.Contains(t, report, "already gone")
+	kr := forceKillHolder(cmd.Process.Pid, time.Second)
+	assert.Contains(t, kr.Report, "already gone")
+	assert.True(t, kr.ConfirmedDead)
+	assert.Equal(t, holderAlreadyDead, kr.State)
 }
 
 // TestProbeThenKillHolder_StalePIDNotKilled is the regression test for the
@@ -128,9 +145,11 @@ func TestProbeThenKillHolder_StalePIDNotKilled(t *testing.T) {
 	lockPath := filepath.Join(dataDir, "locks", "session-stale-pid-id.lock")
 	require.NoError(t, os.WriteFile(lockPath, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0o644))
 
-	report := probeThenKillHolder(dataDir, "stale-pid-id", os.Getpid(), time.Second)
-	assert.Contains(t, report, "stale")
-	assert.NotContains(t, report, "killed PID")
+	kr := probeThenKillHolder(dataDir, "stale-pid-id", os.Getpid(), time.Second)
+	assert.Contains(t, kr.Report, "stale")
+	assert.NotContains(t, kr.Report, "killed PID")
+	assert.True(t, kr.ConfirmedDead, "no live OS lock -> holder confirmed dead (nothing to kill)")
+	assert.Equal(t, holderAlreadyDead, kr.State)
 	assert.True(t, session.IsProcessAlive(os.Getpid()), "probe must never kill the calling test process")
 }
 
@@ -151,9 +170,10 @@ func TestProbeThenKillHolder_LiveHolderStillKilled(t *testing.T) {
 
 	require.True(t, session.IsProcessAlive(holder.pid))
 
-	report := probeThenKillHolder(dataDir, "live-holder-id", holder.pid, 5*time.Second)
-	t.Logf("report: %s", report)
-	assert.True(t, strings.Contains(report, "killed PID") || strings.Contains(report, "already gone"))
+	kr := probeThenKillHolder(dataDir, "live-holder-id", holder.pid, 5*time.Second)
+	t.Logf("report: %s", kr.Report)
+	assert.True(t, strings.Contains(kr.Report, "killed PID") || strings.Contains(kr.Report, "already gone"))
+	assert.True(t, kr.ConfirmedDead, "a genuinely live holder that was killed must be confirmed dead")
 	assert.False(t, session.IsProcessAlive(holder.pid), "a genuinely live holder must still be killed")
 }
 
@@ -187,10 +207,11 @@ func TestForceKillHolder_LiveProcess(t *testing.T) {
 	go func() { _, _ = cmd.Process.Wait() }()
 
 	require.True(t, session.IsProcessAlive(pid))
-	report := forceKillHolder(pid, 5*time.Second)
-	t.Logf("report: %s", report)
-	assert.True(t, strings.Contains(report, "killed PID") || strings.Contains(report, "already gone"))
-	assert.Contains(t, report, "exited")
+	kr := forceKillHolder(pid, 5*time.Second)
+	t.Logf("report: %s", kr.Report)
+	assert.True(t, strings.Contains(kr.Report, "killed PID") || strings.Contains(kr.Report, "already gone"))
+	assert.Contains(t, kr.Report, "exited")
+	assert.True(t, kr.ConfirmedDead, "a killed live PID must be reported confirmed dead")
 	assert.False(t, session.IsProcessAlive(pid), "PID should be dead after forceKillHolder")
 }
 

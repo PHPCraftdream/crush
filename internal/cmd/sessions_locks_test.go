@@ -200,6 +200,7 @@ func TestSessionsLocksCmdRun_HonorsConfiguredDataDir(t *testing.T) {
 	require.NoError(t, sessionsLocksCmd.Flags().Set("cwd", ""))
 	require.NoError(t, sessionsLocksCmd.Flags().Set("json", "false"))
 	require.NoError(t, sessionsLocksCmd.Flags().Set("stale-only", "false"))
+	require.NoError(t, sessionsLocksCmd.Flags().Set("prune", "false"))
 	sessionsLocksCmd.SetContext(context.Background())
 
 	const sessionID = "configured-datadir-locks-id"
@@ -283,6 +284,7 @@ func TestSessionsLocksCmdRun_RemoveFailureAfterProvablyDead_Surfaced(t *testing.
 	require.NoError(t, sessionsLocksCmd.Flags().Set("cwd", ""))
 	require.NoError(t, sessionsLocksCmd.Flags().Set("json", "false"))
 	require.NoError(t, sessionsLocksCmd.Flags().Set("stale-only", "false"))
+	require.NoError(t, sessionsLocksCmd.Flags().Set("prune", "true"))
 	sessionsLocksCmd.SetContext(context.Background())
 
 	const sessionID = "remove-fail-provably-dead-id"
@@ -377,6 +379,7 @@ func TestSessionsLocksCmdRun_ConcurrentDeleteBeforeRemove_ENOENTIsSuccess(t *tes
 	require.NoError(t, sessionsLocksCmd.Flags().Set("cwd", ""))
 	require.NoError(t, sessionsLocksCmd.Flags().Set("json", "false"))
 	require.NoError(t, sessionsLocksCmd.Flags().Set("stale-only", "false"))
+	require.NoError(t, sessionsLocksCmd.Flags().Set("prune", "true"))
 	sessionsLocksCmd.SetContext(context.Background())
 
 	const sessionID = "concurrent-delete-enoent-id"
@@ -469,6 +472,7 @@ func TestSessionsLocksCmdRun_AutoDeleteRemovesStaleLock(t *testing.T) {
 	require.NoError(t, sessionsLocksCmd.Flags().Set("cwd", ""))
 	require.NoError(t, sessionsLocksCmd.Flags().Set("json", "false"))
 	require.NoError(t, sessionsLocksCmd.Flags().Set("stale-only", "false"))
+	require.NoError(t, sessionsLocksCmd.Flags().Set("prune", "true"))
 	sessionsLocksCmd.SetContext(context.Background())
 
 	const sessionID = "auto-delete-stale-id"
@@ -597,6 +601,7 @@ func TestSessionsLocksCmdRun_ReadsPIDViaSidecarFallback(t *testing.T) {
 	require.NoError(t, sessionsLocksCmd.Flags().Set("cwd", ""))
 	require.NoError(t, sessionsLocksCmd.Flags().Set("json", "false"))
 	require.NoError(t, sessionsLocksCmd.Flags().Set("stale-only", "false"))
+	require.NoError(t, sessionsLocksCmd.Flags().Set("prune", "false"))
 	sessionsLocksCmd.SetContext(context.Background())
 
 	const sessionID = "sidecar-fallback-id"

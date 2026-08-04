@@ -390,15 +390,23 @@ crush sessions reset pr-42 --force
 			// see task #219.
 			dataDir := a.Config().Options.DataDirectory
 			lockPath := filepath.Join(dataDir, "locks", "session-"+sanitiseSessionIDForFilename(sess.ID)+".lock")
-			if _, statErr := os.Stat(lockPath); statErr == nil {
-				pid := session.ReadLockPID(lockPath)
-				fmt.Fprint(os.Stderr, probeThenKillHolder(dataDir, sess.ID, pid, 5*time.Second))
-				if err := removeLockWithRetry(lockPath, 5*time.Second); err != nil {
-					fmt.Fprintf(os.Stderr, "warning: could not remove lock %s: %v\n", lockPath, err)
-				} else {
-					fmt.Fprintf(os.Stderr, "removed lock %s\n", lockPath)
-				}
+			fmt.Fprintf(os.Stderr, "reset --force: acquiring session lock at %s\n", lockPath)
+			pid := session.ReadLockPID(lockPath)
+			lk, kr, acquireErr := acquireSessionLockForReset(dataDir, sess.ID, pid, 5*time.Second)
+			if acquireErr != nil {
+				fmt.Fprint(os.Stderr, kr.Report)
+				return fmt.Errorf("reset --force: %w", acquireErr)
 			}
+			fmt.Fprint(os.Stderr, kr.Report)
+			// HOLD the real OS lock across the DB reset below so no concurrent
+			// `crush run --session <id>` can recreate the lock at this path and
+			// start writing into the session DB while the wipe is in flight.
+			// The lock FILE is deliberately NOT removed: an empty lock file
+			// with no held OS lock is harmless (the next acquirer reopens and
+			// overwrites it; see internal/session/lock.go's Release), and
+			// removing a path a live holder may be reusing is exactly the
+			// two-owners bug this command must avoid.
+			defer lk.Release()
 		}
 
 		if err := a.Messages.DeleteSessionMessages(cmd.Context(), sess.ID); err != nil {
@@ -461,28 +469,24 @@ it appears stale (process not running or lock older than 10 minutes).
 
 Lock files are typically acquired when a session is running and released
 when the run completes. Stale locks can accumulate if processes crash
-without cleanup. This command DOES auto-delete a lock once it has proven
-(via a real OS-level lock probe, not just its mtime age) that no live
-process actually holds it — see the note below for the exact discipline
-and its narrow, documented residual risk windows.
+without cleanup. By default this command is READ-ONLY: it lists locks and
+never removes anything — an empty lock file with no held OS lock is
+harmless (the next acquirer reopens and overwrites it; see
+internal/session/lock.go's Release), so auto-deleting stable per-session
+lock files is unnecessary and only ever reintroduces TOCTOU "unlink a path
+a live holder may be reusing" bugs.
 
-Note: entries that merely LOOK stale by mtime (older than 60s) but that a
-real OS-level lock probe proves are still held are never deleted — only a
-lock file with no live OS-level holder is auto-removed (see
-lockHolderProvablyDead's doc comment for the full discipline and its two
-documented, narrow residual windows: a post-probe TOCTOU on removal, and
-brief probe-induced contention with a concurrent "crush run" starting on
-the exact same session id). This auto-delete runs unconditionally, on
-every invocation, on every stale-looking entry — it is not gated behind an
-opt-in flag. That was a deliberate call (task #230): the contention window
-per entry is a single lock acquire+release cycle (well under what a
-"crush run" start already tolerates elsewhere), it only collides with a
-run starting on that exact session id in that exact instant, and this
-default (auto-pruning stale entries) predates task #230 and is what
-existing scripts already depend on. Adding a --prune/--auto-delete flag
-to gate it was considered and rejected as over-engineering a rare,
-already-narrow edge case; revisit only if the collision is ever observed
-in practice, not preemptively.
+Pass --prune to opt in to removing a lock once it has been proven (via a
+real OS-level lock probe, not just its mtime age) that no live process
+actually holds it. Entries that merely LOOK stale by mtime (older than 60s)
+but that a real OS-level lock probe proves are still held are never deleted
+— only a lock file with no live OS-level holder is removed under --prune.
+See lockHolderProvablyDead's doc comment for the full discipline and its
+two documented, narrow residual windows (a post-probe TOCTOU on removal,
+and brief probe-induced contention with a concurrent "crush run" starting
+on the exact same session id). --prune is opt-in precisely because those
+narrow windows are accepted for an explicit operator request, not for a
+default that runs silently on every invocation.
 
 Use --stale-only to filter to suspicious locks. Use --json for NDJSON
 output suitable for metrics collection or automation.`,
@@ -633,6 +637,7 @@ func init() {
 
 	sessionsLocksCmd.Flags().Bool("json", false, "Emit NDJSON (one JSON object per line)")
 	sessionsLocksCmd.Flags().Bool("stale-only", false, "Filter to locks older than 10 minutes or for dead processes")
+	sessionsLocksCmd.Flags().Bool("prune", false, "Remove lock files proven (via a real OS-level lock probe) to have no live holder. Off by default: `sessions locks` is read-only unless this is set.")
 
 	sessionsTailCmd.Flags().Bool("follow", false, "Keep polling for new messages until session finishes")
 	sessionsTailCmd.Flags().String("from-message", "", "Resume from this message ID (skip earlier)")
@@ -1072,6 +1077,7 @@ var preAutoDeleteRemoveHook func(lockPath string)
 func sessionsLocksCmdRun(cmd *cobra.Command, args []string) error {
 	asJSON, _ := cmd.Flags().GetBool("json")
 	staleOnly, _ := cmd.Flags().GetBool("stale-only")
+	prune, _ := cmd.Flags().GetBool("prune")
 
 	a, err := setupApp(cmd)
 	if err != nil {
@@ -1131,19 +1137,29 @@ func sessionsLocksCmdRun(cmd *cobra.Command, args []string) error {
 
 		lockPath := filepath.Join(locksDir, entry.Name())
 
-		// Auto-delete candidate: mtime older than 1 minute. mtime alone is
-		// NO LONGER proof of death (task #222) — the heartbeat's mtime touch
-		// is now gated on RecordActivity, so a session blocked on a single
-		// long-running tool call (up to toolExecutionMaxDefault, 45 minutes)
-		// can look stale here while still being completely healthy and still
-		// holding the real OS lock. Before deleting, prove it via a real
-		// OS-level lock attempt (lockHolderProvablyDead) — same discipline
-		// as sessions_kill.go's probeThenKillHolder. Unlinking a path out
-		// from under a live holder's flock/LockFileEx does not revoke it
-		// (advisory locks are bound to the inode, not the path); it just
-		// lets a second process create a fresh inode at the same path and
-		// believe it owns the session — two owners of one session id.
-		if age > autoDeleteAfter {
+		// Auto-delete candidate: mtime older than 1 minute AND the operator
+		// explicitly opted in via --prune. By default `sessions locks` is
+		// READ-ONLY — it never removes anything. Deleting stable per-session
+		// lock files is unnecessary in the first place (an empty lock file
+		// with no held OS lock is harmless: the next acquirer reopens and
+		// overwrites it, see internal/session/lock.go's Release), so the
+		// whole class of TOCTOU "unlink a path that a live holder may be
+		// reusing" bugs is closed by NOT auto-deleting unless an operator
+		// asks for it.
+		//
+		// mtime alone is NO LONGER proof of death (task #222) — the
+		// heartbeat's mtime touch is gated on RecordActivity, so a session
+		// blocked on a single long-running tool call (up to
+		// toolExecutionMaxDefault, 45 minutes) can look stale here while
+		// still being completely healthy and still holding the real OS lock.
+		// Before deleting under --prune, prove it via a real OS-level lock
+		// attempt (lockHolderProvablyDead) — same discipline as
+		// sessions_kill.go's probeThenKillHolder. Unlinking a path out from
+		// under a live holder's flock/LockFileEx does not revoke it (advisory
+		// locks are bound to the inode, not the path); it just lets a second
+		// process create a fresh inode at the same path and believe it owns
+		// the session — two owners of one session id.
+		if prune && age > autoDeleteAfter {
 			if lockHolderProvablyDead(dataDir, sessionID) {
 				if preAutoDeleteRemoveHook != nil {
 					preAutoDeleteRemoveHook(lockPath)
