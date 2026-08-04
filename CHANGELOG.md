@@ -37,6 +37,19 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   takes the parent's resolved `dataDir` and passes it through as
   `--data-dir` on the child's argv.
 
+- **Web UI attachments now honor the configured data directory** —
+  `saveAttachmentToDisk` (in `internal/server/handlers.go`) always wrote
+  uploaded attachments to `<cwd>/.crush/attachments/`, hardcoding both the
+  working directory and the `.crush` segment instead of using the
+  resolved `data_directory`/`--data-dir`. With a non-default data
+  directory configured, attachments landed in a location the rest of the
+  app doesn't read from. It now takes the already-resolved data
+  directory (the same `externalOwnershipDataDir` helper that
+  `annotateExternalOwnership` uses) and writes
+  to `<dataDir>/attachments/`; a nil-config edge case defensively falls
+  back to the old `<cwd>/.crush` default rather than hard-failing an
+  otherwise best-effort save.
+
 A separate review flagged the session heartbeat as reporting "alive"
 for a fully deadlocked process (no real progress, mtime still fresh)
 and a backlog of eight lower-priority follow-ups from the stability

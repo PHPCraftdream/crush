@@ -160,10 +160,16 @@ func handleIncoming(ctx context.Context, a *appPkg.App, c *Client, raw []byte) {
 	}
 }
 
-// saveAttachmentToDisk saves an attachment to .crush/attachments/ with a
-// timestamped filename and returns the absolute path.
-func saveAttachmentToDisk(workingDir, fileName string, data []byte) (string, error) {
-	dir := filepath.Join(workingDir, ".crush", "attachments")
+// saveAttachmentToDisk saves an attachment to <dataDir>/attachments/ with a
+// timestamped filename and returns the absolute path. dataDir must already be
+// the fully resolved data directory (e.g. cfg.Options.DataDirectory, which
+// defaults to "<workingDir>/.crush" but honors an explicit --data-dir or
+// configured data_directory) — callers must not append ".crush" themselves.
+func saveAttachmentToDisk(dataDir, fileName string, data []byte) (string, error) {
+	if dataDir == "" {
+		return "", errors.New("data directory not configured")
+	}
+	dir := filepath.Join(dataDir, "attachments")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", fmt.Errorf("create attachments dir: %w", err)
 	}
@@ -205,8 +211,8 @@ func handleSendMessage(ctx context.Context, a *appPkg.App, c *Client, msg WSMess
 	for _, att := range p.Attachments {
 		slog.Info("ws: attachment received", "fileName", att.FileName, "mimeType", att.MimeType, "dataLen", len(att.Data))
 
-		// Save to .crush/attachments/ with timestamped name.
-		savedPath, saveErr := saveAttachmentToDisk(a.Store().WorkingDir(), att.FileName, att.Data)
+		// Save to <data dir>/attachments/ with timestamped name.
+		savedPath, saveErr := saveAttachmentToDisk(attachmentsDataDir(a), att.FileName, att.Data)
 		if saveErr != nil {
 			slog.Warn("ws: failed to save attachment to disk", "err", saveErr)
 		} else {
@@ -322,7 +328,7 @@ func handleInterruptAndSend(ctx context.Context, a *appPkg.App, c *Client, msg W
 	// metadata so vision-capable providers can ingest images.
 	var attachments []message.Attachment
 	for _, att := range p.Attachments {
-		savedPath, saveErr := saveAttachmentToDisk(a.Store().WorkingDir(), att.FileName, att.Data)
+		savedPath, saveErr := saveAttachmentToDisk(attachmentsDataDir(a), att.FileName, att.Data)
 		if saveErr != nil {
 			slog.Warn("ws: failed to save attachment to disk", "err", saveErr)
 		} else {
@@ -394,7 +400,7 @@ func handleInjectMessage(ctx context.Context, a *appPkg.App, c *Client, msg WSMe
 	// Same attachments path as handleSendMessage.
 	var attachments []message.Attachment
 	for _, att := range p.Attachments {
-		savedPath, saveErr := saveAttachmentToDisk(a.Store().WorkingDir(), att.FileName, att.Data)
+		savedPath, saveErr := saveAttachmentToDisk(attachmentsDataDir(a), att.FileName, att.Data)
 		if saveErr != nil {
 			slog.Warn("ws: failed to save attachment to disk", "err", saveErr)
 		} else {
@@ -738,6 +744,15 @@ func externalOwnershipDataDir(a *appPkg.App) string {
 		return ""
 	}
 	return cfg.Options.DataDirectory
+}
+
+// attachmentsDataDir resolves the configured data directory for saved
+// attachments. It defensively falls back to "<workingDir>/.crush" (the
+// pre-fix, cwd-derived default) on the rare nil-config edge case, so a
+// missing config doesn't turn a best-effort attachment save into a hard
+// failure.
+func attachmentsDataDir(a *appPkg.App) string {
+	return cmp.Or(externalOwnershipDataDir(a), filepath.Join(a.Store().WorkingDir(), ".crush"))
 }
 
 func handleListSessions(ctx context.Context, a *appPkg.App, c *Client, msg WSMessage) {
