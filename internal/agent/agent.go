@@ -407,6 +407,18 @@ type sessionAgent struct {
 	// summarizeQueue holds a pending manual-summarise request per session,
 	// queued while the session was busy.
 	summarizeQueue *csync.Map[string, fantasy.ProviderOptions]
+	// mailboxes holds the per-session owner/mailbox state machine described
+	// in docs/plans/2026-08-04-session-owner-mailbox-design.md. Stage 1 of
+	// that migration (this field's introduction) is purely additive: no
+	// caller reads or writes through it yet, and none of
+	// activeRequests/messageQueue/injectQueue/sessionStartMu above are
+	// removed or altered in behavior. One mailbox per session id, created
+	// lazily on first touch via GetOrSet and never explicitly deleted —
+	// same "one map, lazily populated, entries live forever" lifetime as
+	// activeRequests today. Later stages migrate call sites onto this map
+	// one at a time (see the design doc §7) before the old structures are
+	// finally deleted.
+	mailboxes *csync.Map[string, *mailbox]
 	// peakHoursCheck, when non-nil, is called once per step from
 	// OnStepFinish to re-check whether the large model's provider has
 	// entered its peak_hours refusal window mid-turn. Returns nil while
@@ -525,6 +537,7 @@ func NewSessionAgent(
 		injectQueue:                csync.NewKeyedQueue[message.Message](),
 		activeRequests:             csync.NewMap[string, context.CancelFunc](),
 		summarizeQueue:             csync.NewMap[string, fantasy.ProviderOptions](),
+		mailboxes:                  csync.NewMap[string, *mailbox](),
 		streamIdleTimeout:          opts.StreamIdleTimeout,
 		dataDir:                    opts.DataDirectory,
 		checkpointInterval:         opts.CheckpointInterval,
