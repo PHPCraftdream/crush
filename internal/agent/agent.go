@@ -505,37 +505,45 @@ type sessionAgent struct {
 	// shared state.
 	titleGenerationMaxDuration time.Duration
 
-	// messageQueue and injectQueue are per-session FIFO queues. They use
-	// csync.KeyedQueue (not csync.Map[string, []T]) because every real
-	// usage here is a composite read-modify-write (append-to-existing,
-	// or read-then-delete-to-drain) — pairing Map.Get with a later
-	// Map.Set/Del leaves a window where a concurrent Append/drain can
-	// interleave and silently lose a queued message. KeyedQueue makes
-	// each of those composite operations (Append, TakeAll, PopFront) a
-	// single atomic critical section per session id.
+	// messageQueue is a per-session FIFO queue. It uses csync.KeyedQueue
+	// (not csync.Map[string, []T]) because every real usage here is a
+	// composite read-modify-write (append-to-existing, or
+	// read-then-delete-to-drain) — pairing Map.Get with a later Map.Set/Del
+	// leaves a window where a concurrent Append/drain can interleave and
+	// silently lose a queued message. KeyedQueue makes each of those
+	// composite operations (Append, TakeAll, PopFront) a single atomic
+	// critical section per session id.
+	//
+	// Still live: only tryReserveSession/releaseSessionReservation and
+	// InterruptAndReplace have migrated to the mailbox (design §7 stages
+	// 2.1-2.3); QueueMessage and its drain consumers
+	// (drainOrReleaseMerged, PrepareStep, runSummarizeCore, QueuedPrompts,
+	// ClearQueue, Run's re-queue defer) still read/write this queue
+	// directly. Removed once those move to the mailbox.
 	messageQueue *csync.KeyedQueue[SessionAgentCall]
-	// injectQueue holds user messages that were ALREADY persisted to the DB
-	// (visible in the UI immediately) and are waiting to be merged into the
-	// next provider request via PrepareStep. Unlike messageQueue (where the
-	// DB write happens at drain time), injectQueue entries are pre-created
-	// rows from InjectMessage — the drain just adds them to prepared.Messages
-	// so the in-flight Run() sees them without restart. Seamless injection.
-	injectQueue    *csync.KeyedQueue[message.Message]
+	// activeRequests is retained solely for the sessionID+"-summarize"
+	// synthetic key that runSummarize/runSummarizeCore register as their
+	// cancel target (Cancel, CancelAll, IsBusy still read it, filtered to
+	// that suffix). Migration to mailbox.compact is deferred to #268;
+	// until then this field MUST stay. Plain-sessionID entries it
+	// accumulated pre-migration are inert (already-fired cancelFuncs) and
+	// are no longer consulted for busy state (IsSessionBusy reads the
+	// mailbox).
 	activeRequests *csync.Map[string, context.CancelFunc]
 	// summarizeQueue holds a pending manual-summarise request per session,
 	// queued while the session was busy.
 	summarizeQueue *csync.Map[string, fantasy.ProviderOptions]
 	// mailboxes holds the per-session owner/mailbox state machine described
-	// in docs/plans/2026-08-04-session-owner-mailbox-design.md. Stage 1 of
-	// that migration (this field's introduction) is purely additive: no
-	// caller reads or writes through it yet, and none of
-	// activeRequests/messageQueue/injectQueue/sessionStartMu above are
-	// removed or altered in behavior. One mailbox per session id, created
-	// lazily on first touch via GetOrSet and never explicitly deleted —
-	// same "one map, lazily populated, entries live forever" lifetime as
-	// activeRequests today. Later stages migrate call sites onto this map
-	// one at a time (see the design doc §7) before the old structures are
-	// finally deleted.
+	// in docs/plans/2026-08-04-session-owner-mailbox-design.md. Stages
+	// 2.1-2.4 migrated tryReserveSession/releaseSessionReservation,
+	// InterruptAndReplace, the two-tier context split, and the inject path
+	// onto the mailbox; injectQueue and sessionStartMu have been deleted as
+	// fully dead. messageQueue (QueueMessage + its drain consumers) and
+	// activeRequests (the sessionID+"-summarize" cancel key, deferred to
+	// #268) remain live and are removed in later stages. One mailbox per
+	// session id, created lazily on first touch via GetOrSet and never
+	// explicitly deleted — same "one map, lazily populated, entries live
+	// forever" lifetime as activeRequests today.
 	mailboxes *csync.Map[string, *mailbox]
 	// peakHoursCheck, when non-nil, is called once per step from
 	// OnStepFinish to re-check whether the large model's provider has
@@ -545,17 +553,6 @@ type sessionAgent struct {
 	// itself only knows about Model (SelectedModel + catwalk metadata),
 	// not the provider's peak_hours setting.
 	peakHoursCheck func() error
-
-	// sessionStartMu serializes the "is this session busy? if not, claim
-	// it" decision at the top of Run(). Without this, two concurrent Run()
-	// calls for the SAME sessionID can both observe IsSessionBusy==false
-	// (the read of activeRequests and the later activeRequests.Set used to
-	// happen tens/hundreds of DB-preamble milliseconds apart — see
-	// tryReserveSession's doc) and both proceed past the in-process check,
-	// only then to race for the real (but far less informative) OS-level
-	// file lock. Guarding check+reserve with one mutex makes the decision
-	// atomic and the rejection deterministic and immediate.
-	sessionStartMu sync.Mutex
 }
 
 type SessionAgentOptions struct {
@@ -652,7 +649,6 @@ func NewSessionAgent(
 		isYolo:                     opts.IsYolo,
 		notify:                     opts.Notify,
 		messageQueue:               csync.NewKeyedQueue[SessionAgentCall](),
-		injectQueue:                csync.NewKeyedQueue[message.Message](),
 		activeRequests:             csync.NewMap[string, context.CancelFunc](),
 		summarizeQueue:             csync.NewMap[string, fantasy.ProviderOptions](),
 		mailboxes:                  csync.NewMap[string, *mailbox](),
@@ -3854,13 +3850,12 @@ func (a *sessionAgent) Cancel(sessionID string) {
 func (a *sessionAgent) ClearQueue(sessionID string) {
 	// The single intentional "drop everything queued" operation (design
 	// §4): clears the mailbox's submitted/replacement/injects atomically
-	// under its lock, plus the still-live legacy messageQueue/injectQueue
-	// (not all callers are migrated yet — design §7 step 5). Cancel no
-	// longer touches any of these; only this method does.
+	// under its lock, plus the still-live legacy messageQueue (QueueMessage
+	// is not yet migrated to the mailbox — see drainOrReleaseMerged's doc).
+	// Cancel no longer touches any of these; only this method does.
 	slog.Debug("Clearing queued prompts", "session_id", sessionID)
 	a.getMailbox(sessionID).clearAll()
 	a.messageQueue.Clear(sessionID)
-	a.injectQueue.Clear(sessionID)
 }
 
 func (a *sessionAgent) QueueMessage(call SessionAgentCall) {

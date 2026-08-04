@@ -9,13 +9,15 @@ import (
 )
 
 // mailbox is the per-session owner/mailbox state machine described in
-// docs/plans/2026-08-04-session-owner-mailbox-design.md. It is introduced
-// here (stage 1/5 of the migration) purely as an additive, unwired type:
-// nothing in sessionAgent calls into it yet, and none of the existing
-// activeRequests/messageQueue/injectQueue/sessionStartMu structures are
-// touched. See the design doc for the full rationale; this file implements
-// exactly the seven methods specified in sections 3, 4, and 5 there
-// (submit, drainOrRelease, interruptAndReplace, drainAfterCancel, inject,
+// docs/plans/2026-08-04-session-owner-mailbox-design.md. Stages 2.1-2.4
+// wired tryReserveSession/releaseSessionReservation, InterruptAndReplace,
+// the two-tier context split, and the inject path onto it; injectQueue and
+// sessionStartMu have been deleted as fully dead, while messageQueue
+// (QueueMessage + drain consumers) and activeRequests (the
+// sessionID+"-summarize" cancel key, deferred to #268) remain live. See
+// the design doc for the full rationale; this file implements exactly the
+// seven methods specified in sections 3, 4, and 5 there (submit,
+// drainOrRelease, interruptAndReplace, drainAfterCancel, inject,
 // drainInjects, beginGeneration) with no behavior deviation.
 type mailboxState int
 
@@ -44,9 +46,10 @@ type pendingInject struct {
 }
 
 // mailbox holds all per-session ownership/queueing state behind one mutex,
-// replacing (once wired, in later stages) activeRequests, messageQueue,
-// injectQueue, and the sessionStartMu reservation gate for a single session
-// id. See design doc §1 for the full field-by-field rationale.
+// ultimately replacing activeRequests, messageQueue, and the former
+// sessionStartMu reservation gate for a single session id (injectQueue and
+// sessionStartMu are already deleted). See design doc §1 for the full
+// field-by-field rationale.
 type mailbox struct {
 	mu sync.Mutex // single critical section for ALL fields below
 
