@@ -85,6 +85,16 @@ type Service interface {
 	Deny(permission PermissionRequest)
 	Request(ctx context.Context, opts CreatePermissionRequest) (bool, error)
 	AutoApproveSession(sessionID string)
+	// InheritSessionAutoApprove propagates parentID's auto-approve status
+	// (if any) to childID, atomically. Sub-agent delegations run under
+	// their OWN child session id, so without this a non-interactive
+	// `crush run` — which auto-approves only the root session it was
+	// given — leaves every delegated sub-agent unapproved, and the
+	// sub-agent's first non-safe tool call blocks forever on a UI prompt
+	// that does not exist in that mode. Deliberately inheritance rather
+	// than a blanket auto-approve: an INTERACTIVE parent's sub-agent must
+	// still go through the normal prompt path.
+	InheritSessionAutoApprove(parentID, childID string)
 	SetSkipRequests(skip bool)
 	SkipRequests() bool
 	// SetRunAllowlist arms the restricted-run allowlist used by
@@ -374,6 +384,27 @@ func (s *permissionService) AutoApproveSession(sessionID string) {
 	s.autoApproveSessionsMu.Lock()
 	s.autoApproveSessions[sessionID] = true
 	s.autoApproveSessionsMu.Unlock()
+}
+
+// InheritSessionAutoApprove — see the Service interface comment for the
+// full rationale. Read and write happen under ONE write-lock hold so a
+// concurrent AutoApproveSession/Request on either id can't interleave
+// between the check and the propagation.
+//
+// A childID that would inherit nothing (parent not auto-approved) is
+// left absent from the map rather than written as false: Request reads
+// the map with a plain index expression, so absent and false behave
+// identically, and not writing keeps the map from growing one entry per
+// sub-agent delegation in interactive sessions.
+func (s *permissionService) InheritSessionAutoApprove(parentID, childID string) {
+	if parentID == "" || childID == "" || parentID == childID {
+		return
+	}
+	s.autoApproveSessionsMu.Lock()
+	defer s.autoApproveSessionsMu.Unlock()
+	if s.autoApproveSessions[parentID] {
+		s.autoApproveSessions[childID] = true
+	}
 }
 
 func (s *permissionService) SubscribeNotifications(ctx context.Context) <-chan pubsub.Event[PermissionNotification] {

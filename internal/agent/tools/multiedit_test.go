@@ -32,6 +32,8 @@ func (m *mockPermissionService) GrantPersistent(req permission.PermissionRequest
 
 func (m *mockPermissionService) AutoApproveSession(sessionID string) {}
 
+func (m *mockPermissionService) InheritSessionAutoApprove(parentID, childID string) {}
+
 func (m *mockPermissionService) SetSkipRequests(skip bool) {}
 
 func (m *mockPermissionService) SetRunAllowlist(allowlist permission.RunAllowlist) {}

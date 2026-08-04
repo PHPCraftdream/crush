@@ -31,6 +31,8 @@ func (m *mockBashPermissionService) GrantPersistent(req permission.PermissionReq
 
 func (m *mockBashPermissionService) AutoApproveSession(sessionID string) {}
 
+func (m *mockBashPermissionService) InheritSessionAutoApprove(parentID, childID string) {}
+
 func (m *mockBashPermissionService) SetSkipRequests(skip bool) {}
 
 func (m *mockBashPermissionService) SetRunAllowlist(allowlist permission.RunAllowlist) {}
@@ -193,6 +195,8 @@ func (m *recordingPermissionService) Deny(req permission.PermissionRequest) {}
 func (m *recordingPermissionService) GrantPersistent(req permission.PermissionRequest) {}
 
 func (m *recordingPermissionService) AutoApproveSession(sessionID string) {}
+
+func (m *recordingPermissionService) InheritSessionAutoApprove(parentID, childID string) {}
 
 func (m *recordingPermissionService) SetSkipRequests(skip bool) {}
 

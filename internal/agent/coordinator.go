@@ -2467,6 +2467,32 @@ func (c *coordinator) runSubAgent(ctx context.Context, params subAgentParams) (f
 		session = created
 	}
 
+	// Propagate the PARENT session's auto-approve status to this child.
+	//
+	// A sub-agent runs under its own child session id
+	// (parentMessageID$$toolCallID), which is a completely different key
+	// from the parent's. A non-interactive `crush run` auto-approves ONLY
+	// the root session id it was handed (app.go's
+	// Permissions.AutoApproveSession(sess.ID)), so before this call every
+	// delegated sub-agent was unapproved: its first non-safe tool call
+	// (anything outside tools.safeCommands — e.g. a bare `wc -l`) reached
+	// permission.Request's final select, which blocks on a UI response
+	// that does not exist in that mode, and hung until the 45-minute tool
+	// watchdog cap. Observed in the wild as "the agent spawns a sub-agent
+	// and then nothing happens at all" — the parent sat in `delegating`
+	// with a healthy heartbeat while the child was stuck on a trivial
+	// command.
+	//
+	// Inheritance (not a blanket auto-approve) is deliberate: an
+	// INTERACTIVE parent's sub-agent must still go through the normal
+	// prompt path, and the restricted-run allowlist gate still applies on
+	// top, since it is consulted inside the auto-approve branch itself.
+	// Applied BEFORE SessionSetup so an explicit setup callback can still
+	// override (agentic_fetch_tool.go auto-approves unconditionally).
+	if c.permissions != nil {
+		c.permissions.InheritSessionAutoApprove(params.SessionID, session.ID)
+	}
+
 	// Call session setup function if provided
 	if params.SessionSetup != nil {
 		params.SessionSetup(session.ID)
