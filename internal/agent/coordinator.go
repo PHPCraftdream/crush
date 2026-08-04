@@ -2022,9 +2022,11 @@ func (c *coordinator) requeueInterruptMessage(ctx context.Context, sessionID, me
 	// Reference the existing row; the agent must not re-create it.
 	call.ExistingMessageID = messageID
 	// InterruptAndReplace atomically records call and cancels only the
-	// in-flight generation (design §4) — same P0-2 fix as InterruptAndSend.
+	// in-flight generation (design §4) — same P0-2 fix as InterruptAndSend,
+	// and the same P0-B idle handling: with no owner there is nobody to
+	// drain a queued call, so start the run instead of stranding it.
 	if !c.currentAgent.InterruptAndReplace(sessionID, call) {
-		c.currentAgent.QueueMessage(call)
+		c.startDetachedRun(ctx, call)
 	}
 
 	// The row was created by a foreign process (`crush sessions inject`), so
@@ -2057,13 +2059,47 @@ func (c *coordinator) InterruptAndSend(ctx context.Context, sessionID, prompt st
 	// current owner runs next and cancels only the in-flight generation
 	// (design §4) — replacing the QueueMessage+Cancel two-step that P0-2
 	// made self-defeating (Cancel deterministically wiped what QueueMessage
-	// just queued). When the session is idle there is nothing to interrupt;
-	// fall back to the legacy queue so the next Run()'s drain picks the call
-	// up (same observable behavior as before for that case).
+	// just queued). When the session is idle there is nothing to interrupt,
+	// and nobody is running who would ever drain a queued call — so we must
+	// start the run ourselves (P0-B).
 	if !c.currentAgent.InterruptAndReplace(sessionID, call) {
-		c.currentAgent.QueueMessage(call)
+		c.startDetachedRun(ctx, call)
 	}
 	return nil
+}
+
+// startDetachedRun runs call in its own goroutine, for the idle-session
+// paths of InterruptAndSend / requeueInterruptMessage (P0-B).
+//
+// Those paths used to call QueueMessage(call) when InterruptAndReplace
+// reported no owner. That is a runnerless queue: with the session idle
+// there is no turn loop left to drain it, so the call sat there until
+// some unrelated future Run() happened to come along — while the caller
+// (and, through it, the web client) had already been told the message was
+// "queued". For a user pressing interrupt on a session that had just
+// finished, or landing in the race right after a release, the message
+// simply never ran. Starting the run here is what the mailbox's own
+// contract says the caller must do when it is handed "no owner" (see
+// mailbox.interruptAndReplace's doc).
+//
+// Losing the race to a concurrent Run() is safe and needs no coordination:
+// SessionAgent.Run submits through the mailbox, so if an owner appeared in
+// the meantime this call is queued behind it and that owner drains it —
+// the one thing that cannot happen either way is the call going unrun.
+//
+// The context is detached (WithoutCancel) because the caller's ctx is
+// request-scoped: the web handler returns as soon as InterruptAndSend
+// does, and a CLI `sessions inject` process may exit moments later.
+// Cancelling the run when that context goes away would recreate the very
+// "accepted but never executed" outcome this exists to prevent.
+func (c *coordinator) startDetachedRun(ctx context.Context, call SessionAgentCall) {
+	runCtx := context.WithoutCancel(ctx)
+	go func() {
+		if _, err := c.currentAgent.Run(runCtx, call); err != nil {
+			slog.Error("coordinator: detached run for an idle-session interrupt failed",
+				"session_id", call.SessionID, "err", err)
+		}
+	}()
 }
 
 // InjectMessage — see Coordinator interface.
