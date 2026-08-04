@@ -26,18 +26,28 @@ import (
 // Summarize, and the web handlers — none of which look at mailbox state.
 func TestCancelAll_RefusesNewRunsAfterShutdown(t *testing.T) {
 	t.Run("mailbox latch alone does not stop a new owner", func(t *testing.T) {
-		// Documents WHY the agent-level gate is needed rather than more
-		// mailbox gating: after a hard stop and the era ending, the mailbox
-		// is idle again and submit grants ownership to the next caller.
+		// Observation, NOT a contract: submit() consults only mb.state, so a
+		// hard-stopped mailbox whose era has ended still grants ownership.
+		// That is why the refusal has to live on the AGENT, ahead of any
+		// mailbox — which is what the other subtests actually pin.
+		//
+		// Deliberately logged rather than asserted. An earlier draft did
+		// require.True(t, became) here, which pins a DEFECT as if it were
+		// intended: anyone later gating submit() on `stopped` (the natural
+		// defence in depth, and plausibly part of #296) would get a red test
+		// reading like a regression they caused. Start from a genuinely
+		// owned mailbox so the scenario matches the comment — from the zero
+		// value, hardStop/abandonOwnership change nothing this observes.
 		mb := &mailbox{}
+		became, epoch := mb.submit(SessionAgentCall{SessionID: "s1"}, func() {})
+		require.True(t, became, "sanity: a fresh mailbox grants ownership")
 		mb.hardStop()
-		mb.abandonOwnership(0)
-		require.True(t, mb.isStopped(), "sanity: the latch is set")
+		mb.abandonOwnership(epoch)
+		require.True(t, mb.isStopped(), "sanity: the latch is set and the era has ended")
 
-		became, _ := mb.submit(SessionAgentCall{SessionID: "s1"}, func() {})
-		require.True(t, became,
-			"submit still grants ownership on a hard-stopped mailbox once its era ended — this is exactly why "+
-				"the refusal has to live on the agent, before any mailbox is consulted")
+		againBecame, _ := mb.submit(SessionAgentCall{SessionID: "s1"}, func() {})
+		t.Logf("submit on a hard-stopped, era-ended mailbox returned becomeOwner=%v "+
+			"(if this ever becomes false, submit grew its own stopped gate — fine, and this line can go)", againBecame)
 	})
 
 	t.Run("Run refuses on a session the sweep never saw", func(t *testing.T) {

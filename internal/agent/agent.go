@@ -813,11 +813,12 @@ func (a *sessionAgent) releaseSessionReservation(sessionID string, epoch uint64)
 //     having no callbacks of its own). Non-empty: reclaim ownership for the
 //     SAME era (no epoch bump — mirrors the old reclaimSameEra contract) and
 //     return it; lk again NOT touched.
-//  3. Both empty: transition to mbReleasing, release lk (if non-nil) OUTSIDE
-//     mb.mu (P1-C), then flip mb.state to mbIdle under mb.mu. While release
-//     is in flight the mailbox reads as "busy" (mbReleasing), so no
-//     same-process observer can see "not busy" until the OS lock genuinely
-//     is gone — HIGH-1 holds without holding the mutex across the disk I/O.
+//  3. Both empty: release lk (if non-nil) and THEN flip mb.state to mbIdle,
+//     all still under mb.mu. No same-process observer can see "not busy"
+//     until the OS lock genuinely is gone, closing the window above. Note
+//     the disk I/O of that release happens with mb.mu held — an accepted
+//     trade documented on drainOrReleaseFinal itself, and the subject of
+//     the still-open task #296.
 //
 // This is why checkLegacy is tried BEFORE releasing lk: reclaiming behind
 // the SAME lock avoids the release-then-reacquire shape, which would open a
@@ -920,7 +921,6 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	if a.shuttingDown.Load() {
 		return nil, ErrAgentShuttingDown
 	}
-
 
 	// runCtx/runCancel span the WHOLE call: the DB preamble of every turn
 	// (before runTurn creates its own per-turn genCtx) plus every turn
@@ -1025,10 +1025,10 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	// legitimately returns becomeOwner=true) and reach TryAcquireSessionLock
 	// here while the OS lock was still, transiently, held by its own
 	// process's outgoing turn — a same-process false "already in use".
-	// drainOrReleaseMerged now publishes mbIdle only after lk.Release has
-	// completed (see mailbox.drainOrReleaseFinal's mbReleasing state), so
-	// "not busy" and "OS lock free" become true together — this window is
-	// closed. Two sub-agent invocations
+	// drainOrReleaseMerged now releases lk inside the same mailbox critical
+	// section that flips state to mbIdle (see mailbox.drainOrReleaseFinal),
+	// so "not busy" and "OS lock free" become true together — this window
+	// is closed. Two sub-agent invocations
 	// spawned in parallel by fantasy's ParallelAgentTool likewise never
 	// collide here — each gets a distinct toolCallID and therefore a
 	// distinct child session id.
@@ -3424,10 +3424,21 @@ func (a *sessionAgent) generateTitle(ctx context.Context, sessionID string, user
 		// The re-read is what makes abandonment safe: a late finisher either
 		// finds the slot still empty and fills it (the original intent) or
 		// finds it taken and leaves it alone.
-		if sess, err := a.sessions.Get(fallbackCtx, sessionID); err == nil {
-			if sess.Title != "" && sess.Title != DefaultSessionName {
-				return
-			}
+		// Fail CLOSED: if the slot cannot be VERIFIED empty, do not stamp it.
+		// An earlier draft fell through to the rename whenever this read
+		// errored, which reinstates the very clobber-and-loop being fixed —
+		// and the read is most likely to fail exactly when it matters (the
+		// 5s budget expiring, or the DB closing during shutdown, both of
+		// which mean this goroutine has been abandoned and has no business
+		// writing).
+		sess, err := a.sessions.Get(fallbackCtx, sessionID)
+		if err != nil {
+			slog.Debug("agent: skipping fallback session title — could not confirm the title is still unset",
+				"session_id", sessionID, "err", err)
+			return
+		}
+		if sess.Title != "" && sess.Title != DefaultSessionName {
+			return
 		}
 		if err := a.sessions.Rename(fallbackCtx, sessionID, DefaultSessionName); err != nil {
 			slog.Error("Failed to save fallback session title", "error", err)
@@ -3838,10 +3849,7 @@ func (a *sessionAgent) CancelAll() {
 func (a *sessionAgent) IsBusy() bool {
 	for _, mb := range a.mailboxes.Seq2() {
 		mb.mu.Lock()
-		// mbReleasing (release in flight) counts as busy: while the OS lock
-		// is being released the session is not yet genuinely idle, and
-		// CancelAll's drain loop must wait for it to reach mbIdle.
-		busy := mb.state != mbIdle
+		busy := mb.state == mbOwned
 		mb.mu.Unlock()
 		if busy {
 			return true

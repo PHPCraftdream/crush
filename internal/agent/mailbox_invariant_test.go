@@ -151,6 +151,47 @@ func TestMailbox_Invariant_NoStaleCancelHandleSurvivesAnyMutatorReturn(t *testin
 			},
 			want: expectation{stillOwned: false},
 		},
+		// The shutdown branches added by the closing-review round. The
+		// previous review pointed out this table had stopped covering the
+		// branches it promises to cover — these close that gap. All of them
+		// return "no more work" while state stays mbOwned (Run's
+		// abandonOwnership defer ends the era shortly after), so they must
+		// still satisfy the no-stale-handle half of the invariant.
+		{
+			name: "drainAfterCancel/hard-stopped refuses and clears the handle",
+			run: func(t *testing.T, mb *mailbox) {
+				repl := SessionAgentCall{SessionID: "s1"}
+				mb.replacement = &repl
+				mb.hardStop()
+				_, ok := mb.drainAfterCancel()
+				require.False(t, ok, "a hard-stopped mailbox must not hand the turn loop more work")
+			},
+			want: expectation{stillOwned: true},
+		},
+		{
+			name: "drainOrReleaseFinal/hard-stopped ends the era and still releases",
+			run: func(t *testing.T, mb *mailbox) {
+				mb.submitted = []SessionAgentCall{{SessionID: "s1"}}
+				mb.hardStop()
+				released := false
+				_, hasNext, err := mb.drainOrReleaseFinal(1, nil, nil, func() error {
+					released = true
+					return nil
+				})
+				require.NoError(t, err)
+				require.False(t, hasNext, "a hard-stopped mailbox must not continue into another turn")
+				require.True(t, released,
+					"shutdown must still release the OS lock — refusing to continue is not a reason to leak it")
+			},
+			want: expectation{stillOwned: false},
+		},
+		// interruptAndReplace is deliberately NOT in this table. The
+		// invariant here is about operations that hand work back to a turn
+		// loop or end an era; interruptAndReplace's refusal path is a pure
+		// early return that mutates nothing, so the blanket "current.cancel
+		// must be nil" post-condition does not apply to it (and asserting it
+		// would just force a pointless write). Its stopped behaviour is
+		// covered directly by TestInterruptAndReplace_RefusesOnStoppedMailbox.
 	}
 
 	for _, c := range cases {

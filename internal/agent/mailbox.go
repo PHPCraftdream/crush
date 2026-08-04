@@ -597,9 +597,20 @@ func (mb *mailbox) drainAfterCancel() (SessionAgentCall, bool) {
 	// Hard-stopped (P0-C): the process is shutting down, so refuse to hand
 	// the turn loop another call. This is THE branch that made CancelAll
 	// start turn N+1 instead of stopping — it runs immediately after the
-	// cancel CancelAll itself caused. Queued work is left in place, not
-	// discarded: it is already persisted, and a future process picks it up.
+	// cancel CancelAll itself caused. Queued work is left in place rather
+	// than discarded — but see hardStop's doc for what that does and does
+	// not buy: a queued call is NOT a DB row, so an unstarted prompt is
+	// genuinely lost when the process exits. Leaving it is the lesser evil,
+	// not a save.
 	if mb.stopped {
+		// Clear the spent generation handle on the way out, like the two hit
+		// branches below (closing-review follow-up). This branch returns "no
+		// more work" while state is still mbOwned, which is exactly the
+		// stale-cancel shape rounds 9-13 found five times: left set, a
+		// Cancel landing before Run's abandonOwnership defer catches up
+		// invokes an already-spent handle instead of falling through to
+		// dispatcherCancel. The window is short — so was every one of those.
+		mb.current.cancel = nil
 		return SessionAgentCall{}, false
 	}
 
