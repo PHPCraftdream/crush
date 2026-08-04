@@ -1181,6 +1181,42 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	}
 }
 
+// drainDueInjects is PrepareStep's mailbox-inject drain (design §5, stage
+// 2.4), pulled out into a named method for the same reason handleWatchdogFire
+// below was (task #243): a test must be able to drive the REAL production
+// logic instead of a copy of it. The first version of this lived inline in
+// the PrepareStep closure and its tests re-implemented the drain-and-dedup
+// in a local helper — a mirror that passes whether or not production still
+// matches it, which is exactly the shape #243 exists to stop.
+//
+// The rows are ALREADY in the DB (InjectMessage persisted them via
+// createUserMessage), so callers only splice them into the current prompt —
+// no second Create call.
+//
+// Two rules, one per half of P1-1:
+//   - drainInjects(genID) returns only entries stamped at or before THIS
+//     turn's generation, so an inject that landed after a previous turn's
+//     last PrepareStep is picked up by this turn rather than stranded (the
+//     LOSS half).
+//   - historyIDs skips any inject whose row the preamble's
+//     getSessionMessages already loaded, so a DB write that raced ahead of
+//     the preamble does not appear both in history and in the splice (the
+//     DUPLICATION half).
+func (a *sessionAgent) drainDueInjects(sessionID string, genID uint64, historyIDs map[string]struct{}) []message.Message {
+	due := a.getMailbox(sessionID).drainInjects(genID)
+	if len(due) == 0 {
+		return nil
+	}
+	spliced := make([]message.Message, 0, len(due))
+	for _, inj := range due {
+		if _, ok := historyIDs[inj.msg.ID]; ok {
+			continue
+		}
+		spliced = append(spliced, inj.msg)
+	}
+	return spliced
+}
+
 // handleWatchdogFire is runTurn's stream-watchdog onFire callback, pulled out
 // into a named method (task #243) so a unit test can invoke the REAL
 // production logic directly — constructing a minimal *sessionAgent and
@@ -1442,7 +1478,7 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 	// beginGeneration(runCancel) only for the brief preamble window this
 	// call closes; from here until the turn returns, THIS is the live
 	// cancel an interrupt must hit.
-	a.getMailbox(call.SessionID).beginGeneration(cancel)
+	genID := a.getMailbox(call.SessionID).beginGeneration(cancel)
 
 	// Closed by the title goroutine when it returns; nil when no title was
 	// requested. The deferred bounded join below selects on it. A
@@ -1564,6 +1600,17 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 	// writes synchronously, so there is nothing to flush here.
 
 	history, files := a.preparePrompt(msgs, currentSession.Todos, call.Attachments...)
+
+	// historyIDs is the dedup set for mailbox-injected messages (design §5):
+	// an inject whose DB row was already loaded into msgs by this turn's
+	// preamble must not be spliced again from the mailbox's injects queue.
+	// drainInjects + this ID check together guarantee exactly-once delivery
+	// regardless of whether the DB write landed before or after the
+	// preamble's getSessionMessages call.
+	historyIDs := make(map[string]struct{}, len(msgs))
+	for _, m := range msgs {
+		historyIDs[m.ID] = struct{}{}
+	}
 
 	var currentAssistant *message.Message
 	var stepMessages []fantasy.Message
@@ -1895,12 +1942,7 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 				prepared.Messages = append(prepared.Messages, userMessage.ToAIMessage()...)
 			}
 
-			// Drain InjectMessage queue: these rows are ALREADY in the DB
-			// (persisted at click time by InjectMessage), so we only need
-			// to splice them into the current prompt — no second Create
-			// call, no duplicate rows in history.
-			injected := a.injectQueue.TakeAll(call.SessionID)
-			for _, inj := range injected {
+			for _, inj := range a.drainDueInjects(call.SessionID, genID, historyIDs) {
 				prepared.Messages = append(prepared.Messages, inj.ToAIMessage()...)
 			}
 
@@ -3847,17 +3889,23 @@ func (a *sessionAgent) InterruptAndReplace(sessionID string, call SessionAgentCa
 
 // InjectMessage — see SessionAgent interface comment. Persists immediately
 // (UI updates via the same pubsub path that handleSendMessage uses) and, if
-// the session is currently running, latches the persisted row into
-// injectQueue so the next PrepareStep dredges it into prepared.Messages
-// without duplicating the DB write.
+// the session is currently running, atomically queues the persisted row into
+// the mailbox's injects list (stamped with the current generation id) so the
+// next PrepareStep splices it into prepared.Messages without duplicating the
+// DB write. The atomic busy-check + inject (mailbox.injectIfBusy, design §5
+// stage 2.4) replaces the old non-atomic IsSessionBusy + injectQueue.Append
+// pair.
 func (a *sessionAgent) InjectMessage(ctx context.Context, call SessionAgentCall) (message.Message, error) {
 	msg, err := a.createUserMessage(ctx, call)
 	if err != nil {
 		return message.Message{}, err
 	}
-	if a.IsSessionBusy(call.SessionID) {
-		a.injectQueue.Append(call.SessionID, msg)
-	}
+	// Atomic busy-check + inject under one mb.mu hold (design §5, stage 2.4):
+	// replaces the non-atomic IsSessionBusy + injectQueue.Append pair that
+	// had a window between check and append where the owner could finish and
+	// release to mbIdle. When the session is idle, the message lives only in
+	// the DB and is picked up by the next Run's preamble naturally.
+	a.getMailbox(call.SessionID).injectIfBusy(msg)
 	return msg, nil
 }
 
