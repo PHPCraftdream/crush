@@ -67,6 +67,13 @@ type App struct {
 	// don't have to sleep waiting for fresh messages to "age out" before
 	// recovery considers them orphans.
 	recoveryOrphanAge *time.Duration
+
+	// recoveryDataDir — internal test seam for recoverInterruptedTurns'
+	// cross-process liveness probe (task #287). nil = resolve from the
+	// app's own config, as production does. Tests point it at a temp dir
+	// so they can seed a real session lock and drive the live-holder
+	// branch without standing up a full config.
+	recoveryDataDir *string
 }
 
 // New initializes a new application instance.
@@ -1624,12 +1631,24 @@ func (app *App) recoverInterruptedTurns(ctx context.Context) {
 		orphanAgeThreshold = *app.recoveryOrphanAge
 	}
 	staleBefore := start.Add(-orphanAgeThreshold).Unix()
+	// Data directory for the cross-process liveness probe below. Empty
+	// only in degenerate/test configs; when empty we fall back to the age
+	// heuristic alone rather than skipping recovery entirely.
+	var dataDir string
+	switch {
+	case app.recoveryDataDir != nil:
+		dataDir = *app.recoveryDataDir
+	case app.config != nil:
+		if cfg := app.Config(); cfg != nil && cfg.Options != nil {
+			dataDir = cfg.Options.DataDirectory
+		}
+	}
 	sessions, err := app.Sessions.List(ctx)
 	if err != nil {
 		slog.Warn("startup recovery: failed to list sessions", "err", err)
 		return
 	}
-	var recovered, skippedFresh int
+	var recovered, skippedFresh, skippedLive int
 	for _, sess := range sessions {
 		msgs, err := app.Messages.List(ctx, sess.ID)
 		if err != nil {
@@ -1648,9 +1667,36 @@ func (app *App) recoverInterruptedTurns(ctx context.Context) {
 		if lastAssistant == nil || lastAssistant.IsFinished() {
 			continue
 		}
-		// Age filter: skip messages another concurrent crush process
-		// might have just created. Without this, recovery would mark a
-		// fresh streaming assistant as "Process restarted" mid-stream.
+		// PRIMARY GUARD (task #287, release blocker): never touch a session
+		// that another LIVE crush process still owns. This sweep runs at the
+		// start of EVERY crush process and iterates EVERY session in the data
+		// directory — not just this process's own — so without a real
+		// liveness probe it happily stamps "Process restarted" onto turns
+		// that are genuinely mid-flight in a sibling process. Because
+		// message.Update rewrites the whole Parts blob from the snapshot read
+		// here, that stamp also CLOBBERS whatever the live owner streamed in
+		// between our read and our write. This fork's entire model is N
+		// concurrent `crush run` sessions sharing one data directory, so that
+		// was routine, not rare: an observed 38-minute sub-agent delegation
+		// was marked errored by an unrelated process merely starting up.
+		//
+		// The age filter below is NOT sufficient for this — it only covers
+		// the first 30 seconds of a turn, while a delegation is bounded at 45
+		// minutes. Same discipline `sessions kill`/`locks`/`reap` already
+		// apply (tasks #219/#224/#241): prove the holder is gone before
+		// acting on its session. InspectSessionLock reports Live for a fresh
+		// heartbeat AND, when the mtime looks stale, for a still-running
+		// recorded PID (bounded by MaxPidFallbackAge), so a healthy session
+		// blocked on one long tool call is correctly protected too.
+		if dataDir != "" {
+			if st := session.InspectSessionLock(dataDir, sess.ID, session.LockStaleDuration); st.Live {
+				skippedLive++
+				continue
+			}
+		}
+		// Age filter: secondary belt-and-braces only. Skips messages another
+		// concurrent crush process might have just created in the window
+		// before it managed to write its lock file at all.
 		if lastAssistant.CreatedAt > staleBefore {
 			skippedFresh++
 			continue
@@ -1672,11 +1718,12 @@ func (app *App) recoverInterruptedTurns(ctx context.Context) {
 		recovered++
 	}
 	elapsed := time.Since(start)
-	if recovered > 0 || skippedFresh > 0 {
+	if recovered > 0 || skippedFresh > 0 || skippedLive > 0 {
 		slog.Info(
 			"startup recovery: completed",
 			"recovered", recovered,
 			"skipped_fresh", skippedFresh,
+			"skipped_live", skippedLive,
 			"total_sessions_scanned", len(sessions),
 			"elapsed", elapsed.String(),
 		)
