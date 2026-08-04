@@ -23,6 +23,67 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **A delegated sub-agent could hang forever on its very first command,
+  making the parent look busy while nothing happened at all** — the most
+  visible bug of this round, reproduced live: a session sat in
+  `delegating` with a healthy heartbeat for 41 minutes while its
+  sub-agent was stuck on a bare `wc -l`. A non-interactive `crush run`
+  auto-approves only the session id it was given, but a sub-agent runs
+  under its own child session id, so its first command outside the
+  read-only safe list waited on a permission prompt that does not exist
+  in that mode. Sub-agents now inherit their parent's auto-approve
+  status. Deliberately inheritance and not a blanket grant: a sub-agent
+  of an interactive session still prompts as before, and
+  `--restrict-run` still applies on top.
+
+- **Shutdown could start a new turn instead of stopping** — cancelling
+  every session on exit cancelled only each one's current turn, and the
+  cancel-handling path then immediately pulled the next queued message
+  in and began a fresh provider request, on a context nothing had
+  cancelled. The process then tore its database down underneath an agent
+  that was still working. Shutdown now latches every session closed
+  first, so a cancelled turn can no longer pick up more work, and
+  cancels the whole run rather than just the current turn. Anything
+  still queued is left in place — it is already saved, and a later run
+  picks it up — rather than being discarded.
+
+- **An interrupt sent just as a turn finished could be accepted and then
+  never run** — the interrupt was recorded and reported as successful,
+  but only the cancellation path ever looked for it. When the cancel
+  lost the race to the turn's own completion (which it can), the normal
+  end-of-turn path released the session without ever seeing the pending
+  message. Every end-of-turn decision now checks it.
+
+- **Interrupting an idle session accepted the message but never ran it**
+  — with no turn in progress there was nothing to interrupt, and the
+  message was queued for a runner that did not exist, while the UI was
+  told it had been queued successfully. It now starts a run.
+
+- **A hung title generation could hold a whole turn open indefinitely** —
+  the turn waited unconditionally for its background title goroutine,
+  which is itself unbounded when a provider ignores cancellation. The
+  session's ownership and lock stayed held for work that had already
+  finished. The wait is now bounded; a title that overruns is abandoned
+  and still saves itself if it eventually completes.
+
+- **A wedged tool looked exactly like a working one** — the session
+  heartbeat was refreshed on a timer for as long as any tool call was
+  open, regardless of whether anything was happening, so `sessions
+  locks`/`why`/`list` reported a stuck session as healthy for up to 45
+  minutes (38 minutes of false "activity" were observed in practice).
+  Activity is now recorded only for real progress. Long delegations stay
+  covered without the timer: a sub-agent's genuine progress already
+  propagates up through every ancestor session.
+
+- **`sessions watch` spammed a once-per-second "sub-agent active" line
+  and hid what the sub-agent was actually doing** — the line's throttle
+  compared its own text, which embedded a live-updating age, so it
+  changed every second and never throttled. Watch now live-tails
+  delegated sessions the same way it shows the main session — real tool
+  calls and results as they land, prefixed so they stay distinguishable
+  — and covers every session in the call tree, so parallel delegations
+  and a sub-agent's own sub-agent are visible too.
+
 - **An interrupt or cancel landing right after a normal follow-up message
   was queued mid-turn could also silently do nothing** — a fourth
   independent review found the same defect the fix above closed on the
