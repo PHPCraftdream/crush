@@ -23,6 +23,22 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **A message queued via the legacy path could still permanently wedge a
+  session busy, and a message dropped on turn error was lost instead of
+  retried** — two narrower follow-ups to the P0-2/P0-3 mailbox-migration
+  fixes above, found by a second independent review of the fix itself.
+  Reclaiming ownership from the not-yet-migrated legacy message queue
+  used to grant a brand new ownership era without telling the turn loop,
+  which kept using its original (now stale) era id for the rest of the
+  call — the next release attempt then saw a mismatch, assumed a
+  different owner held the session, and left it stuck busy forever with
+  nobody running it. Reclaiming now explicitly continues the SAME era
+  instead of starting a new one. Separately, a message still queued when
+  a turn ended on a genuine error (not a cancellation) used to be logged
+  and discarded by the cleanup step; it's now put back on the queue so
+  the next run picks it up, matching how a stale reservation used to
+  recover before the migration.
+
 - **`crush run` hung for a full 5 seconds on exit after any turn ran, and a
   turn that errored out with a message still queued could wedge that
   session permanently busy** — introduced by the per-session owner/mailbox

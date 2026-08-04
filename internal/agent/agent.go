@@ -766,8 +766,27 @@ func (a *sessionAgent) drainOrReleaseMerged(sessionID string, epoch uint64) (Ses
 	if !ok {
 		return SessionAgentCall{}, false
 	}
-	became, _ := a.getMailbox(sessionID).submit(next, nil)
-	return next, became
+	// Reclaim under the SAME epoch the caller already holds (round 9 review
+	// round 2, HIGH-1) — NOT a plain submit(), which would grant a brand
+	// new era the caller (Run's loop, which captured its epoch exactly
+	// once at claim time) has no way to learn about. Presenting a now-stale
+	// epoch to a later drainOrRelease/abandonOwnership call would then find
+	// it mismatched, assume some other owner holds the session, and quietly
+	// abandon it — nobody left running, recreating the exact permanent-wedge
+	// shape this whole epoch mechanism exists to prevent, just via this one
+	// narrower path (a message sitting in the legacy messageQueue at the
+	// instant this function's own release-to-idle happens).
+	if a.getMailbox(sessionID).reclaimSameEra(epoch, nil) {
+		return next, true
+	}
+	// reclaimSameEra failing means a genuinely DIFFERENT caller's submit()
+	// claimed a new era in the exact gap between our own release and this
+	// reclaim attempt — vanishingly rare, but messageQueue.PopFront already
+	// removed `next`, so it must go somewhere. Put it back rather than
+	// forcing ownership into a race already lost: whichever era is current
+	// now will pick it up via ITS OWN eventual drainOrReleaseMerged call.
+	a.messageQueue.Append(sessionID, next)
+	return SessionAgentCall{}, false
 }
 
 // activityNotifyContextKey is the context key under which runTurn stores a
@@ -872,16 +891,30 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	//   - If `epoch` still matches, there is no live turn loop left (this
 	//     defer IS the end of Run) to hand a "keep going" answer to, so
 	//     unlike the loop's own drainOrReleaseMerged this always ends the
-	//     era at idle, logging (not silently keeping, and not silently
+	//     era at idle, re-queueing (not silently keeping, and not silently
 	//     dropping while leaving the session permanently owned) anything it
 	//     finds still queued. The OLD code's "found something" branch left
 	//     state == mbOwned with nobody running it — the session was wedged
 	//     busy forever, since nothing else would ever drain it again.
+	//
+	// Round 9 review round 2, HIGH-2: an earlier version of this defer
+	// logged dropped calls at slog.Error and discarded them — a silent
+	// user-message loss reachable on any ordinary non-cancel turn error
+	// (provider 5xx, a DB write failure) with a second message queued
+	// concurrently, not just the rare pre-loop bail-out case. Pre-mailbox-
+	// migration, a message in this position lived in messageQueue and was
+	// picked up by the NEXT Run() call's own PrepareStep drain — not lost.
+	// Re-queueing into messageQueue here (which is not epoch-scoped, so it
+	// survives safely across ownership eras) restores exactly that
+	// behavior instead of introducing a new one.
 	defer func() {
 		dropped, hadWork := a.getMailbox(call.SessionID).abandonOwnership(epoch)
 		if hadWork {
+			for _, d := range dropped {
+				a.messageQueue.Append(call.SessionID, d)
+			}
 			slog.Error(
-				"agent.Run: dropping call(s) queued during session lock failure or an early error return — no turn loop left to run them",
+				"agent.Run: re-queued call(s) that were pending when ownership had to be abandoned — no turn loop left to run them this call; a future Run() will pick them up",
 				"session_id", call.SessionID,
 				"count", len(dropped),
 			)

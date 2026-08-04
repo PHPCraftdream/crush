@@ -179,6 +179,55 @@ func (mb *mailbox) drainOrRelease(epoch uint64) (SessionAgentCall, bool) {
 	return SessionAgentCall{}, false
 }
 
+// reclaimSameEra re-owns the mailbox for the SAME ownership era that just
+// released it, WITHOUT bumping epoch (round 9 review round 2, HIGH-1).
+//
+// It exists only for drainOrReleaseMerged's legacy-messageQueue fallback:
+// that caller's own drainOrRelease call just released to mbIdle under
+// `epoch` (unchanged — only submit()'s idle->owned transition bumps epoch,
+// never a release), then found something in the legacy messageQueue and
+// wants to keep running as the SAME Run() call's next turn. Reclaiming via
+// a plain submit() would grant a NEW epoch — which the caller (Run's loop)
+// has no way to learn, since it captured `epoch` exactly once at claim
+// time (agent.go:849) and never re-reads it. A caller then presenting the
+// STALE original epoch to its next drainOrRelease call would find it no
+// longer matches the mailbox's real (bumped) epoch, treat that as "a
+// different owner now holds this", and silently abandon a session nobody
+// else is actually running — recreating BLOCKER-1/2's permanent-wedge
+// shape via this one narrow path.
+//
+// Returns false if the epoch no longer matches mbIdle's recorded value —
+// meaning a genuinely DIFFERENT caller's submit() claimed a new era in the
+// exact gap between this caller's own release and this reclaim attempt.
+// The caller must not proceed as owner in that case; see
+// drainOrReleaseMerged for how it recovers the item it already popped off
+// messageQueue in that (extremely narrow, but real) case.
+func (mb *mailbox) reclaimSameEra(epoch uint64, dispatcherCancel context.CancelFunc) bool {
+	mb.mu.Lock()
+	defer mb.mu.Unlock()
+
+	if mb.state != mbIdle || mb.epoch != epoch {
+		return false
+	}
+	mb.state = mbOwned
+	mb.dispatcherCancel = dispatcherCancel
+	// Nothing is appended to mb.submitted — matching submit()'s own
+	// idle-branch contract (design §3: "true = caller becomes owner and
+	// must run [the message] itself"), the caller (drainOrReleaseMerged)
+	// already returns the reclaimed call directly as the next turn's
+	// SessionAgentCall. An earlier version of this method also appended
+	// it to `submitted` here, which duplicated it: the reclaimed turn ran
+	// it as its prompt AND left an identical copy sitting in `submitted`,
+	// so that turn's own end-of-turn drain found it "still queued" and
+	// ran a THIRD, spurious turn on the same content. Caught by this
+	// package's own test suite (three pre-existing/new tests expecting N
+	// provider calls got N+1) before landing.
+	//
+	// epoch is deliberately NOT bumped — this is a continuation of the
+	// same era the caller already holds, not a new one.
+	return true
+}
+
 // abandonOwnership implements Run's cleanup-defer release path (round 9
 // review, BLOCKER-2a). It is NOT the same operation as drainOrRelease:
 // drainOrRelease is called by an owner's OWN live turn loop, which can

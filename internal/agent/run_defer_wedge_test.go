@@ -28,6 +28,14 @@ import (
 // holds at the Run() level: after an OS-lock failure, the session is NOT
 // stuck permanently busy — a subsequent Run() call for the same session
 // must succeed.
+//
+// NOTE (round 10 review, MEDIUM-1): nothing is ever queued in this
+// scenario, so it does NOT exercise abandonOwnership's "found something"
+// branch end-to-end — that branch is covered directly (and non-vacuously)
+// by the mailbox-level TestMailbox_AbandonOwnership_WithQueuedWork_*
+// tests. This test's own value is proving the empty-branch release+
+// reclaim plumbing works through the real Run() call, which the isolated
+// mailbox tests cannot do by themselves.
 func TestRun_OSLockAcquisitionFailure_DoesNotPermanentlyWedgeMailbox(t *testing.T) {
 	env := testEnv(t)
 	dataDir := t.TempDir()
@@ -92,13 +100,18 @@ func TestRun_OSLockAcquisitionFailure_DoesNotPermanentlyWedgeMailbox(t *testing.
 	// wedged busy by the first call's failure.
 	require.NoError(t, externalHolder.Release())
 
-	_, err = agentIface.Run(t.Context(), SessionAgentCall{
+	res, err := agentIface.Run(t.Context(), SessionAgentCall{
 		SessionID:       sess.ID,
 		Prompt:          "second attempt, lock is free now",
 		MaxOutputTokens: 1000,
 	})
-	assert.NoError(t, err, "a session must be claimable again after a prior Run() call's OS-lock failure — "+
-		"if BLOCKER-2a regressed, this second call would silently queue behind a dead owner and Run would return (nil, nil) here instead of actually running")
+	require.NoError(t, err)
+	// Round 10 review, MEDIUM-1: (nil, nil) is ALSO err == nil, so asserting
+	// only NoError passes vacuously in exactly the regressed case this test
+	// claims to catch (a wedged session silently queues and Run returns
+	// (nil, nil) without ever running). Assert a real result came back.
+	require.NotNil(t, res, "a wedged session would return (nil, nil) here instead of an actual result — "+
+		"NoError alone does not distinguish 'ran successfully' from 'silently queued behind a dead owner'")
 
 	assert.False(t, sa.IsSessionBusy(sess.ID), "must be idle again after the second call completes")
 }
