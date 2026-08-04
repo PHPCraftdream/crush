@@ -694,7 +694,16 @@ func (a *sessionAgent) getMailbox(sessionID string) *mailbox {
 // the current owner's end-of-turn drain to pick up as the next turn's
 // SessionAgentCall — a placeholder with an empty Prompt would silently
 // replace the caller's actual prompt with an empty one once drained.
-func (a *sessionAgent) tryReserveSession(call SessionAgentCall, reserveCancel context.CancelFunc) bool {
+//
+// When becomeOwner is true, epoch is this ownership era's id (round 9
+// review, BLOCKER-2) — the caller MUST present it to every subsequent
+// releaseSessionReservation/drainOrReleaseMerged/abandonOwnership call it
+// makes for the lifetime of this Run() call, so a stale/duplicate release
+// (Run's cleanup defer firing after the era already legitimately ended) can
+// never be mistaken for "release MY still-current ownership" and clobber a
+// different, later owner's state. See mailbox.epoch's doc for the full
+// rationale.
+func (a *sessionAgent) tryReserveSession(call SessionAgentCall, reserveCancel context.CancelFunc) (becomeOwner bool, epoch uint64) {
 	return a.getMailbox(call.SessionID).submit(call, reserveCancel)
 }
 
@@ -710,8 +719,12 @@ func (a *sessionAgent) tryReserveSession(call SessionAgentCall, reserveCancel co
 // that cannot start another turn synchronously (e.g. Run's pre-loop bail-out
 // paths) must not discard it silently — see those call sites for how it is
 // handled.
-func (a *sessionAgent) releaseSessionReservation(sessionID string) (SessionAgentCall, bool) {
-	return a.getMailbox(sessionID).drainOrRelease()
+//
+// epoch must be the era id tryReserveSession (or a prior drainOrRelease
+// call within the same era) returned. See mailbox.drainOrRelease's doc for
+// what a mismatch means.
+func (a *sessionAgent) releaseSessionReservation(sessionID string, epoch uint64) (SessionAgentCall, bool) {
+	return a.getMailbox(sessionID).drainOrRelease(epoch)
 }
 
 // drainOrReleaseMerged is releaseSessionReservation's composition with the
@@ -738,15 +751,23 @@ func (a *sessionAgent) releaseSessionReservation(sessionID string) (SessionAgent
 //     under them — so this function's own hasNext report must reflect
 //     submit's actual return value, not just "the legacy queue had
 //     something."
-func (a *sessionAgent) drainOrReleaseMerged(sessionID string) (SessionAgentCall, bool) {
-	if next, ok := a.releaseSessionReservation(sessionID); ok {
+//
+// ONLY safe to call from a live turn loop that will actually run the
+// returned call as its next turn (runTurn's own end-of-turn drain). Run's
+// cleanup defer, which has no turn loop left to hand a "yes, keep going"
+// answer to, uses abandonOwnership instead (BLOCKER-2a) — calling THIS
+// from there could reclaim the legacy queue into a brand new era that
+// then never gets a turn either.
+func (a *sessionAgent) drainOrReleaseMerged(sessionID string, epoch uint64) (SessionAgentCall, bool) {
+	if next, ok := a.releaseSessionReservation(sessionID, epoch); ok {
 		return next, true
 	}
 	next, ok := a.messageQueue.PopFront(sessionID)
 	if !ok {
 		return SessionAgentCall{}, false
 	}
-	return next, a.getMailbox(sessionID).submit(next, nil)
+	became, _ := a.getMailbox(sessionID).submit(next, nil)
+	return next, became
 }
 
 // activityNotifyContextKey is the context key under which runTurn stores a
@@ -825,32 +846,45 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	// (mailbox.submit, design §3). If someone else already owns the
 	// session, submit has already appended call to the mailbox's own
 	// pending queue under the same lock — nothing left to do here.
-	if !a.tryReserveSession(call, runCancel) {
+	became, epoch := a.tryReserveSession(call, runCancel)
+	if !became {
 		return nil, nil
 	}
-	// We now own call.SessionID's reservation for the entire loop below,
-	// including every queue-drain turn. Released exactly once, whichever
-	// way the loop ends (error, or no more queued work) via
-	// releaseSessionReservation (mailbox.drainOrRelease). Unlike the old
-	// activeRequests.Del, that release can itself hand back a call that a
-	// concurrent submit queued in the exact window between the loop's own
-	// last drain check and this defer running — see releaseSessionReservation's
-	// doc. This defer only fires on Run's PRE-LOOP bail-out paths below (the
-	// session-lock acquisition failures): the loop itself always drains via
-	// runTurn/runSummarizeCore's own drainOrRelease calls before falling out
-	// of the `for`, so by the time control reaches here after a normal loop
-	// exit the mailbox is already idle and this is a harmless no-op. On a
-	// pre-loop bail-out there is no live turn loop left to hand a drained
-	// call to, so any call that surfaces here is logged instead of silently
-	// dropped (the old code's behavior for this same narrow window, just
-	// invisibly rather than audibly).
+	// We now own call.SessionID's reservation, under ownership era `epoch`,
+	// for the entire loop below, including every queue-drain turn. Released
+	// exactly once, whichever way the loop ends, via THIS defer.
+	//
+	// Round 9 review, BLOCKER-2: this defer fires on EVERY return from Run
+	// — not just the pre-loop bail-out paths its old doc comment claimed —
+	// including after runTurn's own final drain already released the era
+	// (the common, correct case) and after any early-return inside runTurn
+	// that skipped its own drain entirely (an error path). It must
+	// therefore be safe to call unconditionally on every exit, which is
+	// exactly what abandonOwnership (not drainOrReleaseMerged) provides:
+	//   - If `epoch` no longer matches the mailbox's current epoch, the era
+	//     already ended (either via runTurn's own drain, or a concurrent
+	//     submit became a NEW owner in the meantime) — a safe no-op, since
+	//     whatever is in the mailbox now belongs to that other owner. The
+	//     OLD code called drainOrRelease/drainOrReleaseMerged unconditionally
+	//     here with no such check, so on this path it could silently flip a
+	//     DIFFERENT, still-live owner's session back to idle out from under
+	//     it.
+	//   - If `epoch` still matches, there is no live turn loop left (this
+	//     defer IS the end of Run) to hand a "keep going" answer to, so
+	//     unlike the loop's own drainOrReleaseMerged this always ends the
+	//     era at idle, logging (not silently keeping, and not silently
+	//     dropping while leaving the session permanently owned) anything it
+	//     finds still queued. The OLD code's "found something" branch left
+	//     state == mbOwned with nobody running it — the session was wedged
+	//     busy forever, since nothing else would ever drain it again.
 	defer func() {
-		if leftover, ok := a.drainOrReleaseMerged(call.SessionID); ok {
+		dropped, hadWork := a.getMailbox(call.SessionID).abandonOwnership(epoch)
+		if hadWork {
 			slog.Error(
-				"agent.Run: dropping call queued during session lock failure — no turn loop left to run it",
+				"agent.Run: dropping call(s) queued during session lock failure or an early error return — no turn loop left to run them",
 				"session_id", call.SessionID,
+				"count", len(dropped),
 			)
-			_ = leftover
 		}
 	}()
 
@@ -955,7 +989,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 		// between turns would silently no-op (the exact task #206
 		// regression). runCancel covers the preamble exactly as before.
 		a.getMailbox(call.SessionID).beginGeneration(runCancel)
-		result, err, next, hasNext := a.runTurn(runCtx, call, lk)
+		result, err, next, hasNext := a.runTurn(runCtx, call, lk, epoch)
 		if !hasNext {
 			return result, err
 		}
@@ -1085,7 +1119,7 @@ func (a *sessionAgent) handleWatchdogFire(
 // end-of-turn queue check, or a /compact drain) with next set to that call;
 // the caller's loop is expected to invoke runTurn(ctx, next) again in that
 // case. When hasNext is false, result/err are Run's final return values.
-func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *session.SessionLock) (res *fantasy.AgentResult, resErr error, next SessionAgentCall, hasNext bool) {
+func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *session.SessionLock, epoch uint64) (res *fantasy.AgentResult, resErr error, next SessionAgentCall, hasNext bool) {
 	// Copy mutable fields under lock to avoid races with SetTools/SetModels.
 	agentTools := a.tools.Copy()
 	largeModel := a.largeModel.Get()
@@ -2471,7 +2505,7 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 	// legacy messageQueue (QueueMessage's callers are not migrated to the
 	// mailbox until a later stage — see its doc) so a message queued via the
 	// still-live QueueMessage path is not silently stranded.
-	firstQueuedMessage, ok := a.drainOrReleaseMerged(call.SessionID)
+	firstQueuedMessage, ok := a.drainOrReleaseMerged(call.SessionID, epoch)
 	if !ok {
 		return result, err, SessionAgentCall{}, false
 	}
@@ -3550,8 +3584,24 @@ func (a *sessionAgent) CancelAll() {
 	if !a.IsBusy() {
 		return
 	}
-	for key := range a.activeRequests.Seq2() {
-		a.Cancel(key) // key is sessionID
+	for key, mb := range a.mailboxes.Seq2() {
+		mb.mu.Lock()
+		owned := mb.state == mbOwned
+		mb.mu.Unlock()
+		if owned {
+			a.Cancel(key) // key is sessionID
+		}
+	}
+	// Legacy "-summarize" cancel slot isn't tracked by the mailbox (design
+	// §6, deferred to #268) — still needs its own sweep here. Filtered to
+	// that suffix specifically: activeRequests ALSO still holds a
+	// permanently-stale, non-nil (already-fired) entry per plain sessionID
+	// (see IsBusy's doc) — iterating it unfiltered would re-fire Cancel on
+	// every session this process has ever touched, not just the busy ones.
+	for key, cancel := range a.activeRequests.Seq2() {
+		if cancel != nil && strings.HasSuffix(key, "-summarize") {
+			cancel()
+		}
 	}
 
 	timeout := time.After(5 * time.Second)
@@ -3565,15 +3615,42 @@ func (a *sessionAgent) CancelAll() {
 	}
 }
 
+// IsBusy reports whether ANY session this agent knows about currently has a
+// live owner. Task #206-followup (round 9 review, BLOCKER-1): this used to
+// read activeRequests directly, but releaseSessionReservation (mailbox.
+// drainOrRelease) stopped clearing the plain-sessionID activeRequests entry
+// once the mailbox migration (P0-3, task #282) landed — tryReserveSession/
+// Run's loop still WRITE it every turn (agent.go:949, :1194) via
+// activeRequests.Set, so after the FIRST turn any session ever ran,
+// activeRequests permanently holds a non-nil (already-fired, inert)
+// cancelFunc for it. The old activeRequests-based IsBusy therefore returned
+// true forever after any session's first turn completed, which meant
+// CancelAll's 5-second drain loop (App.Shutdown, reached by every `crush
+// run` via `defer a.Shutdown()`) always ran to its full timeout instead of
+// returning immediately once genuinely idle. mailboxes.state is the
+// post-migration source of truth for "does this session have a live
+// owner" (see IsSessionBusy's doc) and is correctly reset to mbIdle on
+// release, so it does not have this staleness problem.
 func (a *sessionAgent) IsBusy() bool {
-	var busy bool
-	for cancelFunc := range a.activeRequests.Seq() {
-		if cancelFunc != nil {
-			busy = true
-			break
+	for _, mb := range a.mailboxes.Seq2() {
+		mb.mu.Lock()
+		owned := mb.state == mbOwned
+		mb.mu.Unlock()
+		if owned {
+			return true
 		}
 	}
-	return busy
+	// Legacy "-summarize" cancel slot isn't tracked by the mailbox (design
+	// §6, deferred to #268) — a live standalone /compact still counts as
+	// busy for shutdown-drain purposes. Filtered to that suffix
+	// specifically — see CancelAll's matching comment for why an
+	// unfiltered scan would be permanently true.
+	for key, cancelFunc := range a.activeRequests.Seq2() {
+		if cancelFunc != nil && strings.HasSuffix(key, "-summarize") {
+			return true
+		}
+	}
+	return false
 }
 
 // IsSessionBusy reports whether sessionID currently has an owner (design §2's

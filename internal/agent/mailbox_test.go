@@ -21,9 +21,10 @@ func TestMailbox_Submit_BecomesOwnerWhenIdle(t *testing.T) {
 	cancelCalled := false
 	cancel := func() { cancelCalled = true }
 
-	becomeOwner := mb.submit(call, cancel)
+	becomeOwner, epoch := mb.submit(call, cancel)
 
 	require.True(t, becomeOwner, "first submit on an idle mailbox must become owner")
+	require.NotZero(t, epoch, "a granted ownership era must have a non-zero epoch")
 	require.Equal(t, mbOwned, mb.state)
 	require.Empty(t, mb.submitted, "submitted queue must stay empty when becoming owner directly")
 	require.False(t, cancelCalled, "submit must not invoke the dispatcher cancel func itself")
@@ -34,11 +35,13 @@ func TestMailbox_Submit_QueuesWhenAlreadyOwned(t *testing.T) {
 	first := SessionAgentCall{SessionID: "s1", Prompt: "first"}
 	second := SessionAgentCall{SessionID: "s1", Prompt: "second"}
 
-	becomeOwner1 := mb.submit(first, func() {})
+	becomeOwner1, epoch1 := mb.submit(first, func() {})
 	require.True(t, becomeOwner1)
+	require.NotZero(t, epoch1)
 
-	becomeOwner2 := mb.submit(second, func() {})
+	becomeOwner2, epoch2 := mb.submit(second, func() {})
 	require.False(t, becomeOwner2, "submit while owned must queue, not become owner")
+	require.Zero(t, epoch2, "epoch is meaningless when the caller does not become owner")
 	require.Equal(t, mbOwned, mb.state, "state must remain owned")
 	require.Len(t, mb.submitted, 1)
 	require.Equal(t, second, mb.submitted[0])
@@ -47,11 +50,12 @@ func TestMailbox_Submit_QueuesWhenAlreadyOwned(t *testing.T) {
 func TestMailbox_DrainOrRelease_WithQueuedItem(t *testing.T) {
 	mb := &mailbox{
 		state:     mbOwned,
+		epoch:     1,
 		current:   generation{id: 3, cancel: func() {}},
 		submitted: []SessionAgentCall{{SessionID: "s1", Prompt: "next"}},
 	}
 
-	next, ok := mb.drainOrRelease()
+	next, ok := mb.drainOrRelease(1)
 
 	require.True(t, ok, "a queued call must be returned")
 	require.Equal(t, "next", next.Prompt)
@@ -63,17 +67,44 @@ func TestMailbox_DrainOrRelease_WithQueuedItem(t *testing.T) {
 func TestMailbox_DrainOrRelease_EmptyFlipsToIdle(t *testing.T) {
 	mb := &mailbox{
 		state:            mbOwned,
+		epoch:            1,
 		dispatcherCancel: func() {},
 		current:          generation{id: 7, cancel: func() {}},
 	}
 
-	next, ok := mb.drainOrRelease()
+	next, ok := mb.drainOrRelease(1)
 
 	require.False(t, ok, "no queued call must be reported")
 	require.Equal(t, SessionAgentCall{}, next)
 	require.Equal(t, mbIdle, mb.state, "state must flip to idle only when nothing was queued")
-	require.Equal(t, generation{}, mb.current, "current generation must reset to zero value on release")
+	require.Equal(t, uint64(7), mb.current.id,
+		"generation id must be preserved across a release (round 9 review MEDIUM-2) — only the spent cancel func is cleared, "+
+			"so a future inject stamped against this id is not wrongly treated as belonging to a not-yet-started future generation")
+	require.Nil(t, mb.current.cancel, "the spent cancel func must be cleared on release")
 	require.Nil(t, mb.dispatcherCancel, "dispatcherCancel must be cleared on release")
+}
+
+// TestMailbox_DrainOrRelease_EpochMismatch_IsNoOp is the regression test for
+// release-blocker BLOCKER-2 (round 9 review): a stale drainOrRelease call —
+// e.g. Run's cleanup defer firing after a DIFFERENT, later owner has already
+// claimed the mailbox — must not touch that later owner's state at all.
+func TestMailbox_DrainOrRelease_EpochMismatch_IsNoOp(t *testing.T) {
+	laterOwnerCall := SessionAgentCall{SessionID: "s1", Prompt: "later owner's call"}
+	mb := &mailbox{
+		state:     mbOwned,
+		epoch:     2, // a NEW era, e.g. claimed by a concurrent submit after the stale caller's era ended
+		current:   generation{id: 9, cancel: func() {}},
+		submitted: []SessionAgentCall{laterOwnerCall},
+	}
+
+	next, ok := mb.drainOrRelease(1) // stale caller presents an OLD epoch
+
+	require.False(t, ok, "a stale release must report nothing drained, not silently steal the later owner's queued call")
+	require.Equal(t, SessionAgentCall{}, next)
+	require.Equal(t, mbOwned, mb.state, "a stale release must not touch a different owner's state")
+	require.Equal(t, uint64(2), mb.epoch, "epoch must be untouched by a stale release")
+	require.Len(t, mb.submitted, 1, "the later owner's queued call must survive a stale release untouched")
+	require.Equal(t, laterOwnerCall, mb.submitted[0])
 }
 
 func TestMailbox_InterruptAndReplace_NoOwnerReturnsFalse(t *testing.T) {
@@ -247,7 +278,7 @@ func TestMailbox_InterruptThenDrainAfterCancel_SequenceRoundTrips(t *testing.T) 
 	mb := &mailbox{}
 
 	first := SessionAgentCall{SessionID: "s1", Prompt: "first"}
-	becomeOwner := mb.submit(first, func() {})
+	becomeOwner, _ := mb.submit(first, func() {})
 	require.True(t, becomeOwner)
 
 	genCtx, genCancel := context.WithCancel(context.Background())
@@ -296,8 +327,10 @@ func TestMailbox_InterruptThenDrainAfterCancel_SequenceRoundTrips(t *testing.T) 
 // the window; the window is held open by the mutex until the test releases
 // it.
 func TestMailbox_DrainOrRelease_ConcurrentSubmitInFinalDrainWindow_P0_3(t *testing.T) {
+	const ownerEpoch = 1
 	mb := &mailbox{
 		state:   mbOwned,
+		epoch:   ownerEpoch,
 		current: generation{id: 1, cancel: func() {}},
 	}
 
@@ -311,6 +344,7 @@ func TestMailbox_DrainOrRelease_ConcurrentSubmitInFinalDrainWindow_P0_3(t *testi
 	var (
 		wg                    sync.WaitGroup
 		concurrentBecameOwner bool
+		concurrentEpoch       uint64
 	)
 	concurrentCall := SessionAgentCall{SessionID: "s1", Prompt: "concurrent-during-final-drain"}
 
@@ -321,7 +355,7 @@ func TestMailbox_DrainOrRelease_ConcurrentSubmitInFinalDrainWindow_P0_3(t *testi
 		ok   bool
 	}, 1)
 	wg.Go(func() {
-		next, ok := mb.drainOrRelease()
+		next, ok := mb.drainOrRelease(ownerEpoch)
 		drainResult <- struct {
 			next SessionAgentCall
 			ok   bool
@@ -345,7 +379,7 @@ func TestMailbox_DrainOrRelease_ConcurrentSubmitInFinalDrainWindow_P0_3(t *testi
 	// critical sections cannot interleave.
 	submitReturned := make(chan struct{})
 	wg.Go(func() {
-		concurrentBecameOwner = mb.submit(concurrentCall, func() {})
+		concurrentBecameOwner, concurrentEpoch = mb.submit(concurrentCall, func() {})
 		close(submitReturned)
 	})
 
@@ -382,6 +416,15 @@ func TestMailbox_DrainOrRelease_ConcurrentSubmitInFinalDrainWindow_P0_3(t *testi
 		"the concurrent submit landing in the old lost-wakeup window must become the new owner instead of being silently queued with nobody left to drain it")
 	require.Equal(t, mbOwned, mb.state, "the concurrent submit becoming owner must leave the mailbox owned, not idle")
 	require.Empty(t, mb.submitted, "the concurrent call must have been picked up as the new owner's call, not left sitting in submitted with no reader")
+
+	// Round 9 review, BLOCKER-2: the concurrent owner's era must be a NEW
+	// epoch, distinct from the departing owner's. This is what makes a
+	// stale drainOrRelease call from the departing owner's own cleanup
+	// path (Run's defer, presenting ownerEpoch) a safe no-op afterward
+	// instead of being able to clobber this new owner's state — see
+	// TestMailbox_DrainOrRelease_EpochMismatch_IsNoOp for that half.
+	require.NotEqual(t, uint64(ownerEpoch), concurrentEpoch, "the new owner must be granted a NEW ownership era, not reuse the departing owner's")
+	require.Equal(t, concurrentEpoch, mb.epoch, "the mailbox's current epoch must match what the new owner was granted")
 }
 
 // TestMailbox_DrainOrRelease_NoSeamHook_BehavesIdentically is a sanity check
@@ -391,13 +434,99 @@ func TestMailbox_DrainOrRelease_ConcurrentSubmitInFinalDrainWindow_P0_3(t *testi
 func TestMailbox_DrainOrRelease_NoSeamHook_BehavesIdentically(t *testing.T) {
 	mb := &mailbox{
 		state:            mbOwned,
+		epoch:            1,
 		dispatcherCancel: func() {},
 		current:          generation{id: 9, cancel: func() {}},
 	}
 
-	next, ok := mb.drainOrRelease()
+	next, ok := mb.drainOrRelease(1)
 
 	require.False(t, ok)
 	require.Equal(t, SessionAgentCall{}, next)
 	require.Equal(t, mbIdle, mb.state)
+	require.Equal(t, uint64(9), mb.current.id, "generation id is preserved across release (round 9 review MEDIUM-2)")
+	require.Nil(t, mb.current.cancel)
+	require.Nil(t, mb.dispatcherCancel)
+}
+
+// TestMailbox_AbandonOwnership_EmptyEndsAtIdle is the round 9 review's
+// BLOCKER-2a regression test: Run's cleanup defer must not leave the
+// mailbox permanently mbOwned with nobody running it. Even with nothing
+// queued, abandonOwnership must end the era at idle.
+func TestMailbox_AbandonOwnership_EmptyEndsAtIdle(t *testing.T) {
+	mb := &mailbox{
+		state:            mbOwned,
+		epoch:            1,
+		dispatcherCancel: func() {},
+		current:          generation{id: 3, cancel: func() {}},
+	}
+
+	dropped, hadWork := mb.abandonOwnership(1)
+
+	require.False(t, hadWork, "nothing was queued")
+	require.Empty(t, dropped)
+	require.Equal(t, mbIdle, mb.state)
+	require.Nil(t, mb.dispatcherCancel)
+	require.Nil(t, mb.current.cancel)
+}
+
+// TestMailbox_AbandonOwnership_WithQueuedWork_DropsAndEndsAtIdle is the core
+// BLOCKER-2a regression: before this method existed, Run's cleanup defer
+// called drainOrRelease/drainOrReleaseMerged, whose "found something"
+// branch leaves state == mbOwned expecting the CALLER to run it as the
+// next turn. Run's defer has no turn loop left to do that, so the old code
+// silently wedged the session permanently busy (IsSessionBusy true
+// forever, every future submit() queuing behind an owner that would never
+// drain again). abandonOwnership must ALWAYS end at idle, whether or not
+// anything was queued, and hand back everything so the caller can log
+// what was dropped instead of silently keeping the session unusable.
+func TestMailbox_AbandonOwnership_WithQueuedWork_DropsAndEndsAtIdle(t *testing.T) {
+	queued := SessionAgentCall{SessionID: "s1", Prompt: "queued during the failed turn"}
+	replacement := SessionAgentCall{SessionID: "s1", Prompt: "an interrupt-and-replace nobody got to run"}
+	mb := &mailbox{
+		state:       mbOwned,
+		epoch:       1,
+		current:     generation{id: 5, cancel: func() {}},
+		submitted:   []SessionAgentCall{queued},
+		replacement: &replacement,
+	}
+
+	dropped, hadWork := mb.abandonOwnership(1)
+
+	require.True(t, hadWork)
+	require.ElementsMatch(t, []SessionAgentCall{queued, replacement}, dropped,
+		"both a queued follow-up AND a stranded replacement must be surfaced so the caller can log them")
+	require.Equal(t, mbIdle, mb.state,
+		"the mailbox must end up idle even though something was queued — there is no turn loop left to keep it owned for (BLOCKER-2a)")
+	require.Empty(t, mb.submitted)
+	require.Nil(t, mb.replacement)
+
+	// A NEW Run() for this session must be able to claim it fresh.
+	becomeOwner, newEpoch := mb.submit(SessionAgentCall{SessionID: "s1", Prompt: "fresh start"}, func() {})
+	require.True(t, becomeOwner, "the session must not be permanently wedged busy — a later Run() must be able to claim it")
+	require.NotEqual(t, uint64(1), newEpoch)
+}
+
+// TestMailbox_AbandonOwnership_EpochMismatch_IsNoOp mirrors
+// TestMailbox_DrainOrRelease_EpochMismatch_IsNoOp for abandonOwnership: a
+// stale call (the era already ended, e.g. runTurn's own drain already ran,
+// or a concurrent submit became a new owner) must not touch a different,
+// current owner's state.
+func TestMailbox_AbandonOwnership_EpochMismatch_IsNoOp(t *testing.T) {
+	laterOwnerCall := SessionAgentCall{SessionID: "s1", Prompt: "later owner's call"}
+	mb := &mailbox{
+		state:     mbOwned,
+		epoch:     2,
+		current:   generation{id: 9, cancel: func() {}},
+		submitted: []SessionAgentCall{laterOwnerCall},
+	}
+
+	dropped, hadWork := mb.abandonOwnership(1) // stale epoch
+
+	require.False(t, hadWork)
+	require.Empty(t, dropped)
+	require.Equal(t, mbOwned, mb.state, "a stale abandon must not touch a different owner's state")
+	require.Equal(t, uint64(2), mb.epoch)
+	require.Len(t, mb.submitted, 1)
+	require.Equal(t, laterOwnerCall, mb.submitted[0], "the later owner's queued call must survive a stale abandon call untouched")
 }

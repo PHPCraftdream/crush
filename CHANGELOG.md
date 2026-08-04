@@ -23,6 +23,32 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **`crush run` hung for a full 5 seconds on exit after any turn ran, and a
+  turn that errored out with a message still queued could wedge that
+  session permanently busy** — introduced by the per-session owner/mailbox
+  migration's first two stages (P0-3, P0-2) and found the same day by an
+  independent review of that migration. Two related defects:
+  - `IsBusy()`/`CancelAll()` still read the `activeRequests` map directly,
+    but the migration stopped clearing its plain-session-id entry on
+    release (only the mailbox's own state is cleared now) — so
+    `IsBusy()` returned `true` forever after a session's first turn, and
+    `App.Shutdown()` (reached by every `crush run` via
+    `defer a.Shutdown()`) always burned its full 5-second busy-drain
+    timeout instead of returning immediately once idle. Both now read the
+    mailbox's state directly.
+  - `Run`'s cleanup step ran unconditionally on every return path — not
+    just the pre-loop bail-outs it was meant for — including after the
+    turn loop's own drain had already released the session, or after an
+    early-error return that left work still queued with nobody left to
+    run it. On the "still queued" branch it left the session marked
+    busy forever with no owner; on the "already released" branch, if a
+    concurrent turn had since claimed the session, it could silently
+    flip that live turn's ownership back to idle out from under it. The
+    mailbox now tracks which ownership era each caller was granted, so a
+    stale cleanup call is a safe no-op instead of clobbering a different,
+    later owner, and it always fully releases the session (logging what
+    was dropped) instead of leaving it stuck.
+
 - **Starting any `crush` process could kill a long-running session in a
   DIFFERENT process (release blocker)** — the startup recovery sweep
   (`recoverInterruptedTurns`, which runs on every process start) walked

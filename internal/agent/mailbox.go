@@ -98,6 +98,23 @@ type mailbox struct {
 	// mirrors the existing onFire test-seam idiom already used by
 	// stream_watchdog.go elsewhere in this package.
 	testDrainSeam func()
+
+	// epoch identifies the current OWNERSHIP ERA: bumped every time state
+	// transitions mbIdle -> mbOwned (a NEW caller becomes owner), never on
+	// a continuing turn within the same era (beginGeneration's turn-level
+	// `current.id` is a different counter — see its own doc). Round 9
+	// review, BLOCKER-2: without this, drainOrRelease had no way to tell
+	// "am I still the current owner calling this for the first time" apart
+	// from "a stale/duplicate release call from an era that has already
+	// ended" — Run's cleanup defer calls drainOrRelease unconditionally on
+	// every return path, including ones where runTurn's own internal drain
+	// already released ownership (or where an EARLY error return skipped
+	// it entirely, leaving the era still open). A caller now presents the
+	// epoch IT was granted ownership under; drainOrRelease is a safe no-op
+	// if that epoch no longer matches — either because the era already
+	// ended and moved on (a concurrent submit became the new owner) or
+	// because it never held ownership in the first place.
+	epoch uint64
 }
 
 // submit implements design §3: replaces both tryReserveSession +
@@ -105,18 +122,23 @@ type mailbox struct {
 // messageQueue.Append (the "queue behind the current owner" path) as one
 // atomic operation. Returns true when the caller becomes the new owner and
 // must run call itself; false when call was appended to the queue for the
-// current owner to drain.
-func (mb *mailbox) submit(call SessionAgentCall, dispatcherCancel context.CancelFunc) bool {
+// current owner to drain. When becomeOwner is true, epoch is this NEW
+// ownership era's id — the caller must present it to every drainOrRelease
+// call it makes for the lifetime of its ownership (BLOCKER-2, see the
+// epoch field's doc). epoch is meaningless (0) when becomeOwner is false:
+// the caller never held ownership and has nothing to release.
+func (mb *mailbox) submit(call SessionAgentCall, dispatcherCancel context.CancelFunc) (becomeOwner bool, epoch uint64) {
 	mb.mu.Lock()
 	defer mb.mu.Unlock()
 
 	if mb.state == mbIdle {
 		mb.state = mbOwned
 		mb.dispatcherCancel = dispatcherCancel
-		return true // caller (Run) becomes the new owner, runs call itself
+		mb.epoch++
+		return true, mb.epoch // caller (Run) becomes the new owner, runs call itself
 	}
 	mb.submitted = append(mb.submitted, call)
-	return false // caller queues and returns nil, exactly like today
+	return false, 0 // caller queues and returns nil, exactly like today
 }
 
 // drainOrRelease implements design §3: called by the owner at the exact
@@ -125,10 +147,21 @@ func (mb *mailbox) submit(call SessionAgentCall, dispatcherCancel context.Cancel
 // (state remains mbOwned). Otherwise ownership is atomically released
 // (state flips to mbIdle) in the SAME critical section as the emptiness
 // check, closing the P0-3 lost-wakeup window.
-func (mb *mailbox) drainOrRelease() (SessionAgentCall, bool) {
+//
+// epoch must be the value submit() returned when granting the caller
+// ownership (BLOCKER-2). If the mailbox's current epoch has since moved on
+// — a different, later caller became owner, e.g. because THIS call is a
+// stale duplicate release from Run's unconditional cleanup defer running
+// after runTurn's own drain already ended the era — this is a safe no-op:
+// it must not touch submitted/state/current, which belong to that later
+// owner now.
+func (mb *mailbox) drainOrRelease(epoch uint64) (SessionAgentCall, bool) {
 	mb.mu.Lock()
 	defer mb.mu.Unlock()
 
+	if mb.epoch != epoch {
+		return SessionAgentCall{}, false
+	}
 	if len(mb.submitted) > 0 {
 		next := mb.submitted[0]
 		mb.submitted = mb.submitted[1:]
@@ -141,9 +174,56 @@ func (mb *mailbox) drainOrRelease() (SessionAgentCall, bool) {
 		mb.testDrainSeam()
 	}
 	mb.state = mbIdle
-	mb.current = generation{}
+	mb.current.cancel = nil // preserve id (monotonic, see the field doc) — only the cancel func is spent
 	mb.dispatcherCancel = nil
 	return SessionAgentCall{}, false
+}
+
+// abandonOwnership implements Run's cleanup-defer release path (round 9
+// review, BLOCKER-2a). It is NOT the same operation as drainOrRelease:
+// drainOrRelease is called by an owner's OWN live turn loop, which can
+// choose to keep running ("found something queued, stay owned, run it as
+// the next turn"). Run's defer calls this instead specifically because it
+// has NO live turn loop left — it fires on every return from Run(),
+// including early bail-outs (OS-lock acquisition failure) and any
+// early-return inside runTurn that skipped runTurn's own final drain (an
+// error path returning before reaching it). In both cases there is nobody
+// left to hand a "keep running" answer to, so — unlike drainOrRelease —
+// this ALWAYS ends the era at mbIdle if epoch still matches, logging
+// (rather than silently keeping) anything it finds. Before this method
+// existed, Run's defer called the ordinary drainOrRelease/
+// drainOrReleaseMerged, which — on finding something in submitted — left
+// state == mbOwned with nobody running it: the session was silently wedged
+// permanently busy (IsSessionBusy true forever, every future submit()
+// silently queues behind a owner that will never drain it again).
+//
+// epoch behaves exactly as in drainOrRelease: a mismatch means this era
+// already ended (a concurrent submit became the new owner, or drainOrRelease
+// already released it) — a safe no-op that touches nothing, since whatever
+// is in submitted/replacement now belongs to that later owner.
+//
+// The legacy messageQueue is deliberately NOT touched here (unlike
+// drainOrReleaseMerged): its entries are not epoch-scoped and survive
+// independently of this mailbox era, so leaving them queued is correct —
+// the NEXT Run() call for this session will reach a normal end-of-turn
+// drainOrReleaseMerged and pick them up then, not lose them.
+func (mb *mailbox) abandonOwnership(epoch uint64) (dropped []SessionAgentCall, hadWork bool) {
+	mb.mu.Lock()
+	defer mb.mu.Unlock()
+
+	if mb.epoch != epoch {
+		return nil, false
+	}
+	dropped = mb.submitted
+	if mb.replacement != nil {
+		dropped = append(dropped, *mb.replacement)
+	}
+	mb.submitted = nil
+	mb.replacement = nil
+	mb.state = mbIdle
+	mb.current.cancel = nil // preserve id (monotonic, see the field doc) — only the cancel func is spent
+	mb.dispatcherCancel = nil
+	return dropped, len(dropped) > 0
 }
 
 // interruptAndReplace implements design §4: the coordinator's single entry
@@ -152,8 +232,8 @@ func (mb *mailbox) drainOrRelease() (SessionAgentCall, bool) {
 // hadOwner=false and does nothing further (the caller should instead start
 // a fresh Run() with call directly). When a turn is in progress, it
 // durably records call as the replacement to be consumed by the NEXT
-// generation, and returns the CURRENT generation's cancel func so the
-// caller can cancel it (outside the mailbox lock).
+// generation, and returns a cancel func the caller can invoke to interrupt
+// the in-flight generation (outside the mailbox lock).
 func (mb *mailbox) interruptAndReplace(call SessionAgentCall) (context.CancelFunc, bool) {
 	mb.mu.Lock()
 	defer mb.mu.Unlock()
@@ -170,7 +250,19 @@ func (mb *mailbox) interruptAndReplace(call SessionAgentCall) (context.CancelFun
 	// an external observer to land in, because both happen before mu is
 	// released.
 	mb.replacement = &call
+	// Fall back to dispatcherCancel when no generation is live yet (round 9
+	// review, MEDIUM-1 — mirrors Cancel's own fallback, agent.go's Cancel
+	// doc explains the exact window: between submit() granting ownership
+	// and the loop's first beginGeneration, current.cancel is nil for the
+	// whole OS-lock preamble). Without this, an interrupt landing in that
+	// window returned (nil, true) — success, with NOTHING actually
+	// cancelled — so the turn ran to completion on the ORIGINAL prompt and
+	// the replacement was silently stranded until some later, unrelated
+	// cancel eventually surfaced it out of order (HIGH-2).
 	cancel := mb.current.cancel
+	if cancel == nil {
+		cancel = mb.dispatcherCancel
+	}
 	return cancel, true
 }
 
