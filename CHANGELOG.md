@@ -23,6 +23,17 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **An interrupt or cancel landing right after a normal follow-up message
+  was queued mid-turn could also silently do nothing** — a fourth
+  independent review found the same defect the fix above closed on the
+  legacy-queue reclaim path was still present on the far more commonly
+  hit path: the current, non-legacy way a follow-up message gets queued
+  while a turn is running. Fixed the same way — restore a working cancel
+  handle at the moment ownership continues to the next turn — plus a
+  small hardening (explicitly re-assert ownership state on reclaim
+  instead of relying on it already being true) aimed at the same class
+  of defect before it can resurface on a future code path.
+
 - **A same-process concurrent send landing right as a turn finished could
   get a spurious "session already in use" error and be silently dropped,
   and an interrupt/cancel landing in the legacy-queue reclaim window could
