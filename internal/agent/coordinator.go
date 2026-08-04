@@ -399,6 +399,7 @@ func (c *coordinator) Run(ctx context.Context, sessionID string, prompt string, 
 	// If so, apply overrides before running (without going through RunWithOverrides
 	// to avoid mutual recursion).
 	sess, err := c.sessions.Get(ctx, sessionID)
+	var pinned *resolvedOverrides
 	if err == nil && (sess.LargeModelID != "" || sess.SmallModelID != "") {
 		var large, small *ModelOverride
 		if sess.LargeModelID != "" {
@@ -407,12 +408,19 @@ func (c *coordinator) Run(ctx context.Context, sessionID string, prompt string, 
 		if sess.SmallModelID != "" {
 			small = &ModelOverride{Provider: sess.SmallModelProvider, Model: sess.SmallModelID, ReasoningEffort: sess.SmallModelReasoningEffort}
 		}
-		if applyErr := c.applyModelOverrides(ctx, large, small); applyErr != nil {
+		resolved, applyErr := c.applyModelOverrides(ctx, large, small)
+		if applyErr != nil {
 			slog.Error("Coordinator.Run: failed to apply DB model overrides, using current models", "err", applyErr)
+		} else {
+			// This session asked for a specific model in the DB. Carrying the
+			// resolution down with the call is the whole point: otherwise the
+			// next thing that reads the shared agent may already be looking at
+			// a different session's override.
+			pinned = resolved
 		}
 	}
 
-	return c.runInternal(ctx, sessionID, prompt, attachments...)
+	return c.runInternal(ctx, sessionID, prompt, pinned, attachments...)
 }
 
 // SetRunLimits stores cost and token caps for the next Run call.
@@ -494,8 +502,33 @@ func (c *coordinator) autoResumeEligible(sessionID string) bool {
 		c.consecutiveResume(sessionID) < maxConsecutiveAutoResumes
 }
 
-// applyModelOverrides sets up the agent with the given model overrides (modifies currentAgent in place).
-func (c *coordinator) applyModelOverrides(ctx context.Context, large, small *ModelOverride) error {
+// resolvedOverrides is what applyModelOverrides computed, captured so the
+// caller can pin it onto the SessionAgentCall (task #265, P0-1).
+//
+// Without this, the sequence was: applyModelOverrides writes the resolved
+// values into the SHARED agent, then runInternal reads them back out of that
+// same shared agent a few dozen lines later, then the turn reads them AGAIN
+// when it actually starts. Every one of those gaps is a window where another
+// session's applyModelOverrides can land, and this fork's whole premise is N
+// concurrent sessions. Returning the values means the caller never has to
+// read them back.
+type resolvedOverrides struct {
+	large        Model
+	small        Model
+	promptPrefix string
+	systemPrompt string
+}
+
+// applyModelOverrides sets up the agent with the given model overrides
+// (modifies currentAgent in place) and returns what it resolved.
+//
+// It still writes the shared fields: `c.currentAgent.Model()` is what the web
+// UI and the no-override paths read to answer "which model is this agent on",
+// and changing that is a separate, larger question. The returned snapshot is
+// what makes a TURN immune to the shared state moving underneath it — shared
+// state stays last-writer-wins for display, but no turn reads it after this
+// point.
+func (c *coordinator) applyModelOverrides(ctx context.Context, large, small *ModelOverride) (*resolvedOverrides, error) {
 	largeCfg := c.cfg.Config().Models[config.SelectedModelTypeLarge]
 	smallCfg := c.cfg.Config().Models[config.SelectedModelTypeSmall]
 
@@ -524,23 +557,52 @@ func (c *coordinator) applyModelOverrides(ctx context.Context, large, small *Mod
 
 	largeModel, smallModel, err := c.buildModelsFromCfg(ctx, largeCfg, smallCfg, false)
 	if err != nil {
-		return fmt.Errorf("failed to build override models: %w", err)
+		return nil, fmt.Errorf("failed to build override models: %w", err)
 	}
 
 	c.currentAgent.SetModels(largeModel, smallModel)
 
+	resolved := &resolvedOverrides{large: largeModel, small: smallModel}
+
 	if largeProviderCfg, ok := c.cfg.Config().Providers.Get(largeModel.ModelCfg.Provider); ok {
-		c.currentAgent.SetSystemPromptPrefix(largeProviderCfg.SystemPromptPrefix)
+		resolved.promptPrefix = largeProviderCfg.SystemPromptPrefix
+		c.currentAgent.SetSystemPromptPrefix(resolved.promptPrefix)
 	}
 	if c.prompt != nil {
 		newSystemPrompt, err := c.prompt.Build(ctx, largeModel.ModelCfg.Provider, largeModel.ModelCfg.Model, c.cfg, c.workerSubAgentActive())
 		if err != nil {
+			// Leave resolved.systemPrompt empty rather than guessing: the
+			// caller treats "" as "nothing to pin", so the turn falls back to
+			// the agent's shared prompt exactly as it did before this returned
+			// anything at all.
 			slog.Error("applyModelOverrides: failed to rebuild system prompt", "err", err)
 		} else {
+			resolved.systemPrompt = newSystemPrompt
 			c.currentAgent.SetSystemPrompt(newSystemPrompt)
 		}
 	}
-	return nil
+	return resolved, nil
+}
+
+// pin copies the resolved values onto a call so the turn runs on them
+// regardless of what another session does to the shared agent meanwhile.
+// nil receiver = no overrides were applied, so nothing to pin — the call
+// keeps whatever runInternal/buildCall already put there.
+func (r *resolvedOverrides) pin(call *SessionAgentCall) {
+	if r == nil {
+		return
+	}
+	large, small := r.large, r.small
+	call.LargeModel = &large
+	call.SmallModel = &small
+	if r.promptPrefix != "" {
+		prefix := r.promptPrefix
+		call.SystemPromptPrefix = &prefix
+	}
+	if r.systemPrompt != "" {
+		prompt := r.systemPrompt
+		call.SystemPrompt = &prompt
+	}
 }
 
 // resolveSessionSystemPrompt loads the per-session system prompt from the DB,
@@ -570,8 +632,14 @@ func (c *coordinator) resolveSessionSystemPrompt(ctx context.Context, sessionID 
 // buildCall assembles the SessionAgentCall for the current agent + model
 // state. Extracted so InterruptAndSend can queue a call shaped exactly like
 // runInternal would.
-func (c *coordinator) buildCall(ctx context.Context, sessionID, prompt string, attachments []message.Attachment) (SessionAgentCall, error) {
+//
+// pinned works exactly as in runInternal: non-nil when the caller just
+// applied overrides, nil otherwise (read the shared model once, then pin it).
+func (c *coordinator) buildCall(ctx context.Context, sessionID, prompt string, pinned *resolvedOverrides, attachments []message.Attachment) (SessionAgentCall, error) {
 	model := c.currentAgent.Model()
+	if pinned != nil {
+		model = pinned.large
+	}
 
 	maxTokens := model.CatwalkCfg.DefaultMaxTokens
 	if model.ModelCfg.MaxTokens != 0 {
@@ -599,7 +667,8 @@ func (c *coordinator) buildCall(ctx context.Context, sessionID, prompt string, a
 	mergedOptions, temp, topP, topK, freqPenalty, presPenalty := mergeCallOptions(model, providerCfg)
 	sessionSystemPrompt := c.resolveSessionSystemPrompt(ctx, sessionID)
 
-	return SessionAgentCall{
+	pinnedLarge := model
+	call := SessionAgentCall{
 		SessionID:            sessionID,
 		Prompt:               prompt,
 		Attachments:          attachments,
@@ -611,12 +680,29 @@ func (c *coordinator) buildCall(ctx context.Context, sessionID, prompt string, a
 		FrequencyPenalty:     freqPenalty,
 		PresencePenalty:      presPenalty,
 		SystemPromptOverride: sessionSystemPrompt,
-	}, nil
+		LargeModel:           &pinnedLarge,
+	}
+	// Pinning matters more here than in runInternal: this call is QUEUED as a
+	// replacement and may not start for a while, so the gap between "options
+	// computed" and "turn starts" is unbounded rather than a few lines.
+	pinned.pin(&call)
+	return call, nil
 }
 
-// runInternal executes the agent with whatever models are currently set, handling 401 retries.
-func (c *coordinator) runInternal(ctx context.Context, sessionID string, prompt string, attachments ...message.Attachment) (*fantasy.AgentResult, error) {
+// runInternal executes the agent, handling 401 retries.
+//
+// pinned carries what the caller's applyModelOverrides just resolved; nil
+// means "no overrides for this call", in which case the agent's current
+// shared model is read once here and pinned from that point on. Either way
+// everything below — maxOutputTokens, providerCfg, the peak-hours check,
+// mergeCallOptions — is derived from ONE model value that also travels with
+// the call, so the turn cannot end up running a different model than the
+// options were computed for (task #265).
+func (c *coordinator) runInternal(ctx context.Context, sessionID string, prompt string, pinned *resolvedOverrides, attachments ...message.Attachment) (*fantasy.AgentResult, error) {
 	model := c.currentAgent.Model()
+	if pinned != nil {
+		model = pinned.large
+	}
 	slog.Debug("Coordinator: running with model", "sessionID", sessionID, "model", model.ModelCfg.Model)
 
 	maxOutputTokens := model.CatwalkCfg.DefaultMaxTokens
@@ -670,22 +756,36 @@ func (c *coordinator) runInternal(ctx context.Context, sessionID string, prompt 
 	c.maxTokens = 0
 	c.runLimitsMu.Unlock()
 
+	// Pin the model this call already resolved (task #265). Everything above
+	// — maxOutputTokens, mergedOptions, temp/topP/topK/penalties — was
+	// derived from THIS `model` value. Without pinning it, the agent
+	// re-reads its shared largeModel when the turn actually starts, so a
+	// concurrent session's applyModelOverrides landing in between makes the
+	// turn run one model with another model's options. Passing it down keeps
+	// the call internally consistent.
+	pinnedLarge := model
+	agentCall := SessionAgentCall{
+		SessionID:            sessionID,
+		Prompt:               prompt,
+		Attachments:          attachments,
+		MaxOutputTokens:      maxOutputTokens,
+		ProviderOptions:      mergedOptions,
+		Temperature:          temp,
+		TopP:                 topP,
+		TopK:                 topK,
+		FrequencyPenalty:     freqPenalty,
+		PresencePenalty:      presPenalty,
+		SystemPromptOverride: sessionSystemPrompt,
+		MaxCost:              maxCost,
+		MaxTokens:            maxTokensRunLimit,
+		LargeModel:           &pinnedLarge,
+	}
+	// Overrides pin small model / prefix / base prompt too; pin() leaves
+	// LargeModel as set above when pinned is nil, and rewrites it to the same
+	// value when it isn't (model was taken FROM pinned.large).
+	pinned.pin(&agentCall)
 	run := func() (*fantasy.AgentResult, error) {
-		return c.currentAgent.Run(ctx, SessionAgentCall{
-			SessionID:            sessionID,
-			Prompt:               prompt,
-			Attachments:          attachments,
-			MaxOutputTokens:      maxOutputTokens,
-			ProviderOptions:      mergedOptions,
-			Temperature:          temp,
-			TopP:                 topP,
-			TopK:                 topK,
-			FrequencyPenalty:     freqPenalty,
-			PresencePenalty:      presPenalty,
-			SystemPromptOverride: sessionSystemPrompt,
-			MaxCost:              maxCost,
-			MaxTokens:            maxTokensRunLimit,
-		})
+		return c.currentAgent.Run(ctx, agentCall)
 	}
 	// Interrupt-inject ticker: watches pending_injects for interrupt=true rows
 	// written by `crush sessions inject --interrupt` in another process, and
@@ -942,11 +1042,12 @@ func (c *coordinator) RunWithOverrides(ctx context.Context, sessionID, prompt st
 		}
 	}
 
-	if err := c.applyModelOverrides(ctx, large, small); err != nil {
+	pinned, err := c.applyModelOverrides(ctx, large, small)
+	if err != nil {
 		return nil, err
 	}
 
-	return c.runInternal(ctx, sessionID, prompt, attachments...)
+	return c.runInternal(ctx, sessionID, prompt, pinned, attachments...)
 }
 
 // effectiveReasoningEffort returns the reasoning effort to apply for provider calls.
@@ -2015,7 +2116,7 @@ func (c *coordinator) requeueInterruptMessage(ctx context.Context, sessionID, me
 		return fmt.Errorf("interrupt inject references missing message %q: %w", messageID, err)
 	}
 
-	call, err := c.buildCall(ctx, sessionID, injMsg.FullText(), nil)
+	call, err := c.buildCall(ctx, sessionID, injMsg.FullText(), nil, nil)
 	if err != nil {
 		return err
 	}
@@ -2046,12 +2147,15 @@ func (c *coordinator) InterruptAndSend(ctx context.Context, sessionID, prompt st
 	if err := c.readyWg.Wait(); err != nil {
 		return err
 	}
+	var pinned *resolvedOverrides
 	if large != nil || small != nil {
-		if applyErr := c.applyModelOverrides(ctx, large, small); applyErr != nil {
+		resolved, applyErr := c.applyModelOverrides(ctx, large, small)
+		if applyErr != nil {
 			return applyErr
 		}
+		pinned = resolved
 	}
-	call, err := c.buildCall(ctx, sessionID, prompt, attachments)
+	call, err := c.buildCall(ctx, sessionID, prompt, pinned, attachments)
 	if err != nil {
 		return err
 	}
@@ -2107,7 +2211,7 @@ func (c *coordinator) InjectMessage(ctx context.Context, sessionID, prompt strin
 	if err := c.readyWg.Wait(); err != nil {
 		return message.Message{}, err
 	}
-	call, err := c.buildCall(ctx, sessionID, prompt, attachments)
+	call, err := c.buildCall(ctx, sessionID, prompt, nil, attachments)
 	if err != nil {
 		return message.Message{}, err
 	}

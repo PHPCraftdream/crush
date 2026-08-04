@@ -24,12 +24,19 @@ import (
 // same way NewSessionAgent does. activeRequests/messageQueue are still
 // initialized too since Cancel/QueueMessage and related legacy call sites
 // (untouched by the mailbox migration) still read/write them. tools/
-// largeModel/systemPrompt/systemPromptPrefix are initialized too because
-// Run's very next block after the lock section (agent.go:546-549, "Copy
-// mutable fields under lock") unconditionally dereferences them — needed
-// only by TestRun_SubAgentChildSession_ProceedsPastLockWhenFree, which
-// drives Run() past the lock into that code; harmless no-ops for the
-// lock-rejection test, which returns before reaching that point.
+// largeModel/smallModel/systemPrompt/systemPromptPrefix are initialized too
+// because Run's very next block after the lock section resolves the turn's
+// config snapshot (agent.go's resolveTurnConfig, task #265) and
+// unconditionally dereferences all four — needed only by
+// TestRun_SubAgentChildSession_ProceedsPastLockWhenFree, which drives Run()
+// past the lock into that code; harmless no-ops for the lock-rejection test,
+// which returns before reaching that point.
+//
+// smallModel joined that list with #265: before it, small was read lazily
+// inside generateTitle (which none of these tests reach), so leaving it nil
+// was survivable. The snapshot now reads every field ONCE at turn start —
+// that is the whole point, since a concurrent session can rewrite the shared
+// fields mid-turn — so a nil here panics instead of silently not mattering.
 func newLockTestSessionAgent(dataDir string, isSubAgent bool) *sessionAgent {
 	return &sessionAgent{
 		dataDir:            dataDir,
@@ -39,6 +46,7 @@ func newLockTestSessionAgent(dataDir string, isSubAgent bool) *sessionAgent {
 		mailboxes:          csync.NewMap[string, *mailbox](),
 		tools:              csync.NewSliceFrom[fantasy.AgentTool](nil),
 		largeModel:         csync.NewValue(Model{}),
+		smallModel:         csync.NewValue(Model{}),
 		systemPrompt:       csync.NewValue(""),
 		systemPromptPrefix: csync.NewValue(""),
 	}

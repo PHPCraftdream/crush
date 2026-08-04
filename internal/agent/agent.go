@@ -285,6 +285,79 @@ type SessionAgentCall struct {
 	// would see the same message twice in history. Set by
 	// QueueExistingMessage on the interrupt path.
 	ExistingMessageID string
+
+	// LargeModel/SmallModel/SystemPromptPrefix, when set, pin this call's
+	// model and prompt configuration instead of reading the agent's shared,
+	// mutable fields (task #265, P0-1).
+	//
+	// The agent's largeModel/smallModel/systemPromptPrefix are process-wide
+	// and get REWRITTEN in place by coordinator.applyModelOverrides, which
+	// any per-session model override triggers. Every turn re-reads them, so
+	// with two sessions running concurrently — the whole point of this fork
+	// — session A's override lands in session B's next turn, and a turn can
+	// even observe a model change partway through its own run. These fields
+	// let a caller hand the resolved values down with the call, so a run
+	// stays self-consistent regardless of what another session does
+	// meanwhile.
+	//
+	// Pointers, so "explicitly set" is distinguishable from "zero value":
+	// nil means "use the agent's shared value", which is exactly what every
+	// existing caller that never sets them keeps getting.
+	LargeModel         *Model
+	SmallModel         *Model
+	SystemPromptPrefix *string
+
+	// SystemPrompt pins the BASE system prompt — the one applyModelOverrides
+	// rebuilds from the resolved provider/model. It is distinct from, and
+	// lower precedence than, SystemPromptOverride: the override is the
+	// per-session prompt persisted in the DB, which still wins when present.
+	//
+	// This one matters on the paths where the per-session prompt is empty
+	// (resolveSessionSystemPrompt returning "" on a DB error, mainly) — the
+	// turn then falls back to the agent's shared systemPrompt, which is
+	// exactly the field another session's override rewrites.
+	SystemPrompt *string
+}
+
+// turnConfig is the immutable per-call snapshot of everything model- and
+// prompt-shaped a turn needs (task #265, P0-1). Resolved ONCE — from the
+// call where it pins values, otherwise from the agent's shared fields —
+// then passed by value, so nothing downstream can observe a mid-run change
+// made by a concurrent session.
+type turnConfig struct {
+	largeModel   Model
+	smallModel   Model
+	systemPrompt string
+	promptPrefix string
+}
+
+// resolveTurnConfig builds the snapshot for one call. Reads each shared
+// field exactly once; a value pinned on the call wins over the shared one.
+func (a *sessionAgent) resolveTurnConfig(call SessionAgentCall) turnConfig {
+	cfg := turnConfig{
+		largeModel:   a.largeModel.Get(),
+		smallModel:   a.smallModel.Get(),
+		systemPrompt: a.systemPrompt.Get(),
+		promptPrefix: a.systemPromptPrefix.Get(),
+	}
+	if call.LargeModel != nil {
+		cfg.largeModel = *call.LargeModel
+	}
+	if call.SmallModel != nil {
+		cfg.smallModel = *call.SmallModel
+	}
+	if call.SystemPromptPrefix != nil {
+		cfg.promptPrefix = *call.SystemPromptPrefix
+	}
+	if call.SystemPrompt != nil {
+		cfg.systemPrompt = *call.SystemPrompt
+	}
+	// Per-session system prompt beats the global one — same precedence this
+	// had when it lived inline in runTurn.
+	if call.SystemPromptOverride != "" {
+		cfg.systemPrompt = call.SystemPromptOverride
+	}
+	return cfg
 }
 
 type SessionAgent interface {
@@ -1241,14 +1314,15 @@ func (a *sessionAgent) handleWatchdogFire(
 func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *session.SessionLock, epoch uint64, runCancel context.CancelFunc) (res *fantasy.AgentResult, resErr error, next SessionAgentCall, hasNext bool) {
 	// Copy mutable fields under lock to avoid races with SetTools/SetModels.
 	agentTools := a.tools.Copy()
-	largeModel := a.largeModel.Get()
-	systemPrompt := a.systemPrompt.Get()
-	promptPrefix := a.systemPromptPrefix.Get()
-
-	// Per-session system prompt overrides the global one when set.
-	if call.SystemPromptOverride != "" {
-		systemPrompt = call.SystemPromptOverride
-	}
+	// One immutable snapshot for the whole turn (task #265). Resolving these
+	// individually here used to mean a concurrent session's
+	// applyModelOverrides could land BETWEEN the reads, so a single turn ran
+	// with a mismatched model/prompt pair — and the next turn silently
+	// inherited another session's model.
+	cfg := a.resolveTurnConfig(call)
+	largeModel := cfg.largeModel
+	systemPrompt := cfg.systemPrompt
+	promptPrefix := cfg.promptPrefix
 
 	slog.Info("SessionAgent.Run: starting", "sessionID", call.SessionID, "model", largeModel.ModelCfg.Model, "promptLen", len(systemPrompt))
 
@@ -1377,7 +1451,7 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 		go func() {
 			defer close(titleDone)
 			defer titleCancel()
-			a.generateTitle(titleCtx, call.SessionID, call.Prompt)
+			a.generateTitle(titleCtx, call.SessionID, call.Prompt, cfg)
 		}()
 	}
 	// Bounded join (P1-B). This used to be a bare `defer wg.Wait()`, which
@@ -3393,7 +3467,7 @@ func cleanTitle(raw string) string {
 }
 
 // generateTitle generates a session titled based on the initial prompt.
-func (a *sessionAgent) generateTitle(ctx context.Context, sessionID string, userPrompt string) {
+func (a *sessionAgent) generateTitle(ctx context.Context, sessionID string, userPrompt string, cfg turnConfig) {
 	if userPrompt == "" {
 		return
 	}
@@ -3445,9 +3519,13 @@ func (a *sessionAgent) generateTitle(ctx context.Context, sessionID string, user
 		}
 	}()
 
-	smallModel := a.smallModel.Get()
-	largeModel := a.largeModel.Get()
-	systemPromptPrefix := a.systemPromptPrefix.Get()
+	// From the turn's snapshot, not a fresh read of the shared fields — a
+	// title generated for session A must not pick up session B's model just
+	// because B applied an override while this goroutine was starting
+	// (task #265).
+	smallModel := cfg.smallModel
+	largeModel := cfg.largeModel
+	systemPromptPrefix := cfg.promptPrefix
 
 	newAgent := func(m fantasy.LanguageModel, p []byte, tok int64) fantasy.Agent {
 		return fantasy.NewAgent(

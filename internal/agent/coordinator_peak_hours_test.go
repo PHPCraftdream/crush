@@ -96,7 +96,7 @@ func TestSetAllowPeakHours_BypassesRunInternal(t *testing.T) {
 
 	// Sanity: without the bypass, runInternal must refuse BEFORE reaching the
 	// agent. (This is the "test must fail without the fix" leg.)
-	_, err = coord.runInternal(t.Context(), "sess", "prompt")
+	_, err = coord.runInternal(t.Context(), "sess", "prompt", nil)
 	require.Error(t, err, "without bypass, in-window peak_hours must refuse")
 	assert.ErrorIs(t, err, errProviderPeakHours)
 	assert.False(t, agentReached, "agent.Run must NOT be reached when peak_hours refuses")
@@ -109,14 +109,14 @@ func TestSetAllowPeakHours_BypassesRunInternal(t *testing.T) {
 	sess, err := env.sessions.Create(t.Context(), "peak-bypass")
 	require.NoError(t, err)
 
-	res, err := coord.runInternal(t.Context(), sess.ID, "prompt")
+	res, err := coord.runInternal(t.Context(), sess.ID, "prompt", nil)
 	require.NoError(t, err, "with bypass armed, peak_hours must NOT refuse")
 	require.NotNil(t, res)
 	assert.True(t, agentReached, "agent.Run must be reached when --allow-peak-hours bypass is armed")
 
 	// The bypass is one-shot: a second run without re-arming must refuse again.
 	agentReached = false
-	_, err = coord.runInternal(t.Context(), sess.ID, "prompt")
+	_, err = coord.runInternal(t.Context(), sess.ID, "prompt", nil)
 	require.Error(t, err, "bypass must be consumed after one Run; second run refuses again")
 	assert.ErrorIs(t, err, errProviderPeakHours)
 	assert.False(t, agentReached)
