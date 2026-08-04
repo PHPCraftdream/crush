@@ -995,13 +995,13 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 		return nil, ErrAgentShuttingDown
 	}
 
-	// runCtx/runCancel span the WHOLE call: the DB preamble of every turn
-	// (before runTurn creates its own per-turn genCtx) plus every turn
-	// itself, since each turn's genCtx is derived from runCtx below. This is
-	// what tryReserveSession registers as the busy slot's CancelFunc, so
-	// Cancel(sessionID) does something even if it lands during a preamble,
-	// before the first turn has replaced the map entry with its own
-	// genCtx-scoped cancel func.
+	// runCtx/runCancel span the WHOLE dispatcher (every turn + every
+	// preamble). The loop derives a per-turn turnCtx from runCtx (#284) so
+	// that cancelling a single turn's preamble — via InterruptAndReplace —
+	// does NOT kill the dispatcher: runCancel is never the target of an
+	// interrupt; it is invoked only by this defer and by CancelAll's
+	// hardStop. tryReserveSession stores runCancel as dispatcherCancel, the
+	// mailbox's durable fallback when no live generation cancel exists yet.
 	runCtx, runCancel := context.WithCancel(ctx)
 	defer runCancel()
 
@@ -1153,35 +1153,27 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	// original ctx) is passed through so runCancel — registered as the
 	// busy slot's CancelFunc — actually reaches every turn's genCtx.
 	for {
-		// Re-arm activeRequests with runCancel (the live, whole-call cancel
-		// func) before every turn, not just the first. tryReserveSession
-		// already set it once before this loop started, but runTurn
-		// overwrites the map entry with its own per-turn `cancel` (derived
-		// from runCtx) partway through — see the Set call near genCtx's
-		// creation. Once that turn returns, its `cancel` is spent (already
-		// invoked via defer) and the map entry left behind is a dead
-		// placeholder: calling it does nothing. From here until the next
-		// runTurn call reaches its own activeRequests.Set — i.e. for the
-		// whole of the next turn's DB preamble — a concurrent
-		// Cancel(sessionID) would silently no-op instead of interrupting
-		// anything. Setting runCancel again here closes that window: it's
-		// still live (only runCancel's own defer at the top of Run cancels
-		// it), and since every turn's genCtx is derived from runCtx,
-		// invoking it cancels the in-flight preamble/turn same as before.
-		// Redundant but harmless on the very first iteration (tryReserveSession
-		// already stored this exact func); csync.Map.Set is a plain
-		// overwrite, not additive, so setting the same value twice is a
-		// no-op in effect.
-		a.activeRequests.Set(call.SessionID, runCancel)
+		// Per-turn context, derived from runCtx but independently
+		// cancelable. An interrupt during this turn's DB preamble (before
+		// runTurn creates genCtx) targets THIS cancel — not runCancel — so
+		// the dispatcher (this loop, plus runCtx) survives the interrupt and
+		// can atomically decide what to do next via runTurn's own
+		// drainAfterCancel recovery. Before #284 the loop registered
+		// runCancel for the preamble window, so an InterruptAndReplace
+		// during the preamble killed the entire dispatcher and the
+		// replacement was stranded in the legacy queue with no runner.
+		turnCtx, turnCancel := context.WithCancel(runCtx)
+		a.activeRequests.Set(call.SessionID, turnCancel)
 		// Mirror the activeRequests re-arm into the mailbox's current
-		// generation cancel (design §4): Cancel(sessionID) now targets
-		// mailbox.current.cancel instead of activeRequests, so it must be
-		// populated for the whole preamble (until runTurn swaps in its own
-		// per-turn genCtx cancel below) — otherwise a bare Cancel landing
-		// between turns would silently no-op (the exact task #206
-		// regression). runCancel covers the preamble exactly as before.
-		a.getMailbox(call.SessionID).beginGeneration(runCancel)
-		result, err, next, hasNext := a.runTurn(runCtx, call, lk, epoch, runCancel)
+		// generation cancel (design §4): Cancel(sessionID) targets
+		// mailbox.current.cancel, so it must be populated for the whole
+		// preamble (until runTurn swaps in its own per-turn genCtx cancel
+		// below). Using turnCancel (not runCancel) is the #284 fix: the
+		// preamble is now part of a cancelable generation that is SEPARATE
+		// from the durable dispatcher cancel.
+		a.getMailbox(call.SessionID).beginGeneration(turnCancel)
+		result, err, next, hasNext := a.runTurn(turnCtx, call, lk, epoch, runCancel)
+		turnCancel()
 		if !hasNext {
 			return result, err
 		}
@@ -1363,12 +1355,30 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 	currentSession, err := a.sessions.Get(preambleCtx, call.SessionID)
 	if err != nil {
 		preambleCancel()
+		// #284: the preamble runs inside a per-turn cancelable context
+		// (turnCtx, derived from runCtx). An InterruptAndReplace during
+		// the preamble cancels that context without killing the
+		// dispatcher. If the preamble failed because of a cancellation,
+		// the mailbox may hold a replacement that runTurn's own
+		// drainAfterCancel path never reached (it only runs after
+		// agent.Stream returns, and we never got there). Recover it now
+		// so the loop runs it as the next turn.
+		if errors.Is(err, context.Canceled) {
+			if next, ok := a.getMailbox(call.SessionID).drainAfterCancel(); ok {
+				return nil, nil, next, true
+			}
+		}
 		return nil, fmt.Errorf("failed to get session: %w", err), SessionAgentCall{}, false
 	}
 
 	msgs, err := a.getSessionMessages(preambleCtx, currentSession)
 	if err != nil {
 		preambleCancel()
+		if errors.Is(err, context.Canceled) {
+			if next, ok := a.getMailbox(call.SessionID).drainAfterCancel(); ok {
+				return nil, nil, next, true
+			}
+		}
 		return nil, fmt.Errorf("failed to get session messages: %w", err), SessionAgentCall{}, false
 	}
 
@@ -1394,6 +1404,11 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 		_, err = a.createUserMessage(preambleCtx, call)
 		if err != nil {
 			preambleCancel()
+			if errors.Is(err, context.Canceled) {
+				if next, ok := a.getMailbox(call.SessionID).drainAfterCancel(); ok {
+					return nil, nil, next, true
+				}
+			}
 			return nil, err, SessionAgentCall{}, false
 		}
 	}

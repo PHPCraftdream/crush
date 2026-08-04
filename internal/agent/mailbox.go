@@ -642,6 +642,14 @@ func (mb *mailbox) drainAfterCancel() (SessionAgentCall, bool) {
 		mb.current.cancel = nil
 		return next, true
 	}
+	// Clear the spent handle on the empty branch too (the sixth instance
+	// of the same stale-cancel shape rounds 9-14 fixed one branch at a
+	// time). This branch is now reachable from runTurn's preamble
+	// cancel-recovery (#284): without the clear, current.cancel survives
+	// as a spent handle, defeating Cancel()/InterruptAndReplace()'s
+	// nil-check fallback to dispatcherCancel for the window between this
+	// return and the caller's abandonOwnership defer.
+	mb.current.cancel = nil
 	return SessionAgentCall{}, false
 }
 

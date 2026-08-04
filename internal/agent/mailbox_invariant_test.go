@@ -135,6 +135,14 @@ func TestMailbox_Invariant_NoStaleCancelHandleSurvivesAnyMutatorReturn(t *testin
 			want: expectation{stillOwned: true},
 		},
 		{
+			name: "drainAfterCancel/empty returns no work and clears the handle",
+			run: func(t *testing.T, mb *mailbox) {
+				_, ok := mb.drainAfterCancel()
+				require.False(t, ok, "empty mailbox must return no work")
+			},
+			want: expectation{stillOwned: true},
+		},
+		{
 			name: "abandonOwnership/empty always ends the era",
 			run: func(t *testing.T, mb *mailbox) {
 				_, hadWork := mb.abandonOwnership(1)
