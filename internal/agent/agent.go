@@ -224,6 +224,25 @@ const sessionPreambleMaxDurationDefault = 60 * time.Second
 // via effectiveTitleGenerationMaxDuration below.
 const titleGenerationMaxDurationDefault = 2 * time.Minute
 
+// titleJoinGrace bounds how long runTurn's deferred join waits for the
+// title goroutine AFTER that goroutine's own deadline should already have
+// fired (P1-B).
+//
+// The timer above only bounds a provider that honours context
+// cancellation. One that does not — a hung connection, a transport stuck
+// outside context-aware I/O — never returns, and the bare `defer
+// wg.Wait()` this replaces then held runTurn (and with it Run, the
+// session's mailbox ownership and its OS lock) open indefinitely, for a
+// turn whose real work had already completed.
+//
+// Short on purpose: by the time this is consulted the title's own
+// deadline has passed, so any further waiting is pure loss. Abandoning
+// the goroutine is safe — it is not leaked so much as detached: it exits
+// whenever its provider finally unblocks, and generateTitle's own
+// deferred rename runs on a context.WithoutCancel, so a late completion
+// still persists its result.
+const titleJoinGrace = 5 * time.Second
+
 var userAgent = fmt.Sprintf("Charm-Crush/%s (https://charm.land/crush)", version.Version)
 
 //go:embed templates/title.md
@@ -1306,7 +1325,12 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 	// cancel an interrupt must hit.
 	a.getMailbox(call.SessionID).beginGeneration(cancel)
 
-	var wg sync.WaitGroup
+	// Closed by the title goroutine when it returns; nil when no title was
+	// requested. The deferred bounded join below selects on it. A
+	// sync.WaitGroup used to serve this role, but a WaitGroup can only be
+	// waited on unconditionally — and an unconditional wait is exactly the
+	// defect being fixed here (see the join's own comment).
+	var titleDone chan struct{}
 	if needsTitle {
 		// Derived from genCtx (not the outer ctx runTurn was called with) so
 		// the stream watchdog cancelling genCtx — idle timeout, tool
@@ -1316,15 +1340,46 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 		// backstop: generateTitle's two model attempts are each a blocking
 		// agent.Stream with no timeout of their own, so a provider that
 		// never returns (hung connection, stream never closed) must not be
-		// able to keep the deferred wg.Wait() below from returning even if
+		// able to keep the deferred join below from returning even if
 		// genCtx's own cancellation somehow doesn't unblock it.
 		titleCtx, titleCancel := context.WithTimeout(genCtx, a.effectiveTitleGenerationMaxDuration())
-		wg.Go(func() {
+		titleDone = make(chan struct{})
+		go func() {
+			defer close(titleDone)
 			defer titleCancel()
 			a.generateTitle(titleCtx, call.SessionID, call.Prompt)
-		})
+		}()
 	}
-	defer wg.Wait()
+	// Bounded join (P1-B). This used to be a bare `defer wg.Wait()`, which
+	// is only as bounded as the goroutine it waits on. generateTitle's two
+	// attempts are each a blocking agent.Stream with no timeout of their
+	// own, so the titleCtx deadline above only helps for a provider that
+	// actually honours context cancellation. One that does not — a hung
+	// connection, a transport stuck outside context-aware I/O — never
+	// returns, and the bare Wait then held runTurn (and with it Run, the
+	// session's mailbox ownership and its OS lock) open forever, on a turn
+	// whose real work had already finished.
+	//
+	// The title is best-effort metadata; it must never be able to outlive
+	// the turn it decorates. So we wait for it only up to a grace period
+	// beyond its own deadline, and otherwise abandon it: titleCancel has
+	// already fired via genCtx, the goroutine will exit whenever its
+	// provider finally unblocks, and its own deferred Rename is written
+	// against a detached context so a late completion still persists.
+	defer func() {
+		if titleDone == nil {
+			return
+		}
+		select {
+		case <-titleDone:
+		case <-time.After(titleJoinGrace):
+			slog.Warn(
+				"agent: abandoning title generation that outlived its deadline — the turn is not held open for it",
+				"session_id", call.SessionID,
+				"grace", titleJoinGrace,
+			)
+		}
+	}()
 
 	// Stream-progress watchdog (see streamWatchdog doc in stream_watchdog.go
 	// for the invariant). Every fantasy stream callback below calls
