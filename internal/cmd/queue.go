@@ -249,7 +249,7 @@ reason) are written back to the queue.`,
 
 				for _, t := range tasks {
 					go func(task queue.Task) {
-						cost, tokens, exitReason, runErr := runQueueTask(runCtx, cwd, task)
+						cost, tokens, exitReason, runErr := runQueueTask(runCtx, cwd, dataDir, task)
 						ch <- taskResult{task: task, cost: cost, tokens: tokens, exitReason: exitReason, err: runErr}
 					}(t)
 				}
@@ -326,9 +326,16 @@ var queueClearCmd = &cobra.Command{
 	},
 }
 
+// queueTaskExecOverride is a test-only seam for runQueueTask. When non-nil,
+// it replaces the real platform.Command + execCmd.Output() call, letting a
+// test intercept the spawned child's argv (e.g. to assert --data-dir
+// forwarding) without spawning a real crush run subprocess. Always nil in
+// production.
+var queueTaskExecOverride func(args []string, cwd, prompt string) ([]byte, error)
+
 // runQueueTask executes a single queue task by spawning crush run.
 // Returns cost, tokens, exit reason, and any error.
-func runQueueTask(ctx context.Context, cwd string, task queue.Task) (float64, int64, string, error) {
+func runQueueTask(ctx context.Context, cwd, dataDir string, task queue.Task) (float64, int64, string, error) {
 	sessionID := task.SessionID
 	if sessionID == "" {
 		sessionID = task.ID
@@ -360,6 +367,7 @@ func runQueueTask(ctx context.Context, cwd string, task queue.Task) (float64, in
 		"--session", sessionID,
 		"--json",
 		"--role", role,
+		"--data-dir", dataDir,
 	}
 	if task.MaxCost > 0 {
 		cmdArgs = append(cmdArgs, "--max-cost", fmt.Sprintf("%.4f", task.MaxCost))
@@ -371,16 +379,26 @@ func runQueueTask(ctx context.Context, cwd string, task queue.Task) (float64, in
 		cmdArgs = append(cmdArgs, "--timeout", fmt.Sprintf("%ds", task.TimeoutSec))
 	}
 
-	execCmd := platform.Command(ctx, crushBin, cmdArgs...)
-	execCmd.Dir = cwd
-	execCmd.Stdin = strings.NewReader(task.Prompt)
-
-	output, err := execCmd.Output()
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			return 0, 0, fmt.Sprintf("exit %d", exitErr.ExitCode()), fmt.Errorf("%s", string(exitErr.Stderr))
+	var output []byte
+	if queueTaskExecOverride != nil {
+		var overrideErr error
+		output, overrideErr = queueTaskExecOverride(cmdArgs, cwd, task.Prompt)
+		if overrideErr != nil {
+			return 0, 0, "", overrideErr
 		}
-		return 0, 0, "", err
+	} else {
+		execCmd := platform.Command(ctx, crushBin, cmdArgs...)
+		execCmd.Dir = cwd
+		execCmd.Stdin = strings.NewReader(task.Prompt)
+
+		var execErr error
+		output, execErr = execCmd.Output()
+		if execErr != nil {
+			if exitErr, ok := execErr.(*exec.ExitError); ok {
+				return 0, 0, fmt.Sprintf("exit %d", exitErr.ExitCode()), fmt.Errorf("%s", string(exitErr.Stderr))
+			}
+			return 0, 0, "", execErr
+		}
 	}
 
 	// Parse JSON output to extract cost/tokens.

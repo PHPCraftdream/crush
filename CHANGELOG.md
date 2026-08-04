@@ -23,6 +23,20 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **`queue run`'s spawned children now inherit the parent's explicit
+  `--data-dir`** — `queue run` resolves its own data directory once
+  (honoring an explicit `--data-dir` on the parent invocation, or a
+  configured `data_directory`) to open the queue DB and acquire
+  `queue.lock`, but `runQueueTask` never forwarded that resolved path
+  to the `crush run --session ...` subprocess it spawns per task. Each
+  spawned child independently re-resolved its own data directory
+  starting from `--cwd`, which diverges from the parent's when
+  `--data-dir` was passed explicitly — a queued task's child process
+  could read/write its session and messages against a different DB
+  than the one the queue claimed the task from. `runQueueTask` now
+  takes the parent's resolved `dataDir` and passes it through as
+  `--data-dir` on the child's argv.
+
 A separate review flagged the session heartbeat as reporting "alive"
 for a fully deadlocked process (no real progress, mtime still fresh)
 and a backlog of eight lower-priority follow-ups from the stability
