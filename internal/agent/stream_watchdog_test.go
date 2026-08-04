@@ -735,27 +735,33 @@ func TestStreamWatchdog_ToolFinishesWithinGraceNeverFires(t *testing.T) {
 	assert.NoError(t, ctx.Err())
 }
 
-// TestStreamWatchdog_RecordActivityCalledOnEveryToolInFlightTick is the
-// regression test for task #222: a tool running synchronously (no fantasy
-// stream callbacks fire while it's in flight) used to record ZERO activity
-// for its entire duration — bump() is only called from stream callbacks and
-// from toolFinished's idle-clock reset, neither of which fire WHILE a long
-// tool is still running. With toolExecutionMaxDefault at 45 minutes in
-// production, that left SessionLock's activity-gated heartbeat dark for up
-// to 45 minutes on a perfectly healthy session (see RecordActivity's doc in
-// internal/session/lock.go). This proves recordActivity is now invoked once
-// per tick for the entire time a tool is in flight and still under its cap
-// — not just at toolStarted/toolFinished — by simulating a tool running past
-// what would have been the old activity gap (several multiples of `tick`)
-// and asserting recordActivity fired many times, continuously, throughout.
-func TestStreamWatchdog_RecordActivityCalledOnEveryToolInFlightTick(t *testing.T) {
+// TestStreamWatchdog_NoTimerDrivenActivityWhileToolInFlight is the
+// regression test for task #300, and deliberately asserts the OPPOSITE of
+// what task #222's test used to.
+//
+// #222 made the watchdog call recordActivity once per tick for as long as
+// any tool was in flight, so a long synchronous tool (which produces no
+// stream callbacks) would not starve SessionLock's activity-gated
+// heartbeat. The cost was that the heartbeat then reported "alive" purely
+// because a tool call was OPEN: a wedged tool looked exactly like a
+// working one for its entire cap. That was observed in the wild as a
+// session showing a fresh heartbeat for 38 minutes while its sub-agent was
+// stuck on a trivial command, with sessions locks/why/list all calling it
+// healthy.
+//
+// The heartbeat must now reflect only REAL progress. #222's original
+// concern is covered without a timer: withActivityNotify (agent.go)
+// composes each session's activity callback with its ancestors', so a
+// delegated sub-agent's genuine stream callbacks walk back up and touch
+// every ancestor session's lock. Nothing else may synthesise activity.
+func TestStreamWatchdog_NoTimerDrivenActivityWhileToolInFlight(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
-	const idle = 5 * time.Second // large — idle path must not confound this test
+	const idle = 5 * time.Second // large — the idle path must not confound this
 	const tick = 10 * time.Millisecond
-	const toolMaxDuration = 5 * time.Second // generous — tool must not be cut off
+	const toolMaxDuration = 5 * time.Second // generous — the tool must not be cut off
 
 	var recordCalls atomic.Int32
 	var fired atomic.Int32
@@ -769,22 +775,20 @@ func TestStreamWatchdog_RecordActivityCalledOnEveryToolInFlightTick(t *testing.T
 		<-wd.done
 	}()
 
-	// A tool starts and stays in flight for well more than the old activity
-	// gap (several ticks) with zero stream callbacks — simulating a single
-	// long-running tool call (e.g. a bounded sub-agent delegation).
+	// A tool stays in flight for many ticks while producing NOTHING — the
+	// exact shape of a hung tool call.
 	wd.toolStarted()
-	const simulatedToolRuntime = 15 * tick
-	time.Sleep(simulatedToolRuntime)
+	time.Sleep(15 * tick)
 
 	assert.Equal(t, int32(0), fired.Load(), "watchdog must not fire while the tool is under its cap")
+	assert.Equal(t, int32(0), recordCalls.Load(),
+		"a tool merely being OPEN must never synthesise activity: the timer must not touch the heartbeat, "+
+			"otherwise a wedged tool is indistinguishable from a working one for its whole cap (task #300)")
 
-	// recordActivity must have been invoked repeatedly WHILE the tool was in
-	// flight — proving the heartbeat kept advancing throughout the tool's
-	// execution, not just once at toolStarted.
-	calls := recordCalls.Load()
-	assert.Greater(t, calls, int32(5),
-		"recordActivity must be called on every tick a tool is in flight and under its cap, "+
-			"not just at toolStarted/toolFinished transitions")
+	// A real stream callback — genuine progress — still records activity.
+	wd.bump()
+	assert.Greater(t, recordCalls.Load(), int32(0),
+		"real progress (a stream callback) must still record activity — this is the ONLY thing that may")
 
 	wd.toolFinished()
 }

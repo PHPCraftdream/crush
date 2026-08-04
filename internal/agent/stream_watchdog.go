@@ -329,15 +329,33 @@ func startStreamWatchdog(
 						return
 					}
 					last.Store(now.UnixNano())
-					// A tool is in flight AND still under its cap — that is
-					// legitimate ongoing activity, not silence. Record it every
-					// tick, not just at toolStarted/toolFinished transitions, so
-					// SessionLock's activity-gated heartbeat (see recordActivity's
-					// doc above) keeps ticking for the tool's whole duration
-					// instead of going dark for up to toolMaxDuration.
-					if recordActivity != nil {
-						recordActivity()
-					}
+					// Deliberately does NOT call recordActivity() (task #300).
+					//
+					// This used to fire every tick while any tool was open, on
+					// the theory (task #222) that a long delegation produces no
+					// stream callbacks and would otherwise starve SessionLock's
+					// activity-gated heartbeat. The effect was a heartbeat that
+					// reported "alive" purely because a tool call was OPEN — so
+					// a genuinely wedged tool was indistinguishable from a
+					// working one for its whole cap. Seen in the wild: a
+					// session with a fresh heartbeat for 38 minutes while its
+					// sub-agent sat stuck on a trivial command, with sessions
+					// locks/why/list all calling it healthy.
+					//
+					// #222's concern is already covered without a timer:
+					// withActivityNotify (agent.go) composes each session's
+					// activity callback with its ancestors', so a delegated
+					// sub-agent's REAL stream callbacks walk back up and touch
+					// every ancestor's lock. A delegation that is genuinely
+					// working keeps its parent's heartbeat fresh through actual
+					// progress; a stuck one no longer can.
+					//
+					// A non-delegating tool that emits nothing for a long time
+					// (a slow build) now goes heartbeat-quiet. That is the
+					// honest signal — it is indistinguishable from a hang by
+					// construction — and InspectSessionLock's bounded
+					// PID-liveness fallback still keeps it from being declared
+					// dead on mtime alone.
 					continue
 				}
 				lastActivity := time.Unix(0, last.Load())

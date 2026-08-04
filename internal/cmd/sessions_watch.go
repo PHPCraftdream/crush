@@ -242,10 +242,51 @@ func liveTailSession(ctx context.Context, a *app.App, sessionID, dataDir string,
 		// the child session means nothing is printed, tool-call-quiet
 		// periods produce no output at all, matching how the top-level
 		// stream already behaves.
-		if act := computeCallTreeActivity(ctx, a, sessionID); act.SubAgentActive && act.DeepestSessionID != "" {
-			printNewMessagesSince(subAgentWriter(os.Stdout, act.DeepestSessionID), ctx, a, act.DeepestSessionID, subAgentLastPrinted, tickNow)
+		for _, childID := range descendantSessionIDs(ctx, a, sessionID) {
+			printNewMessagesSince(subAgentWriter(os.Stdout, childID), ctx, a, childID, subAgentLastPrinted, tickNow)
 		}
 	}
+}
+
+// descendantSessionIDs returns every session below rootID in the call
+// tree, breadth-first, so the watch loop can tail all of them.
+//
+// Every level is walked, not just the immediate children: a sub-agent may
+// itself delegate, and its grandchild's tool calls are just as much "real
+// activity" as the top-level session's. Tailing all of them (rather than
+// only the single freshest descendant computeCallTreeActivity reports) is
+// what makes concurrent delegations visible — with one-at-a-time tailing,
+// two sub-agents working in parallel would leave whichever one wrote
+// second-most-recently completely invisible.
+//
+// Errors are swallowed deliberately: this drives a live display, and a
+// transient DB hiccup should skip a tick's worth of sub-agent output, not
+// abort the watch. Depth is capped as a defensive guard against a
+// parent/child cycle in the data.
+func descendantSessionIDs(ctx context.Context, a *app.App, rootID string) []string {
+	const maxDepth = 16
+	var out []string
+	seen := map[string]bool{rootID: true}
+	frontier := []string{rootID}
+	for depth := 0; depth < maxDepth && len(frontier) > 0; depth++ {
+		var next []string
+		for _, parent := range frontier {
+			children, err := a.Sessions.ListSubSessions(ctx, parent)
+			if err != nil {
+				continue
+			}
+			for _, ch := range children {
+				if seen[ch.ID] {
+					continue
+				}
+				seen[ch.ID] = true
+				out = append(out, ch.ID)
+				next = append(next, ch.ID)
+			}
+		}
+		frontier = next
+	}
+	return out
 }
 
 // printNewMessagesSince prints every message in sessionID newer than
