@@ -179,53 +179,129 @@ func (mb *mailbox) drainOrRelease(epoch uint64) (SessionAgentCall, bool) {
 	return SessionAgentCall{}, false
 }
 
-// reclaimSameEra re-owns the mailbox for the SAME ownership era that just
-// released it, WITHOUT bumping epoch (round 9 review round 2, HIGH-1).
+// drainOrReleaseFinal implements round 11 review, HIGH-1: it replaces the
+// former two-step "release to mbIdle under mb.mu, THEN — outside mb.mu, in
+// drainOrReleaseMerged — separately check the legacy messageQueue and only
+// THEN release the OS session lock much later, once Run's whole call stack
+// unwinds" shape with one atomic operation, so that "mb.state == mbIdle"
+// (observable in-process via IsSessionBusy/submit/CancelAll/IsBusy, all of
+// which just read mb.state under mb.mu) can no longer become true while the
+// OS-level session.SessionLock this same call is still holding is not yet
+// released.
 //
-// It exists only for drainOrReleaseMerged's legacy-messageQueue fallback:
-// that caller's own drainOrRelease call just released to mbIdle under
-// `epoch` (unchanged — only submit()'s idle->owned transition bumps epoch,
-// never a release), then found something in the legacy messageQueue and
-// wants to keep running as the SAME Run() call's next turn. Reclaiming via
-// a plain submit() would grant a NEW epoch — which the caller (Run's loop)
-// has no way to learn, since it captured `epoch` exactly once at claim
-// time (agent.go:849) and never re-reads it. A caller then presenting the
-// STALE original epoch to its next drainOrRelease call would find it no
-// longer matches the mailbox's real (bumped) epoch, treat that as "a
-// different owner now holds this", and silently abandon a session nobody
-// else is actually running — recreating BLOCKER-1/2's permanent-wedge
-// shape via this one narrow path.
+// Without this, a same-process caller that saw IsSessionBusy(sessionID) ==
+// false and tried to become the new owner via submit() — legitimately, that
+// IS what "not busy" is supposed to mean — could reach
+// session.TryAcquireSessionLock and get a spurious SessionLockBusyError from
+// its own process's prior turn, which hadn't finished unwinding
+// (runTurn's deferred wg.Wait() for title generation, then Run's own
+// deferred lk.Release()) yet. Because tryReserveSession's "someone already
+// owns it" branch never re-queues (submit()'s owner-branch assumes the
+// eventual real owner will drain it), that manifested as a silently
+// dropped user message, not a retryable error.
 //
-// Returns false if the epoch no longer matches mbIdle's recorded value —
-// meaning a genuinely DIFFERENT caller's submit() claimed a new era in the
-// exact gap between this caller's own release and this reclaim attempt.
-// The caller must not proceed as owner in that case; see
-// drainOrReleaseMerged for how it recovers the item it already popped off
-// messageQueue in that (extremely narrow, but real) case.
-func (mb *mailbox) reclaimSameEra(epoch uint64, dispatcherCancel context.CancelFunc) bool {
+// checkLegacy is called (still holding mb.mu) ONLY when mb.submitted is also
+// empty — it must perform the legacy-messageQueue.PopFront check (or
+// equivalent) and return the same (call, found) shape drainOrRelease itself
+// returns for its own submitted-queue branch. It must NOT call back into
+// this mailbox (mb.mu is not reentrant) — csync.KeyedQueue.PopFront (the
+// only real caller, see drainOrReleaseMerged) is backed by its own
+// independent sync.Mutex with no callbacks of its own, so nesting it inside
+// mb.mu here is safe (confirmed by reading internal/csync/keyedqueue.go: no
+// method calls out to anything).
+//
+// reclaimDispatcherCancel is stored into mb.dispatcherCancel, and
+// mb.current.cancel is explicitly cleared, both still under mb.mu, ONLY on
+// the checkLegacy-hit branch — round 11 review, MEDIUM-1. Before this,
+// reclaiming from the legacy queue (via the historical reclaimSameEra,
+// called with a literal nil dispatcherCancel) left mb.dispatcherCancel nil
+// AND left mb.current.cancel pointing at the JUST-FINISHED turn's own
+// cancel func — already invoked once by that turn and therefore inert, but
+// not nil. Both defects independently made Cancel()/InterruptAndReplace()
+// silently ineffective for a call landing before the reclaimed turn's own
+// beginGeneration: Cancel()'s `if genCancel == nil { fallback to
+// dispatcherCancel }` never even reached the fallback (genCancel was the
+// stale, non-nil, spent prior-turn cancel), so fixing only dispatcherCancel
+// is not sufficient on its own — both must be set here. Passing the
+// caller's runCancel as reclaimDispatcherCancel — the SAME whole-call
+// CancelFunc tryReserveSession/submit() already store in this exact field
+// for the analogous "no live generation yet" window — closes the
+// dispatcherCancel half; explicitly nil-ing current.cancel closes the rest.
+//
+// release is called (still holding mb.mu) ONLY when BOTH mb.submitted and
+// checkLegacy came back empty — i.e. exactly the branch that used to flip
+// mb.state to mbIdle. It must release the OS-level session lock (or be a
+// no-op when a.dataDir == "" and no lock was ever acquired — see
+// drainOrReleaseMerged's call site). Any error it returns is surfaced to the
+// caller for logging; it never blocks the state flip to mbIdle, mirroring
+// how Run's own `defer lk.Release()` today only logs a Release failure
+// rather than treating it as fatal — a failed unlock must not leave the
+// mailbox permanently mbOwned with nobody left to retry it.
+//
+// The two callbacks are invoked in this exact order — checkLegacy before
+// release — precisely so a hit in the legacy queue can skip releasing the
+// OS lock entirely and keep it held for the reclaimed turn, instead of
+// releasing-then-reacquiring (which would open a real cross-process race:
+// see the historical reclaimSameEra doc, superseded by this function, for
+// why that shape is rejected).
+func (mb *mailbox) drainOrReleaseFinal(
+	epoch uint64,
+	checkLegacy func() (SessionAgentCall, bool),
+	reclaimDispatcherCancel context.CancelFunc,
+	release func() error,
+) (call SessionAgentCall, hasNext bool, releaseErr error) {
 	mb.mu.Lock()
 	defer mb.mu.Unlock()
 
-	if mb.state != mbIdle || mb.epoch != epoch {
-		return false
+	if mb.epoch != epoch {
+		return SessionAgentCall{}, false, nil
 	}
-	mb.state = mbOwned
-	mb.dispatcherCancel = dispatcherCancel
-	// Nothing is appended to mb.submitted — matching submit()'s own
-	// idle-branch contract (design §3: "true = caller becomes owner and
-	// must run [the message] itself"), the caller (drainOrReleaseMerged)
-	// already returns the reclaimed call directly as the next turn's
-	// SessionAgentCall. An earlier version of this method also appended
-	// it to `submitted` here, which duplicated it: the reclaimed turn ran
-	// it as its prompt AND left an identical copy sitting in `submitted`,
-	// so that turn's own end-of-turn drain found it "still queued" and
-	// ran a THIRD, spurious turn on the same content. Caught by this
-	// package's own test suite (three pre-existing/new tests expecting N
-	// provider calls got N+1) before landing.
-	//
-	// epoch is deliberately NOT bumped — this is a continuation of the
-	// same era the caller already holds, not a new one.
-	return true
+	if len(mb.submitted) > 0 {
+		next := mb.submitted[0]
+		mb.submitted = mb.submitted[1:]
+		return next, true, nil // caller runs another turn; state stays mbOwned, lock stays held
+	}
+	if mb.testDrainSeam != nil {
+		mb.testDrainSeam()
+	}
+	if checkLegacy != nil {
+		if next, ok := checkLegacy(); ok {
+			// Reclaimed from the legacy queue under the SAME era — mirrors
+			// the historical reclaimSameEra's contract (no epoch bump, state
+			// stays mbOwned) but done here, still under mb.mu, instead of via
+			// a separate release-then-reclaim round trip: the OS lock is
+			// simply never released for this handoff.
+			mb.dispatcherCancel = reclaimDispatcherCancel
+			// mb.current.cancel must ALSO be cleared here (round 11 review,
+			// MEDIUM-1 — caught by this fix's own regression test failing
+			// even with dispatcherCancel populated): it still holds the
+			// JUST-FINISHED turn's own cancel func, already invoked once
+			// (runTurn's `cancel()` call before this drain runs) and
+			// therefore inert, but NOT nil. Cancel()'s fallback to
+			// dispatcherCancel is gated on `mb.current.cancel == nil` — if
+			// it is left non-nil here, Cancel() calls the spent, harmless
+			// prior-turn cancel func instead of ever reaching the fallback,
+			// silently failing to interrupt the reclaimed turn exactly like
+			// the original defect, just via a different nil-check path.
+			// Preserve current.id (monotonic, see the generation field's
+			// doc) — only the spent cancel func is cleared, mirroring
+			// drainOrRelease's own submitted-empty branch below.
+			mb.current.cancel = nil
+			return next, true, nil
+		}
+	}
+	// Nothing queued anywhere AT THE INSTANT OF THIS CHECK, and — because mu
+	// is held for the whole of this function, including the release call
+	// below — nothing CAN be queued (submit() would block on mb.mu) and no
+	// same-process observer CAN see mb.state flip to mbIdle before the OS
+	// lock this call is about to release is actually gone.
+	if release != nil {
+		releaseErr = release()
+	}
+	mb.state = mbIdle
+	mb.current.cancel = nil // preserve id (monotonic, see the field doc) — only the cancel func is spent
+	mb.dispatcherCancel = nil
+	return SessionAgentCall{}, false, releaseErr
 }
 
 // abandonOwnership implements Run's cleanup-defer release path (round 9

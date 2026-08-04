@@ -723,70 +723,92 @@ func (a *sessionAgent) tryReserveSession(call SessionAgentCall, reserveCancel co
 // epoch must be the era id tryReserveSession (or a prior drainOrRelease
 // call within the same era) returned. See mailbox.drainOrRelease's doc for
 // what a mismatch means.
+//
+// Not used by runTurn's own end-of-turn drain any more (see
+// drainOrReleaseMerged/drainOrReleaseFinal, round 11 review HIGH-1) since it
+// releases nothing but the in-process reservation — callers that also need
+// the OS-level session lock released atomically with the mbIdle flip must go
+// through drainOrReleaseFinal instead. Kept as a thin wrapper for direct
+// mailbox-level testing and any future caller with no OS lock in play.
 func (a *sessionAgent) releaseSessionReservation(sessionID string, epoch uint64) (SessionAgentCall, bool) {
 	return a.getMailbox(sessionID).drainOrRelease(epoch)
 }
 
-// drainOrReleaseMerged is releaseSessionReservation's composition with the
-// STILL-LIVE legacy messageQueue (design §7, stage 2 step 1 explicitly
-// migrates only tryReserveSession/releaseSessionReservation — QueueMessage
-// itself, and its callers InterruptAndSend/requeueInterruptMessage in
-// coordinator.go, are migrated in a LATER step and still append directly to
-// a.messageQueue, not the mailbox). Routing the end-of-turn drain through
-// mailbox.drainOrRelease ALONE — without also still checking messageQueue —
-// would silently stop delivering anything QueueMessage queues, since nothing
-// would be draining that structure anymore. This merges both sources without
-// reopening the P0-3 window:
-//  1. Try the mailbox first (atomic check-and-maybe-release, same as
-//     releaseSessionReservation). If it finds something, that's the answer.
-//  2. If the mailbox had nothing — meaning it just atomically released
-//     ownership to mbIdle — check the legacy queue. If IT has something,
-//     reclaim ownership via mailbox.submit(next, nil): submit on an idle
-//     mailbox always returns true (becomes owner) deterministically, so
-//     there is no ambiguous case to re-check. If some other caller raced a
-//     legitimate mailbox.submit into mbOwned in the narrow gap between step
-//     1 and step 2 (a real but different call than the one this function is
-//     handling), our own submit call here correctly loses (returns false,
-//     queues `next` behind that new owner) instead of running it out from
-//     under them — so this function's own hasNext report must reflect
-//     submit's actual return value, not just "the legacy queue had
-//     something."
+// drainOrReleaseMerged is runTurn's end-of-turn drain: releaseSessionReservation's
+// former composition with the STILL-LIVE legacy messageQueue (design §7,
+// stage 2 step 1 explicitly migrates only tryReserveSession/
+// releaseSessionReservation — QueueMessage itself, and its callers
+// InterruptAndSend/requeueInterruptMessage in coordinator.go, are migrated in
+// a LATER step and still append directly to a.messageQueue, not the
+// mailbox), now ALSO folding in the OS-level session lock release (round 11
+// review, HIGH-1).
+//
+// Before this, the mailbox flipped to mbIdle — making IsSessionBusy/
+// IsBusy/submit(), all same-process, in-memory reads under mb.mu, observe
+// "not busy" — strictly BEFORE lk (the OS-level inter-process session lock)
+// was actually released: that only happened much later, once runTurn
+// returned, its own deferred wg.Wait() (title generation, up to several
+// seconds) finished, control returned to Run's loop, and Run itself decided
+// to return, running ITS deferred lk.Release(). A same-process caller that
+// saw "not busy" in that window and tried to become the new owner via
+// submit() + TryAcquireSessionLock got a spurious SessionLockBusyError from
+// its own prior turn — and since tryReserveSession's "someone already owns
+// it" branch never re-queues on that error path, the message was silently
+// dropped, not just delayed.
+//
+// lk is the SAME *session.SessionLock Run() acquired once for the whole
+// call (nil when a.dataDir == ""), and runCancel is Run's own whole-call
+// CancelFunc (design §4 / round 11 review MEDIUM-1): if the legacy queue
+// reclaims ownership for another turn, dispatcherCancel must keep pointing
+// at something live (runCancel, exactly what tryReserveSession/submit()
+// already stores there for the "no live generation yet" window) rather than
+// being left nil until the reclaimed turn's own beginGeneration call —
+// otherwise a Cancel()/InterruptAndReplace() landing in that narrow window
+// would silently no-op (Cancel) or falsely report success while cancelling
+// nothing (InterruptAndReplace).
+//
+// The whole operation is one atomic mailbox.drainOrReleaseFinal call (mb.mu
+// held throughout):
+//  1. Check mb.submitted first. Non-empty: pop and return it; state stays
+//     mbOwned; lk is NOT touched (still held for the reclaimed turn).
+//  2. mb.submitted empty: check the legacy messageQueue (still under mb.mu —
+//     safe, see drainOrReleaseFinal's doc on csync.KeyedQueue.PopFront
+//     having no callbacks of its own). Non-empty: reclaim ownership for the
+//     SAME era (no epoch bump — mirrors the old reclaimSameEra contract) and
+//     return it; lk again NOT touched.
+//  3. Both empty: release lk (if non-nil) and THEN flip mb.state to mbIdle,
+//     all still under mb.mu. No same-process observer can see "not busy"
+//     until the OS lock genuinely is gone, closing the window above.
+//
+// This is why checkLegacy is tried BEFORE releasing lk: reclaiming behind
+// the SAME lock avoids the release-then-reacquire shape, which would open a
+// real cross-process race (a different process could win the OS lock in the
+// gap) — see the old reclaimSameEra doc (removed; superseded by this
+// function) for the fuller rationale, still applicable here.
 //
 // ONLY safe to call from a live turn loop that will actually run the
 // returned call as its next turn (runTurn's own end-of-turn drain). Run's
 // cleanup defer, which has no turn loop left to hand a "yes, keep going"
 // answer to, uses abandonOwnership instead (BLOCKER-2a) — calling THIS
-// from there could reclaim the legacy queue into a brand new era that
-// then never gets a turn either.
-func (a *sessionAgent) drainOrReleaseMerged(sessionID string, epoch uint64) (SessionAgentCall, bool) {
-	if next, ok := a.releaseSessionReservation(sessionID, epoch); ok {
-		return next, true
+// from there could reclaim the legacy queue into a brand new turn that
+// then never runs, AND would release lk from the wrong place (Run's own
+// deferred lk.Release() already owns that responsibility on that path).
+func (a *sessionAgent) drainOrReleaseMerged(sessionID string, epoch uint64, lk *session.SessionLock, runCancel context.CancelFunc) (SessionAgentCall, bool) {
+	checkLegacy := func() (SessionAgentCall, bool) {
+		return a.messageQueue.PopFront(sessionID)
 	}
-	next, ok := a.messageQueue.PopFront(sessionID)
-	if !ok {
+	var release func() error
+	if lk != nil {
+		release = lk.Release
+	}
+	next, hasNext, releaseErr := a.getMailbox(sessionID).drainOrReleaseFinal(epoch, checkLegacy, runCancel, release)
+	if releaseErr != nil {
+		slog.Debug("agent.drainOrReleaseMerged: release session lock failed", "session_id", sessionID, "err", releaseErr)
+	}
+	if !hasNext {
 		return SessionAgentCall{}, false
 	}
-	// Reclaim under the SAME epoch the caller already holds (round 9 review
-	// round 2, HIGH-1) — NOT a plain submit(), which would grant a brand
-	// new era the caller (Run's loop, which captured its epoch exactly
-	// once at claim time) has no way to learn about. Presenting a now-stale
-	// epoch to a later drainOrRelease/abandonOwnership call would then find
-	// it mismatched, assume some other owner holds the session, and quietly
-	// abandon it — nobody left running, recreating the exact permanent-wedge
-	// shape this whole epoch mechanism exists to prevent, just via this one
-	// narrower path (a message sitting in the legacy messageQueue at the
-	// instant this function's own release-to-idle happens).
-	if a.getMailbox(sessionID).reclaimSameEra(epoch, nil) {
-		return next, true
-	}
-	// reclaimSameEra failing means a genuinely DIFFERENT caller's submit()
-	// claimed a new era in the exact gap between our own release and this
-	// reclaim attempt — vanishingly rare, but messageQueue.PopFront already
-	// removed `next`, so it must go somewhere. Put it back rather than
-	// forcing ownership into a race already lost: whichever era is current
-	// now will pick it up via ITS OWN eventual drainOrReleaseMerged call.
-	a.messageQueue.Append(sessionID, next)
-	return SessionAgentCall{}, false
+	return next, true
 }
 
 // activityNotifyContextKey is the context key under which runTurn stores a
@@ -941,11 +963,26 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	// This does not introduce false-positive "already in use" errors for
 	// legitimate same-process reentrancy (e.g. the "agent" tool's
 	// resume_session_id path racing a still-active run on that same child
-	// id): the in-process reservation above already queues that case via
-	// messageQueue.Append and returns before this point is ever reached.
-	// Two sub-agent invocations spawned in parallel by fantasy's
-	// ParallelAgentTool likewise never collide here — each gets a distinct
-	// toolCallID and therefore a distinct child session id.
+	// id): the in-process reservation above (tryReserveSession/mailbox.submit)
+	// already queues that case behind the current in-process owner and
+	// returns before this point is ever reached — AS LONG AS the mailbox
+	// still reports that owner as busy. Round 11 review, HIGH-1: before that
+	// fix, drainOrReleaseMerged could flip the mailbox to mbIdle (making
+	// IsSessionBusy/tryReserveSession see "not busy") strictly BEFORE this
+	// same process's own prior Run() call had actually released ITS lk —
+	// runTurn's deferred wg.Wait() and the rest of the call stack unwinding
+	// still hadn't run. A second same-process Run() call for the identical
+	// session id could then become the new in-process owner (submit()
+	// legitimately returns becomeOwner=true) and reach TryAcquireSessionLock
+	// here while the OS lock was still, transiently, held by its own
+	// process's outgoing turn — a same-process false "already in use".
+	// drainOrReleaseMerged now releases lk atomically inside the same
+	// mailbox critical section that flips state to mbIdle (see
+	// mailbox.drainOrReleaseFinal), so "not busy" and "OS lock free" become
+	// true together — this window is closed. Two sub-agent invocations
+	// spawned in parallel by fantasy's ParallelAgentTool likewise never
+	// collide here — each gets a distinct toolCallID and therefore a
+	// distinct child session id.
 	//
 	// Acquired ONCE for the whole loop below — every queue-drain turn reuses
 	// this same lock instead of each one acquiring (and needing to release)
@@ -1022,7 +1059,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 		// between turns would silently no-op (the exact task #206
 		// regression). runCancel covers the preamble exactly as before.
 		a.getMailbox(call.SessionID).beginGeneration(runCancel)
-		result, err, next, hasNext := a.runTurn(runCtx, call, lk, epoch)
+		result, err, next, hasNext := a.runTurn(runCtx, call, lk, epoch, runCancel)
 		if !hasNext {
 			return result, err
 		}
@@ -1152,7 +1189,7 @@ func (a *sessionAgent) handleWatchdogFire(
 // end-of-turn queue check, or a /compact drain) with next set to that call;
 // the caller's loop is expected to invoke runTurn(ctx, next) again in that
 // case. When hasNext is false, result/err are Run's final return values.
-func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *session.SessionLock, epoch uint64) (res *fantasy.AgentResult, resErr error, next SessionAgentCall, hasNext bool) {
+func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *session.SessionLock, epoch uint64, runCancel context.CancelFunc) (res *fantasy.AgentResult, resErr error, next SessionAgentCall, hasNext bool) {
 	// Copy mutable fields under lock to avoid races with SetTools/SetModels.
 	agentTools := a.tools.Copy()
 	largeModel := a.largeModel.Get()
@@ -2538,7 +2575,7 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 	// legacy messageQueue (QueueMessage's callers are not migrated to the
 	// mailbox until a later stage — see its doc) so a message queued via the
 	// still-live QueueMessage path is not silently stranded.
-	firstQueuedMessage, ok := a.drainOrReleaseMerged(call.SessionID, epoch)
+	firstQueuedMessage, ok := a.drainOrReleaseMerged(call.SessionID, epoch, lk, runCancel)
 	if !ok {
 		return result, err, SessionAgentCall{}, false
 	}
