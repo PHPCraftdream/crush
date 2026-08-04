@@ -560,11 +560,14 @@ lower-severity issues, closed the same way:
   constant) is intentionally not merged; it's kept in sync by a
   comment cross-reference on both sides rather than wiring the
   literal through the WS/JSON protocol (LOW severity).
-- Two of this batch's own regression tests (the `crush models use
-  --large`/`--small` PID-fallback test-timing margins, and a stream-watchdog
-  test whose 100ms timing budget went stale once its diagnostic capture
-  became synchronous by design) were themselves flaky under `-race` load;
-  both are now deterministic — one via a wider margin, the other via a
+- Two classes of this batch's own regression tests were themselves flaky
+  under `-race` load; both are now deterministic. The PID-fallback
+  boundary tests across `sessions_list_test.go`, `sessions_watch_test.go`,
+  `sessions_why_test.go`, `stream_watchdog_test.go`, and
+  `internal/session/lock_test.go` used a 1-second timing margin around
+  `MaxPidFallbackAge` that was too tight under load; widened to 2 minutes.
+  A separate stream-watchdog test whose 100ms timing budget went stale
+  once its diagnostic capture became synchronous by design now uses a
   direct file-presence check instead of a timing budget that a widened
   timeout would have made unable to catch its own regression. Also fixed a
   read-before-write race in the same watchdog test (polled for a dump
