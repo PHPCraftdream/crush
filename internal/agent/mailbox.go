@@ -171,6 +171,14 @@ func (mb *mailbox) drainOrRelease(epoch uint64) (SessionAgentCall, bool) {
 	if len(mb.submitted) > 0 {
 		next := mb.submitted[0]
 		mb.submitted = mb.submitted[1:]
+		// Same stale-cancel shape as drainOrReleaseFinal's/drainAfterCancel's
+		// equivalent branches (rounds 11-13) — this function has no live
+		// production caller today (its only wrapper, releaseSessionReservation,
+		// has zero call sites), but its own doc explicitly reserves it for a
+		// future caller with no OS lock in play, so it gets the same
+		// defensive clear rather than being a silent fifth instance waiting
+		// to be reintroduced.
+		mb.current.cancel = nil
 		return next, true // caller runs another turn; state stays mbOwned
 	}
 	// Nothing queued AT THE INSTANT OF THIS CHECK, and — because mu is
@@ -460,14 +468,32 @@ func (mb *mailbox) drainAfterCancel() (SessionAgentCall, bool) {
 	mb.mu.Lock()
 	defer mb.mu.Unlock()
 
+	// Both hit branches below clear mb.current.cancel (round 13 review,
+	// the fourth instance of the same shape rounds 11/12 already fixed on
+	// drainOrReleaseFinal's two branches): by the time this is called
+	// (agent.go's isCancelErr block, right before its own `cancel()` call),
+	// mb.current.cancel is the just-cancelled generation's own genCtx
+	// cancel func — spent (whether invoked by the external Cancel() that
+	// caused isCancelErr, or by this function's own caller a line later)
+	// but NOT nil. Left untouched, it defeats Cancel()/InterruptAndReplace()'s
+	// current.cancel==nil fallback gate exactly like every prior instance,
+	// for the window until the next turn's own beginGeneration —
+	// arguably the worst of the four, since this is precisely the "user
+	// already cancelled once and wants the replacement instead" path: a
+	// second Cancel/interrupt landing in this window would silently no-op
+	// while the replacement turn streams anyway. dispatcherCancel is left
+	// untouched, same reasoning as the other two fixed branches — it's
+	// already the live runCancel, nothing to reset.
 	if mb.replacement != nil {
 		next := *mb.replacement
 		mb.replacement = nil
+		mb.current.cancel = nil
 		return next, true
 	}
 	if len(mb.submitted) > 0 {
 		next := mb.submitted[0]
 		mb.submitted = mb.submitted[1:]
+		mb.current.cancel = nil
 		return next, true
 	}
 	return SessionAgentCall{}, false

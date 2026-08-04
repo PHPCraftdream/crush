@@ -293,13 +293,12 @@ func TestMailbox_DrainOrReleaseFinal_LegacyReclaimNeverReleasesLock(t *testing.T
 // direct code read (mb.submitted branch returned without touching
 // mb.current.cancel at all) before landing the one-line fix.
 func TestMailbox_DrainOrReleaseFinal_SubmittedBranchClearsStaleCancelHandle(t *testing.T) {
-	var staleCancelCalled bool
 	queued := SessionAgentCall{SessionID: "s1", Prompt: "queued via submit()"}
 	mb := &mailbox{
 		state:            mbOwned,
 		epoch:            1,
 		dispatcherCancel: func() {},
-		current:          generation{id: 1, cancel: func() { staleCancelCalled = true }},
+		current:          generation{id: 1, cancel: func() {}},
 		submitted:        []SessionAgentCall{queued},
 	}
 
@@ -317,11 +316,50 @@ func TestMailbox_DrainOrReleaseFinal_SubmittedBranchClearsStaleCancelHandle(t *t
 	require.Nil(t, mb.current.cancel, "current.cancel must be cleared on the mb.submitted branch too — otherwise "+
 		"Cancel() calls the stale, already-spent PRIOR turn's cancel func instead of ever reaching the "+
 		"dispatcherCancel fallback (round 12 review, finding A)")
+}
 
-	// Confirm the ORIGINAL cancel func is genuinely unreachable now, not
-	// just that the field looks nil in this snapshot.
-	if mb.current.cancel != nil {
-		mb.current.cancel()
-	}
-	require.False(t, staleCancelCalled, "the stale pre-drain cancel func must never be invoked via mb.current.cancel again")
+// TestMailbox_DrainAfterCancel_ClearsStaleCancelHandle is the regression
+// test for round 13 review's fourth instance of the same MEDIUM-1 shape:
+// drainAfterCancel — the cancel-branch drain, called from agent.go's
+// isCancelErr block right before its own `cancel()` call — left
+// mb.current.cancel holding the just-cancelled generation's own spent
+// (but non-nil) genCtx cancel func on BOTH of its hit branches
+// (replacement and submitted), defeating Cancel()/InterruptAndReplace()'s
+// current.cancel==nil fallback gate for the window until the replacement
+// turn's own beginGeneration — arguably the worst instance of the four,
+// since this is exactly the "user already cancelled once and wants the
+// replacement instead" path.
+func TestMailbox_DrainAfterCancel_ClearsStaleCancelHandle(t *testing.T) {
+	t.Run("replacement branch", func(t *testing.T) {
+		replacement := SessionAgentCall{SessionID: "s1", Prompt: "replacement"}
+		mb := &mailbox{
+			state:       mbOwned,
+			replacement: &replacement,
+			current:     generation{id: 1, cancel: func() {}},
+		}
+
+		next, ok := mb.drainAfterCancel()
+
+		require.True(t, ok)
+		require.Equal(t, replacement, next)
+		require.Nil(t, mb.current.cancel, "current.cancel must be cleared on the replacement branch — otherwise "+
+			"Cancel()/InterruptAndReplace() call the stale, already-cancelled PRIOR generation's cancel func "+
+			"instead of ever reaching the dispatcherCancel fallback (round 13 review, fourth instance)")
+	})
+
+	t.Run("submitted branch", func(t *testing.T) {
+		queued := SessionAgentCall{SessionID: "s1", Prompt: "queued"}
+		mb := &mailbox{
+			state:     mbOwned,
+			submitted: []SessionAgentCall{queued},
+			current:   generation{id: 1, cancel: func() {}},
+		}
+
+		next, ok := mb.drainAfterCancel()
+
+		require.True(t, ok)
+		require.Equal(t, queued, next)
+		require.Nil(t, mb.current.cancel, "current.cancel must be cleared on the submitted branch too — same "+
+			"defect, same fix, mirroring the replacement branch above")
+	})
 }
