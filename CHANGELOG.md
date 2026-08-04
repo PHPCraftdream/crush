@@ -23,6 +23,25 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **Shutdown could still begin a brand-new turn, and an interrupt during
+  shutdown was reported as accepted** — a closing review of the fixes
+  below found the shutdown work only half done. Refusing to hand more
+  queued work to a turn already in progress does not stop a *new* one
+  from starting: sessions are tracked lazily, so a request for a session
+  the shutdown sweep never saw got fresh state and ran a full turn that
+  nothing would then cancel. Shutdown now refuses new work at the agent
+  level, before any session is claimed, and says so with a clear error
+  instead of silently accepting a request that could never run. An
+  interrupt arriving during shutdown likewise no longer reports success
+  for a message that will not be executed.
+
+- **A hung title could overwrite a good one, repeatedly** — a regression
+  from the title fix below. Once a stuck title attempt is abandoned, a
+  later turn generates a title normally; the abandoned attempt could then
+  finish and overwrite it with the placeholder name, which in turn made
+  the next turn try again, and so on. A late-finishing attempt now only
+  fills the title in if it is still empty.
+
 - **A delegated sub-agent could hang forever on its very first command,
   making the parent look busy while nothing happened at all** — the most
   visible bug of this round, reproduced live: a session sat in
