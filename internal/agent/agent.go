@@ -3651,15 +3651,34 @@ func (a *sessionAgent) InjectMessage(ctx context.Context, call SessionAgentCall)
 }
 
 func (a *sessionAgent) CancelAll() {
-	if !a.IsBusy() {
-		return
-	}
-	for key, mb := range a.mailboxes.Seq2() {
-		mb.mu.Lock()
-		owned := mb.state == mbOwned
-		mb.mu.Unlock()
-		if owned {
-			a.Cancel(key) // key is sessionID
+	// Latch EVERY mailbox closed FIRST, before cancelling anything (round
+	// 14 review, P0-C). Ordering is what makes the shutdown terminal: a
+	// turn cancelled below immediately runs its cancel-handling branch,
+	// and that branch drains replacement/submitted and starts the NEXT
+	// turn. With `stopped` already latched, every drain refuses instead —
+	// so no new provider request can begin while we are trying to exit.
+	//
+	// This is also why it hard-stops rather than reusing Cancel(): Cancel
+	// deliberately targets only the current generation, leaving the
+	// dispatcher (runCancel, the whole-Run() context) alive precisely so a
+	// turn loop survives to run a replacement. Shutdown needs the opposite,
+	// so hardStop hands back the DISPATCHER cancel too and we fire it.
+	//
+	// Latching is unconditional rather than gated on the mailbox currently
+	// being owned: a Run() sitting between turns, or one that reaches its
+	// drain in the window between this sweep and process exit, must be
+	// refused as well.
+	for _, mb := range a.mailboxes.Seq2() {
+		dispatcherCancel, genCancel := mb.hardStop()
+		// Generation first, then dispatcher: the generation cancel is what
+		// promptly unblocks an in-flight provider stream, and cancelling
+		// the dispatcher afterwards tears down the Run() that owns it.
+		// Both are invoked outside mb.mu — hardStop has already returned.
+		if genCancel != nil {
+			genCancel()
+		}
+		if dispatcherCancel != nil {
+			dispatcherCancel()
 		}
 	}
 	// Legacy "-summarize" cancel slot isn't tracked by the mailbox (design

@@ -122,6 +122,56 @@ type mailbox struct {
 	// ended and moved on (a concurrent submit became the new owner) or
 	// because it never held ownership in the first place.
 	epoch uint64
+
+	// stopped is the one-way hard-stop latch set by hardStop (process
+	// shutdown / CancelAll). Once set, every "keep running" branch of every
+	// drain refuses to hand work back to a turn loop, so a cancelled turn
+	// can no longer pull the NEXT queued call in and start a fresh provider
+	// request while the process is trying to exit.
+	//
+	// Round 14 review, P0-C: CancelAll used to call the ordinary
+	// Cancel(sessionID), which cancels only the CURRENT generation. The
+	// cancel-error branch in runTurn then immediately drained
+	// replacement/submitted and looped into the next turn — on a runCtx
+	// that was never cancelled, since Cancel deliberately does not touch
+	// dispatcherCancel. Shutdown therefore did the opposite of stopping:
+	// it cancelled turn N and started turn N+1, and App.Shutdown's bounded
+	// wait then tore the DB down underneath a still-running agent.
+	//
+	// Deliberately one-way (never cleared): a mailbox that has been
+	// hard-stopped belongs to a process that is exiting. Mailboxes are
+	// per-process, so there is nothing to reset it for.
+	stopped bool
+}
+
+// hardStop implements the shutdown half of P0-C: it latches the mailbox
+// closed and returns the dispatcher cancel (the DURABLE, whole-Run()
+// CancelFunc) plus the current generation's cancel, for the caller to
+// invoke outside mb.mu.
+//
+// Unlike Cancel/interruptAndReplace — which deliberately target only the
+// current generation so a turn loop survives to run the replacement —
+// this is the operation that must actually END the dispatcher: cancelling
+// dispatcherCancel unwinds Run() itself, and `stopped` guarantees that on
+// the way out no drain hands it another call to run.
+//
+// Anything still queued is deliberately left in place rather than
+// discarded. It is already persisted as user messages, and a future
+// process that opens this session picks it up through the normal
+// queue-drain path; throwing it away here would turn "you shut down
+// mid-queue" into silent data loss.
+func (mb *mailbox) hardStop() (dispatcherCancel, genCancel context.CancelFunc) {
+	mb.mu.Lock()
+	defer mb.mu.Unlock()
+	mb.stopped = true
+	return mb.dispatcherCancel, mb.current.cancel
+}
+
+// isStopped reports whether hardStop has latched this mailbox closed.
+func (mb *mailbox) isStopped() bool {
+	mb.mu.Lock()
+	defer mb.mu.Unlock()
+	return mb.stopped
 }
 
 // submit implements design §3: replaces both tryReserveSession +
@@ -304,6 +354,19 @@ func (mb *mailbox) drainOrReleaseFinal(
 
 	if mb.epoch != epoch {
 		return SessionAgentCall{}, false, nil
+	}
+	// Hard-stopped (P0-C): end the era rather than continuing into another
+	// turn. Fall through to the release path below so the OS lock is still
+	// released and the mailbox still lands on mbIdle — a shutdown must not
+	// leave the session marked busy with the lock held.
+	if mb.stopped {
+		if release != nil {
+			releaseErr = release()
+		}
+		mb.state = mbIdle
+		mb.current.cancel = nil
+		mb.dispatcherCancel = nil
+		return SessionAgentCall{}, false, releaseErr
 	}
 	// Seam for deterministic test interleaving: fires right after the epoch check,
 	// before ANY queue (replacement, submitted, legacy) is consulted — this is the
@@ -503,6 +566,15 @@ func (mb *mailbox) interruptAndReplace(call SessionAgentCall) (context.CancelFun
 func (mb *mailbox) drainAfterCancel() (SessionAgentCall, bool) {
 	mb.mu.Lock()
 	defer mb.mu.Unlock()
+
+	// Hard-stopped (P0-C): the process is shutting down, so refuse to hand
+	// the turn loop another call. This is THE branch that made CancelAll
+	// start turn N+1 instead of stopping — it runs immediately after the
+	// cancel CancelAll itself caused. Queued work is left in place, not
+	// discarded: it is already persisted, and a future process picks it up.
+	if mb.stopped {
+		return SessionAgentCall{}, false
+	}
 
 	// Both hit branches below clear mb.current.cancel (round 13 review,
 	// the fourth instance of the same shape rounds 11/12 already fixed on
