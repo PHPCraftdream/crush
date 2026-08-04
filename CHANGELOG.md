@@ -563,15 +563,15 @@ lower-severity issues, closed the same way:
 - Two classes of this batch's own regression tests were themselves flaky
   under `-race` load; both are now deterministic. The PID-fallback
   boundary tests across `sessions_list_test.go`, `sessions_watch_test.go`,
-  `sessions_why_test.go`, `stream_watchdog_test.go`, and
-  `internal/session/lock_test.go` used a 1-second timing margin around
-  `MaxPidFallbackAge` that was too tight under load; widened to 2 minutes.
-  A separate stream-watchdog test whose 100ms timing budget went stale
-  once its diagnostic capture became synchronous by design now uses a
-  direct file-presence check instead of a timing budget that a widened
-  timeout would have made unable to catch its own regression. Also fixed a
-  read-before-write race in the same watchdog test (polled for a dump
-  file's existence rather than its content, occasionally reading it
+  `sessions_why_test.go`, and `internal/session/lock_test.go` used a
+  1-second timing margin around `MaxPidFallbackAge` that was too tight
+  under load; widened to 2 minutes. A separate test in
+  `internal/agent/stream_watchdog_test.go` — whose 100ms timing budget went
+  stale once its diagnostic capture became synchronous by design — now
+  uses a direct file-presence check instead of a timing budget that a
+  widened timeout would have made unable to catch its own regression. Also
+  fixed a read-before-write race in that same watchdog test (polled for a
+  dump file's existence rather than its content, occasionally reading it
   mid-write) and made a probabilistic ENOENT-race regression test
   deterministic via a test-only hook instead of a goroutine race that could
   pass even against a reverted fix.
