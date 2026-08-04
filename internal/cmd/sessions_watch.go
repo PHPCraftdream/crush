@@ -140,16 +140,12 @@ func liveTailSession(ctx context.Context, a *app.App, sessionID, dataDir string,
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	// Sub-agent pulse throttling: the live-tail only sees the TOP-LEVEL
-	// session's message rows, so an in-flight `agent` delegation (which
-	// writes to a child session) would otherwise make watch look frozen for
-	// minutes. We emit a "sub-agent active …" heartbeat line at most every
-	// subAgentPulseEvery, and only when there were no new top-level messages
-	// this tick (so it never crowds out real output), and only when the note
-	// actually changed (so a stuck sub-agent doesn't spam identical lines).
-	const subAgentPulseEvery = 5 * time.Second
-	var lastSubAgentPulse time.Time
-	var lastSubAgentNote string
+	// Per-session "last message printed" cursor for every in-flight
+	// sub-agent delegation this watch has followed so far, keyed by child
+	// session id. Lets printNewMessagesSince (below) resume each child
+	// stream independently across ticks, the same way lastPrinted does for
+	// the top-level session.
+	subAgentLastPrinted := map[string]string{}
 
 	// Resume-race guard state — see decideWatchExit. watchStart anchors the
 	// grace window; sawLiveLock records whether this watch has ever seen the
@@ -222,7 +218,6 @@ func liveTailSession(ctx context.Context, a *app.App, sessionID, dataDir string,
 		if lastPrinted != "" {
 			anchor = findByID(msgs, lastPrinted)
 		}
-		printedThisTick := false
 		for i := range msgs {
 			if msgs[i].ID == lastPrinted {
 				continue
@@ -230,25 +225,95 @@ func liveTailSession(ctx context.Context, a *app.App, sessionID, dataDir string,
 			if lastPrinted == "" || isAfter(&msgs[i], anchor) {
 				printMessageWithTime(os.Stdout, msgs[i], "text", tickNow, callCtx, i < len(msgs)-1)
 				lastPrinted = msgs[i].ID
-				printedThisTick = true
 			}
 		}
 
-		// When the top-level stream is quiet, show the sub-agent pulse so the
-		// operator can tell a live delegation from a hang. Baseline = the
-		// newest top-level message time (or session created time as a floor)
-		// so the note only fires while a CHILD session is the fresher edge.
-		if !printedThisTick {
-			baseline := newestMessageUnix(msgs)
-			if note := subAgentActivityNote(ctx, a, sessionID, baseline, tickNow); note != "" {
-				if note != lastSubAgentNote || tickNow.Sub(lastSubAgentPulse) >= subAgentPulseEvery {
-					fmt.Fprintf(os.Stdout, "[%s] %s\n\n", tickNow.Format("2006-01-02 15:04:05"), note)
-					lastSubAgentPulse = tickNow
-					lastSubAgentNote = note
-				}
-			}
+		// Live-tail whichever descendant session is currently the freshest
+		// edge of work — i.e. an in-flight `agent` delegation — the SAME way
+		// the top-level session's own messages are shown above: real tool
+		// calls/results as they land, not a synthetic timer-driven pulse.
+		//
+		// This replaces the old "sub-agent active: activity Ns ago" line,
+		// which ticked (and printed) on every poll interval regardless of
+		// whether the sub-agent had actually done anything — the embedded
+		// age string changed every second, so the "only when the note
+		// changed" throttle never actually throttled anything. Printing
+		// real messages instead is naturally event-driven: nothing new in
+		// the child session means nothing is printed, tool-call-quiet
+		// periods produce no output at all, matching how the top-level
+		// stream already behaves.
+		if act := computeCallTreeActivity(ctx, a, sessionID); act.SubAgentActive && act.DeepestSessionID != "" {
+			printNewMessagesSince(subAgentWriter(os.Stdout, act.DeepestSessionID), ctx, a, act.DeepestSessionID, subAgentLastPrinted, tickNow)
 		}
 	}
+}
+
+// printNewMessagesSince prints every message in sessionID newer than
+// lastPrinted[sessionID] to w, using the same rendering
+// (printMessageWithTime) the top-level live-tail stream uses. When the
+// session has never been seen before (no entry in lastPrinted yet), its
+// ENTIRE history so far is printed — mirroring the backfill
+// liveTailSession does for the root session before entering its poll loop
+// — so a delegation already in progress when watch starts (or first
+// notices it) is shown from the beginning, not just from this tick
+// forward. Updates lastPrinted in place and reports whether anything was
+// printed.
+func printNewMessagesSince(w io.Writer, ctx context.Context, a *app.App, sessionID string, lastPrinted map[string]string, now time.Time) bool {
+	msgs, err := a.Messages.List(ctx, sessionID)
+	if err != nil || len(msgs) == 0 {
+		return false
+	}
+	callCtx := buildToolCallContext(msgs)
+	last := lastPrinted[sessionID]
+	var anchor *message.Message
+	if last != "" {
+		anchor = findByID(msgs, last)
+	}
+	printed := false
+	for i := range msgs {
+		if msgs[i].ID == last {
+			continue
+		}
+		if last == "" || isAfter(&msgs[i], anchor) {
+			printMessageWithTime(w, msgs[i], "text", now, callCtx, i < len(msgs)-1)
+			lastPrinted[sessionID] = msgs[i].ID
+			printed = true
+		}
+	}
+	return printed
+}
+
+// subAgentWriter wraps w so every line written to it is prefixed with a
+// short tag naming the delegated child session — otherwise a sub-agent's
+// "[tool: bash] …" output would be visually indistinguishable from the
+// top-level session's own tool calls in the same stream.
+func subAgentWriter(w io.Writer, childSessionID string) io.Writer {
+	return &prefixWriter{w: w, prefix: "  [sub-agent " + short(session.HashID(childSessionID)) + "] "}
+}
+
+// prefixWriter prepends prefix to every line written through it. Used to
+// visually nest a sub-agent delegation's live-tail output under the
+// top-level session's own stream.
+type prefixWriter struct {
+	w      io.Writer
+	prefix string
+}
+
+func (p *prefixWriter) Write(b []byte) (int, error) {
+	s := string(b)
+	// strings.Split on a trailing "\n" produces a final empty element —
+	// skip it so we don't emit a bare prefix-only line after the last
+	// real one.
+	lines := strings.Split(s, "\n")
+	if len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	for _, line := range lines {
+		if _, err := fmt.Fprintf(p.w, "%s%s\n", p.prefix, line); err != nil {
+			return 0, err
+		}
+	}
+	return len(b), nil
 }
 
 // newestMessageUnix returns the newest activity timestamp among a session's
