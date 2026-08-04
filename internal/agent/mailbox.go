@@ -88,10 +88,16 @@ type mailbox struct {
 	// observed mb.submitted empty but BEFORE it flips state to mbIdle — i.e.
 	// exactly inside the critical section that used to NOT exist as a single
 	// atomic unit before this migration (see drainOrRelease's doc and design
-	// §3). It exists solely so a test can deterministically land a
-	// concurrent submit() call inside that instant: since mu is still held
-	// by drainOrRelease while testDrainSeam runs, a concurrent submit()
-	// blocks on mu.Lock() until testDrainSeam returns, making the
+	// §3). drainOrReleaseFinal (round 11 review, HIGH-1) calls it at the
+	// analogous point too — after mb.submitted is observed empty but BEFORE
+	// checkLegacy runs, i.e. before EITHER a legacy-queue reclaim or the
+	// final release/idle-flip decision is made; run_reclaim_cancel_test.go
+	// relies on this exact position to land a real sa.Cancel call inside
+	// the reclaim window. It exists solely so a test can deterministically
+	// land a concurrent submit() call (or, via drainOrReleaseFinal, a
+	// concurrent Cancel/InterruptAndReplace call) inside that instant: since
+	// mu is still held while testDrainSeam runs, a concurrent caller needing
+	// mu blocks on mu.Lock() until testDrainSeam returns, making the
 	// interleaving reproducible on every run instead of relying on
 	// goroutine-scheduling luck. nil in all non-test construction paths
 	// (the zero value of mailbox), so it changes no production behavior —
@@ -244,6 +250,29 @@ func (mb *mailbox) drainOrRelease(epoch uint64) (SessionAgentCall, bool) {
 // releasing-then-reacquiring (which would open a real cross-process race:
 // see the historical reclaimSameEra doc, superseded by this function, for
 // why that shape is rejected).
+//
+// Two accepted trade-offs from round 12 review, recorded here rather than
+// left implicit:
+//   - The OS lock hand-off point moved earlier than it used to be: before
+//     this function existed, the lock stayed held through the REST of
+//     runTurn's own deferred cleanup (stream watchdog stop, waiting on the
+//     title-generation goroutine) and Run's own trailing defers. Now it is
+//     released the instant both queues are confirmed empty, so a title
+//     rename (sessions.Rename, including its context.WithoutCancel fallback)
+//     or a final cost increment can still be in flight AFTER a different
+//     process has already acquired the lock for the same session. Both
+//     writes are narrowly-scoped, additive/idempotent SQL updates (not
+//     read-modify-write on shared state), so the worst case is a cosmetic
+//     title race, not data loss — but it is a real, deliberate narrowing of
+//     what the OS lock's hold-time used to cover.
+//   - release() (a real syscall: unlock, close, and — via
+//     session.SessionLock.Release — a metadata truncate/remove) now runs
+//     WHILE mb.mu is held, so disk I/O briefly blocks every other in-process
+//     reader of this mailbox (IsSessionBusy, IsBusy, CancelAll, Cancel,
+//     QueuedPrompts) for that session. This is required for the atomicity
+//     HIGH-1 depends on (see above) and is expected to be very fast in
+//     practice, but it is a genuinely new coupling between mailbox-state
+//     reads and disk latency that didn't exist before this function.
 func (mb *mailbox) drainOrReleaseFinal(
 	epoch uint64,
 	checkLegacy func() (SessionAgentCall, bool),
@@ -259,6 +288,21 @@ func (mb *mailbox) drainOrReleaseFinal(
 	if len(mb.submitted) > 0 {
 		next := mb.submitted[0]
 		mb.submitted = mb.submitted[1:]
+		// mb.current.cancel must be cleared here too (round 12 review,
+		// finding A — the SAME MEDIUM-1 shape as the checkLegacy branch
+		// below, just on the more commonly hit mb.submitted path): by the
+		// time this branch runs, it still holds the JUST-FINISHED turn's
+		// own genCtx cancel — already invoked once via runTurn's
+		// unconditional `cancel()` call right before this drain — inert but
+		// NOT nil, which defeats Cancel()/InterruptAndReplace()'s
+		// current.cancel==nil fallback gate exactly like the original
+		// defect, for the whole window until the next turn's own
+		// beginGeneration (which can be as long as title generation takes).
+		// dispatcherCancel is left untouched here (unlike the release
+		// branch below): it's already the live runCancel from submit()/the
+		// loop's own re-arm, still valid for the caller's own remaining
+		// lifetime — nothing to reset.
+		mb.current.cancel = nil
 		return next, true, nil // caller runs another turn; state stays mbOwned, lock stays held
 	}
 	if mb.testDrainSeam != nil {
@@ -271,6 +315,21 @@ func (mb *mailbox) drainOrReleaseFinal(
 			// stays mbOwned) but done here, still under mb.mu, instead of via
 			// a separate release-then-reclaim round trip: the OS lock is
 			// simply never released for this handoff.
+			// mb.state is set explicitly here (round 12 review, finding C),
+			// even though it's already mbOwned on every path that can reach
+			// this line today (this function has exactly one call site per
+			// era). The old reclaimSameEra both checked AND set state for
+			// exactly this reason: relying on an invariant that isn't
+			// locally re-asserted is fragile — epoch is not bumped by
+			// release, so "epoch matches && state == mbIdle" is a reachable
+			// combination in general (it's what the release branch below
+			// produces), and a future second call site for this function
+			// (e.g. once #281/#284/#285 finish the mailbox migration) could
+			// plausibly land here with state already mbIdle, silently
+			// granting two owners of the same session with the OS lock
+			// already released. Setting it explicitly costs nothing today
+			// and removes that whole class of future mistake.
+			mb.state = mbOwned
 			mb.dispatcherCancel = reclaimDispatcherCancel
 			// mb.current.cancel must ALSO be cleared here (round 11 review,
 			// MEDIUM-1 — caught by this fix's own regression test failing

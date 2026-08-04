@@ -215,10 +215,11 @@ func TestMailbox_DrainOrReleaseFinal_LegacyReclaimNeverReleasesLock(t *testing.T
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = lk.Release() })
 
+	var staleDispatcherCancelCalled bool
 	mb := &mailbox{
 		state:            mbOwned,
 		epoch:            1,
-		dispatcherCancel: func() {},
+		dispatcherCancel: func() { staleDispatcherCancelCalled = true },
 		current:          generation{id: 1, cancel: func() {}},
 	}
 
@@ -229,7 +230,8 @@ func TestMailbox_DrainOrReleaseFinal_LegacyReclaimNeverReleasesLock(t *testing.T
 		releaseCalled = true
 		return lk.Release()
 	}
-	newDispatcherCancel := func() {}
+	var newDispatcherCancelCalled bool
+	newDispatcherCancel := func() { newDispatcherCancelCalled = true }
 
 	next, hasNext, releaseErr := mb.drainOrReleaseFinal(1, checkLegacy, newDispatcherCancel, release)
 
@@ -251,6 +253,16 @@ func TestMailbox_DrainOrReleaseFinal_LegacyReclaimNeverReleasesLock(t *testing.T
 	// TestRun_CancelDuringLegacyReclaimWindow_ActuallyCancelsTurn2, initially
 	// caught: dispatcherCancel alone was not sufficient).
 	require.NotNil(t, mb.dispatcherCancel, "dispatcherCancel must be populated on reclaim, not left nil")
+	// Identity check, not just non-nil (round 12 review, finding B): the
+	// fixture's OWN initial dispatcherCancel was also a non-nil func, so a
+	// bare NotNil check would pass even if drainOrReleaseFinal silently
+	// failed to overwrite it with the freshly-passed reclaim cancel. Calling
+	// the field's CURRENT value must invoke the NEW closure, not the stale
+	// fixture one.
+	mb.dispatcherCancel()
+	require.True(t, newDispatcherCancelCalled, "dispatcherCancel must be the freshly-passed reclaim cancel, not left "+
+		"at whatever the mailbox held before this call")
+	require.False(t, staleDispatcherCancelCalled, "the stale, pre-reclaim dispatcherCancel must not still be reachable")
 	require.Nil(t, mb.current.cancel, "current.cancel must be cleared on reclaim — otherwise Cancel() calls the "+
 		"stale, already-spent PRIOR turn's cancel func instead of ever reaching the dispatcherCancel fallback")
 	require.Equal(t, uint64(1), mb.current.id, "current.id must be preserved (monotonic) even though its cancel is cleared")
@@ -259,4 +271,57 @@ func TestMailbox_DrainOrReleaseFinal_LegacyReclaimNeverReleasesLock(t *testing.T
 	// attempt must fail.
 	_, lockErr := session.TryAcquireSessionLock(dataDir, sessionID)
 	require.Error(t, lockErr, "the OS lock must remain held across a legacy-queue reclaim")
+}
+
+// TestMailbox_DrainOrReleaseFinal_SubmittedBranchClearsStaleCancelHandle is
+// the regression test for round 12 review, finding A: the SAME MEDIUM-1
+// shape as TestMailbox_DrainOrReleaseFinal_LegacyReclaimNeverReleasesLock
+// above, but on drainOrReleaseFinal's OTHER "keep running" branch — the
+// mb.submitted queue, populated by the CURRENT (non-legacy) submit() path,
+// hit far more often in practice than the legacy-messageQueue fallback.
+//
+// By the time this branch runs, mb.current.cancel still holds the
+// just-finished turn's own genCtx cancel func — already invoked once via
+// runTurn's unconditional `cancel()` call immediately before the drain
+// (agent.go, right before drainOrReleaseMerged) — inert but NOT nil. Left
+// untouched, it defeats Cancel()/InterruptAndReplace()'s
+// `current.cancel == nil` fallback gate exactly like the original MEDIUM-1
+// defect, for the whole window until the NEXT turn's own beginGeneration
+// (which can be as long as title generation takes — several seconds).
+//
+// Caught by round 12's independent review; confirmed by this session via
+// direct code read (mb.submitted branch returned without touching
+// mb.current.cancel at all) before landing the one-line fix.
+func TestMailbox_DrainOrReleaseFinal_SubmittedBranchClearsStaleCancelHandle(t *testing.T) {
+	var staleCancelCalled bool
+	queued := SessionAgentCall{SessionID: "s1", Prompt: "queued via submit()"}
+	mb := &mailbox{
+		state:            mbOwned,
+		epoch:            1,
+		dispatcherCancel: func() {},
+		current:          generation{id: 1, cancel: func() { staleCancelCalled = true }},
+		submitted:        []SessionAgentCall{queued},
+	}
+
+	next, hasNext, releaseErr := mb.drainOrReleaseFinal(1, nil, nil, nil)
+
+	require.True(t, hasNext)
+	require.Equal(t, queued, next)
+	require.NoError(t, releaseErr)
+	require.Equal(t, mbOwned, mb.state, "state must stay owned when mb.submitted has a queued call")
+	require.Empty(t, mb.submitted, "the popped call must be removed from the queue")
+
+	// THE core finding-A assertion: current.cancel must be cleared so
+	// Cancel()'s fallback to dispatcherCancel actually fires, instead of
+	// silently invoking the just-finished turn's spent, harmless cancel.
+	require.Nil(t, mb.current.cancel, "current.cancel must be cleared on the mb.submitted branch too — otherwise "+
+		"Cancel() calls the stale, already-spent PRIOR turn's cancel func instead of ever reaching the "+
+		"dispatcherCancel fallback (round 12 review, finding A)")
+
+	// Confirm the ORIGINAL cancel func is genuinely unreachable now, not
+	// just that the field looks nil in this snapshot.
+	if mb.current.cancel != nil {
+		mb.current.cancel()
+	}
+	require.False(t, staleCancelCalled, "the stale pre-drain cancel func must never be invoked via mb.current.cancel again")
 }
