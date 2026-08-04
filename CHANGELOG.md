@@ -23,6 +23,29 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **A same-process concurrent send landing right as a turn finished could
+  get a spurious "session already in use" error and be silently dropped,
+  and an interrupt/cancel landing in the legacy-queue reclaim window could
+  silently do nothing** — a third independent review of the mailbox
+  migration (following the two fixes above) found no remaining bugs
+  inside the mailbox's own state machine, but found two narrower defects
+  at the seam between the mailbox and the OS-level session lock/cancel
+  lifecycle. The end-of-turn drain used to flip the mailbox to "idle"
+  well before the OS-level session lock was actually released (only once
+  the whole call unwound, including up to several seconds waiting on
+  title generation) — so a second call for the same session could
+  legitimately see "not busy," try to start, and hit "already in use"
+  from its own process's not-yet-finished prior turn, with the message
+  lost rather than requeued. Fixed by releasing the OS lock and flipping
+  the mailbox to idle as one atomic step, so "not busy" now always means
+  the lock is genuinely free. Separately, reclaiming ownership from the
+  legacy message queue left both of the mailbox's cancel handles pointing
+  at nothing usable until the reclaimed turn got underway — a Cancel or
+  interrupt landing in that narrow window silently did nothing (an
+  interrupt-and-replace even reported success while cancelling nothing).
+  Fixed by restoring a working cancel handle at the same moment ownership
+  is reclaimed.
+
 - **A message queued via the legacy path could still permanently wedge a
   session busy, and a message dropped on turn error was lost instead of
   retried** — two narrower follow-ups to the P0-2/P0-3 mailbox-migration
