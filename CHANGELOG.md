@@ -540,7 +540,16 @@ lower-severity issues, closed the same way:
   alive" when that PID was, in fact, genuinely alive (just untrusted due to
   lock age). `sessions why` now gives that case its own accurate wording
   ("no longer trustworthy — likely OS PID reuse") instead of reusing the
-  genuinely-dead-PID phrasing.
+  genuinely-dead-PID phrasing. Two more review passes caught the reason
+  text still wrong on both sides of that fix: the age-bound branch printed
+  "likely OS PID reuse" unconditionally, even for the dominant case of a
+  lock whose recorded PID is genuinely dead (now checks `IsProcessAlive`
+  and only claims reuse when the PID is actually confirmed alive, and now
+  also prints the lock's real age alongside the bound threshold), and the
+  separate unreadable-PID case (`pid <= 0`, normal on Windows, but here
+  combined with a stale heartbeat) claimed a fictional "holder PID 0 is
+  not alive" — it now cites the real evidence, a stale heartbeat, instead
+  of a PID that was never actually read.
 - De-duplicated four independently-hardcoded copies of the
   "Stream stalled" finish-title string in internal/agent (the retry
   logic's own constant, the watchdog's actual production value, and

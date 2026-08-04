@@ -247,6 +247,14 @@ func TestExplainSessionStatus_Running_PIDUnreadableFreshHeartbeat(t *testing.T) 
 // TestExplainSessionStatus_Crashed_PIDUnreadableStaleHeartbeat: pid=0 AND a
 // stale heartbeat (old mtime) must still report "crashed" — the heartbeat
 // fallback only rescues genuinely fresh locks, not abandoned ones.
+//
+// Task #258: pid=0 means the PID sidecar was never readable in the first
+// place (normal on Windows while a holder is alive — but here the
+// heartbeat is ALSO stale, so no live holder is claiming it). The old
+// reason text said `holder PID 0 is not alive`, which falsely implies PID 0
+// was ever a real holder. The real evidence is the stale heartbeat, so the
+// output must reference that instead and must not name a fictional "PID 0"
+// holder.
 func TestExplainSessionStatus_Crashed_PIDUnreadableStaleHeartbeat(t *testing.T) {
 	t.Parallel()
 
@@ -268,6 +276,10 @@ func TestExplainSessionStatus_Crashed_PIDUnreadableStaleHeartbeat(t *testing.T) 
 
 	out := buf.String()
 	require.Contains(t, out, "status: crashed")
+	require.NotContains(t, out, "PID 0",
+		"pid=0 means the PID was never readable, not that a real holder named PID 0 was confirmed dead — the reason text must not invent a fictional PID 0 holder (task #258)")
+	require.Contains(t, out, "heartbeat is stale",
+		"the real evidence for this branch is the stale heartbeat, not a PID read — the reason text must say so explicitly (task #258)")
 }
 
 // TestExplainSessionStatus_ErrorFinishSurfacesErrorText: when the last
@@ -359,6 +371,54 @@ func TestExplainSessionStatus_PidReuseBeyondMaxFallbackAgeIsNotRunning(t *testin
 		"the bound-triggered reason must explain the recorded PID is untrusted due to age/PID reuse — not claim it is dead")
 	require.NotContains(t, out, "is not alive",
 		"the recorded PID is factually alive in this scenario (OS reuse, via spawnKillTestLockHolder) — claiming 'is not alive' would be the same factual lie task #250's verdict fix was meant to remove, relocated to the reason text (#256)")
+	require.Contains(t, out, formatDurationShort(session.MaxPidFallbackAge),
+		"the reuse reason must still show the bound threshold")
+	require.Contains(t, out, "lock is",
+		"the reuse reason must ALSO show the lock's actual age, not just the bound threshold, so the operator can see both numbers (task #257 review nit)")
+}
+
+// TestExplainSessionStatus_PidBoundExceededGenuinelyDeadIsNotAlive is the
+// regression test for task #257: the age-bound branch (pidBoundExceeded)
+// used to ALWAYS print the "likely OS PID reuse" wording, even though it
+// never actually checked whether the recorded PID was still alive. That
+// made the reuse phrasing print for the dominant real-world case too — a
+// session that crashed hours ago, whose PID is genuinely dead, not reused.
+// This test uses a PID number that is guaranteed not to belong to any
+// process (same convention as TestExplainSessionStatus_Crashed_NoCleanFinish),
+// combined with a lock mtime old enough to exceed MaxPidFallbackAge, and
+// asserts the output uses the plain "is not alive" phrasing, NOT the
+// PID-reuse phrasing — the mirror image of
+// TestExplainSessionStatus_PidReuseBeyondMaxFallbackAgeIsNotRunning above,
+// which covers the genuinely-alive-but-reused case.
+func TestExplainSessionStatus_PidBoundExceededGenuinelyDeadIsNotAlive(t *testing.T) {
+	t.Parallel()
+
+	conn, q := newTestDB(t)
+	s := session.NewService(q, conn)
+	m := message.NewService(q)
+
+	sess, err := s.Create(context.Background(), "why-status-pid-bound-genuinely-dead")
+	require.NoError(t, err)
+
+	// PID 999999 is guaranteed not to be a live process on any platform.
+	dataDir := writeLockFile(t, sess.ID, 999999)
+	lockPath := filepath.Join(dataDir, "locks", "session-"+sanitiseSessionIDForFilename(sess.ID)+".lock")
+	staleTime := time.Now().Add(-(session.MaxPidFallbackAge + 5*time.Second))
+	require.NoError(t, os.Chtimes(lockPath, staleTime, staleTime),
+		"back-dating mtime past MaxPidFallbackAge so this hits the same pidBoundExceeded branch as the reuse test, but with a genuinely dead PID this time")
+
+	a := &app.App{Messages: m, Sessions: s}
+	var buf bytes.Buffer
+	require.NoError(t, explainSessionStatus(context.Background(), a, dataDir, sess.ID, &buf))
+
+	out := buf.String()
+	require.Contains(t, out, "status: crashed")
+	require.Contains(t, out, "is not alive",
+		"the recorded PID is genuinely dead here (999999, not a real process) — the reason text must use the plain dead-PID phrasing, not speculate about OS PID reuse (task #257)")
+	require.NotContains(t, out, "no longer trustworthy",
+		"a genuinely dead PID is not a reuse scenario — the age-bound branch must not claim it might be a different live process just because the lock is old (task #257)")
+	require.NotContains(t, out, "OS PID reuse",
+		"same as above: the PID-reuse wording must be reserved for the case where IsProcessAlive actually confirms the recorded PID is currently alive (task #257)")
 }
 
 // TestExplainSessionStatus_PidAliveWithinMaxFallbackAgeIsRunning is the
