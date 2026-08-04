@@ -26,10 +26,11 @@ import (
 
 // mockSessionAgent is a minimal mock for the SessionAgent interface.
 type mockSessionAgent struct {
-	model       Model
-	runFunc     func(ctx context.Context, call SessionAgentCall) (*fantasy.AgentResult, error)
-	cancelled   []string
-	queuedCalls []SessionAgentCall
+	model                Model
+	runFunc              func(ctx context.Context, call SessionAgentCall) (*fantasy.AgentResult, error)
+	cancelled            []string
+	queuedCalls          []SessionAgentCall
+	interruptAndReplaced []SessionAgentCall
 }
 
 func (m *mockSessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy.AgentResult, error) {
@@ -51,6 +52,10 @@ func (m *mockSessionAgent) QueuedPromptsList(sessionID string) []string { return
 func (m *mockSessionAgent) ClearQueue(sessionID string)                 {}
 func (m *mockSessionAgent) QueueMessage(call SessionAgentCall) {
 	m.queuedCalls = append(m.queuedCalls, call)
+}
+func (m *mockSessionAgent) InterruptAndReplace(_ string, call SessionAgentCall) bool {
+	m.interruptAndReplaced = append(m.interruptAndReplaced, call)
+	return true
 }
 
 func (m *mockSessionAgent) InjectMessage(_ context.Context, call SessionAgentCall) (message.Message, error) {
@@ -1591,12 +1596,21 @@ func TestHandleInterruptTick(t *testing.T) {
 		require.NoError(t, err)
 		assert.True(t, fired)
 
-		require.Len(t, agent.queuedCalls, 1)
-		q := agent.queuedCalls[0]
+		// requeueInterruptMessage now routes through InterruptAndReplace
+		// (design §4 / P0-2): the old QueueMessage-then-Cancel two-step
+		// deterministically wiped its own queued message, because Cancel
+		// cleared the queue. The mock's InterruptAndReplace reports it
+		// interrupted a live turn, so the QueueMessage fallback — which
+		// only covers the idle-session case — must not fire, and no
+		// separate Cancel is issued (InterruptAndReplace cancels the
+		// in-flight generation itself, atomically with recording the
+		// replacement).
+		require.Len(t, agent.interruptAndReplaced, 1)
+		q := agent.interruptAndReplaced[0]
 		assert.Equal(t, msg.ID, q.ExistingMessageID, "must reference existing message, not create a new one")
 		assert.Equal(t, "stop and do X", q.Prompt)
-		require.Len(t, agent.cancelled, 1)
-		assert.Equal(t, sess.ID, agent.cancelled[0])
+		assert.Empty(t, agent.queuedCalls, "must not fall back to QueueMessage when a live turn was interrupted")
+		assert.Empty(t, agent.cancelled, "InterruptAndReplace cancels the generation itself — no separate Cancel call")
 
 		// No new user message row was created — history still holds exactly
 		// the one the CLI created.
@@ -1615,9 +1629,11 @@ func TestHandleInterruptTick(t *testing.T) {
 		fired, err := coord.handleInterruptTick(ctx, sess.ID)
 		require.NoError(t, err)
 		assert.False(t, fired)
-		// No additional queue/cancel activity.
-		assert.Len(t, agent.queuedCalls, 1)
-		assert.Len(t, agent.cancelled, 1)
+		// No ADDITIONAL interrupt activity beyond the one the previous
+		// subtest already recorded.
+		assert.Len(t, agent.interruptAndReplaced, 1)
+		assert.Empty(t, agent.queuedCalls)
+		assert.Empty(t, agent.cancelled)
 	})
 }
 

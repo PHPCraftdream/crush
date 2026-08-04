@@ -2021,8 +2021,11 @@ func (c *coordinator) requeueInterruptMessage(ctx context.Context, sessionID, me
 	}
 	// Reference the existing row; the agent must not re-create it.
 	call.ExistingMessageID = messageID
-	c.currentAgent.QueueMessage(call)
-	c.currentAgent.Cancel(sessionID)
+	// InterruptAndReplace atomically records call and cancels only the
+	// in-flight generation (design §4) — same P0-2 fix as InterruptAndSend.
+	if !c.currentAgent.InterruptAndReplace(sessionID, call) {
+		c.currentAgent.QueueMessage(call)
+	}
 
 	// The row was created by a foreign process (`crush sessions inject`), so
 	// its Create() never published through this process's message broker.
@@ -2050,8 +2053,16 @@ func (c *coordinator) InterruptAndSend(ctx context.Context, sessionID, prompt st
 	if err != nil {
 		return err
 	}
-	c.currentAgent.QueueMessage(call)
-	c.currentAgent.Cancel(sessionID)
+	// InterruptAndReplace atomically records call as the replacement the
+	// current owner runs next and cancels only the in-flight generation
+	// (design §4) — replacing the QueueMessage+Cancel two-step that P0-2
+	// made self-defeating (Cancel deterministically wiped what QueueMessage
+	// just queued). When the session is idle there is nothing to interrupt;
+	// fall back to the legacy queue so the next Run()'s drain picks the call
+	// up (same observable behavior as before for that case).
+	if !c.currentAgent.InterruptAndReplace(sessionID, call) {
+		c.currentAgent.QueueMessage(call)
+	}
 	return nil
 }
 

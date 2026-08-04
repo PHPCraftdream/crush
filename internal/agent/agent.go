@@ -287,6 +287,13 @@ type SessionAgent interface {
 	// server: the caller queues, then Cancel()s the running turn, and the
 	// in-flight Run() drains the queue from its cancel-handling branch.
 	QueueMessage(call SessionAgentCall)
+	// InterruptAndReplace atomically records call as the replacement the
+	// current owner runs next and cancels only the in-flight generation
+	// (design §4). Replaces the QueueMessage+Cancel two-step that
+	// deterministically wiped its own queued message (P0-2). Returns true
+	// when a turn was actually interrupted; false when the session was idle
+	// (the caller should then queue the call for the next Run itself).
+	InterruptAndReplace(sessionID string, call SessionAgentCall) bool
 	// InjectMessage persists `call` as a regular user message in the DB
 	// immediately (so the UI sees it the moment the operator clicks Inject)
 	// AND — if the session is currently running — schedules the message to
@@ -940,6 +947,14 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 		// overwrite, not additive, so setting the same value twice is a
 		// no-op in effect.
 		a.activeRequests.Set(call.SessionID, runCancel)
+		// Mirror the activeRequests re-arm into the mailbox's current
+		// generation cancel (design §4): Cancel(sessionID) now targets
+		// mailbox.current.cancel instead of activeRequests, so it must be
+		// populated for the whole preamble (until runTurn swaps in its own
+		// per-turn genCtx cancel below) — otherwise a bare Cancel landing
+		// between turns would silently no-op (the exact task #206
+		// regression). runCancel covers the preamble exactly as before.
+		a.getMailbox(call.SessionID).beginGeneration(runCancel)
 		result, err, next, hasNext := a.runTurn(runCtx, call, lk)
 		if !hasNext {
 			return result, err
@@ -1177,6 +1192,15 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 	// owned and released by Run(), not per-turn — see the removed
 	// `defer a.activeRequests.Del(call.SessionID)` note below.
 	a.activeRequests.Set(call.SessionID, cancel)
+	// Record this turn's genCtx cancel as the mailbox's current generation
+	// cancel (design §4): InterruptAndReplace returns THIS func (so a
+	// mid-stream interrupt cancels only this generation, leaving the Run
+	// turn loop alive to drain the replacement), and Cancel(sessionID)
+	// targets it for a bare abort. Redundant with Run's loop-level
+	// beginGeneration(runCancel) only for the brief preamble window this
+	// call closes; from here until the turn returns, THIS is the live
+	// cancel an interrupt must hit.
+	a.getMailbox(call.SessionID).beginGeneration(cancel)
 
 	var wg sync.WaitGroup
 	if needsTitle {
@@ -2360,18 +2384,20 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 			return nil, updateErr, SessionAgentCall{}, false
 		}
 
-		// Drain the message queue on cancel. The "interrupt and send" web
-		// flow queues a user message and then cancels the turn; without
-		// this drain that message would sit in the queue until another
-		// /send arrives. cancel() the goroutine's context — the busy
-		// reservation itself stays claimed (Run's loop is about to run
-		// another turn for the same sessionID, so it must keep looking
-		// busy to any concurrent caller) and is only released by Run()
-		// once the loop has no more queued work.
+		// Drain on cancel via the mailbox's generation-aware drain (design
+		// §4): an interrupt-and-replace payload (mb.replacement) takes
+		// precedence over a plain queued follow-up (mb.submitted). This
+		// replaces the old messageQueue.PopFront: the interrupt path now
+		// records its replacement in the mailbox, so a legacy-queue-only
+		// drain would miss it entirely and silently drop the user's new
+		// message — the P0-2 defect. The busy reservation itself stays
+		// claimed (Run's loop is about to run another turn for the same
+		// sessionID) and is only released by Run() once the loop has no
+		// more queued work.
 		if isCancelErr {
-			if firstQueuedMessage, ok := a.messageQueue.PopFront(call.SessionID); ok {
+			if next, ok := a.getMailbox(call.SessionID).drainAfterCancel(); ok {
 				cancel()
-				return nil, nil, firstQueuedMessage, true
+				return nil, nil, next, true
 			}
 		}
 		return nil, err, SessionAgentCall{}, false
@@ -3429,38 +3455,79 @@ func summaryCompletionTokens(usage fantasy.Usage, summaryMessage message.Message
 }
 
 func (a *sessionAgent) Cancel(sessionID string) {
-	// Cancel regular requests. Don't use Take() here - we need the entry to
-	// remain in activeRequests so IsBusy() returns true until the goroutine
-	// fully completes (including error handling that may access the DB).
-	// The defer in processRequest will clean up the entry.
-	if cancel, ok := a.activeRequests.Get(sessionID); ok && cancel != nil {
+	// Cancel only the in-flight generation (design §4): a bare interrupt
+	// (Ctrl-C, sessions kill, cost/token cap) must NOT discard durable
+	// queued user intent. Previously Cancel unconditionally cleared
+	// messageQueue/injectQueue — a latent second bug riding along with
+	// P0-2 that silently dropped anything a caller had queued moments
+	// earlier via QueueMessage for an unrelated reason. ClearQueue remains
+	// the one intentional "drop everything queued" operation. The mailbox
+	// (whose current.cancel is populated by beginGeneration in Run's loop
+	// and runTurn) is now the cancel target instead of activeRequests.
+	//
+	// Falls back to dispatcherCancel when no generation is live yet: Run
+	// claims the mailbox (submit stores runCancel as dispatcherCancel) and
+	// only calls beginGeneration once it reaches its turn loop, so a Cancel
+	// landing in between — while the inter-process OS lock is still being
+	// acquired — would otherwise find current.cancel nil and silently
+	// no-op. Before the mailbox migration tryReserveSession wrote runCancel
+	// straight into activeRequests, so that window WAS covered; keeping the
+	// fallback preserves it (the task #206 "Cancel must never find a dead
+	// placeholder" invariant).
+	mb := a.getMailbox(sessionID)
+	mb.mu.Lock()
+	genCancel := mb.current.cancel
+	if genCancel == nil {
+		genCancel = mb.dispatcherCancel
+	}
+	mb.mu.Unlock()
+	if genCancel != nil {
 		slog.Debug("Request cancellation initiated", "session_id", sessionID)
-		cancel()
+		genCancel()
 	}
 
-	// Also check for summarize requests.
+	// Summarize requests still use the legacy activeRequests slot (not yet
+	// migrated to the mailbox — design §6, deferred to #268).
 	if cancel, ok := a.activeRequests.Get(sessionID + "-summarize"); ok && cancel != nil {
 		slog.Debug("Summarize cancellation initiated", "session_id", sessionID)
 		cancel()
 	}
-
-	if a.QueuedPrompts(sessionID) > 0 {
-		slog.Debug("Clearing queued prompts", "session_id", sessionID)
-		a.messageQueue.Clear(sessionID)
-	}
-	a.injectQueue.Clear(sessionID)
 }
 
 func (a *sessionAgent) ClearQueue(sessionID string) {
-	if a.QueuedPrompts(sessionID) > 0 {
-		slog.Debug("Clearing queued prompts", "session_id", sessionID)
-		a.messageQueue.Clear(sessionID)
-	}
+	// The single intentional "drop everything queued" operation (design
+	// §4): clears the mailbox's submitted/replacement/injects atomically
+	// under its lock, plus the still-live legacy messageQueue/injectQueue
+	// (not all callers are migrated yet — design §7 step 5). Cancel no
+	// longer touches any of these; only this method does.
+	slog.Debug("Clearing queued prompts", "session_id", sessionID)
+	a.getMailbox(sessionID).clearAll()
+	a.messageQueue.Clear(sessionID)
 	a.injectQueue.Clear(sessionID)
 }
 
 func (a *sessionAgent) QueueMessage(call SessionAgentCall) {
 	a.messageQueue.Append(call.SessionID, call)
+}
+
+// InterruptAndReplace is the coordinator's single entry point for "interrupt
+// and replace" (design §4), replacing the QueueMessage+Cancel two-step that
+// P0-2 made self-defeating: Cancel deterministically wiped the very message
+// QueueMessage had just queued the line before. It atomically records call
+// as the replacement the current owner must run next, and cancels ONLY the
+// in-flight generation — leaving the dispatcher (Run's turn loop) alive to
+// drain the replacement via drainAfterCancel. Returns true when a turn was
+// actually interrupted; false when the session was idle (nothing to cancel —
+// the caller should queue call for the next Run itself).
+func (a *sessionAgent) InterruptAndReplace(sessionID string, call SessionAgentCall) bool {
+	cancelFn, hadOwner := a.getMailbox(sessionID).interruptAndReplace(call)
+	if !hadOwner {
+		return false
+	}
+	if cancelFn != nil {
+		cancelFn()
+	}
+	return true
 }
 
 // InjectMessage — see SessionAgent interface comment. Persists immediately

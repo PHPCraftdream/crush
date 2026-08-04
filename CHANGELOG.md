@@ -23,6 +23,28 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **Starting any `crush` process could kill a long-running session in a
+  DIFFERENT process (release blocker)** — the startup recovery sweep
+  (`recoverInterruptedTurns`, which runs on every process start) walked
+  **every** session in the data directory, not just this process's own,
+  and stamped `FinishReasonError: "Process restarted"` on any assistant
+  message that lacked a finish part and was older than 30 seconds. It
+  performed no cross-process liveness check of any kind. Since a turn is
+  legitimately unfinished for as long as it runs — a sub-agent
+  delegation is bounded at 45 minutes — essentially every non-trivial
+  turn was exposed: a sibling `crush` merely starting up marked it as
+  crashed. Worse, `message.Update` rewrites the whole `Parts` blob from
+  the snapshot the sweep read, so the stamp also **clobbered** whatever
+  the live owner had streamed in between. This hit the fork's core use
+  case (N concurrent `crush run` sessions sharing one data directory)
+  routinely rather than rarely; an observed 38-minute delegation was
+  killed this way and produced zero file edits. The sweep now proves no
+  other live process owns a session — via `session.InspectSessionLock`,
+  the same discipline `sessions kill`/`locks`/`reap` already use —
+  before touching it, and skips it entirely if a live holder exists.
+  The 30-second age threshold is demoted to a secondary check. A
+  genuinely orphaned turn is still recovered exactly as before.
+
 - **A message queued at the exact instant a turn released its session
   reservation could be silently orphaned (P0-3)** — the owning turn's
   final check ("is anything queued?") and the reservation release
@@ -41,6 +63,21 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   becomes the new owner — never in a gap where neither does. Also
   applies to the standalone `/compact` follow-up drain that had the
   same shape.
+
+- **"Interrupt and send" discarded the very message it was sending
+  (P0-2)** — `InterruptAndSend` queued the replacement and then called
+  `Cancel`, and `Cancel` unconditionally cleared the message queue — so
+  the replacement was deleted by the line immediately after the one that
+  queued it, on every call, deterministically. The web UI's interrupt
+  button and `crush sessions inject --interrupt` therefore silently
+  dropped the user's new request. Both now route through one atomic
+  `InterruptAndReplace` operation that records the replacement and
+  cancels only the in-flight generation under the same lock, so the
+  turn loop stays alive to run it next. Related, previously unnoticed:
+  a **bare** cancel (Ctrl-C, `sessions kill`, a cost/token cap) also
+  wiped anything a caller had queued moments earlier for unrelated
+  reasons; `Cancel` no longer touches queued work at all, leaving
+  `ClearQueue` as the one explicit "discard everything" operation.
 
 - **`queue run`'s spawned children now inherit the parent's explicit
   `--data-dir`** — `queue run` resolves its own data directory once

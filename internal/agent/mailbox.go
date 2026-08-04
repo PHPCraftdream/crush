@@ -244,3 +244,18 @@ func (mb *mailbox) beginGeneration(cancel context.CancelFunc) (genID uint64) {
 	mb.current.cancel = cancel
 	return mb.current.id
 }
+
+// clearAll implements design §4's "ClearQueue is the one intentional
+// drop-everything operation": clears submitted, replacement, and injects
+// together under mu. It does NOT release ownership (state/current/
+// dispatcherCancel are untouched) — the owner is still running and merely
+// wants its pending queues discarded, not its reservation yanked. The
+// sessionAgent.ClearQueue wrapper also clears the still-live legacy
+// messageQueue/injectQueue for completeness during the migration.
+func (mb *mailbox) clearAll() {
+	mb.mu.Lock()
+	defer mb.mu.Unlock()
+	mb.submitted = nil
+	mb.replacement = nil
+	mb.injects = nil
+}

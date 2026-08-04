@@ -33,12 +33,12 @@ func TestQueueMessage_AppendsToSessionQueue(t *testing.T) {
 	assert.Equal(t, 1, a.QueuedPrompts("other"))
 }
 
-// TestCoordinator_InterruptAndSend_QueuesThenCancels verifies the public
-// coordinator method does exactly two things, in order: builds a
-// SessionAgentCall with the prompt + attachments, hands it to QueueMessage,
-// and then triggers Cancel. The cancel-handling branch in Run() (covered by
-// the running-agent integration test) drains the queue.
-func TestCoordinator_InterruptAndSend_QueuesThenCancels(t *testing.T) {
+// TestCoordinator_InterruptAndSend_UsesInterruptAndReplace verifies the
+// public coordinator method routes through InterruptAndReplace (design §4),
+// NOT the QueueMessage+Cancel two-step that P0-2 made self-defeating. The
+// replacement-reaches-next-turn behavior is covered by the real-agent
+// integration test TestInterruptAndReplace_ReplacementReachesNextTurn_P0_2.
+func TestCoordinator_InterruptAndSend_UsesInterruptAndReplace(t *testing.T) {
 	const providerID = "anthropic"
 	providerCfg := config.ProviderConfig{ID: providerID}
 
@@ -61,15 +61,19 @@ func TestCoordinator_InterruptAndSend_QueuesThenCancels(t *testing.T) {
 	err = coord.InterruptAndSend(t.Context(), sess.ID, "stop, do X instead", nil, nil, att)
 	require.NoError(t, err)
 
-	// One call queued, with the user's prompt and attachment carried through.
-	require.Len(t, mock.queuedCalls, 1)
-	assert.Equal(t, sess.ID, mock.queuedCalls[0].SessionID)
-	assert.Equal(t, "stop, do X instead", mock.queuedCalls[0].Prompt)
-	require.Len(t, mock.queuedCalls[0].Attachments, 1)
-	assert.Equal(t, "a.txt", mock.queuedCalls[0].Attachments[0].FileName)
+	// InterruptAndSend now routes through InterruptAndReplace (design §4),
+	// NOT the QueueMessage+Cancel two-step that P0-2 made self-defeating.
+	// One call recorded as an interrupt-and-replace, with the user's prompt
+	// and attachment carried through.
+	require.Len(t, mock.interruptAndReplaced, 1)
+	assert.Equal(t, sess.ID, mock.interruptAndReplaced[0].SessionID)
+	assert.Equal(t, "stop, do X instead", mock.interruptAndReplaced[0].Prompt)
+	require.Len(t, mock.interruptAndReplaced[0].Attachments, 1)
+	assert.Equal(t, "a.txt", mock.interruptAndReplaced[0].Attachments[0].FileName)
 
-	// Cancel was called for the same session.
-	assert.Equal(t, []string{sess.ID}, mock.cancelled)
+	// The old QueueMessage+Cancel path must no longer fire.
+	assert.Empty(t, mock.queuedCalls, "InterruptAndSend must not use QueueMessage anymore")
+	assert.Empty(t, mock.cancelled, "InterruptAndSend must not call Cancel anymore")
 }
 
 // TestCoordinator_InterruptAndSend_UnknownProvider_Errors verifies that we
@@ -96,4 +100,5 @@ func TestCoordinator_InterruptAndSend_UnknownProvider_Errors(t *testing.T) {
 	require.Error(t, err)
 	assert.Empty(t, mock.queuedCalls, "queue must not be touched when build fails")
 	assert.Empty(t, mock.cancelled, "Cancel must not be called when build fails")
+	assert.Empty(t, mock.interruptAndReplaced, "InterruptAndReplace must not be called when build fails")
 }
