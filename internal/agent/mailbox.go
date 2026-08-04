@@ -88,20 +88,21 @@ type mailbox struct {
 	// observed mb.submitted empty but BEFORE it flips state to mbIdle — i.e.
 	// exactly inside the critical section that used to NOT exist as a single
 	// atomic unit before this migration (see drainOrRelease's doc and design
-	// §3). drainOrReleaseFinal (round 11 review, HIGH-1) calls it at the
-	// analogous point too — after mb.submitted is observed empty but BEFORE
-	// checkLegacy runs, i.e. before EITHER a legacy-queue reclaim or the
-	// final release/idle-flip decision is made; run_reclaim_cancel_test.go
-	// relies on this exact position to land a real sa.Cancel call inside
-	// the reclaim window. It exists solely so a test can deterministically
-	// land a concurrent submit() call (or, via drainOrReleaseFinal, a
-	// concurrent Cancel/InterruptAndReplace call) inside that instant: since
-	// mu is still held while testDrainSeam runs, a concurrent caller needing
-	// mu blocks on mu.Lock() until testDrainSeam returns, making the
-	// interleaving reproducible on every run instead of relying on
-	// goroutine-scheduling luck. nil in all non-test construction paths
-	// (the zero value of mailbox), so it changes no production behavior —
-	// mirrors the existing onFire test-seam idiom already used by
+	// §3). drainOrReleaseFinal (round 11 review, HIGH-1; round 14 review,
+	// P0-A fix) calls it at the analogous point too — right after the epoch
+	// check, before ANY queue (replacement, submitted, legacy) is consulted;
+	// run_reclaim_cancel_test.go relies on this exact position to land a real
+	// sa.Cancel call inside the reclaim window (that test's scenario has
+	// mb.submitted empty and mb.replacement nil, so the flow still reaches
+	// checkLegacy after the seam). It exists solely so a test can
+	// deterministically land a concurrent submit() call (or, via
+	// drainOrReleaseFinal, a concurrent Cancel/InterruptAndReplace call)
+	// inside that instant: since mu is still held while testDrainSeam runs,
+	// a concurrent caller needing mu blocks on mu.Lock() until testDrainSeam
+	// returns, making the interleaving reproducible on every run instead of
+	// relying on goroutine-scheduling luck. nil in all non-test construction
+	// paths (the zero value of mailbox), so it changes no production behavior
+	// — mirrors the existing onFire test-seam idiom already used by
 	// stream_watchdog.go elsewhere in this package.
 	testDrainSeam func()
 
@@ -259,6 +260,17 @@ func (mb *mailbox) drainOrRelease(epoch uint64) (SessionAgentCall, bool) {
 // see the historical reclaimSameEra doc, superseded by this function, for
 // why that shape is rejected).
 //
+// Priority of branch evaluation within this function is now explicitly
+// "replacement -> submitted -> legacy -> release" (round 14 review, P0-A
+// fix), closing a race where a late interrupt whose cancel lost to
+// Stream's normal completion could strand the replacement: mb.replacement
+// was set by interruptAndReplace under mb.mu, but agent.Stream returned
+// nil (not context.Canceled), so runTurn took the normal-completion path
+// instead of the isCancelErr branch's drainAfterCancel. The replacement
+// check here ensures the replacement is recovered without releasing the
+// OS lock or entering the legacy queue, preserving the same atomic state
+// machine semantics drainAfterCancel already provides for the cancel path.
+//
 // Two accepted trade-offs from round 12 review, recorded here rather than
 // left implicit:
 //   - The OS lock hand-off point moved earlier than it used to be: before
@@ -293,6 +305,33 @@ func (mb *mailbox) drainOrReleaseFinal(
 	if mb.epoch != epoch {
 		return SessionAgentCall{}, false, nil
 	}
+	// Seam for deterministic test interleaving: fires right after the epoch check,
+	// before ANY queue (replacement, submitted, legacy) is consulted — this is the
+	// earliest deterministic pause point. Existing tests (e.g. run_reclaim_cancel_test.go)
+	// that relied on the seam firing only when mb.submitted is empty are unaffected
+	// because their scenarios always have mb.submitted empty and mb.replacement nil,
+	// so the flow still reaches the same checkLegacy/release branches after the seam.
+	if mb.testDrainSeam != nil {
+		mb.testDrainSeam()
+	}
+	// P0-A fix: a late interrupt whose cancel lost the race to Stream's normal
+	// completion lands here. mb.replacement was recorded by interruptAndReplace
+	// under mb.mu, but agent.Stream returned nil (not context.Canceled), so runTurn
+	// took the normal-completion path instead of the isCancelErr branch's
+	// drainAfterCancel. Without this check, the replacement is silently stranded:
+	// the drain releases ownership and the OS lock, and Run's defer can only move
+	// the payload to the legacy queue (where no runner exists) or no-op it under a
+	// new era. Priority "replacement -> submitted -> legacy -> release" is now
+	// ONE atomic state machine operation, matching drainAfterCancel's existing
+	// ordering. mb.current.cancel = nil — same invariant as every other "keep running"
+	// branch (see mailbox_invariant_test.go). State stays mbOwned, OS lock untouched,
+	// epoch NOT bumped — same semantics as the existing keep-running branches.
+	if mb.replacement != nil {
+		next := *mb.replacement
+		mb.replacement = nil
+		mb.current.cancel = nil
+		return next, true, nil
+	}
 	if len(mb.submitted) > 0 {
 		next := mb.submitted[0]
 		mb.submitted = mb.submitted[1:]
@@ -312,9 +351,6 @@ func (mb *mailbox) drainOrReleaseFinal(
 		// lifetime — nothing to reset.
 		mb.current.cancel = nil
 		return next, true, nil // caller runs another turn; state stays mbOwned, lock stays held
-	}
-	if mb.testDrainSeam != nil {
-		mb.testDrainSeam()
 	}
 	if checkLegacy != nil {
 		if next, ok := checkLegacy(); ok {

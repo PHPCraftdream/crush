@@ -82,6 +82,17 @@ func TestMailbox_Invariant_NoStaleCancelHandleSurvivesAnyMutatorReturn(t *testin
 			want: expectation{stillOwned: true},
 		},
 		{
+			name: "drainOrReleaseFinal/replacement branch keeps ownership",
+			run: func(t *testing.T, mb *mailbox) {
+				repl := SessionAgentCall{SessionID: "s1"}
+				mb.replacement = &repl
+				_, hasNext, err := mb.drainOrReleaseFinal(1, nil, nil, nil)
+				require.NoError(t, err)
+				require.True(t, hasNext)
+			},
+			want: expectation{stillOwned: true},
+		},
+		{
 			name: "drainOrReleaseFinal/checkLegacy reclaim keeps ownership",
 			run: func(t *testing.T, mb *mailbox) {
 				checkLegacy := func() (SessionAgentCall, bool) {
