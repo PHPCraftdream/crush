@@ -144,7 +144,7 @@ func TestRunSummarizeCore_QueuedMessage_ReturnsHasNext(t *testing.T) {
 	}
 	sa.messageQueue.Append(sess.ID, queued)
 
-	next, hasNext, err := sa.runSummarizeCore(t.Context(), sess.ID, fantasy.ProviderOptions{})
+	next, hasNext, err := sa.runSummarizeCore(t.Context(), sess.ID, fantasy.ProviderOptions{}, false)
 	require.NoError(t, err)
 	assert.True(t, hasNext, "expected hasNext=true when a message was queued before runSummarizeCore ran")
 	assert.Equal(t, queued.Prompt, next.Prompt, "expected the drained call to match the queued call's Prompt")
@@ -157,7 +157,7 @@ func TestRunSummarizeCore_QueuedMessage_ReturnsHasNext(t *testing.T) {
 func TestRunSummarizeCore_NoQueuedMessage_ReturnsNoNext(t *testing.T) {
 	sa, sess := newSummarizeCoreTestAgent(t)
 
-	next, hasNext, err := sa.runSummarizeCore(t.Context(), sess.ID, fantasy.ProviderOptions{})
+	next, hasNext, err := sa.runSummarizeCore(t.Context(), sess.ID, fantasy.ProviderOptions{}, false)
 	require.NoError(t, err)
 	assert.False(t, hasNext, "expected hasNext=false when nothing was queued")
 	assert.Equal(t, SessionAgentCall{}, next, "expected the zero value when nothing was queued")

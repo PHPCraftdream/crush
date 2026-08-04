@@ -23,6 +23,25 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **A message queued at the exact instant a turn released its session
+  reservation could be silently orphaned (P0-3)** — the owning turn's
+  final check ("is anything queued?") and the reservation release
+  (`activeRequests.Del`, run from a `defer` back in `Run`) were two
+  separate, non-atomically-linked steps. A concurrent send landing in
+  the gap between them would see the session still marked busy, queue
+  itself, and then nobody was left watching that queue: the owner had
+  already decided "nothing queued" and returned, and its deferred
+  release ran afterward with no further check. First step of the
+  per-session owner/mailbox migration
+  (`docs/plans/2026-08-04-session-owner-mailbox-design.md`) closes
+  this: the "is anything queued" check and the reservation release now
+  happen inside the SAME lock (`mailbox.drainOrRelease`), so a
+  concurrent send can only ever land before or after that atomic
+  transition — either the departing owner picks it up, or the sender
+  becomes the new owner — never in a gap where neither does. Also
+  applies to the standalone `/compact` follow-up drain that had the
+  same shape.
+
 - **`queue run`'s spawned children now inherit the parent's explicit
   `--data-dir`** — `queue run` resolves its own data directory once
   (honoring an explicit `--data-dir` on the parent invocation, or a

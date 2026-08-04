@@ -18,16 +18,17 @@ import (
 // Run() as far as the inter-process session-lock check (agent.go ~470-543)
 // without panicking on a nil csync field. Bare &sessionAgent{} (the pattern
 // used by convert_test.go / usage_fallback_test.go) is NOT enough here:
-// Run() calls a.IsSessionBusy, which calls a.activeRequests.Get — a nil
-// *csync.Map receiver panics (nil pointer dereference inside sync.RWMutex),
-// so activeRequests must be initialized the same way NewSessionAgent does.
-// messageQueue is initialized too since the busy path (not exercised by
-// these tests, but reached if IsSessionBusy ever returned true) appends to
-// it. tools/largeModel/systemPrompt/systemPromptPrefix are initialized too
-// because Run's very next block after the lock section (agent.go:546-549,
-// "Copy mutable fields under lock") unconditionally dereferences them —
-// needed only by TestRun_SubAgentChildSession_ProceedsPastLockWhenFree,
-// which drives Run() past the lock into that code; harmless no-ops for the
+// Run() calls a.tryReserveSession, which calls a.getMailbox, which calls
+// a.mailboxes.GetOrSet — a nil *csync.Map receiver panics (nil pointer
+// dereference inside sync.RWMutex), so mailboxes must be initialized the
+// same way NewSessionAgent does. activeRequests/messageQueue are still
+// initialized too since Cancel/QueueMessage and related legacy call sites
+// (untouched by the mailbox migration) still read/write them. tools/
+// largeModel/systemPrompt/systemPromptPrefix are initialized too because
+// Run's very next block after the lock section (agent.go:546-549, "Copy
+// mutable fields under lock") unconditionally dereferences them — needed
+// only by TestRun_SubAgentChildSession_ProceedsPastLockWhenFree, which
+// drives Run() past the lock into that code; harmless no-ops for the
 // lock-rejection test, which returns before reaching that point.
 func newLockTestSessionAgent(dataDir string, isSubAgent bool) *sessionAgent {
 	return &sessionAgent{
@@ -35,6 +36,7 @@ func newLockTestSessionAgent(dataDir string, isSubAgent bool) *sessionAgent {
 		isSubAgent:         isSubAgent,
 		activeRequests:     csync.NewMap[string, context.CancelFunc](),
 		messageQueue:       csync.NewKeyedQueue[SessionAgentCall](),
+		mailboxes:          csync.NewMap[string, *mailbox](),
 		tools:              csync.NewSliceFrom[fantasy.AgentTool](nil),
 		largeModel:         csync.NewValue(Model{}),
 		systemPrompt:       csync.NewValue(""),

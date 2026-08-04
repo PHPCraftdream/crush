@@ -2,7 +2,9 @@ package agent
 
 import (
 	"context"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/stretchr/testify/require"
@@ -263,4 +265,139 @@ func TestMailbox_InterruptThenDrainAfterCancel_SequenceRoundTrips(t *testing.T) 
 	next, ok := mb.drainAfterCancel()
 	require.True(t, ok)
 	require.Equal(t, replacement, next)
+}
+
+// TestMailbox_DrainOrRelease_ConcurrentSubmitInFinalDrainWindow_P0_3 is the
+// mandatory deterministic regression test for release-blocker P0-3
+// (docs/reviews/2026-08-04-multi-agent-stability-follow-up.md, release-gate
+// scenario 3): "a plain concurrent send that lands exactly in the
+// final-drain-to-release window must either become the new owner or be
+// guaranteed to run under the old owner — never orphaned."
+//
+// Before this migration, the owner's final drain (messageQueue.PopFront
+// returning empty) and the reservation release (activeRequests.Del, run via
+// Run()'s deferred releaseSessionReservation) were two SEPARATE, non-atomic
+// steps. A concurrent submit landing in the gap between them would observe
+// "still busy" (the map entry not yet deleted), append itself to
+// messageQueue, and then nobody would ever look at that queue entry again —
+// the owner had already decided "nothing queued" and moved on, and the
+// concurrent caller had already returned believing its message was queued
+// for the (already-departing) owner to pick up.
+//
+// This test reproduces that EXACT window deterministically — not
+// probabilistically — using mailbox.testDrainSeam: a hook drainOrRelease
+// invokes strictly after observing mb.submitted empty but strictly before
+// flipping mb.state to mbIdle (i.e., precisely inside what is now one
+// critical section but used to be the gap between two). Because
+// mb.mu is held for the whole of drainOrRelease (including the hook call),
+// a concurrent submit() blocks on mb.mu.Lock() until the hook returns and
+// drainOrRelease's own critical section finishes — so the test does not
+// need to win a race against goroutine scheduling to land the submit inside
+// the window; the window is held open by the mutex until the test releases
+// it.
+func TestMailbox_DrainOrRelease_ConcurrentSubmitInFinalDrainWindow_P0_3(t *testing.T) {
+	mb := &mailbox{
+		state:   mbOwned,
+		current: generation{id: 1, cancel: func() {}},
+	}
+
+	seamEntered := make(chan struct{})
+	releaseSeam := make(chan struct{})
+	mb.testDrainSeam = func() {
+		close(seamEntered)
+		<-releaseSeam
+	}
+
+	var (
+		wg                    sync.WaitGroup
+		concurrentBecameOwner bool
+	)
+	concurrentCall := SessionAgentCall{SessionID: "s1", Prompt: "concurrent-during-final-drain"}
+
+	// Owner's final drain, running in its own goroutine so the test can
+	// observe it paused mid-critical-section via seamEntered.
+	drainResult := make(chan struct {
+		next SessionAgentCall
+		ok   bool
+	}, 1)
+	wg.Go(func() {
+		next, ok := mb.drainOrRelease()
+		drainResult <- struct {
+			next SessionAgentCall
+			ok   bool
+		}{next, ok}
+	})
+
+	// Wait until drainOrRelease has entered the hook — i.e. has already
+	// observed mb.submitted empty and is about to flip state to mbIdle, but
+	// has NOT released mb.mu yet (the hook itself runs under mb.mu, and
+	// mb.mu is not released until drainOrRelease's deferred Unlock runs
+	// after the hook returns).
+	select {
+	case <-seamEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("drainOrRelease never reached the test seam")
+	}
+
+	// Fire the concurrent submit NOW, while drainOrRelease is paused inside
+	// its own critical section holding mb.mu. submit() must block on
+	// mb.mu.Lock() until we release the seam below — proving the two
+	// critical sections cannot interleave.
+	submitReturned := make(chan struct{})
+	wg.Go(func() {
+		concurrentBecameOwner = mb.submit(concurrentCall, func() {})
+		close(submitReturned)
+	})
+
+	// submit() must NOT be able to proceed while the seam is held — give it
+	// a moment on a real scheduler and confirm it is still blocked. This
+	// turns "the two critical sections are mutually exclusive" from an
+	// assumption into an observed fact for this run.
+	select {
+	case <-submitReturned:
+		t.Fatal("submit() returned before drainOrRelease released the mailbox lock — critical sections overlapped")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Now let drainOrRelease finish its critical section (flip to idle,
+	// unlock). Exactly one of two outcomes is correct from here:
+	//  1. drainOrRelease's own critical section commits FIRST (state ->
+	//     mbIdle, lock released) and submit() then acquires the lock and
+	//     sees mbIdle -> becomes the new owner (concurrentBecameOwner ==
+	//     true). This is what will actually happen here, since submit() is
+	//     already blocked waiting on mb.mu when we release the seam.
+	// Either way, the message is never orphaned: it either becomes owned by
+	// the concurrent caller (fresh Run()) or would have been picked up by
+	// the departing owner had it arrived a moment earlier (covered by the
+	// sibling "WithQueuedItem" test above). What must NEVER happen is what
+	// the old code allowed: the departing owner decides "nothing queued"
+	// AND the concurrent caller decides "still busy, I'll just queue" —
+	// both true at once, with nobody left to drain the queue.
+	close(releaseSeam)
+	wg.Wait()
+
+	res := <-drainResult
+	require.False(t, res.ok, "the owner's own drain found nothing queued at the instant it checked")
+	require.True(t, concurrentBecameOwner,
+		"the concurrent submit landing in the old lost-wakeup window must become the new owner instead of being silently queued with nobody left to drain it")
+	require.Equal(t, mbOwned, mb.state, "the concurrent submit becoming owner must leave the mailbox owned, not idle")
+	require.Empty(t, mb.submitted, "the concurrent call must have been picked up as the new owner's call, not left sitting in submitted with no reader")
+}
+
+// TestMailbox_DrainOrRelease_NoSeamHook_BehavesIdentically is a sanity check
+// that a nil testDrainSeam (the case for every real, non-test mailbox) makes
+// drainOrRelease behave exactly as it did before the hook was added — the
+// hook must be a strict no-op addition, never a behavior change.
+func TestMailbox_DrainOrRelease_NoSeamHook_BehavesIdentically(t *testing.T) {
+	mb := &mailbox{
+		state:            mbOwned,
+		dispatcherCancel: func() {},
+		current:          generation{id: 9, cancel: func() {}},
+	}
+
+	next, ok := mb.drainOrRelease()
+
+	require.False(t, ok)
+	require.Equal(t, SessionAgentCall{}, next)
+	require.Equal(t, mbIdle, mb.state)
 }

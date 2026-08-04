@@ -664,43 +664,82 @@ func logProviderWarnings(warnings []fantasy.CallWarning) {
 	}
 }
 
-// tryReserveSession atomically decides "is this session busy? if not, claim
-// it" for the given sessionID. Before this helper, Run() called
-// a.IsSessionBusy(call.SessionID) (a bare map read) and only registered the
-// real claim — a.activeRequests.Set(call.SessionID, cancel) — much later,
-// after the DB preamble (sessions.Get / getSessionMessages /
-// createUserMessage) and the inter-process lock acquisition had already
-// run. Two concurrent Run() calls for the same sessionID could both read
-// "not busy" in that window and both proceed, only to collide later at the
-// (correct, but far less informative) OS-level file lock — or, worse, both
-// think they legitimately own the slot for a moment.
+// getMailbox returns the per-session mailbox for sessionID, creating it
+// lazily on first touch. Mirrors activeRequests' "one map, lazily
+// populated, entries live forever" lifetime — see mailbox.go and
+// docs/plans/2026-08-04-session-owner-mailbox-design.md §1.
+func (a *sessionAgent) getMailbox(sessionID string) *mailbox {
+	return a.mailboxes.GetOrSet(sessionID, func() *mailbox { return &mailbox{} })
+}
+
+// tryReserveSession is now a thin wrapper around mailbox.submit (design §3,
+// stage 2 step 1 of the migration — see
+// docs/plans/2026-08-04-session-owner-mailbox-design.md §7). Historically
+// this used sessionStartMu + activeRequests directly; that had a real
+// P0-3 lost-wakeup defect at the OTHER end of the reservation's lifetime
+// (see releaseSessionReservation's doc below) even though the reserve side
+// itself was already atomic. Routing through the mailbox's own mutex keeps
+// the reserve and release sides of the reservation on the same lock, which
+// is what closes that window.
 //
-// This closes that window: reserveCancel is written into activeRequests
-// immediately, under sessionStartMu, so any concurrent caller's
-// IsSessionBusy check — including a concurrent call to this same helper —
-// deterministically observes "busy" the instant this one succeeds.
-// reserveCancel must actually be able to interrupt the reservation (it is
-// Run's own outer cancel func, covering the DB preamble and every turn, NOT
-// a no-op placeholder) so that Cancel(sessionID) called while a turn is
-// still in its DB preamble — before runTurn has replaced the map entry with
-// the per-turn genCtx cancel func — still does something instead of finding
-// a dead placeholder and silently no-op'ing. The reservation is released
-// exactly once, by the caller, via releaseSessionReservation.
-func (a *sessionAgent) tryReserveSession(sessionID string, reserveCancel context.CancelFunc) bool {
-	a.sessionStartMu.Lock()
-	defer a.sessionStartMu.Unlock()
-	if a.IsSessionBusy(sessionID) {
-		return false
-	}
-	a.activeRequests.Set(sessionID, reserveCancel)
-	return true
+// call must be the REAL call Run() received, not a placeholder: when the
+// mailbox is already owned, submit appends call verbatim to mb.submitted for
+// the current owner's end-of-turn drain to pick up as the next turn's
+// SessionAgentCall — a placeholder with an empty Prompt would silently
+// replace the caller's actual prompt with an empty one once drained.
+func (a *sessionAgent) tryReserveSession(call SessionAgentCall, reserveCancel context.CancelFunc) bool {
+	return a.getMailbox(call.SessionID).submit(call, reserveCancel)
 }
 
 // releaseSessionReservation clears the busy slot claimed by
-// tryReserveSession. Safe to call even if the slot was since overwritten
-// with a real cancel func (Del just removes the map entry either way).
-func (a *sessionAgent) releaseSessionReservation(sessionID string) {
-	a.activeRequests.Del(sessionID)
+// tryReserveSession, atomically checking for and returning any call queued
+// in the meantime via mailbox.drainOrRelease (design §3). Before this, the
+// old activeRequests.Del(sessionID) was strictly a release with no way to
+// observe a concurrent submit that raced into the gap between the caller's
+// own final "nothing queued" check and this release running — that gap is
+// exactly the P0-3 lost-wakeup window. Any call handed back here (which can
+// only happen when a concurrent submit lands between this release and the
+// caller's own preceding drain check) is a genuine hasNext case; callers
+// that cannot start another turn synchronously (e.g. Run's pre-loop bail-out
+// paths) must not discard it silently — see those call sites for how it is
+// handled.
+func (a *sessionAgent) releaseSessionReservation(sessionID string) (SessionAgentCall, bool) {
+	return a.getMailbox(sessionID).drainOrRelease()
+}
+
+// drainOrReleaseMerged is releaseSessionReservation's composition with the
+// STILL-LIVE legacy messageQueue (design §7, stage 2 step 1 explicitly
+// migrates only tryReserveSession/releaseSessionReservation — QueueMessage
+// itself, and its callers InterruptAndSend/requeueInterruptMessage in
+// coordinator.go, are migrated in a LATER step and still append directly to
+// a.messageQueue, not the mailbox). Routing the end-of-turn drain through
+// mailbox.drainOrRelease ALONE — without also still checking messageQueue —
+// would silently stop delivering anything QueueMessage queues, since nothing
+// would be draining that structure anymore. This merges both sources without
+// reopening the P0-3 window:
+//  1. Try the mailbox first (atomic check-and-maybe-release, same as
+//     releaseSessionReservation). If it finds something, that's the answer.
+//  2. If the mailbox had nothing — meaning it just atomically released
+//     ownership to mbIdle — check the legacy queue. If IT has something,
+//     reclaim ownership via mailbox.submit(next, nil): submit on an idle
+//     mailbox always returns true (becomes owner) deterministically, so
+//     there is no ambiguous case to re-check. If some other caller raced a
+//     legitimate mailbox.submit into mbOwned in the narrow gap between step
+//     1 and step 2 (a real but different call than the one this function is
+//     handling), our own submit call here correctly loses (returns false,
+//     queues `next` behind that new owner) instead of running it out from
+//     under them — so this function's own hasNext report must reflect
+//     submit's actual return value, not just "the legacy queue had
+//     something."
+func (a *sessionAgent) drainOrReleaseMerged(sessionID string) (SessionAgentCall, bool) {
+	if next, ok := a.releaseSessionReservation(sessionID); ok {
+		return next, true
+	}
+	next, ok := a.messageQueue.PopFront(sessionID)
+	if !ok {
+		return SessionAgentCall{}, false
+	}
+	return next, a.getMailbox(sessionID).submit(next, nil)
 }
 
 // activityNotifyContextKey is the context key under which runTurn stores a
@@ -775,17 +814,38 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	runCtx, runCancel := context.WithCancel(ctx)
 	defer runCancel()
 
-	// Atomically check-and-claim the busy slot (see tryReserveSession doc).
-	// If already busy, queue and return — same observable behaviour as
-	// before, just without the check/register race.
-	if !a.tryReserveSession(call.SessionID, runCancel) {
-		a.messageQueue.Append(call.SessionID, call)
+	// Atomically check-and-claim the busy slot via the session's mailbox
+	// (mailbox.submit, design §3). If someone else already owns the
+	// session, submit has already appended call to the mailbox's own
+	// pending queue under the same lock — nothing left to do here.
+	if !a.tryReserveSession(call, runCancel) {
 		return nil, nil
 	}
 	// We now own call.SessionID's reservation for the entire loop below,
 	// including every queue-drain turn. Released exactly once, whichever
-	// way the loop ends (error, or no more queued work).
-	defer a.releaseSessionReservation(call.SessionID)
+	// way the loop ends (error, or no more queued work) via
+	// releaseSessionReservation (mailbox.drainOrRelease). Unlike the old
+	// activeRequests.Del, that release can itself hand back a call that a
+	// concurrent submit queued in the exact window between the loop's own
+	// last drain check and this defer running — see releaseSessionReservation's
+	// doc. This defer only fires on Run's PRE-LOOP bail-out paths below (the
+	// session-lock acquisition failures): the loop itself always drains via
+	// runTurn/runSummarizeCore's own drainOrRelease calls before falling out
+	// of the `for`, so by the time control reaches here after a normal loop
+	// exit the mailbox is already idle and this is a harmless no-op. On a
+	// pre-loop bail-out there is no live turn loop left to hand a drained
+	// call to, so any call that surfaces here is logged instead of silently
+	// dropped (the old code's behavior for this same narrow window, just
+	// invisibly rather than audibly).
+	defer func() {
+		if leftover, ok := a.drainOrReleaseMerged(call.SessionID); ok {
+			slog.Error(
+				"agent.Run: dropping call queued during session lock failure — no turn loop left to run it",
+				"session_id", call.SessionID,
+			)
+			_ = leftover
+		}
+	}()
 
 	// Inter-process session lock. The reservation above is per-process (an
 	// in-memory map); two crush processes wouldn't see each other's busy
@@ -2324,25 +2384,37 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 		// busy reservation for call.SessionID for the whole turn loop, and
 		// runSummarize's own tail used to recurse into a.Run() to drain any
 		// message queued during the summarize stream — which would have
-		// tried to re-acquire the same still-held OS lock. runSummarizeCore
-		// returns that queued call (if any) instead, and it is merged below
-		// with the queue-drain logic already needed for shouldSummarize's
-		// own hasPendingToolCalls follow-up, so at most one queued call is
-		// carried forward into the next loop iteration.
-		summarizeQueued, summarizeHasNext, summarizeErr := a.runSummarizeCore(genCtx, call.SessionID, call.ProviderOptions)
+		// tried to re-acquire the same still-held OS lock.
+		//
+		// ownsMailbox=true: this call is inline inside runTurn, which — via
+		// Run's turn loop — already holds call.SessionID's mailbox
+		// reservation for the whole loop. Because of that, runSummarizeCore
+		// deliberately does NOT drain-or-release on our behalf (see its doc):
+		// this call always returns hasNext=false when ownsMailbox=true, and
+		// anything queued during the summarize stream simply stays parked in
+		// mailbox.submitted for THIS function's own end-of-turn
+		// drainOrRelease call, a few lines below, to pick up — the single
+		// true final drain point for the whole turn, summarize included.
+		_, summarizeHasNext, summarizeErr := a.runSummarizeCore(genCtx, call.SessionID, call.ProviderOptions, true)
 		if summarizeErr != nil {
 			return nil, summarizeErr, SessionAgentCall{}, false
 		}
 		if summarizeHasNext {
-			a.messageQueue.Append(call.SessionID, summarizeQueued)
+			// Not reachable today (see above), but if runSummarizeCore's
+			// contract ever changes to return true while ownsMailbox=true,
+			// fail loudly rather than silently dropping the call it handed
+			// back — dropping it here would reintroduce exactly the P0-3
+			// lost-message shape this migration exists to close.
+			return nil, fmt.Errorf("agent: runSummarizeCore unexpectedly returned hasNext=true while owning the mailbox"), SessionAgentCall{}, false
 		}
+		mb := a.getMailbox(call.SessionID)
 		// If the agent wasn't done...
 		sessionLock.Lock()
 		hasPendingToolCalls := len(currentAssistant.ToolCalls()) > 0
 		sessionLock.Unlock()
 		if hasPendingToolCalls {
 			call.Prompt = fmt.Sprintf("The previous session was interrupted because it got too long, the initial user request was: `%s`", call.Prompt)
-			a.messageQueue.Append(call.SessionID, call)
+			mb.submit(call, nil)
 		}
 	}
 
@@ -2358,7 +2430,22 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 		})
 	}
 
-	firstQueuedMessage, ok := a.messageQueue.PopFront(call.SessionID)
+	// Atomic final drain-or-release (design §3, closes P0-3). Before this,
+	// the equivalent check was a.messageQueue.PopFront(call.SessionID) here,
+	// with the actual reservation release happening SEPARATELY and LATER —
+	// only once Run's own deferred releaseSessionReservation ran, after this
+	// whole call had already returned hasNext=false. That gap was the lost-
+	// wakeup window: a concurrent submit landing in it would see the session
+	// still "busy" (activeRequests still held the entry), queue itself, and
+	// never be drained by anyone, since this function had already decided
+	// "nothing queued" and moved on. mailbox.drainOrRelease makes the
+	// emptiness check and the ownership release one atomic operation under
+	// the mailbox's own lock — no concurrent submit can land in a gap that no
+	// longer exists. drainOrReleaseMerged additionally still checks the
+	// legacy messageQueue (QueueMessage's callers are not migrated to the
+	// mailbox until a later stage — see its doc) so a message queued via the
+	// still-live QueueMessage path is not silently stranded.
+	firstQueuedMessage, ok := a.drainOrReleaseMerged(call.SessionID)
 	if !ok {
 		return result, err, SessionAgentCall{}, false
 	}
@@ -2389,7 +2476,13 @@ func (a *sessionAgent) Summarize(ctx context.Context, sessionID string, opts fan
 // already routed the "session is mid-turn" case into the summarizeQueue
 // instead of reaching here.
 func (a *sessionAgent) runSummarize(ctx context.Context, sessionID string, opts fantasy.ProviderOptions) error {
-	next, hasNext, err := a.runSummarizeCore(ctx, sessionID, opts)
+	// ownsMailbox=false: this call stack never claimed sessionID's mailbox
+	// reservation (see the doc above) — runSummarizeCore must not drain
+	// or release the MAIN session mailbox on our behalf, only its own
+	// synthetic "-summarize" activeRequests slot, or it could yank
+	// ownership out from under a genuinely concurrent Run() for the same
+	// session (pre-existing hazard, tracked separately as #268/P0-4).
+	next, hasNext, err := a.runSummarizeCore(ctx, sessionID, opts, false)
 	if err != nil {
 		return err
 	}
@@ -2433,7 +2526,24 @@ func (a *sessionAgent) CancelQueuedSummarize(sessionID string) {
 //     with "already in use" (the exact bug this refactor fixes). That
 //     caller instead appends the drained call onto messageQueue so the
 //     existing turn loop picks it up on its next iteration.
-func (a *sessionAgent) runSummarizeCore(ctx context.Context, sessionID string, opts fantasy.ProviderOptions) (next SessionAgentCall, hasNext bool, resErr error) {
+//
+// ownsMailbox tells runSummarizeCore whether the caller already holds
+// sessionID's mailbox reservation (mbOwned) for the entire call stack:
+//   - true from runTurn's shouldSummarize branch — Run's turn loop already
+//     owns the mailbox, so this function's own final drain is safe to route
+//     through the SAME mailbox.drainOrRelease as runTurn's own end-of-turn
+//     drain (it observes/mutates the state the caller is already holding).
+//   - false from the standalone runSummarize path (manual /compact via
+//     Summarize/handlers.go) — that call stack never claimed the mailbox
+//     (Summarize's IsSessionBusy check routes a busy session into
+//     summarizeQueue instead of reaching here), so calling
+//     mailbox.drainOrRelease here would be operating on a mailbox this call
+//     does not own: it could incorrectly idle out a genuinely concurrent
+//     Run() for the same session, or hand back a call that belongs to that
+//     other owner. When false, this function does not touch the main
+//     session mailbox at all — only its own synthetic "-summarize"
+//     activeRequests slot, exactly as before this migration.
+func (a *sessionAgent) runSummarizeCore(ctx context.Context, sessionID string, opts fantasy.ProviderOptions, ownsMailbox bool) (next SessionAgentCall, hasNext bool, resErr error) {
 	// Copy mutable fields under lock to avoid races with SetModels.
 	largeModel := a.largeModel.Get()
 	systemPromptPrefix := a.systemPromptPrefix.Get()
@@ -2610,19 +2720,43 @@ func (a *sessionAgent) runSummarizeCore(ctx context.Context, sessionID string, o
 	// messages flowing after a manual /compact. Our Summarize() outer wrapper
 	// uses a separate summarizeQueue keyed by sessionID, so the busy state
 	// here is the "-summarize" key — releasing it does NOT release the main
-	// Run()'s lock. The drain below runs only if a user message landed in
-	// messageQueue during summarisation. Instead of recursing into a.Run()
-	// (which, when this is called from runTurn's shouldSummarize branch,
-	// would try to re-acquire the OS lock the outer Run() call is still
-	// holding), the drained call is simply returned — see the doc above for
-	// how each of the two callers handles it.
+	// Run()'s lock.
 	a.activeRequests.Del(sessionID + "-summarize")
 	cancel()
-	firstQueuedMessage, ok := a.messageQueue.PopFront(sessionID)
-	if !ok {
-		return SessionAgentCall{}, false, nil
+	if !ownsMailbox {
+		// Standalone /compact (runSummarize): this call stack never claimed
+		// the main session mailbox (see ownsMailbox's doc above), so it must
+		// not drain-or-release it — doing so could yank ownership out from
+		// under a genuinely concurrent Run() for the same session. This does
+		// NOT mean nothing can have been queued during the stream: the
+		// public QueueMessage/messageQueue path (untouched by this
+		// migration — see agent.go's mailbox migration notes) is still a
+		// live, legacy way for a caller to queue work for sessionID
+		// independent of the mailbox, so this call site keeps draining THAT
+		// queue exactly as it did before, unrelated to mailbox ownership.
+		firstQueuedMessage, ok := a.messageQueue.PopFront(sessionID)
+		if !ok {
+			return SessionAgentCall{}, false, nil
+		}
+		return firstQueuedMessage, true, nil
 	}
-	return firstQueuedMessage, true, nil
+	// ownsMailbox=true (runTurn's shouldSummarize branch): deliberately do
+	// NOT call mailbox.drainOrRelease here. This function's return is not
+	// the true end of the owning turn — runTurn does more work after it
+	// returns (the hasPendingToolCalls follow-up a few lines below in the
+	// caller, which may itself feed another call into the SAME mailbox) and
+	// only then reaches its own single true final drainOrRelease call. If
+	// this function released ownership here (by finding `submitted` empty
+	// at this intermediate point) and runTurn's own follow-up subsequently
+	// called mailbox.submit again, that submit would incorrectly believe it
+	// was becoming a BRAND NEW owner — reopening a window for a genuinely
+	// concurrent submit to land between this release and that re-claim and
+	// end up racing runTurn's still-live goroutine for ownership. Anything
+	// queued during the summarize stream simply stays in mailbox.submitted
+	// and is picked up by runTurn's own end-of-turn drainOrRelease call
+	// exactly like any other queued item — no separate return path is
+	// needed here at all.
+	return SessionAgentCall{}, false, nil
 }
 
 // runSummarizeSilent compacts the oldest half of the session's messages in
@@ -3375,23 +3509,61 @@ func (a *sessionAgent) IsBusy() bool {
 	return busy
 }
 
+// IsSessionBusy reports whether sessionID currently has an owner (design §2's
+// mapping table: mailbox.state != mbIdle replaces the old
+// activeRequests.Get(sessionID) busy check). This is now the ONLY source of
+// truth for the main-session busy state: releaseSessionReservation (via
+// mailbox.drainOrRelease) no longer touches activeRequests at all, so
+// activeRequests entries for a plain sessionID key would otherwise never be
+// cleared. activeRequests itself is untouched by this migration and remains
+// the cancel-target lookup Cancel/CancelAll/the peak-hours abort path use —
+// call-site migration happens incrementally, one piece at a time (see the
+// design doc's §7 migration plan).
 func (a *sessionAgent) IsSessionBusy(sessionID string) bool {
-	_, busy := a.activeRequests.Get(sessionID)
-	return busy
+	mb := a.getMailbox(sessionID)
+	mb.mu.Lock()
+	defer mb.mu.Unlock()
+	return mb.state != mbIdle
 }
 
+// QueuedPrompts reports how many calls are waiting for sessionID's current
+// owner to finish, across BOTH the legacy messageQueue (still populated
+// directly by QueueMessage, which is not yet migrated to the mailbox — see
+// drainOrReleaseMerged's doc) and the mailbox's own submitted queue (now
+// populated by tryReserveSession/mailbox.submit for a concurrent Run() call
+// — design §3). Reporting only one of the two would undercount: a message
+// queued via the now-mailbox-backed path would silently show as "0 queued"
+// even though a turn IS waiting to run it.
 func (a *sessionAgent) QueuedPrompts(sessionID string) int {
-	return a.messageQueue.Len(sessionID)
+	mb := a.getMailbox(sessionID)
+	mb.mu.Lock()
+	mailboxQueued := len(mb.submitted)
+	mb.mu.Unlock()
+	return a.messageQueue.Len(sessionID) + mailboxQueued
 }
 
+// QueuedPromptsList is QueuedPrompts' list counterpart — see its doc for why
+// both sources are merged. Legacy-queue items are listed first, in their
+// existing order, followed by mailbox-queued items in their FIFO order;
+// relative ordering BETWEEN the two sources is not meaningful (they are
+// drained from different structures by different code paths today — see
+// drainOrReleaseMerged), only each source's own internal order is preserved.
 func (a *sessionAgent) QueuedPromptsList(sessionID string) []string {
 	l := a.messageQueue.Snapshot(sessionID)
-	if len(l) == 0 {
+	mb := a.getMailbox(sessionID)
+	mb.mu.Lock()
+	mailboxCalls := append([]SessionAgentCall(nil), mb.submitted...)
+	mb.mu.Unlock()
+
+	if len(l) == 0 && len(mailboxCalls) == 0 {
 		return nil
 	}
-	prompts := make([]string, len(l))
-	for i, call := range l {
-		prompts[i] = call.Prompt
+	prompts := make([]string, 0, len(l)+len(mailboxCalls))
+	for _, call := range l {
+		prompts = append(prompts, call.Prompt)
+	}
+	for _, call := range mailboxCalls {
+		prompts = append(prompts, call.Prompt)
 	}
 	return prompts
 }

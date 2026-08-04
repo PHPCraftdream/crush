@@ -20,9 +20,9 @@ import (
 type mailboxState int
 
 const (
-	mbIdle     mailboxState = iota // no owner, nothing queued
-	mbOwned                        // a turn loop holds ownership
-	mbReleasing                    // owner is mid drain-or-release transition (see design §3)
+	mbIdle      mailboxState = iota // no owner, nothing queued
+	mbOwned                         // a turn loop holds ownership
+	mbReleasing                     // owner is mid drain-or-release transition (see design §3)
 )
 
 // generation identifies one in-flight turn (or, once #268 lands, one
@@ -83,6 +83,21 @@ type mailbox struct {
 	// drain-or-release; not exercised until #268 (design §6) — unused
 	// placeholder field for this stage.
 	compact *fantasy.ProviderOptions
+
+	// testDrainSeam, when non-nil, is invoked by drainOrRelease AFTER it has
+	// observed mb.submitted empty but BEFORE it flips state to mbIdle — i.e.
+	// exactly inside the critical section that used to NOT exist as a single
+	// atomic unit before this migration (see drainOrRelease's doc and design
+	// §3). It exists solely so a test can deterministically land a
+	// concurrent submit() call inside that instant: since mu is still held
+	// by drainOrRelease while testDrainSeam runs, a concurrent submit()
+	// blocks on mu.Lock() until testDrainSeam returns, making the
+	// interleaving reproducible on every run instead of relying on
+	// goroutine-scheduling luck. nil in all non-test construction paths
+	// (the zero value of mailbox), so it changes no production behavior —
+	// mirrors the existing onFire test-seam idiom already used by
+	// stream_watchdog.go elsewhere in this package.
+	testDrainSeam func()
 }
 
 // submit implements design §3: replaces both tryReserveSession +
@@ -122,6 +137,9 @@ func (mb *mailbox) drainOrRelease() (SessionAgentCall, bool) {
 	// Nothing queued AT THE INSTANT OF THIS CHECK, and — because mu is
 	// held — nothing CAN be queued between this check and the state flip
 	// below.
+	if mb.testDrainSeam != nil {
+		mb.testDrainSeam()
+	}
 	mb.state = mbIdle
 	mb.current = generation{}
 	mb.dispatcherCancel = nil

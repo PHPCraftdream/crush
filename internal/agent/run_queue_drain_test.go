@@ -400,19 +400,23 @@ func TestRun_ConcurrentSameSession_SecondCallQueuesInsteadOfRacingReservation(t 
 	assert.Equal(t, int64(0), calls.Load(),
 		"the second call must never have reached the provider while the first holds the reservation")
 
-	// Let the first call's preamble proceed and the turn complete. The
-	// queued second message was appended before the first turn's own
-	// PrepareStep has run (PrepareStep is gated behind the same blocked
-	// sessions.Get call), so PrepareStep's messageQueue.TakeAll folds it
-	// into turn 1's own prompt (one provider call covering both messages)
-	// rather than running it as a separate turn 2 — the queue-drain-as-a-
-	// separate-turn path (runTurn's end-of-turn PopFront /
-	// TestRun_QueueDrain_DoesNotDeadlockOnOwnSessionLock) only kicks in for
-	// a message queued AFTER PrepareStep has already run for that turn.
-	// Either way, the queue must end up empty and the call must succeed —
-	// which is what actually matters for this test (the atomic reserve
-	// preventing the race), the exact mechanics of when the queued message
-	// is folded in are secondary.
+	// Let the first call's preamble proceed and the turn complete. Since the
+	// per-session owner/mailbox migration (P0-3 fix,
+	// docs/plans/2026-08-04-session-owner-mailbox-design.md), the second,
+	// concurrently-queued call is appended to mailbox.submitted (via
+	// mailbox.submit in tryReserveSession), NOT the legacy messageQueue that
+	// PrepareStep's TakeAll drains — so it is no longer folded into turn 1's
+	// own prompt. Instead, runTurn's end-of-turn drainOrReleaseMerged picks
+	// it up from the mailbox and the turn loop runs it as a genuine separate
+	// turn 2, exactly like a message queued AFTER PrepareStep already ran
+	// (TestRun_QueueDrain_DoesNotDeadlockOnOwnSessionLock). This is a real,
+	// intentional behavior change from the fold-in this test originally
+	// documented — see the design doc's own note that "the exact mechanics
+	// of when the queued message is folded in are secondary" to what THIS
+	// test actually verifies: the atomic reserve preventing the race. What
+	// still must hold: the call succeeds, both messages are eventually
+	// processed (two provider calls now, not one folded call), and the
+	// queue ends up empty.
 	close(blocking.unblock)
 	select {
 	case err := <-firstDone:
@@ -420,6 +424,6 @@ func TestRun_ConcurrentSameSession_SecondCallQueuesInsteadOfRacingReservation(t 
 	case <-time.After(15 * time.Second):
 		t.Fatal("first Run() call did not complete after unblocking")
 	}
-	assert.Equal(t, int64(1), calls.Load(), "expected the queued second message to be folded into turn 1's own PrepareStep, not run as a separate provider call")
+	assert.Equal(t, int64(2), calls.Load(), "expected the queued second message to run as its own turn 2 via the mailbox's end-of-turn drain, not folded into turn 1")
 	assert.Equal(t, 0, sa.QueuedPrompts(sess.ID))
 }
