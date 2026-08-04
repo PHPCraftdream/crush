@@ -355,6 +355,25 @@ type sessionAgent struct {
 	systemPrompt       *csync.Value[string]
 	tools              *csync.Slice[fantasy.AgentTool]
 
+	// shuttingDown latches on the first CancelAll and is checked by Run
+	// before it claims any session. Round 14 closing review, blocker 1:
+	// the per-mailbox `stopped` latch only stops an EXISTING turn loop from
+	// picking up more work — it cannot stop a NEW owner from appearing.
+	// After CancelAll's sweep, a mailbox that ends at mbIdle happily grants
+	// ownership to the next Run(), which then runs a full provider turn
+	// that the (already-finished) sweep will never cancel. Worse, mailboxes
+	// are created lazily, so a Run for a session id the sweep never saw
+	// gets a fresh mailbox with stopped == false — no race required.
+	//
+	// Entry points that can still call Run after the sweep are real and
+	// several: coordinator.startDetachedRun (its own detached goroutine on
+	// a WithoutCancel context), runSummarize's tail, Summarize, and the web
+	// handlers — none of which observe per-mailbox state.
+	//
+	// Agent-level and one-way, for the same reason `stopped` is: the agent
+	// belongs to a process that is exiting.
+	shuttingDown atomic.Bool
+
 	isSubAgent           bool
 	sessions             session.Service
 	messages             message.Service
@@ -786,8 +805,7 @@ func (a *sessionAgent) releaseSessionReservation(sessionID string, epoch uint64)
 // would silently no-op (Cancel) or falsely report success while cancelling
 // nothing (InterruptAndReplace).
 //
-// The whole operation is one atomic mailbox.drainOrReleaseFinal call (mb.mu
-// held throughout):
+// The whole operation is one mailbox.drainOrReleaseFinal call:
 //  1. Check mb.submitted first. Non-empty: pop and return it; state stays
 //     mbOwned; lk is NOT touched (still held for the reclaimed turn).
 //  2. mb.submitted empty: check the legacy messageQueue (still under mb.mu —
@@ -795,9 +813,11 @@ func (a *sessionAgent) releaseSessionReservation(sessionID string, epoch uint64)
 //     having no callbacks of its own). Non-empty: reclaim ownership for the
 //     SAME era (no epoch bump — mirrors the old reclaimSameEra contract) and
 //     return it; lk again NOT touched.
-//  3. Both empty: release lk (if non-nil) and THEN flip mb.state to mbIdle,
-//     all still under mb.mu. No same-process observer can see "not busy"
-//     until the OS lock genuinely is gone, closing the window above.
+//  3. Both empty: transition to mbReleasing, release lk (if non-nil) OUTSIDE
+//     mb.mu (P1-C), then flip mb.state to mbIdle under mb.mu. While release
+//     is in flight the mailbox reads as "busy" (mbReleasing), so no
+//     same-process observer can see "not busy" until the OS lock genuinely
+//     is gone — HIGH-1 holds without holding the mutex across the disk I/O.
 //
 // This is why checkLegacy is tried BEFORE releasing lk: reclaiming behind
 // the SAME lock avoids the release-then-reacquire shape, which would open a
@@ -891,6 +911,16 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	if call.SessionID == "" {
 		return nil, ErrSessionMissing
 	}
+	// Refuse outright once shutdown has begun (closing review, blocker 1).
+	// Checked BEFORE tryReserveSession so no ownership is claimed and no
+	// mailbox is created: the per-mailbox `stopped` latch can only stop an
+	// existing turn loop, and CancelAll's sweep cannot reach a mailbox that
+	// does not exist yet. See the shuttingDown field's doc for the call
+	// paths that reach here after the sweep.
+	if a.shuttingDown.Load() {
+		return nil, ErrAgentShuttingDown
+	}
+
 
 	// runCtx/runCancel span the WHOLE call: the DB preamble of every turn
 	// (before runTurn creates its own per-turn genCtx) plus every turn
@@ -995,10 +1025,10 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	// legitimately returns becomeOwner=true) and reach TryAcquireSessionLock
 	// here while the OS lock was still, transiently, held by its own
 	// process's outgoing turn — a same-process false "already in use".
-	// drainOrReleaseMerged now releases lk atomically inside the same
-	// mailbox critical section that flips state to mbIdle (see
-	// mailbox.drainOrReleaseFinal), so "not busy" and "OS lock free" become
-	// true together — this window is closed. Two sub-agent invocations
+	// drainOrReleaseMerged now publishes mbIdle only after lk.Release has
+	// completed (see mailbox.drainOrReleaseFinal's mbReleasing state), so
+	// "not busy" and "OS lock free" become true together — this window is
+	// closed. Two sub-agent invocations
 	// spawned in parallel by fantasy's ParallelAgentTool likewise never
 	// collide here — each gets a distinct toolCallID and therefore a
 	// distinct child session id.
@@ -3373,12 +3403,34 @@ func (a *sessionAgent) generateTitle(ctx context.Context, sessionID string, user
 	// the fallback still lands when the caller's ctx is already done.
 	var titleSaved bool
 	defer func() {
-		if !titleSaved {
-			fallbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-			defer cancel()
-			if err := a.sessions.Rename(fallbackCtx, sessionID, DefaultSessionName); err != nil {
-				slog.Error("Failed to save fallback session title", "error", err)
+		if titleSaved {
+			return
+		}
+		fallbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		// Only stamp the default when the session STILL has no real title.
+		//
+		// This used to be unconditional, which was safe only because runTurn
+		// waited unconditionally for this goroutine: the write always landed
+		// before the turn returned, so no later turn could have set a title
+		// yet. Bounding that wait (P1-B) removed the ordering — a goroutine
+		// whose provider ignores cancellation can now outlive its turn by
+		// minutes. Unconditional, it would then overwrite a perfectly good
+		// title a LATER turn had since generated; and because runTurn's
+		// needsTitle test counts DefaultSessionName as "still needs one",
+		// that becomes a loop, with every following turn spawning another
+		// attempt for the abandoned one to clobber again.
+		//
+		// The re-read is what makes abandonment safe: a late finisher either
+		// finds the slot still empty and fills it (the original intent) or
+		// finds it taken and leaves it alone.
+		if sess, err := a.sessions.Get(fallbackCtx, sessionID); err == nil {
+			if sess.Title != "" && sess.Title != DefaultSessionName {
+				return
 			}
+		}
+		if err := a.sessions.Rename(fallbackCtx, sessionID, DefaultSessionName); err != nil {
+			slog.Error("Failed to save fallback session title", "error", err)
 		}
 	}()
 
@@ -3706,6 +3758,14 @@ func (a *sessionAgent) InjectMessage(ctx context.Context, call SessionAgentCall)
 }
 
 func (a *sessionAgent) CancelAll() {
+	// Refuse all FUTURE Run() calls before touching anything else (closing
+	// review, blocker 1). This must come first and must live on the agent
+	// rather than the mailboxes: the sweep below can only latch mailboxes
+	// that already exist, and mailboxes are created lazily, so a Run for a
+	// session id the sweep never saw would otherwise get a fresh mailbox
+	// with stopped == false and run a full turn nothing will cancel.
+	a.shuttingDown.Store(true)
+
 	// Latch EVERY mailbox closed FIRST, before cancelling anything (round
 	// 14 review, P0-C). Ordering is what makes the shutdown terminal: a
 	// turn cancelled below immediately runs its cancel-handling branch,
@@ -3778,9 +3838,12 @@ func (a *sessionAgent) CancelAll() {
 func (a *sessionAgent) IsBusy() bool {
 	for _, mb := range a.mailboxes.Seq2() {
 		mb.mu.Lock()
-		owned := mb.state == mbOwned
+		// mbReleasing (release in flight) counts as busy: while the OS lock
+		// is being released the session is not yet genuinely idle, and
+		// CancelAll's drain loop must wait for it to reach mbIdle.
+		busy := mb.state != mbIdle
 		mb.mu.Unlock()
-		if owned {
+		if busy {
 			return true
 		}
 	}

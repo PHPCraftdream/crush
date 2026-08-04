@@ -155,11 +155,28 @@ type mailbox struct {
 // dispatcherCancel unwinds Run() itself, and `stopped` guarantees that on
 // the way out no drain hands it another call to run.
 //
-// Anything still queued is deliberately left in place rather than
-// discarded. It is already persisted as user messages, and a future
-// process that opens this session picks it up through the normal
-// queue-drain path; throwing it away here would turn "you shut down
-// mid-queue" into silent data loss.
+// Anything still queued is left in place rather than discarded, but be
+// clear about what that does and does not buy (closing review, blocker
+// 3 — an earlier version of this comment claimed the queue was already
+// persisted, which is false).
+//
+// A queued SessionAgentCall is NOT a DB row: coordinator.buildCall does
+// not create one, and the user message is only written in runTurn's
+// preamble, i.e. after a turn has already started. Both mb.submitted and
+// mb.replacement live purely in this process, and Run's cleanup defer
+// merely moves them to a.messageQueue, which is also in-memory. So on
+// shutdown a prompt that never reached a turn IS lost, with only a
+// slog.Error to show for it.
+//
+// That is the accepted trade: losing an unstarted prompt is better than
+// starting a fresh provider turn while the process is tearing its
+// database down. The one case that does survive is
+// requeueInterruptMessage's, whose call carries an ExistingMessageID for
+// a row `crush sessions inject` already wrote.
+//
+// Making this genuinely lossless needs the queue to be durable, which is
+// a design change well beyond a shutdown latch — tracked separately, not
+// papered over here.
 func (mb *mailbox) hardStop() (dispatcherCancel, genCancel context.CancelFunc) {
 	mb.mu.Lock()
 	defer mb.mu.Unlock()
@@ -529,10 +546,20 @@ func (mb *mailbox) interruptAndReplace(call SessionAgentCall) (context.CancelFun
 	mb.mu.Lock()
 	defer mb.mu.Unlock()
 
-	if mb.state != mbOwned {
+	if mb.state != mbOwned || mb.stopped {
 		// Nobody running: behave like a plain submit that also happens to
 		// return "no cancel needed" — the caller (coordinator) then starts
 		// a fresh Run() with call directly instead of relying on drain.
+		//
+		// `stopped` counts as "nobody running" too (closing review, blocker
+		// 2), even while state is still mbOwned. Recording a replacement on
+		// a hard-stopped mailbox would report success to the caller — and
+		// through it "queued" to the web client — for a payload both drains
+		// are now guaranteed to refuse, leaving it to be swept into an
+		// in-memory queue by a process that is exiting. Returning false
+		// instead routes the caller to its own no-owner path, where Run
+		// refuses with ErrAgentShuttingDown so the failure is visible
+		// rather than silent.
 		return nil, false
 	}
 	// Durably record the replacement FIRST, under the same lock that is
