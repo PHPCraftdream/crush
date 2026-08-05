@@ -5,8 +5,84 @@ import (
 	"path/filepath"
 	"testing"
 
+	appPkg "github.com/charmbracelet/crush/internal/app"
+	"github.com/charmbracelet/crush/internal/config"
+	"github.com/charmbracelet/crush/internal/db"
 	"github.com/stretchr/testify/require"
 )
+
+// isolateAllGlobalConfigPaths redirects every environment variable that
+// config.GlobalConfig()/config.GlobalConfigData() (and the XDG fallbacks
+// they defer to) can resolve through, so config.Init below can never read
+// or merge the operator's real ~/.config/crush/crush.json (live API keys,
+// MCP server definitions) nor the real global data-dir crush.json into the
+// App under test — see internal/cmd/providers_test.go's
+// runProvidersCmdInIsolatedApp for the concrete failure mode this guards
+// against (a leaked real MCP config made app.New's mcp.Initialize hang on a
+// real network connection for 9+ minutes inside a test).
+//
+// This is a package-local twin of internal/config's and internal/agent's
+// identically-named helpers: the logic must stay identical, but it can't be
+// shared as a single file because these are three separate Go packages and
+// all three copies are test-only (no non-test importer to hang a shared
+// helper off of).
+func isolateAllGlobalConfigPaths(t *testing.T) {
+	t.Helper()
+
+	tmp := t.TempDir()
+	configDir := filepath.Join(tmp, "global-config")
+	dataDir := filepath.Join(tmp, "global-data")
+	skillsDir := filepath.Join(tmp, "global-skills")
+
+	t.Setenv("CRUSH_GLOBAL_CONFIG", configDir)
+	t.Setenv("XDG_CONFIG_HOME", configDir)
+	t.Setenv("CRUSH_GLOBAL_DATA", dataDir)
+	t.Setenv("XDG_DATA_HOME", dataDir)
+
+	// Without this, provider discovery makes a real network call to Catwalk
+	// (and Hyper) the first time it runs against a fresh, cache-empty
+	// isolated data dir — see internal/cmd/providers_test.go's identical
+	// use of this env var for the same reason.
+	t.Setenv("CRUSH_PROVIDER_CACHE_ONLY", "1")
+
+	// If a local CLI (claude/gemini/...) happens to be on this machine's
+	// PATH, config.Load auto-synthesizes a "local-cli" provider, which
+	// makes cfg.IsConfigured() true and drives app.New into
+	// InitCoderAgent -> NewCoordinator -> discoverSkills. Without this
+	// override that reads the OPERATOR's real
+	// ~/.config/crush/skills / ~/.claude/skills, making the test
+	// non-deterministic across machines and leaking real filesystem state
+	// into a test that has nothing to do with skills.
+	t.Setenv("CRUSH_SKILLS_DIR", skillsDir)
+}
+
+// newAttachmentsTestApp builds a real *appPkg.App over a config.Init'd temp
+// workingDir/dataDir pair, isolated from the host's real global config.
+// dataDir may be "" to exercise config's own default-resolution path (see
+// setDefaults); the resolved directory (store.Config().Options.DataDirectory)
+// is what actually gets used for the DB connection, not the raw parameter.
+func newAttachmentsTestApp(t *testing.T, workingDir, dataDir string) *appPkg.App {
+	t.Helper()
+	isolateAllGlobalConfigPaths(t)
+
+	store, err := config.Init(workingDir, dataDir, false)
+	require.NoError(t, err)
+	resolvedDataDir := store.Config().Options.DataDirectory
+	require.NotEmpty(t, resolvedDataDir)
+	// Mirrors setupApp's createDotCrushDir (internal/cmd/root.go): db.Connect
+	// expects the data directory to already exist.
+	require.NoError(t, os.MkdirAll(resolvedDataDir, 0o700))
+
+	conn, err := db.Connect(t.Context(), resolvedDataDir)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Release(resolvedDataDir) })
+
+	a, err := appPkg.New(t.Context(), conn, store)
+	require.NoError(t, err)
+	t.Cleanup(a.Shutdown)
+
+	return a
+}
 
 // TestSaveAttachmentToDisk_UsesDataDirNotWorkingDir verifies that
 // saveAttachmentToDisk writes under <dataDir>/attachments/ using the
@@ -52,4 +128,57 @@ func TestSaveAttachmentToDisk_UsesDataDirNotWorkingDir(t *testing.T) {
 func TestSaveAttachmentToDisk_EmptyDataDirErrors(t *testing.T) {
 	_, err := saveAttachmentToDisk("", "notes.txt", []byte("hello"))
 	require.Error(t, err)
+}
+
+// TestAttachmentsDataDir_UsesConfiguredDataDirectory is the regression test
+// for task #262 (Round 8 review, LOW-1): the previously-existing tests only
+// covered saveAttachmentToDisk, a pure path-join function — none of them
+// exercised attachmentsDataDir itself or its three call sites in
+// handleSendMessage/handleInterruptAndSend/handleInjectMessage. As a result,
+// reverting those call sites back to
+// saveAttachmentToDisk(a.Store().WorkingDir(), ...) (the pre-#248 bug) left
+// every existing test green.
+//
+// This test builds a real *appPkg.App over a config-initialized dataDir
+// that is deliberately DIFFERENT from <workingDir>/.crush, then asserts
+// attachmentsDataDir(a) resolves to the configured dataDir — not a
+// workingDir-derived path — and that saveAttachmentToDisk driven with that
+// result actually lands the file under the configured dir.
+func TestAttachmentsDataDir_UsesConfiguredDataDirectory(t *testing.T) {
+	workingDir := t.TempDir()
+	dataDir := t.TempDir()
+	require.NotEqual(t, filepath.Join(workingDir, ".crush"), dataDir)
+
+	a := newAttachmentsTestApp(t, workingDir, dataDir)
+
+	got := attachmentsDataDir(a)
+	require.Equal(t, dataDir, got,
+		"attachmentsDataDir must resolve to the configured data_directory, not <workingDir>/.crush")
+
+	path, err := saveAttachmentToDisk(got, "notes.txt", []byte("hello"))
+	require.NoError(t, err)
+	rel, err := filepath.Rel(dataDir, path)
+	require.NoError(t, err)
+	require.False(t, filepath.IsAbs(rel))
+	require.NotContains(t, rel, "..")
+
+	// The historical bug's location: nothing must land under
+	// <workingDir>/.crush/attachments.
+	_, statErr := os.Stat(filepath.Join(workingDir, ".crush", "attachments"))
+	require.True(t, os.IsNotExist(statErr), "no attachments dir should exist under workingDir/.crush")
+}
+
+// TestAttachmentsDataDir_DefaultsToWorkingDirCrushWhenUnconfigured is the
+// companion case: with no explicit data_directory passed to config.Init
+// (empty string), config's own setDefaults falls back to
+// "<workingDir>/.crush" — the same value attachmentsDataDir's own
+// nil-config defensive fallback would produce. This pins down that the
+// "normal" (no override) path still behaves exactly as before #248.
+func TestAttachmentsDataDir_DefaultsToWorkingDirCrushWhenUnconfigured(t *testing.T) {
+	workingDir := t.TempDir()
+
+	a := newAttachmentsTestApp(t, workingDir, "")
+
+	want := filepath.Join(workingDir, ".crush")
+	require.Equal(t, want, attachmentsDataDir(a))
 }
