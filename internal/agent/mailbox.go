@@ -842,20 +842,129 @@ func (mb *mailbox) interruptAndReplace(call SessionAgentCall) (context.CancelFun
 	// an external observer to land in, because both happen before mu is
 	// released.
 	mb.replacement = &call
-	// Fall back to dispatcherCancel when no generation is live yet (round 9
-	// review, MEDIUM-1 — mirrors Cancel's own fallback, agent.go's Cancel
-	// doc explains the exact window: between submit() granting ownership
-	// and the loop's first beginGeneration, current.cancel is nil for the
-	// whole OS-lock preamble). Without this, an interrupt landing in that
-	// window returned (nil, true) — success, with NOTHING actually
-	// cancelled — so the turn ran to completion on the ORIGINAL prompt and
-	// the replacement was silently stranded until some later, unrelated
-	// cancel eventually surfaced it out of order (HIGH-2).
-	cancel := mb.current.cancel
-	if cancel == nil {
-		cancel = mb.dispatcherCancel
+	// #307 (P1-2 follow-up): mb.current.cancel == nil while mb.state ==
+	// mbOwned is NOT a special case restricted to "before the very first
+	// generation" — it is the inter-turn window too: Run's loop clears
+	// current.cancel (via the just-finished turn's own drain — every hit
+	// branch of drainOrRelease/drainOrReleaseFinal/drainAfterCancel leaves
+	// it nil, see mailbox_invariant_test.go) and does not repopulate it
+	// until the NEXT iteration's beginGeneration call. In BOTH windows
+	// (pre-first-generation and inter-turn) there is genuinely nothing
+	// live to interrupt — the turn loop itself is between provider calls,
+	// not inside one.
+	//
+	// A previous version of this method (round 9 review, MEDIUM-1) fell
+	// back to mb.dispatcherCancel here on the theory that SOME cancel must
+	// be returned or the replacement would be silently stranded. That was
+	// wrong: dispatcherCancel is runCancel, the whole-Run() context every
+	// future turn's genCtx descends from (see the field's own doc — "never
+	// the target of an interrupt"). Firing it here doesn't just end the
+	// current (nonexistent) generation, it poisons runCtx for every turn
+	// the loop will ever create again, including the replacement's own —
+	// the replacement gets recorded, then the loop's next iteration derives
+	// a turnCtx from an already-cancelled runCtx, whose preamble immediately
+	// fails with context.Canceled. That failure DOES recover the mailbox's
+	// replacement (the #284 preamble-cancel-recovery this bug rides on top
+	// of), but there is no live runCtx left to run it on either, so the
+	// recovered replacement fails the exact same way a turn later —
+	// "accepted, reported queued, never executed", the same P0-A/P0-B shape
+	// this whole mailbox exists to prevent. This was #307.
+	//
+	// The fix: return nil here instead of falling back to dispatcherCancel.
+	// mb.replacement is already durably recorded under this same lock, which
+	// is sufficient — nothing needs to be cancelled, because nothing is
+	// running. The loop's own testLoopRearmSeam window (agent.go) is where
+	// the replacement is reclaimed: see reclaimReplacementOrKeep, called
+	// there immediately before each iteration's beginGeneration, which
+	// atomically swaps the loop's stale `call` for a same-window replacement
+	// instead of letting the stale call run first. The caller
+	// (sessionAgent.InterruptAndReplace) already treats a nil returned
+	// CancelFunc as "nothing to invoke" (`if cancelFn != nil { cancelFn() }`)
+	// and still reports hadOwner=true, so the caller-visible contract
+	// ("accepted, will run next, do not start a fresh Run()") is unchanged —
+	// only WHAT gets cancelled (nothing, correctly, instead of the whole
+	// dispatcher) changes.
+	return mb.current.cancel, true
+}
+
+// reclaimReplacementOrKeep is called by Run's turn loop (agent.go)
+// immediately before each iteration's beginGeneration call — the exact
+// point testLoopRearmSeam already parks a test at (see that seam's own doc)
+// — to atomically check whether an interrupt landed in the inter-turn
+// window (#307) and recorded a fresher mb.replacement than the `call` the
+// loop is about to run. If so, the replacement is consumed and returned
+// instead, so the interrupt's intent ("run this now, not the old one")
+// actually takes effect on the very next generation rather than being
+// stranded until some later turn's own drain happens to notice it.
+//
+// Without this, interruptAndReplace's #307 fix (recording mb.replacement
+// but returning a nil cancel instead of firing dispatcherCancel) would only
+// be half the fix: the loop's local `call` variable was already decided by
+// the PREVIOUS turn's own drain before this window began, so simply not
+// cancelling anything would let that stale call run to completion first —
+// an entire extra provider turn against the ALREADY-SUPERSEDED prompt —
+// before the replacement is picked up by that stale turn's own end-of-turn
+// drain (drainOrReleaseFinal checks mb.replacement first, ahead of
+// submitted/legacy). That is not "replace", it is "queue behind" — the
+// caller asked to interrupt-and-replace and would silently get run-then-
+// replace instead. Consuming the replacement HERE, before the stale call is
+// ever handed to beginGeneration/runTurn, makes replace actually mean
+// replace.
+//
+// `call` is NOT discarded on the replacement-hit branch (closing review
+// after the first draft of this fix, same class as #283/P0-2 — "the
+// interrupt destroys the very message it's supposed to queue behind"):
+// `call` at this point is not an abstraction. On every iteration after the
+// first, it is a SessionAgentCall a PRIOR drain (drainOrRelease/
+// drainOrReleaseFinal) already popped out of mb.submitted (or the legacy
+// queue) specifically because "next" meant "run this next" — it has not run
+// yet, and for the ExistingMessageID path (e.g. `crush sessions inject
+// --interrupt`) its DB row already exists with nothing that will ever
+// answer it if silently dropped here. On the LOOP'S VERY FIRST iteration,
+// `call` is instead the original argument to Run() itself — verified, not
+// assumed, by TestRun_InterruptBeforeFirstGeneration_ReplacementRunsExactlyOnce:
+// an interrupt landing before turn 1's own beginGeneration is just as real a
+// window as the inter-turn one (mb.state is already mbOwned by the time
+// Run()'s loop reaches its first testLoopRearmSeam call — see submit()'s own
+// doc — only mb.current.cancel is still nil), and this method treats that
+// `call` exactly the same way: requeued, not special-cased as "never queued
+// anywhere so safe to drop". An earlier version of this method returned only
+// the replacement and let `call` vanish — with more than one message already
+// queued behind the current turn (submitted = [B, C], drain already popped A
+// as `call`), that silently destroyed exactly one message (A) while B and C
+// survived untouched in mb.submitted, with the choice of victim decided
+// purely by scheduling luck (whether the interrupt landed a moment before or
+// after the drain popped A). ClearQueue is documented as "the single
+// intentional drop-everything-queued operation" — discarding queued work is
+// its job alone, not an accidental side effect of this one.
+//
+// The fix: push `call` back onto the FRONT of mb.submitted before handing
+// back the replacement. This mirrors how drainAfterCancel/drainOrReleaseFinal
+// already treat replacement-vs-submitted priority elsewhere in this file —
+// replacement runs next, but submitted is never destroyed, only deferred.
+// So for the A/B/C scenario above: D (the replacement) runs now, A is
+// restored to the front of mb.submitted (order: A, B, C) and is picked up
+// by D's own end-of-turn drain, so the FIFO order the caller originally
+// queued in is preserved end to end, nothing lost, nothing reordered past
+// the one deliberate pre-emption (D jumping ahead of A because the caller
+// explicitly asked to interrupt).
+//
+// This does not appear in mailbox_invariant_test.go's stale-cancel-handle
+// table: that table's postcondition (current.cancel == nil) is unrelated to
+// this method's job, which is choosing WHICH SessionAgentCall the next
+// generation runs — it does not touch state/current/dispatcherCancel at
+// all. Covered instead by TestMailbox_ReclaimReplacementOrKeep_* in
+// mailbox_test.go.
+func (mb *mailbox) reclaimReplacementOrKeep(call SessionAgentCall) SessionAgentCall {
+	mb.mu.Lock()
+	defer mb.mu.Unlock()
+	if mb.replacement != nil {
+		next := *mb.replacement
+		mb.replacement = nil
+		mb.submitted = append([]SessionAgentCall{call}, mb.submitted...)
+		return next
 	}
-	return cancel, true
+	return call
 }
 
 // drainAfterCancel implements design §4: the generation-aware drain called

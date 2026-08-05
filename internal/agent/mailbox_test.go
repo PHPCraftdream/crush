@@ -174,6 +174,112 @@ func TestMailbox_InterruptAndReplace_OwnedRecordsReplacementAndReturnsCurrentCan
 	require.True(t, currentCancelCalled, "returned cancel must be the current generation's cancel func")
 }
 
+// TestMailbox_InterruptAndReplace_OwnedButNoLiveGeneration_RecordsReplacementWithoutDispatcherFallback
+// is the direct unit-level regression test for #307 (P1-2 follow-up): the
+// inter-turn window, where mb.state == mbOwned (the era is still open, a
+// turn loop iteration is about to run) but mb.current.cancel == nil (no
+// generation is actually live — see drainOrRelease/drainOrReleaseFinal/
+// drainAfterCancel's every "keep ownership" branch, all of which clear
+// current.cancel as part of the SAME postcondition
+// mailbox_invariant_test.go's table checks).
+//
+// Before the fix, interruptAndReplace fell back to mb.dispatcherCancel in
+// this exact situation (round 9 review, MEDIUM-1's fallback, originally
+// added to cover the narrow pre-first-generation window and never
+// reconsidered for the inter-turn window opened up by #284's turnCtx/
+// turnCancel split). dispatcherCancel is runCancel — the parent context of
+// EVERY future turn, never meant to be an interrupt target (see the field's
+// own doc) — so firing it here killed the whole dispatcher instead of just
+// failing to cancel a nonexistent generation.
+func TestMailbox_InterruptAndReplace_OwnedButNoLiveGeneration_RecordsReplacementWithoutDispatcherFallback(t *testing.T) {
+	dispatcherCancelCalled := false
+	mb := &mailbox{
+		state:            mbOwned,
+		dispatcherCancel: func() { dispatcherCancelCalled = true },
+		current:          generation{id: 3, cancel: nil}, // the inter-turn window: owned, but no live generation
+	}
+	call := SessionAgentCall{SessionID: "s1", Prompt: "replace-me"}
+
+	cancel, hadOwner := mb.interruptAndReplace(call)
+
+	require.True(t, hadOwner, "an owned mailbox must still report an owner existed, even with no live generation — "+
+		"the caller's contract is 'accepted, will run next', not 'a generation was actually interrupted'")
+	require.NotNil(t, mb.replacement, "the replacement must still be durably recorded")
+	require.Equal(t, call, *mb.replacement)
+	require.Nil(t, cancel, "must NOT fall back to dispatcherCancel — firing it would cancel runCtx, the parent of "+
+		"every future turn's context, not just the (nonexistent) current generation")
+
+	require.False(t, dispatcherCancelCalled, "dispatcherCancel must never be invoked by interruptAndReplace — "+
+		"only hardStop/CancelAll are allowed to touch it")
+}
+
+// TestMailbox_ReclaimReplacementOrKeep_* covers the loop-side half of the
+// #307 fix: reclaimReplacementOrKeep is called by Run's turn loop
+// (agent.go) at the testLoopRearmSeam point, immediately before
+// beginGeneration, specifically so a replacement recorded during the
+// inter-turn window pre-empts the stale `call` the previous turn's own
+// drain already decided on, instead of that stale call running to
+// completion first.
+func TestMailbox_ReclaimReplacementOrKeep_NoReplacementReturnsCallUnchanged(t *testing.T) {
+	mb := &mailbox{}
+	call := SessionAgentCall{SessionID: "s1", Prompt: "the queued call"}
+
+	got := mb.reclaimReplacementOrKeep(call)
+
+	require.Equal(t, call, got, "with no replacement recorded, the loop's own call must be returned unchanged")
+	require.Nil(t, mb.replacement)
+}
+
+func TestMailbox_ReclaimReplacementOrKeep_ReplacementPreemptsStaleCall(t *testing.T) {
+	staleCall := SessionAgentCall{SessionID: "s1", Prompt: "stale queued call"}
+	replacement := SessionAgentCall{SessionID: "s1", Prompt: "replacement from InterruptAndReplace"}
+	mb := &mailbox{
+		replacement: &replacement,
+	}
+
+	got := mb.reclaimReplacementOrKeep(staleCall)
+
+	require.Equal(t, replacement, got, "a recorded replacement must pre-empt the loop's stale call, not merely "+
+		"run after it — this is what makes InterruptAndReplace actually mean replace instead of queue-behind")
+	require.Nil(t, mb.replacement, "the replacement must be cleared once consumed, so it is not run a second time "+
+		"by a later drain")
+	require.Equal(t, []SessionAgentCall{staleCall}, mb.submitted, "the pre-empted stale call must NOT be discarded — "+
+		"it must be pushed back onto mb.submitted so a later drain still runs it (closing review after the first "+
+		"draft of this fix: destroying it here would be the exact #283/P0-2 class of bug, 'interrupt deletes the "+
+		"very message it's supposed to queue behind')")
+}
+
+// TestMailbox_ReclaimReplacementOrKeep_MultiElementQueue_OnlyReordersNothingIsLost is
+// the direct unit-level regression test for the closing-review defect: with
+// MORE than one message already queued, a prior draft of this method
+// silently destroyed exactly the one message a drain had already popped out
+// of mb.submitted into `call`, while any siblings still sitting in
+// mb.submitted survived untouched — the choice of victim decided purely by
+// scheduling luck (whether the interrupt landed a moment before or after
+// the drain popped `call`). This test simulates that exact scenario: A was
+// already popped out of mb.submitted (so it arrives here as `call`), B and
+// C are still queued, and D lands as the replacement.
+func TestMailbox_ReclaimReplacementOrKeep_MultiElementQueue_OnlyReordersNothingIsLost(t *testing.T) {
+	callA := SessionAgentCall{SessionID: "s1", Prompt: "A - already popped by a prior drain, arrives as `call`"}
+	callB := SessionAgentCall{SessionID: "s1", Prompt: "B - still queued"}
+	callC := SessionAgentCall{SessionID: "s1", Prompt: "C - still queued"}
+	callD := SessionAgentCall{SessionID: "s1", Prompt: "D - the interrupt's replacement"}
+	mb := &mailbox{
+		replacement: &callD,
+		submitted:   []SessionAgentCall{callB, callC},
+	}
+
+	got := mb.reclaimReplacementOrKeep(callA)
+
+	require.Equal(t, callD, got, "D must run next — the interrupt's whole point is pre-empting whatever the loop "+
+		"was about to run")
+	require.Nil(t, mb.replacement)
+	require.Equal(t, []SessionAgentCall{callA, callB, callC}, mb.submitted,
+		"A must be restored to the FRONT of mb.submitted (ahead of B and C, preserving original FIFO order "+
+			"among the deferred messages) — none of A, B, or C may be lost; only D is allowed to jump the queue, "+
+			"because the caller explicitly asked to interrupt-and-replace")
+}
+
 func TestMailbox_DrainAfterCancel_PrefersReplacementOverSubmitted(t *testing.T) {
 	replacement := SessionAgentCall{SessionID: "s1", Prompt: "replacement"}
 	queued := SessionAgentCall{SessionID: "s1", Prompt: "queued"}

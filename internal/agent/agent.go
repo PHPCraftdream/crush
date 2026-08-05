@@ -1243,6 +1243,25 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 		if mb.testLoopRearmSeam != nil {
 			mb.testLoopRearmSeam()
 		}
+		// #307 (P1-2 follow-up): reclaim a same-window replacement BEFORE
+		// committing to run `call` — the value the PREVIOUS turn's own drain
+		// already decided on. An InterruptAndReplace landing in the
+		// inter-turn window (after the previous iteration's turnCancel()
+		// above, before this iteration's beginGeneration below —
+		// mb.current.cancel is nil for the whole window, exactly where
+		// testLoopRearmSeam parks a test) now records mb.replacement and
+		// returns a nil cancel instead of falling back to dispatcherCancel
+		// (see interruptAndReplace's own doc for why that fallback used to
+		// cancel runCtx itself and poison every future turn). Nothing was
+		// cancelled, so nothing recovers the replacement automatically —
+		// this call is what actually picks it up, swapping it in for `call`
+		// so the interrupt's intent takes effect on the very next
+		// generation instead of `call` running to completion first and the
+		// replacement only surfacing via that turn's own end-of-turn drain.
+		// A no-op (returns call unchanged) on every iteration where no
+		// interrupt landed in this exact window, which is the overwhelming
+		// majority of iterations.
+		call = mb.reclaimReplacementOrKeep(call)
 		// Per-turn context, derived from runCtx but independently
 		// cancelable. An interrupt during this turn's DB preamble (before
 		// runTurn creates genCtx) targets THIS cancel — not runCancel — so

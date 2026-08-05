@@ -206,6 +206,44 @@ func TestMailbox_Invariant_NoStaleCancelHandleSurvivesAnyMutatorReturn(t *testin
 		// must be nil" post-condition does not apply to it (and asserting it
 		// would just force a pointless write). Its stopped behaviour is
 		// covered directly by TestInterruptAndReplace_RefusesOnStoppedMailbox.
+		//
+		// #307 (P1-2 follow-up) update: interruptAndReplace's OWNED branch
+		// (state == mbOwned && !stopped) is also not added here, even though
+		// it is no longer a pure early return — it durably records
+		// mb.replacement and returns mb.current.cancel as-is (nil or
+		// non-nil, whichever it already was). It still never WRITES to
+		// state/current.cancel/dispatcherCancel, the three fields this
+		// table's postcondition governs, so there is nothing for the
+		// blanket "current.cancel must be nil" (or the mbOwned/mbIdle
+		// dichotomy) to assert about it: it neither hands work back to a
+		// turn loop (that's reclaimReplacementOrKeep's job, below) nor ends
+		// an era. Covered directly instead by
+		// TestMailbox_InterruptAndReplace_OwnedButNoLiveGeneration_RecordsReplacementWithoutDispatcherFallback
+		// and TestMailbox_InterruptAndReplace_OwnedRecordsReplacementAndReturnsCurrentCancel
+		// (mailbox_test.go), which assert its actual postcondition:
+		// mb.replacement is set, and the returned cancel is exactly
+		// mb.current.cancel (never a dispatcherCancel fallback — that
+		// fallback is precisely what #307 removed, since dispatcherCancel
+		// is runCancel and firing it poisons every future turn's context,
+		// not just the possibly-nonexistent current generation).
+		//
+		// reclaimReplacementOrKeep is likewise NOT in this table, for the
+		// same reason injectIfBusy already isn't (see that method's own
+		// doc): it does not change ownership state at all — state, current,
+		// and dispatcherCancel are all left untouched. Its job is choosing
+		// WHICH SessionAgentCall the next generation runs (the loop's stale
+		// `call` vs. a same-window mb.replacement), not deciding whether
+		// the era continues or ends — that decision was already made by
+		// whichever drain call produced `call` in the first place. On the
+		// replacement-hit branch it also pushes the pre-empted `call` back
+		// onto the FRONT of mb.submitted (closing review: an earlier draft
+		// discarded it instead, the #283/P0-2 class of bug — "interrupt
+		// deletes the very message it's supposed to queue behind"), but
+		// mb.submitted's contents are not part of this table's ownership-
+		// state postcondition either. Covered directly by
+		// TestMailbox_ReclaimReplacementOrKeep_* (mailbox_test.go), including
+		// the multi-element-queue case that specifically catches the discard
+		// defect.
 
 		// #296/P1-C, corrected per #297 review: drainOrReleaseFinal passes
 		// THROUGH mbReleasing on its way to mbIdle — it NEVER re-emerges as
