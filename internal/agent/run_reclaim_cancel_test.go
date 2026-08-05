@@ -36,14 +36,51 @@ import (
 // Ctrl-C/sessions kill/cost-cap landing in this narrow window would
 // silently fail to interrupt the reclaimed turn.
 //
-// This test proves the fix (drainOrReleaseFinal now stores runCancel into
-// mb.dispatcherCancel atomically, in the SAME critical section as the
-// reclaim decision) by using mailbox.testDrainSeam to land a real
-// sa.Cancel(sess.ID) call so that it can only complete once the reclaim's
-// critical section (which sets mb.dispatcherCancel) has already run — since
-// Cancel takes the same mb.mu — and confirms turn 2 (the reclaimed call)
-// never gets a chance to run to completion: its context is cancelled before
-// its provider request would otherwise succeed.
+// This test proves the fix (drainOrReleaseFinal now stores the reclaim
+// cancel into mb.dispatcherCancel, and clears mb.current.cancel, both in
+// the SAME critical section as the reclaim decision) by driving a real
+// sa.Cancel(sess.ID) call and confirming turn 2 (the reclaimed call) never
+// gets a chance to run to completion: its context is cancelled before its
+// provider request would otherwise succeed.
+//
+// It uses TWO test-only seams, in sequence, to make the interleaving
+// deterministic rather than racy:
+//
+//  1. mailbox.testDrainSeam fires inside drainOrReleaseFinal, strictly
+//     before the legacy-queue reclaim runs. Released immediately — it only
+//     signals "the reclaim is about to happen", so the test can then wait
+//     for seam 2 instead of guessing with a sleep.
+//  2. mailbox.testLoopRearmSeam fires in Run's turn loop (agent.go),
+//     strictly AFTER the reclaim's critical section has already run to
+//     completion (dispatcherCancel populated, current.cancel nil'd) and
+//     mb.mu released, and strictly BEFORE that same loop iteration calls
+//     beginGeneration(turnCancel) to re-arm current.cancel for turn 2. The
+//     test parks the loop here, calls sa.Cancel(sess.ID) to completion
+//     (guaranteed to observe the reclaim's already-fixed state, since the
+//     loop cannot have re-armed yet), and only then releases the loop to
+//     proceed with its own beginGeneration call.
+//
+// Earlier versions of this test used only seam 1 and assumed that was
+// enough to "deterministically" land Cancel inside the reclaim window. That
+// assumption was checked empirically (temporarily reverting just the
+// mb.current.cancel = nil line in mailbox.go's reclaim branch, run
+// repeatedly) and found false both before and after #284/#296: once seam 1
+// releases and drainOrReleaseFinal's own mb.mu.Unlock() runs, there is a
+// genuine, unguarded race for the NEXT mb.mu acquisition between a blocked
+// Cancel() goroutine and the loop's own re-arm — regardless of whether the
+// re-arm writes the SAME cancel value each iteration (true before #284) or
+// a FRESH, distinct one every iteration (true after #284's turnCtx/
+// turnCancel split). Either way the race existed; only the shape of what
+// "losing" it looked like changed. Seam 2 removes the race by parking the
+// loop before it can even attempt the re-arm.
+//
+// TestMailbox_DrainOrReleaseFinal_LegacyReclaimNeverReleasesLock
+// (mailbox_lock_test.go) is, and remains, the authoritative regression
+// guard for the underlying MEDIUM-1 defect: it asserts the exact same
+// post-reclaim state directly, in the same goroutine, with no concurrency
+// at all. This test is the additional real-Run()/real-Cancel() integration
+// check — with seam 2 it is now deterministic too, not merely
+// non-false-failing.
 func TestRun_CancelDuringLegacyReclaimWindow_ActuallyCancelsTurn2(t *testing.T) {
 	env := testEnv(t)
 	dataDir := t.TempDir()
@@ -137,30 +174,54 @@ func TestRun_CancelDuringLegacyReclaimWindow_ActuallyCancelsTurn2(t *testing.T) 
 	sa := agentIface.(*sessionAgent)
 	mb := sa.getMailbox(sess.ID)
 
-	// Arm the seam: fires inside runTurn's end-of-turn drainOrReleaseMerged,
-	// strictly after mb.submitted has been observed empty but strictly
-	// before the legacy-queue check/reclaim runs. mb.mu is held for the
-	// whole pause (both by the seam and, crucially, by sa.Cancel below,
-	// which also needs mb.mu) — see mailbox.drainOrReleaseFinal's doc.
+	// Arm the FIRST seam: fires inside runTurn's end-of-turn
+	// drainOrReleaseMerged, strictly after mb.submitted has been observed
+	// empty but strictly before the legacy-queue check/reclaim runs. mb.mu
+	// is held for the whole pause — see mailbox.drainOrReleaseFinal's doc.
+	// Released immediately (no gating on Cancel here — that used to be the
+	// unreliable part, see testLoopRearmSeam below): this seam only exists
+	// to let the test know the reclaim's critical section is ABOUT to run,
+	// so it can wait for the SECOND seam next rather than racing a sleep
+	// against it.
 	//
-	// The seam is guarded with sync.Once and, after the first pause, becomes
-	// a no-op: if the FIX under test is broken (Cancel fails to actually
-	// stop turn 2), turn 2 runs to completion and reaches this SAME seam
-	// again at ITS OWN end-of-turn drain. Without the guard that would
-	// double-close seamEntered and panic, masking the real bug behind a
-	// test-harness crash instead of a clean, informative assertion failure
-	// below.
+	// Guarded with sync.Once and a no-op after the first pause: if the FIX
+	// under test is broken (Cancel fails to actually stop turn 2), turn 2
+	// runs to completion and reaches this SAME seam again at ITS OWN
+	// end-of-turn drain. Without the guard that would double-close
+	// seamEntered and panic, masking the real bug behind a test-harness
+	// crash instead of a clean, informative assertion failure below.
 	seamEntered := make(chan struct{})
-	releaseSeam := make(chan struct{})
 	var seamOnce sync.Once
 	mb.testDrainSeam = func() {
-		first := false
-		seamOnce.Do(func() {
-			first = true
-			close(seamEntered)
-		})
-		if first {
-			<-releaseSeam
+		seamOnce.Do(func() { close(seamEntered) })
+	}
+
+	// Arm the SECOND seam (#289 fix for this test's own flakiness):
+	// mailbox.testLoopRearmSeam fires in Run's turn loop (agent.go) at the
+	// top of EVERY iteration, including turn 1's — so the FIRST call is
+	// turn 1's own loop entry (long before the reclaim this test cares
+	// about even exists) and must pass straight through as a no-op. Only
+	// the SECOND call is the one this test wants: it fires strictly AFTER
+	// the reclaim's critical section above has already run and released
+	// mb.mu (state == mbOwned, dispatcherCancel populated, current.cancel
+	// nil — the fixed post-reclaim state), and strictly BEFORE that same
+	// loop iteration calls beginGeneration(turnCancel) to re-arm
+	// current.cancel for turn 2. Without this seam there is a genuine,
+	// unguarded race for the next mb.mu acquisition between (a) a
+	// concurrently-fired Cancel() goroutine and (b) the loop's own re-arm —
+	// see this test's git history for the empirical failure rate that race
+	// produced (13/20 runs failed to catch a reverted fix). Parking the
+	// loop at the SECOND call, calling Cancel() to completion, and only
+	// THEN releasing the loop removes the race entirely: Cancel() is
+	// guaranteed to observe the reclaim's fixed state before
+	// beginGeneration ever runs.
+	loopRearmEntered := make(chan struct{})
+	releaseLoopRearm := make(chan struct{})
+	var loopRearmCalls atomic.Int64
+	mb.testLoopRearmSeam = func() {
+		if loopRearmCalls.Add(1) == 2 {
+			close(loopRearmEntered)
+			<-releaseLoopRearm
 		}
 	}
 
@@ -206,50 +267,56 @@ func TestRun_CancelDuringLegacyReclaimWindow_ActuallyCancelsTurn2(t *testing.T) 
 		t.Fatal("turn 1's end-of-turn drain never reached the test seam")
 	}
 
-	// Fire Cancel from a separate goroutine WHILE the seam still holds
-	// mb.mu: Cancel blocks on mb.mu.Lock() until the seam (and the reclaim
-	// critical section immediately following it) completes.
+	// Wait for the loop to reach testLoopRearmSeam: by construction this can
+	// only happen AFTER drainOrReleaseFinal's reclaim critical section has
+	// already run to completion and released mb.mu (state == mbOwned,
+	// dispatcherCancel == the freshly-passed reclaim cancel,
+	// current.cancel == nil — see drainOrReleaseFinal's own doc for why),
+	// and STRICTLY BEFORE this same loop iteration calls
+	// beginGeneration(turnCancel) to re-arm current.cancel for turn 2. The
+	// loop parks here, so there is no clock to race against: whatever
+	// Cancel() observes below is guaranteed to be the reclaim's
+	// post-critical-section state, not a coin flip against the re-arm.
+	select {
+	case <-loopRearmEntered:
+	case err := <-runDone:
+		t.Fatalf("Run returned before the loop-rearm seam was reached: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("the loop never reached testLoopRearmSeam after the reclaim")
+	}
+
+	// Fire Cancel from a separate goroutine and wait for it to run to
+	// completion WHILE the loop is still parked in testLoopRearmSeam, i.e.
+	// strictly before beginGeneration(turnCancel) can execute. This is what
+	// makes the interleaving deterministic (#289): the old version of this
+	// test only held mb.mu for the DRAIN seam, so once that seam released,
+	// Cancel() and the loop's own re-arm raced for the next mb.mu
+	// acquisition — verified empirically (temporarily reverting just the
+	// mb.current.cancel = nil line in mailbox.go's reclaim branch) to catch
+	// the regression only ~1/3-2/3 of the time across repeated runs, not
+	// reliably. Parking the loop in a SECOND seam (testLoopRearmSeam,
+	// mirroring testDrainSeam's existing idiom) before it ever calls
+	// beginGeneration removes that race entirely: Cancel() is guaranteed to
+	// complete before the loop's re-arm gets a chance to run at all.
 	//
-	// NOTE — this is a best-effort integration check, NOT a deterministic
-	// reproduction of the exact defect: once drainOrReleaseFinal's own
-	// deferred mb.mu.Unlock() runs, there is a genuine, unguarded race for
-	// the NEXT mb.mu acquisition between (a) this test's blocked Cancel
-	// goroutine and (b) Run's OWN loop re-arming the mailbox via its
-	// unconditional `beginGeneration(runCancel)` at the top of the for loop
-	// (agent.go, before the next runTurn call) — which happens to write the
-	// SAME runCancel into mb.current.cancel that a correct MEDIUM-1 fix
-	// would also expose via the dispatcherCancel fallback, so the loop's
-	// own re-arm winning the race incidentally masks a missing MEDIUM-1
-	// fix too. Verified empirically (temporarily reverting just the
-	// mb.current.cancel = nil line in mailbox.go's reclaim branch): this
-	// test then catches the regression only ~1/3 of the time across
-	// repeated runs, not reliably. The mailbox-level
-	// TestMailbox_DrainOrReleaseFinal_LegacyReclaimNeverReleasesLock (see
-	// mailbox_lock_test.go) asserts the same post-reclaim state directly,
-	// in the same goroutine, with no race — THAT is the deterministic
-	// regression guard for this defect. This test is kept as an additional
-	// real-Run()-level sanity check: it never false-fails when the fix is
-	// present, it just cannot be trusted alone to catch a reintroduction.
-	// Making it genuinely deterministic would need a second test-only seam
-	// at Run's loop-level re-arm point (mirroring mailbox.testDrainSeam) —
-	// filed as backlog, not done here to keep this fix's scope bounded.
-	var cancelWG sync.WaitGroup
-	cancelWG.Add(1)
-	cancelStarted := make(chan struct{})
+	// The mailbox-level TestMailbox_DrainOrReleaseFinal_LegacyReclaimNeverReleasesLock
+	// (mailbox_lock_test.go) remains the authoritative, always-was-
+	// deterministic regression guard for the underlying MEDIUM-1 defect —
+	// it asserts the same post-reclaim state directly, in the same
+	// goroutine, with no concurrency at all. This test is the additional
+	// real-Run()-level, real-Cancel()-call integration check; with the
+	// second seam it is now ALSO deterministic rather than merely
+	// non-false-failing.
+	cancelDone := make(chan struct{})
 	go func() {
-		defer cancelWG.Done()
-		close(cancelStarted)
+		defer close(cancelDone)
 		sa.Cancel(sess.ID)
 	}()
-	<-cancelStarted
-	// Give the Cancel goroutine a moment to actually reach mb.mu.Lock() and
-	// block there (best-effort — the subsequent release+wait below is what
-	// actually guarantees correctness, this just makes the intended
-	// interleaving likely rather than relying on it).
-	time.Sleep(20 * time.Millisecond)
+	<-cancelDone
 
-	close(releaseSeam)
-	cancelWG.Wait()
+	// Only now let the loop proceed to beginGeneration(turnCancel) for
+	// turn 2 — strictly after Cancel() has already returned.
+	close(releaseLoopRearm)
 
 	// Race Run() actually returning against turn 2 reaching the provider a
 	// SECOND time (which, per the handler above, hangs forever rather than

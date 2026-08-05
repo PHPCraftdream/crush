@@ -176,6 +176,33 @@ type mailbox struct {
 	// stream_watchdog.go elsewhere in this package.
 	testDrainSeam func()
 
+	// testLoopRearmSeam, when non-nil, is invoked by Run's turn loop
+	// (agent.go) immediately BEFORE each iteration's beginGeneration(turnCancel)
+	// call — i.e. strictly after any end-of-turn drain (drainOrRelease/
+	// drainOrReleaseFinal/drainAfterCancel) has already released mb.mu, and
+	// strictly before the loop re-arms the mailbox's current generation for
+	// the next turn. It exists so a test can deterministically land a
+	// concurrent Cancel()/InterruptAndReplace() call inside that exact
+	// window and observe its effect BEFORE the loop's own re-arm can
+	// overwrite mb.current.cancel — closing the gap
+	// TestRun_CancelDuringLegacyReclaimWindow_ActuallyCancelsTurn2 (#289)
+	// used to be unable to close deterministically: without this seam, the
+	// loop's re-arm and a concurrently-blocked Cancel() call race for the
+	// NEXT mb.mu acquisition after a reclaim releases it, so whether Cancel
+	// observes the reclaim's fixed state (dispatcherCancel populated,
+	// current.cancel nil) or loses the race to the re-arm (which writes its
+	// own fresh, unrelated turnCancel into current.cancel first) depends on
+	// goroutine-scheduling luck. Unlike testDrainSeam (which fires WHILE
+	// holding mb.mu, so a concurrent mb.mu-needing caller blocks on the seam
+	// itself), this seam fires OUTSIDE mb.mu — the loop has not yet called
+	// beginGeneration when it fires — specifically so a test can let a
+	// blocked Cancel() goroutine actually ACQUIRE mb.mu, run to completion,
+	// and release it while the loop is parked here, before waving the loop
+	// through to make its own beginGeneration call. nil in all non-test
+	// construction paths (the zero value of mailbox), so it changes no
+	// production behavior — mirrors testDrainSeam's existing idiom.
+	testLoopRearmSeam func()
+
 	// epoch identifies the current OWNERSHIP ERA: bumped every time state
 	// transitions mbIdle -> mbOwned (a NEW caller becomes owner), never on
 	// a continuing turn within the same era (beginGeneration's turn-level

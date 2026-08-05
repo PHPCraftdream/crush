@@ -1231,6 +1231,18 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	// original ctx) is passed through so runCancel — registered as the
 	// busy slot's CancelFunc — actually reaches every turn's genCtx.
 	for {
+		// Test-only seam (#289): fires strictly after any end-of-turn drain
+		// has already released mb.mu and strictly before this iteration's
+		// beginGeneration call below re-arms it. nil (a no-op) in every
+		// production path — see mailbox.testLoopRearmSeam's own doc for why
+		// this exists and what it lets a test do that it otherwise could
+		// not: deterministically land a concurrent Cancel() inside the
+		// window between a reclaim and the loop's own re-arm, instead of
+		// racing the two for the next mb.mu acquisition.
+		mb := a.getMailbox(call.SessionID)
+		if mb.testLoopRearmSeam != nil {
+			mb.testLoopRearmSeam()
+		}
 		// Per-turn context, derived from runCtx but independently
 		// cancelable. An interrupt during this turn's DB preamble (before
 		// runTurn creates genCtx) targets THIS cancel — not runCancel — so
@@ -1249,7 +1261,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 		// below). Using turnCancel (not runCancel) is the #284 fix: the
 		// preamble is now part of a cancelable generation that is SEPARATE
 		// from the durable dispatcher cancel.
-		a.getMailbox(call.SessionID).beginGeneration(turnCancel)
+		mb.beginGeneration(turnCancel)
 		result, err, next, hasNext := a.runTurn(turnCtx, call, lk, epoch, runCancel)
 		turnCancel()
 		if !hasNext {
