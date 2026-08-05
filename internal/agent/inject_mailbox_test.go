@@ -98,7 +98,7 @@ func TestInject_NoLoss_SurvivesToNextTurn(t *testing.T) {
 		"session still owned → inject must succeed")
 
 	// Turn 1 finishes, nothing else queued → owner releases.
-	_, hasNext, _, _ := mb.drainOrReleaseFinal(1, nil, nil, nil)
+	_, hasNext, _, _ := mb.drainOrReleaseFinal(1, nil)
 	require.False(t, hasNext)
 	require.Equal(t, mbIdle, mb.state, "owner released")
 
@@ -161,7 +161,7 @@ func TestInjectIfBusy_AtomicWithOwnerRelease(t *testing.T) {
 	drainDone := make(chan struct{})
 	go func() {
 		defer close(drainDone)
-		_, _, _, _ = mb.drainOrReleaseFinal(1, nil, nil, nil)
+		_, _, _, _ = mb.drainOrReleaseFinal(1, nil)
 	}()
 
 	select {

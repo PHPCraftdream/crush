@@ -121,7 +121,7 @@ func TestRun_CancelDuringSecondTurnPreamble_ActuallyCancels(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			return
 		}
-		sa.messageQueue.Append(sess.ID, SessionAgentCall{
+		sa.getMailbox(sess.ID).queue(SessionAgentCall{
 			SessionID:       sess.ID,
 			Prompt:          "second message",
 			MaxOutputTokens: 1000,

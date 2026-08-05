@@ -600,26 +600,24 @@ func TestMailbox_AbandonOwnership_EmptyEndsAtIdle(t *testing.T) {
 		current:          generation{id: 3, cancel: func() {}},
 	}
 
-	dropped, hadWork := mb.abandonOwnership(1)
+	hadWork := mb.abandonOwnership(1)
 
 	require.False(t, hadWork, "nothing was queued")
-	require.Empty(t, dropped)
 	require.Equal(t, mbIdle, mb.state)
 	require.Nil(t, mb.dispatcherCancel)
 	require.Nil(t, mb.current.cancel)
 }
 
-// TestMailbox_AbandonOwnership_WithQueuedWork_DropsAndEndsAtIdle is the core
-// BLOCKER-2a regression: before this method existed, Run's cleanup defer
-// called drainOrRelease/drainOrReleaseMerged, whose "found something"
-// branch leaves state == mbOwned expecting the CALLER to run it as the
-// next turn. Run's defer has no turn loop left to do that, so the old code
-// silently wedged the session permanently busy (IsSessionBusy true
-// forever, every future submit() queuing behind an owner that would never
-// drain again). abandonOwnership must ALWAYS end at idle, whether or not
-// anything was queued, and hand back everything so the caller can log
-// what was dropped instead of silently keeping the session unusable.
-func TestMailbox_AbandonOwnership_WithQueuedWork_DropsAndEndsAtIdle(t *testing.T) {
+// TestMailbox_AbandonOwnership_WithQueuedWork_LeavesEntriesAndEndsAtIdle is
+// the core BLOCKER-2a regression: before this method existed, Run's cleanup
+// defer called drainOrRelease/drainOrReleaseMerged, whose "found something"
+// branch leaves state == mbOwned expecting the CALLER to run it as the next
+// turn. Run's defer has no turn loop left to do that, so the old code silently
+// wedged the session permanently busy. abandonOwnership must ALWAYS end at
+// idle, whether or not anything was queued. Since #308, it leaves entries in
+// submitted (folding any pending replacement in) for the next owner to drain
+// — the mailbox's submitted queue is now the single source of truth.
+func TestMailbox_AbandonOwnership_WithQueuedWork_LeavesEntriesAndEndsAtIdle(t *testing.T) {
 	queued := SessionAgentCall{SessionID: "s1", Prompt: "queued during the failed turn"}
 	replacement := SessionAgentCall{SessionID: "s1", Prompt: "an interrupt-and-replace nobody got to run"}
 	mb := &mailbox{
@@ -630,15 +628,16 @@ func TestMailbox_AbandonOwnership_WithQueuedWork_DropsAndEndsAtIdle(t *testing.T
 		replacement: &replacement,
 	}
 
-	dropped, hadWork := mb.abandonOwnership(1)
+	hadWork := mb.abandonOwnership(1)
 
 	require.True(t, hadWork)
-	require.ElementsMatch(t, []SessionAgentCall{queued, replacement}, dropped,
-		"both a queued follow-up AND a stranded replacement must be surfaced so the caller can log them")
+	// The entries remain in mb.submitted (replacement folded in) for the
+	// next owner to drain.
+	require.Len(t, mb.submitted, 2, "both submitted and replacement entries should remain in mb.submitted")
+	require.ElementsMatch(t, []SessionAgentCall{queued, replacement}, mb.submitted)
 	require.Equal(t, mbIdle, mb.state,
 		"the mailbox must end up idle even though something was queued — there is no turn loop left to keep it owned for (BLOCKER-2a)")
-	require.Empty(t, mb.submitted)
-	require.Nil(t, mb.replacement)
+	require.Nil(t, mb.replacement, "replacement must be folded into submitted, not left as a separate field")
 
 	// A NEW Run() for this session must be able to claim it fresh.
 	becomeOwner, newEpoch := mb.submit(SessionAgentCall{SessionID: "s1", Prompt: "fresh start"}, func() {})
@@ -660,10 +659,9 @@ func TestMailbox_AbandonOwnership_EpochMismatch_IsNoOp(t *testing.T) {
 		submitted: []SessionAgentCall{laterOwnerCall},
 	}
 
-	dropped, hadWork := mb.abandonOwnership(1) // stale epoch
+	hadWork := mb.abandonOwnership(1) // stale epoch
 
 	require.False(t, hadWork)
-	require.Empty(t, dropped)
 	require.Equal(t, mbOwned, mb.state, "a stale abandon must not touch a different owner's state")
 	require.Equal(t, uint64(2), mb.epoch)
 	require.Len(t, mb.submitted, 1)

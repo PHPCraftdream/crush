@@ -518,22 +518,6 @@ type sessionAgent struct {
 	// shared state.
 	titleGenerationMaxDuration time.Duration
 
-	// messageQueue is a per-session FIFO queue. It uses csync.KeyedQueue
-	// (not csync.Map[string, []T]) because every real usage here is a
-	// composite read-modify-write (append-to-existing, or
-	// read-then-delete-to-drain) — pairing Map.Get with a later Map.Set/Del
-	// leaves a window where a concurrent Append/drain can interleave and
-	// silently lose a queued message. KeyedQueue makes each of those
-	// composite operations (Append, TakeAll, PopFront) a single atomic
-	// critical section per session id.
-	//
-	// Still live: only tryReserveSession/releaseSessionReservation and
-	// InterruptAndReplace have migrated to the mailbox (design §7 stages
-	// 2.1-2.3); QueueMessage and its drain consumers
-	// (drainOrReleaseMerged, PrepareStep, runSummarizeBody, QueuedPrompts,
-	// ClearQueue, Run's re-queue defer) still read/write this queue
-	// directly. Removed once those move to the mailbox.
-	messageQueue *csync.KeyedQueue[SessionAgentCall]
 	// activeRequests is retained for the per-turn cancel that
 	// OnStepFinish's max-cost / max-tokens / peak-hours abort paths still
 	// look up directly (Cancel/CancelAll now route through the mailbox
@@ -551,8 +535,7 @@ type sessionAgent struct {
 	// 2.1-2.4 migrated tryReserveSession/releaseSessionReservation,
 	// InterruptAndReplace, the two-tier context split, and the inject path
 	// onto the mailbox; injectQueue and sessionStartMu have been deleted as
-	// fully dead. messageQueue (QueueMessage + its drain consumers) remains
-	// live. activeRequests is retained for OnStepFinish abort-path cancel
+	// fully dead. activeRequests is retained for OnStepFinish abort-path cancel
 	// lookups; the sessionID+"-summarize" synthetic key has been removed
 	// (#268). Both are removed in later stages. One mailbox per
 	// session id, created lazily on first touch via GetOrSet and never
@@ -662,7 +645,6 @@ func NewSessionAgent(
 		tools:                      csync.NewSliceFrom(opts.Tools),
 		isYolo:                     opts.IsYolo,
 		notify:                     opts.Notify,
-		messageQueue:               csync.NewKeyedQueue[SessionAgentCall](),
 		activeRequests:             csync.NewMap[string, context.CancelFunc](),
 		summarizeQueue:             csync.NewMap[string, fantasy.ProviderOptions](),
 		mailboxes:                  csync.NewMap[string, *mailbox](),
@@ -855,14 +837,8 @@ func (a *sessionAgent) releaseSessionReservation(sessionID string, epoch uint64)
 	return a.getMailbox(sessionID).drainOrRelease(epoch)
 }
 
-// drainOrReleaseMerged is runTurn's end-of-turn drain: releaseSessionReservation's
-// former composition with the STILL-LIVE legacy messageQueue (design §7,
-// stage 2 step 1 explicitly migrates only tryReserveSession/
-// releaseSessionReservation — QueueMessage itself, and its callers
-// InterruptAndSend/requeueInterruptMessage in coordinator.go, are migrated in
-// a LATER step and still append directly to a.messageQueue, not the
-// mailbox), now ALSO folding in the OS-level session lock release (round 11
-// review, HIGH-1).
+// drainOrReleaseMerged is runTurn's end-of-turn drain, folding in the OS-level
+// session lock release (round 11 review, HIGH-1).
 //
 // Before this, the mailbox flipped to mbIdle — making IsSessionBusy/
 // IsBusy/submit(), all same-process, in-memory reads under mb.mu, observe
@@ -879,14 +855,13 @@ func (a *sessionAgent) releaseSessionReservation(sessionID string, epoch uint64)
 //
 // lk is the SAME *session.SessionLock Run() acquired once for the whole
 // call (nil when a.dataDir == ""), and runCancel is Run's own whole-call
-// CancelFunc (design §4 / round 11 review MEDIUM-1): if the legacy queue
-// reclaims ownership for another turn, dispatcherCancel must keep pointing
-// at something live (runCancel, exactly what tryReserveSession/submit()
-// already stores there for the "no live generation yet" window) rather than
-// being left nil until the reclaimed turn's own beginGeneration call —
-// otherwise a Cancel()/InterruptAndReplace() landing in that narrow window
-// would silently no-op (Cancel) or falsely report success while cancelling
-// nothing (InterruptAndReplace).
+// CancelFunc (design §4 / round 11 review MEDIUM-1): dispatcherCancel must
+// keep pointing at something live (runCancel, exactly what tryReserveSession/
+// submit() already stores there for the "no live generation yet" window)
+// rather than being left nil until the reclaimed turn's own beginGeneration
+// call — otherwise a Cancel()/InterruptAndReplace() landing in that narrow
+// window would silently no-op (Cancel) or falsely report success while
+// cancelling nothing (InterruptAndReplace).
 //
 // The whole operation is one mailbox.drainOrReleaseFinal call, with exactly
 // FOUR possible outcomes (corrected here — #297 review: an earlier version
@@ -899,13 +874,9 @@ func (a *sessionAgent) releaseSessionReservation(sessionID string, epoch uint64)
 //     time of the call, BEFORE any release attempt: pop and return it;
 //     state stays mbOwned; lk is NOT touched (still held for the reclaimed
 //     turn). The caller's loop runs it as the next turn under the SAME lk.
-//  2. Both empty: check the legacy messageQueue (still under mb.mu — safe,
-//     see drainOrReleaseFinal's doc on csync.KeyedQueue.PopFront having no
-//     callbacks of its own). Non-empty: reclaim ownership for the SAME era
-//     (no epoch bump — mirrors the old reclaimSameEra contract) and return
-//     it; lk again NOT touched — "the OS lock is simply never released for
-//     this handoff" is accurate for cases 1 and 2, and ONLY for these two.
-//  3. All three empty: release lk (if non-nil) — now OUTSIDE mb.mu (#296/
+//  2. Both empty: check mb.submitted (already checked in case 1). If
+//     still empty, this is the end-of-turn handoff — proceed to case 3.
+//  3. Both mb.submitted and mb.replacement are empty: release lk (if non-nil) — now OUTSIDE mb.mu (#296/
 //     P1-C: mb.state == mbReleasing stands in for the mutex so a hung
 //     filesystem cannot stall the control plane) — then flip mb.state to
 //     mbIdle. No same-process observer can see "not busy" until the OS lock
@@ -927,11 +898,10 @@ func (a *sessionAgent) releaseSessionReservation(sessionID string, epoch uint64)
 //     directly" — case 4 is that same contract, reached via a different
 //     door). Never treat orphaned as a queue the CURRENT lk can serve.
 //
-// This is why checkLegacy is tried BEFORE releasing lk: reclaiming behind
-// the SAME lock avoids the release-then-reacquire shape, which would open a
-// real cross-process race (a different process could win the OS lock in the
-// gap) — see the old reclaimSameEra doc (removed; superseded by this
-// function) for the fuller rationale, still applicable here.
+// lk is released only when no work is available to run next, avoiding the
+// HIGH-1 window where "not busy" appears true while the OS lock is still
+// held by a previous turn. This keeps the in-process and inter-process
+// busy states in sync.
 //
 // ONLY safe to call from a live turn loop that will actually run the
 // returned call as its next turn (runTurn's own end-of-turn drain). Run's
@@ -941,14 +911,11 @@ func (a *sessionAgent) releaseSessionReservation(sessionID string, epoch uint64)
 // then never runs, AND would release lk from the wrong place (Run's own
 // deferred lk.Release() already owns that responsibility on that path).
 func (a *sessionAgent) drainOrReleaseMerged(sessionID string, epoch uint64, lk *session.SessionLock, runCancel context.CancelFunc) (SessionAgentCall, bool) {
-	checkLegacy := func() (SessionAgentCall, bool) {
-		return a.messageQueue.PopFront(sessionID)
-	}
 	var release func() error
 	if lk != nil {
 		release = lk.Release
 	}
-	next, hasNext, releaseErr, orphaned := a.getMailbox(sessionID).drainOrReleaseFinal(epoch, checkLegacy, runCancel, release)
+	next, hasNext, releaseErr, orphaned := a.getMailbox(sessionID).drainOrReleaseFinal(epoch, release)
 	if releaseErr != nil {
 		slog.Debug("agent.drainOrReleaseMerged: release session lock failed", "session_id", sessionID, "err", releaseErr)
 	}
@@ -1123,22 +1090,15 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	// logged dropped calls at slog.Error and discarded them — a silent
 	// user-message loss reachable on any ordinary non-cancel turn error
 	// (provider 5xx, a DB write failure) with a second message queued
-	// concurrently, not just the rare pre-loop bail-out case. Pre-mailbox-
-	// migration, a message in this position lived in messageQueue and was
-	// picked up by the NEXT Run() call's own PrepareStep drain — not lost.
-	// Re-queueing into messageQueue here (which is not epoch-scoped, so it
-	// survives safely across ownership eras) restores exactly that
-	// behavior instead of introducing a new one.
+	// concurrently, not just the rare pre-loop bail-out case. abandonOwnership
+	// now leaves queued entries in mb.submitted (not epoch-scoped) so they
+	// survive safely across ownership eras and are picked up by the next
+	// Run() call.
 	defer func() {
-		dropped, hadWork := a.getMailbox(call.SessionID).abandonOwnership(epoch)
-		if hadWork {
-			for _, d := range dropped {
-				a.messageQueue.Append(call.SessionID, d)
-			}
+		if hadWork := a.getMailbox(call.SessionID).abandonOwnership(epoch); hadWork {
 			slog.Error(
-				"agent.Run: re-queued call(s) that were pending when ownership had to be abandoned — no turn loop left to run them this call; a future Run() will pick them up",
+				"agent.Run: calls were pending when ownership had to be abandoned — they remain queued in the mailbox for the next Run() to drain",
 				"session_id", call.SessionID,
-				"count", len(dropped),
 			)
 		}
 	}()
@@ -2035,28 +1995,6 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 			// Use latest tools (updated by SetTools when MCP tools change).
 			prepared.Tools = a.tools.Copy()
 
-			queuedCalls := a.messageQueue.TakeAll(call.SessionID)
-			for _, queued := range queuedCalls {
-				// Interrupt-inject path: the message row already exists in the
-				// DB (created by `crush sessions inject --interrupt`). Load it
-				// by ID and splice it in — do NOT create a duplicate row.
-				if queued.ExistingMessageID != "" {
-					existingMsg, getErr := a.messages.Get(callContext, queued.ExistingMessageID)
-					if getErr != nil {
-						slog.Warn("queued interrupt inject references missing message, skipping",
-							"session_id", call.SessionID, "message_id", queued.ExistingMessageID, "error", getErr)
-						continue
-					}
-					prepared.Messages = append(prepared.Messages, existingMsg.ToAIMessage()...)
-					continue
-				}
-				userMessage, createErr := a.createUserMessage(callContext, queued)
-				if createErr != nil {
-					return callContext, prepared, createErr
-				}
-				prepared.Messages = append(prepared.Messages, userMessage.ToAIMessage()...)
-			}
-
 			for _, inj := range a.drainDueInjects(call.SessionID, genID, historyIDs) {
 				prepared.Messages = append(prepared.Messages, inj.ToAIMessage()...)
 			}
@@ -2811,14 +2749,10 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 
 		// Drain on cancel via the mailbox's generation-aware drain (design
 		// §4): an interrupt-and-replace payload (mb.replacement) takes
-		// precedence over a plain queued follow-up (mb.submitted). This
-		// replaces the old messageQueue.PopFront: the interrupt path now
-		// records its replacement in the mailbox, so a legacy-queue-only
-		// drain would miss it entirely and silently drop the user's new
-		// message — the P0-2 defect. The busy reservation itself stays
-		// claimed (Run's loop is about to run another turn for the same
-		// sessionID) and is only released by Run() once the loop has no
-		// more queued work.
+		// precedence over a plain queued follow-up (mb.submitted). The
+		// busy reservation itself stays claimed (Run's loop is about to
+		// run another turn for the same sessionID) and is only released
+		// by Run() once the loop has no more queued work.
 		if isCancelErr {
 			if next, ok := a.getMailbox(call.SessionID).drainAfterCancel(); ok {
 				cancel()
@@ -2880,21 +2814,18 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 		})
 	}
 
-	// Atomic final drain-or-release (design §3, closes P0-3). Before this,
-	// the equivalent check was a.messageQueue.PopFront(call.SessionID) here,
-	// with the actual reservation release happening SEPARATELY and LATER —
-	// only once Run's own deferred releaseSessionReservation ran, after this
-	// whole call had already returned hasNext=false. That gap was the lost-
-	// wakeup window: a concurrent submit landing in it would see the session
-	// still "busy" (activeRequests still held the entry), queue itself, and
-	// never be drained by anyone, since this function had already decided
-	// "nothing queued" and moved on. mailbox.drainOrRelease makes the
-	// emptiness check and the ownership release one atomic operation under
-	// the mailbox's own lock — no concurrent submit can land in a gap that no
-	// longer exists. drainOrReleaseMerged additionally still checks the
-	// legacy messageQueue (QueueMessage's callers are not migrated to the
-	// mailbox until a later stage — see its doc) so a message queued via the
-	// still-live QueueMessage path is not silently stranded.
+	// Atomic final drain-or-release (design §3, closes P0-3). Before the
+	// mailbox migration, the equivalent check was a separate
+	// messageQueue.PopFront call, with the actual reservation release
+	// happening SEPARATELY and LATER — only once Run's own deferred
+	// releaseSessionReservation ran, after this whole call had already
+	// returned hasNext=false. That gap was the lost-wakeup window: a
+	// concurrent submit landing in it would see the session still "busy",
+	// queue itself, and never be drained by anyone, since this function had
+	// already decided "nothing queued" and moved on. drainOrReleaseMerged
+	// makes the emptiness check, the ownership release, and the OS lock
+	// release one atomic operation under the mailbox's own lock — no
+	// concurrent submit can land in a gap that no longer exists.
 	firstQueuedMessage, ok := a.drainOrReleaseMerged(call.SessionID, epoch, lk, runCancel)
 	if !ok {
 		return result, err, SessionAgentCall{}, false
@@ -2936,20 +2867,18 @@ func (a *sessionAgent) Summarize(ctx context.Context, sessionID string, opts fan
 func (a *sessionAgent) runSummarize(ctx context.Context, genCtx context.Context, sessionID string, opts fantasy.ProviderOptions, mb *mailbox, epoch uint64, cancel context.CancelFunc) error {
 	defer cancel()
 	err := a.runSummarizeBody(genCtx, sessionID, opts)
-	// Release mailbox ownership. Any work queued via mb.submit during the
-	// compaction is collected here; re-queue it to the legacy messageQueue so
-	// the Run started below (or a future Run) drains it via checkLegacy.
-	dropped, _ := mb.abandonOwnership(epoch)
-	for _, d := range dropped {
-		a.messageQueue.Append(d.SessionID, d)
-	}
+	// Release mailbox ownership. abandonOwnership leaves any work queued
+	// during the compaction in mb.submitted (folding replacement into it),
+	// setting state to mbIdle — the entries survive there for the Run
+	// started below to drain.
+	_ = mb.abandonOwnership(epoch)
 	if err != nil {
 		return err
 	}
-	// Drain legacy queue (covers both mailbox-drained work above and direct
-	// QueueMessage callers not yet migrated — #308) and start a Run for the
-	// first queued call.
-	firstQueued, hasNext := a.messageQueue.PopFront(sessionID)
+	// Start a Run for the first queued entry. The Run becomes owner via
+	// submit() (mbIdle) and drains remaining entries via end-of-turn
+	// drainOrReleaseFinal calls.
+	firstQueued, hasNext := mb.popFirstSubmitted()
 	if !hasNext {
 		return nil
 	}
@@ -3859,14 +3788,14 @@ func summaryCompletionTokens(usage fantasy.Usage, summaryMessage message.Message
 func (a *sessionAgent) Cancel(sessionID string) {
 	// Cancel only the in-flight generation (design §4): a bare interrupt
 	// (Ctrl-C, sessions kill, cost/token cap) must NOT discard durable
-	// queued user intent. Previously Cancel unconditionally cleared
-	// messageQueue/injectQueue — a latent second bug riding along with
-	// P0-2 that silently dropped anything a caller had queued moments
-	// earlier via QueueMessage for an unrelated reason. ClearQueue remains
-	// the one intentional "drop everything queued" operation. The mailbox
-	// (whose current.cancel is populated by beginGeneration in Run's loop
-	// and runTurn, and by beginCompact for synchronous compactions) is now
-	// the cancel target instead of activeRequests.
+	// queued user intent. Previously Cancel unconditionally cleared the
+	// queue — a latent second bug riding along with P0-2 that silently
+	// dropped anything a caller had queued moments earlier via QueueMessage
+	// for an unrelated reason. ClearQueue remains the one intentional
+	// "drop everything queued" operation. The mailbox (whose current.cancel
+	// is populated by beginGeneration in Run's loop and runTurn, and by
+	// beginCompact for synchronous compactions) is now the cancel target
+	// instead of activeRequests.
 	//
 	// Falls back to dispatcherCancel when no generation is live yet: Run
 	// claims the mailbox (submit stores runCancel as dispatcherCancel) and
@@ -3893,16 +3822,14 @@ func (a *sessionAgent) Cancel(sessionID string) {
 func (a *sessionAgent) ClearQueue(sessionID string) {
 	// The single intentional "drop everything queued" operation (design
 	// §4): clears the mailbox's submitted/replacement/injects atomically
-	// under its lock, plus the still-live legacy messageQueue (QueueMessage
-	// is not yet migrated to the mailbox — see drainOrReleaseMerged's doc).
-	// Cancel no longer touches any of these; only this method does.
+	// under its lock. Cancel no longer touches any of these; only this
+	// method does.
 	slog.Debug("Clearing queued prompts", "session_id", sessionID)
 	a.getMailbox(sessionID).clearAll()
-	a.messageQueue.Clear(sessionID)
 }
 
 func (a *sessionAgent) QueueMessage(call SessionAgentCall) {
-	a.messageQueue.Append(call.SessionID, call)
+	a.getMailbox(call.SessionID).queue(call)
 }
 
 // InterruptAndReplace is the coordinator's single entry point for "interrupt
@@ -4054,41 +3981,28 @@ func (a *sessionAgent) IsSessionBusy(sessionID string) bool {
 }
 
 // QueuedPrompts reports how many calls are waiting for sessionID's current
-// owner to finish, across BOTH the legacy messageQueue (still populated
-// directly by QueueMessage, which is not yet migrated to the mailbox — see
-// drainOrReleaseMerged's doc) and the mailbox's own submitted queue (now
-// populated by tryReserveSession/mailbox.submit for a concurrent Run() call
-// — design §3). Reporting only one of the two would undercount: a message
-// queued via the now-mailbox-backed path would silently show as "0 queued"
-// even though a turn IS waiting to run it.
+// owner to finish, in the mailbox's submitted queue. All queue paths
+// (QueueMessage, submit during busy session, abandonOwnership survivors)
+// now go through the mailbox's submitted queue as the single source of
+// truth.
 func (a *sessionAgent) QueuedPrompts(sessionID string) int {
 	mb := a.getMailbox(sessionID)
 	mb.mu.Lock()
-	mailboxQueued := len(mb.submitted)
-	mb.mu.Unlock()
-	return a.messageQueue.Len(sessionID) + mailboxQueued
+	defer mb.mu.Unlock()
+	return len(mb.submitted)
 }
 
-// QueuedPromptsList is QueuedPrompts' list counterpart — see its doc for why
-// both sources are merged. Legacy-queue items are listed first, in their
-// existing order, followed by mailbox-queued items in their FIFO order;
-// relative ordering BETWEEN the two sources is not meaningful (they are
-// drained from different structures by different code paths today — see
-// drainOrReleaseMerged), only each source's own internal order is preserved.
+// QueuedPromptsList is QueuedPrompts' list counterpart — see its doc.
 func (a *sessionAgent) QueuedPromptsList(sessionID string) []string {
-	l := a.messageQueue.Snapshot(sessionID)
 	mb := a.getMailbox(sessionID)
 	mb.mu.Lock()
 	mailboxCalls := append([]SessionAgentCall(nil), mb.submitted...)
 	mb.mu.Unlock()
 
-	if len(l) == 0 && len(mailboxCalls) == 0 {
+	if len(mailboxCalls) == 0 {
 		return nil
 	}
-	prompts := make([]string, 0, len(l)+len(mailboxCalls))
-	for _, call := range l {
-		prompts = append(prompts, call.Prompt)
-	}
+	prompts := make([]string, 0, len(mailboxCalls))
 	for _, call := range mailboxCalls {
 		prompts = append(prompts, call.Prompt)
 	}

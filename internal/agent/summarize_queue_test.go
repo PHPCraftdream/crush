@@ -144,7 +144,7 @@ func TestRunSummarizeCore_QueuedMessage_ReturnsHasNext(t *testing.T) {
 		Prompt:          "queued during summarize",
 		MaxOutputTokens: 1000,
 	}
-	sa.messageQueue.Append(sess.ID, queued)
+	sa.getMailbox(sess.ID).queue(queued)
 
 	// Summarize acquires ownership via beginCompact, runs the body, releases,
 	// then drains messageQueue and starts a follow-on Run for the queued call.
@@ -239,7 +239,7 @@ func TestRunSummarize_QueuedMessage_RunsAsFollowOnTurn(t *testing.T) {
 		Prompt:          "queued during manual compact",
 		MaxOutputTokens: 1000,
 	}
-	sa.messageQueue.Append(sess.ID, queued)
+	sa.getMailbox(sess.ID).queue(queued)
 
 	// Use the public Summarize API which handles ownership acquisition internally
 	// via beginCompact (the P0-4 fix).
@@ -416,7 +416,7 @@ func TestRunTurn_ShouldSummarize_QueuedMessageContinuesWithoutLockDeadlock(t *te
 		case <-time.After(5 * time.Second):
 			return
 		}
-		sa.messageQueue.Append(sess.ID, queued)
+		sa.getMailbox(sess.ID).queue(queued)
 		close(proceed)
 	}()
 

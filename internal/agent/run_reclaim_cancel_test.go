@@ -248,7 +248,7 @@ func TestRun_CancelDuringLegacyReclaimWindow_ActuallyCancelsTurn2(t *testing.T) 
 	// uses for HIGH-1, so it can only be picked up by the end-of-turn drain's
 	// legacy-queue fallback (the reclaim path this test targets), not folded
 	// into turn 1's own PrepareStep.
-	sa.messageQueue.Append(sess.ID, SessionAgentCall{
+	sa.getMailbox(sess.ID).queue(SessionAgentCall{
 		SessionID:       sess.ID,
 		Prompt:          "queued via the legacy path, to be reclaimed as turn 2",
 		MaxOutputTokens: 1000,

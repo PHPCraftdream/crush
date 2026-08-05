@@ -90,7 +90,7 @@ func TestMailbox_DrainOrReleaseFinal_OSLockReleasedBeforeStateFlipsIdle(t *testi
 			current:          generation{id: 1, cancel: func() {}},
 		}
 
-		_, hasNext, releaseErr, orphaned := mb.drainOrReleaseFinal(1, nil, nil, lk.Release)
+		_, hasNext, releaseErr, orphaned := mb.drainOrReleaseFinal(1, lk.Release)
 		require.False(t, hasNext)
 		require.NoError(t, releaseErr)
 		require.Empty(t, orphaned)
@@ -165,7 +165,7 @@ func TestMailbox_DrainOrReleaseFinal_MuNotHeldDuringRelease_ButNoPrematureIdle(t
 	}
 	drainDone := make(chan drainResult, 1)
 	go func() {
-		_, hasNext, releaseErr, orphaned := mb.drainOrReleaseFinal(1, nil, func() {}, release)
+		_, hasNext, releaseErr, orphaned := mb.drainOrReleaseFinal(1, release)
 		drainDone <- drainResult{hasNext: hasNext, releaseErr: releaseErr, orphaned: orphaned}
 	}()
 
@@ -276,7 +276,7 @@ func TestMailbox_DrainOrReleaseFinal_OrphanedWorkNeverRunsWithoutFreshOSLock(t *
 		return lk.Release()
 	}
 
-	_, hasNext, releaseErr, orphaned := mb.drainOrReleaseFinal(1, nil, func() {}, release)
+	_, hasNext, releaseErr, orphaned := mb.drainOrReleaseFinal(1, release)
 	require.NoError(t, releaseErr)
 	require.False(t, hasNext, "orphaned work must not be reported as hasNext — that would tell the caller's turn "+
 		"loop to keep running without a lock")
@@ -308,7 +308,7 @@ func TestMailbox_DrainOrReleaseFinal_ReleaseErrorStillReachesIdle(t *testing.T) 
 
 	release := func() error { return errors.New("disk full") }
 
-	next, hasNext, releaseErr, orphaned := mb.drainOrReleaseFinal(1, nil, nil, release)
+	next, hasNext, releaseErr, orphaned := mb.drainOrReleaseFinal(1, release)
 
 	require.False(t, hasNext)
 	require.Equal(t, SessionAgentCall{}, next)
@@ -358,7 +358,7 @@ func TestMailbox_DrainOrReleaseFinal_ReleasePanicStillReachesIdle(t *testing.T) 
 				}
 			}
 		}()
-		_, hasNext, releaseErr, orphaned := mb.drainOrReleaseFinal(1, nil, nil, release)
+		_, hasNext, releaseErr, orphaned := mb.drainOrReleaseFinal(1, release)
 		drainDone <- drainResult{hasNext: hasNext, releaseErr: releaseErr, orphaned: orphaned}
 	}()
 
@@ -411,7 +411,7 @@ func TestMailbox_DrainOrReleaseFinal_HardStopDuringReleaseWindow_DiscardsWork(t 
 		return nil
 	}
 
-	next, hasNext, releaseErr, orphaned := mb.drainOrReleaseFinal(1, nil, nil, release)
+	next, hasNext, releaseErr, orphaned := mb.drainOrReleaseFinal(1, release)
 
 	require.NoError(t, releaseErr)
 	require.False(t, hasNext, "work that landed during the release window must NOT be handed back once hardStop "+
@@ -469,13 +469,13 @@ func TestSessionAgent_IsBusyAndIsSessionBusy_TreatMbReleasingAsBusy(t *testing.T
 	assert.False(t, sa.IsSessionBusy(sessionID), "IsSessionBusy must report false once the mailbox is genuinely mbIdle")
 }
 
-// TestMailbox_DrainOrReleaseFinal_LegacyReclaimNeverReleasesLock is the
-// companion proving the OTHER half of HIGH-1's fix: when the legacy queue
+// TestMailbox_DrainOrReleaseFinal_SubmittedReclaimNeverReleasesLock is the
+// companion proving the OTHER half of HIGH-1's fix: when mb.submitted
 // has something, the OS lock must NOT be released at all — ownership (and
 // the lock) is handed straight to the reclaimed turn without ever exposing a
 // gap where a different process could steal it (see drainOrReleaseFinal's
 // own doc for why release-then-reacquire is rejected).
-func TestMailbox_DrainOrReleaseFinal_LegacyReclaimNeverReleasesLock(t *testing.T) {
+func TestMailbox_DrainOrReleaseFinal_SubmittedReclaimNeverReleasesLock(t *testing.T) {
 	dataDir := t.TempDir()
 	const sessionID = "high-1-lock-reclaim-test"
 
@@ -483,71 +483,44 @@ func TestMailbox_DrainOrReleaseFinal_LegacyReclaimNeverReleasesLock(t *testing.T
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = lk.Release() })
 
-	var staleDispatcherCancelCalled bool
 	mb := &mailbox{
-		state:            mbOwned,
-		epoch:            1,
-		dispatcherCancel: func() { staleDispatcherCancelCalled = true },
-		current:          generation{id: 1, cancel: func() {}},
+		state:   mbOwned,
+		epoch:   1,
+		current: generation{id: 1, cancel: func() {}},
 	}
 
-	reclaimed := SessionAgentCall{SessionID: sessionID, Prompt: "reclaimed from legacy queue"}
+	reclaimed := SessionAgentCall{SessionID: sessionID, Prompt: "reclaimed from submitted"}
 	releaseCalled := false
-	checkLegacy := func() (SessionAgentCall, bool) { return reclaimed, true }
+	mb.submitted = []SessionAgentCall{reclaimed}
 	release := func() error {
 		releaseCalled = true
 		return lk.Release()
 	}
-	var newDispatcherCancelCalled bool
-	newDispatcherCancel := func() { newDispatcherCancelCalled = true }
 
-	next, hasNext, releaseErr, orphaned := mb.drainOrReleaseFinal(1, checkLegacy, newDispatcherCancel, release)
+	next, hasNext, releaseErr, orphaned := mb.drainOrReleaseFinal(1, release)
 
 	require.True(t, hasNext)
 	require.Equal(t, reclaimed, next)
 	require.NoError(t, releaseErr)
 	require.Empty(t, orphaned)
-	require.False(t, releaseCalled, "release() must NOT be invoked when the legacy queue reclaims ownership — "+
+	require.False(t, releaseCalled, "release() must NOT be invoked when mb.submitted reclaims ownership — "+
 		"the OS lock stays held for the reclaimed turn, never released-then-reacquired")
-	require.Equal(t, mbOwned, mb.state, "state must stay owned across a legacy-queue reclaim")
+	require.Equal(t, mbOwned, mb.state, "state must stay owned across a mb.submitted reclaim")
 	require.Equal(t, uint64(1), mb.epoch, "epoch must NOT bump on a same-era reclaim")
-
-	// round 11 review, MEDIUM-1: both cancel handles must be left in a state
-	// Cancel()/InterruptAndReplace() can actually use. dispatcherCancel must
-	// be the freshly-passed reclaim cancel (NOT nil, and NOT left at
-	// whatever it was before), and current.cancel must be nil so Cancel()'s
-	// `if genCancel == nil { fallback to dispatcherCancel }` branch actually
-	// fires instead of calling the just-finished, already-spent PRIOR turn's
-	// stale cancel func (a real second bug this fix's own end-to-end test,
-	// TestRun_CancelDuringLegacyReclaimWindow_ActuallyCancelsTurn2, initially
-	// caught: dispatcherCancel alone was not sufficient).
-	require.NotNil(t, mb.dispatcherCancel, "dispatcherCancel must be populated on reclaim, not left nil")
-	// Identity check, not just non-nil (round 12 review, finding B): the
-	// fixture's OWN initial dispatcherCancel was also a non-nil func, so a
-	// bare NotNil check would pass even if drainOrReleaseFinal silently
-	// failed to overwrite it with the freshly-passed reclaim cancel. Calling
-	// the field's CURRENT value must invoke the NEW closure, not the stale
-	// fixture one.
-	mb.dispatcherCancel()
-	require.True(t, newDispatcherCancelCalled, "dispatcherCancel must be the freshly-passed reclaim cancel, not left "+
-		"at whatever the mailbox held before this call")
-	require.False(t, staleDispatcherCancelCalled, "the stale, pre-reclaim dispatcherCancel must not still be reachable")
-	require.Nil(t, mb.current.cancel, "current.cancel must be cleared on reclaim — otherwise Cancel() calls the "+
-		"stale, already-spent PRIOR turn's cancel func instead of ever reaching the dispatcherCancel fallback")
-	require.Equal(t, uint64(1), mb.current.id, "current.id must be preserved (monotonic) even though its cancel is cleared")
 
 	// The OS lock must still be held by THIS process — a second acquisition
 	// attempt must fail.
 	_, lockErr := session.TryAcquireSessionLock(dataDir, sessionID)
-	require.Error(t, lockErr, "the OS lock must remain held across a legacy-queue reclaim")
+	require.Error(t, lockErr, "the OS lock must remain held across a mb.submitted reclaim")
 }
 
 // TestMailbox_DrainOrReleaseFinal_SubmittedBranchClearsStaleCancelHandle is
 // the regression test for round 12 review, finding A: the SAME MEDIUM-1
-// shape as TestMailbox_DrainOrReleaseFinal_LegacyReclaimNeverReleasesLock
-// above, but on drainOrReleaseFinal's OTHER "keep running" branch — the
-// mb.submitted queue, populated by the CURRENT (non-legacy) submit() path,
-// hit far more often in practice than the legacy-messageQueue fallback.
+// shape as TestMailbox_DrainOrReleaseFinal_SubmittedReclaimNeverReleasesLock
+// above, but explicitly checking the stale-cancel-handle postcondition.
+// The mb.submitted queue is populated by the CURRENT submit() path and
+// is now the only "keep running" branch in drainOrReleaseFinal (the former
+// checkLegacy branch was removed in #308).
 //
 // By the time this branch runs, mb.current.cancel still holds the
 // just-finished turn's own genCtx cancel func — already invoked once via
@@ -571,7 +544,7 @@ func TestMailbox_DrainOrReleaseFinal_SubmittedBranchClearsStaleCancelHandle(t *t
 		submitted:        []SessionAgentCall{queued},
 	}
 
-	next, hasNext, releaseErr, orphaned := mb.drainOrReleaseFinal(1, nil, nil, nil)
+	next, hasNext, releaseErr, orphaned := mb.drainOrReleaseFinal(1, nil)
 
 	require.True(t, hasNext)
 	require.Equal(t, queued, next)

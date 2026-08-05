@@ -188,7 +188,7 @@ func TestRun_InterruptDuringInterTurnWindow_ReplacementRunsExactlyOnce(t *testin
 	// Queue a STALE legacy message while turn 1 is still in flight — this is
 	// what the end-of-turn drain will reclaim and hand to the loop as `call`
 	// for its next iteration, strictly BEFORE the interrupt below lands.
-	sa.messageQueue.Append(sess.ID, SessionAgentCall{
+	sa.getMailbox(sess.ID).queue(SessionAgentCall{
 		SessionID:       sess.ID,
 		Prompt:          "STALE queued message, must never reach the provider",
 		MaxOutputTokens: 1000,

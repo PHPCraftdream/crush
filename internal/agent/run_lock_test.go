@@ -21,9 +21,9 @@ import (
 // Run() calls a.tryReserveSession, which calls a.getMailbox, which calls
 // a.mailboxes.GetOrSet — a nil *csync.Map receiver panics (nil pointer
 // dereference inside sync.RWMutex), so mailboxes must be initialized the
-// same way NewSessionAgent does. activeRequests/messageQueue are still
-// initialized too since Cancel/QueueMessage and related legacy call sites
-// (untouched by the mailbox migration) still read/write them. tools/
+// same way NewSessionAgent does. activeRequests is initialized too since
+// Cancel and OnStepFinish's abort-path cancel lookups still read it.
+// tools/
 // largeModel/smallModel/systemPrompt/systemPromptPrefix are initialized too
 // because Run's very next block after the lock section resolves the turn's
 // config snapshot (agent.go's resolveTurnConfig, task #265) and
@@ -42,7 +42,6 @@ func newLockTestSessionAgent(dataDir string, isSubAgent bool) *sessionAgent {
 		dataDir:            dataDir,
 		isSubAgent:         isSubAgent,
 		activeRequests:     csync.NewMap[string, context.CancelFunc](),
-		messageQueue:       csync.NewKeyedQueue[SessionAgentCall](),
 		mailboxes:          csync.NewMap[string, *mailbox](),
 		tools:              csync.NewSliceFrom[fantasy.AgentTool](nil),
 		largeModel:         csync.NewValue(Model{}),

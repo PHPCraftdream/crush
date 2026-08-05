@@ -13,15 +13,16 @@ import (
 // docs/plans/2026-08-04-session-owner-mailbox-design.md. Stages 2.1-2.4
 // wired tryReserveSession/releaseSessionReservation, InterruptAndReplace,
 // the two-tier context split, and the inject path onto it; #268/P0-4 wired
-// compaction onto beginCompact. injectQueue and sessionStartMu have been
-// deleted as fully dead, while messageQueue (QueueMessage + drain consumers)
-// remains live. activeRequests is retained for OnStepFinish abort-path
-// cancel lookups — the sessionID+"-summarize" synthetic key it used to hold
-// has been removed by #268. See
-// the design doc for the full rationale; this file implements exactly the
-// seven methods specified in sections 3, 4, and 5 there (submit,
-// drainOrRelease, interruptAndReplace, drainAfterCancel, inject,
-// drainInjects, beginGeneration, beginCompact) with no behavior deviation.
+// compaction onto beginCompact. #308 completed the migration: QueueMessage
+// and all its drain consumers moved from the legacy messageQueue to the
+// mailbox's own submitted queue, and messageQueue was removed entirely.
+// activeRequests is retained for OnStepFinish abort-path cancel lookups
+// — the sessionID+"-summarize" synthetic key it used to hold has been
+// removed by #268. See the design doc for the full rationale; this file
+// implements the mailbox methods (submit, drainOrRelease,
+// drainOrReleaseFinal, interruptAndReplace, drainAfterCancel, inject,
+// drainInjects, beginGeneration, beginCompact, queue, popFirstSubmitted)
+// with no behavior deviation.
 type mailboxState int
 
 // mbReleasing is drainOrReleaseFinal's terminal state, entered ONLY on the
@@ -259,11 +260,10 @@ type mailbox struct {
 //
 // A queued SessionAgentCall is NOT a DB row: coordinator.buildCall does
 // not create one, and the user message is only written in runTurn's
-// preamble, i.e. after a turn has already started. Both mb.submitted and
-// mb.replacement live purely in this process, and Run's cleanup defer
-// merely moves them to a.messageQueue, which is also in-memory. So on
-// shutdown a prompt that never reached a turn IS lost, with only a
-// slog.Error to show for it.
+// preamble, i.e. after a turn has already started. mb.submitted and
+// mb.replacement live purely in this process (in-memory). So on shutdown a
+// prompt that never reached a turn IS lost, with only a slog.Error to show
+// for it.
 //
 // That is the accepted trade: losing an unstarted prompt is better than
 // starting a fresh provider turn while the process is tearing its
@@ -402,67 +402,32 @@ func (mb *mailbox) drainOrRelease(epoch uint64) (SessionAgentCall, bool) {
 // eventual real owner will drain it), that manifested as a silently
 // dropped user message, not a retryable error.
 //
-// checkLegacy is called (still holding mb.mu) ONLY when mb.submitted is also
-// empty — it must perform the legacy-messageQueue.PopFront check (or
-// equivalent) and return the same (call, found) shape drainOrRelease itself
-// returns for its own submitted-queue branch. It must NOT call back into
-// this mailbox (mb.mu is not reentrant) — csync.KeyedQueue.PopFront (the
-// only real caller, see drainOrReleaseMerged) is backed by its own
-// independent sync.Mutex with no callbacks of its own, so nesting it inside
-// mb.mu here is safe (confirmed by reading internal/csync/keyedqueue.go: no
-// method calls out to anything).
-//
-// reclaimDispatcherCancel is stored into mb.dispatcherCancel, and
-// mb.current.cancel is explicitly cleared, both still under mb.mu, ONLY on
-// the checkLegacy-hit branch — round 11 review, MEDIUM-1. Before this,
-// reclaiming from the legacy queue (via the historical reclaimSameEra,
-// called with a literal nil dispatcherCancel) left mb.dispatcherCancel nil
-// AND left mb.current.cancel pointing at the JUST-FINISHED turn's own
-// cancel func — already invoked once by that turn and therefore inert, but
-// not nil. Both defects independently made Cancel()/InterruptAndReplace()
-// silently ineffective for a call landing before the reclaimed turn's own
-// beginGeneration: Cancel()'s `if genCancel == nil { fallback to
-// dispatcherCancel }` never even reached the fallback (genCancel was the
-// stale, non-nil, spent prior-turn cancel), so fixing only dispatcherCancel
-// is not sufficient on its own — both must be set here. Passing the
-// caller's runCancel as reclaimDispatcherCancel — the SAME whole-call
-// CancelFunc tryReserveSession/submit() already store in this exact field
-// for the analogous "no live generation yet" window — closes the
-// dispatcherCancel half; explicitly nil-ing current.cancel closes the rest.
-//
-// release is called ONLY when BOTH mb.submitted and checkLegacy came back
-// empty — i.e. exactly the branch that used to flip mb.state to mbIdle
-// directly. As of #296/P1-C it is called WITHOUT mb.mu held (see the
-// mbReleasing const's doc for the full state-machine rationale): mb.state is
-// set to mbReleasing and mb.mu is released before invoking it, then mb.mu is
-// reacquired to finalize once it returns. It must release the OS-level
-// session lock (or be a no-op when a.dataDir == "" and no lock was ever
-// acquired — see drainOrReleaseMerged's call site). Any error it returns is
-// surfaced to the caller for logging; it never blocks the state flip to
-// mbIdle, mirroring how Run's own `defer lk.Release()` today only logs a
-// Release failure rather than treating it as fatal — a failed unlock must
-// not leave the mailbox permanently non-mbIdle with nobody left to retry it.
-// A panic escaping release() is recovered (in the same way) and turned into
-// an error for the same reason: the mailbox must always reach a terminal
-// state, never get stuck in mbReleasing.
-//
-// The two callbacks are invoked in this exact order — checkLegacy before
-// release — precisely so a hit in the legacy queue can skip releasing the
-// OS lock entirely and keep it held for the reclaimed turn, instead of
-// releasing-then-reacquiring (which would open a real cross-process race:
-// see the historical reclaimSameEra doc, superseded by this function, for
-// why that shape is rejected).
+// release is called ONLY when BOTH mb.submitted came back empty — i.e.
+// exactly the branch that used to flip mb.state to mbIdle directly. As of
+// #296/P1-C it is called WITHOUT mb.mu held (see the mbReleasing const's doc
+// for the full state-machine rationale): mb.state is set to mbReleasing and
+// mb.mu is released before invoking it, then mb.mu is reacquired to finalize
+// once it returns. It must release the OS-level session lock (or be a no-op
+// when a.dataDir == "" and no lock was ever acquired — see
+// drainOrReleaseMerged's call site). Any error it returns is surfaced to the
+// caller for logging; it never blocks the state flip to mbIdle, mirroring
+// how Run's own `defer lk.Release()` today only logs a Release failure rather
+// than treating it as fatal — a failed unlock must not leave the mailbox
+// permanently non-mbIdle with nobody left to retry it. A panic escaping
+// release() is recovered (in the same way) and turned into an error for the
+// same reason: the mailbox must always reach a terminal state, never get
+// stuck in mbReleasing.
 //
 // Priority of branch evaluation within this function is now explicitly
-// "replacement -> submitted -> legacy -> release" (round 14 review, P0-A
+// "replacement -> submitted -> release" (round 14 review, P0-A
 // fix), closing a race where a late interrupt whose cancel lost to
 // Stream's normal completion could strand the replacement: mb.replacement
 // was set by interruptAndReplace under mb.mu, but agent.Stream returned
 // nil (not context.Canceled), so runTurn took the normal-completion path
 // instead of the isCancelErr branch's drainAfterCancel. The replacement
 // check here ensures the replacement is recovered without releasing the
-// OS lock or entering the legacy queue, preserving the same atomic state
-// machine semantics drainAfterCancel already provides for the cancel path.
+// OS lock, preserving the same atomic state machine semantics
+// drainAfterCancel already provides for the cancel path.
 //
 // One accepted trade-off from round 12 review, recorded here rather than
 // left implicit:
@@ -514,8 +479,6 @@ func (mb *mailbox) drainOrRelease(epoch uint64) (SessionAgentCall, bool) {
 // of continuing the current turn loop on a lock that is no longer held.
 func (mb *mailbox) drainOrReleaseFinal(
 	epoch uint64,
-	checkLegacy func() (SessionAgentCall, bool),
-	reclaimDispatcherCancel context.CancelFunc,
 	release func() error,
 ) (call SessionAgentCall, hasNext bool, releaseErr error, orphaned []SessionAgentCall) {
 	mb.mu.Lock()
@@ -533,11 +496,11 @@ func (mb *mailbox) drainOrReleaseFinal(
 	// why a stopped mailbox must refuse to hand a turn loop more work.
 	if !mb.stopped {
 		// Seam for deterministic test interleaving: fires right after the epoch check,
-		// before ANY queue (replacement, submitted, legacy) is consulted — this is the
-		// earliest deterministic pause point. Existing tests (e.g. run_reclaim_cancel_test.go)
-		// that relied on the seam firing only when mb.submitted is empty are unaffected
-		// because their scenarios always have mb.submitted empty and mb.replacement nil,
-		// so the flow still reaches the same checkLegacy/release branches after the seam.
+		// before ANY queue (replacement, submitted) is consulted — this is the
+		// earliest deterministic pause point. Existing tests that relied on the seam
+		// firing before the legacy-queue check are unaffected because their scenarios
+		// now queue into mb.submitted instead, so the flow still reaches the same
+		// submitted/release branches after the seam.
 		if mb.testDrainSeam != nil {
 			mb.testDrainSeam()
 		}
@@ -546,11 +509,10 @@ func (mb *mailbox) drainOrReleaseFinal(
 		// under mb.mu, but agent.Stream returned nil (not context.Canceled), so runTurn
 		// took the normal-completion path instead of the isCancelErr branch's
 		// drainAfterCancel. Without this check, the replacement is silently stranded:
-		// the drain releases ownership and the OS lock, and Run's defer can only move
-		// the payload to the legacy queue (where no runner exists) or no-op it under a
-		// new era. Priority "replacement -> submitted -> legacy -> release" is now
-		// ONE atomic state machine operation, matching drainAfterCancel's existing
-		// ordering. mb.current.cancel = nil — same invariant as every other "keep running"
+		// the drain releases ownership and the OS lock, and Run's defer
+		// can only no-op it under a new era. Priority "replacement ->
+		// submitted -> release" is now ONE atomic state machine operation,
+		// matching drainAfterCancel's existing ordering. mb.current.cancel = nil — same invariant as every other "keep running"
 		// branch (see mailbox_invariant_test.go). State stays mbOwned, OS lock untouched,
 		// epoch NOT bumped — same semantics as the existing keep-running branches.
 		if mb.replacement != nil {
@@ -564,15 +526,16 @@ func (mb *mailbox) drainOrReleaseFinal(
 			next := mb.submitted[0]
 			mb.submitted = mb.submitted[1:]
 			// mb.current.cancel must be cleared here too (round 12 review,
-			// finding A — the SAME MEDIUM-1 shape as the checkLegacy branch
-			// below, just on the more commonly hit mb.submitted path): by the
-			// time this branch runs, it still holds the JUST-FINISHED turn's
-			// own genCtx cancel — already invoked once via runTurn's
-			// unconditional `cancel()` call right before this drain — inert but
-			// NOT nil, which defeats Cancel()/InterruptAndReplace()'s
+			// finding A — the SAME MEDIUM-1 shape as the former checkLegacy
+			// branch, just on the more commonly hit mb.submitted path): by
+			// the time this branch runs, it still holds the JUST-FINISHED
+			// turn's own genCtx cancel — already invoked once via runTurn's
+			// unconditional `cancel()` call right before this drain — inert
+			// but NOT nil, which defeats Cancel()/InterruptAndReplace()'s
 			// current.cancel==nil fallback gate exactly like the original
 			// defect, for the whole window until the next turn's own
-			// beginGeneration (which can be as long as title generation takes).
+			// beginGeneration (which can be as long as title generation
+			// takes).
 			// dispatcherCancel is left untouched here (unlike the release
 			// branch below): it's already the live runCancel from submit()/the
 			// loop's own re-arm, still valid for the caller's own remaining
@@ -581,52 +544,10 @@ func (mb *mailbox) drainOrReleaseFinal(
 			mb.mu.Unlock()
 			return next, true, nil, nil // caller runs another turn; state stays mbOwned, lock stays held
 		}
-		if checkLegacy != nil {
-			if next, ok := checkLegacy(); ok {
-				// Reclaimed from the legacy queue under the SAME era — mirrors
-				// the historical reclaimSameEra's contract (no epoch bump, state
-				// stays mbOwned) but done here, still under mb.mu, instead of via
-				// a separate release-then-reclaim round trip: the OS lock is
-				// simply never released for this handoff.
-				// mb.state is set explicitly here (round 12 review, finding C),
-				// even though it's already mbOwned on every path that can reach
-				// this line today (this function has exactly one call site per
-				// era). The old reclaimSameEra both checked AND set state for
-				// exactly this reason: relying on an invariant that isn't
-				// locally re-asserted is fragile — epoch is not bumped by
-				// release, so "epoch matches && state == mbIdle" is a reachable
-				// combination in general (it's what the release branch below
-				// produces), and a future second call site for this function
-				// (e.g. once #281/#284/#285 finish the mailbox migration) could
-				// plausibly land here with state already mbIdle, silently
-				// granting two owners of the same session with the OS lock
-				// already released. Setting it explicitly costs nothing today
-				// and removes that whole class of future mistake.
-				mb.state = mbOwned
-				mb.dispatcherCancel = reclaimDispatcherCancel
-				// mb.current.cancel must ALSO be cleared here (round 11 review,
-				// MEDIUM-1 — caught by this fix's own regression test failing
-				// even with dispatcherCancel populated): it still holds the
-				// JUST-FINISHED turn's own cancel func, already invoked once
-				// (runTurn's `cancel()` call before this drain runs) and
-				// therefore inert, but NOT nil. Cancel()'s fallback to
-				// dispatcherCancel is gated on `mb.current.cancel == nil` — if
-				// it is left non-nil here, Cancel() calls the spent, harmless
-				// prior-turn cancel func instead of ever reaching the fallback,
-				// silently failing to interrupt the reclaimed turn exactly like
-				// the original defect, just via a different nil-check path.
-				// Preserve current.id (monotonic, see the generation field's
-				// doc) — only the spent cancel func is cleared, mirroring
-				// drainOrRelease's own submitted-empty branch below.
-				mb.current.cancel = nil
-				mb.mu.Unlock()
-				return next, true, nil, nil
-			}
-		}
 	}
 
 	// RELEASING (#296/P1-C): reached when stopped was already latched at
-	// entry, OR when replacement/submitted/legacy all came back empty —
+	// entry, OR when replacement/submitted all came back empty —
 	// exactly the condition that used to flip mb.state straight to mbIdle
 	// while still holding mb.mu across release()'s disk I/O. mbReleasing is
 	// published and mb.mu is dropped BEFORE calling release(): every other
@@ -758,43 +679,45 @@ func callReleaseRecoveringPanic(release func() error) (err error) {
 // has NO live turn loop left — it fires on every return from Run(),
 // including early bail-outs (OS-lock acquisition failure) and any
 // early-return inside runTurn that skipped runTurn's own final drain (an
-// error path returning before reaching it). In both cases there is nobody
-// left to hand a "keep running" answer to, so — unlike drainOrRelease —
-// this ALWAYS ends the era at mbIdle if epoch still matches, logging
-// (rather than silently keeping) anything it finds. Before this method
-// existed, Run's defer called the ordinary drainOrRelease/
-// drainOrReleaseMerged, which — on finding something in submitted — left
-// state == mbOwned with nobody running it: the session was silently wedged
-// permanently busy (IsSessionBusy true forever, every future submit()
-// silently queues behind a owner that will never drain it again).
+// error path). In both cases there is nobody left to hand a "keep
+// running" answer to, so — unlike drainOrRelease — this ALWAYS ends the
+// era at mbIdle.
+//
+// Unlike the pre-#308 version, this method does NOT drain submitted or
+// replacement out to the caller. Entries left in submitted survive in
+// place for the next owner to drain via drainOrReleaseFinal, and any
+// pending replacement is folded INTO submitted (so it becomes a normal
+// queued follow-up rather than pre-empting the next owner's first turn).
+// The former messageQueue re-queue that the caller used to perform is no
+// longer needed: the mailbox's own submitted queue is now the single
+// source of truth for queued work.
 //
 // epoch behaves exactly as in drainOrRelease: a mismatch means this era
-// already ended (a concurrent submit became the new owner, or drainOrRelease
-// already released it) — a safe no-op that touches nothing, since whatever
-// is in submitted/replacement now belongs to that later owner.
-//
-// The legacy messageQueue is deliberately NOT touched here (unlike
-// drainOrReleaseMerged): its entries are not epoch-scoped and survive
-// independently of this mailbox era, so leaving them queued is correct —
-// the NEXT Run() call for this session will reach a normal end-of-turn
-// drainOrReleaseMerged and pick them up then, not lose them.
-func (mb *mailbox) abandonOwnership(epoch uint64) (dropped []SessionAgentCall, hadWork bool) {
+// already ended (a concurrent submit became the new owner, or
+// drainOrReleaseFinal already released it) — a safe no-op that touches
+// nothing, since whatever is in submitted/replacement now belongs to
+// that later owner.
+func (mb *mailbox) abandonOwnership(epoch uint64) (hadWork bool) {
 	mb.mu.Lock()
 	defer mb.mu.Unlock()
 
 	if mb.epoch != epoch {
-		return nil, false
+		return false
 	}
-	dropped = mb.submitted
+	// Fold any pending replacement into submitted so the next owner
+	// treats it as a normal queued follow-up, not as a pre-emption
+	// target for reclaimReplacementOrKeep. A replacement left in
+	// mb.replacement across an era boundary would silently jump the
+	// queue of whatever the next owner's first turn happens to be.
 	if mb.replacement != nil {
-		dropped = append(dropped, *mb.replacement)
+		mb.submitted = append(mb.submitted, *mb.replacement)
+		mb.replacement = nil
 	}
-	mb.submitted = nil
-	mb.replacement = nil
+	hadWork = len(mb.submitted) > 0
 	mb.state = mbIdle
 	mb.current.cancel = nil // preserve id (monotonic, see the field doc) — only the cancel func is spent
 	mb.dispatcherCancel = nil
-	return dropped, len(dropped) > 0
+	return hadWork
 }
 
 // interruptAndReplace implements design §4: the coordinator's single entry
@@ -1158,13 +1081,38 @@ func (mb *mailbox) beginCompact(cancel context.CancelFunc) (epoch uint64, ok boo
 // drop-everything operation": clears submitted, replacement, and injects
 // together under mu. It does NOT release ownership (state/current/
 // dispatcherCancel are untouched) — the owner is still running and merely
-// wants its pending queues discarded, not its reservation yanked. The
-// sessionAgent.ClearQueue wrapper also clears the still-live legacy
-// messageQueue/injectQueue for completeness during the migration.
+// wants its pending queues discarded, not its reservation yanked.
 func (mb *mailbox) clearAll() {
 	mb.mu.Lock()
 	defer mb.mu.Unlock()
 	mb.submitted = nil
 	mb.replacement = nil
 	mb.injects = nil
+}
+
+// queue appends call to the submitted queue regardless of ownership state.
+// Used by QueueMessage (the fire-and-forget queue primitive) and by the
+// re-queue paths in Run's defer and runSummarize that used to target the
+// legacy messageQueue. When the session is idle, the entry survives in
+// submitted until the next submit() becomes owner and drains it via
+// drainOrReleaseFinal.
+func (mb *mailbox) queue(call SessionAgentCall) {
+	mb.mu.Lock()
+	defer mb.mu.Unlock()
+	mb.submitted = append(mb.submitted, call)
+}
+
+// popFirstSubmitted removes and returns the first entry from the submitted
+// queue, regardless of mailbox state. Used by runSummarize to extract the
+// first queued entry after abandonOwnership left work in submitted with
+// state mbIdle, so it can start a fresh Run for it.
+func (mb *mailbox) popFirstSubmitted() (SessionAgentCall, bool) {
+	mb.mu.Lock()
+	defer mb.mu.Unlock()
+	if len(mb.submitted) == 0 {
+		return SessionAgentCall{}, false
+	}
+	first := mb.submitted[0]
+	mb.submitted = mb.submitted[1:]
+	return first, true
 }

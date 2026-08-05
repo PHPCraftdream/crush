@@ -43,10 +43,8 @@ func TestP268_ManualCompactBlocksConcurrentRun(t *testing.T) {
 	mb.mu.Unlock()
 
 	// Release compaction ownership. The queued call should be handed back.
-	dropped, hadQueued := mb.abandonOwnership(epoch)
+	hadQueued := mb.abandonOwnership(epoch)
 	require.True(t, hadQueued)
-	require.Len(t, dropped, 1)
-	assert.Equal(t, "concurrent", dropped[0].Prompt)
 
 	// After release, a new submit can become owner again.
 	becomeOwner2, _ := mb.submit(SessionAgentCall{SessionID: sess.ID}, func() {})
