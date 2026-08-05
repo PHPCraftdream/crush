@@ -229,3 +229,65 @@ func TestMailbox_Invariant_NoStaleCancelHandleSurvivesAnyMutatorReturn(t *testin
 		})
 	}
 }
+
+// TestMailbox_BeginCompact_Postconditions verifies the postconditions of
+// beginCompact — the atomic acquisition method added by #268/P0-4 for
+// compaction ownership. Unlike the drain/release/abandon operations in the
+// main invariant table (whose postcondition is current.cancel == nil),
+// beginCompact STARTS an era: its postcondition is the opposite —
+// current.cancel must be freshly set (non-nil), state must be mbOwned, and
+// dispatcherCancel must be set. It is deliberately in a separate test
+// function rather than the stale-handle table because the assertion is
+// different.
+func TestMailbox_BeginCompact_Postconditions(t *testing.T) {
+	t.Run("acquires idle mailbox", func(t *testing.T) {
+		mb := &mailbox{
+			state: mbIdle,
+		}
+		myCancel := func() {}
+		epoch, ok := mb.beginCompact(myCancel)
+		require.True(t, ok, "beginCompact on an idle mailbox must succeed")
+		require.NotZero(t, epoch, "epoch must be non-zero after acquisition")
+		require.Equal(t, mbOwned, mb.state, "state must be mbOwned after acquisition")
+		require.NotNil(t, mb.current.cancel, "current.cancel must be set after acquisition "+
+			"— Cancel(sessionID) targets it instead of the old synthetic key")
+		require.NotNil(t, mb.dispatcherCancel, "dispatcherCancel must be set after acquisition "+
+			"— Cancel()'s fallback depends on it")
+	})
+
+	t.Run("refuses owned mailbox", func(t *testing.T) {
+		existingCancel := func() {}
+		mb := &mailbox{
+			state:            mbOwned,
+			epoch:            5,
+			dispatcherCancel: existingCancel,
+			current:          generation{id: 5, cancel: existingCancel},
+		}
+		_, ok := mb.beginCompact(func() {})
+		require.False(t, ok, "beginCompact on an owned mailbox must fail")
+		require.Equal(t, mbOwned, mb.state, "state must be unchanged")
+		require.Equal(t, uint64(5), mb.epoch, "epoch must be unchanged")
+		require.NotNil(t, mb.current.cancel, "current.cancel must be unchanged (non-nil)")
+		require.NotNil(t, mb.dispatcherCancel, "dispatcherCancel must be unchanged (non-nil)")
+	})
+
+	t.Run("refuses stopped mailbox", func(t *testing.T) {
+		mb := &mailbox{
+			state:   mbIdle,
+			stopped: true,
+		}
+		_, ok := mb.beginCompact(func() {})
+		require.False(t, ok, "beginCompact on a stopped mailbox must fail")
+		require.Equal(t, mbIdle, mb.state, "state must be unchanged")
+		require.Nil(t, mb.current.cancel, "current.cancel must be unchanged (nil)")
+	})
+
+	t.Run("two beginCompact calls are mutually exclusive", func(t *testing.T) {
+		mb := &mailbox{state: mbIdle}
+		_, ok1 := mb.beginCompact(func() {})
+		require.True(t, ok1, "first beginCompact must succeed")
+		_, ok2 := mb.beginCompact(func() {})
+		require.False(t, ok2, "second beginCompact on the same mailbox must fail "+
+			"— this is the core P0-4 fix: two concurrent compactions are impossible")
+	})
+}

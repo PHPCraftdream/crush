@@ -131,9 +131,11 @@ func newSummarizeCoreTestAgent(t *testing.T) (*sessionAgent, session.Session) {
 	return sa, sess
 }
 
-// TestRunSummarizeCore_QueuedMessage_ReturnsHasNext proves runSummarizeCore
-// reports the message queued (via a plain, pre-call messageQueue.Append) as
-// its `next`/`hasNext` return values, with no error.
+// TestRunSummarizeCore_QueuedMessage_ReturnsHasNext proves the summarize
+// path (now via Summarize → beginCompact → runSummarizeBody → drain)
+// processes a message queued via messageQueue as a follow-on turn.
+// runSummarizeCore was refactored into runSummarizeBody during #268/P0-4;
+// this test verifies the full public Summarize path with a queued message.
 func TestRunSummarizeCore_QueuedMessage_ReturnsHasNext(t *testing.T) {
 	sa, sess := newSummarizeCoreTestAgent(t)
 
@@ -144,23 +146,33 @@ func TestRunSummarizeCore_QueuedMessage_ReturnsHasNext(t *testing.T) {
 	}
 	sa.messageQueue.Append(sess.ID, queued)
 
-	next, hasNext, err := sa.runSummarizeCore(t.Context(), sess.ID, fantasy.ProviderOptions{}, false)
+	// Summarize acquires ownership via beginCompact, runs the body, releases,
+	// then drains messageQueue and starts a follow-on Run for the queued call.
+	err := sa.Summarize(t.Context(), sess.ID, fantasy.ProviderOptions{})
 	require.NoError(t, err)
-	assert.True(t, hasNext, "expected hasNext=true when a message was queued before runSummarizeCore ran")
-	assert.Equal(t, queued.Prompt, next.Prompt, "expected the drained call to match the queued call's Prompt")
-	assert.Equal(t, sess.ID, next.SessionID)
+
+	// The follow-on Run must have created the queued user message in the DB.
+	msgs, listErr := sa.messages.List(t.Context(), sess.ID)
+	require.NoError(t, listErr)
+	found := false
+	for _, m := range msgs {
+		msg := m
+		if msg.Role == message.User && msg.Content().Text == queued.Prompt {
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "queued prompt must have been processed as a follow-on turn")
 }
 
 // TestRunSummarizeCore_NoQueuedMessage_ReturnsNoNext is the negative
-// counterpart: with nothing queued, hasNext must be false and next must be
-// the zero value.
+// counterpart: with nothing queued, Summarize completes cleanly.
+// runSummarizeCore was refactored into runSummarizeBody during #268/P0-4.
 func TestRunSummarizeCore_NoQueuedMessage_ReturnsNoNext(t *testing.T) {
 	sa, sess := newSummarizeCoreTestAgent(t)
 
-	next, hasNext, err := sa.runSummarizeCore(t.Context(), sess.ID, fantasy.ProviderOptions{}, false)
-	require.NoError(t, err)
-	assert.False(t, hasNext, "expected hasNext=false when nothing was queued")
-	assert.Equal(t, SessionAgentCall{}, next, "expected the zero value when nothing was queued")
+	err := sa.Summarize(t.Context(), sess.ID, fantasy.ProviderOptions{})
+	require.NoError(t, err, "Summarize must succeed when nothing is queued")
 }
 
 // --- Test B: runSummarize (top-level /compact entry point) -----------------
@@ -229,8 +241,10 @@ func TestRunSummarize_QueuedMessage_RunsAsFollowOnTurn(t *testing.T) {
 	}
 	sa.messageQueue.Append(sess.ID, queued)
 
-	err = sa.runSummarize(t.Context(), sess.ID, fantasy.ProviderOptions{})
-	require.NoError(t, err, "runSummarize must not error when draining a queued message into a fresh a.Run() call")
+	// Use the public Summarize API which handles ownership acquisition internally
+	// via beginCompact (the P0-4 fix).
+	err = sa.Summarize(t.Context(), sess.ID, fantasy.ProviderOptions{})
+	require.NoError(t, err, "Summarize must not error when draining a queued message into a fresh a.Run() call")
 
 	after, err := env.messages.List(t.Context(), sess.ID)
 	require.NoError(t, err)

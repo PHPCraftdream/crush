@@ -224,6 +224,19 @@ const sessionPreambleMaxDurationDefault = 60 * time.Second
 // via effectiveTitleGenerationMaxDuration below.
 const titleGenerationMaxDurationDefault = 2 * time.Minute
 
+// summaryCommitMaxDuration bounds the silent compaction's COMMIT phase — the
+// SetSummaryAndUsage write plus the deletion of the messages it replaces
+// (P0-4 review follow-up).
+//
+// That phase deliberately runs on context.WithoutCancel: interrupting it
+// between "summary pointer written" and "old messages deleted" is how a
+// session's history gets unrecoverably holed, so cancellation must not be
+// able to land in the middle. Detaching from cancellation without a deadline
+// would recreate the unbounded-operation-holds-Run shape P1-B removed, hence
+// this bound. The provider stream is already finished by then; what remains
+// is local single-writer DB work, so 30s is generous rather than tight.
+const summaryCommitMaxDuration = 30 * time.Second
+
 // titleJoinGrace bounds how long runTurn's deferred join waits for the
 // title goroutine AFTER that goroutine's own deadline should already have
 // fired (P1-B).
@@ -517,18 +530,18 @@ type sessionAgent struct {
 	// Still live: only tryReserveSession/releaseSessionReservation and
 	// InterruptAndReplace have migrated to the mailbox (design §7 stages
 	// 2.1-2.3); QueueMessage and its drain consumers
-	// (drainOrReleaseMerged, PrepareStep, runSummarizeCore, QueuedPrompts,
+	// (drainOrReleaseMerged, PrepareStep, runSummarizeBody, QueuedPrompts,
 	// ClearQueue, Run's re-queue defer) still read/write this queue
 	// directly. Removed once those move to the mailbox.
 	messageQueue *csync.KeyedQueue[SessionAgentCall]
-	// activeRequests is retained solely for the sessionID+"-summarize"
-	// synthetic key that runSummarize/runSummarizeCore register as their
-	// cancel target (Cancel, CancelAll, IsBusy still read it, filtered to
-	// that suffix). Migration to mailbox.compact is deferred to #268;
-	// until then this field MUST stay. Plain-sessionID entries it
-	// accumulated pre-migration are inert (already-fired cancelFuncs) and
-	// are no longer consulted for busy state (IsSessionBusy reads the
-	// mailbox).
+	// activeRequests is retained for the per-turn cancel that
+	// OnStepFinish's max-cost / max-tokens / peak-hours abort paths still
+	// look up directly (Cancel/CancelAll now route through the mailbox
+	// instead). The sessionID+"-summarize" synthetic key that used to live
+	// here has been removed (#268/P0-4: compaction now owns the mailbox via
+	// beginCompact, so its cancel lives in mailbox.current.cancel). Plain
+	// sessionID entries are inert (already-fired cancelFuncs) and are no
+	// longer consulted for busy state (IsSessionBusy reads the mailbox).
 	activeRequests *csync.Map[string, context.CancelFunc]
 	// summarizeQueue holds a pending manual-summarise request per session,
 	// queued while the session was busy.
@@ -538,9 +551,10 @@ type sessionAgent struct {
 	// 2.1-2.4 migrated tryReserveSession/releaseSessionReservation,
 	// InterruptAndReplace, the two-tier context split, and the inject path
 	// onto the mailbox; injectQueue and sessionStartMu have been deleted as
-	// fully dead. messageQueue (QueueMessage + its drain consumers) and
-	// activeRequests (the sessionID+"-summarize" cancel key, deferred to
-	// #268) remain live and are removed in later stages. One mailbox per
+	// fully dead. messageQueue (QueueMessage + its drain consumers) remains
+	// live. activeRequests is retained for OnStepFinish abort-path cancel
+	// lookups; the sessionID+"-summarize" synthetic key has been removed
+	// (#268). Both are removed in later stages. One mailbox per
 	// session id, created lazily on first touch via GetOrSet and never
 	// explicitly deleted — same "one map, lazily populated, entries live
 	// forever" lifetime as activeRequests today.
@@ -1142,7 +1156,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 
 	// Turn loop: replaces the three recursive a.Run(ctx, ...) call sites
 	// that used to live inside runTurn's body (cancel-drain, end-of-turn
-	// drain, and the /compact drain in runSummarizeCore). Each iteration
+	// drain, and the /compact drain in runSummarizeBody). Each iteration
 	// runs exactly one provider turn; runTurn reports whether another
 	// queued call should run next, using the reservation and OS lock
 	// acquired once above instead of re-acquiring them. runCtx (not the
@@ -1665,9 +1679,15 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 		return peakHoursAbortErr
 	}
 
-	// bgSummarizeLaunched ensures we launch at most one background
-	// summarisation per Run() call (fired the first time we trim the window).
-	var bgSummarizeLaunched bool
+	// silentCompactNeeded records that PrepareStep's sliding-window trim
+	// fired this turn. The silent compact runs SYNCHRONOUSLY after the turn's
+	// main work completes (under the turn's mailbox ownership), not as a
+	// background goroutine — a goroutine that deleted messages concurrently
+	// with the active turn was the P0-4 data-corruption bug (#268). Running
+	// synchronously under the same ownership guarantees no concurrent turn or
+	// compaction can touch the history while the compact's snapshot/delete
+	// is in flight.
+	var silentCompactNeeded bool
 
 	// Fork patch: batch 8 — auto-checkpoint state for mid-stream
 	// persistence. See CHANGELOG.fork.md section 6.
@@ -1997,23 +2017,13 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 						targetTokens := int64(float64(cw) * contextSlideRatio)
 						prepared.Messages = trimMessagesToWindow(prepared.Messages, targetTokens)
 
-						// Silently compact the oldest 50% of messages in the
-						// background so the main task keeps running uninterrupted.
-						if !bgSummarizeLaunched {
-							bgSummarizeLaunched = true
-							bgCtx, bgCancel := context.WithTimeout(
-								context.WithoutCancel(callContext),
-								10*time.Minute,
-							)
-							bgOpts := call.ProviderOptions
-							bgSessionID := call.SessionID
-							go func() {
-								defer bgCancel()
-								if bgErr := a.runSummarizeSilent(bgCtx, bgSessionID, bgOpts); bgErr != nil {
-									slog.Warn("background silent summarise failed", "session_id", bgSessionID, "err", bgErr)
-								}
-							}()
-						}
+						// Record that a silent compact is needed — it runs
+						// synchronously AFTER the turn completes (under the
+						// turn's mailbox ownership), not as a concurrent
+						// goroutine. A goroutine deleting messages while the
+						// turn is still streaming was the P0-4 data corruption
+						// bug (#268).
+						silentCompactNeeded = true
 					}
 				}
 			}
@@ -2720,34 +2730,20 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 	}
 
 	if shouldSummarize {
-		// Run the compaction inline (runSummarizeCore, not the public
+		// Run the compaction inline (runSummarizeBody, not the public
 		// Summarize/runSummarize path) so it never calls back into Run():
 		// Run() is still on the stack here, holding the OS lock and the
-		// busy reservation for call.SessionID for the whole turn loop, and
-		// runSummarize's own tail used to recurse into a.Run() to drain any
-		// message queued during the summarize stream — which would have
-		// tried to re-acquire the same still-held OS lock.
-		//
-		// ownsMailbox=true: this call is inline inside runTurn, which — via
-		// Run's turn loop — already holds call.SessionID's mailbox
-		// reservation for the whole loop. Because of that, runSummarizeCore
-		// deliberately does NOT drain-or-release on our behalf (see its doc):
-		// this call always returns hasNext=false when ownsMailbox=true, and
-		// anything queued during the summarize stream simply stays parked in
-		// mailbox.submitted for THIS function's own end-of-turn
-		// drainOrRelease call, a few lines below, to pick up — the single
-		// true final drain point for the whole turn, summarize included.
-		_, summarizeHasNext, summarizeErr := a.runSummarizeCore(genCtx, call.SessionID, call.ProviderOptions, true)
+		// busy reservation for call.SessionID for the whole turn loop. This
+		// call already holds the mailbox via the turn loop's submit, so
+		// runSummarizeBody does not touch ownership at all — it only performs
+		// the summarisation body itself. Anything queued during the summarize
+		// stream simply stays parked in mailbox.submitted for THIS function's
+		// own end-of-turn drainOrRelease call, a few lines below, to pick up
+		// — the single true final drain point for the whole turn, summarize
+		// included.
+		summarizeErr := a.runSummarizeBody(genCtx, call.SessionID, call.ProviderOptions)
 		if summarizeErr != nil {
 			return nil, summarizeErr, SessionAgentCall{}, false
-		}
-		if summarizeHasNext {
-			// Not reachable today (see above), but if runSummarizeCore's
-			// contract ever changes to return true while ownsMailbox=true,
-			// fail loudly rather than silently dropping the call it handed
-			// back — dropping it here would reintroduce exactly the P0-3
-			// lost-message shape this migration exists to close.
-			return nil, fmt.Errorf("agent: runSummarizeCore unexpectedly returned hasNext=true while owning the mailbox"), SessionAgentCall{}, false
 		}
 		mb := a.getMailbox(call.SessionID)
 		// If the agent wasn't done...
@@ -2757,6 +2753,19 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 		if hasPendingToolCalls {
 			call.Prompt = fmt.Sprintf("The previous session was interrupted because it got too long, the initial user request was: `%s`", call.Prompt)
 			mb.submit(call, nil)
+		}
+	}
+
+	// Silent compact of the oldest half (P0-4/#268): runs synchronously under
+	// the turn's mailbox ownership — not as a background goroutine — so no
+	// concurrent turn or compaction can delete/rewrite history while it is in
+	// flight. Skipped when shouldSummarize already ran a full compaction
+	// above (the two would be redundant, and running both would race for
+	// SummaryMessageID). genCtx is still alive here (cancel() hasn't fired
+	// yet), so Cancel(sessionID) can interrupt this if needed.
+	if !shouldSummarize && silentCompactNeeded {
+		if silentErr := a.runSummarizeSilent(genCtx, call.SessionID, call.ProviderOptions); silentErr != nil {
+			slog.Warn("silent summarise failed", "session_id", call.SessionID, "err", silentErr)
 		}
 	}
 
@@ -2800,38 +2809,52 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 var ErrSummarizeQueued = errors.New("summarize queued")
 
 func (a *sessionAgent) Summarize(ctx context.Context, sessionID string, opts fantasy.ProviderOptions) error {
-	if a.IsSessionBusy(sessionID) {
+	// Atomic check-and-reserve (#268/P0-4, design §6): beginCompact makes
+	// us the sole owner of sessionID's mailbox or returns false if a turn
+	// or another compaction already owns it. This replaces the old
+	// non-atomic IsSessionBusy + runSummarize pair that had a TOCTOU window
+	// between the busy check and the compaction's DB writes — a concurrent
+	// Run could start between the check and the first delete, corrupting
+	// history.
+	genCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	mb := a.getMailbox(sessionID)
+	epoch, ok := mb.beginCompact(cancel)
+	if !ok {
+		cancel()
 		a.summarizeQueue.Set(sessionID, opts)
 		return ErrSummarizeQueued
 	}
-	return a.runSummarize(ctx, sessionID, opts)
+	return a.runSummarize(ctx, genCtx, sessionID, opts, mb, epoch, cancel)
 }
 
-// runSummarize is the top-level entry point for a standalone manual
-// /compact request (called from Summarize, which is itself called directly
-// by the web server's handlers.go — NOT nested inside a Run() call). It runs
-// the compaction via runSummarizeCore and, if a message was queued during
-// the summarize stream, starts a fresh Run() for it. That a.Run() call here
-// is safe (unlike the one runSummarizeCore used to make internally): this
-// call stack does not hold sessionID's OS lock or busy reservation — Run()
-// was never on the stack to begin with, since Summarize's busy-check above
-// already routed the "session is mid-turn" case into the summarizeQueue
-// instead of reaching here.
-func (a *sessionAgent) runSummarize(ctx context.Context, sessionID string, opts fantasy.ProviderOptions) error {
-	// ownsMailbox=false: this call stack never claimed sessionID's mailbox
-	// reservation (see the doc above) — runSummarizeCore must not drain
-	// or release the MAIN session mailbox on our behalf, only its own
-	// synthetic "-summarize" activeRequests slot, or it could yank
-	// ownership out from under a genuinely concurrent Run() for the same
-	// session (pre-existing hazard, tracked separately as #268/P0-4).
-	next, hasNext, err := a.runSummarizeCore(ctx, sessionID, opts, false)
+// runSummarize runs a manual /compact under mailbox ownership acquired by
+// Summarize's beginCompact call. After the compaction body completes, it
+// releases ownership via abandonOwnership (handing back any Run that queued
+// behind it via mailbox.submit during the stream) and starts a fresh Run for
+// the first queued call — the same drain shape the old runSummarizeCore tail
+// had, now operating on mailbox ownership instead of a synthetic
+// activeRequests key.
+func (a *sessionAgent) runSummarize(ctx context.Context, genCtx context.Context, sessionID string, opts fantasy.ProviderOptions, mb *mailbox, epoch uint64, cancel context.CancelFunc) error {
+	defer cancel()
+	err := a.runSummarizeBody(genCtx, sessionID, opts)
+	// Release mailbox ownership. Any work queued via mb.submit during the
+	// compaction is collected here; re-queue it to the legacy messageQueue so
+	// the Run started below (or a future Run) drains it via checkLegacy.
+	dropped, _ := mb.abandonOwnership(epoch)
+	for _, d := range dropped {
+		a.messageQueue.Append(d.SessionID, d)
+	}
 	if err != nil {
 		return err
 	}
+	// Drain legacy queue (covers both mailbox-drained work above and direct
+	// QueueMessage callers not yet migrated — #308) and start a Run for the
+	// first queued call.
+	firstQueued, hasNext := a.messageQueue.PopFront(sessionID)
 	if !hasNext {
 		return nil
 	}
-	_, runErr := a.Run(ctx, next)
+	_, runErr := a.Run(ctx, firstQueued)
 	return runErr
 }
 
@@ -2849,68 +2872,40 @@ func (a *sessionAgent) CancelQueuedSummarize(sessionID string) {
 	a.summarizeQueue.Del(sessionID)
 }
 
-// runSummarizeCore performs the actual summarisation without a busy-check.
-// It uses the sessionID+"-summarize" key in activeRequests so it can run
-// concurrently with a regular Run() call on the same session.
+// runSummarizeBody performs the actual summarisation: load messages, snapshot
+// non-pinned IDs for deletion, create the summary message, stream the
+// summary, persist it, wire up SummaryMessageID, and delete the old messages.
+// It performs NO busy-check and NO ownership management — the caller must
+// already hold sessionID's mailbox ownership (via beginCompact for
+// standalone /compact, or via the turn loop's submit for inline
+// auto-summarize). The caller's cancel is already registered in the mailbox
+// (current.cancel), so Cancel(sessionID) naturally targets this compaction
+// — no synthetic "sessionID-summarize" key.
 //
-// Unlike the code this replaced, it does NOT call back into a.Run() to drain
-// a message queued during the summarize stream — it returns that call to
-// the caller instead. This matters because runSummarizeCore has two very
-// different callers with two very different stack shapes:
-//
-//  1. runSummarize (top-level, from Summarize/handlers.go): no Run() is on
-//     the stack, so it's safe for THAT caller to start a fresh a.Run() with
-//     the drained call.
-//  2. runTurn's shouldSummarize branch (nested, mid-turn /compact): Run()
-//     IS on the stack, still holding sessionID's OS lock and busy
-//     reservation for the entire turn loop — calling a.Run() again from
-//     here would try to re-acquire that same still-held OS lock and fail
-//     with "already in use" (the exact bug this refactor fixes). That
-//     caller instead appends the drained call onto messageQueue so the
-//     existing turn loop picks it up on its next iteration.
-//
-// ownsMailbox tells runSummarizeCore whether the caller already holds
-// sessionID's mailbox reservation (mbOwned) for the entire call stack:
-//   - true from runTurn's shouldSummarize branch — Run's turn loop already
-//     owns the mailbox, so this function's own final drain is safe to route
-//     through the SAME mailbox.drainOrRelease as runTurn's own end-of-turn
-//     drain (it observes/mutates the state the caller is already holding).
-//   - false from the standalone runSummarize path (manual /compact via
-//     Summarize/handlers.go) — that call stack never claimed the mailbox
-//     (Summarize's IsSessionBusy check routes a busy session into
-//     summarizeQueue instead of reaching here), so calling
-//     mailbox.drainOrRelease here would be operating on a mailbox this call
-//     does not own: it could incorrectly idle out a genuinely concurrent
-//     Run() for the same session, or hand back a call that belongs to that
-//     other owner. When false, this function does not touch the main
-//     session mailbox at all — only its own synthetic "-summarize"
-//     activeRequests slot, exactly as before this migration.
-func (a *sessionAgent) runSummarizeCore(ctx context.Context, sessionID string, opts fantasy.ProviderOptions, ownsMailbox bool) (next SessionAgentCall, hasNext bool, resErr error) {
+// genCtx is the caller's already-cancel-scoped context (beginCompact's
+// cancel for manual /compact, or the turn's genCtx for inline
+// auto-summarize).
+func (a *sessionAgent) runSummarizeBody(ctx context.Context, sessionID string, opts fantasy.ProviderOptions) error {
 	// Copy mutable fields under lock to avoid races with SetModels.
 	largeModel := a.largeModel.Get()
 	systemPromptPrefix := a.systemPromptPrefix.Get()
 
 	currentSession, err := a.sessions.Get(ctx, sessionID)
 	if err != nil {
-		return SessionAgentCall{}, false, fmt.Errorf("failed to get session: %w", err)
+		return fmt.Errorf("failed to get session: %w", err)
 	}
 	msgs, err := a.getSessionMessages(ctx, currentSession)
 	if err != nil {
-		return SessionAgentCall{}, false, err
+		return err
 	}
 	if len(msgs) == 0 {
 		// Nothing to summarize.
-		return SessionAgentCall{}, false, nil
+		return nil
 	}
 
 	// Snapshot non-pinned message IDs for deletion AFTER the summary stream
-	// completes. Without this manual /compact mirrored runSummarizeSilent only
-	// halfway: it created the summary + reset PromptTokens, but left every
-	// historical message in the DB. A subsequent Run that took session.
-	// SummaryMessageID into account via getSessionMessages worked logically,
-	// but the dangling rows bloated the DB and made provider usage look
-	// inconsistent because the cut never made it to the wire. Symmetric to
-	// the silent path now: pinned messages stay; everything else goes.
+	// completes. The summary message itself is created BELOW, after this
+	// snapshot, so it is never in toDelete. Pinned messages stay.
 	var toDelete []message.Message
 	for _, m := range msgs {
 		if !m.Pinned {
@@ -2919,14 +2914,6 @@ func (a *sessionAgent) runSummarizeCore(ctx context.Context, sessionID string, o
 	}
 
 	aiMsgs, _ := a.preparePrompt(msgs, nil)
-
-	summarizeKey := sessionID + "-summarize"
-	genCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
-	a.activeRequests.Set(summarizeKey, cancel)
-	defer a.activeRequests.Del(summarizeKey)
-	defer cancel()
-	// Fork merge note: FlushAll deleted with the debounced layer — see the
-	// Run() entry point above for context.
 
 	agent := fantasy.NewAgent(
 		largeModel.Model,
@@ -2941,12 +2928,12 @@ func (a *sessionAgent) runSummarizeCore(ctx context.Context, sessionID string, o
 		IsSummaryMessage: true,
 	})
 	if err != nil {
-		return SessionAgentCall{}, false, err
+		return err
 	}
 
 	summaryPromptText := buildSummaryPrompt(currentSession.Todos)
 
-	resp, err := agent.Stream(genCtx, fantasy.AgentStreamCall{
+	resp, err := agent.Stream(ctx, fantasy.AgentStreamCall{
 		Prompt:          summaryPromptText,
 		Messages:        aiMsgs,
 		Headers:         sessionHeaders(sessionID),
@@ -2959,19 +2946,9 @@ func (a *sessionAgent) runSummarizeCore(ctx context.Context, sessionID string, o
 			return callContext, prepared, nil
 		},
 		OnReasoningDelta: func(id string, text string) error {
-			// task #222: propagate summarize-stream progress into the
-			// activity-notify chain composed by runTurn's shouldSummarize
-			// branch (genCtx there descends from a ctx that already carries
-			// withActivityNotify — see that branch's call into
-			// runSummarizeCore). Reuses the existing mechanism with zero new
-			// plumbing: when runSummarizeCore is instead called from the
-			// standalone runSummarize (manual /compact), ctx carries no
-			// activity-notify value and this is correctly a no-op — that
-			// caller never holds sessionID's OS lock in the first place (see
-			// runSummarize's doc comment), so there is nothing to protect.
 			notifyActivity(ctx)
 			summaryMessage.AppendReasoningContent(text)
-			return a.messages.Update(genCtx, summaryMessage)
+			return a.messages.Update(ctx, summaryMessage)
 		},
 		OnReasoningEnd: func(id string, reasoning fantasy.ReasoningContent) error {
 			notifyActivity(ctx)
@@ -2982,34 +2959,32 @@ func (a *sessionAgent) runSummarizeCore(ctx context.Context, sessionID string, o
 				}
 			}
 			summaryMessage.FinishThinking()
-			return a.messages.Update(genCtx, summaryMessage)
+			return a.messages.Update(ctx, summaryMessage)
 		},
 		OnTextDelta: func(id, text string) error {
 			notifyActivity(ctx)
 			summaryMessage.AppendContent(text)
-			return a.messages.Update(genCtx, summaryMessage)
+			return a.messages.Update(ctx, summaryMessage)
 		},
 	})
 	if err != nil {
-		isCancelErr := errors.Is(err, context.Canceled)
-		if isCancelErr {
-			// User cancelled summarize we need to remove the summary message.
+		if errors.Is(err, context.Canceled) {
+			// User cancelled summarize; remove the summary message.
 			deleteErr := a.messages.Delete(ctx, summaryMessage.ID)
-			return SessionAgentCall{}, false, deleteErr
+			return deleteErr
 		}
 		// Mark the summary message as finished with an error so the UI
 		// stops spinning.
 		summaryMessage.AddFinish(message.FinishReasonError, "Summarization Error", err.Error())
 		if updateErr := a.messages.Update(ctx, summaryMessage); updateErr != nil {
-			return SessionAgentCall{}, false, updateErr
+			return updateErr
 		}
-		return SessionAgentCall{}, false, err
+		return err
 	}
 
 	summaryMessage.AddFinish(message.FinishReasonEndTurn, "", "")
-	err = a.messages.Update(genCtx, summaryMessage)
-	if err != nil {
-		return SessionAgentCall{}, false, err
+	if err = a.messages.Update(ctx, summaryMessage); err != nil {
+		return err
 	}
 
 	var openrouterCost *float64
@@ -3024,85 +2999,39 @@ func (a *sessionAgent) runSummarizeCore(ctx context.Context, sessionID string, o
 		}
 	}
 
-	// Re-fetch the session to pick up any user edits (e.g. todo changes) that
-	// happened while the summary was streaming, then overlay our own fields.
+	// Re-fetch the session to pick up any user edits that happened while the
+	// summary was streaming, then overlay our own fields.
 	freshSession, err := a.sessions.Get(ctx, sessionID)
 	if err != nil {
-		return SessionAgentCall{}, false, fmt.Errorf("failed to re-fetch session before save: %w", err)
+		return fmt.Errorf("failed to re-fetch session before save: %w", err)
 	}
 	costDelta := a.updateSessionUsage(largeModel, &freshSession, resp.TotalUsage, openrouterCost)
 	if costDelta != 0 {
-		if _, costErr := a.sessions.IncrementCost(genCtx, freshSession.ID, costDelta); costErr != nil {
-			return SessionAgentCall{}, false, costErr
+		if _, costErr := a.sessions.IncrementCost(ctx, freshSession.ID, costDelta); costErr != nil {
+			return costErr
 		}
 	}
 
-	// Just in case, get just the last usage info. Use upstream's
-	// summaryCompletionTokens helper (origin/main 6ed8852b) so we fall back
-	// to an approximate count when the provider omits OutputTokens on the
-	// summary stream's final usage chunk.
 	usage := resp.Response.Usage
-	if err := a.sessions.SetSummaryAndUsage(genCtx, freshSession.ID, summaryMessage.ID, 0, summaryCompletionTokens(usage, summaryMessage)); err != nil {
-		return SessionAgentCall{}, false, err
+	if err := a.sessions.SetSummaryAndUsage(ctx, freshSession.ID, summaryMessage.ID, 0, summaryCompletionTokens(usage, summaryMessage)); err != nil {
+		return err
 	}
 
 	// Now that the summary is persisted and SummaryMessageID is wired up,
 	// drop the historical non-pinned messages. The summary message itself was
-	// created AFTER the snapshot above so it is not in toDelete. Any user
-	// messages that landed via messageQueue during the stream are also safe —
-	// they are not in this snapshot either.
+	// created AFTER the snapshot above so it is not in toDelete.
 	for _, m := range toDelete {
 		if delErr := a.messages.Delete(ctx, m.ID); delErr != nil {
-			slog.Warn("manual summarise: failed to delete old message", "id", m.ID, "err", delErr)
+			slog.Warn("summarise: failed to delete old message", "id", m.ID, "err", delErr)
 		}
 	}
 
-	// Fork merge note (origin/main 61f49b23 "drain queued messages after manual
-	// session summarize"): upstream added this drain to keep the user's queued
-	// messages flowing after a manual /compact. Our Summarize() outer wrapper
-	// uses a separate summarizeQueue keyed by sessionID, so the busy state
-	// here is the "-summarize" key — releasing it does NOT release the main
-	// Run()'s lock.
-	a.activeRequests.Del(sessionID + "-summarize")
-	cancel()
-	if !ownsMailbox {
-		// Standalone /compact (runSummarize): this call stack never claimed
-		// the main session mailbox (see ownsMailbox's doc above), so it must
-		// not drain-or-release it — doing so could yank ownership out from
-		// under a genuinely concurrent Run() for the same session. This does
-		// NOT mean nothing can have been queued during the stream: the
-		// public QueueMessage/messageQueue path (untouched by this
-		// migration — see agent.go's mailbox migration notes) is still a
-		// live, legacy way for a caller to queue work for sessionID
-		// independent of the mailbox, so this call site keeps draining THAT
-		// queue exactly as it did before, unrelated to mailbox ownership.
-		firstQueuedMessage, ok := a.messageQueue.PopFront(sessionID)
-		if !ok {
-			return SessionAgentCall{}, false, nil
-		}
-		return firstQueuedMessage, true, nil
-	}
-	// ownsMailbox=true (runTurn's shouldSummarize branch): deliberately do
-	// NOT call mailbox.drainOrRelease here. This function's return is not
-	// the true end of the owning turn — runTurn does more work after it
-	// returns (the hasPendingToolCalls follow-up a few lines below in the
-	// caller, which may itself feed another call into the SAME mailbox) and
-	// only then reaches its own single true final drainOrRelease call. If
-	// this function released ownership here (by finding `submitted` empty
-	// at this intermediate point) and runTurn's own follow-up subsequently
-	// called mailbox.submit again, that submit would incorrectly believe it
-	// was becoming a BRAND NEW owner — reopening a window for a genuinely
-	// concurrent submit to land between this release and that re-claim and
-	// end up racing runTurn's still-live goroutine for ownership. Anything
-	// queued during the summarize stream simply stays in mailbox.submitted
-	// and is picked up by runTurn's own end-of-turn drainOrRelease call
-	// exactly like any other queued item — no separate return path is
-	// needed here at all.
-	return SessionAgentCall{}, false, nil
+	return nil
 }
 
-// runSummarizeSilent compacts the oldest half of the session's messages in
-// the background without any visible change in the UI. It:
+// runSummarizeSilent compacts the oldest half of the session's messages
+// synchronously under the caller's mailbox ownership without any visible
+// change in the UI. It:
 //  1. Loads all current messages, splits them at the midpoint.
 //  2. Sends the older half to the LLM for summarisation.
 //  3. Creates a hidden summary message (not rendered in the UI).
@@ -3145,12 +3074,6 @@ func (a *sessionAgent) runSummarizeSilent(ctx context.Context, sessionID string,
 
 	aiMsgs, _ := a.preparePrompt(toSummarise, nil)
 
-	summarizeKey := sessionID + "-summarize"
-	genCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
-	a.activeRequests.Set(summarizeKey, cancel)
-	defer a.activeRequests.Del(summarizeKey)
-	defer cancel()
-
 	agent := fantasy.NewAgent(
 		largeModel.Model,
 		fantasy.WithSystemPrompt(string(summaryPrompt)),
@@ -3169,7 +3092,7 @@ func (a *sessionAgent) runSummarizeSilent(ctx context.Context, sessionID string,
 	}
 
 	summaryPromptText := buildSummaryPrompt(currentSession.Todos)
-	resp, err := agent.Stream(genCtx, fantasy.AgentStreamCall{
+	resp, err := agent.Stream(ctx, fantasy.AgentStreamCall{
 		Prompt:          summaryPromptText,
 		Messages:        aiMsgs,
 		Headers:         sessionHeaders(sessionID),
@@ -3183,7 +3106,7 @@ func (a *sessionAgent) runSummarizeSilent(ctx context.Context, sessionID string,
 		},
 		OnReasoningDelta: func(id string, text string) error {
 			summaryMessage.AppendReasoningContent(text)
-			return a.messages.Update(genCtx, summaryMessage)
+			return a.messages.Update(ctx, summaryMessage)
 		},
 		OnReasoningEnd: func(id string, reasoning fantasy.ReasoningContent) error {
 			if anthropicData, ok := reasoning.ProviderMetadata["anthropic"]; ok {
@@ -3192,11 +3115,11 @@ func (a *sessionAgent) runSummarizeSilent(ctx context.Context, sessionID string,
 				}
 			}
 			summaryMessage.FinishThinking()
-			return a.messages.Update(genCtx, summaryMessage)
+			return a.messages.Update(ctx, summaryMessage)
 		},
 		OnTextDelta: func(id, text string) error {
 			summaryMessage.AppendContent(text)
-			return a.messages.Update(genCtx, summaryMessage)
+			return a.messages.Update(ctx, summaryMessage)
 		},
 	})
 	if err != nil {
@@ -3207,22 +3130,34 @@ func (a *sessionAgent) runSummarizeSilent(ctx context.Context, sessionID string,
 	}
 
 	summaryMessage.AddFinish(message.FinishReasonEndTurn, "", "")
-	if err = a.messages.Update(genCtx, summaryMessage); err != nil {
+	if err = a.messages.Update(ctx, summaryMessage); err != nil {
 		return err
 	}
 
-	// Delete the non-pinned old messages that were replaced by the summary.
-	for _, m := range toSummarise {
-		if delErr := a.messages.Delete(ctx, m.ID); delErr != nil {
-			slog.Warn("silent summarise: failed to delete old message", "id", m.ID, "err", delErr)
-		}
-	}
-	_ = pinnedOld // pinned messages stay in the DB untouched
+	// COMMIT PHASE — the order and the context were both wrong here, and
+	// P0-4's own change is what made that reachable.
+	//
+	// Order: wire up SummaryMessageID BEFORE deleting the messages it
+	// replaces, exactly as runSummarizeBody does (see its comment at the
+	// equivalent point). This function did the opposite. Interrupted between
+	// the two, that leaves the old half deleted with no summary pointer
+	// standing in for it — getSessionMessages then finds neither, and the
+	// history is unrecoverably holed.
+	//
+	// Context: the commit must not be tearable by cancellation. While the
+	// silent compaction was a detached goroutine on context.WithoutCancel,
+	// this window was unreachable. Making it synchronous (P0-4) put it on the
+	// turn's cancellable genCtx and turned a long-standing latent ordering
+	// bug into a live one, reachable via Stop in the web UI, CancelAll on
+	// shutdown, --timeout, or the turn's own stream watchdog. Bounded rather
+	// than unbounded: the provider stream is already finished, so what
+	// remains is local DB work.
+	commitCtx, commitCancel := context.WithTimeout(context.WithoutCancel(ctx), summaryCommitMaxDuration)
+	defer commitCancel()
 
-	// Update session: point SummaryMessageID to the new hidden summary and
-	// reset token counters so the next call gets an accurate remaining-context
-	// estimate.
-	freshSession, err := a.sessions.Get(ctx, sessionID)
+	// Point SummaryMessageID at the new hidden summary and reset token
+	// counters so the next call gets an accurate remaining-context estimate.
+	freshSession, err := a.sessions.Get(commitCtx, sessionID)
 	if err != nil {
 		return fmt.Errorf("silent summarise: failed to re-fetch session: %w", err)
 	}
@@ -3237,11 +3172,26 @@ func (a *sessionAgent) runSummarizeSilent(ctx context.Context, sessionID string,
 	}
 	costDelta := a.updateSessionUsage(largeModel, &freshSession, resp.TotalUsage, openrouterCost)
 	if costDelta != 0 {
-		if _, costErr := a.sessions.IncrementCost(genCtx, freshSession.ID, costDelta); costErr != nil {
+		if _, costErr := a.sessions.IncrementCost(commitCtx, freshSession.ID, costDelta); costErr != nil {
 			return costErr
 		}
 	}
-	return a.sessions.SetSummaryAndUsage(genCtx, freshSession.ID, summaryMessage.ID, 0, resp.Response.Usage.OutputTokens)
+	if err := a.sessions.SetSummaryAndUsage(commitCtx, freshSession.ID, summaryMessage.ID, 0, resp.Response.Usage.OutputTokens); err != nil {
+		// Nothing has been deleted yet, so the session is still whole: the
+		// compaction simply did not happen, and the next turn retries it.
+		return err
+	}
+
+	// Only now, with the summary persisted AND pointed at, drop what it
+	// replaces. A failure here is survivable — the summary already stands in
+	// for these rows, so the worst case is redundant history, not a hole.
+	for _, m := range toSummarise {
+		if delErr := a.messages.Delete(commitCtx, m.ID); delErr != nil {
+			slog.Warn("silent summarise: failed to delete old message", "id", m.ID, "err", delErr)
+		}
+	}
+	_ = pinnedOld // pinned messages stay in the DB untouched
+	return nil
 }
 
 func (a *sessionAgent) getCacheControlOptions() fantasy.ProviderOptions {
@@ -3816,7 +3766,8 @@ func (a *sessionAgent) Cancel(sessionID string) {
 	// earlier via QueueMessage for an unrelated reason. ClearQueue remains
 	// the one intentional "drop everything queued" operation. The mailbox
 	// (whose current.cancel is populated by beginGeneration in Run's loop
-	// and runTurn) is now the cancel target instead of activeRequests.
+	// and runTurn, and by beginCompact for synchronous compactions) is now
+	// the cancel target instead of activeRequests.
 	//
 	// Falls back to dispatcherCancel when no generation is live yet: Run
 	// claims the mailbox (submit stores runCancel as dispatcherCancel) and
@@ -3837,13 +3788,6 @@ func (a *sessionAgent) Cancel(sessionID string) {
 	if genCancel != nil {
 		slog.Debug("Request cancellation initiated", "session_id", sessionID)
 		genCancel()
-	}
-
-	// Summarize requests still use the legacy activeRequests slot (not yet
-	// migrated to the mailbox — design §6, deferred to #268).
-	if cancel, ok := a.activeRequests.Get(sessionID + "-summarize"); ok && cancel != nil {
-		slog.Debug("Summarize cancellation initiated", "session_id", sessionID)
-		cancel()
 	}
 }
 
@@ -3943,17 +3887,6 @@ func (a *sessionAgent) CancelAll() {
 			dispatcherCancel()
 		}
 	}
-	// Legacy "-summarize" cancel slot isn't tracked by the mailbox (design
-	// §6, deferred to #268) — still needs its own sweep here. Filtered to
-	// that suffix specifically: activeRequests ALSO still holds a
-	// permanently-stale, non-nil (already-fired) entry per plain sessionID
-	// (see IsBusy's doc) — iterating it unfiltered would re-fire Cancel on
-	// every session this process has ever touched, not just the busy ones.
-	for key, cancel := range a.activeRequests.Seq2() {
-		if cancel != nil && strings.HasSuffix(key, "-summarize") {
-			cancel()
-		}
-	}
 
 	timeout := time.After(5 * time.Second)
 	for a.IsBusy() {
@@ -3988,16 +3921,6 @@ func (a *sessionAgent) IsBusy() bool {
 		busy := mb.state == mbOwned
 		mb.mu.Unlock()
 		if busy {
-			return true
-		}
-	}
-	// Legacy "-summarize" cancel slot isn't tracked by the mailbox (design
-	// §6, deferred to #268) — a live standalone /compact still counts as
-	// busy for shutdown-drain purposes. Filtered to that suffix
-	// specifically — see CancelAll's matching comment for why an
-	// unfiltered scan would be permanently true.
-	for key, cancelFunc := range a.activeRequests.Seq2() {
-		if cancelFunc != nil && strings.HasSuffix(key, "-summarize") {
 			return true
 		}
 	}
