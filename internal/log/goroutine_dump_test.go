@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -195,4 +196,50 @@ func TestCaptureGoroutineStack_ReturnsBeforeSlowWrite(t *testing.T) {
 	assert.False(t, writeFinished.Load(), "write must still be pending — this proves capture did not wait for it")
 
 	close(releaseWrite)
+}
+
+// TestWriteGoroutineDump_ConcurrentDumpsDoNotCollide is the regression test
+// for task #275: the dump filename used to be built from PID + a timestamp
+// with ONE-SECOND precision alone. Several wedged sub-agent turns inside one
+// process can each fire the stream watchdog within the same second, and
+// their dumps then land on the identical path — silently overwriting or
+// interleaving the only diagnostic evidence available, precisely when it is
+// most needed.
+func TestWriteGoroutineDump_ConcurrentDumpsDoNotCollide(t *testing.T) {
+	dir := t.TempDir()
+	prev := logDir.Load()
+	logDir.Store(dir)
+	t.Cleanup(func() {
+		if s, ok := prev.(string); ok {
+			logDir.Store(s)
+		} else {
+			logDir.Store("")
+		}
+	})
+
+	const n = 20
+	paths := make([]string, n)
+	var wg sync.WaitGroup
+	for i := range n {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			buf := CaptureGoroutineStack("concurrent dump test")
+			path, err := WriteGoroutineDump(buf)
+			require.NoError(t, err)
+			paths[i] = path
+		}(i)
+	}
+	wg.Wait()
+
+	seen := make(map[string]bool, n)
+	for _, p := range paths {
+		require.NotEmpty(t, p)
+		require.False(t, seen[p], "duplicate dump path %q — two concurrent dumps collided onto the same file", p)
+		seen[p] = true
+	}
+
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	assert.Len(t, entries, n, "every concurrent dump must have produced its own file on disk")
 }

@@ -15,6 +15,14 @@ import (
 // in which case DumpGoroutines falls back to the OS temp dir.
 var logDir atomic.Value // string
 
+// dumpSeq disambiguates two dumps from the SAME process that land in the
+// same wall-clock second (task #275): several wedged sub-agent turns can
+// each fire the stream watchdog within one second, and PID+timestamp alone
+// then collide, silently overwriting or interleaving diagnostic dumps at
+// exactly the moment they are most needed. A process-local monotonic
+// counter is enough — the PID already disambiguates across processes.
+var dumpSeq atomic.Uint64
+
 // SetLogDirForTest points WriteGoroutineDump's target directory at dir for
 // the duration of the calling test, restoring the previous value via
 // t.Cleanup. Exists so tests OUTSIDE this package (e.g.
@@ -112,8 +120,12 @@ func WriteGoroutineDump(buf []byte) (string, error) {
 	}
 
 	// PID + timestamp so concurrent crush processes sharing one .crush dir
-	// (the normal case for parallel `crush run`) never overwrite each other.
-	name := fmt.Sprintf("goroutines-%d-%s.txt", os.Getpid(), time.Now().Format("20060102-150405"))
+	// (the normal case for parallel `crush run`) never overwrite each
+	// other, plus a monotonic sequence number so multiple dumps from THIS
+	// process within the same wall-clock second don't collide either
+	// (task #275).
+	seq := dumpSeq.Add(1)
+	name := fmt.Sprintf("goroutines-%d-%s-%03d.txt", os.Getpid(), time.Now().Format("20060102-150405"), seq)
 	path := filepath.Join(dir, name)
 
 	if err := os.WriteFile(path, buf, 0o644); err != nil {
