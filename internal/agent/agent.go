@@ -2889,8 +2889,55 @@ func (a *sessionAgent) Summarize(ctx context.Context, sessionID string, opts fan
 // the first queued call — the same drain shape the old runSummarizeCore tail
 // had, now operating on mailbox ownership instead of a synthetic
 // activeRequests key.
+//
+// #312: Cross-process compaction serialization
+//
+// Manual compaction (this path) acquires the OS session lock before calling
+// runSummarizeBody and releases it after. This prevents another process from
+// starting a Run() for the same session while the compaction's commit phase
+// (set SummaryMessageID + delete messages) is in flight.
+//
+// Inline compaction paths (runTurn's shouldSummarize and silentCompactNeeded)
+// do NOT go through this function — they call runSummarizeBody or
+// runSummarizeSilent directly while already holding the OS lock via the parent
+// Run() call. No deadlock is possible because those paths never acquire a
+// second lock.
+//
+// OS lock acquisition happens AFTER beginCompact succeeds and mb.mu is
+// released, avoiding #296's I/O-under-mu anti-pattern. The lock is held for
+// the entire runSummarizeBody call to protect both the LLM stream and the
+// commit phase, matching Run()'s lock-hold semantics.
 func (a *sessionAgent) runSummarize(ctx context.Context, genCtx context.Context, sessionID string, opts fantasy.ProviderOptions, mb *mailbox, epoch uint64, cancel context.CancelFunc) error {
 	defer cancel()
+
+	// #312: Acquire OS session lock for cross-process serialization.
+	// Manual compaction runs outside any Run() call, so the OS lock is not
+	// already held. Acquiring it here prevents another process from starting
+	// a concurrent Run() that would race with the compaction's DB writes.
+	var lk *session.SessionLock
+	if a.dataDir != "" {
+		var lockErr error
+		lk, lockErr = session.TryAcquireSessionLock(a.dataDir, sessionID)
+		if lockErr != nil {
+			var busyErr *session.SessionLockBusyError
+			if errors.As(lockErr, &busyErr) {
+				slog.Warn(
+					"agent.runSummarize: rejected — session locked by another process",
+					"session_id", sessionID,
+					"holder_pid", busyErr.HolderPID,
+					"lock_path", busyErr.Path,
+				)
+				// Release mailbox ownership and return error so the caller can retry.
+				_ = mb.abandonOwnership(epoch)
+				return fmt.Errorf("session %q is already in use: %w", sessionID, lockErr)
+			}
+			slog.Error("agent.runSummarize: failed to acquire inter-process session lock, refusing to compact unprotected",
+				"session_id", sessionID, "err", lockErr)
+			_ = mb.abandonOwnership(epoch)
+			return fmt.Errorf("session %q: could not acquire session lock: %w", sessionID, lockErr)
+		}
+	}
+
 	err := a.runSummarizeBody(genCtx, sessionID, opts)
 	// Release mailbox ownership. abandonOwnership leaves any work queued
 	// during the compaction in mb.submitted (folding replacement into it),
@@ -2898,8 +2945,26 @@ func (a *sessionAgent) runSummarize(ctx context.Context, genCtx context.Context,
 	// started below to drain.
 	_ = mb.abandonOwnership(epoch)
 	if err != nil {
+		// Release OS lock on error path too.
+		if lk != nil {
+			if relErr := lk.Release(); relErr != nil {
+				slog.Debug("agent.runSummarize: release session lock failed", "session_id", sessionID, "err", relErr)
+			}
+		}
 		return err
 	}
+
+	// Release OS lock before calling Run, so the follow-on turn can acquire it.
+	// The lock MUST be held for runSummarizeBody (including its commit phase),
+	// but MUST NOT be held for the follow-on Run, or the process would deadlock
+	// trying to acquire the same lock it already holds (see agent.go ~1169 comment
+	// about the old recursive-Run() deadlock).
+	if lk != nil {
+		if relErr := lk.Release(); relErr != nil {
+			slog.Debug("agent.runSummarize: release session lock failed", "session_id", sessionID, "err", relErr)
+		}
+	}
+
 	// Start a Run for the first queued entry. The Run becomes owner via
 	// submit() (mbIdle) and drains remaining entries via end-of-turn
 	// drainOrReleaseFinal calls.
@@ -3043,6 +3108,20 @@ func (a *sessionAgent) runSummarizeBody(ctx context.Context, sessionID string, o
 		return err
 	}
 
+	// COMMIT PHASE — the commit must not be tearable by cancellation.
+	//
+	// Without WithoutCancel, a cancellation (Stop, CancelAll, --timeout, stream
+	// watchdog) could land between SetSummaryAndUsage and the deletes, leaving
+	// the session in a holed state: summary pointer is set but old messages
+	// still exist, getSessionMessages sees neither, history is unrecoverably
+	// corrupt.
+	//
+	// Bounded rather than unbounded: the provider stream is already finished,
+	// so what remains is local DB work. Uses the same timeout as
+	// runSummarizeSilent.
+	commitCtx, commitCancel := context.WithTimeout(context.WithoutCancel(ctx), summaryCommitMaxDuration)
+	defer commitCancel()
+
 	var openrouterCost *float64
 	for _, step := range resp.Steps {
 		stepCost := a.openrouterCost(step.ProviderMetadata)
@@ -3057,19 +3136,21 @@ func (a *sessionAgent) runSummarizeBody(ctx context.Context, sessionID string, o
 
 	// Re-fetch the session to pick up any user edits that happened while the
 	// summary was streaming, then overlay our own fields.
-	freshSession, err := a.sessions.Get(ctx, sessionID)
+	freshSession, err := a.sessions.Get(commitCtx, sessionID)
 	if err != nil {
 		return fmt.Errorf("failed to re-fetch session before save: %w", err)
 	}
 	costDelta := a.updateSessionUsage(largeModel, &freshSession, resp.TotalUsage, openrouterCost)
 	if costDelta != 0 {
-		if _, costErr := a.sessions.IncrementCost(ctx, freshSession.ID, costDelta); costErr != nil {
+		if _, costErr := a.sessions.IncrementCost(commitCtx, freshSession.ID, costDelta); costErr != nil {
 			return costErr
 		}
 	}
 
 	usage := resp.Response.Usage
-	if err := a.sessions.SetSummaryAndUsage(ctx, freshSession.ID, summaryMessage.ID, 0, summaryCompletionTokens(usage, summaryMessage)); err != nil {
+	if err := a.sessions.SetSummaryAndUsage(commitCtx, freshSession.ID, summaryMessage.ID, 0, summaryCompletionTokens(usage, summaryMessage)); err != nil {
+		// Nothing has been deleted yet, so the session is still whole: the
+		// compaction simply did not happen, and the next turn retries it.
 		return err
 	}
 
@@ -3077,7 +3158,7 @@ func (a *sessionAgent) runSummarizeBody(ctx context.Context, sessionID string, o
 	// drop the historical non-pinned messages. The summary message itself was
 	// created AFTER the snapshot above so it is not in toDelete.
 	for _, m := range toDelete {
-		if delErr := a.messages.Delete(ctx, m.ID); delErr != nil {
+		if delErr := a.messages.Delete(commitCtx, m.ID); delErr != nil {
 			slog.Warn("summarise: failed to delete old message", "id", m.ID, "err", delErr)
 		}
 	}
