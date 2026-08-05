@@ -140,8 +140,46 @@ func registerProvider(cfg *config.Config, providerID, modelID string, contextWin
 	return config.SelectedModel{Provider: providerID, Model: modelID}
 }
 
+// isolateAllGlobalConfigPaths redirects every environment variable that
+// config.GlobalConfig()/config.GlobalConfigData() (and the XDG fallbacks
+// they defer to) can resolve through, plus skill discovery's own
+// CRUSH_SKILLS_DIR, so config.Init below can never read the operator's real
+// ~/.config/crush/crush.json nor ~/.claude/skills into a test. Without the
+// skills isolation specifically, a test asserting the rendered coder prompt
+// does NOT mention "delegat" (TestBuild_WorkerNotConfigured_PromptByteIdentical)
+// fails or flakes depending on what skills happen to be installed on the
+// machine running the test — several real skill descriptions contain that
+// substring (task #324, found by @oh's review of the #319/#321 round).
+//
+// This is a package-local twin of internal/config's, internal/agent's, and
+// internal/server's identically-named helpers: the logic must stay
+// identical, but it can't be shared as a single file because these are
+// separate Go packages and all copies are test-only.
+func isolateAllGlobalConfigPaths(t *testing.T) {
+	t.Helper()
+
+	tmp := t.TempDir()
+	configDir := filepath.Join(tmp, "global-config")
+	dataDir := filepath.Join(tmp, "global-data")
+	skillsDir := filepath.Join(tmp, "global-skills")
+
+	t.Setenv("CRUSH_GLOBAL_CONFIG", configDir)
+	t.Setenv("XDG_CONFIG_HOME", configDir)
+	t.Setenv("CRUSH_GLOBAL_DATA", dataDir)
+	t.Setenv("XDG_DATA_HOME", dataDir)
+	t.Setenv("CRUSH_SKILLS_DIR", skillsDir)
+
+	// Without this, provider discovery makes a real network call to Catwalk
+	// (and Hyper) the first time it runs against a fresh, cache-empty
+	// isolated data dir — see internal/cmd/providers_test.go's and
+	// internal/server/handlers_test.go's identical use of this env var for
+	// the same reason.
+	t.Setenv("CRUSH_PROVIDER_CACHE_ONLY", "1")
+}
+
 func testConfigStore(t *testing.T) *config.ConfigStore {
 	t.Helper()
+	isolateAllGlobalConfigPaths(t)
 	workingDir := t.TempDir()
 	store, err := config.Init(workingDir, "", false)
 	require.NoError(t, err)
