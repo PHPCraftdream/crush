@@ -121,3 +121,95 @@ func TestQueue_ClaimPending_Empty(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, claimed, 0)
 }
+
+// TestQueue_ReclaimRunning_ResetsOrphanedTaskToPending is the regression test
+// for finding 3 of task #272 (P1-3): a task claimed into 'running' by a
+// runner that then crashed/was killed before writing a final status used to
+// stay 'running' forever — no future `queue run` would ever pick it up again
+// (ClaimPending only looks at 'pending' rows). ReclaimRunning is the
+// recovery path queueRunCmd now calls, once per invocation, immediately
+// after winning the process-exclusive queue.lock.
+func TestQueue_ReclaimRunning_ResetsOrphanedTaskToPending(t *testing.T) {
+	db := setupTestDB(t)
+	q := NewService(db)
+	ctx := context.Background()
+
+	id, err := q.Add(ctx, "", "orphaned", "", 0, 0, 0)
+	require.NoError(t, err)
+
+	claimed, err := q.ClaimPending(ctx, 1)
+	require.NoError(t, err)
+	require.Len(t, claimed, 1)
+
+	// Simulate the abandoned runner having partially written metrics before
+	// it died (e.g. a crash between running the child and calling
+	// UpdateStatus) — ReclaimRunning must wipe these so the task starts
+	// completely clean on its next attempt, not with a previous attempt's
+	// stale cost/tokens/exit_reason bleeding into the retry.
+	_, err = db.ExecContext(ctx, "UPDATE queue_tasks SET cost = 1.23, tokens = 99, exit_reason = 'leftover' WHERE id = ?", id)
+	require.NoError(t, err)
+
+	task, err := q.Get(ctx, id)
+	require.NoError(t, err)
+	require.Equal(t, StatusRunning, task.Status)
+	require.True(t, task.StartedAt.Valid, "precondition: started_at must be set by ClaimPending")
+
+	reclaimed, err := q.ReclaimRunning(ctx)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, reclaimed)
+
+	task, err = q.Get(ctx, id)
+	require.NoError(t, err)
+	assert.Equal(t, StatusPending, task.Status, "orphaned running task must become pending again, or it is unreachable forever")
+	assert.Equal(t, float64(0), task.Cost)
+	assert.Equal(t, int64(0), task.Tokens)
+	assert.Equal(t, "", task.ExitReason)
+	assert.False(t, task.StartedAt.Valid, "started_at must be cleared so the task looks like a fresh, never-attempted task")
+	assert.False(t, task.FinishedAt.Valid)
+
+	// The reclaimed task must be claimable again by a subsequent queue run —
+	// this is the actual symptom the bug produced (task permanently
+	// unreachable by any future `queue run`).
+	reclaimedTasks, err := q.ClaimPending(ctx, 1)
+	require.NoError(t, err)
+	require.Len(t, reclaimedTasks, 1)
+	assert.Equal(t, id, reclaimedTasks[0].ID)
+}
+
+// TestQueue_ReclaimRunning_DoesNotTouchPendingDoneOrFailed guards against a
+// reclaim implementation that is too broad (e.g. a WHERE clause that matches
+// more than 'running'). Only orphaned 'running' rows may be reset; pending,
+// done, and failed tasks must be left exactly as they are.
+func TestQueue_ReclaimRunning_DoesNotTouchPendingDoneOrFailed(t *testing.T) {
+	db := setupTestDB(t)
+	q := NewService(db)
+	ctx := context.Background()
+
+	pendingID, err := q.Add(ctx, "", "still-pending", "", 0, 0, 0)
+	require.NoError(t, err)
+
+	doneID, err := q.Add(ctx, "", "already-done", "", 0, 0, 0)
+	require.NoError(t, err)
+	require.NoError(t, q.UpdateStatus(ctx, doneID, StatusDone, 0.5, 100, "stop"))
+
+	failedID, err := q.Add(ctx, "", "already-failed", "", 0, 0, 0)
+	require.NoError(t, err)
+	require.NoError(t, q.UpdateStatus(ctx, failedID, StatusFailed, 0, 0, "error"))
+
+	reclaimed, err := q.ReclaimRunning(ctx)
+	require.NoError(t, err)
+	assert.EqualValues(t, 0, reclaimed, "no 'running' rows exist, so reclaim must be a no-op")
+
+	pending, err := q.Get(ctx, pendingID)
+	require.NoError(t, err)
+	assert.Equal(t, StatusPending, pending.Status)
+
+	done, err := q.Get(ctx, doneID)
+	require.NoError(t, err)
+	assert.Equal(t, StatusDone, done.Status)
+	assert.InDelta(t, 0.5, done.Cost, 0.001, "done task's recorded cost must survive an unrelated reclaim call")
+
+	failed, err := q.Get(ctx, failedID)
+	require.NoError(t, err)
+	assert.Equal(t, StatusFailed, failed.Status)
+}

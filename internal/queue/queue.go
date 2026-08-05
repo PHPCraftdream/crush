@@ -170,6 +170,45 @@ func (s *Service) UpdateStatus(ctx context.Context, id string, status TaskStatus
 	return err
 }
 
+// ReclaimRunning resets every task stuck in 'running' back to 'pending' so a
+// future `queue run` can pick it up again, clearing the run-scoped fields
+// (cost/tokens/exit_reason/started_at/finished_at) left over from the
+// abandoned attempt.
+//
+// Callers MUST call this only while holding the process-exclusive queue.lock
+// OS lock (see acquireSpawnLock in internal/cmd/queue.go) — winning that lock
+// is authoritative proof no other `queue run` is alive, because a live
+// runner keeps the OS lock held for its entire run (flock/LockFileEx
+// auto-releases only on process death, mirroring internal/session/lock.go's
+// SessionLock). Given that invariant, EVERY row still marked 'running' at
+// this point necessarily belongs to a previous runner that died or was
+// killed before it could write a final status; there is no live owner it
+// could ever steal from.
+//
+// This deliberately does NOT use a per-task lease, heartbeat, runner ID, or
+// any mtime/PID-based liveness threshold. Task #269 (see
+// internal/session/lock.go's package doc) found that reclaiming a lock by
+// "PID looks dead" or "mtime looks stale" can steal ownership from a holder
+// that is merely busy on one long tool call (up to ~45 minutes is normal),
+// producing two simultaneous owners. That failure mode requires multiple
+// candidate owners racing a time/liveness guess. The queue has none: only
+// one process can ever hold queue.lock at a time, so there is nothing for a
+// threshold to disambiguate — the OS lock itself is the exact, zero-latency
+// answer "is a previous runner still alive", with no window in which a
+// healthy runner can be mistaken for a dead one.
+func (s *Service) ReclaimRunning(ctx context.Context) (int64, error) {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE queue_tasks
+		    SET status = 'pending', cost = 0, tokens = 0, exit_reason = '',
+		        started_at = NULL, finished_at = NULL
+		  WHERE status = 'running'`,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("reclaim running tasks: %w", err)
+	}
+	return res.RowsAffected()
+}
+
 // Remove deletes a task by ID (only if in a terminal state).
 func (s *Service) Remove(ctx context.Context, id string) error {
 	_, err := s.db.ExecContext(ctx,

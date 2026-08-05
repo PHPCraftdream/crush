@@ -214,6 +214,24 @@ reason) are written back to the queue.`,
 
 		q := queue.NewService(a.DB())
 		ctx := cmd.Context()
+
+		// Reclaim tasks orphaned in 'running' by a previous runner that
+		// crashed, was killed, or lost its process before it could write
+		// a final status. This is safe to do unconditionally right here
+		// because we already hold queue.lock (acquireSpawnLock above),
+		// and per queue.ReclaimRunning's doc comment that lock is
+		// authoritative proof no other `queue run` is alive right now —
+		// so every 'running' row at this point belongs to a dead
+		// runner, never a live-but-busy one. See that doc comment for
+		// why this does NOT use a lease/heartbeat/PID-liveness
+		// threshold (task #269's lesson: time/PID-based reclaim can
+		// steal from a runner merely busy on one long tool call).
+		if reclaimed, rerr := q.ReclaimRunning(ctx); rerr != nil {
+			return fmt.Errorf("failed to reclaim orphaned running tasks: %w", rerr)
+		} else if reclaimed > 0 {
+			fmt.Fprintf(os.Stderr, "reclaimed %d orphaned running task(s)\n", reclaimed)
+		}
+
 		processed := 0
 
 		for maxTasks <= 0 || processed < maxTasks {
@@ -255,19 +273,48 @@ reason) are written back to the queue.`,
 				}
 
 				var firstErr error
+				var statusErr error
 				for range tasks {
 					r := <-ch
 					processed++
+					finalStatus := queue.StatusDone
 					if r.err != nil {
 						slog.Error("queue task failed", "id", r.task.ID, "err", r.err)
-						_ = q.UpdateStatus(ctx, r.task.ID, queue.StatusFailed, r.cost, r.tokens, r.exitReason)
-						if stopOnFail && firstErr == nil {
-							firstErr = fmt.Errorf("task %s failed: %w", r.task.ID, r.err)
-							runCancel()
-						}
-					} else {
-						_ = q.UpdateStatus(ctx, r.task.ID, queue.StatusDone, r.cost, r.tokens, r.exitReason)
+						finalStatus = queue.StatusFailed
 					}
+					// Surface, never swallow: the pre-fix code did
+					// `_ = q.UpdateStatus(...)` on both branches. A failed
+					// status write here is worse than a failed task — the
+					// row is left stuck in 'running' with no lease/heartbeat
+					// to time it out (see queue.ReclaimRunning's doc comment
+					// for why THIS process's own crash between here and its
+					// next `queue run` invocation is exactly what that
+					// reclaim path is for; a live DB error in this same
+					// process must still be reported, not hidden). Record it
+					// and keep draining the channel so every task still gets
+					// its UpdateStatus attempt and every goroutine is
+					// reaped, but remember to fail the command afterward.
+					if uerr := q.UpdateStatus(ctx, r.task.ID, finalStatus, r.cost, r.tokens, r.exitReason); uerr != nil {
+						wrapped := fmt.Errorf("persist final status for task %s (%s): %w", r.task.ID, finalStatus, uerr)
+						slog.Error("queue task status update failed", "id", r.task.ID, "status", finalStatus, "err", uerr)
+						if statusErr == nil {
+							statusErr = wrapped
+						} else {
+							statusErr = fmt.Errorf("%w; %w", statusErr, wrapped)
+						}
+					}
+					if r.err != nil && stopOnFail && firstErr == nil {
+						firstErr = fmt.Errorf("task %s failed: %w", r.task.ID, r.err)
+						runCancel()
+					}
+				}
+				// A status-persistence failure takes priority: it means the
+				// task's outcome could not be recorded at all (stuck in
+				// 'running' until the next `queue run` reclaims it), which
+				// is a strictly worse outcome than a recorded task failure
+				// and must not be masked by firstErr staying nil.
+				if statusErr != nil {
+					return statusErr
 				}
 				return firstErr
 			}()
@@ -401,14 +448,29 @@ func runQueueTask(ctx context.Context, cwd, dataDir string, task queue.Task) (fl
 		}
 	}
 
-	// Parse JSON output to extract cost/tokens.
+	// Parse JSON output to extract cost/tokens. A parse failure here means
+	// the child's stdout was corrupted, empty, or not JSON at all (crash
+	// mid-write, a non-JSON banner/error bleeding onto stdout, an early
+	// pipe close) — it must be reported as a task failure, not silently
+	// treated as success. The pre-fix code returned a nil error here, which
+	// the caller (queueRunCmd.RunE) took as "task succeeded" and persisted
+	// StatusDone with zeroed cost/tokens, hiding a broken run entirely.
+	//
+	// The error carries a length-bounded excerpt of stdout (via the
+	// package's existing truncate helper, defined in sessions.go and already
+	// used a few lines up in queueShowCmd for its own Prompt preview) rather
+	// than the full output: a misbehaving child can write arbitrarily large
+	// stdout before failing to emit valid JSON, and the operator only needs
+	// enough of the head to see why parsing failed, not the whole blob
+	// logged/wrapped into an error chain.
 	var result struct {
 		CostUSD    float64 `json:"cost_usd"`
 		Tokens     int64   `json:"tokens"`
 		ExitReason string  `json:"exit_reason"`
 	}
 	if jsonErr := json.Unmarshal(output, &result); jsonErr != nil {
-		return 0, 0, "", nil
+		excerpt := truncate(string(output), 512)
+		return 0, 0, "", fmt.Errorf("parse crush run JSON output: %w (stdout excerpt: %q)", jsonErr, excerpt)
 	}
 	return result.CostUSD, result.Tokens, result.ExitReason, nil
 }
