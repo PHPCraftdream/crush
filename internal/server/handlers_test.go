@@ -1,6 +1,7 @@
 package server
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -128,6 +129,39 @@ func TestSaveAttachmentToDisk_UsesDataDirNotWorkingDir(t *testing.T) {
 func TestSaveAttachmentToDisk_EmptyDataDirErrors(t *testing.T) {
 	_, err := saveAttachmentToDisk("", "notes.txt", []byte("hello"))
 	require.Error(t, err)
+}
+
+// TestSaveAttachmentToDisk_SameNameSameSecondDoesNotCollide is the
+// regression test for task #274: the filename used to be built from a
+// timestamp with ONE-SECOND precision plus filepath.Base(fileName) alone.
+// Two uploads of the same-named file within the same second produced the
+// identical path, so the second os.WriteFile call silently overwrote the
+// first upload's content with no error and no signal to the caller.
+func TestSaveAttachmentToDisk_SameNameSameSecondDoesNotCollide(t *testing.T) {
+	dataDir := t.TempDir()
+
+	const n = 20
+	paths := make([]string, n)
+	for i := range n {
+		path, err := saveAttachmentToDisk(dataDir, "report.txt", []byte(fmt.Sprintf("upload-%d", i)))
+		require.NoError(t, err)
+		paths[i] = path
+	}
+
+	seen := make(map[string]bool, n)
+	for _, p := range paths {
+		require.False(t, seen[p], "duplicate path %q — two uploads collided onto the same file", p)
+		seen[p] = true
+	}
+
+	// Every upload's own content must still be intact under its own path —
+	// not merely distinct paths, but that none of the writes clobbered
+	// another.
+	for i, p := range paths {
+		data, err := os.ReadFile(p)
+		require.NoError(t, err)
+		require.Equal(t, fmt.Sprintf("upload-%d", i), string(data))
+	}
 }
 
 // TestAttachmentsDataDir_UsesConfiguredDataDirectory is the regression test

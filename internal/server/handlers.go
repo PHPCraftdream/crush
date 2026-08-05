@@ -22,6 +22,7 @@ import (
 	"github.com/charmbracelet/crush/internal/session"
 	"github.com/charmbracelet/crush/internal/skills"
 	"github.com/charmbracelet/crush/internal/version"
+	"github.com/google/uuid"
 
 	"charm.land/catwalk/pkg/catwalk"
 )
@@ -174,7 +175,11 @@ func saveAttachmentToDisk(dataDir, fileName string, data []byte) (string, error)
 		return "", fmt.Errorf("create attachments dir: %w", err)
 	}
 	ts := time.Now().Format("2006-01-02_15-04-05")
-	name := ts + "_" + filepath.Base(fileName)
+	// A uuid suffix, not just the second-precision timestamp, guarantees a
+	// unique filename even for two same-named attachments uploaded within
+	// the same second (task #274) -- os.WriteFile below would otherwise
+	// silently let the second upload overwrite the first's content.
+	name := ts + "_" + uuid.NewString()[:8] + "_" + filepath.Base(fileName)
 	path := filepath.Join(dir, name)
 	if err := os.WriteFile(path, data, 0o644); err != nil {
 		return "", fmt.Errorf("write attachment: %w", err)
