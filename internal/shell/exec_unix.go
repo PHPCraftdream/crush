@@ -76,19 +76,44 @@ func isolateProcess(cmd *exec.Cmd) {
 // holds for exactly the "direct child exits, backgrounded grandchild
 // lingers holding stdio" shape.
 //
-// Known accepted gap, NOT covered by the above: a grandchild that
-// deliberately escapes this process group by calling setsid() itself (the
-// classic double-fork daemonize pattern, or an explicit `setsid cmd &`
-// shell invocation) is no longer a member of pgid X and will not receive
-// the negative-PID kill — cmd.Wait() would then block until ctx-independent
-// termination. This is a narrower and more deliberate evasion than the
-// ordinary backgrounded-job case above (`nohup`/`disown`/plain `&` do NOT
-// call setsid and remain covered); fixing it would require walking the
-// full process tree (as Windows' taskkill /T does, see exec_windows.go)
-// rather than relying on a single process-group signal, and was judged out
-// of scope for this LOW-priority investigation since it has not been
-// observed in practice, unlike cliprovider's grandchild bug which was a
-// real, reproducible CI failure.
+// Which of the two signals below actually does the unwedging, for the
+// ordinary `foo &` case: NOT the initial SIGINT. POSIX (XCU 2.11)
+// requires a non-job-control shell to set SIGINT/SIGQUIT to SIG_IGN for
+// asynchronous (backgrounded) commands, and bash/dash/ksh all do this —
+// so the SIGINT below is delivered and ignored by a plain background job.
+// It's the SIGKILL sent killTimeout later that actually reaches and kills
+// it, unblocking cmd.Wait() at that point (bounded by killTimeout, not
+// instant — see TestProcessIsolation_GrandchildHoldingStdoutDoesNotWedgeForever's
+// 4s assertion window, not the ctx deadline alone).
+//
+// Known accepted gaps, NOT covered by the above:
+//   - A grandchild that deliberately escapes this process group by
+//     calling setsid() itself (the classic double-fork daemonize
+//     pattern, or an explicit `setsid cmd &` shell invocation) is no
+//     longer a member of pgid X and will not receive the negative-PID
+//     kill.
+//   - Same escape, different trigger: `bash -c 'set -m; foo &'` enables
+//     job control non-interactively, which puts the backgrounded job in
+//     its OWN process group without any setsid() call at all.
+//
+// Either way cmd.Wait() would then block until ctx-independent
+// termination. Both are narrower and more deliberate than the ordinary
+// backgrounded-job case above (`nohup`/`disown`/plain `&` without `set -m`
+// do NOT get their own process group and remain covered); fixing them
+// would require walking the full process tree (as Windows' taskkill /T
+// does, see exec_windows.go) rather than relying on a single process-group
+// signal, and was judged out of scope for this LOW-priority investigation
+// since neither has been observed in practice, unlike cliprovider's
+// grandchild bug which was a real, reproducible CI failure.
+//
+// Also worth noting: all of the above protection requires ctx to actually
+// be cancelled or deadlined — it is the ctx-cancellation callback that
+// does the killing. A caller that starts this exec handler's shell with
+// context.Background() (as internal/agent/tools/bash.go's foreground path
+// does) has no independent timeout of its own here; in practice it's
+// bounded by whatever OUTER mechanism eventually cancels that context
+// (turn cancellation, the stream watchdog, `job_kill` for a backgrounded
+// tool run), not by anything in this file.
 func processGroupExecHandler(killTimeout time.Duration) interp.ExecHandlerFunc {
 	return func(ctx context.Context, args []string) error {
 		hc := interp.HandlerCtx(ctx)

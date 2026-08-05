@@ -175,10 +175,14 @@ func saveAttachmentToDisk(dataDir, fileName string, data []byte) (string, error)
 		return "", fmt.Errorf("create attachments dir: %w", err)
 	}
 	ts := time.Now().Format("2006-01-02_15-04-05")
-	// A uuid suffix, not just the second-precision timestamp, guarantees a
-	// unique filename even for two same-named attachments uploaded within
-	// the same second (task #274) -- os.WriteFile below would otherwise
-	// silently let the second upload overwrite the first's content.
+	// A uuid suffix, not just the second-precision timestamp, makes a
+	// filename collision between two same-named attachments uploaded
+	// within the same second astronomically unlikely (32 bits of entropy
+	// per upload) rather than a near-certainty (task #274) -- os.WriteFile
+	// below would otherwise silently let the second upload overwrite the
+	// first's content. A uuid, not #275's atomic counter, on purpose: an
+	// atomic counter is only unique WITHIN one process, but multiple crush
+	// processes can share this same dataDir/attachments directory.
 	name := ts + "_" + uuid.NewString()[:8] + "_" + filepath.Base(fileName)
 	path := filepath.Join(dir, name)
 	if err := os.WriteFile(path, data, 0o644); err != nil {

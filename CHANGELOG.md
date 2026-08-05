@@ -37,14 +37,16 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   Fixed to use the freshest signal regardless of source, while still
   only labeling it as a sub-agent delegation when it actually is one.
 
-- **Two messages created in the same second could print in a random
-  order in `sessions watch`/`sessions tail`** — timestamps are stored
-  with one-second precision, and same-second ties used to fall back to
-  comparing message IDs (random UUIDs), so print order for a fast
-  back-to-back exchange changed from run to run. The database already
-  orders messages deterministically (insertion order as a tiebreaker);
-  the display code now trusts that order instead of re-deriving a worse
-  one.
+- **Two messages created in the same second could be permanently
+  skipped in `sessions watch`/`sessions tail`, not just printed out of
+  order** — timestamps are stored with one-second precision, and
+  same-second ties used to fall back to comparing message IDs (random
+  UUIDs). Whenever that comparison happened to lose, the message was
+  silently dropped for good: the "already printed" cursor never moved
+  past it, so the same losing comparison repeated identically on every
+  later poll. The database already orders messages deterministically
+  (insertion order as a tiebreaker); the display code now trusts that
+  order instead of re-deriving a worse one.
 
 - **`sessions pick` could hand off to a session in the wrong data
   directory** — after picking a session with `--data-dir` pointed
