@@ -23,6 +23,55 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **`sessions locks` showed a healthy, actively-working session as
+  "offline"** — observed live: a session sat at `PULSE_AGE == ELAPSED ==
+  36s` while the process was alive and running real tool calls. The
+  heartbeat mtime only advances on LLM-stream-chunk-gated activity, not
+  on tool-call execution itself (a deliberate earlier design choice, to
+  avoid a hung tool being masked as healthy by a timer that fires on
+  tool-open alone) — so a session can legitimately run several tool
+  calls in a row with no heartbeat touch for well over the offline
+  threshold. The underlying call-tree activity signal already tracked a
+  session's own top-level activity correctly; the display code was
+  discarding it whenever it didn't come from a sub-agent delegation.
+  Fixed to use the freshest signal regardless of source, while still
+  only labeling it as a sub-agent delegation when it actually is one.
+
+- **Two messages created in the same second could print in a random
+  order in `sessions watch`/`sessions tail`** — timestamps are stored
+  with one-second precision, and same-second ties used to fall back to
+  comparing message IDs (random UUIDs), so print order for a fast
+  back-to-back exchange changed from run to run. The database already
+  orders messages deterministically (insertion order as a tiebreaker);
+  the display code now trusts that order instead of re-deriving a worse
+  one.
+
+- **`sessions pick` could hand off to a session in the wrong data
+  directory** — after picking a session with `--data-dir` pointed
+  somewhere non-default, the follow-up `sessions tail`/`sessions last`
+  it spawns didn't forward that flag, so the child re-resolved to the
+  default location and reported "session not found" for the very
+  session just displayed.
+
+- **Same-named file attachments uploaded within the same second could
+  silently overwrite each other** — attachment filenames were built
+  from a one-second-precision timestamp plus the original filename
+  alone; two uploads of e.g. `report.txt` in the same second landed on
+  the same path, and the second silently replaced the first's content.
+
+- **Concurrent goroutine diagnostic dumps from one process could
+  collide** — several stuck sub-agent turns firing the stream watchdog
+  within the same second could overwrite or interleave each other's
+  diagnostic dump, exactly when that evidence is most needed.
+
+- **The hard-cap watchdog's diagnostic log could report a near-zero
+  turn duration for a multi-hour timeout** — a copy/paste-style gap
+  meant the out-of-tool branch reported time since the last stream
+  chunk instead of the actual turn length, which is misleading
+  precisely in the one situation (a postmortem) this log line exists
+  for. Does not affect the timeout decision itself, only its own log
+  message.
+
 - **Shutdown could still begin a brand-new turn, and an interrupt during
   shutdown was reported as accepted** — a closing review of the fixes
   below found the shutdown work only half done. Refusing to hand more
