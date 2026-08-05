@@ -3,14 +3,18 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/charmbracelet/crush/internal/db"
+	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/session"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -637,4 +641,111 @@ func TestSessionsLocksCmdRun_ReadsPIDViaSidecarFallback(t *testing.T) {
 		"PID column must reflect the sidecar-resolved PID (session.ReadLockPID), not the raw lock-file content")
 	require.NotContains(t, stdout, fmt.Sprintf("\t%d\t", staleLockContentPID),
 		"PID column must not fall back to a raw Sscanf of the lock file's own content when a sidecar disagrees")
+}
+
+// TestSessionsLocksCmdRun_TopLevelActivityOverridesStaleHeartbeat is the
+// regression test for task #321, observed live on 2026-08-05: `sessions
+// locks` showed a session as "offline" (PULSE_AGE == ELAPSED == 36s) while
+// the process was genuinely alive and running real top-level tool calls
+// (view, todos, agent) — the heartbeat mtime only advances on a
+// RecordActivity-gated tick driven by LLM stream chunks (task #300), NOT by
+// tool-call execution itself, so a session can be legitimately busy for
+// well over the 20s offline threshold with zero heartbeat touches.
+//
+// computeCallTreeActivity (sessions_activity.go) already tracks the ROOT
+// session's own message activity (created_at/updated_at, bumped on every
+// tool-input-start/tool-call/tool-result), not just a descendant sub-agent's
+// — but sessionsLocksCmdRun's override required act.SubAgentActive, so it
+// only ever kicked in for an in-flight delegation, silently discarding a
+// fresher signal that came from the session's OWN top-level activity.
+//
+// This seeds a REAL session + message (via a file-backed DB at the same
+// --data-dir sessionsLocksCmdRun itself opens, so the exact
+// computeCallTreeActivity codepath runs) with a fresh message row, then
+// backdates the lock file's heartbeat mtime past the offline threshold, and
+// asserts the listing does NOT report "offline" for that session.
+func TestSessionsLocksCmdRun_TopLevelActivityOverridesStaleHeartbeat(t *testing.T) {
+	tmp := isolateConfigEnvForTests(t)
+
+	workDir := t.TempDir()
+	orig, err := os.Getwd()
+	require.NoError(t, err)
+	require.NoError(t, os.Chdir(workDir))
+	t.Cleanup(func() { _ = os.Chdir(orig) })
+
+	dataDir := filepath.Join(tmp, "toplevel-activity-data")
+	require.NoError(t, os.MkdirAll(dataDir, 0o755))
+
+	ctx := context.Background()
+	conn, err := db.Connect(ctx, dataDir)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Release(dataDir) })
+	q := db.New(conn)
+	sessionSvc := session.NewService(q, conn)
+	messageSvc := message.NewService(q)
+
+	sess, err := sessionSvc.Create(ctx, "top-level-activity")
+	require.NoError(t, err)
+
+	// A real tool-call message: the agent loop's Update call bumps
+	// updated_at via the DB trigger on every tool-input-start/tool-call/
+	// tool-result (see sessions_activity.go's latestMessageUnix), so this
+	// stands in for that kind of activity. created_at alone (just Create,
+	// no Update) is already enough for computeCallTreeActivity to see it.
+	_, err = messageSvc.Create(ctx, sess.ID, message.CreateMessageParams{
+		Role:  message.Assistant,
+		Parts: []message.ContentPart{message.ToolCall{ID: "call_1", Name: "view", Input: `{}`}},
+	})
+	require.NoError(t, err)
+
+	ensureRootFlagStandIns(sessionsLocksCmd, dataDir)
+	if f := sessionsLocksCmd.Flags().Lookup("cwd"); f == nil {
+		sessionsLocksCmd.Flags().StringP("cwd", "c", "", "")
+	}
+	require.NoError(t, sessionsLocksCmd.Flags().Set("cwd", ""))
+	require.NoError(t, sessionsLocksCmd.Flags().Set("json", "true"))
+	require.NoError(t, sessionsLocksCmd.Flags().Set("stale-only", "false"))
+	require.NoError(t, sessionsLocksCmd.Flags().Set("prune", "false"))
+	sessionsLocksCmd.SetContext(ctx)
+
+	lockDir := filepath.Join(dataDir, "locks")
+	require.NoError(t, os.MkdirAll(lockDir, 0o755))
+	lockPath := filepath.Join(lockDir, "session-"+sess.ID+".lock")
+	require.NoError(t, os.WriteFile(lockPath, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0o644))
+
+	// Backdate the lock's heartbeat mtime well past the 20s offline
+	// threshold (lockPulseStatus) — but the message row created above has a
+	// fresh created_at (just now), simulating the observed scenario: real
+	// tool-call activity while the heartbeat itself hasn't ticked.
+	staleTime := time.Now().Add(-30 * time.Second)
+	require.NoError(t, os.Chtimes(lockPath, staleTime, staleTime))
+
+	stdout := captureStdout(t, func() {
+		runErr := sessionsLocksCmd.RunE(sessionsLocksCmd, nil)
+		require.NoError(t, runErr)
+	})
+	t.Logf("sessions locks --json stdout:\n%s", stdout)
+
+	type lockItemJSON struct {
+		SessionID string `json:"session_id"`
+		Pulse     string `json:"pulse"`
+		Stale     bool   `json:"stale"`
+		SubAgent  string `json:"sub_agent,omitempty"`
+	}
+	var found *lockItemJSON
+	dec := json.NewDecoder(strings.NewReader(stdout))
+	for dec.More() {
+		var item lockItemJSON
+		require.NoError(t, dec.Decode(&item))
+		if item.SessionID == sess.ID {
+			item := item
+			found = &item
+		}
+	}
+	require.NotNil(t, found, "seeded session must appear in the --json listing")
+	assert.NotEqual(t, "offline", found.Pulse,
+		"fresh top-level tool-call activity must override a stale heartbeat mtime, even without a sub-agent delegation")
+	assert.False(t, found.Stale)
+	assert.Empty(t, found.SubAgent,
+		"the freshness signal came from the session's OWN activity, not a delegation — sub_agent must stay empty")
 }

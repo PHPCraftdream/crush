@@ -1228,19 +1228,32 @@ func sessionsLocksCmdRun(cmd *cobra.Command, args []string) error {
 		pulse := lockPulseStatus(pulseSec)
 		stale := pulse == "offline"
 
-		// Sub-agent pulse override: the lock mtime only tracks the top-level
-		// heartbeat. If this session is blocked inside an `agent` delegation,
-		// the freshest real activity lives on the sub-agent's child-session
-		// message rows (see sessions_activity.go). When that activity is newer
-		// than the heartbeat, report ITS age as the pulse — otherwise a hung
-		// sub-agent and a working one look identical (heartbeat always fresh).
+		// Call-tree pulse override: the lock mtime only ticks on real
+		// activity the heartbeat goroutine's RecordActivity gate observed
+		// (stream chunks — task #300), NOT on tool-call execution itself.
+		// A session can be genuinely busy running ordinary top-level tool
+		// calls (view, todos, ...) between model responses, with no stream
+		// chunk arriving for well over the heartbeat's stale threshold —
+		// the heartbeat mtime then reads "offline" for a live, working
+		// session (task #321; observed live: PULSE_AGE == ELAPSED == 36s
+		// with the process alive and real tool calls in progress).
+		// computeCallTreeActivity's LatestUnix already covers the ROOT
+		// session's own message activity (created_at/updated_at, bumped on
+		// every tool-input-start/tool-call/tool-result), not just a
+		// descendant sub-agent's — so this override no longer requires
+		// act.SubAgentActive to apply. It's still used below to decide
+		// whether to show a specific sub-agent's hash: a fresher signal
+		// that came from the session's OWN activity, not a delegation,
+		// gets no such label.
 		var subAgentLabel string
-		if act, fresher := callTreeActivityFresherThan(cmd.Context(), a, sessionID, info.ModTime().Unix()); fresher && act.SubAgentActive {
+		if act, fresher := callTreeActivityFresherThan(cmd.Context(), a, sessionID, info.ModTime().Unix()); fresher {
 			if subAge, ok := act.Age(now); ok {
 				pulseSec = int64(subAge.Seconds())
 				pulse = lockPulseStatus(pulseSec)
 				stale = pulse == "offline"
-				subAgentLabel = short(session.HashID(act.DeepestSessionID))
+				if act.SubAgentActive {
+					subAgentLabel = short(session.HashID(act.DeepestSessionID))
+				}
 			}
 		}
 
