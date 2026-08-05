@@ -13,6 +13,12 @@ Nothing else counts. A slow run, a transient 5xx, a `Process restarted`, your ow
 
 When one of the two does fire: **switch immediately and silently.** Don't ask the operator for permission, don't ask them for the refusal text, don't confirm — arming this command already was their instruction. Just route the work through `Agent({subagent_type: "<agent>"})` and say one line about it.
 
+And once you have switched, **stay switched until something else tells
+you the window is over** — the cron for peak-hours, `/crush-fallback
+clear` for a hard limit. Re-attempting `crush run` in the meantime is
+the single most common way this command gets misused; see "Once armed,
+stop checking" below for what that costs and what to do instead.
+
 If `<agent>` is missing on invocation, **stop and ask** which agent type to use — that's the only thing you may never pick yourself.
 
 ## The eternal marker task
@@ -72,17 +78,37 @@ Re-invoking with a different agent (armed or active) just replaces `AGENT` in th
 
 ## Trigger 1 — peak-hours refusal
 
-Recognise it by all three strings in the failed run's stderr / `--json` `.error`:
+The one string that always appears is `is in peak hours (` in the failed
+run's stderr / `--json` `.error`. Match on that. Don't infer the refusal
+from `exit_reason` alone — `cancelled`/`error` are shared with timeouts,
+max-cost and generic failures.
 
-- `is in peak hours (`
-- `RESUME AT:` — followed by a local date-time and an RFC3339 stamp
-- `peak-hours window`
+There are **two** shapes, and you must handle both:
 
-(That's the stable block `crush` always emits for this refusal — `internal/agent/peak_hours_stop.go`'s `PeakHoursGuidance`. Don't infer it from `exit_reason` alone; `cancelled`/`error` are shared with timeouts, max-cost and generic failures.)
+- **Full guidance block** — `is in peak hours (` plus `RESUME AT:`
+  (a local date-time and an RFC3339 stamp) plus `peak-hours window`.
+  This is `internal/agent/peak_hours_stop.go`'s `PeakHoursGuidance`,
+  emitted when the top-level run is refused.
+- **Short form** — only `is in peak hours (HH:MM–HH:MM), refusing until
+  HH:MM`, with no `RESUME AT:` and no `peak-hours window`. This comes
+  from a different path: the refusal surfacing as `failed to start agent
+  processing stream: …` when a **sub-agent's** stream is what hit the
+  window. Observed in practice; a run can do 800+ seconds of real work
+  and only then be refused this way.
+
+Requiring all three markers would make you miss the short form entirely
+and keep hammering a provider that has already said no.
 
 Then:
 
-1. Take the RFC3339 stamp from `RESUME AT:` verbatim — it's already the exact reopen moment, day-wrap handled. If it's already in the past, the window closed while you were reading: stay on `/crush`, don't switch.
+1. Get the reopen moment.
+   - Full block: take the RFC3339 stamp from `RESUME AT:` verbatim —
+     it is already exact, day-wrap handled.
+   - Short form: build it from `refusing until HH:MM`, interpreted in
+     **local** time. If that time-of-day is not later than now, it means
+     tomorrow.
+   If the resulting moment is already in the past, the window closed
+   while you were reading: stay on `/crush`, don't switch.
 2. Marker → `STATUS: active`, `TRIGGER: peak-hours`, provider id, `UNTIL`.
 3. Arm the one-shot auto-revert cron below, record its id into `CRON_JOB_ID`.
 4. Route subsequent delegated work through `<agent>`.
@@ -107,6 +133,42 @@ Weekly/monthly budget exhausted, account suspended, or "context window exceeded"
 Hand anything you'd have given `crush run` to `Agent({subagent_type: "<agent>", ...})`, briefed the same way — goal, file-set, definition of done. All of `/crush`'s delegation hygiene still applies: scope call-outs for concurrent work, no parallel git-writing sub-agents over one tree, tests scoped to what changed, zero-trust verification of the diff afterward. This changes the **transport**, not the verification bar.
 
 One agent type for everything — the reason is "crush is unavailable", not task complexity.
+
+### Once armed, stop checking — the cron IS the resume signal
+
+While `STATUS: active`, **`/crush` does not exist for you.** Not as a
+first choice, not as a fallback-from-the-fallback, not "just to see".
+
+Concretely, until the cron's `# crush-fallback resume` prompt actually
+fires, do NOT:
+
+- launch `crush run` for any reason, including a task that feels
+  different, smaller, or more urgent than the one that got refused;
+- compare the current time against `UNTIL` and conclude the window has
+  reopened — the cron owns that decision, and it fires on its own;
+- re-attempt a refused run "to check" whether the provider is back;
+- poll `crush sessions why` / `sessions locks` / `sessions list` hoping
+  for a different answer;
+- rewrite `UNTIL` or `CRON_JOB_ID`, or arm a second cron.
+
+A manual retry before the real reopen does not get you an early start.
+It gets you the same refusal, minus the tokens and minutes the run burnt
+before hitting it — and, on the sub-agent path, that can be a *lot*: the
+refusal may arrive only after the run has already done substantial work,
+leaving partial edits in the tree that you then have to triage.
+
+Between arming and the cron firing there is exactly one correct
+behaviour: **keep routing new delegated work through `<agent>`, and
+otherwise leave the marker alone.**
+
+The same applies with `TRIGGER: hard-limit`, where there is no cron at
+all: nothing you can observe will end that state. Only
+`/crush-fallback clear` does.
+
+The liveness watchdog `/crush` prescribes (`crush sessions locks` every
+~10 min) is for **`crush run` processes you launched**. It does not
+apply to `<agent>` runs and must not be repurposed into peak-hours
+polling — the harness notifies you when a sub-agent finishes.
 
 ## `/crush-fallback clear`
 
