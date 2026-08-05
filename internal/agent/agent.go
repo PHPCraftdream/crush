@@ -977,6 +977,12 @@ func (a *sessionAgent) restartOrphaned(calls []SessionAgentCall) {
 // unmodified, which is enough for the value to keep flowing.
 type activityNotifyContextKey struct{}
 
+// watchdogBumpContextKey is the context key for storing the stream watchdog's
+// bump function. Used by runSummarizeBody and runSummarizeSilent to report
+// LLM streaming progress to the watchdog so healthy long-running compaction
+// doesn't get falsely killed as "no provider activity" (task #310).
+type watchdogBumpContextKey struct{}
+
 // withActivityNotify returns a child of ctx carrying a composed
 // activity-notify callback: calling the returned callback records activity
 // on lk (nil-receiver-safe, see SessionLock.RecordActivity) AND forwards to
@@ -1009,6 +1015,22 @@ func withActivityNotify(ctx context.Context, lk *session.SessionLock) context.Co
 func notifyActivity(ctx context.Context) {
 	if notify, ok := ctx.Value(activityNotifyContextKey{}).(func()); ok && notify != nil {
 		notify()
+	}
+}
+
+// withWatchdogBump stores the stream watchdog's bump function in ctx.
+// Used by runSummarizeBody and runSummarizeSilent to report LLM streaming
+// progress during compaction (task #310).
+func withWatchdogBump(ctx context.Context, bump func()) context.Context {
+	return context.WithValue(ctx, watchdogBumpContextKey{}, bump)
+}
+
+// notifyWatchdog invokes the watchdog bump function stored on ctx by
+// withWatchdogBump, if any. Safe to call on a ctx that never had
+// withWatchdogBump applied — it is then a harmless no-op.
+func notifyWatchdog(ctx context.Context) {
+	if bump, ok := ctx.Value(watchdogBumpContextKey{}).(func()); ok && bump != nil {
+		bump()
 	}
 }
 
@@ -1640,6 +1662,9 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 	// The watchdog now calls recordActivity (== notifyActivity(genCtx))
 	// internally on every bump(), so this wrapper can be just wd.bump.
 	bumpActivity := wd.bump
+	// Store wd.bump in genCtx so runSummarizeBody and runSummarizeSilent
+	// can report LLM streaming progress during compaction (task #310).
+	genCtx = withWatchdogBump(genCtx, wd.bump)
 	// toolStarted/toolFinished bracket tool execution so the watchdog pauses
 	// its idle timer while a (possibly long) tool runs — see streamWatchdog.
 	toolStarted := wd.toolStarted
@@ -2975,11 +3000,13 @@ func (a *sessionAgent) runSummarizeBody(ctx context.Context, sessionID string, o
 		},
 		OnReasoningDelta: func(id string, text string) error {
 			notifyActivity(ctx)
+			notifyWatchdog(ctx)
 			summaryMessage.AppendReasoningContent(text)
 			return a.messages.Update(ctx, summaryMessage)
 		},
 		OnReasoningEnd: func(id string, reasoning fantasy.ReasoningContent) error {
 			notifyActivity(ctx)
+			notifyWatchdog(ctx)
 			// Handle anthropic signature.
 			if anthropicData, ok := reasoning.ProviderMetadata["anthropic"]; ok {
 				if signature, ok := anthropicData.(*anthropic.ReasoningOptionMetadata); ok && signature.Signature != "" {
@@ -2991,6 +3018,7 @@ func (a *sessionAgent) runSummarizeBody(ctx context.Context, sessionID string, o
 		},
 		OnTextDelta: func(id, text string) error {
 			notifyActivity(ctx)
+			notifyWatchdog(ctx)
 			summaryMessage.AppendContent(text)
 			return a.messages.Update(ctx, summaryMessage)
 		},
@@ -3133,10 +3161,14 @@ func (a *sessionAgent) runSummarizeSilent(ctx context.Context, sessionID string,
 			return callContext, prepared, nil
 		},
 		OnReasoningDelta: func(id string, text string) error {
+			notifyActivity(ctx)
+			notifyWatchdog(ctx)
 			summaryMessage.AppendReasoningContent(text)
 			return a.messages.Update(ctx, summaryMessage)
 		},
 		OnReasoningEnd: func(id string, reasoning fantasy.ReasoningContent) error {
+			notifyActivity(ctx)
+			notifyWatchdog(ctx)
 			if anthropicData, ok := reasoning.ProviderMetadata["anthropic"]; ok {
 				if signature, ok := anthropicData.(*anthropic.ReasoningOptionMetadata); ok && signature.Signature != "" {
 					summaryMessage.AppendReasoningSignature(signature.Signature)
@@ -3146,6 +3178,8 @@ func (a *sessionAgent) runSummarizeSilent(ctx context.Context, sessionID string,
 			return a.messages.Update(ctx, summaryMessage)
 		},
 		OnTextDelta: func(id, text string) error {
+			notifyActivity(ctx)
+			notifyWatchdog(ctx)
 			summaryMessage.AppendContent(text)
 			return a.messages.Update(ctx, summaryMessage)
 		},
