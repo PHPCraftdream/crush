@@ -787,3 +787,77 @@ lower-severity issues, closed the same way:
   mid-write) and made a probabilistic ENOENT-race regression test
   deterministic via a test-only hook instead of a goroutine race that could
   pass even against a reverted fix.
+
+A further round closed the last P0-4 (summarization/compaction) gaps and
+finished the mailbox migration:
+
+- **Summarization could run outside session ownership and delete live
+  history out from under a turn (P0-4)** — `/compact` and the auto-summarize
+  path used a separate, non-atomic busy check from the mailbox's own
+  turn-ownership tracking, so a manual `/compact` and an ordinary turn
+  could both believe they owned a session at once; whichever finished last
+  won, and the loser's in-flight message could vanish along with the
+  history it referenced. Summarization now goes through the same atomic
+  `beginCompact` check-and-reserve the mailbox uses for turns, so a
+  compaction and a turn (or two compactions) are now mutually exclusive by
+  construction, not by convention.
+- **Cross-process compaction was not serialized — only in-process (P0-4
+  residual)** — `beginCompact` closed the gap above only within one
+  process; a *second* `crush` process holding the OS session lock could
+  still start an ordinary turn while this process's compaction was mid
+  commit, the same "one process deletes history the other believes is
+  live" shape P0-4 itself was about. In a fork whose whole point is N
+  concurrent `crush run` processes over one tree, that's a routine
+  configuration, not a theoretical one. Manual `/compact` now takes the
+  same OS session lock a turn takes, held across the compaction's commit
+  phase, and releases it explicitly (not via `defer`) before handing off
+  to a drained queued message's own turn — a `defer` would have kept the
+  lock held across that hand-off and made the process reject itself with
+  "already in use," naming its own PID. Inline compaction (already running
+  under a turn's own lock) is unaffected; it never takes a second lock.
+  Also hardened compaction's commit phase (writing the summary pointer,
+  then deleting the old messages) against cancellation the same way an
+  earlier fix protected the "silent" auto-compact path: a cancellation
+  landing between the two writes used to leave a session's history in a
+  half-updated, unrecoverable state.
+- **Silent (background) compaction was invisible to both the session
+  heartbeat and the stream watchdog** — a healthy compaction stream
+  produced no heartbeat activity and no watchdog progress signal, so
+  `sessions watch`/`locks` could report a working session as heartbeat-stale
+  mid-compaction, and a compaction that legitimately ran longer than the
+  idle-stall timeout could be killed as "no provider activity" with a
+  misleading warning and a goroutine dump. Both compaction paths
+  (mid-turn and manual) now report progress the same way an ordinary
+  turn's stream does.
+- **An interrupt landing between two turns of the same session could still
+  kill the whole dispatcher instead of just redirecting it, and could
+  drop the message that triggered the interrupt** — a follow-up to the
+  DB-preamble interrupt fix above: the same race existed in the narrower
+  window between one turn ending and the next one starting. Fixed the
+  same way, plus a fix for the message itself: the pre-empted call that
+  the interrupt was replacing used to be silently discarded rather than
+  requeued, which meant that with two or more messages queued, exactly
+  one was destroyed — chosen by scheduling luck, not deterministically.
+  It's now put back at the front of the queue instead.
+- **Finished migrating `QueueMessage` off the legacy message queue** — the
+  fire-and-forget queue primitive was the last production caller of the
+  pre-mailbox `messageQueue` structure, left behind when the rest of the
+  mailbox migration landed. It now queues through the mailbox directly,
+  and the legacy structure and its remaining call sites are gone. As part
+  of this, `PrepareStep`'s behavior of folding an already-queued message
+  into the current turn's own prompt was deliberately removed: in the
+  mailbox model, each queued call is its own turn with its own DB record
+  and its own response, and silently merging two into one broke that
+  contract.
+- **The release gate's own regression coverage had two real gaps, found
+  by an independent audit that first gave a passing verdict its own
+  evidence didn't support** — every gate scenario now has a test that is
+  independently revert-checked (fix removed → test fails on its own
+  assertion → fix restored), not just green. That process caught: a
+  test asserting the wrong thing for one scenario had been accepted on
+  the strength of an unexplained panic rather than a clean failure (now
+  has a reasoned explanation tying the panic to the exact removed guard);
+  and one scenario — an abandoned title-generation goroutine's deferred
+  fallback overwriting a *later* turn's real title with the placeholder
+  name — had no regression test at all despite being a named, previously
+  fixed defect. It does now.
