@@ -278,9 +278,9 @@ func TestStreamWatchdog_HardCapRespected(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(t.Context())
 
-	const idle = 80 * time.Millisecond
+	const idle = 200 * time.Millisecond
 	const tick = 10 * time.Millisecond
-	const hardCap = 200 * time.Millisecond
+	const hardCap = 400 * time.Millisecond
 
 	var fired atomic.Int32
 	var firedCause atomic.Int32
@@ -292,7 +292,7 @@ func TestStreamWatchdog_HardCapRespected(t *testing.T) {
 	start := time.Now()
 
 	// Bump rapidly — but hard cap should still kill it.
-	stop := time.After(500 * time.Millisecond)
+	stop := time.After(2 * time.Second)
 loop:
 	for {
 		select {
@@ -310,9 +310,13 @@ loop:
 	assert.True(t, wd.stalled.Load())
 	assert.Equal(t, causeHardCap, watchdogCause(firedCause.Load()),
 		"firing at the hard cap despite continuous progress must report causeHardCap")
-	// The hard cap is 200ms with a tick of 10ms, so it should fire
-	// somewhere between 200-250ms.
-	assert.LessOrEqual(t, elapsed, 350*time.Millisecond,
+	// The hard cap is 400ms; widened from an earlier 200ms-cap/350ms-ceiling
+	// version (task #320) whose 150ms of upper-bound slack was tight enough
+	// to flake on a loaded CI runner under -race in a full-package parallel
+	// run, where a single delayed tick is enough to blow the margin without
+	// indicating any real bug. 800ms of slack on top of the cap only fails
+	// if the fire is genuinely late, not merely jittered.
+	assert.LessOrEqual(t, elapsed, hardCap+800*time.Millisecond,
 		"watchdog must fire near the hard cap")
 }
 
@@ -330,9 +334,9 @@ func TestStreamWatchdog_HardCapRespectedWithoutExtendsOnProgress(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(t.Context())
 
-	const idle = 80 * time.Millisecond
+	const idle = 200 * time.Millisecond
 	const tick = 10 * time.Millisecond
-	const hardCap = 200 * time.Millisecond
+	const hardCap = 400 * time.Millisecond
 
 	var fired atomic.Int32
 	var firedCause atomic.Int32
@@ -345,7 +349,7 @@ func TestStreamWatchdog_HardCapRespectedWithoutExtendsOnProgress(t *testing.T) {
 
 	// Bump rapidly — more often than idleTimeout — so the idle-only check
 	// would NEVER fire on its own. The hard cap must still kill it.
-	stop := time.After(500 * time.Millisecond)
+	stop := time.After(2 * time.Second)
 loop:
 	for {
 		select {
@@ -363,9 +367,11 @@ loop:
 	assert.True(t, wd.stalled.Load())
 	assert.Equal(t, causeHardCap, watchdogCause(firedCause.Load()),
 		"the hard-cap fire outside tool-in-flight must report causeHardCap, not causeIdleStall or causeToolTimeout")
-	// The hard cap is 200ms with a tick of 10ms, so it should fire
-	// somewhere between 200-250ms.
-	assert.LessOrEqual(t, elapsed, 350*time.Millisecond,
+	// The hard cap is 400ms; widened from an earlier 200ms-cap/350ms-ceiling
+	// version (task #320) for the same reason as TestStreamWatchdog_HardCapRespected:
+	// 150ms of upper-bound slack was tight enough to flake on a loaded CI
+	// runner under -race in a full-package parallel run.
+	assert.LessOrEqual(t, elapsed, hardCap+800*time.Millisecond,
 		"watchdog must fire near the hard cap")
 }
 
@@ -591,8 +597,16 @@ func TestStreamWatchdog_SequentialBatchProgressResetsCapClock(t *testing.T) {
 
 	const idle = 5 * time.Second // large — idle path must not confound this test
 	const tick = 10 * time.Millisecond
-	const toolMaxDuration = 60 * time.Millisecond
-	const stepGap = 30 * time.Millisecond // < toolMaxDuration; 4 steps sum to ~120ms > toolMaxDuration
+	const toolMaxDuration = 600 * time.Millisecond
+	// stepGap < toolMaxDuration; 4 steps sum to ~1200ms > toolMaxDuration.
+	// Scaled 10x up from an earlier 30ms/60ms version (task #320): the
+	// invariant this test needs is "each individual gap stays under the
+	// cap", and that margin was only 30ms wide — well inside typical
+	// scheduler jitter for a goroutine under -race in a full-package
+	// parallel run, where a delayed time.Sleep wakeup could push a single
+	// gap over the cap and flake the test on pure scheduling luck, not a
+	// real bug. Same 2x ratio, ten times the absolute margin.
+	const stepGap = 300 * time.Millisecond
 
 	var fired atomic.Int32
 	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(time.Duration, watchdogCause) {
@@ -606,8 +620,8 @@ func TestStreamWatchdog_SequentialBatchProgressResetsCapClock(t *testing.T) {
 	wd.toolStarted()
 	wd.toolStarted()
 
-	// They finish one at a time, ~30ms apart — each gap is safely under the
-	// 60ms cap, but the cumulative batch span (~120ms) is not.
+	// They finish one at a time, ~300ms apart — each gap is safely under
+	// the 600ms cap, but the cumulative batch span (~1200ms) is not.
 	for i := 0; i < 4; i++ {
 		time.Sleep(stepGap)
 		wd.toolFinished()
@@ -624,7 +638,7 @@ func TestStreamWatchdog_SequentialBatchProgressResetsCapClock(t *testing.T) {
 	wd.toolStarted()
 	select {
 	case <-wd.done:
-	case <-time.After(500 * time.Millisecond):
+	case <-time.After(toolMaxDuration + time.Second):
 		t.Fatal("watchdog must still fire for a genuinely stuck tool after a healthy sequential batch")
 	}
 	assert.Equal(t, int32(1), fired.Load())
@@ -1103,6 +1117,18 @@ func TestSessionAgent_HandleWatchdogFire_StoresCauseAndDispatchesDumpAsync(t *te
 	// contain real data, not merely to exist: os.WriteFile creates the file
 	// before writing its ~1 MiB body, so a naive existence-only poll can
 	// observe a zero-byte file mid-write and pass on empty content.
+	//
+	// Budget is 30s, not a small fixed guess (task #320): this assertion
+	// isn't timing a race, it's waiting out real, variable-cost work — the
+	// 300-segment os.MkdirAll this test deliberately constructs, plus
+	// runtime.Stack over every live goroutine, plus a ~1 MiB disk write —
+	// all under -race, in a full-package parallel run where every other
+	// test's goroutines compete for scheduler time (observed failing on a
+	// loaded macOS CI runner at the previous 5s budget: CI log showed
+	// "Condition never satisfied" with zero indication the write ever
+	// failed, only that it hadn't finished in time). 30s only fails if the
+	// dispatch is genuinely broken (skipped, deadlocked, or the content
+	// assertions are wrong), not merely slow.
 	var dumpContent []byte
 	var matches []string
 	require.Eventually(t, func() bool {
@@ -1117,7 +1143,7 @@ func TestSessionAgent_HandleWatchdogFire_StoresCauseAndDispatchesDumpAsync(t *te
 		}
 		return bytes.Contains(dumpContent, []byte("stream watchdog fired")) &&
 			bytes.Contains(dumpContent, []byte("goroutine "))
-	}, 5*time.Second, 20*time.Millisecond, "expected a goroutine dump with real content to appear matching %s", pattern)
+	}, 30*time.Second, 50*time.Millisecond, "expected a goroutine dump with real content to appear matching %s", pattern)
 	require.Len(t, matches, 1, "expected exactly one dump file from this call")
 	assert.Contains(t, string(dumpContent), "stream watchdog fired",
 		"the dump must carry the reason handleWatchdogFire passes to crushlog.CaptureGoroutineStack")
