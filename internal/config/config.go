@@ -412,9 +412,16 @@ type Options struct {
 	// previously unbounded, freezing the turn on a stuck tool (hung MCP
 	// tool, blocking job_output --wait). Past this cap the watchdog fires
 	// with a distinct "tool timeout" reason so the turn ends. 0 (default)
-	// keeps the built-in 900s (15m) backstop; raise it for very long
+	// keeps the built-in 2700s (45m) backstop; raise it for very long
 	// synchronous tools.
-	StreamToolTimeoutSeconds int `json:"stream_tool_timeout_seconds,omitempty" jsonschema:"description=Max seconds a single tool may run while the stream watchdog is paused before it force-cancels the turn (never-freeze backstop). Omit to use the built-in default (900s = 15m). Raise for very long synchronous tools.,default=0,example=1800"`
+	//
+	// Keep this number in sync with agent.toolExecutionMaxDefault, which is
+	// what actually resolves the 0 case (see effectiveToolMaxDuration). It
+	// said 900s/15m here for days after e9544a8f raised the real default to
+	// 45m, and the jsonschema description below is user-facing — it reaches
+	// generated docs and editor tooltips, so a stale number there is a
+	// promise the binary does not keep.
+	StreamToolTimeoutSeconds int `json:"stream_tool_timeout_seconds,omitempty" jsonschema:"description=Max seconds a single tool may run while the stream watchdog is paused before it force-cancels the turn (never-freeze backstop). Omit to use the built-in default (2700s = 45m). Raise for very long synchronous tools.,default=0,example=3600"`
 	// StreamStallRetries is the number of times to automatically retry a
 	// turn that ended in a transient provider failure (stream stall, empty
 	// stream, overload, 5xx, network). Embodies "solve it ourselves before
