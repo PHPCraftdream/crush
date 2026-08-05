@@ -44,6 +44,51 @@ func isolateProcess(cmd *exec.Cmd) {
 // isolateProcess(&cmd) after construction, and negative-PID signal targeting
 // in the cancellation callback so grandchildren spawned by the command are
 // reaped along with it.
+//
+// Grandchild-holds-stdio wedge (task #313, investigated as the exec_unix
+// counterpart to cliprovider's grandchild-holds-stderr fix, commit
+// 271d4505): cmd.Stdout/cmd.Stderr here are plain io.Writers, not *os.File,
+// so os/exec backs them with an OS pipe plus a copy-goroutine that
+// cmd.Wait() joins — that goroutine only sees EOF once EVERY process
+// holding the pipe's write end has closed it, not just this direct child.
+// A shell command that backgrounds a grandchild without waiting for it
+// (`server & echo done`, a common pattern for starting a dev server or
+// proxy from an agent) leaves that grandchild holding the SAME inherited
+// stdout/stderr fd open long after the direct child (this cmd) exits, so
+// an unbounded cmd.Wait() would hang until the grandchild itself closes
+// that fd — exactly cliprovider's bug, just one layer removed.
+//
+// This IS already bounded here, unlike the pre-fix cliprovider code,
+// because of how isolateProcess's Setsid interacts with normal Unix
+// process-group inheritance: Setsid makes this cmd (say pid X) both a new
+// session leader AND its own process group leader (pgid X). Any process
+// IT forks — including a `foo &` backgrounded inside a shell script this
+// cmd runs — inherits pgid X via fork() unless that process explicitly
+// calls setpgid/setsid itself (ordinary shells running non-interactively,
+// i.e. without job control, do not). So syscall.Kill(-X, ...) in the
+// ctx-cancellation callback below reaches the grandchild too, even after X
+// itself has already exited (a pgid remains a valid signal target as long
+// as ANY process is still a member, regardless of whether the original
+// leader is still alive) — which closes the grandchild's fd, which EOFs
+// the pipe, which unblocks cmd.Wait(). See
+// TestProcessIsolation_GrandchildHoldingStdoutDoesNotWedgeForever
+// (isolation_unix_test.go) for the regression test proving this bound
+// holds for exactly the "direct child exits, backgrounded grandchild
+// lingers holding stdio" shape.
+//
+// Known accepted gap, NOT covered by the above: a grandchild that
+// deliberately escapes this process group by calling setsid() itself (the
+// classic double-fork daemonize pattern, or an explicit `setsid cmd &`
+// shell invocation) is no longer a member of pgid X and will not receive
+// the negative-PID kill — cmd.Wait() would then block until ctx-independent
+// termination. This is a narrower and more deliberate evasion than the
+// ordinary backgrounded-job case above (`nohup`/`disown`/plain `&` do NOT
+// call setsid and remain covered); fixing it would require walking the
+// full process tree (as Windows' taskkill /T does, see exec_windows.go)
+// rather than relying on a single process-group signal, and was judged out
+// of scope for this LOW-priority investigation since it has not been
+// observed in practice, unlike cliprovider's grandchild bug which was a
+// real, reproducible CI failure.
 func processGroupExecHandler(killTimeout time.Duration) interp.ExecHandlerFunc {
 	return func(ctx context.Context, args []string) error {
 		hc := interp.HandlerCtx(ctx)

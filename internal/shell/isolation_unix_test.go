@@ -141,3 +141,50 @@ func TestProcessIsolation_ChildProcessGroupKill(t *testing.T) {
 		t.Fatalf("cancellation took %v; expected prompt process group kill", elapsed)
 	}
 }
+
+// TestProcessIsolation_GrandchildHoldingStdoutDoesNotWedgeForever is the
+// Unix counterpart to
+// TestBackgroundShellManager_Kill_TreeKillsOrphanedGrandchild_Windows
+// (exec_windows_test.go) and the regression test for task #313: it
+// investigates whether processGroupExecHandler's cmd.Wait() is protected
+// against the exact grandchild-holds-stdio wedge cliprovider hit (commit
+// 271d4505), not just against a still-alive DIRECT child.
+//
+// `sleep 60 & echo done` backgrounds sleep WITHOUT waiting for it — unlike
+// TestProcessIsolation_ChildProcessGroupKill's `sleep 60 & wait`, the outer
+// `sh` process here exits almost immediately after printing "done", while
+// `sleep` (forked by sh's OWN internal job control, invisible to our exec
+// handler) is left running, still holding its inherited copy of sh's
+// stdout fd open. Since cmd.Stdout is a plain io.Writer here, os/exec backs
+// it with a pipe whose copy-goroutine cmd.Wait() joins — that goroutine
+// does not see EOF from sh exiting alone, only once EVERY holder of the
+// pipe's write end (sh AND the still-alive sleep) has closed it. Without
+// isolateProcess's Setsid + the negative-PID kill in the ctx-cancellation
+// callback reaching that backgrounded grandchild too, this would hang for
+// the full 60s instead of returning promptly on ctx cancellation.
+func TestProcessIsolation_GrandchildHoldingStdoutDoesNotWedgeForever(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err := Run(ctx, RunOptions{
+		Command: `sh -c 'sleep 60 & echo done'`,
+		Cwd:     t.TempDir(),
+		Env:     os.Environ(),
+	})
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected error from cancelled context")
+	}
+	// Allow up to 4s: 500ms context timeout + 2s kill timeout + margin —
+	// same bound as TestProcessIsolation_ChildProcessGroupKill. A broken
+	// (direct-child-only) kill would instead hang for the backgrounded
+	// sleep's full 60s, nowhere close to this bound.
+	if elapsed > 4*time.Second {
+		t.Fatalf("cancellation took %v; expected the process-group kill to reach the "+
+			"backgrounded grandchild holding stdout open, not hang for its full sleep", elapsed)
+	}
+}
