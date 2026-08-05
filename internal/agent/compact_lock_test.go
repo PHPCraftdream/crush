@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -386,4 +387,241 @@ func TestP312_ManualCompactionDrainsQueuedWork_WithDataDir(t *testing.T) {
 	require.NoError(t, lkErr, "the session lock must be free after Summarize returns")
 	require.NotNil(t, lk)
 	_ = lk.Release()
+}
+
+// TestP312_OSLockReleasedBeforeMailboxReportsIdle is the regression test for
+// HIGH-1 found by an independent review of #312: runSummarize's first
+// version called abandonOwnership (which flips the mailbox to mbIdle, what
+// IsSessionBusy/IsBusy report to same-process callers) BEFORE releasing the
+// OS session lock. Releasing the lock is unbounded disk I/O (Truncate/Seek/
+// Sync/unlink sidecar/unlock/Close) with no timeout, so a same-process
+// caller (a web UI request, `sessions inject`, restartOrphaned) could see
+// "not busy" via IsSessionBusy, win submit(), and then hit
+// TryAcquireSessionLock's SessionLockBusyError naming its OWN pid while this
+// goroutine was still mid-Release. This is the exact class of bug mbReleasing
+// (#296) exists to prevent, reopened by #312's own fix.
+//
+// Uses mailbox.testPreAbandonSeam — fired strictly after the OS lock is
+// released and strictly before abandonOwnership runs — to deterministically
+// park a check at that instant: the OS lock must already be free (another
+// process could take it) while the mailbox must still report busy. No
+// time.Sleep, no polling.
+func TestP312_OSLockReleasedBeforeMailboxReportsIdle(t *testing.T) {
+	t.Parallel()
+
+	env := testEnv(t)
+	dataDir := t.TempDir()
+
+	var calls atomic.Int64
+	srv := summarizeSSEServer(5, 2, &calls)
+	t.Cleanup(srv.Close)
+	lm := languageModelFromServer(t, srv)
+
+	model := Model{
+		Model:      lm,
+		CatwalkCfg: catwalk.Model{ContextWindow: 200000, DefaultMaxTokens: 1000},
+	}
+
+	a := NewSessionAgent(SessionAgentOptions{
+		DataDirectory:        dataDir,
+		LargeModel:           model,
+		SmallModel:           model,
+		SystemPrompt:         "you are a probe",
+		IsYolo:               true,
+		Sessions:             env.sessions,
+		Messages:             env.messages,
+		Tools:                []fantasy.AgentTool{},
+		DisableAutoSummarize: true,
+	})
+	sa := a.(*sessionAgent)
+
+	sess, err := env.sessions.Create(t.Context(), "os-lock-before-idle test")
+	require.NoError(t, err)
+	_, err = env.messages.Create(t.Context(), sess.ID, message.CreateMessageParams{
+		Role:  message.User,
+		Parts: []message.ContentPart{message.TextContent{Text: "seed message"}},
+	})
+	require.NoError(t, err)
+
+	mb := sa.getMailbox(sess.ID)
+
+	seamHit := make(chan struct{})
+	mb.testPreAbandonSeam = func() {
+		defer close(seamHit)
+
+		// The OS lock must already be free: another process (simulated here
+		// by a direct call, exactly like the other P312 tests) must succeed.
+		externalLock, lockErr := session.TryAcquireSessionLock(dataDir, sess.ID)
+		assert.NoError(t, lockErr, "OS lock must already be released by the time this seam fires")
+		if externalLock != nil {
+			_ = externalLock.Release()
+		}
+
+		// The mailbox must still report this session busy: abandonOwnership
+		// has not run yet, so no same-process caller should be able to walk
+		// in and become owner right now. The seam's own contract (mirroring
+		// testLoopRearmSeam) is that it fires with mb.mu NOT held, so a plain
+		// Lock here is safe.
+		mb.mu.Lock()
+		state := mb.state
+		mb.mu.Unlock()
+		assert.Equal(t, mbOwned, state,
+			"mailbox must still report mbOwned — abandonOwnership must not have run yet")
+	}
+	t.Cleanup(func() { mb.testPreAbandonSeam = nil })
+
+	err = sa.Summarize(t.Context(), sess.ID, fantasy.ProviderOptions{})
+	require.NoError(t, err)
+
+	select {
+	case <-seamHit:
+	default:
+		t.Fatal("testPreAbandonSeam never fired — the seam wiring itself is broken, this test proves nothing")
+	}
+}
+
+// oneChunkThenBlockServer sends a single text-delta chunk (enough to trigger
+// runSummarizeBody's OnTextDelta -> notifyActivity(ctx) call), signals
+// `started`, then blocks on `proceed` before completing the stream. Lets a
+// test observe a real heartbeat tick landing WHILE the compaction is still
+// in flight, with at least one activity recorded before the tick.
+func oneChunkThenBlockServer(promptTokens, completionTokens int64, started, proceed chan struct{}) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fl, _ := w.(http.Flusher)
+
+		fmt.Fprintf(w, "data: %s\n\n", `{"id":"c1","object":"chat.completion.chunk","created":1,"model":"probe","choices":[{"index":0,"delta":{"role":"assistant","content":"partial"},"finish_reason":null}]}`)
+		if fl != nil {
+			fl.Flush()
+		}
+
+		if started != nil {
+			close(started)
+		}
+		if proceed != nil {
+			<-proceed
+		}
+
+		fmt.Fprintf(w, "data: %s\n\n",
+			fmt.Sprintf(`{"id":"c1","object":"chat.completion.chunk","created":1,"model":"probe","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":%d,"completion_tokens":%d,"total_tokens":%d}}`,
+				promptTokens, completionTokens, promptTokens+completionTokens))
+		if fl != nil {
+			fl.Flush()
+		}
+		fmt.Fprint(w, "data: [DONE]\n\n")
+		if fl != nil {
+			fl.Flush()
+		}
+	}))
+}
+
+// TestP312_ManualCompactionHeartbeatStaysAlive is the regression test for
+// MEDIUM-1 found by an independent review of #312: runSummarize acquires its
+// own OS session lock (separate from the one Run's turn loop holds), but
+// never wired it into genCtx's activity-notify chain (task #222). Every
+// notifyActivity(ctx) call runSummarizeBody's stream callbacks already made
+// (#310) landed on a ctx with no activity-notify chain — a harmless no-op —
+// so a long-running manual /compact's own lock never got RecordActivity
+// calls and its mtime stayed frozen from acquisition to release. `sessions
+// locks`/`watch`/`why` read that as heartbeat-stale for a session that is
+// actually healthy and working — the same failure mode #310 fixed for
+// silent compaction, reopened here for the manual path by #312's own lock.
+//
+// Real-time cost (~12s), matching the established convention in
+// heartbeat_activity_test.go / internal/session/lock_test.go: the heartbeat
+// goroutine is a real 10s ticker with no test seam, so there is no way to
+// observe its effect deterministically without waiting for a real tick.
+func TestP312_ManualCompactionHeartbeatStaysAlive(t *testing.T) {
+	t.Parallel()
+
+	env := testEnv(t)
+	dataDir := t.TempDir()
+
+	started := make(chan struct{})
+	proceed := make(chan struct{})
+	srv := oneChunkThenBlockServer(5, 2, started, proceed)
+	t.Cleanup(srv.Close)
+	lm := languageModelFromServer(t, srv)
+
+	model := Model{
+		Model:      lm,
+		CatwalkCfg: catwalk.Model{ContextWindow: 200000, DefaultMaxTokens: 1000},
+	}
+
+	a := NewSessionAgent(SessionAgentOptions{
+		DataDirectory:        dataDir,
+		LargeModel:           model,
+		SmallModel:           model,
+		SystemPrompt:         "you are a probe",
+		IsYolo:               true,
+		Sessions:             env.sessions,
+		Messages:             env.messages,
+		Tools:                []fantasy.AgentTool{},
+		DisableAutoSummarize: true,
+	})
+	sa := a.(*sessionAgent)
+
+	sess, err := env.sessions.Create(t.Context(), "manual compact heartbeat test")
+	require.NoError(t, err)
+	_, err = env.messages.Create(t.Context(), sess.ID, message.CreateMessageParams{
+		Role:  message.User,
+		Parts: []message.ContentPart{message.TextContent{Text: "seed message"}},
+	})
+	require.NoError(t, err)
+
+	// Same lock path Summarize's own runSummarize will acquire — grab it
+	// once, up front, purely to learn its Path; release it immediately so
+	// it doesn't block the real compaction below. Do NOT use this probe's
+	// mtime as the "before" baseline: acquireSessionLockFile itself
+	// Truncates+writes the PID into the file on every successful
+	// acquisition, independent of the heartbeat/RecordActivity mechanism —
+	// runSummarize's own TryAcquireSessionLock call below will stamp its
+	// own PID and bump mtime again, AFTER this probe's snapshot would have
+	// been taken. Snapshotting here would make the test pass even with the
+	// activity-notify wiring completely removed (bumped mtime is from the
+	// PID stamp, not the heartbeat) — caught only by revert-checking. The
+	// real baseline is captured below, after `started` fires, i.e. after
+	// runSummarize's own acquisition (and its PID stamp) has already
+	// happened.
+	probe, err := session.TryAcquireSessionLock(dataDir, sess.ID)
+	require.NoError(t, err)
+	lockPath := probe.Path
+	require.NoError(t, probe.Release())
+
+	compactionDone := make(chan error, 1)
+	go func() {
+		compactionDone <- sa.Summarize(t.Context(), sess.ID, fantasy.ProviderOptions{})
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("compaction stream never started")
+	}
+
+	// Baseline taken AFTER runSummarize's own TryAcquireSessionLock (and its
+	// PID-stamp mtime bump) has already happened — everything from here on
+	// can only be the heartbeat, not the acquisition stamp.
+	info, err := os.Stat(lockPath)
+	require.NoError(t, err)
+	before := info.ModTime()
+
+	// The first chunk already landed (OnTextDelta fired, notifyActivity(ctx)
+	// was called) before `started` closed. Wait past one real heartbeat tick
+	// while the compaction is still parked on `proceed`, holding its lock.
+	time.Sleep(12 * time.Second)
+
+	info2, err := os.Stat(lockPath)
+	require.NoError(t, err)
+	assert.True(t, info2.ModTime().After(before),
+		"manual /compact's own OS lock must record activity from its stream and stay heartbeat-fresh while genuinely working")
+
+	close(proceed)
+
+	select {
+	case err := <-compactionDone:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("compaction did not finish")
+	}
 }

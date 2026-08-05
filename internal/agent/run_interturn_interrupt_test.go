@@ -419,8 +419,11 @@ func TestRun_InterruptDuringInterTurnWindow_MultiElementQueue_NoMessageLost(t *t
 		require.NoError(t, queueErr, "queuing behind a busy session must not itself error")
 		require.Nil(t, res, "a queued call must return (nil, nil) — it does not run inline")
 	}
+	mb.mu.Lock()
+	submittedSnapshot := append([]SessionAgentCall(nil), mb.submitted...)
+	mb.mu.Unlock()
 	require.Equal(t, []string{"A - must run third", "B - must run fourth", "C - must run fifth"},
-		promptsOf(mb.submitted), "precondition: A, B, C must all be sitting in mb.submitted, in FIFO order, "+
+		promptsOf(submittedSnapshot), "precondition: A, B, C must all be sitting in mb.submitted, in FIFO order, "+
 			"before turn 1 is allowed to finish")
 
 	// Let turn 1 finish. Its own end-of-turn drain pops A out of

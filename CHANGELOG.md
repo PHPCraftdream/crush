@@ -819,16 +819,27 @@ finished the mailbox migration:
   then deleting the old messages) against cancellation the same way an
   earlier fix protected the "silent" auto-compact path: a cancellation
   landing between the two writes used to leave a session's history in a
-  half-updated, unrecoverable state.
-- **Silent (background) compaction was invisible to both the session
-  heartbeat and the stream watchdog** — a healthy compaction stream
-  produced no heartbeat activity and no watchdog progress signal, so
-  `sessions watch`/`locks` could report a working session as heartbeat-stale
-  mid-compaction, and a compaction that legitimately ran longer than the
-  idle-stall timeout could be killed as "no provider activity" with a
-  misleading warning and a goroutine dump. Both compaction paths
-  (mid-turn and manual) now report progress the same way an ordinary
-  turn's stream does.
+  half-updated, unrecoverable state. An independent review of this fix
+  found two further issues, both closed the same day: manual `/compact`
+  released its OS lock only AFTER flipping the session's in-memory state
+  to idle, reopening the exact same-process "not busy, but the OS lock
+  says otherwise" race `mbReleasing` exists to prevent — the lock is now
+  released first; and manual `/compact` acquired its own OS lock but never
+  wired it into the session's activity-notify chain, so a long-running
+  manual compaction's lock file went heartbeat-stale for the same reason
+  the next bullet describes for the mid-turn path — it's wired now, the
+  same way.
+- **Silent (background) compaction was invisible to the session
+  heartbeat** — a healthy mid-turn compaction stream produced no heartbeat
+  activity, so `sessions watch`/`locks` could report a working session as
+  heartbeat-stale mid-compaction. It's wired the same way an ordinary
+  turn's stream is. Separately, the same stream also now bumps the stream
+  watchdog, so a compaction that legitimately runs longer than the idle-
+  stall timeout is not killed as "no provider activity" with a misleading
+  warning and a goroutine dump; this half only applies to compaction
+  running under a turn's own watchdog (mid-turn/silent) — manual
+  `/compact` has no watchdog of its own to bump, only the unrelated
+  10-minute overall timeout it already had.
 - **An interrupt landing between two turns of the same session could still
   kill the whole dispatcher instead of just redirecting it, and could
   drop the message that triggered the interrupt** — a follow-up to the

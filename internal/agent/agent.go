@@ -2938,31 +2938,49 @@ func (a *sessionAgent) runSummarize(ctx context.Context, genCtx context.Context,
 		}
 	}
 
+	// Wire this lock into genCtx's activity-notify chain (task #222's
+	// pattern, mirrored from runTurn's own withActivityNotify call) so
+	// runSummarizeBody's notifyActivity(ctx) calls on its stream callbacks
+	// (#310) actually reach THIS lock. Without this, manual /compact
+	// acquires its own lk above but never records activity on it — the
+	// lock's mtime is frozen from acquisition until release, up to the full
+	// 10-minute genCtx timeout, so `sessions locks`/`watch` can misreport a
+	// healthy long-running /compact as heartbeat-stale. nil-receiver-safe
+	// when lk is nil (a.dataDir == "").
+	genCtx = withActivityNotify(genCtx, lk)
+
 	err := a.runSummarizeBody(genCtx, sessionID, opts)
+
+	// Release the OS lock BEFORE abandoning mailbox ownership. abandonOwnership
+	// flips the mailbox to mbIdle, which is what IsSessionBusy/IsBusy report to
+	// same-process callers (web UI requests, sessions inject, restartOrphaned).
+	// Releasing the OS lock is unbounded disk I/O (Truncate/Seek/Sync/unlink
+	// sidecar/unlock/Close) with no timeout — if mbIdle were visible first, a
+	// concurrent same-process caller could see "not busy", win submit(), and
+	// then hit TryAcquireSessionLock's SessionLockBusyError naming its own PID
+	// while this goroutine is still mid-Release. This is the exact class of bug
+	// mbReleasing (#296) exists to prevent; releasing the lock first keeps the
+	// same "OS lock free is a precondition of mbIdle" invariant Run() upholds.
+	if lk != nil {
+		if relErr := lk.Release(); relErr != nil {
+			slog.Debug("agent.runSummarize: release session lock failed", "session_id", sessionID, "err", relErr)
+		}
+	}
+
+	// Test-only seam: fires strictly after the OS lock above is released and
+	// strictly before abandonOwnership below makes that visible as mbIdle to
+	// same-process callers. See mailbox.testPreAbandonSeam's own doc.
+	if mb.testPreAbandonSeam != nil {
+		mb.testPreAbandonSeam()
+	}
+
 	// Release mailbox ownership. abandonOwnership leaves any work queued
 	// during the compaction in mb.submitted (folding replacement into it),
 	// setting state to mbIdle — the entries survive there for the Run
 	// started below to drain.
 	_ = mb.abandonOwnership(epoch)
 	if err != nil {
-		// Release OS lock on error path too.
-		if lk != nil {
-			if relErr := lk.Release(); relErr != nil {
-				slog.Debug("agent.runSummarize: release session lock failed", "session_id", sessionID, "err", relErr)
-			}
-		}
 		return err
-	}
-
-	// Release OS lock before calling Run, so the follow-on turn can acquire it.
-	// The lock MUST be held for runSummarizeBody (including its commit phase),
-	// but MUST NOT be held for the follow-on Run, or the process would deadlock
-	// trying to acquire the same lock it already holds (see agent.go ~1169 comment
-	// about the old recursive-Run() deadlock).
-	if lk != nil {
-		if relErr := lk.Release(); relErr != nil {
-			slog.Debug("agent.runSummarize: release session lock failed", "session_id", sessionID, "err", relErr)
-		}
 	}
 
 	// Start a Run for the first queued entry. The Run becomes owner via

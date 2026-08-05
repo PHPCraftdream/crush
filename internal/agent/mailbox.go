@@ -204,6 +204,22 @@ type mailbox struct {
 	// production behavior — mirrors testDrainSeam's existing idiom.
 	testLoopRearmSeam func()
 
+	// testPreAbandonSeam, when non-nil, is invoked by runSummarize (agent.go)
+	// strictly AFTER the manual-compaction OS session lock has been released
+	// and strictly BEFORE the mailbox is flipped to mbIdle via
+	// abandonOwnership. It exists to let a test deterministically observe,
+	// at that exact instant, that the two release the invariant Run() and
+	// mbReleasing both uphold: an OS lock being free must never trail
+	// mb.state still reporting idle to a same-process caller. Concretely: a
+	// test parked here must see mb.IsSessionBusy()-equivalent state == true
+	// (this compaction is still the owner) while TryAcquireSessionLock
+	// already succeeds from "another process" (the OS lock is already
+	// free) — proving the lock was released before, not after, idle became
+	// visible. Fires outside mb.mu (abandonOwnership has not been called
+	// yet), mirroring testLoopRearmSeam's own idiom. nil (a no-op) in every
+	// production path.
+	testPreAbandonSeam func()
+
 	// epoch identifies the current OWNERSHIP ERA: bumped every time state
 	// transitions mbIdle -> mbOwned (a NEW caller becomes owner), never on
 	// a continuing turn within the same era (beginGeneration's turn-level

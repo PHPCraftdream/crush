@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -34,9 +35,16 @@ func failFastSSEServer() *httptest.Server {
 // eventually reaching its deferred fallback, but before that fallback has
 // run — so the test can deterministically inject state changes into that
 // window without any sleep or real hang.
+//
+// The requestStarted close is guarded by sync.Once rather than relying
+// solely on 400 being non-retryable: if fantasy's retryable-status set ever
+// changes underneath this test, a second hit on this handler would panic on
+// close-of-closed-channel and fail the whole test binary instead of failing
+// this one test with a readable message.
 func handshakeFailSSEServer(requestStarted chan<- struct{}, proceed <-chan struct{}) *httptest.Server {
+	var once sync.Once
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		close(requestStarted)
+		once.Do(func() { close(requestStarted) })
 		<-proceed
 		http.Error(w, "boom", http.StatusBadRequest)
 	}))
