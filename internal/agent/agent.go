@@ -888,20 +888,44 @@ func (a *sessionAgent) releaseSessionReservation(sessionID string, epoch uint64)
 // would silently no-op (Cancel) or falsely report success while cancelling
 // nothing (InterruptAndReplace).
 //
-// The whole operation is one mailbox.drainOrReleaseFinal call:
-//  1. Check mb.submitted first. Non-empty: pop and return it; state stays
-//     mbOwned; lk is NOT touched (still held for the reclaimed turn).
-//  2. mb.submitted empty: check the legacy messageQueue (still under mb.mu —
-//     safe, see drainOrReleaseFinal's doc on csync.KeyedQueue.PopFront
-//     having no callbacks of its own). Non-empty: reclaim ownership for the
-//     SAME era (no epoch bump — mirrors the old reclaimSameEra contract) and
-//     return it; lk again NOT touched.
-//  3. Both empty: release lk (if non-nil) and THEN flip mb.state to mbIdle,
-//     all still under mb.mu. No same-process observer can see "not busy"
-//     until the OS lock genuinely is gone, closing the window above. Note
-//     the disk I/O of that release happens with mb.mu held — an accepted
-//     trade documented on drainOrReleaseFinal itself, and the subject of
-//     the still-open task #296.
+// The whole operation is one mailbox.drainOrReleaseFinal call, with exactly
+// FOUR possible outcomes (corrected here — #297 review: an earlier version
+// of this doc claimed only three cases and asserted "lk is simply never
+// released for [a same-era reclaim] handoff" as the invariant covering
+// every hasNext==true return, which #296/P1-C's first draft violated by
+// adding a hand-back that returned hasNext==true AFTER lk had already been
+// released):
+//  1. mb.submitted (checked first) or mb.replacement is non-empty at the
+//     time of the call, BEFORE any release attempt: pop and return it;
+//     state stays mbOwned; lk is NOT touched (still held for the reclaimed
+//     turn). The caller's loop runs it as the next turn under the SAME lk.
+//  2. Both empty: check the legacy messageQueue (still under mb.mu — safe,
+//     see drainOrReleaseFinal's doc on csync.KeyedQueue.PopFront having no
+//     callbacks of its own). Non-empty: reclaim ownership for the SAME era
+//     (no epoch bump — mirrors the old reclaimSameEra contract) and return
+//     it; lk again NOT touched — "the OS lock is simply never released for
+//     this handoff" is accurate for cases 1 and 2, and ONLY for these two.
+//  3. All three empty: release lk (if non-nil) — now OUTSIDE mb.mu (#296/
+//     P1-C: mb.state == mbReleasing stands in for the mutex so a hung
+//     filesystem cannot stall the control plane) — then flip mb.state to
+//     mbIdle. No same-process observer can see "not busy" until the OS lock
+//     genuinely is gone (mbReleasing reads as busy throughout), closing the
+//     HIGH-1 window described above.
+//  4. Work (a submit()/interruptAndReplace()) races into mb.submitted/
+//     mb.replacement WHILE case 3's release() is running. This is the ONLY
+//     case where drainOrReleaseFinal itself CANNOT decide "keep this turn
+//     loop running" — by the time it notices, release() has ALREADY run and
+//     lk is gone (or its fate unknown, on error/panic). It therefore drains
+//     that work out as `orphaned` and — critically — still ends at mbIdle
+//     with hasNext==false, exactly like case 3. hasNext==true now means,
+//     and only means, "lk is still held, keep the current turn loop going
+//     on it" — cases 1 and 2 exclusively. `orphaned` is a DIFFERENT signal:
+//     "this work has no lock and no turn loop; someone must start a fresh
+//     one for it", handled below exactly like coordinator.startDetachedRun's
+//     existing P0-B idle-session contract (mailbox.interruptAndReplace's own
+//     doc: "the caller should instead start a fresh Run() with call
+//     directly" — case 4 is that same contract, reached via a different
+//     door). Never treat orphaned as a queue the CURRENT lk can serve.
 //
 // This is why checkLegacy is tried BEFORE releasing lk: reclaiming behind
 // the SAME lock avoids the release-then-reacquire shape, which would open a
@@ -924,14 +948,58 @@ func (a *sessionAgent) drainOrReleaseMerged(sessionID string, epoch uint64, lk *
 	if lk != nil {
 		release = lk.Release
 	}
-	next, hasNext, releaseErr := a.getMailbox(sessionID).drainOrReleaseFinal(epoch, checkLegacy, runCancel, release)
+	next, hasNext, releaseErr, orphaned := a.getMailbox(sessionID).drainOrReleaseFinal(epoch, checkLegacy, runCancel, release)
 	if releaseErr != nil {
 		slog.Debug("agent.drainOrReleaseMerged: release session lock failed", "session_id", sessionID, "err", releaseErr)
 	}
+	// Case 4 (see doc above): work raced in during release() and cannot be
+	// handed to the current (now lock-less) turn loop. Each orphaned call
+	// gets its own independent, detached restart — the SAME mechanism
+	// coordinator.startDetachedRun already uses for InterruptAndSend/
+	// requeueInterruptMessage's "session was idle" case, since that is
+	// exactly what this now is: from orphaned's perspective the session is
+	// idle (mbIdle, no lk held) the instant drainOrReleaseFinal returned.
+	a.restartOrphaned(orphaned)
 	if !hasNext {
 		return SessionAgentCall{}, false
 	}
 	return next, true
+}
+
+// restartOrphaned starts one independent, detached a.Run call per entry in
+// calls — the sessionAgent-level equivalent of coordinator.startDetachedRun
+// (P0-B), needed here because drainOrReleaseMerged/drainOrReleaseFinal have
+// no access to a *coordinator (agent and coordinator are separate layers;
+// coordinator wraps sessionAgent, not the other way around).
+//
+// Each call gets its OWN goroutine and its own context.Background(): the
+// caller (drainOrReleaseMerged, called from runTurn, called from Run's turn
+// loop) is about to return control up its own call stack, possibly all the
+// way out of Run() entirely — there is no request-scoped ctx left in scope
+// whose cancellation would be meaningful to inherit, and even if there were,
+// cancelling it would recreate the exact "accepted but never executed"
+// outcome startDetachedRun's own doc warns against. a.Run performs its own
+// full acquisition (mailbox.submit + a fresh session.TryAcquireSessionLock)
+// for each one — none of these reuse the lk that drainOrReleaseFinal already
+// released; see drainOrReleaseFinal's own doc for why reusing it is exactly
+// the bug this function exists to close.
+//
+// Losing a race to a concurrent Run() that claims the mailbox first is safe
+// and needs no coordination (same reasoning as startDetachedRun's doc): if
+// another owner appears between orphaning and this call's own submit(), this
+// call's submit() simply queues behind that new owner instead of becoming
+// owner itself, and that owner's own end-of-turn drain picks it up. The one
+// outcome that cannot happen is the call going unrun.
+func (a *sessionAgent) restartOrphaned(calls []SessionAgentCall) {
+	for _, call := range calls {
+		call := call
+		go func() {
+			if _, err := a.Run(context.Background(), call); err != nil {
+				slog.Error("agent: detached restart for a call orphaned by a concurrent session-lock release failed",
+					"session_id", call.SessionID, "err", err)
+			}
+		}()
+	}
 }
 
 // activityNotifyContextKey is the context key under which runTurn stores a
@@ -3915,10 +3983,20 @@ func (a *sessionAgent) CancelAll() {
 // post-migration source of truth for "does this session have a live
 // owner" (see IsSessionBusy's doc) and is correctly reset to mbIdle on
 // release, so it does not have this staleness problem.
+//
+// `mb.state != mbIdle` (NOT `mb.state == mbOwned`) is deliberate as of
+// #296/P1-C: mbReleasing means drainOrReleaseFinal's release() — the OS
+// session-lock teardown — is running with mb.mu NOT held, on some OTHER
+// goroutine than this one. If IsBusy() treated mbReleasing as "not busy",
+// CancelAll's 5-second drain loop could see every mailbox as idle and
+// return WHILE that release() disk I/O (and the whole-process DB teardown
+// App.Shutdown runs right after CancelAll returns) is still in flight —
+// reopening the exact class of race HIGH-1 closed, just observed through
+// the shutdown path instead of a same-process "become the new owner" path.
 func (a *sessionAgent) IsBusy() bool {
 	for _, mb := range a.mailboxes.Seq2() {
 		mb.mu.Lock()
-		busy := mb.state == mbOwned
+		busy := mb.state != mbIdle
 		mb.mu.Unlock()
 		if busy {
 			return true

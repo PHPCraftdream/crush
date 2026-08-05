@@ -47,6 +47,39 @@ func TestMailbox_Submit_QueuesWhenAlreadyOwned(t *testing.T) {
 	require.Equal(t, second, mb.submitted[0])
 }
 
+// TestMailbox_Submit_QueuesWhenReleasing is the direct unit-level companion
+// to the invariant-table/lock tests: submit() must treat mbReleasing (#296/
+// P1-C) exactly like mbOwned — queue the call rather than become owner —
+// since the OS session lock may still be held by the in-flight release()
+// call even though no turn loop is currently running.
+func TestMailbox_Submit_QueuesWhenReleasing(t *testing.T) {
+	mb := &mailbox{state: mbReleasing}
+	call := SessionAgentCall{SessionID: "s1", Prompt: "during release"}
+
+	becomeOwner, epoch := mb.submit(call, func() {})
+
+	require.False(t, becomeOwner, "submit during mbReleasing must NOT become owner — the OS lock may still be held")
+	require.Zero(t, epoch)
+	require.Equal(t, mbReleasing, mb.state, "submit must not alter mb.state while releasing")
+	require.Len(t, mb.submitted, 1)
+	require.Equal(t, call, mb.submitted[0])
+}
+
+// TestMailbox_InterruptAndReplace_NoOwnerWhenReleasing is the direct
+// unit-level companion proving interruptAndReplace() also treats mbReleasing
+// as "nobody running" (gated on `state != mbOwned`): there is no live
+// generation left to interrupt once a turn has reached mbReleasing.
+func TestMailbox_InterruptAndReplace_NoOwnerWhenReleasing(t *testing.T) {
+	mb := &mailbox{state: mbReleasing}
+	call := SessionAgentCall{SessionID: "s1", Prompt: "interrupt during release"}
+
+	cancel, hadOwner := mb.interruptAndReplace(call)
+
+	require.False(t, hadOwner, "interruptAndReplace during mbReleasing must report no live owner to interrupt")
+	require.Nil(t, cancel)
+	require.Nil(t, mb.replacement, "interruptAndReplace must not record a replacement when it reports no owner")
+}
+
 func TestMailbox_DrainOrRelease_WithQueuedItem(t *testing.T) {
 	mb := &mailbox{
 		state:     mbOwned,
