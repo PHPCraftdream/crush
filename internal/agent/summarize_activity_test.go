@@ -110,7 +110,7 @@ func TestRunSummarizeSilent_CallsWatchdogBump(t *testing.T) {
 			`{"id":"c1","object":"chat.completion.chunk","created":1,"model":"probe","choices":[{"index":0,"delta":{"content":"a"},"finish_reason":null}]}`,
 			`{"id":"c1","object":"chat.completion.chunk","created":1,"model":"probe","choices":[{"index":0,"delta":{"content":"r"},"finish_reason":null}]}`,
 			`{"id":"c1","object":"chat.completion.chunk","created":1,"model":"probe","choices":[{"index":0,"delta":{"content":"y"},"finish_reason":null}]}`,
-			fmt.Sprintf(`{"id":"c1","object":"chat.completion.chunk","created":1,"model":"probe","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":50,"total_tokens":150}}`),
+			`{"id":"c1","object":"chat.completion.chunk","created":1,"model":"probe","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":50,"total_tokens":150}}`,
 		}
 		for _, c := range chunks {
 			fmt.Fprintf(w, "data: %s\n\n", c)
@@ -266,7 +266,7 @@ func TestRunSummarizeBody_CallsWatchdogBump(t *testing.T) {
 			`{"id":"c1","object":"chat.completion.chunk","created":1,"model":"probe","choices":[{"index":0,"delta":{"content":"a"},"finish_reason":null}]}`,
 			`{"id":"c1","object":"chat.completion.chunk","created":1,"model":"probe","choices":[{"index":0,"delta":{"content":"r"},"finish_reason":null}]}`,
 			`{"id":"c1","object":"chat.completion.chunk","created":1,"model":"probe","choices":[{"index":0,"delta":{"content":"y"},"finish_reason":null}]}`,
-			fmt.Sprintf(`{"id":"c1","object":"chat.completion.chunk","created":1,"model":"probe","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":50,"total_tokens":150}}`),
+			`{"id":"c1","object":"chat.completion.chunk","created":1,"model":"probe","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":50,"total_tokens":150}}`,
 		}
 		for _, c := range chunks {
 			fmt.Fprintf(w, "data: %s\n\n", c)

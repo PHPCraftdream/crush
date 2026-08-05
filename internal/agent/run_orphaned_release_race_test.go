@@ -221,7 +221,7 @@ func TestMailbox_DrainOrReleaseFinal_ThenAgentRestartsOrphaned_FullPath(t *testi
 		return lk.Release()
 	}
 
-	next, hasNext, releaseErr, orphaned := mb.drainOrReleaseFinal(1, raceRelease)
+	next, hasNext, orphaned, releaseErr := mb.drainOrReleaseFinal(1, raceRelease)
 	require.NoError(t, releaseErr)
 	require.False(t, hasNext, "the original caller must not be told to keep running — lk is already released")
 	require.Equal(t, SessionAgentCall{}, next)

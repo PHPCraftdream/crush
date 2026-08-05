@@ -90,7 +90,7 @@ func TestMailbox_DrainOrReleaseFinal_OSLockReleasedBeforeStateFlipsIdle(t *testi
 			current:          generation{id: 1, cancel: func() {}},
 		}
 
-		_, hasNext, releaseErr, orphaned := mb.drainOrReleaseFinal(1, lk.Release)
+		_, hasNext, orphaned, releaseErr := mb.drainOrReleaseFinal(1, lk.Release)
 		require.False(t, hasNext)
 		require.NoError(t, releaseErr)
 		require.Empty(t, orphaned)
@@ -165,7 +165,7 @@ func TestMailbox_DrainOrReleaseFinal_MuNotHeldDuringRelease_ButNoPrematureIdle(t
 	}
 	drainDone := make(chan drainResult, 1)
 	go func() {
-		_, hasNext, releaseErr, orphaned := mb.drainOrReleaseFinal(1, release)
+		_, hasNext, orphaned, releaseErr := mb.drainOrReleaseFinal(1, release)
 		drainDone <- drainResult{hasNext: hasNext, releaseErr: releaseErr, orphaned: orphaned}
 	}()
 
@@ -276,7 +276,7 @@ func TestMailbox_DrainOrReleaseFinal_OrphanedWorkNeverRunsWithoutFreshOSLock(t *
 		return lk.Release()
 	}
 
-	_, hasNext, releaseErr, orphaned := mb.drainOrReleaseFinal(1, release)
+	_, hasNext, orphaned, releaseErr := mb.drainOrReleaseFinal(1, release)
 	require.NoError(t, releaseErr)
 	require.False(t, hasNext, "orphaned work must not be reported as hasNext — that would tell the caller's turn "+
 		"loop to keep running without a lock")
@@ -308,7 +308,7 @@ func TestMailbox_DrainOrReleaseFinal_ReleaseErrorStillReachesIdle(t *testing.T) 
 
 	release := func() error { return errors.New("disk full") }
 
-	next, hasNext, releaseErr, orphaned := mb.drainOrReleaseFinal(1, release)
+	next, hasNext, orphaned, releaseErr := mb.drainOrReleaseFinal(1, release)
 
 	require.False(t, hasNext)
 	require.Equal(t, SessionAgentCall{}, next)
@@ -358,7 +358,7 @@ func TestMailbox_DrainOrReleaseFinal_ReleasePanicStillReachesIdle(t *testing.T) 
 				}
 			}
 		}()
-		_, hasNext, releaseErr, orphaned := mb.drainOrReleaseFinal(1, release)
+		_, hasNext, orphaned, releaseErr := mb.drainOrReleaseFinal(1, release)
 		drainDone <- drainResult{hasNext: hasNext, releaseErr: releaseErr, orphaned: orphaned}
 	}()
 
@@ -411,7 +411,7 @@ func TestMailbox_DrainOrReleaseFinal_HardStopDuringReleaseWindow_DiscardsWork(t 
 		return nil
 	}
 
-	next, hasNext, releaseErr, orphaned := mb.drainOrReleaseFinal(1, release)
+	next, hasNext, orphaned, releaseErr := mb.drainOrReleaseFinal(1, release)
 
 	require.NoError(t, releaseErr)
 	require.False(t, hasNext, "work that landed during the release window must NOT be handed back once hardStop "+
@@ -497,7 +497,7 @@ func TestMailbox_DrainOrReleaseFinal_SubmittedReclaimNeverReleasesLock(t *testin
 		return lk.Release()
 	}
 
-	next, hasNext, releaseErr, orphaned := mb.drainOrReleaseFinal(1, release)
+	next, hasNext, orphaned, releaseErr := mb.drainOrReleaseFinal(1, release)
 
 	require.True(t, hasNext)
 	require.Equal(t, reclaimed, next)
@@ -544,7 +544,7 @@ func TestMailbox_DrainOrReleaseFinal_SubmittedBranchClearsStaleCancelHandle(t *t
 		submitted:        []SessionAgentCall{queued},
 	}
 
-	next, hasNext, releaseErr, orphaned := mb.drainOrReleaseFinal(1, nil)
+	next, hasNext, orphaned, releaseErr := mb.drainOrReleaseFinal(1, nil)
 
 	require.True(t, hasNext)
 	require.Equal(t, queued, next)

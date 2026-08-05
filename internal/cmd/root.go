@@ -517,12 +517,12 @@ func maybePrependStdin(prompt string, grace time.Duration) (string, error) {
 		// drift out of sync on how an EOF/error/more-data chunk is handled.
 		handleChunk := func(chunk stdinChunkResult) (result string, done bool) {
 			sb.Write(chunk.data)
-			switch {
-			case chunk.err == nil:
+			switch chunk.err {
+			case nil:
 				// More to come — caller should keep looping, which
 				// implicitly resets the idle timer.
 				return "", false
-			case chunk.err == io.EOF:
+			case io.EOF:
 				if sb.Len() == 0 {
 					return prompt, true
 				}

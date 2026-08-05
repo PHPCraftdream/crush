@@ -238,7 +238,7 @@ func TestQueueRunCmdRun_UpdateStatusFailure_SurfacesError(t *testing.T) {
 		sabotage, sabErr := sql.Open("sqlite", dbPath)
 		require.NoError(t, sabErr)
 		defer sabotage.Close()
-		_, sabErr = sabotage.Exec("DROP TABLE queue_tasks")
+		_, sabErr = sabotage.ExecContext(t.Context(), "DROP TABLE queue_tasks")
 		require.NoError(t, sabErr, "sabotage connection must succeed in dropping queue_tasks for this test to be meaningful")
 
 		out, _ := json.Marshal(map[string]any{

@@ -75,7 +75,7 @@ func TestMailbox_Invariant_NoStaleCancelHandleSurvivesAnyMutatorReturn(t *testin
 			name: "drainOrReleaseFinal/submitted branch keeps ownership",
 			run: func(t *testing.T, mb *mailbox) {
 				mb.submitted = []SessionAgentCall{{SessionID: "s1"}}
-				_, hasNext, err, orphaned := mb.drainOrReleaseFinal(1, nil)
+				_, hasNext, orphaned, err := mb.drainOrReleaseFinal(1, nil)
 				require.NoError(t, err)
 				require.True(t, hasNext)
 				require.Empty(t, orphaned)
@@ -87,7 +87,7 @@ func TestMailbox_Invariant_NoStaleCancelHandleSurvivesAnyMutatorReturn(t *testin
 			run: func(t *testing.T, mb *mailbox) {
 				repl := SessionAgentCall{SessionID: "s1"}
 				mb.replacement = &repl
-				_, hasNext, err, orphaned := mb.drainOrReleaseFinal(1, nil)
+				_, hasNext, orphaned, err := mb.drainOrReleaseFinal(1, nil)
 				require.NoError(t, err)
 				require.True(t, hasNext)
 				require.Empty(t, orphaned)
@@ -97,7 +97,7 @@ func TestMailbox_Invariant_NoStaleCancelHandleSurvivesAnyMutatorReturn(t *testin
 		{
 			name: "drainOrReleaseFinal/both empty releases and ends the era",
 			run: func(t *testing.T, mb *mailbox) {
-				_, hasNext, err, orphaned := mb.drainOrReleaseFinal(1, func() error { return nil })
+				_, hasNext, orphaned, err := mb.drainOrReleaseFinal(1, func() error { return nil })
 				require.NoError(t, err)
 				require.False(t, hasNext)
 				require.Empty(t, orphaned)
@@ -171,7 +171,7 @@ func TestMailbox_Invariant_NoStaleCancelHandleSurvivesAnyMutatorReturn(t *testin
 				mb.submitted = []SessionAgentCall{{SessionID: "s1"}}
 				mb.hardStop()
 				released := false
-				_, hasNext, err, orphaned := mb.drainOrReleaseFinal(1, func() error {
+				_, hasNext, orphaned, err := mb.drainOrReleaseFinal(1, func() error {
 					released = true
 					return nil
 				})
@@ -254,7 +254,7 @@ func TestMailbox_Invariant_NoStaleCancelHandleSurvivesAnyMutatorReturn(t *testin
 					mb.mu.Unlock()
 					return nil
 				}
-				_, hasNext, err, orphaned := mb.drainOrReleaseFinal(1, release)
+				_, hasNext, orphaned, err := mb.drainOrReleaseFinal(1, release)
 				require.NoError(t, err)
 				require.False(t, hasNext, "work that lands in mb.submitted while release() is running must NOT "+
 					"be handed back to the turn loop — the OS lock is already gone by the time it is noticed")
@@ -273,7 +273,7 @@ func TestMailbox_Invariant_NoStaleCancelHandleSurvivesAnyMutatorReturn(t *testin
 					mb.mu.Unlock()
 					return nil
 				}
-				_, hasNext, err, orphaned := mb.drainOrReleaseFinal(1, release)
+				_, hasNext, orphaned, err := mb.drainOrReleaseFinal(1, release)
 				require.NoError(t, err)
 				require.False(t, hasNext, "a replacement recorded while release() is running must NOT be handed "+
 					"back to the turn loop — the OS lock is already gone by the time it is noticed")
@@ -292,7 +292,7 @@ func TestMailbox_Invariant_NoStaleCancelHandleSurvivesAnyMutatorReturn(t *testin
 					mb.mu.Unlock()
 					return nil
 				}
-				_, hasNext, err, orphaned := mb.drainOrReleaseFinal(1, release)
+				_, hasNext, orphaned, err := mb.drainOrReleaseFinal(1, release)
 				require.NoError(t, err)
 				require.False(t, hasNext, "hardStop landing during the release() window must override any work "+
 					"that also landed there — a shutdown must not hand the turn loop a fresh call")

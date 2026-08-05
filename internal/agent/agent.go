@@ -915,7 +915,7 @@ func (a *sessionAgent) drainOrReleaseMerged(sessionID string, epoch uint64, lk *
 	if lk != nil {
 		release = lk.Release
 	}
-	next, hasNext, releaseErr, orphaned := a.getMailbox(sessionID).drainOrReleaseFinal(epoch, release)
+	next, hasNext, orphaned, releaseErr := a.getMailbox(sessionID).drainOrReleaseFinal(epoch, release)
 	if releaseErr != nil {
 		slog.Debug("agent.drainOrReleaseMerged: release session lock failed", "session_id", sessionID, "err", releaseErr)
 	}
@@ -1263,7 +1263,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 		// preamble is now part of a cancelable generation that is SEPARATE
 		// from the durable dispatcher cancel.
 		mb.beginGeneration(turnCancel)
-		result, err, next, hasNext := a.runTurn(turnCtx, call, lk, epoch, runCancel)
+		result, next, hasNext, err := a.runTurn(turnCtx, call, lk, epoch, runCancel)
 		turnCancel()
 		if !hasNext {
 			return result, err
@@ -1430,7 +1430,7 @@ func (a *sessionAgent) handleWatchdogFire(
 // end-of-turn queue check, or a /compact drain) with next set to that call;
 // the caller's loop is expected to invoke runTurn(ctx, next) again in that
 // case. When hasNext is false, result/err are Run's final return values.
-func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *session.SessionLock, epoch uint64, runCancel context.CancelFunc) (res *fantasy.AgentResult, resErr error, next SessionAgentCall, hasNext bool) {
+func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *session.SessionLock, epoch uint64, runCancel context.CancelFunc) (res *fantasy.AgentResult, next SessionAgentCall, hasNext bool, resErr error) {
 	// Copy mutable fields under lock to avoid races with SetTools/SetModels.
 	agentTools := a.tools.Copy()
 	// One immutable snapshot for the whole turn (task #265). Resolving these
@@ -1492,10 +1492,10 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 		// so the loop runs it as the next turn.
 		if errors.Is(err, context.Canceled) {
 			if next, ok := a.getMailbox(call.SessionID).drainAfterCancel(); ok {
-				return nil, nil, next, true
+				return nil, next, true, nil
 			}
 		}
-		return nil, fmt.Errorf("failed to get session: %w", err), SessionAgentCall{}, false
+		return nil, SessionAgentCall{}, false, fmt.Errorf("failed to get session: %w", err)
 	}
 
 	msgs, err := a.getSessionMessages(preambleCtx, currentSession)
@@ -1503,10 +1503,10 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 		preambleCancel()
 		if errors.Is(err, context.Canceled) {
 			if next, ok := a.getMailbox(call.SessionID).drainAfterCancel(); ok {
-				return nil, nil, next, true
+				return nil, next, true, nil
 			}
 		}
-		return nil, fmt.Errorf("failed to get session messages: %w", err), SessionAgentCall{}, false
+		return nil, SessionAgentCall{}, false, fmt.Errorf("failed to get session messages: %w", err)
 	}
 
 	// Generate the title on the first message — OR self-heal on a later turn
@@ -1533,10 +1533,10 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 			preambleCancel()
 			if errors.Is(err, context.Canceled) {
 				if next, ok := a.getMailbox(call.SessionID).drainAfterCancel(); ok {
-					return nil, nil, next, true
+					return nil, next, true, nil
 				}
 			}
-			return nil, err, SessionAgentCall{}, false
+			return nil, SessionAgentCall{}, false, err
 		}
 	}
 	preambleCancel()
@@ -2594,7 +2594,7 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 		nilAssistant := currentAssistant == nil
 		sessionLock.Unlock()
 		if nilAssistant {
-			return result, err, SessionAgentCall{}, false
+			return result, SessionAgentCall{}, false, err
 		}
 		// All DB writes in the error path use a detached context. The outer
 		// ctx may itself be cancelled — in `crush run` it's the
@@ -2620,7 +2620,7 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 		sessionLock.Unlock()
 		msgs, createErr := a.messages.List(flushCtx, sessionID)
 		if createErr != nil {
-			return nil, createErr, SessionAgentCall{}, false
+			return nil, SessionAgentCall{}, false, createErr
 		}
 		for _, tc := range toolCalls {
 			if !tc.Finished {
@@ -2632,7 +2632,7 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 				sessionLock.Unlock()
 				updateErr := a.messages.Update(flushCtx, snap)
 				if updateErr != nil {
-					return nil, updateErr, SessionAgentCall{}, false
+					return nil, SessionAgentCall{}, false, updateErr
 				}
 			}
 
@@ -2678,7 +2678,7 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 				},
 			})
 			if createErr != nil {
-				return nil, createErr, SessionAgentCall{}, false
+				return nil, SessionAgentCall{}, false, createErr
 			}
 		}
 		var fantasyErr *fantasy.Error
@@ -2769,7 +2769,7 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 				"session_id", call.SessionID,
 				"err", updateErr,
 			)
-			return nil, updateErr, SessionAgentCall{}, false
+			return nil, SessionAgentCall{}, false, updateErr
 		}
 
 		// Drain on cancel via the mailbox's generation-aware drain (design
@@ -2781,10 +2781,10 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 		if isCancelErr {
 			if next, ok := a.getMailbox(call.SessionID).drainAfterCancel(); ok {
 				cancel()
-				return nil, nil, next, true
+				return nil, next, true, nil
 			}
 		}
-		return nil, err, SessionAgentCall{}, false
+		return nil, SessionAgentCall{}, false, err
 	}
 
 	if shouldSummarize {
@@ -2801,7 +2801,7 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 		// included.
 		summarizeErr := a.runSummarizeBody(genCtx, call.SessionID, call.ProviderOptions)
 		if summarizeErr != nil {
-			return nil, summarizeErr, SessionAgentCall{}, false
+			return nil, SessionAgentCall{}, false, summarizeErr
 		}
 		mb := a.getMailbox(call.SessionID)
 		// If the agent wasn't done...
@@ -2853,10 +2853,10 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 	// concurrent submit can land in a gap that no longer exists.
 	firstQueuedMessage, ok := a.drainOrReleaseMerged(call.SessionID, epoch, lk, runCancel)
 	if !ok {
-		return result, err, SessionAgentCall{}, false
+		return result, SessionAgentCall{}, false, err
 	}
 	// There are queued messages — the caller's loop runs another turn.
-	return nil, nil, firstQueuedMessage, true
+	return nil, firstQueuedMessage, true, nil
 }
 
 // ErrSummarizeQueued is returned by Summarize when the session is busy and

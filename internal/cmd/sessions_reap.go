@@ -138,8 +138,8 @@ func sessionsReapCmdRun(cmd *cobra.Command, args []string) error {
 		// session — two owners of one session id. See internal/session/lock.go
 		// and lockHolderProvablyDead (sessions.go) for the full rationale.
 		lk, probeErr := session.TryAcquireSessionLock(dataDir, sessionID)
-		switch {
-		case probeErr == nil:
+		switch probeErr {
+		case nil:
 			// Nobody holds the OS lock — provably dead. Release our probe and
 			// mark for removal. The narrow release→Remove TOCTOU this leaves
 			// is the same accepted one documented for `sessions locks --prune`

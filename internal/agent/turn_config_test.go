@@ -135,6 +135,8 @@ func TestResolveTurnConfig_Precedence(t *testing.T) {
 	}
 
 	t.Run("an unpinned call still reads the shared fields", func(t *testing.T) {
+		t.Parallel()
+
 		// Backward compatibility: every caller that predates #265 passes no
 		// pins at all and must behave exactly as before.
 		cfg := newAgent().resolveTurnConfig(SessionAgentCall{SessionID: "s"})
@@ -145,6 +147,8 @@ func TestResolveTurnConfig_Precedence(t *testing.T) {
 	})
 
 	t.Run("SystemPromptOverride beats a pinned base prompt", func(t *testing.T) {
+		t.Parallel()
+
 		// The per-session prompt persisted in the DB is the most specific
 		// value there is; the pinned base is only the model-derived default.
 		base := "pinned-base"
@@ -157,12 +161,16 @@ func TestResolveTurnConfig_Precedence(t *testing.T) {
 	})
 
 	t.Run("a pinned base prompt beats the shared one", func(t *testing.T) {
+		t.Parallel()
+
 		base := "pinned-base"
 		cfg := newAgent().resolveTurnConfig(SessionAgentCall{SessionID: "s", SystemPrompt: &base})
 		assert.Equal(t, "pinned-base", cfg.systemPrompt)
 	})
 
 	t.Run("pins are independent of each other", func(t *testing.T) {
+		t.Parallel()
+
 		// Pinning only the large model must not drag the others off the
 		// shared values — that would be a different flavour of the same
 		// mixing bug.

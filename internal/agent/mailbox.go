@@ -496,7 +496,7 @@ func (mb *mailbox) drainOrRelease(epoch uint64) (SessionAgentCall, bool) {
 func (mb *mailbox) drainOrReleaseFinal(
 	epoch uint64,
 	release func() error,
-) (call SessionAgentCall, hasNext bool, releaseErr error, orphaned []SessionAgentCall) {
+) (call SessionAgentCall, hasNext bool, orphaned []SessionAgentCall, releaseErr error) {
 	mb.mu.Lock()
 
 	if mb.epoch != epoch {
@@ -625,7 +625,7 @@ func (mb *mailbox) drainOrReleaseFinal(
 	if mb.stopped {
 		mb.submitted = nil
 		mb.replacement = nil
-		return SessionAgentCall{}, false, releaseErr, nil
+		return SessionAgentCall{}, false, nil, releaseErr
 	}
 
 	// Drain everything that raced into the mailbox during the release()
@@ -664,7 +664,7 @@ func (mb *mailbox) drainOrReleaseFinal(
 	// restart) for each of them, exactly as if a brand new caller had
 	// submitted them against an idle mailbox — because that is, at this
 	// instant, genuinely what they are.
-	return SessionAgentCall{}, false, releaseErr, orphaned
+	return SessionAgentCall{}, false, orphaned, releaseErr
 }
 
 // callReleaseRecoveringPanic invokes release and recovers any panic it

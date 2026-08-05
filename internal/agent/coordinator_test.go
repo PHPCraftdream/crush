@@ -53,6 +53,7 @@ func (m *mockSessionAgent) ClearQueue(sessionID string)                 {}
 func (m *mockSessionAgent) QueueMessage(call SessionAgentCall) {
 	m.queuedCalls = append(m.queuedCalls, call)
 }
+
 func (m *mockSessionAgent) InterruptAndReplace(_ string, call SessionAgentCall) bool {
 	m.interruptAndReplaced = append(m.interruptAndReplaced, call)
 	return true
