@@ -232,27 +232,24 @@ func explainSessionStatus(ctx context.Context, a *app.App, dataDir, sessionID st
 		//     never a "PID 0" holder to declare dead. The real evidence is
 		//     a stale heartbeat, so say that instead of naming a fictional
 		//     PID (task #258).
-		//   - pidBoundExceeded && pidGenuinelyDead: the lock is old AND
-		//     the recorded PID is confirmed dead — plain "is not alive",
-		//     no need to speculate about PID reuse (task #257).
 		//   - pidBoundExceeded && !pidGenuinelyDead: the lock is old but
 		//     the recorded PID number currently belongs to a live,
 		//     unrelated process — genuine OS PID-reuse territory. Include
 		//     both the bound threshold and the lock's actual age so the
 		//     operator can see both numbers (task #257 review nit).
-		//   - otherwise: a normal, unbounded dead-PID read. A
-		//     genuinely-dead PID really isn't alive; claiming otherwise
-		//     would contradict what tasklist/ps shows the operator — the
-		//     very contradiction task #250's verdict fix was meant to
-		//     remove, caught surviving here in the explanation text
-		//     (#256).
+		//   - otherwise (includes pidBoundExceeded && pidGenuinelyDead,
+		//     which reads identically to the plain unbounded case — no
+		//     need to speculate about PID reuse once IsProcessAlive has
+		//     already confirmed the PID is dead, task #257): a genuinely-dead
+		//     PID really isn't alive; claiming otherwise would contradict
+		//     what tasklist/ps shows the operator — the very contradiction
+		//     task #250's verdict fix was meant to remove, caught
+		//     surviving here in the explanation text (#256).
 		var holderDeadReason string
 		switch {
 		case pid <= 0:
 			holderDeadReason = fmt.Sprintf("lock file exists but its PID could not be read and the heartbeat is stale (%s old, exceeds LockStaleDuration) — the recorded holder cannot be confirmed alive", formatDurationShort(heartAge))
-		case pidBoundExceeded && pidGenuinelyDead:
-			holderDeadReason = fmt.Sprintf("lock file exists but holder PID %d is not alive", pid)
-		case pidBoundExceeded:
+		case pidBoundExceeded && !pidGenuinelyDead:
 			holderDeadReason = fmt.Sprintf("lock file is older than MaxPidFallbackAge (%s, lock is %s old); its recorded PID %d is no longer trustworthy (likely OS PID reuse) — treating the holder as dead", formatDurationShort(session.MaxPidFallbackAge), formatDurationShort(heartAge), pid)
 		default:
 			holderDeadReason = fmt.Sprintf("lock file exists but holder PID %d is not alive", pid)
