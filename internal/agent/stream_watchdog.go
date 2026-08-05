@@ -384,7 +384,15 @@ func startStreamWatchdog(
 				if hardCap > 0 && now.After(hardDeadline) {
 					stalled.Store(true)
 					if onFire != nil {
-						onFire(idle, causeHardCap)
+						// now.Sub(startTime), not idle: this is a wall-clock
+						// turn-length cap, same as the toolsInFlight branch
+						// above (#276) — idle only measures time since the
+						// last stream chunk, which can read as nearly zero
+						// at the moment a multi-hour hard cap fires,
+						// misleading a postmortem into thinking the turn had
+						// just gone quiet rather than run for its full
+						// duration.
+						onFire(now.Sub(startTime), causeHardCap)
 					}
 					cancel()
 					return

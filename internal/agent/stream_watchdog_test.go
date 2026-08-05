@@ -284,9 +284,11 @@ func TestStreamWatchdog_HardCapRespected(t *testing.T) {
 
 	var fired atomic.Int32
 	var firedCause atomic.Int32
-	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(_ time.Duration, cause watchdogCause) {
+	var firedElapsed atomic.Int64
+	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(elapsed time.Duration, cause watchdogCause) {
 		fired.Add(1)
 		firedCause.Store(int32(cause))
+		firedElapsed.Store(int64(elapsed))
 	}, true, hardCap, 0, 0, nil)
 
 	start := time.Now()
@@ -318,6 +320,14 @@ loop:
 	// if the fire is genuinely late, not merely jittered.
 	assert.LessOrEqual(t, elapsed, hardCap+800*time.Millisecond,
 		"watchdog must fire near the hard cap")
+	// Regression for task #276: the value passed to onFire must be the
+	// wall-clock turn length (now.Sub(startTime)), not idle — this loop
+	// bumps every 10ms, so idle sits near-zero for the whole run, and a
+	// misdiagnosed hard-cap fire would report an elapsed close to 0
+	// instead of close to hardCap.
+	gotElapsed := time.Duration(firedElapsed.Load())
+	assert.GreaterOrEqual(t, gotElapsed, hardCap,
+		"elapsed passed to onFire must reflect wall-clock turn length, not near-zero idle time")
 }
 
 // TestStreamWatchdog_HardCapRespectedWithoutExtendsOnProgress is the
@@ -340,9 +350,11 @@ func TestStreamWatchdog_HardCapRespectedWithoutExtendsOnProgress(t *testing.T) {
 
 	var fired atomic.Int32
 	var firedCause atomic.Int32
-	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(_ time.Duration, cause watchdogCause) {
+	var firedElapsed atomic.Int64
+	wd := startStreamWatchdog(ctx, cancel, idle, tick, func(elapsed time.Duration, cause watchdogCause) {
 		fired.Add(1)
 		firedCause.Store(int32(cause))
+		firedElapsed.Store(int64(elapsed))
 	}, false, hardCap, 0, 0, nil)
 
 	start := time.Now()
@@ -373,6 +385,13 @@ loop:
 	// runner under -race in a full-package parallel run.
 	assert.LessOrEqual(t, elapsed, hardCap+800*time.Millisecond,
 		"watchdog must fire near the hard cap")
+	// Regression for task #276: this is exactly the branch that used to
+	// pass idle instead of the wall-clock elapsed to onFire. The bump loop
+	// keeps idle near-zero for the whole run, so a misdiagnosed fire would
+	// report an elapsed close to 0 instead of close to hardCap.
+	gotElapsed := time.Duration(firedElapsed.Load())
+	assert.GreaterOrEqual(t, gotElapsed, hardCap,
+		"elapsed passed to onFire must reflect wall-clock turn length, not near-zero idle time")
 }
 
 // TestStreamWatchdog_HardCapRespectedWithToolInFlight is the regression test
