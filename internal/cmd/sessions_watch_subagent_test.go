@@ -183,19 +183,22 @@ func TestPrintNewMessagesSince_EventDriven_NoRepeatOnUnchangedSession(t *testing
 	// A THIRD call, after genuine new activity, must print again — proving
 	// the quiet result above is because nothing changed, not because the
 	// function is broken/stuck.
-	newMsg, err := m.Create(ctx, child.ID, message.CreateMessageParams{
+	//
+	// created_at has ONLY second granularity (see message.service.Update's
+	// time.Now().Unix() and the messages table's INTEGER column), so within
+	// a fast test run this new message routinely lands in the SAME second
+	// as the first. This USED to require forcing created_at strictly past
+	// the first message's via a direct SQL UPDATE, because the old isAfter
+	// fell back to comparing random UUIDs on a same-second tie — a
+	// coinflip, not an order. Task #319 replaced that with indexByID, which
+	// trusts ListMessagesBySession's own deterministic
+	// (created_at ASC, rowid ASC) order instead of re-deriving one, so no
+	// workaround is needed here anymore: this is now a same-second tie by
+	// construction, run without any created_at manipulation, on purpose.
+	_, err = m.Create(ctx, child.ID, message.CreateMessageParams{
 		Role:  message.Assistant,
 		Parts: []message.ContentPart{message.TextContent{Text: "found the answer"}},
 	})
-	require.NoError(t, err)
-	// created_at has ONLY second granularity (see message.service.Update's
-	// time.Now().Unix() and the messages table's INTEGER column), so within a
-	// fast test run this new message can land in the SAME second as the
-	// first — isAfter then falls back to comparing random UUIDs
-	// (a.ID > b.ID), which is not deterministic. Force created_at strictly
-	// past the first message's so the "new activity is detected" assertion
-	// below cannot flake depending on wall-clock/UUID luck.
-	_, err = conn.ExecContext(ctx, `UPDATE messages SET created_at = created_at + 10 WHERE id = ?`, newMsg.ID)
 	require.NoError(t, err)
 
 	var buf3 bytes.Buffer

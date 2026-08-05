@@ -1419,10 +1419,19 @@ func sessionsTailCmdRun(cmd *cobra.Command, args []string) error {
 		// this tick, and the next ToolResult render needs them.
 		callCtx = buildToolCallContext(messages)
 
-		// Print any new messages
+		// Print any new messages. lastIdx, not a CreatedAt/ID comparison:
+		// messages is already the DB's own deterministic total order
+		// (ListMessagesBySession's `ORDER BY created_at ASC, rowid ASC` —
+		// created_at alone has only one-second granularity, so several
+		// messages from one fast turn routinely tie). Re-deriving "after"
+		// from CreatedAt+ID (the old isAfter) discarded that order and
+		// substituted a coinflip on message.ID, a random UUID, whenever two
+		// messages landed in the same second (task #319). Trusting the
+		// slice's own position is both simpler and correct by construction.
 		now := time.Now()
+		lastIdx := indexByID(messages, lastPrinted)
 		for i := range messages {
-			if messages[i].ID != lastPrinted && (lastPrinted == "" || isAfter(&messages[i], findByID(messages, lastPrinted))) {
+			if i > lastIdx {
 				printMessageWithTime(os.Stdout, messages[i], format, now, callCtx, i < len(messages)-1)
 				lastPrinted = messages[i].ID
 			}
@@ -1437,20 +1446,21 @@ func sessionsTailCmdRun(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func findByID(messages []message.Message, id string) *message.Message {
+// indexByID returns the index of the message with the given id in
+// messages, or -1 if id is empty or not found (including the case where a
+// previously-printed message no longer appears in a fresh List() result —
+// matching the old findByID+isAfter behavior of treating a missing anchor
+// as "print everything").
+func indexByID(messages []message.Message, id string) int {
+	if id == "" {
+		return -1
+	}
 	for i := range messages {
 		if messages[i].ID == id {
-			return &messages[i]
+			return i
 		}
 	}
-	return nil
-}
-
-func isAfter(a, b *message.Message) bool {
-	if b == nil {
-		return true
-	}
-	return a.CreatedAt > b.CreatedAt || (a.CreatedAt == b.CreatedAt && a.ID > b.ID)
+	return -1
 }
 
 // formatAgo returns a human-friendly "X ago" string for the given duration.

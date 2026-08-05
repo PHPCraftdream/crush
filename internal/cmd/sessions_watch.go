@@ -214,15 +214,13 @@ func liveTailSession(ctx context.Context, a *app.App, sessionID, dataDir string,
 		}
 		callCtx = buildToolCallContext(msgs)
 		tickNow := time.Now()
-		var anchor *message.Message
-		if lastPrinted != "" {
-			anchor = findByID(msgs, lastPrinted)
-		}
+		// lastIdx, not CreatedAt/ID comparison — see indexByID's doc
+		// comment (task #319): msgs is already in the DB's own
+		// deterministic total order, so trusting slice position avoids the
+		// old same-second-tie coinflip on message.ID.
+		lastIdx := indexByID(msgs, lastPrinted)
 		for i := range msgs {
-			if msgs[i].ID == lastPrinted {
-				continue
-			}
-			if lastPrinted == "" || isAfter(&msgs[i], anchor) {
+			if i > lastIdx {
 				printMessageWithTime(os.Stdout, msgs[i], "text", tickNow, callCtx, i < len(msgs)-1)
 				lastPrinted = msgs[i].ID
 			}
@@ -306,16 +304,12 @@ func printNewMessagesSince(w io.Writer, ctx context.Context, a *app.App, session
 	}
 	callCtx := buildToolCallContext(msgs)
 	last := lastPrinted[sessionID]
-	var anchor *message.Message
-	if last != "" {
-		anchor = findByID(msgs, last)
-	}
+	// lastIdx, not CreatedAt/ID comparison — see indexByID's doc comment
+	// (task #319).
+	lastIdx := indexByID(msgs, last)
 	printed := false
 	for i := range msgs {
-		if msgs[i].ID == last {
-			continue
-		}
-		if last == "" || isAfter(&msgs[i], anchor) {
+		if i > lastIdx {
 			printMessageWithTime(w, msgs[i], "text", now, callCtx, i < len(msgs)-1)
 			lastPrinted[sessionID] = msgs[i].ID
 			printed = true
