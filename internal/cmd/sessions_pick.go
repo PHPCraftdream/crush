@@ -45,6 +45,15 @@ func sessionsPickCmdRun(cmd *cobra.Command, args []string) error {
 	}
 	defer a.Shutdown()
 
+	// Use the already-resolved data directory from setupApp (honors
+	// --data-dir AND any configured data_directory), not a re-read of the
+	// raw flag — same "prefer the raw flag" anti-pattern task #224 fixed in
+	// sessions_kill.go and #247 fixed in queue.go's runQueueTask. Forwarded
+	// to the spawned child below so it resolves the SAME session DB the
+	// picker just listed from, instead of re-deriving <cwd>/.crush from
+	// scratch and reporting "session not found" for the ID just displayed.
+	dataDir := a.Config().Options.DataDirectory
+
 	sessions, err := a.Sessions.List(cmd.Context())
 	if err != nil {
 		return fmt.Errorf("failed to list sessions: %w", err)
@@ -79,12 +88,21 @@ func sessionsPickCmdRun(cmd *cobra.Command, args []string) error {
 	}
 	items, hidden := trimSessionItems(items, pickerMaxItems)
 
+	// os.Executable(), not os.Args[0]: the latter can be an unresolvable
+	// relative path once the process has chdir'd (which setupApp's
+	// ResolveCwd, called above, just did) — see queue.go's runQueueTask
+	// doc comment for the same reasoning (#247/#263).
+	binary, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("failed to resolve crush binary path: %w", err)
+	}
+
 	m := pickerModel{
 		items:   items,
 		hidden:  hidden,
 		cursor:  0,
 		tail:    tail,
-		binary:  os.Args[0],
+		binary:  binary,
 		quit:    false,
 		swapped: false,
 	}
@@ -100,18 +118,25 @@ func sessionsPickCmdRun(cmd *cobra.Command, args []string) error {
 
 	fmt.Fprintf(os.Stderr, "selected: %s\n", m.selected)
 
-	var cmdArgs []string
-	if tail {
-		cmdArgs = []string{"sessions", "tail", m.selected, "--follow"}
-	} else {
-		cmdArgs = []string{"sessions", "last", m.selected}
-	}
+	cmdArgs := pickedSessionArgs(dataDir, m.selected, tail)
 
 	subCmd := platform.Command(context.Background(), m.binary, cmdArgs...)
 	subCmd.Stdin = os.Stdin
 	subCmd.Stdout = os.Stdout
 	subCmd.Stderr = os.Stderr
 	return subCmd.Run()
+}
+
+// pickedSessionArgs builds the argv for the child `crush sessions
+// tail|last` process spawned after a session is picked. Split out from
+// sessionsPickCmdRun so it can be tested directly without driving the
+// interactive tea.Program picker — see
+// TestPickedSessionArgs_ForwardsDataDir (task #263).
+func pickedSessionArgs(dataDir, selected string, tail bool) []string {
+	if tail {
+		return []string{"sessions", "tail", selected, "--follow", "--data-dir", dataDir}
+	}
+	return []string{"sessions", "last", selected, "--data-dir", dataDir}
 }
 
 // pickerMaxItems caps how many session rows the interactive picker
