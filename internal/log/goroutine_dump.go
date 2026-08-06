@@ -27,8 +27,7 @@ var dumpSeq atomic.Uint64
 // the duration of the calling test, restoring the previous value via
 // t.Cleanup. Exists so tests OUTSIDE this package (e.g.
 // internal/agent's stream-watchdog-fire tests) can redirect where a REAL
-// crushlog.WriteGoroutineDump call lands — including at a deliberately slow
-// (deeply nested, not-yet-created) path — without needing Setup's
+// crushlog.WriteGoroutineDump call lands without needing Setup's
 // process-wide sync.Once or reaching into this package's unexported logDir
 // directly. Safe to call from any test package; not for production use.
 func SetLogDirForTest(t testingTB, dir string) {
@@ -40,6 +39,41 @@ func SetLogDirForTest(t testingTB, dir string) {
 			logDir.Store(s)
 		} else {
 			logDir.Store("")
+		}
+	})
+}
+
+// writeDelayHook, when set, is invoked at the top of WriteGoroutineDump
+// before any real I/O. It exists so tests OUTSIDE this package can prove a
+// caller dispatches the write asynchronously (i.e. returns before the write
+// completes) with a deterministic synchronization point instead of racing
+// real disk speed — see SetWriteDelayHookForTest. A prior test attempted
+// this by pointing SetLogDirForTest at a deliberately deep, not-yet-created
+// directory to make the write "slow"; that approach failed outright on
+// macOS, where the kernel enforces PATH_MAX=1024 and the constructed path
+// exceeded it, so os.MkdirAll returned ENAMETOOLONG immediately instead of
+// merely running slowly (see internal/agent/stream_watchdog_test.go).
+var writeDelayHook atomic.Value // func()
+
+// SetWriteDelayHookForTest installs hook to run at the very start of every
+// WriteGoroutineDump call for the duration of the calling test, restoring
+// the previous value via t.Cleanup. nil-safe: passing nil (or never calling
+// this) leaves WriteGoroutineDump's production behavior unchanged. Not for
+// production use.
+func SetWriteDelayHookForTest(t testingTB, hook func()) {
+	t.Helper()
+	prev := writeDelayHook.Load()
+	writeDelayHook.Store(hook)
+	t.Cleanup(func() {
+		// atomic.Value.Store panics on a genuinely untyped nil, which is
+		// exactly what Load returns here if no hook was ever installed
+		// before this call — fall back to a func()-typed nil in that case,
+		// same pattern SetLogDirForTest uses for its own zero value.
+		if h, ok := prev.(func()); ok {
+			writeDelayHook.Store(h)
+		} else {
+			var zero func()
+			writeDelayHook.Store(zero)
 		}
 	})
 }
@@ -111,6 +145,9 @@ func CaptureGoroutineStack(reason string) []byte {
 // to log, and none of them are worth escalating — a missing dump must never
 // turn a recoverable stall into a crash.
 func WriteGoroutineDump(buf []byte) (string, error) {
+	if h, ok := writeDelayHook.Load().(func()); ok && h != nil {
+		h()
+	}
 	dir, _ := logDir.Load().(string)
 	if dir == "" {
 		dir = os.TempDir()
