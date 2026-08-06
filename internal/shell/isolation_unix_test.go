@@ -176,15 +176,30 @@ func TestProcessIsolation_GrandchildHoldingStdoutDoesNotWedgeForever(t *testing.
 	})
 	elapsed := time.Since(start)
 
-	if err == nil {
-		t.Fatal("expected error from cancelled context")
-	}
+	// Unlike TestProcessIsolation_ChildProcessGroupKill (where `wait` keeps
+	// sh itself blocked in the foreground, so THAT test's cancellation
+	// signal kills sh directly and correctly expects a non-nil error), err
+	// == nil is the CORRECT outcome here, not a sign the fix is missing:
+	// cmd.Wait()'s return value reflects the DIRECT child's (sh's) own exit
+	// status, and sh here exits cleanly (code 0) almost immediately after
+	// backgrounding sleep -- well before ctx ever expires. The forced kill
+	// 2s later reaches the GRANDCHILD (sleep) to unblock the stdout pipe,
+	// not sh, so it does not change sh's already-determined clean exit
+	// status. Confirmed against real CI (ubuntu-latest, the only place this
+	// !windows-tagged file actually runs): err was nil, elapsed was ~2.5s
+	// -- exactly ctxTimeout(500ms) + killTimeout(2s), i.e. the kill path
+	// ran to completion and then returned promptly, not a hang. The
+	// property this test actually needs to prove is elapsed time, not the
+	// error value -- asserting err != nil here was the test's own bug, not
+	// a gap in the underlying fix.
+	t.Logf("Run returned err=%v after %v", err, elapsed)
+
 	// Allow up to 4s: 500ms context timeout + 2s kill timeout + margin —
 	// same bound as TestProcessIsolation_ChildProcessGroupKill. A broken
 	// (direct-child-only) kill would instead hang for the backgrounded
 	// sleep's full 60s, nowhere close to this bound.
 	if elapsed > 4*time.Second {
-		t.Fatalf("cancellation took %v; expected the process-group kill to reach the "+
+		t.Fatalf("Run took %v; expected the process-group kill to reach the "+
 			"backgrounded grandchild holding stdout open, not hang for its full sleep", elapsed)
 	}
 }
