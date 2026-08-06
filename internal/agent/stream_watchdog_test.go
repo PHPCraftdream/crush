@@ -1050,32 +1050,47 @@ func TestStreamWatchdog_AsyncDiagnosticWorkDoesNotDelayCancel(t *testing.T) {
 // method runTurn's onFire closure dispatches to (see agent.go) — with no
 // watchdog, no turn, no VCR involved.
 //
-// The write is the REAL crushlog.WriteGoroutineDump (not a fake), so to make
+// The write is the REAL crushlog.WriteGoroutineDump (not a fake). To make
 // "the write is dispatched async and does not delay the return" a
 // deterministic, non-flaky assertion rather than a timing guess against an
-// ordinarily near-instant local disk write, this test redirects
-// crushlog's dump directory (via the exported crushlog.SetLogDirForTest
-// seam) at a deeply nested, not-yet-existing directory. os.MkdirAll walking
-// ~300 missing path segments measurably slows the real write (hundreds of ms,
-// verified empirically) while leaving the code path completely unmodified —
-// giving a wide, reliable margin between "the call returned" and "the slow
-// real write finished" without faking any production logic.
+// ordinarily near-instant local disk write, this test installs a
+// crushlog.SetWriteDelayHookForTest hook that blocks the real write at a
+// known point until the test explicitly releases it — a genuine
+// synchronization barrier, not a race against wall-clock I/O speed.
+//
+// An earlier version of this test tried to manufacture "slow" instead of
+// "blocked": it pointed crushlog.SetLogDirForTest at a deliberately deep,
+// not-yet-created 300-level directory so os.MkdirAll would take measurably
+// long. That failed outright on macOS CI (build(macos-latest), 3 consecutive
+// fork/main pushes) because the kernel enforces PATH_MAX=1024 there; the
+// constructed path was ~3000+ bytes, so MkdirAll returned ENAMETOOLONG
+// immediately instead of running slowly — the write never happened, so the
+// polling assertion below spun to its budget every time regardless of size
+// (task #320 misdiagnosed this as the CI runner being too slow under -race
+// and only widened the budget, which could never fix a hard error). The
+// hook-based version below has no directory depth and no platform-dependent
+// timing assumption at all.
 //
 // It proves, against the REAL method:
 //  1. watchdogCauseVal is stored with the real fired cause by the time
 //     handleWatchdogFire returns (this is the field runTurn's post-stream
 //     error path reads via watchdogCause(watchdogCauseVal.Load()) to decide
 //     the user-facing finish message and tool-result text).
-//  2. The method returns BEFORE the slow real write has completed — proving
-//     the write is genuinely dispatched on its own goroutine, not awaited.
-//  3. The write nonetheless completes shortly after and lands real,
-//     readable goroutine-stack content on disk.
+//  2. The method returns BEFORE the (deliberately held-open) real write has
+//     completed — proving the write is genuinely dispatched on its own
+//     goroutine, not awaited.
+//  3. The write nonetheless completes shortly after being released and
+//     lands real, readable goroutine-stack content on disk.
 func TestSessionAgent_HandleWatchdogFire_StoresCauseAndDispatchesDumpAsync(t *testing.T) {
-	deepDir := t.TempDir()
-	for i := range 300 {
-		deepDir = filepath.Join(deepDir, "nested"+strconv.Itoa(i))
-	}
-	crushlog.SetLogDirForTest(t, deepDir)
+	dumpDir := t.TempDir()
+	crushlog.SetLogDirForTest(t, dumpDir)
+
+	hookEntered := make(chan struct{})
+	release := make(chan struct{})
+	crushlog.SetWriteDelayHookForTest(t, func() {
+		close(hookEntered)
+		<-release
+	})
 
 	largeModel := Model{
 		ModelCfg: config.SelectedModel{
@@ -1112,42 +1127,38 @@ func TestSessionAgent_HandleWatchdogFire_StoresCauseAndDispatchesDumpAsync(t *te
 		"handleWatchdogFire must store the real fired cause, not leave the zero value, "+
 			"by the time it returns — this is what runTurn's error path reads to build the finish message")
 
-	pattern := filepath.Join(deepDir, "goroutines-"+strconv.Itoa(os.Getpid())+"-*.txt")
+	// The async goroutine must actually have started and reached the write
+	// hook — proves the dump dispatch wasn't silently skipped, independent
+	// of how fast the real I/O underneath it would have run.
+	select {
+	case <-hookEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the async goroutine-dump write never started — dispatch may have been skipped")
+	}
 
-	// (2) The method must have returned BEFORE the deliberately-slowed write
-	// could have finished. WriteGoroutineDump's 300-segment os.MkdirAll takes
-	// hundreds of ms, so if handleWatchdogFire had awaited the write inline the
-	// dump file would already exist here. Checking its absence immediately after
-	// return proves the write was dispatched on its own goroutine — directly,
-	// without a timing budget that the now-synchronous CaptureGoroutineStack
-	// (runtime.Stack over every goroutine plus a grow-and-retry loop; see task
-	// #242 / internal/log/goroutine_dump.go) would make both large and variable,
-	// scaling with live goroutine count (worse in a full-package run than under
-	// an isolated -run filter).
+	pattern := filepath.Join(dumpDir, "goroutines-"+strconv.Itoa(os.Getpid())+"-*.txt")
+
+	// (2) The method must have returned BEFORE the real write, which is
+	// still blocked on `release`, could possibly have completed. This is
+	// now a deterministic fact (the write goroutine is parked inside the
+	// hook), not a race against real disk speed.
 	immediate, _ := filepath.Glob(pattern)
 	assert.Empty(t, immediate,
-		"handleWatchdogFire must return before the slow dump write completes; "+
+		"handleWatchdogFire must return before the dump write completes; "+
 			"a file present this early means the write was awaited inline, not dispatched async")
 
-	// (3) The real write must still complete shortly after and land actual
-	// goroutine-stack content on disk — proving the async dispatch genuinely
-	// happened rather than being silently skipped. The content check lives
-	// INSIDE the predicate (not after it) so the poll waits for the file to
-	// contain real data, not merely to exist: os.WriteFile creates the file
-	// before writing its ~1 MiB body, so a naive existence-only poll can
-	// observe a zero-byte file mid-write and pass on empty content.
-	//
-	// Budget is 30s, not a small fixed guess (task #320): this assertion
-	// isn't timing a race, it's waiting out real, variable-cost work — the
-	// 300-segment os.MkdirAll this test deliberately constructs, plus
-	// runtime.Stack over every live goroutine, plus a ~1 MiB disk write —
-	// all under -race, in a full-package parallel run where every other
-	// test's goroutines compete for scheduler time (observed failing on a
-	// loaded macOS CI runner at the previous 5s budget: CI log showed
-	// "Condition never satisfied" with zero indication the write ever
-	// failed, only that it hadn't finished in time). 30s only fails if the
-	// dispatch is genuinely broken (skipped, deadlocked, or the content
-	// assertions are wrong), not merely slow.
+	close(release) // let the real write proceed
+
+	// (3) The real write must complete shortly after being released and
+	// land actual goroutine-stack content on disk — proving the async
+	// dispatch genuinely happened rather than being silently skipped. The
+	// content check lives INSIDE the predicate (not after it) so the poll
+	// waits for the file to contain real data, not merely to exist:
+	// os.WriteFile creates the file before writing its ~1 MiB body, so a
+	// naive existence-only poll can observe a zero-byte file mid-write and
+	// pass on empty content. 5s is a generous margin over the real,
+	// now-unblocked MkdirAll+WriteFile cost — there is no more artificial
+	// slowness to wait out.
 	var dumpContent []byte
 	var matches []string
 	require.Eventually(t, func() bool {
@@ -1162,7 +1173,7 @@ func TestSessionAgent_HandleWatchdogFire_StoresCauseAndDispatchesDumpAsync(t *te
 		}
 		return bytes.Contains(dumpContent, []byte("stream watchdog fired")) &&
 			bytes.Contains(dumpContent, []byte("goroutine "))
-	}, 30*time.Second, 50*time.Millisecond, "expected a goroutine dump with real content to appear matching %s", pattern)
+	}, 5*time.Second, 20*time.Millisecond, "expected a goroutine dump with real content to appear matching %s", pattern)
 	require.Len(t, matches, 1, "expected exactly one dump file from this call")
 	assert.Contains(t, string(dumpContent), "stream watchdog fired",
 		"the dump must carry the reason handleWatchdogFire passes to crushlog.CaptureGoroutineStack")
