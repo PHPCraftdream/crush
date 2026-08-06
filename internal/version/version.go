@@ -15,37 +15,27 @@ import (
 // line a devel binary was built from. This fork bumps versions deliberately and
 // manually (see CLAUDE.md at the repo root), so this constant must be kept in
 // lockstep with npm/crush/package.json on every bump.
-const forkBaseVersion = "0.1.7"
-
-// UpstreamTriagedVersion is the highest charmbracelet/crush release whose
-// commits have been triaged into this fork — every commit up to that tag has
-// been ported, evaluated, or explicitly skipped with a recorded reason (see
-// the merge workflow and the SKIP-note convention in CLAUDE.md, plus the
-// per-batch plans under docs/plans/).
-//
-// It is NOT a claim that the fork contains upstream's code up to that tag —
-// the fork diverges heavily and most upstream commits are deliberately
-// skipped. It answers a different question: how far has anyone actually
-// LOOKED at upstream. That is the number that goes stale silently, so it is
-// surfaced in `crush --version` output rather than living only in a plan
-// document.
-//
-// Bumped by hand at the end of an upstream triage pass, never automatically.
-const UpstreamTriagedVersion = "v0.87.0"
+const forkBaseVersion = "0.2.0-alpha.0"
 
 // VersionLine is what `crush --version`/`crush version` prints: the fork's
-// release-line version and how far upstream has been triaged, joined by "@"
-// with no "v" prefixes, followed by this specific build's provenance —
-// short commit hash and build time — e.g.
+// release-line version, with no "v" prefix, followed by this specific
+// build's provenance — short commit hash and build time — e.g.
 //
-//	0.1.7@0.87.0 (c34a7334, built 2026-07-31 16:24:26)
+//	0.2.0-alpha.0 (c34a7334, built 2026-07-31 16:24:26)
 //
-// The release-line part is deliberately built from forkBaseVersion and
-// UpstreamTriagedVersion directly rather than from the package-level Version
-// var — Version carries a commit hash on local dev builds and a "v" prefix on
-// release builds, neither of which belongs in this human-facing summary.
-// Other consumers of Version (user agent, telemetry, MCP handshake,
-// FullVersion for the web UI) are untouched by this.
+// The release-line part is deliberately built from forkBaseVersion directly
+// rather than from the package-level Version var — Version carries a commit
+// hash on local dev builds and a "v" prefix on release builds, neither of
+// which belongs in this human-facing summary. Other consumers of Version
+// (user agent, telemetry, MCP handshake, FullVersion for the web UI) are
+// untouched by this.
+//
+// This used to also append "@<UpstreamTriagedVersion>" — how far
+// charmbracelet/crush had been triaged into this fork — but that constant
+// and the suffix were removed: the fork no longer tracks or advertises a
+// point-in-time relationship to upstream in its version string. Per-commit
+// PORT/EVAL/SKIP decisions during merges (see CLAUDE.md's Merge Workflow)
+// are unaffected; only the runtime-visible watermark is gone.
 //
 // The provenance suffix exists because the release-line part alone is
 // identical across every build of that line: a deployed binary was
@@ -54,8 +44,7 @@ const UpstreamTriagedVersion = "v0.87.0"
 // component is omitted when genuinely unknown rather than printed as
 // "unknown", so the line stays clean for builds that carry no VCS metadata.
 func VersionLine() string {
-	line := forkBaseVersion + "@" + strings.TrimPrefix(UpstreamTriagedVersion, "v")
-	return line + buildProvenanceSuffix(Commit, BuildTime)
+	return forkBaseVersion + buildProvenanceSuffix(Commit, BuildTime)
 }
 
 // buildProvenanceSuffix formats the " (<commit>, built <time>)" tail of
@@ -115,7 +104,7 @@ var (
 	// via ldflags by build.go (and left empty for plain `go build`/`go run`).
 	//
 	// It exists because `crush --version` used to print only the release-line
-	// summary ("0.1.7@0.87.0"), which is IDENTICAL for every build of that
+	// summary ("0.2.0-alpha.0"), which is IDENTICAL for every build of that
 	// line — so a deployed binary carried no evidence of which source tree it
 	// came from. Answering "is the binary I'm running actually the one I just
 	// built?" then came down to guesswork or memory, and got answered wrong
@@ -161,16 +150,15 @@ func formatFullVersion(v, buildID string) string {
 // version depending on the toolchain, so we additionally derive a meaningful
 // version from the VCS metadata the toolchain embeds (vcs.revision) — this
 // lets two local dev builds be told apart. The derived string is always the
-// bare "<hash>-<forkBaseVersion>" (e.g. "141ac19-0.1.7"): no upstream-tag-
+// bare "<hash>-<forkBaseVersion>" (e.g. "141ac19-0.2.0-alpha.0"): no upstream-tag-
 // shaped prefix is ever recovered or prepended here, even when
 // info.Main.Version happens to be a pseudo-version built on top of a real
-// upstream tag. That upstream signal is deliberately surfaced elsewhere, as
-// the hand-maintained UpstreamTriagedVersion appended by root.go's Execute()
-// — showing two differently-sourced "upstream version" numbers in one line
-// (one incidental, one deliberate) is more confusing than showing only the
-// deliberate one. Neither path ever includes a "devel" or dirty marker in the
-// output. Release/packaged builds inject Version via ldflags and are left
-// untouched.
+// upstream tag. That tag is purely incidental — whichever charmbracelet/crush
+// release the local module cache happened to resolve against — not a
+// deliberate signal about how far this fork has diverged or triaged
+// upstream, so showing it here would misrepresent it as one. Neither path
+// ever includes a "devel" or dirty marker in the output. Release/packaged
+// builds inject Version via ldflags and are left untouched.
 func init() {
 	info, _ := debug.ReadBuildInfo()
 	Version, Commit = resolveVersion(Version, Commit, info)
@@ -294,7 +282,7 @@ func readVCS(info *debug.BuildInfo) vcsInfo {
 
 // deriveDevVersion builds a human-meaningful version for a development build
 // from embedded VCS metadata, embedding the fork's current release-line
-// version (forkBaseVersion), e.g. "06c8078-0.1.7" for a clean checkout. It
+// version (forkBaseVersion), e.g. "06c8078-0.2.0-alpha.0" for a clean checkout. It
 // returns an empty string when no revision is available, signalling the
 // caller to keep the plain "devel" default. No "devel" marker and no dirty
 // marker are ever included in the returned string — the commit hash +
@@ -307,11 +295,11 @@ func readVCS(info *debug.BuildInfo) vcsInfo {
 // always produces info.Main.Version == "(devel)" with no base tag at all —
 // but that assumption does not hold for every Go toolchain: a local `go
 // build .` can embed a real pseudo-version with a recoverable base tag,
-// which produced a confusing "v0.72.1-<hash>-0.1.7" that looked like it
-// carried a deliberate upstream-tracking signal but didn't. That role is
-// now filled by the deliberately hand-maintained UpstreamTriagedVersion
-// (appended separately by root.go's Execute()), which is the one and only
-// upstream-version signal shown to the user.
+// which produced a confusing "v0.72.1-<hash>-0.2.0-alpha.0" that looked like it
+// carried a deliberate upstream-tracking signal but didn't. The fork no
+// longer surfaces any upstream-version signal in `crush --version` output at
+// all (see VersionLine's doc comment) — this function still avoids the
+// incidental pseudo-version tag on its own merits: it is noise, not signal.
 func deriveDevVersion(revision string) string {
 	if revision == "" {
 		return ""

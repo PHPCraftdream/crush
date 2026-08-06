@@ -8,6 +8,22 @@ This is the npm-package changelog, not the fork's engineering decision
 log — see [`CHANGELOG.fork.md`](../../CHANGELOG.fork.md) at the repo
 root for the full per-file merge/divergence history.
 
+## [0.2.0-alpha.0]
+
+Alpha pre-release snapshot — published under the `alpha` npm dist-tag, not
+`latest`. A large amount of internal work has landed since 0.1.7 (session
+lifecycle, watchdog/heartbeat hardening, sub-agent delegation, CLI
+provider fixes, and more); this snapshot exists to let early testers try
+it ahead of a curated 0.2.0 stable release. Full user-facing release notes
+will be written for that stable cut — until then, see the root
+[`CHANGELOG.md`](../../CHANGELOG.md) for the complete list of changes in
+progress.
+
+- Changed: `crush --version` no longer appends an upstream-triage
+  watermark (previously `<version>@<upstream-tag>`, e.g. `0.1.7@0.87.0`)
+  — it now prints just the release-line version plus build provenance,
+  e.g. `0.2.0-alpha.0 (c34a7334, built 2026-08-06 13:48:47)`.
+
 ## [0.1.7]
 
 - New: **four model roles instead of two.** Alongside `large`/`smart` and

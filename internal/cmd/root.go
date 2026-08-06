@@ -239,10 +239,8 @@ func Execute() {
 	defer recoverAndLogPanic()
 
 	options := []fang.Option{
-		// Fork patch: show the release-line version alongside the upstream
-		// triage watermark so `crush --version` answers "how far has upstream
-		// actually been reviewed" without anyone having to open docs/plans/.
-		// See version.VersionLine / version.UpstreamTriagedVersion.
+		// Fork patch: show the fork's own release-line version (not
+		// upstream's) plus build provenance. See version.VersionLine.
 		fang.WithVersion(version.VersionLine()),
 		fang.WithNotifySignal(os.Interrupt),
 	}

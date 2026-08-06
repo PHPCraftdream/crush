@@ -10,14 +10,13 @@ import (
 
 func TestVersionLine(t *testing.T) {
 	t.Parallel()
-	releaseLine := forkBaseVersion + "@" + strings.TrimPrefix(UpstreamTriagedVersion, "v")
-	require.True(t, strings.HasPrefix(VersionLine(), releaseLine),
+	require.True(t, strings.HasPrefix(VersionLine(), forkBaseVersion),
 		"VersionLine must start with the release-line summary, got %q", VersionLine())
 	require.False(t, strings.HasPrefix(VersionLine(), "v"), "VersionLine must not carry a \"v\" prefix")
 }
 
 // TestBuildProvenanceSuffix pins the provenance tail appended to VersionLine.
-// It exists because the release-line part alone ("0.1.7@0.87.0") is identical
+// It exists because the release-line part alone ("0.2.0-alpha.0") is identical
 // for every build of that line, so a deployed binary carried no evidence of
 // which source tree produced it — making "is the running binary actually built
 // from current source?" unanswerable from the binary itself, a question that
