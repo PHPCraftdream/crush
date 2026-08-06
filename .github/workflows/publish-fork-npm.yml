@@ -191,18 +191,16 @@ jobs:
         # this Actions runner; the same source and LDFLAGS are used for every
         # cross-compiled package.
         #
-        # `crush --version` prints version.VersionLine() (e.g. "0.1.7@0.87.0"
-        # — forkBaseVersion "@" UpstreamTriagedVersion, no "v" prefix), NOT
-        # the raw ldflags-injected version.Version. So EXPECTED must be the
-        # bare numeric tag (steps.ver.outputs.version), not go_version, and
-        # "@" must be added to the tokenizer's split-char set below so
-        # "0.1.7@0.87.0" splits into "0.1.7" and "0.87.0" rather than staying
-        # one token that could never match.
+        # `crush --version` prints version.VersionLine() (e.g.
+        # "0.2.0-alpha.0 (c34a7334, built ...)" — forkBaseVersion plus a
+        # provenance suffix, no "v" prefix), NOT the raw ldflags-injected
+        # version.Version. So EXPECTED must be the bare numeric tag
+        # (steps.ver.outputs.version), not go_version.
         env:
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
           set -euo pipefail
-          EXPECTED="${VERSION}"   # e.g. 0.1.7 (resolved from the npm-v tag, no "v" prefix)
+          EXPECTED="${VERSION}"   # e.g. 0.2.0-alpha.0 (resolved from the npm-v tag, no "v" prefix)
           if [ -z "$EXPECTED" ]; then
             echo "::error::expected version is empty — the version-resolution step failed"
             exit 1
@@ -248,6 +246,7 @@ jobs:
         # job: a failed step halts the job before this one).
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          VERSION: ${{ steps.ver.outputs.version }}
           # Hard invariant: a real publish can only happen when this run IS
           # the tag push itself. `workflow_dispatch` (or any other trigger)
           # is always forced into --dry-run — there is deliberately no input
@@ -255,7 +254,21 @@ jobs:
           DRY_RUN: ${{ github.event_name != 'push' }}
         run: |
           set -euo pipefail
-          FLAGS="--access public"
+          # npm defaults every `npm publish` to the "latest" dist-tag
+          # regardless of whether the version string carries a semver
+          # prerelease identifier — publishing e.g. 0.2.0-alpha.0 without an
+          # explicit --tag would make that alpha the version everyone gets
+          # from a bare `npm install @phpcraftdream/crush`. Derive the
+          # dist-tag from the version's prerelease identifier instead
+          # (0.2.0-alpha.0 -> alpha, 0.2.0-rc.1 -> rc), so only a clean
+          # X.Y.Z release ever lands on "latest".
+          if printf '%s' "$VERSION" | grep -Eq -- '-[A-Za-z]'; then
+            PUBLISH_TAG="$(printf '%s' "$VERSION" | sed -E 's/^[0-9]+\.[0-9]+\.[0-9]+-([A-Za-z]+).*/\1/')"
+          else
+            PUBLISH_TAG="latest"
+          fi
+          echo "Publishing under dist-tag: ${PUBLISH_TAG}"
+          FLAGS="--access public --tag ${PUBLISH_TAG}"
           if [ "${DRY_RUN}" = "true" ]; then
             echo "Publishing with --dry-run (not a tag push)"
             FLAGS="$FLAGS --dry-run"
