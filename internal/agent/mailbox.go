@@ -1132,3 +1132,21 @@ func (mb *mailbox) popFirstSubmitted() (SessionAgentCall, bool) {
 	mb.submitted = mb.submitted[1:]
 	return first, true
 }
+
+// popAllSubmitted removes and returns ALL entries from the submitted queue,
+// regardless of mailbox state. Used by abandonOwnershipWithHandoff to start
+// detached runs for all work left in the mailbox after a non-cancel error.
+// This method is safe to call when state is mbIdle (which abandonOwnership
+// guarantees), because no new submit can land on mbIdle — they all queue
+// into submitted under the same lock.
+func (mb *mailbox) popAllSubmitted() []SessionAgentCall {
+	mb.mu.Lock()
+	defer mb.mu.Unlock()
+	if len(mb.submitted) == 0 {
+		return nil
+	}
+	all := make([]SessionAgentCall, len(mb.submitted))
+	copy(all, mb.submitted)
+	mb.submitted = mb.submitted[:0]
+	return all
+}

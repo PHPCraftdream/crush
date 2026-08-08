@@ -933,6 +933,30 @@ func (a *sessionAgent) drainOrReleaseMerged(sessionID string, epoch uint64, lk *
 	return next, true
 }
 
+// abandonOwnershipWithHandoff releases mailbox ownership and starts detached
+// runs for any work left in the mailbox. This is the correct finalizer for
+// error paths that exit ownership without a live turn loop, ensuring that
+// queued calls are not stranded without a runner.
+//
+// It must be called with lk (if any) already released — the caller releases
+// the OS lock first to avoid the HIGH-1 window where mbIdle becomes true
+// while the lock is still held.
+func (a *sessionAgent) abandonOwnershipWithHandoff(sessionID string, epoch uint64) {
+	mb := a.getMailbox(sessionID)
+	if hadWork := mb.abandonOwnership(epoch); hadWork {
+		slog.Error(
+			"agent.Run: calls were pending when ownership had to be abandoned — starting detached runs to ensure they execute",
+			"session_id", sessionID,
+		)
+		// Start detached runs for all work left in the mailbox.
+		// abandonOwnership folds replacement into submitted and
+		// leaves the mailbox at mbIdle, so popAllSubmitted() can safely
+		// read the entire queue without mb.mu (no new submit can land
+		// on mbIdle).
+		a.restartOrphaned(mb.popAllSubmitted())
+	}
+}
+
 // restartOrphaned starts one independent, detached a.Run call per entry in
 // calls — the sessionAgent-level equivalent of coordinator.startDetachedRun
 // (P0-B), needed here because drainOrReleaseMerged/drainOrReleaseFinal have
@@ -1089,40 +1113,16 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	// including after runTurn's own final drain already released the era
 	// (the common, correct case) and after any early-return inside runTurn
 	// that skipped its own drain entirely (an error path). It must
-	// therefore be safe to call unconditionally on every exit, which is
-	// exactly what abandonOwnership (not drainOrReleaseMerged) provides:
-	//   - If `epoch` no longer matches the mailbox's current epoch, the era
-	//     already ended (either via runTurn's own drain, or a concurrent
-	//     submit became a NEW owner in the meantime) — a safe no-op, since
-	//     whatever is in the mailbox now belongs to that other owner. The
-	//     OLD code called drainOrRelease/drainOrReleaseMerged unconditionally
-	//     here with no such check, so on this path it could silently flip a
-	//     DIFFERENT, still-live owner's session back to idle out from under
-	//     it.
-	//   - If `epoch` still matches, there is no live turn loop left (this
-	//     defer IS the end of Run) to hand a "keep going" answer to, so
-	//     unlike the loop's own drainOrReleaseMerged this always ends the
-	//     era at idle, re-queueing (not silently keeping, and not silently
-	//     dropping while leaving the session permanently owned) anything it
-	//     finds still queued. The OLD code's "found something" branch left
-	//     state == mbOwned with nobody running it — the session was wedged
-	//     busy forever, since nothing else would ever drain it again.
+	// therefore be safe to call unconditionally on every exit.
 	//
-	// Round 9 review round 2, HIGH-2: an earlier version of this defer
-	// logged dropped calls at slog.Error and discarded them — a silent
-	// user-message loss reachable on any ordinary non-cancel turn error
-	// (provider 5xx, a DB write failure) with a second message queued
-	// concurrently, not just the rare pre-loop bail-out case. abandonOwnership
-	// now leaves queued entries in mb.submitted (not epoch-scoped) so they
-	// survive safely across ownership eras and are picked up by the next
-	// Run() call.
+	// This defer uses abandonOwnershipWithHandoff to ensure that any work
+	// left in the mailbox after a non-cancel error gets a runner started via
+	// detached runs, fixing P0-1 and P1-1. The OS lock (if any) will be
+	// released before this defer runs — lk is acquired below and this defer
+	// releases it first to avoid the HIGH-1 window where mbIdle becomes true
+	// while the lock is still held.
 	defer func() {
-		if hadWork := a.getMailbox(call.SessionID).abandonOwnership(epoch); hadWork {
-			slog.Error(
-				"agent.Run: calls were pending when ownership had to be abandoned — they remain queued in the mailbox for the next Run() to drain",
-				"session_id", call.SessionID,
-			)
-		}
+		a.abandonOwnershipWithHandoff(call.SessionID, epoch)
 	}()
 
 	// Inter-process session lock. The reservation above is per-process (an
@@ -1169,6 +1169,8 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	// Acquired ONCE for the whole loop below — every queue-drain turn reuses
 	// this same lock instead of each one acquiring (and needing to release)
 	// its own, which is what made the old recursive-Run() shape deadlock.
+	// The lock is released by the defer above (abandonOwnershipWithHandoff)
+	// before Run returns to avoid the HIGH-1 window.
 	var lk *session.SessionLock
 	if a.dataDir != "" {
 		var lockErr error
@@ -1197,9 +1199,10 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 				"session_id", call.SessionID, "err", lockErr)
 			return nil, fmt.Errorf("session %q: could not acquire session lock: %w", call.SessionID, lockErr)
 		}
+		// Release the lock in the abandonOwnershipWithHandoff defer above.
 		defer func() {
-			if relErr := lk.Release(); relErr != nil {
-				slog.Debug("agent.Run: release session lock failed", "session_id", call.SessionID, "err", relErr)
+			if lk != nil {
+				lk.Release()
 			}
 		}()
 	}
@@ -2927,13 +2930,14 @@ func (a *sessionAgent) runSummarize(ctx context.Context, genCtx context.Context,
 					"holder_pid", busyErr.HolderPID,
 					"lock_path", busyErr.Path,
 				)
-				// Release mailbox ownership and return error so the caller can retry.
-				_ = mb.abandonOwnership(epoch)
+				// Release mailbox ownership with handoff so queued work gets a runner.
+				a.abandonOwnershipWithHandoff(sessionID, epoch)
 				return fmt.Errorf("session %q is already in use: %w", sessionID, lockErr)
 			}
 			slog.Error("agent.runSummarize: failed to acquire inter-process session lock, refusing to compact unprotected",
 				"session_id", sessionID, "err", lockErr)
-			_ = mb.abandonOwnership(epoch)
+			// Release mailbox ownership with handoff so queued work gets a runner.
+			a.abandonOwnershipWithHandoff(sessionID, epoch)
 			return fmt.Errorf("session %q: could not acquire session lock: %w", sessionID, lockErr)
 		}
 	}
@@ -2974,14 +2978,16 @@ func (a *sessionAgent) runSummarize(ctx context.Context, genCtx context.Context,
 		mb.testPreAbandonSeam()
 	}
 
-	// Release mailbox ownership. abandonOwnership leaves any work queued
-	// during the compaction in mb.submitted (folding replacement into it),
-	// setting state to mbIdle — the entries survive there for the Run
-	// started below to drain.
-	_ = mb.abandonOwnership(epoch)
 	if err != nil {
+		a.abandonOwnershipWithHandoff(sessionID, epoch)
 		return err
 	}
+
+	// Success path is unchanged from before this round's fix: plain release
+	// (no handoff — this path was never the P1-1 bug), then hand the first
+	// queued entry to a synchronous, caller-ctx-scoped Run whose own error
+	// propagates as runSummarize's result, exactly as before.
+	_ = mb.abandonOwnership(epoch)
 
 	// Start a Run for the first queued entry. The Run becomes owner via
 	// submit() (mbIdle) and drains remaining entries via end-of-turn
