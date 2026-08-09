@@ -68,7 +68,29 @@ const MaxPidFallbackAge = maxPidFallbackAge
 // clearHolderMetadataFn is the function used by Release to clear diagnostic
 // metadata from the lock file. Can be replaced in tests to inject blocking
 // behavior for proving release order invariants (see TestP1_2_ReleaseUnlocksBeforeMetadataCleanup_Hang).
+//
+// Exported as SetClearHolderMetadataFn for agent package tests that need to
+// inject hung cleanup to prove abandonOwnershipWithHandoff reachability.
 var clearHolderMetadataFn = clearHolderMetadata
+
+// SetClearHolderMetadataFn replaces the clearHolderMetadataFn function for
+// testing purposes. Used by agent package tests to inject hung cleanup and
+// prove that abandonOwnershipWithHandoff finalizer is always reachable
+// even when Release() would block on diagnostic cleanup.
+// Must be called with the original function in a defer to restore state.
+func SetClearHolderMetadataFn(fn func(path string)) func() {
+	original := clearHolderMetadataFn
+	clearHolderMetadataFn = fn
+	return func() {
+		clearHolderMetadataFn = original
+	}
+}
+
+// GetClearHolderMetadataFn returns the current clearHolderMetadataFn function
+// for testing purposes.
+func GetClearHolderMetadataFn() func(path string) {
+	return clearHolderMetadataFn
+}
 
 // SessionLock is an inter-process exclusive lock for a single session ID.
 // Acquired around the entire `sessionAgent.Run()` call so two crush
