@@ -193,6 +193,10 @@ func (m *mockSessionService) ConsumeInterruptInject(context.Context, string) (*s
 	return nil, nil
 }
 
+func (m *mockSessionService) DeleteInterruptInject(context.Context, string) error {
+	return nil
+}
+
 func newTestApp(sessions session.Service) *App {
 	return &App{Sessions: sessions}
 }

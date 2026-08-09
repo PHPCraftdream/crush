@@ -232,7 +232,7 @@ type Coordinator interface {
 	// RunWithOverrides is like Run but allows overriding the large and/or small model for this call.
 	RunWithOverrides(ctx context.Context, sessionID, prompt string, large, small *ModelOverride, attachments ...message.Attachment) (*fantasy.AgentResult, error)
 	Cancel(sessionID string)
-	CancelAll()
+	CancelAll() (stillBusy bool)
 	IsSessionBusy(sessionID string) bool
 	IsBusy() bool
 	QueuedPrompts(sessionID string) int
@@ -2046,8 +2046,8 @@ func (c *coordinator) Cancel(sessionID string) {
 	c.currentAgent.Cancel(sessionID)
 }
 
-func (c *coordinator) CancelAll() {
-	c.currentAgent.CancelAll()
+func (c *coordinator) CancelAll() (stillBusy bool) {
+	return c.currentAgent.CancelAll()
 }
 
 func (c *coordinator) ClearQueue(sessionID string) {

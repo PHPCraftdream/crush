@@ -171,14 +171,40 @@ func New(ctx context.Context, conn *sql.DB, store *config.ConfigStore) (*App, er
 	}
 	app.cleanupFuncs = append(
 		app.cleanupFuncs,
-		func(context.Context) error {
-			var err error
-			for range releases {
-				if e := db.Release(dataDir); e != nil {
-					err = e
-				}
+		func(ctx context.Context) error {
+			// DB cleanup must respect the bounded shutdown context.
+			// Since db.Release/sql.DB.Close are synchronous and don't accept
+			// a context, we wrap them in a goroutine and select between completion
+			// and context expiry. This is a forced-shutdown compromise: if ctx
+			// expires before Close() finishes, we log a warning but continue;
+			// the background Close() may leak, but Shutdown() returns within its
+			// bounded time. This is documented as a deliberate trade-off.
+			type result struct {
+				err error
 			}
-			return err
+			resultChan := make(chan result, 1)
+
+			go func() {
+				var err error
+				for range releases {
+					if e := db.Release(dataDir); e != nil {
+						err = e
+					}
+				}
+				resultChan <- result{err: err}
+			}()
+
+			select {
+			case res := <-resultChan:
+				return res.err
+			case <-ctx.Done():
+				// Close() did not complete within shutdownCtx timeout.
+				// The background goroutine will continue running; this is an
+				// acknowledged leak in forced-shutdown mode, but preferable to
+				// unbounded shutdown.
+				slog.Warn("DB cleanup: sql.DB.Close() did not complete within shutdown timeout - background close may leak (forced-shutdown trade-off)")
+				return ctx.Err()
+			}
 		},
 		func(ctx context.Context) error { return mcp.Close(ctx) },
 	)
@@ -1781,8 +1807,20 @@ func (app *App) Shutdown() {
 
 	// First, cancel all agents and wait for them to finish. This must complete
 	// before closing the DB so agents can finish writing their state.
+	// CancelAll now returns whether agents are still busy after the grace period.
+	var stillBusy bool
 	if app.AgentCoordinator != nil {
-		app.AgentCoordinator.CancelAll()
+		stillBusy = app.AgentCoordinator.CancelAll()
+	}
+
+	// Forced-shutdown policy: if CancelAll reports agents still busy after the
+	// 5-second grace period, we log a warning but proceed with resource cleanup.
+	// This is the policy choice: we do not wait indefinitely for agents to finish,
+	// and we explicitly acknowledge that in-progress agent work may be incomplete.
+	// The caller (usually signal handler or command completion) gets bounded shutdown
+	// time rather than a potentially infinite hang.
+	if stillBusy {
+		slog.Warn("Shutdown: some agents did not finish within grace period - proceeding with forced shutdown (in-progress work may be incomplete)")
 	}
 
 	// Shared shutdown context for all timeout-bounded cleanup.
@@ -1792,9 +1830,8 @@ func (app *App) Shutdown() {
 	// Fork merge note: upstream 6938dedd added FlushAll for its debounced
 	// message-update layer. We removed that layer (see message/message.go);
 	// Update() writes synchronously, so there is nothing to drain here.
-	_ = shutdownCtx
 
-	// Now run remaining cleanup tasks in parallel.
+	// Now run remaining cleanup tasks in parallel with an overall bounded timeout.
 	var wg sync.WaitGroup
 
 	// Send exit event
@@ -1816,7 +1853,24 @@ func (app *App) Shutdown() {
 			})
 		}
 	}
-	wg.Wait()
+
+	// Wait for all cleanup with an independent outer timeout to guarantee
+	// bounded shutdown even if a cleanup goroutine ignores shutdownCtx.
+	// 10 seconds is generous: shutdownCtx already gives each cleanup 5 seconds,
+	// and we want to ensure the overall Shutdown() never hangs indefinitely.
+	waitTimeout := time.After(10 * time.Second)
+	waitDone := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(waitDone)
+	}()
+
+	select {
+	case <-waitDone:
+		// All cleanup completed within timeout.
+	case <-waitTimeout:
+		slog.Error("Shutdown: cleanup did not complete within outer timeout - exiting anyway (some resources may not be fully released)")
+	}
 }
 
 // checkForUpdates checks for available updates.

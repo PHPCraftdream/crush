@@ -89,10 +89,11 @@ func TestSessionAgent_IsBusy_FalseAfterTurnCompletes(t *testing.T) {
 	// drain timeout — this is what App.Shutdown relies on for every
 	// `crush run` invocation.
 	start := time.Now()
-	sa.CancelAll()
+	stillBusy := sa.CancelAll()
 	elapsed := time.Since(start)
 	assert.Less(t, elapsed, 1*time.Second,
 		"CancelAll must return immediately when genuinely idle, not burn the 5s drain timeout (BLOCKER-1)")
+	assert.False(t, stillBusy, "CancelAll must report not still busy when genuinely idle")
 }
 
 // TestSessionAgent_IsBusy_TrueDuringLiveTurn is the non-regression

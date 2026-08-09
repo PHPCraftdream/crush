@@ -388,7 +388,7 @@ type SessionAgent interface {
 	SetSystemPromptPrefix(prefix string)
 	SystemPrompt() string
 	Cancel(sessionID string)
-	CancelAll()
+	CancelAll() (stillBusy bool)
 	IsSessionBusy(sessionID string) bool
 	IsBusy() bool
 	QueuedPrompts(sessionID string) int
@@ -4138,7 +4138,7 @@ func (a *sessionAgent) InjectMessage(ctx context.Context, call SessionAgentCall)
 	return msg, nil
 }
 
-func (a *sessionAgent) CancelAll() {
+func (a *sessionAgent) CancelAll() (stillBusy bool) {
 	// Refuse all FUTURE Run() calls before touching anything else (closing
 	// review, blocker 1). This must come first and must live on the agent
 	// rather than the mailboxes: the sweep below can only latch mailboxes
@@ -4182,11 +4182,15 @@ func (a *sessionAgent) CancelAll() {
 	for a.IsBusy() {
 		select {
 		case <-timeout:
-			return
+			// Grace period expired but agents are still busy. Return true
+			// so the caller can decide whether to force shutdown or wait longer.
+			return true
 		default:
 			time.Sleep(200 * time.Millisecond)
 		}
 	}
+	// All agents are now idle. Return false to indicate clean shutdown.
+	return false
 }
 
 // IsBusy reports whether ANY session this agent knows about currently has a

@@ -502,7 +502,7 @@ func (m *modelCallSpyAgent) Model() Model {
 	return m.model
 }
 func (m *modelCallSpyAgent) Cancel(sessionID string)                     {}
-func (m *modelCallSpyAgent) CancelAll()                                  {}
+func (m *modelCallSpyAgent) CancelAll() (stillBusy bool)                 { return false }
 func (m *modelCallSpyAgent) IsSessionBusy(sessionID string) bool         { return false }
 func (m *modelCallSpyAgent) IsBusy() bool                                { return false }
 func (m *modelCallSpyAgent) QueuedPrompts(sessionID string) int          { return 0 }
