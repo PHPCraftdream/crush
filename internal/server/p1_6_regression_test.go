@@ -10,6 +10,7 @@ import (
 	"github.com/charmbracelet/crush/internal/agent"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/message"
+	"github.com/charmbracelet/crush/internal/session"
 	"github.com/stretchr/testify/require"
 )
 
@@ -72,7 +73,7 @@ func (f *fakeAlwaysBusyCoordinator) InjectMessage(ctx context.Context, sessionID
 	return message.Message{}, nil
 }
 
-func (f *fakeAlwaysBusyCoordinator) Summarize(context.Context, string) error {
+func (f *fakeAlwaysBusyCoordinator) Summarize(context.Context, string, *agent.SummarizeSnapshot) error {
 	return nil
 }
 
@@ -80,8 +81,16 @@ func (f *fakeAlwaysBusyCoordinator) SummarizeQueued(sessionID string) bool {
 	return false
 }
 
-func (f *fakeAlwaysBusyCoordinator) TakeSummarizeQueue(sessionID string) (fantasy.ProviderOptions, bool) {
-	return fantasy.ProviderOptions{}, false
+func (f *fakeAlwaysBusyCoordinator) TakeSummarizeQueue(sessionID string) (*agent.SummarizeSnapshot, bool) {
+	return nil, false
+}
+
+func (f *fakeAlwaysBusyCoordinator) RebuildSessionAgentCall(ctx context.Context, data session.SessionAgentCallData) (agent.SessionAgentCall, error) {
+	return agent.SessionAgentCall{}, nil
+}
+
+func (f *fakeAlwaysBusyCoordinator) RunSessionAgentCall(ctx context.Context, call agent.SessionAgentCall) (*fantasy.AgentResult, error) {
+	return nil, nil
 }
 
 func (f *fakeAlwaysBusyCoordinator) CancelQueuedSummarize(sessionID string) {}

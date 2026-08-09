@@ -431,13 +431,18 @@ type SessionAgent interface {
 	// Summarize compresses the session history. If the session is currently
 	// busy the request is queued; call TakeSummarizeQueue after the task
 	// finishes to pick it up.  Returns ErrSummarizeQueued when queued.
-	Summarize(context.Context, string, fantasy.ProviderOptions) error
+	//
+	// The snapshot contains the model, provider options, and prompt prefix
+	// resolved from the target session (or shared state for sessions without
+	// overrides), ensuring the entire summarize operation uses consistent
+	// configuration regardless of concurrent SetModels calls (task #341).
+	Summarize(context.Context, string, *SummarizeSnapshot) error
 	// SummarizeQueued reports whether a manual summarise is pending for the
 	// given session.
 	SummarizeQueued(sessionID string) bool
 	// TakeSummarizeQueue atomically removes and returns the pending summarise
-	// options for the session (if any).
-	TakeSummarizeQueue(sessionID string) (fantasy.ProviderOptions, bool)
+	// snapshot for the session (if any).
+	TakeSummarizeQueue(sessionID string) (*SummarizeSnapshot, bool)
 	// CancelQueuedSummarize removes a pending summarise from the queue.
 	CancelQueuedSummarize(sessionID string)
 	// SetTimeoutOptions configures the stream watchdog's deadline extension
@@ -548,9 +553,12 @@ type sessionAgent struct {
 	// sessionID entries are inert (already-fired cancelFuncs) and are no
 	// longer consulted for busy state (IsSessionBusy reads the mailbox).
 	activeRequests *csync.Map[string, context.CancelFunc]
-	// summarizeQueue holds a pending manual-summarise request per session,
-	// queued while the session was busy.
-	summarizeQueue *csync.Map[string, fantasy.ProviderOptions]
+	// summarizeQueue holds a pending manual-summarise snapshot per session,
+	// queued while the session was busy. The snapshot contains the model,
+	// provider options, and prompt prefix resolved from the target session,
+	// ensuring the entire summarize operation uses consistent configuration
+	// regardless of concurrent SetModels calls (task #341, P1-1).
+	summarizeQueue *csync.Map[string, *SummarizeSnapshot]
 	// mailboxes holds the per-session owner/mailbox state machine described
 	// in docs/plans/2026-08-04-session-owner-mailbox-design.md. Stages
 	// 2.1-2.4 migrated tryReserveSession/releaseSessionReservation,
@@ -667,7 +675,7 @@ func NewSessionAgent(
 		isYolo:                     opts.IsYolo,
 		notify:                     opts.Notify,
 		activeRequests:             csync.NewMap[string, context.CancelFunc](),
-		summarizeQueue:             csync.NewMap[string, fantasy.ProviderOptions](),
+		summarizeQueue:             csync.NewMap[string, *SummarizeSnapshot](),
 		mailboxes:                  csync.NewMap[string, *mailbox](),
 		streamIdleTimeout:          opts.StreamIdleTimeout,
 		dataDir:                    opts.DataDirectory,
@@ -3011,7 +3019,7 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 // the request has been queued for execution after the current task finishes.
 var ErrSummarizeQueued = errors.New("summarize queued")
 
-func (a *sessionAgent) Summarize(ctx context.Context, sessionID string, opts fantasy.ProviderOptions) error {
+func (a *sessionAgent) Summarize(ctx context.Context, sessionID string, snapshot *SummarizeSnapshot) error {
 	// Atomic check-and-reserve (#268/P0-4, design §6): beginCompact makes
 	// us the sole owner of sessionID's mailbox or returns false if a turn
 	// or another compaction already owns it. This replaces the old
@@ -3024,10 +3032,10 @@ func (a *sessionAgent) Summarize(ctx context.Context, sessionID string, opts fan
 	epoch, ok := mb.beginCompact(cancel)
 	if !ok {
 		cancel()
-		a.summarizeQueue.Set(sessionID, opts)
+		a.summarizeQueue.Set(sessionID, snapshot)
 		return ErrSummarizeQueued
 	}
-	return a.runSummarize(ctx, genCtx, sessionID, opts, mb, epoch, cancel)
+	return a.runSummarize(ctx, genCtx, sessionID, snapshot, mb, epoch, cancel)
 }
 
 // runSummarize runs a manual /compact under mailbox ownership acquired by
@@ -3055,7 +3063,12 @@ func (a *sessionAgent) Summarize(ctx context.Context, sessionID string, opts fan
 // released, avoiding #296's I/O-under-mu anti-pattern. The lock is held for
 // the entire runSummarizeBody call to protect both the LLM stream and the
 // commit phase, matching Run()'s lock-hold semantics.
-func (a *sessionAgent) runSummarize(ctx context.Context, genCtx context.Context, sessionID string, opts fantasy.ProviderOptions, mb *mailbox, epoch uint64, cancel context.CancelFunc) error {
+//
+// The snapshot parameter contains the model, provider options, and prompt
+// prefix resolved from the target session (or shared state for sessions without
+// overrides), ensuring the entire summarize operation uses consistent
+// configuration regardless of concurrent SetModels calls (task #341, P1-1).
+func (a *sessionAgent) runSummarize(ctx context.Context, genCtx context.Context, sessionID string, snapshot *SummarizeSnapshot, mb *mailbox, epoch uint64, cancel context.CancelFunc) error {
 	// Determine idle timeout for summarization stream watchdog
 	idleTimeout := streamIdleTimeoutDefault
 	if a.streamIdleTimeout > 0 {
@@ -3155,16 +3168,21 @@ func (a *sessionAgent) runSummarize(ctx context.Context, genCtx context.Context,
 	// when lk is nil (a.dataDir == "").
 	genCtx = withActivityNotify(genCtx, lk)
 
-	// Resolve model/prompt config ONCE for the entire manual compaction
-	// (P1-3): without this snapshot, a concurrent SetModels could land
-	// mid-compaction and leave the provider options (computed from opts)
-	// mismatched from the model actually used. Manual compaction has no
-	// SessionAgentCall to pass to resolveTurnConfig, so we resolve from
-	// shared state directly here — this is the minimal fix; a deeper
-	// refactor would resolve from the target session's own pinned
-	// overrides instead.
-	cfg := a.resolveTurnConfig(SessionAgentCall{})
-	err := a.runSummarizeBody(genCtx, sessionID, opts, cfg.largeModel, cfg.promptPrefix)
+	// Test-only seam: fires strictly after the snapshot above was captured
+	// and strictly before it is consumed below, letting a test land a
+	// concurrent shared-state mutation deterministically inside the window a
+	// pre-#341 regression would have re-read from. See
+	// mailbox.testPreSnapshotConsumeSeam's own doc.
+	if mb.testPreSnapshotConsumeSeam != nil {
+		mb.testPreSnapshotConsumeSeam()
+	}
+
+	// Use the snapshot provided by the caller. The snapshot contains the
+	// model, provider options, and prompt prefix resolved from the target
+	// session (or shared state for sessions without overrides), ensuring the
+	// entire summarize operation uses consistent configuration regardless of
+	// concurrent SetModels calls (task #341, P1-1).
+	err := a.runSummarizeBody(genCtx, sessionID, snapshot.providerOptions, snapshot.model, snapshot.promptPrefix)
 
 	// P1-2 fix (2026-08-09): Transition mailbox to mbReleasing before releasing
 	// the OS lock. This provides the same visibility that normal turns get
@@ -3227,9 +3245,25 @@ func (a *sessionAgent) SummarizeQueued(sessionID string) bool {
 	return ok
 }
 
-func (a *sessionAgent) TakeSummarizeQueue(sessionID string) (fantasy.ProviderOptions, bool) {
-	opts, ok := a.summarizeQueue.Take(sessionID)
-	return opts, ok
+// testBuildSummarizeSnapshot is a test helper that creates a SummarizeSnapshot
+// from the agent's current shared state. Used by tests that call Summarize directly.
+func (a *sessionAgent) testBuildSummarizeSnapshot() *SummarizeSnapshot {
+	model := a.largeModel.Get()
+	prefix := a.systemPromptPrefix.Get()
+
+	// Build minimal provider options (same as getProviderOptions but for tests).
+	opts := fantasy.ProviderOptions{}
+
+	return &SummarizeSnapshot{
+		model:           model,
+		providerOptions: opts,
+		promptPrefix:    prefix,
+	}
+}
+
+func (a *sessionAgent) TakeSummarizeQueue(sessionID string) (*SummarizeSnapshot, bool) {
+	snapshot, ok := a.summarizeQueue.Take(sessionID)
+	return snapshot, ok
 }
 
 func (a *sessionAgent) CancelQueuedSummarize(sessionID string) {

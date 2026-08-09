@@ -255,6 +255,7 @@ func TestP2_3_ManualCompactionWatchdogCatchesIdleStall(t *testing.T) {
 		DisableAutoSummarize: true,
 		StreamIdleTimeout:    shortIdleTimeout,
 	})
+	sa := a.(*sessionAgent)
 
 	sess, err := env.sessions.Create(context.Background(), "p2-3 manual compaction watchdog test")
 	require.NoError(t, err)
@@ -277,7 +278,7 @@ func TestP2_3_ManualCompactionWatchdogCatchesIdleStall(t *testing.T) {
 	// This calls runSummarize, which should now have a watchdog.
 	summarizeDone := make(chan error, 1)
 	go func() {
-		summarizeDone <- a.Summarize(context.Background(), sess.ID, fantasy.ProviderOptions{})
+		summarizeDone <- a.Summarize(context.Background(), sess.ID, sa.testBuildSummarizeSnapshot())
 	}()
 
 	// Wait for the stream to start and send initial chunks.

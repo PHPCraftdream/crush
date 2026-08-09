@@ -99,6 +99,7 @@ func TestP312_ManualCompactionHoldsOSLock_Deterministic(t *testing.T) {
 		Tools:                []fantasy.AgentTool{},
 		DisableAutoSummarize: true,
 	})
+	sa := a.(*sessionAgent)
 
 	sess, err := env.sessions.Create(t.Context(), "manual compact OS lock test")
 	require.NoError(t, err)
@@ -116,7 +117,7 @@ func TestP312_ManualCompactionHoldsOSLock_Deterministic(t *testing.T) {
 
 	compactionDone := make(chan error, 1)
 	go func() {
-		compactionDone <- a.Summarize(ctx, sess.ID, fantasy.ProviderOptions{})
+		compactionDone <- a.Summarize(ctx, sess.ID, sa.testBuildSummarizeSnapshot())
 	}()
 
 	// Unblock the handler no matter how this test exits. A require failure
@@ -370,7 +371,7 @@ func TestP312_ManualCompactionDrainsQueuedWork_WithDataDir(t *testing.T) {
 	}
 	sa.getMailbox(sess.ID).queue(queued)
 
-	err = sa.Summarize(t.Context(), sess.ID, fantasy.ProviderOptions{})
+	err = sa.Summarize(t.Context(), sess.ID, sa.testBuildSummarizeSnapshot())
 	require.NoError(t, err,
 		"Summarize must release the OS lock before draining the queued call into a fresh a.Run(); "+
 			"holding it across that call makes the process reject itself with SessionLockBusyError")
@@ -476,7 +477,7 @@ func TestP312_OSLockReleasedBeforeMailboxReportsIdle(t *testing.T) {
 	}
 	t.Cleanup(func() { mb.testPreAbandonSeam = nil })
 
-	err = sa.Summarize(t.Context(), sess.ID, fantasy.ProviderOptions{})
+	err = sa.Summarize(t.Context(), sess.ID, sa.testBuildSummarizeSnapshot())
 	require.NoError(t, err)
 
 	select {
@@ -596,7 +597,7 @@ func TestP312_ManualCompactionHeartbeatStaysAlive(t *testing.T) {
 
 	compactionDone := make(chan error, 1)
 	go func() {
-		compactionDone <- sa.Summarize(t.Context(), sess.ID, fantasy.ProviderOptions{})
+		compactionDone <- sa.Summarize(t.Context(), sess.ID, sa.testBuildSummarizeSnapshot())
 	}()
 
 	select {

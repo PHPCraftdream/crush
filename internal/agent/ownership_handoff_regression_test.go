@@ -120,7 +120,7 @@ func TestAbandonOwnershipWithHandoff_ManualCompactionSuccess_SynchronousRun_Regr
 	// - popFirstSubmitted() returns nothing (hasNext == false)
 	// - The synchronous a.Run never executes
 	// - Summarize returns nil (FALSE NEGATIVE)
-	summarizeErr := sessionAgent.Summarize(ctx, sess.ID, fantasy.ProviderOptions{})
+	summarizeErr := sessionAgent.Summarize(ctx, sess.ID, sessionAgent.testBuildSummarizeSnapshot())
 
 	// The test proves the fix is in place by requiring Summarize to return an error.
 	// With the buggy code, this assertion would FAIL because Summarize returns nil.

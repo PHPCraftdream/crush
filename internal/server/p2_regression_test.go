@@ -12,6 +12,7 @@ import (
 	"github.com/charmbracelet/crush/internal/agent"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/message"
+	"github.com/charmbracelet/crush/internal/session"
 )
 
 // fakeIsSessionBusyCoordinator is a mock agent.Coordinator that lets us control
@@ -61,7 +62,7 @@ func (f *fakeIsSessionBusyCoordinator) InjectMessage(ctx context.Context, sessio
 	return message.Message{}, nil
 }
 
-func (f *fakeIsSessionBusyCoordinator) Summarize(ctx context.Context, sessionID string) error {
+func (f *fakeIsSessionBusyCoordinator) Summarize(ctx context.Context, sessionID string, snapshot *agent.SummarizeSnapshot) error {
 	return f.summarizeErr
 }
 
@@ -69,8 +70,16 @@ func (f *fakeIsSessionBusyCoordinator) SummarizeQueued(sessionID string) bool {
 	return false
 }
 
-func (f *fakeIsSessionBusyCoordinator) TakeSummarizeQueue(sessionID string) (fantasy.ProviderOptions, bool) {
-	return fantasy.ProviderOptions{}, false
+func (f *fakeIsSessionBusyCoordinator) TakeSummarizeQueue(sessionID string) (*agent.SummarizeSnapshot, bool) {
+	return nil, false
+}
+
+func (f *fakeIsSessionBusyCoordinator) RebuildSessionAgentCall(ctx context.Context, data session.SessionAgentCallData) (agent.SessionAgentCall, error) {
+	return agent.SessionAgentCall{}, nil
+}
+
+func (f *fakeIsSessionBusyCoordinator) RunSessionAgentCall(ctx context.Context, call agent.SessionAgentCall) (*fantasy.AgentResult, error) {
+	return nil, nil
 }
 
 func (f *fakeIsSessionBusyCoordinator) CancelQueuedSummarize(sessionID string) {

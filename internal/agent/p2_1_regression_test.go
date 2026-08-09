@@ -138,9 +138,7 @@ func TestP2_1_SummarizeQueueDrainedFromNonWebPath(t *testing.T) {
 
 	// Call Summarize directly (NON-WEB PATH) while the session is busy.
 	// This should queue the request and return ErrSummarizeQueued.
-	summarizeOpts := fantasy.ProviderOptions{}
-
-	err = sessionAgent.Summarize(ctx, sess.ID, summarizeOpts)
+	err = sessionAgent.Summarize(ctx, sess.ID, sessionAgent.testBuildSummarizeSnapshot())
 	require.Error(t, err, "Summarize should return an error when session is busy")
 	require.ErrorIs(t, err, ErrSummarizeQueued, "error should be ErrSummarizeQueued")
 

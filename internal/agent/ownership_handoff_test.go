@@ -5,7 +5,6 @@ import (
 	"testing"
 	"time"
 
-	"charm.land/fantasy"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/stretchr/testify/require"
 )
@@ -177,7 +176,7 @@ func TestAbandonOwnershipWithHandoff_ManualCompactionError(t *testing.T) {
 
 	// Now the session should be idle. Start a manual compaction that will fail.
 	// We'll cause it to fail by using an invalid session ID.
-	compactErr := sessionAgent.Summarize(ctx, "invalid-session-id", fantasy.ProviderOptions{})
+	compactErr := sessionAgent.Summarize(ctx, "invalid-session-id", sessionAgent.testBuildSummarizeSnapshot())
 	require.Error(t, compactErr, "compaction must error for invalid session")
 
 	// Verify the original queued call is still there (since we didn't compact it).

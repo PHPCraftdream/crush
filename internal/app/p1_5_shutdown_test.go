@@ -80,7 +80,7 @@ func (m *mockCoordinatorForShutdown) InjectMessage(ctx context.Context, sessionI
 	panic("unexpected: Shutdown does not call InjectMessage")
 }
 
-func (m *mockCoordinatorForShutdown) Summarize(context.Context, string) error {
+func (m *mockCoordinatorForShutdown) Summarize(context.Context, string, *agent.SummarizeSnapshot) error {
 	panic("unexpected: Shutdown does not call Summarize")
 }
 
@@ -88,7 +88,7 @@ func (m *mockCoordinatorForShutdown) SummarizeQueued(sessionID string) bool {
 	panic("unexpected: Shutdown does not call SummarizeQueued")
 }
 
-func (m *mockCoordinatorForShutdown) TakeSummarizeQueue(sessionID string) (fantasy.ProviderOptions, bool) {
+func (m *mockCoordinatorForShutdown) TakeSummarizeQueue(sessionID string) (*agent.SummarizeSnapshot, bool) {
 	panic("unexpected: Shutdown does not call TakeSummarizeQueue")
 }
 

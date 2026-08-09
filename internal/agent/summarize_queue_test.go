@@ -148,7 +148,7 @@ func TestRunSummarizeCore_QueuedMessage_ReturnsHasNext(t *testing.T) {
 
 	// Summarize acquires ownership via beginCompact, runs the body, releases,
 	// then drains messageQueue and starts a follow-on Run for the queued call.
-	err := sa.Summarize(t.Context(), sess.ID, fantasy.ProviderOptions{})
+	err := sa.Summarize(t.Context(), sess.ID, sa.testBuildSummarizeSnapshot())
 	require.NoError(t, err)
 
 	// The follow-on Run must have created the queued user message in the DB.
@@ -171,7 +171,7 @@ func TestRunSummarizeCore_QueuedMessage_ReturnsHasNext(t *testing.T) {
 func TestRunSummarizeCore_NoQueuedMessage_ReturnsNoNext(t *testing.T) {
 	sa, sess := newSummarizeCoreTestAgent(t)
 
-	err := sa.Summarize(t.Context(), sess.ID, fantasy.ProviderOptions{})
+	err := sa.Summarize(t.Context(), sess.ID, sa.testBuildSummarizeSnapshot())
 	require.NoError(t, err, "Summarize must succeed when nothing is queued")
 }
 
@@ -243,7 +243,7 @@ func TestRunSummarize_QueuedMessage_RunsAsFollowOnTurn(t *testing.T) {
 
 	// Use the public Summarize API which handles ownership acquisition internally
 	// via beginCompact (the P0-4 fix).
-	err = sa.Summarize(t.Context(), sess.ID, fantasy.ProviderOptions{})
+	err = sa.Summarize(t.Context(), sess.ID, sa.testBuildSummarizeSnapshot())
 	require.NoError(t, err, "Summarize must not error when draining a queued message into a fresh a.Run() call")
 
 	after, err := env.messages.List(t.Context(), sess.ID)

@@ -220,6 +220,16 @@ type mailbox struct {
 	// production path.
 	testPreAbandonSeam func()
 
+	// testPreSnapshotConsumeSeam, when non-nil, is invoked by runSummarize
+	// (agent.go) strictly AFTER the caller's SummarizeSnapshot has been
+	// captured and strictly BEFORE it is consumed by runSummarizeBody. It
+	// exists to let a test deterministically land a concurrent SetModels (or
+	// any other shared-state mutation) exactly inside the window a pre-#341
+	// regression would have re-read shared state in, without relying on a
+	// wall-clock time.Sleep race that a fast in-memory path can simply
+	// out-run. nil (a no-op) in every production path.
+	testPreSnapshotConsumeSeam func()
+
 	// epoch identifies the current OWNERSHIP ERA: bumped every time state
 	// transitions mbIdle -> mbOwned (a NEW caller becomes owner), never on
 	// a continuing turn within the same era (beginGeneration's turn-level

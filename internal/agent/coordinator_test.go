@@ -64,12 +64,12 @@ func (m *mockSessionAgent) InjectMessage(_ context.Context, call SessionAgentCal
 	return message.Message{SessionID: call.SessionID}, nil
 }
 
-func (m *mockSessionAgent) Summarize(context.Context, string, fantasy.ProviderOptions) error {
+func (m *mockSessionAgent) Summarize(context.Context, string, *SummarizeSnapshot) error {
 	return nil
 }
 func (m *mockSessionAgent) SummarizeQueued(string) bool { return false }
-func (m *mockSessionAgent) TakeSummarizeQueue(string) (fantasy.ProviderOptions, bool) {
-	return fantasy.ProviderOptions{}, false
+func (m *mockSessionAgent) TakeSummarizeQueue(string) (*SummarizeSnapshot, bool) {
+	return nil, false
 }
 func (m *mockSessionAgent) CancelQueuedSummarize(string)          {}
 func (m *mockSessionAgent) SetSystemPromptPrefix(string)          {}

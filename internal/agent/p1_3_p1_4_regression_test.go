@@ -453,7 +453,7 @@ func TestP1_3_CoordinatorSummarizeSingleRead(t *testing.T) {
 	}
 
 	// Call Summarize. With the FIX (correct code), Model() should be called ONCE.
-	err = c.Summarize(t.Context(), sess.ID)
+	err = c.Summarize(t.Context(), sess.ID, nil)
 	require.NoError(t, err)
 
 	// Verify that Model() was called exactly ONCE.
@@ -517,7 +517,7 @@ func (m *modelCallSpyAgent) InjectMessage(_ context.Context, call SessionAgentCa
 	return message.Message{SessionID: call.SessionID}, nil
 }
 
-func (m *modelCallSpyAgent) Summarize(ctx context.Context, sessionID string, opts fantasy.ProviderOptions) error {
+func (m *modelCallSpyAgent) Summarize(ctx context.Context, sessionID string, snapshot *SummarizeSnapshot) error {
 	// Call the real runSummarizeSilent to actually create a summary.
 	sa := NewSessionAgent(SessionAgentOptions{
 		LargeModel:           m.model,
@@ -533,11 +533,11 @@ func (m *modelCallSpyAgent) Summarize(ctx context.Context, sessionID string, opt
 	sessionAgent := sa.(*sessionAgent)
 	largeModel := sessionAgent.largeModel.Get()
 	systemPromptPrefix := sessionAgent.systemPromptPrefix.Get()
-	return sessionAgent.runSummarizeSilent(ctx, sessionID, opts, largeModel, systemPromptPrefix)
+	return sessionAgent.runSummarizeSilent(ctx, sessionID, snapshot.providerOptions, largeModel, systemPromptPrefix)
 }
 func (m *modelCallSpyAgent) SummarizeQueued(string) bool { return false }
-func (m *modelCallSpyAgent) TakeSummarizeQueue(string) (fantasy.ProviderOptions, bool) {
-	return fantasy.ProviderOptions{}, false
+func (m *modelCallSpyAgent) TakeSummarizeQueue(sessionID string) (*SummarizeSnapshot, bool) {
+	return nil, false
 }
 func (m *modelCallSpyAgent) CancelQueuedSummarize(string)          {}
 func (m *modelCallSpyAgent) SetSystemPromptPrefix(string)          {}

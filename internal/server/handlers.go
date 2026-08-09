@@ -1254,8 +1254,9 @@ func handleSummarizeSession(ctx context.Context, a *appPkg.App, c *Client, msg W
 	}
 	agentCtx := context.WithoutCancel(ctx)
 	// Summarize will queue the request and return ErrSummarizeQueued if busy.
+	// We pass nil for the snapshot, which causes Summarize to resolve it from the target session.
 	c.hub.Broadcast(EventAgentBusy, AgentBusyPayload{SessionID: p.SessionID, Busy: true})
-	err := a.AgentCoordinator.Summarize(agentCtx, p.SessionID)
+	err := a.AgentCoordinator.Summarize(agentCtx, p.SessionID, nil)
 	if errors.Is(err, agent.ErrSummarizeQueued) {
 		// Undo the busy broadcast — the session isn't busy with summarise yet.
 		c.hub.Broadcast(EventAgentBusy, AgentBusyPayload{SessionID: p.SessionID, Busy: false})

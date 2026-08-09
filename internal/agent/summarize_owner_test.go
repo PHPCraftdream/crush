@@ -5,7 +5,6 @@ import (
 	"testing"
 	"time"
 
-	"charm.land/fantasy"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -71,7 +70,7 @@ func TestP268_TwoCompactionsMutuallyExclusive(t *testing.T) {
 	require.False(t, ok2, "second beginCompact must fail — two concurrent compactions are impossible")
 
 	// A manual Summarize call on the same session must see ErrSummarizeQueued.
-	err := sa.Summarize(t.Context(), sess.ID, fantasy.ProviderOptions{})
+	err := sa.Summarize(t.Context(), sess.ID, sa.testBuildSummarizeSnapshot())
 	assert.ErrorIs(t, err, ErrSummarizeQueued, "Summarize must queue when another compaction owns the mailbox")
 
 	// After the first compaction releases, a new one can proceed.
@@ -97,7 +96,7 @@ func TestP268_ManualCompactAndTurnMutuallyExclusive(t *testing.T) {
 	require.False(t, compactOk, "beginCompact must fail while a turn owns the mailbox")
 
 	// The Summarize wrapper must route to the queue.
-	err := sa.Summarize(t.Context(), sess.ID, fantasy.ProviderOptions{})
+	err := sa.Summarize(t.Context(), sess.ID, sa.testBuildSummarizeSnapshot())
 	assert.ErrorIs(t, err, ErrSummarizeQueued)
 
 	// Now release the turn and acquire as compaction instead.
@@ -155,7 +154,7 @@ func TestP268_SummarizeQueueStillWorksAfterFix(t *testing.T) {
 	require.True(t, ok)
 
 	// Summarize must queue and return ErrSummarizeQueued.
-	err := sa.Summarize(t.Context(), sess.ID, fantasy.ProviderOptions{})
+	err := sa.Summarize(t.Context(), sess.ID, sa.testBuildSummarizeSnapshot())
 	require.ErrorIs(t, err, ErrSummarizeQueued)
 
 	// The queue must hold the request.

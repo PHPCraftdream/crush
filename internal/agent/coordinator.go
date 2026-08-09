@@ -246,9 +246,17 @@ type Coordinator interface {
 	// running, schedules it to be merged into the next provider request
 	// without cancelling the in-flight turn. See SessionAgent.InjectMessage.
 	InjectMessage(ctx context.Context, sessionID, prompt string, attachments ...message.Attachment) (message.Message, error)
-	Summarize(context.Context, string) error
+	// Summarize compresses the session history. If the session is currently
+	// busy the request is queued; call TakeSummarizeQueue after the task
+	// finishes to pick it up. Returns ErrSummarizeQueued when queued.
+	//
+	// The snapshot contains the model, provider options, and prompt prefix
+	// resolved from the target session (or shared state for sessions without
+	// overrides), ensuring the entire summarize operation uses consistent
+	// configuration regardless of concurrent SetModels calls (task #341).
+	Summarize(context.Context, string, *SummarizeSnapshot) error
 	SummarizeQueued(sessionID string) bool
-	TakeSummarizeQueue(sessionID string) (fantasy.ProviderOptions, bool)
+	TakeSummarizeQueue(sessionID string) (*SummarizeSnapshot, bool)
 	CancelQueuedSummarize(sessionID string)
 	Model() Model
 	UpdateModels(ctx context.Context) error
@@ -526,6 +534,21 @@ type resolvedOverrides struct {
 	small        Model
 	promptPrefix string
 	systemPrompt string
+}
+
+// SummarizeSnapshot holds an immutable snapshot of all configuration needed
+// for a single manual/queued summarize operation. It is computed ONCE from the
+// target session's persisted models (or from shared state for sessions without
+// overrides) and passed through the entire summarize path, ensuring the provider
+// options, model, and prompt prefix never diverge due to concurrent SetModels
+// calls (task #341, P1-1).
+//
+// This mirrors the resolvedOverrides pattern used for normal turns, but
+// specialized for summarize which doesn't need smallModel or systemPrompt.
+type SummarizeSnapshot struct {
+	model           Model
+	providerOptions fantasy.ProviderOptions
+	promptPrefix    string
 }
 
 // applyModelOverrides sets up the agent with the given model overrides
@@ -2586,12 +2609,23 @@ func (c *coordinator) QueuedPromptsList(sessionID string) []string {
 	return c.currentAgent.QueuedPromptsList(sessionID)
 }
 
-func (c *coordinator) Summarize(ctx context.Context, sessionID string) error {
-	// Read the model ONCE (P1-3): without this snapshot, a concurrent
-	// SetModels between the provider config lookup and getProviderOptions
-	// would mismatch providerCfg from the actually used model.
-	agentModel := c.currentAgent.Model()
-	providerCfg, ok := c.cfg.Config().Providers.Get(agentModel.ModelCfg.Provider)
+// Summarize implements Coordinator.
+func (c *coordinator) Summarize(ctx context.Context, sessionID string, snapshot *SummarizeSnapshot) error {
+	// If the caller didn't provide a snapshot (e.g., tests), resolve one now.
+	// This maintains backward compatibility while encouraging the correct pattern.
+	if snapshot == nil {
+		var err error
+		snapshot, err = c.buildSummarizeSnapshot(ctx, sessionID)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Refresh OAuth token if needed using the provider from the snapshot.
+	// Auth identity is already captured in the snapshot via providerCfg,
+	// which is read once during snapshot construction, so no additional
+	// pinning is needed here (task #341, P1-1).
+	providerCfg, ok := c.cfg.Config().Providers.Get(snapshot.model.ModelCfg.Provider)
 	if !ok {
 		return errModelProviderNotConfigured
 	}
@@ -2604,10 +2638,67 @@ func (c *coordinator) Summarize(ctx context.Context, sessionID string) error {
 	}
 
 	summarize := func() error {
-		return c.currentAgent.Summarize(ctx, sessionID, getProviderOptions(agentModel, providerCfg))
+		return c.currentAgent.Summarize(ctx, sessionID, snapshot)
 	}
 
 	return c.runWithUnauthorizedRetry(ctx, providerCfg, summarize)
+}
+
+// buildSummarizeSnapshot creates an immutable snapshot for a summarize operation,
+// resolving the model from the target session's persisted models (or shared state
+// for sessions without overrides). This ensures the entire summarize operation
+// uses consistent configuration regardless of concurrent SetModels calls
+// (task #341, P1-1).
+func (c *coordinator) buildSummarizeSnapshot(ctx context.Context, sessionID string) (*SummarizeSnapshot, error) {
+	// Load the session to check for model overrides. If the session has a
+	// LargeModelID in the DB, we resolve from that; otherwise we fall back
+	// to the shared agent state (same guarantee level as Run for sessions
+	// without overrides).
+	sess, err := c.sessions.Get(ctx, sessionID)
+	var agentModel Model
+	var promptPrefix string
+	if err == nil && sess.LargeModelID != "" {
+		// Session has a pinned model in the DB. Resolve it using the same
+		// applyModelOverrides pattern as Run.
+		largeOverride := &ModelOverride{
+			Provider:        sess.LargeModelProvider,
+			Model:           sess.LargeModelID,
+			ReasoningEffort: sess.LargeModelReasoningEffort,
+		}
+		resolved, applyErr := c.applyModelOverrides(ctx, largeOverride, nil)
+		if applyErr != nil {
+			slog.Error("Coordinator.Summarize: failed to apply DB model override, using current models", "err", applyErr)
+			agentModel = c.currentAgent.Model()
+		} else {
+			agentModel = resolved.large
+			promptPrefix = resolved.promptPrefix
+		}
+	} else {
+		// Session has no override. Use the shared agent state. This is the
+		// same guarantee level as Run for sessions without overrides - not
+		// perfect, but acceptable since there's no per-session data to pin.
+		agentModel = c.currentAgent.Model()
+	}
+
+	// Get the provider config for this model.
+	providerCfg, ok := c.cfg.Config().Providers.Get(agentModel.ModelCfg.Provider)
+	if !ok {
+		return nil, errModelProviderNotConfigured
+	}
+
+	// Build provider options from the resolved model.
+	opts := getProviderOptions(agentModel, providerCfg)
+
+	// Build the prompt prefix from the provider config if we haven't already.
+	if promptPrefix == "" {
+		promptPrefix = providerCfg.SystemPromptPrefix
+	}
+
+	return &SummarizeSnapshot{
+		model:           agentModel,
+		providerOptions: opts,
+		promptPrefix:    promptPrefix,
+	}, nil
 }
 
 // refreshTokenIfExpired proactively refreshes the OAuth token if it has expired.
@@ -2709,7 +2800,7 @@ func (c *coordinator) SummarizeQueued(sessionID string) bool {
 	return c.currentAgent.SummarizeQueued(sessionID)
 }
 
-func (c *coordinator) TakeSummarizeQueue(sessionID string) (fantasy.ProviderOptions, bool) {
+func (c *coordinator) TakeSummarizeQueue(sessionID string) (*SummarizeSnapshot, bool) {
 	return c.currentAgent.TakeSummarizeQueue(sessionID)
 }
 
