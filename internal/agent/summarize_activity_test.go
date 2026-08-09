@@ -69,7 +69,9 @@ func TestRunSummarizeSilent_CallsActivityNotify(t *testing.T) {
 	}
 
 	// Run the silent summarize.
-	err = sa.runSummarizeSilent(ctx, sess.ID, fantasy.ProviderOptions{})
+	largeModel := sa.largeModel.Get()
+	systemPromptPrefix := sa.systemPromptPrefix.Get()
+	err = sa.runSummarizeSilent(ctx, sess.ID, fantasy.ProviderOptions{}, largeModel, systemPromptPrefix)
 	require.NoError(t, err)
 
 	// Verify that the provider was called (the summary stream actually ran).
@@ -161,7 +163,9 @@ func TestRunSummarizeSilent_CallsWatchdogBump(t *testing.T) {
 	}
 
 	// Run the silent summarize.
-	err = sa.runSummarizeSilent(ctx, sess.ID, fantasy.ProviderOptions{})
+	largeModel := sa.largeModel.Get()
+	systemPromptPrefix := sa.systemPromptPrefix.Get()
+	err = sa.runSummarizeSilent(ctx, sess.ID, fantasy.ProviderOptions{}, largeModel, systemPromptPrefix)
 	require.NoError(t, err)
 
 	// Verify that the provider was called (the summary stream actually ran).
@@ -225,7 +229,9 @@ func TestRunSummarizeBody_CallsActivityNotify(t *testing.T) {
 	}
 
 	// Run the summarize body.
-	err = sa.runSummarizeBody(ctx, sess.ID, fantasy.ProviderOptions{})
+	largeModel := sa.largeModel.Get()
+	systemPromptPrefix := sa.systemPromptPrefix.Get()
+	err = sa.runSummarizeBody(ctx, sess.ID, fantasy.ProviderOptions{}, largeModel, systemPromptPrefix)
 	require.NoError(t, err)
 
 	// Verify that the provider was called (the summary stream actually ran).
@@ -317,7 +323,9 @@ func TestRunSummarizeBody_CallsWatchdogBump(t *testing.T) {
 	}
 
 	// Run the summarize body.
-	err = sa.runSummarizeBody(ctx, sess.ID, fantasy.ProviderOptions{})
+	largeModel := sa.largeModel.Get()
+	systemPromptPrefix := sa.systemPromptPrefix.Get()
+	err = sa.runSummarizeBody(ctx, sess.ID, fantasy.ProviderOptions{}, largeModel, systemPromptPrefix)
 	require.NoError(t, err)
 
 	// Verify that the provider was called (the summary stream actually ran).

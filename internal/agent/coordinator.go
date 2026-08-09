@@ -2499,7 +2499,11 @@ func (c *coordinator) QueuedPromptsList(sessionID string) []string {
 }
 
 func (c *coordinator) Summarize(ctx context.Context, sessionID string) error {
-	providerCfg, ok := c.cfg.Config().Providers.Get(c.currentAgent.Model().ModelCfg.Provider)
+	// Read the model ONCE (P1-3): without this snapshot, a concurrent
+	// SetModels between the provider config lookup and getProviderOptions
+	// would mismatch providerCfg from the actually used model.
+	agentModel := c.currentAgent.Model()
+	providerCfg, ok := c.cfg.Config().Providers.Get(agentModel.ModelCfg.Provider)
 	if !ok {
 		return errModelProviderNotConfigured
 	}
@@ -2512,7 +2516,7 @@ func (c *coordinator) Summarize(ctx context.Context, sessionID string) error {
 	}
 
 	summarize := func() error {
-		return c.currentAgent.Summarize(ctx, sessionID, getProviderOptions(c.currentAgent.Model(), providerCfg))
+		return c.currentAgent.Summarize(ctx, sessionID, getProviderOptions(agentModel, providerCfg))
 	}
 
 	return c.runWithUnauthorizedRetry(ctx, providerCfg, summarize)

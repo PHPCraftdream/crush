@@ -2901,7 +2901,7 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 		// own end-of-turn drainOrRelease call, a few lines below, to pick up
 		// — the single true final drain point for the whole turn, summarize
 		// included.
-		summarizeErr := a.runSummarizeBody(genCtx, call.SessionID, call.ProviderOptions)
+		summarizeErr := a.runSummarizeBody(genCtx, call.SessionID, call.ProviderOptions, largeModel, promptPrefix)
 		if summarizeErr != nil {
 			return nil, SessionAgentCall{}, false, summarizeErr
 		}
@@ -2924,7 +2924,7 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 	// SummaryMessageID). genCtx is still alive here (cancel() hasn't fired
 	// yet), so Cancel(sessionID) can interrupt this if needed.
 	if !shouldSummarize && silentCompactNeeded {
-		if silentErr := a.runSummarizeSilent(genCtx, call.SessionID, call.ProviderOptions); silentErr != nil {
+		if silentErr := a.runSummarizeSilent(genCtx, call.SessionID, call.ProviderOptions, largeModel, promptPrefix); silentErr != nil {
 			slog.Warn("silent summarise failed", "session_id", call.SessionID, "err", silentErr)
 		}
 	}
@@ -3052,7 +3052,16 @@ func (a *sessionAgent) runSummarize(ctx context.Context, genCtx context.Context,
 	// when lk is nil (a.dataDir == "").
 	genCtx = withActivityNotify(genCtx, lk)
 
-	err := a.runSummarizeBody(genCtx, sessionID, opts)
+	// Resolve model/prompt config ONCE for the entire manual compaction
+	// (P1-3): without this snapshot, a concurrent SetModels could land
+	// mid-compaction and leave the provider options (computed from opts)
+	// mismatched from the model actually used. Manual compaction has no
+	// SessionAgentCall to pass to resolveTurnConfig, so we resolve from
+	// shared state directly here — this is the minimal fix; a deeper
+	// refactor would resolve from the target session's own pinned
+	// overrides instead.
+	cfg := a.resolveTurnConfig(SessionAgentCall{})
+	err := a.runSummarizeBody(genCtx, sessionID, opts, cfg.largeModel, cfg.promptPrefix)
 
 	// Release the OS lock BEFORE abandoning mailbox ownership. abandonOwnership
 	// flips the mailbox to mbIdle, which is what IsSessionBusy/IsBusy report to
@@ -3126,11 +3135,7 @@ func (a *sessionAgent) CancelQueuedSummarize(sessionID string) {
 // genCtx is the caller's already-cancel-scoped context (beginCompact's
 // cancel for manual /compact, or the turn's genCtx for inline
 // auto-summarize).
-func (a *sessionAgent) runSummarizeBody(ctx context.Context, sessionID string, opts fantasy.ProviderOptions) error {
-	// Copy mutable fields under lock to avoid races with SetModels.
-	largeModel := a.largeModel.Get()
-	systemPromptPrefix := a.systemPromptPrefix.Get()
-
+func (a *sessionAgent) runSummarizeBody(ctx context.Context, sessionID string, opts fantasy.ProviderOptions, largeModel Model, systemPromptPrefix string) error {
 	currentSession, err := a.sessions.Get(ctx, sessionID)
 	if err != nil {
 		return fmt.Errorf("failed to get session: %w", err)
@@ -3214,20 +3219,33 @@ func (a *sessionAgent) runSummarizeBody(ctx context.Context, sessionID string, o
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			// User cancelled summarize; remove the summary message.
-			deleteErr := a.messages.Delete(ctx, summaryMessage.ID)
-			return deleteErr
+			// Use a bounded cancel-immune context for cleanup (P1-4): the
+			// stream's context is already canceled, so Delete would silently
+			// fail and leave an orphaned summary message in the DB.
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), summaryCommitMaxDuration)
+			defer cleanupCancel()
+			deleteErr := a.messages.Delete(cleanupCtx, summaryMessage.ID)
+			if deleteErr != nil {
+				slog.Error("Failed to delete orphaned summary message after cancel", "session_id", sessionID, "err", deleteErr)
+			}
+			return err
 		}
 		// Mark the summary message as finished with an error so the UI
-		// stops spinning.
+		// stops spinning. Use a bounded cancel-immune context for cleanup (P1-4).
 		summaryMessage.AddFinish(message.FinishReasonError, "Summarization Error", err.Error())
-		if updateErr := a.messages.Update(ctx, summaryMessage); updateErr != nil {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), summaryCommitMaxDuration)
+		defer cleanupCancel()
+		if updateErr := a.messages.Update(cleanupCtx, summaryMessage); updateErr != nil {
+			slog.Error("Failed to mark summary message as error", "session_id", sessionID, "err", updateErr)
 			return updateErr
 		}
 		return err
 	}
 
 	summaryMessage.AddFinish(message.FinishReasonEndTurn, "", "")
-	if err = a.messages.Update(ctx, summaryMessage); err != nil {
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), summaryCommitMaxDuration)
+	defer cleanupCancel()
+	if err = a.messages.Update(cleanupCtx, summaryMessage); err != nil {
 		return err
 	}
 
@@ -3299,10 +3317,7 @@ func (a *sessionAgent) runSummarizeBody(ctx context.Context, sessionID string, o
 //  5. Updates session.SummaryMessageID so future runs start from the summary.
 //
 // Pinned messages are never deleted.
-func (a *sessionAgent) runSummarizeSilent(ctx context.Context, sessionID string, opts fantasy.ProviderOptions) error {
-	largeModel := a.largeModel.Get()
-	systemPromptPrefix := a.systemPromptPrefix.Get()
-
+func (a *sessionAgent) runSummarizeSilent(ctx context.Context, sessionID string, opts fantasy.ProviderOptions, largeModel Model, systemPromptPrefix string) error {
 	currentSession, err := a.sessions.Get(ctx, sessionID)
 	if err != nil {
 		return fmt.Errorf("failed to get session: %w", err)
@@ -3390,13 +3405,24 @@ func (a *sessionAgent) runSummarizeSilent(ctx context.Context, sessionID string,
 	})
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
-			_ = a.messages.Delete(ctx, summaryMessage.ID)
+			// User cancelled summarize; remove the summary message.
+			// Use a bounded cancel-immune context for cleanup (P1-4): the
+			// stream's context is already canceled, so Delete would silently
+			// fail and leave an orphaned summary message in the DB.
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), summaryCommitMaxDuration)
+			defer cleanupCancel()
+			deleteErr := a.messages.Delete(cleanupCtx, summaryMessage.ID)
+			if deleteErr != nil {
+				slog.Warn("Silent summarize: failed to delete orphaned summary message after cancel", "session_id", sessionID, "err", deleteErr)
+			}
 		}
 		return err
 	}
 
 	summaryMessage.AddFinish(message.FinishReasonEndTurn, "", "")
-	if err = a.messages.Update(ctx, summaryMessage); err != nil {
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), summaryCommitMaxDuration)
+	defer cleanupCancel()
+	if err = a.messages.Update(cleanupCtx, summaryMessage); err != nil {
 		return err
 	}
 
