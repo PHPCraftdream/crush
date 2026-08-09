@@ -23,6 +23,76 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **Nine release-blocking concurrency bugs from the 2026-08-07
+  release-concurrency review, closed and independently verified** (see
+  `docs/reviews/2026-08-07-release-concurrency-review.md`). The review's
+  central invariant: once an action is accepted, exactly one of three
+  things must be true — a live owner is responsible for it, a freshly
+  started runner is responsible for it, or a durable record exists that
+  a future worker can claim. Every owner-exit path (success, cancel,
+  error, panic, shutdown, or OS-lock contention) must transfer or
+  reject all pending work atomically; nothing may be silently dropped.
+
+  - **Ownership exit could silently drop an accepted call** — both the
+    normal end-of-turn path and manual compaction's exit path had
+    windows where a call already accepted into the mailbox could be
+    lost instead of handed off or requeued. Replaced with one unified
+    ownership-exit finalizer used by both paths.
+  - **A call orphaned by OS-lock contention during a detached restart
+    could be lost after retries were exhausted** — the retry loop gave
+    up silently on persistent contention. It now requeues the call for
+    a future `Run()` durably, and the same fix applies to the
+    cross-process interrupt-inject path (the `pending_injects` row is
+    recreated instead of vanishing after `ConsumeInterruptInject`
+    already deleted it).
+  - **Web "rerun message" could race a still-stopping session's
+    transcript writes** — `rerun` now fails closed (rejects the
+    request) instead of proceeding while the session's prior turn is
+    still tearing down.
+  - **Manual/standalone compaction could summarize using a model or
+    provider that had already changed underneath it, and a failed
+    cleanup write could be silently skipped if the context was
+    already cancelled** — the summary snapshot (model + provider) is
+    now captured immutably at the start of the summarize call, and the
+    final DB cleanup write uses a cancel-immune bounded context so it
+    still runs even after the parent context is gone.
+  - **Shutdown could return before live dispatchers actually stopped**
+    — `App.Shutdown()` fired a 5-second context that nothing
+    unconditionally waited on. It now genuinely joins the live
+    dispatchers (bounded, so a stuck one can't hang shutdown forever)
+    and logs a warning if it had to force-exit while an agent was
+    still busy.
+  - **Web "busy"/"queued" events and the summarize-queue drain didn't
+    track real mailbox ownership** — a client could see `Busy: false`
+    broadcast while another owner still held the session, and a
+    summarize request queued from a non-web path (CLI, detached run)
+    could sit un-drained. Both are now tied to the mailbox's actual
+    ownership transitions instead of a best-effort approximation.
+  - **Manual compaction released the OS session lock through a raw,
+    synchronous call instead of the same `mbReleasing` state machine a
+    normal turn uses** — same-process observers (`IsSessionBusy`,
+    `Cancel`) could briefly see "idle" while a slow lock release was
+    still in flight. Manual compaction now goes through the same
+    `beginRelease`/`finishRelease` epoch-protected transition as a
+    normal turn's drain.
+  - **Manual/standalone compaction had no idle-timeout watchdog, and
+    provider cancellation wasn't a tested execution-boundary
+    contract** — an HTTP provider stream could ignore a cancelled
+    context indefinitely with nothing catching it. Compaction now runs
+    under the same stream-watchdog mechanism as a normal turn, and
+    provider cancellation is now covered by a conformance test.
+  - **`internal/session` lock release cleaned up best-effort diagnostic
+    metadata before the actual OS-level unlock**, so a hang in the
+    diagnostic part could delay the real unlock. `SessionLock.Release()`
+    now unlocks first, unconditionally, before touching diagnostics.
+  - **Final audit pass**: two of the nine regression tests added by the
+    fixes above proved only that a call was durably *stored* (in a
+    queue or a recreated DB row), not that it was ever actually
+    *executed* by a subsequent owner — the review's own "persistence is
+    not execution" bar. Both were strengthened with a second phase that
+    releases the OS lock, triggers the real pickup path, and asserts on
+    an atomic provider-call counter plus message history.
+
 - **`sessions locks` showed a healthy, actively-working session as
   "offline"** — observed live: a session sat at `PULSE_AGE == ELAPSED ==
   36s` while the process was alive and running real tool calls. The
