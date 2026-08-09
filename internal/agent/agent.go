@@ -1117,6 +1117,14 @@ func (a *sessionAgent) restartOrphanedWithRetry(calls []SessionAgentCall) {
 				break
 			}
 			// All retry attempts exhausted, or hit a non-retryable error.
+			// Check if the call was already attempted (i.e., user message persisted).
+			// If so, requeuing would cause duplicates — task #339 fix.
+			var alreadyAttempted *ErrCallAlreadyAttempted
+			if errors.As(lastErr, &alreadyAttempted) {
+				slog.Error("agent: detached restart for a call orphaned by a concurrent session-lock release failed — call already attempted, NOT requeuing to avoid duplicates",
+					"session_id", call.SessionID, "err", lastErr)
+				return
+			}
 			// The call was never durably queued (it never went through mb.submit),
 			// because tryReserveSession made it the immediate owner. Queue it now
 			// to prevent data loss (P0-2). Future Run() calls for this session
@@ -1672,6 +1680,13 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 	// path: `crush sessions inject --interrupt` created the row before
 	// signalling this process). Creating it again would duplicate it in
 	// history — the referenced message is already the newest user message.
+	//
+	// Track user message creation status for task #339: errors AFTER this
+	// point (whether or not currentAssistant is set) should be wrapped in
+	// ErrCallAlreadyAttempted to prevent duplicate execution on retry.
+	// If call.ExistingMessageID is set, the user message already exists,
+	// so we're already in the "attempted" state.
+	userMessageCreated := call.ExistingMessageID != ""
 	if call.ExistingMessageID == "" {
 		_, err = a.createUserMessage(preambleCtx, call)
 		if err != nil {
@@ -1683,6 +1698,7 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 			}
 			return nil, SessionAgentCall{}, false, err
 		}
+		userMessageCreated = true
 	}
 	preambleCancel()
 
@@ -2728,6 +2744,18 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 		// Error" with a bare "context deadline exceeded" — indistinguishable
 		// from a real provider failure and useless to `sessions why`.
 		isRunTimeout := errors.Is(err, context.DeadlineExceeded)
+		// If userMessageCreated is true (either we just created it or
+		// call.ExistingMessageID was set), the call has already left a
+		// persistent trace. Wrap the error to prevent duplicate execution
+		// on retry (task #339). This handles ALL errors after user message
+		// creation, not just those after currentAssistant is set.
+		//
+		// The wrapping must happen BEFORE we check nilAssistant because
+		// errors in PrepareStep (before currentAssistant is set) also need
+		// to be wrapped. See call_attempted_error.go for the design rationale.
+		if userMessageCreated {
+			err = &ErrCallAlreadyAttempted{Err: err}
+		}
 		// currentAssistant is only ever reassigned (never set back to nil)
 		// by PrepareStep, under sessionLock. agent.Stream has already
 		// returned by this point so no streaming callback can race this
@@ -2765,7 +2793,7 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 		sessionLock.Unlock()
 		msgs, createErr := a.messages.List(flushCtx, sessionID)
 		if createErr != nil {
-			return nil, SessionAgentCall{}, false, createErr
+			return nil, SessionAgentCall{}, false, &ErrCallAlreadyAttempted{Err: createErr}
 		}
 		for _, tc := range toolCalls {
 			if !tc.Finished {
@@ -2777,7 +2805,7 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 				sessionLock.Unlock()
 				updateErr := a.messages.Update(flushCtx, snap)
 				if updateErr != nil {
-					return nil, SessionAgentCall{}, false, updateErr
+					return nil, SessionAgentCall{}, false, &ErrCallAlreadyAttempted{Err: updateErr}
 				}
 			}
 
@@ -2823,7 +2851,7 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 				},
 			})
 			if createErr != nil {
-				return nil, SessionAgentCall{}, false, createErr
+				return nil, SessionAgentCall{}, false, &ErrCallAlreadyAttempted{Err: createErr}
 			}
 		}
 		var fantasyErr *fantasy.Error
@@ -2914,7 +2942,7 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 				"session_id", call.SessionID,
 				"err", updateErr,
 			)
-			return nil, SessionAgentCall{}, false, updateErr
+			return nil, SessionAgentCall{}, false, &ErrCallAlreadyAttempted{Err: updateErr}
 		}
 
 		// Drain on cancel via the mailbox's generation-aware drain (design
@@ -2929,6 +2957,9 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 				return nil, next, true, nil
 			}
 		}
+		// err was already wrapped in ErrCallAlreadyAttempted above (if
+		// userMessageCreated), so return it directly rather than wrapping
+		// it a second time.
 		return nil, SessionAgentCall{}, false, err
 	}
 
@@ -2946,7 +2977,7 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 		// included.
 		summarizeErr := a.runSummarizeBody(genCtx, call.SessionID, call.ProviderOptions, largeModel, promptPrefix)
 		if summarizeErr != nil {
-			return nil, SessionAgentCall{}, false, summarizeErr
+			return nil, SessionAgentCall{}, false, &ErrCallAlreadyAttempted{Err: summarizeErr}
 		}
 		mb := a.getMailbox(call.SessionID)
 		// If the agent wasn't done...

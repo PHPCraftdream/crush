@@ -2281,6 +2281,14 @@ func (c *coordinator) startDetachedRun(ctx context.Context, call SessionAgentCal
 			break
 		}
 		// All retry attempts exhausted, or hit a non-retryable error.
+		// Check if the call was already attempted (i.e., user message persisted).
+		// If so, recreating the pending_injects row would cause duplicates — task #339 fix.
+		var alreadyAttempted *ErrCallAlreadyAttempted
+		if errors.As(lastErr, &alreadyAttempted) {
+			slog.Error("coordinator: detached run failed after retries — call already attempted, NOT recreating pending_injects row to avoid duplicates",
+				"session_id", call.SessionID, "err", lastErr)
+			return
+		}
 		// P0-2 fix: recreate the pending_injects row so a future tick can retry.
 		// This prevents data loss in the cross-process interrupt inject path.
 		// We generate a new ID to avoid UNIQUE constraint violations.

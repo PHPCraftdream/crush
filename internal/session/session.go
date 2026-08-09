@@ -220,8 +220,15 @@ type Service interface {
 	// transaction) the OLDEST interrupt=true pending_injects row for
 	// sessionID, returning it. Used by P0-2 fix (cross-process interrupt
 	// inject) to immediately consume the row and prevent duplicate
-	// processing by subsequent ticks. The row is recreated in
-	// startDetachedRun if the detached run fails even after retries.
+	// processing by subsequent ticks.
+	//
+	// The row is recreated in startDetachedRun ONLY for the idle-session
+	// inject path (requeueInterruptMessage in coordinator.go). In that path,
+	// ConsumeInterruptInject deletes the row BEFORE the interrupt turn starts
+	// execution, so if the turn fails, the row is recreated to allow a future
+	// retry. In the owned-session inject path (inject during an active turn),
+	// the row is deleted AFTER execution succeeds, and no recreation occurs.
+	//
 	// Returns (nil, nil) when no interrupt row is pending.
 	ConsumeInterruptInject(ctx context.Context, sessionID string) (*PendingInject, error)
 	// DeleteInterruptInject removes a specific pending inject row by ID.
