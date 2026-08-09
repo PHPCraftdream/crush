@@ -65,6 +65,11 @@ const LockStaleDuration = lockStaleDuration
 // liveness forever" check in the codebase.
 const MaxPidFallbackAge = maxPidFallbackAge
 
+// clearHolderMetadataFn is the function used by Release to clear diagnostic
+// metadata from the lock file. Can be replaced in tests to inject blocking
+// behavior for proving release order invariants (see TestP1_2_ReleaseUnlocksBeforeMetadataCleanup_Hang).
+var clearHolderMetadataFn = clearHolderMetadata
+
 // SessionLock is an inter-process exclusive lock for a single session ID.
 // Acquired around the entire `sessionAgent.Run()` call so two crush
 // processes can never write into the same session simultaneously.
@@ -246,6 +251,23 @@ func acquireSessionLockFile(path string) (*SessionLock, error) {
 // Release stops the heartbeat, unlocks and closes the lock file.
 // Safe to call on nil. Idempotent and concurrency-safe.
 //
+// P1-2 fix (2026-08-09): The order of operations is now:
+//  1. Stop the heartbeat goroutine (close(l.stop)).
+//  2. Unlock the OS-level lock (unlockFile) - this is the critical correctness-critical step.
+//  3. Close the file descriptor (f.Close).
+//  4. Clear diagnostic metadata (clearHolderMetadata) - best-effort cleanup that can hang.
+//
+// The old order (clear metadata BEFORE unlock/close) meant that a hung filesystem,
+// AV scan, or SMB share during clearHolderMetadata (Truncate/Seek/Sync/Remove) would
+// prevent the OS lock from ever being released, wedging the session forever.
+//
+// The new order prioritizes releasing the OS lock AND closing the file descriptor BEFORE
+// any diagnostic cleanup that can hang. If clearHolderMetadata hangs after close, the OS
+// lock is already gone and the file descriptor is already closed - no session wedged state,
+// no resource leak. The only downside is that clearHolderMetadata must now operate on a
+// closed file, so we pass only the path (not the open file handle) and let it reopen
+// the file just for the metadata operations.
+//
 // Before actually unlocking, it wipes the PID it stamped into both the
 // primary lock file and the sidecar (see clearHolderMetadata). This
 // matters for `crush sessions kill`: without it, a process that exits
@@ -254,12 +276,9 @@ func acquireSessionLockFile(path string) (*SessionLock, error) {
 // PID number for a completely unrelated process — routine on a busy
 // CI/dev box — a later `sessions kill <id>` invocation would read a
 // "plausible" PID from the stale file and forcibly kill that unrelated
-// process. Clearing the metadata here, while we still hold the OS lock
-// (so no concurrent reader can observe a half-written state), removes
-// that stale PID before it can be mistaken for a live holder. The lock
-// FILE itself is deliberately left in place — see acquireSessionLockFile
-// and the package doc for why unlinking the path is unsafe/unnecessary;
-// only its content is cleared.
+// process. The lock FILE itself is deliberately left in place — see
+// acquireSessionLockFile and the package doc for why unlinking the path
+// is unsafe/unnecessary; only its content is cleared.
 func (l *SessionLock) Release() error {
 	if l == nil {
 		return nil
@@ -270,14 +289,25 @@ func (l *SessionLock) Release() error {
 			close(l.stop)
 		}
 		if l.f != nil {
-			clearHolderMetadata(l.Path, l.f)
+			// P1-2 fix: unlock and close FIRST, before any diagnostic cleanup that can hang.
+			// The OS lock and file descriptor are the correctness-critical resources -
+			// releasing/closing them is the priority. Metadata cleanup is best-effort.
 			unlockErr := unlockFile(l.f)
 			closeErr := l.f.Close()
 			if unlockErr != nil {
 				releaseErr = unlockErr
-			} else {
+			} else if closeErr != nil {
 				releaseErr = closeErr
 			}
+			// Clear diagnostic metadata (best-effort, may hang on slow FS/AV/SMB).
+			// This runs AFTER unlockFile and Close, so a hang here does NOT block
+			// lock release or leak file descriptors. We pass only the path since
+			// the file is already closed; clearHolderMetadataFn will reopen if needed.
+			//
+			// clearHolderMetadataFn is a test seam (package-level var) so tests can
+			// inject blocking behavior to prove unlock/close happen before metadata
+			// cleanup (see TestP1_2_ReleaseUnlocksBeforeMetadataCleanup_Hang).
+			clearHolderMetadataFn(l.Path)
 		}
 	})
 	return releaseErr
@@ -309,15 +339,42 @@ func (l *SessionLock) RecordActivity() {
 // lock file's own content and removes the never-locked sidecar file,
 // so a cleanly-released lock does not leave a stale, plausible-looking
 // PID behind for a later `sessions kill`/`sessions why` to misread as a
-// live holder (see Release's doc comment). Called only while we still
-// hold the OS lock on f, so this can't race a concurrent reader trying
-// to observe a consistent state via the sidecar or the primary file.
+// live holder (see Release's doc comment).
+//
+// P1-2 fix (2026-08-09): Now takes only the path (not an open file *os.File)
+// because Release() now closes the file before calling this. This function
+// reopens the file just for the metadata operations, ensuring that if it
+// hangs, the original file descriptor is already closed and the OS lock
+// is already released.
+//
+// WARNING: This function performs file I/O operations (open/Truncate/Seek/Sync
+// on the lock file and Remove on the sidecar) that can hang indefinitely
+// on slow/unavailable filesystems, AV scans, or SMB shares. For this reason,
+// Release() calls this AFTER unlocking the OS lock and closing the file.
+// This means clearHolderMetadata runs WITHOUT holding the OS lock, so:
+//   - A hang here does NOT prevent other processes from acquiring the lock.
+//   - If it hangs, no file descriptor leaks (the original fd is already closed).
+//   - Another process may briefly see stale metadata in the tiny window
+//     between our unlock and our successful clear, but the OS lock is the
+//     source of truth for ownership.
 //
 // Best-effort: any failure here only degrades diagnosability (same
 // posture as writePIDSidecar) and must never block Release from
 // actually unlocking/closing the file — a stuck holder that can't be
 // released would be strictly worse than a stale PID left on disk.
-func clearHolderMetadata(path string, f *os.File) {
+func clearHolderMetadata(path string) {
+	// Reopen the file just for metadata operations.
+	f, err := os.OpenFile(path, os.O_RDWR, 0o644)
+	if err != nil {
+		slog.Warn("session lock: failed to reopen lock file for metadata clear", "path", path, "err", err)
+		// Still try to remove the sidecar even if we can't open the main file
+		if sidecarErr := os.Remove(pidSidecarPath(path)); sidecarErr != nil && !os.IsNotExist(sidecarErr) {
+			slog.Warn("session lock: failed to remove PID sidecar on release", "path", path, "err", sidecarErr)
+		}
+		return
+	}
+	defer f.Close()
+
 	if err := f.Truncate(0); err != nil {
 		slog.Warn("session lock: failed to clear lock file content on release", "path", path, "err", err)
 	} else if _, err := f.Seek(0, 0); err != nil {

@@ -1150,3 +1150,67 @@ func (mb *mailbox) popAllSubmitted() []SessionAgentCall {
 	mb.submitted = mb.submitted[:0]
 	return all
 }
+
+// beginRelease atomically transitions the mailbox to mbReleasing state
+// for a manual compaction. This mirrors the first half of drainOrReleaseFinal's
+// mbReleasing transition pattern, allowing manual compaction to signal
+// "OS lock release is in progress" separately from "still actively streaming".
+//
+// P1-2 fix (2026-08-09): Manual compaction used to call lk.Release() directly
+// without any mbReleasing visibility (mailbox stayed mbOwned during the release).
+// This meant that a hung filesystem/AV/SMB during lk.Release() would leave the
+// mailbox permanently mbOwned, indistinguishable from an actively streaming turn.
+// With mbReleasing visibility, diagnostic tools and future code can distinguish
+// "releasing OS lock" from "still working".
+//
+// Returns true on successful transition, false if epoch mismatch (era already ended)
+// or state cannot transition (already mbReleasing, mbIdle, etc.).
+//
+// The caller must:
+//  1. Call beginRelease(epoch) to get mbReleasing visibility.
+//  2. Release mb.mu (done by this method).
+//  3. Call the actual release callback (e.g., lk.Release()).
+//  4. Call finishRelease(epoch) to transition to mbIdle.
+//
+// This ensures the same "mbReleasing without holding mb.mu over I/O" invariant
+// that drainOrReleaseFinal maintains.
+func (mb *mailbox) beginRelease(epoch uint64) bool {
+	mb.mu.Lock()
+	defer mb.mu.Unlock()
+
+	if mb.epoch != epoch {
+		return false
+	}
+	// Can only transition from mbOwned to mbReleasing.
+	// If already mbReleasing, mbIdle, or some other state, this is a no-op.
+	if mb.state != mbOwned {
+		return false
+	}
+
+	// Clear the cancel handles before entering mbReleasing, matching drainOrReleaseFinal's
+	// pattern. This ensures Cancel()/interruptAndReplace() correctly treat mbReleasing
+	// as "no live generation left to cancel".
+	mb.current.cancel = nil
+	mb.dispatcherCancel = nil
+	mb.state = mbReleasing
+	return true
+}
+
+// finishRelease completes the release transition, moving from mbReleasing to mbIdle.
+// This must be called after the actual release callback (e.g., lk.Release()) completes.
+// Returns true on successful transition to mbIdle, false if epoch mismatch or state
+// was not mbReleasing (stale/racing call).
+func (mb *mailbox) finishRelease(epoch uint64) bool {
+	mb.mu.Lock()
+	defer mb.mu.Unlock()
+
+	if mb.epoch != epoch {
+		return false
+	}
+	// Must be in mbReleasing state to complete the transition.
+	if mb.state != mbReleasing {
+		return false
+	}
+	mb.state = mbIdle
+	return true
+}

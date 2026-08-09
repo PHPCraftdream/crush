@@ -3100,16 +3100,19 @@ func (a *sessionAgent) runSummarize(ctx context.Context, genCtx context.Context,
 	cfg := a.resolveTurnConfig(SessionAgentCall{})
 	err := a.runSummarizeBody(genCtx, sessionID, opts, cfg.largeModel, cfg.promptPrefix)
 
-	// Release the OS lock BEFORE abandoning mailbox ownership. abandonOwnership
-	// flips the mailbox to mbIdle, which is what IsSessionBusy/IsBusy report to
-	// same-process callers (web UI requests, sessions inject, restartOrphaned).
-	// Releasing the OS lock is unbounded disk I/O (Truncate/Seek/Sync/unlink
-	// sidecar/unlock/Close) with no timeout — if mbIdle were visible first, a
-	// concurrent same-process caller could see "not busy", win submit(), and
-	// then hit TryAcquireSessionLock's SessionLockBusyError naming its own PID
-	// while this goroutine is still mid-Release. This is the exact class of bug
-	// mbReleasing (#296) exists to prevent; releasing the lock first keeps the
-	// same "OS lock free is a precondition of mbIdle" invariant Run() upholds.
+	// P1-2 fix (2026-08-09): Transition mailbox to mbReleasing before releasing
+	// the OS lock. This provides the same visibility that normal turns get
+	// via drainOrReleaseFinal, allowing diagnostic tools to distinguish "releasing
+	// OS lock" from "still actively streaming". If the filesystem/AV/SMB hangs
+	// during lk.Release(), mbReleasing is still observable as "busy but not
+	// streaming", which is semantically correct - the session is technically busy
+	// (ownership not yet relinquished to another caller) but not making progress.
+	releaseStarted := mb.beginRelease(epoch)
+
+	// Release the OS lock. Even if beginRelease failed (epoch mismatch or state
+	// already transitioned), we still need to release the lock to avoid leaking it.
+	// The worst case is we release without mbReleasing visibility, which is the
+	// old (pre-P1-2) behavior for that particular edge case.
 	if lk != nil {
 		if relErr := lk.Release(); relErr != nil {
 			slog.Debug("agent.runSummarize: release session lock failed", "session_id", sessionID, "err", relErr)
@@ -3121,6 +3124,14 @@ func (a *sessionAgent) runSummarize(ctx context.Context, genCtx context.Context,
 	// same-process callers. See mailbox.testPreAbandonSeam's own doc.
 	if mb.testPreAbandonSeam != nil {
 		mb.testPreAbandonSeam()
+	}
+
+	// Complete the mbReleasing -> mbIdle transition if we successfully began it.
+	// If beginRelease failed (epoch changed, wrong state), we skip this - the
+	// actual state transition already happened elsewhere (e.g., a concurrent
+	// abandonOwnership from a Cancel or shutdown).
+	if releaseStarted {
+		mb.finishRelease(epoch)
 	}
 
 	if err != nil {

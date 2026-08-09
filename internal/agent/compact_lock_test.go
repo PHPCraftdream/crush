@@ -462,11 +462,17 @@ func TestP312_OSLockReleasedBeforeMailboxReportsIdle(t *testing.T) {
 		// in and become owner right now. The seam's own contract (mirroring
 		// testLoopRearmSeam) is that it fires with mb.mu NOT held, so a plain
 		// Lock here is safe.
+		//
+		// P1-2 fix: The mailbox is now in mbReleasing state at this point,
+		// not mbOwned, because we call mb.beginRelease() BEFORE lk.Release().
+		// This is the intended behavior - mbReleasing still reports as busy,
+		// it just provides visibility that we're in the "releasing OS lock"
+		// phase rather than "still streaming".
 		mb.mu.Lock()
 		state := mb.state
 		mb.mu.Unlock()
-		assert.Equal(t, mbOwned, state,
-			"mailbox must still report mbOwned — abandonOwnership must not have run yet")
+		assert.Contains(t, []mailboxState{mbOwned, mbReleasing}, state,
+			"mailbox must still report busy (mbOwned or mbReleasing) — abandonOwnership must not have run yet")
 	}
 	t.Cleanup(func() { mb.testPreAbandonSeam = nil })
 
