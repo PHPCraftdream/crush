@@ -87,7 +87,13 @@ const (
 	// promptly (well under streamIdleTimeout) but large enough not to
 	// dominate logs.
 	streamWatchdogTick = 30 * time.Second
+)
 
+// testStreamWatchdogTick is a test seam for overriding streamWatchdogTick
+// in tests that need fast watchdog behavior (e.g., P2_3 regression tests).
+var testStreamWatchdogTick = func() time.Duration { return streamWatchdogTick }
+
+const (
 	// toolExecutionMaxDefault is the never-freeze backstop: the maximum
 	// wall-clock a single tool may run while the stream watchdog is paused
 	// (between OnToolCall and OnToolResult) before the watchdog force-
@@ -1780,7 +1786,7 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 	toolCleanupGrace := a.effectiveToolCleanupGrace()
 	var watchdogCauseVal atomic.Int32 // stores watchdogCause
 	wd := startStreamWatchdog(
-		genCtx, cancel, idleTimeout, streamWatchdogTick,
+		genCtx, cancel, idleTimeout, testStreamWatchdogTick(),
 		// The closure itself is deliberately a thin dispatch to a named
 		// method (task #243): a unit test can construct a minimal
 		// *sessionAgent and call handleWatchdogFire directly, exercising
@@ -3047,6 +3053,63 @@ func (a *sessionAgent) Summarize(ctx context.Context, sessionID string, opts fan
 // the entire runSummarizeBody call to protect both the LLM stream and the
 // commit phase, matching Run()'s lock-hold semantics.
 func (a *sessionAgent) runSummarize(ctx context.Context, genCtx context.Context, sessionID string, opts fantasy.ProviderOptions, mb *mailbox, epoch uint64, cancel context.CancelFunc) error {
+	// Determine idle timeout for summarization stream watchdog
+	idleTimeout := streamIdleTimeoutDefault
+	if a.streamIdleTimeout > 0 {
+		idleTimeout = a.streamIdleTimeout
+	}
+	// No tools in manual compaction, so use 0 for tool bounds
+	toolMaxDuration := time.Duration(0)
+	toolCleanupGrace := time.Duration(0)
+	// Start stream watchdog to detect idle stalls in the summarization stream
+	var watchdogCauseVal atomic.Int32
+	wd := startStreamWatchdog(
+		genCtx, cancel, idleTimeout, testStreamWatchdogTick(),
+		// Use a simple callback - just log and cancel (no tools to report)
+		func(elapsed time.Duration, cause watchdogCause) {
+			watchdogCauseVal.Store(int32(cause))
+			stackDump := crushlog.CaptureGoroutineStack("summarize watchdog fired")
+			go func() {
+				if dumpPath, dumpErr := crushlog.WriteGoroutineDump(stackDump); dumpErr != nil {
+					slog.Warn("agent.runSummarize: failed to write goroutine dump", "err", dumpErr)
+				} else {
+					slog.Warn("agent.runSummarize: wrote goroutine dump", "path", dumpPath)
+				}
+			}()
+			switch cause {
+			case causeToolTimeout:
+				slog.Warn(
+					"agent.runSummarize: watchdog firing — tool execution exceeded cap, force-cancelling",
+					"session_id", sessionID,
+					"elapsed", elapsed.String(),
+					"cap", toolMaxDuration.String(),
+				)
+			case causeHardCap:
+				slog.Warn(
+					"agent.runSummarize: watchdog firing — summarization exceeded hard cap, force-cancelling",
+					"session_id", sessionID,
+					"elapsed", elapsed.String(),
+					"hard_cap", a.timeoutHardCap.String(),
+				)
+			default:
+				slog.Warn(
+					"agent.runSummarize: watchdog firing — no provider activity, force-cancelling",
+					"session_id", sessionID,
+					"idle_duration", elapsed.String(),
+					"threshold", idleTimeout.String(),
+				)
+			}
+		},
+		a.timeoutExtendsOnProgress,
+		a.timeoutHardCap,
+		toolMaxDuration,
+		toolCleanupGrace,
+		func() { notifyActivity(genCtx) },
+	)
+	// Wrap genCtx so notifyWatchdog calls reach this watchdog
+	genCtx = withWatchdogBump(genCtx, wd.bump)
+	// Defer order matters: <-wd.done first so it runs after cancel()
+	defer func() { <-wd.done }()
 	defer cancel()
 
 	// #312: Acquire OS session lock for cross-process serialization.
