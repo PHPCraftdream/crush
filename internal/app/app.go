@@ -85,6 +85,15 @@ type App struct {
 	// raw-SQL features that don't have their own sqlc-generated package.
 	DB func() *sql.DB
 
+	// dataDir is the path to .crush/ where the database lives. Stored here
+	// so Shutdown() can call db.Release() with knowledge of whether shutdown
+	// was graceful or forced.
+	dataDir string
+
+	// dbReleasesNeeded tracks how many db.Release() calls to make on shutdown.
+	// One for each Connect/ConnectRead call during app startup.
+	dbReleasesNeeded int
+
 	// global context and cleanup functions
 	globalCtx          context.Context
 	cleanupFuncs       []func(context.Context) error
@@ -155,7 +164,8 @@ func New(ctx context.Context, conn *sql.DB, store *config.ConfigStore) (*App, er
 		Permissions: permission.NewPermissionService(ctx, store.WorkingDir(), skipPermissionsRequests, allowedTools, q),
 		FileTracker: filetracker.NewService(q),
 
-		DB: func() *sql.DB { return conn },
+		DB:      func() *sql.DB { return conn },
+		dataDir: dataDir,
 
 		globalCtx: ctx,
 
@@ -215,10 +225,16 @@ func New(ctx context.Context, conn *sql.DB, store *config.ConfigStore) (*App, er
 	// before calling New, and New itself did one ConnectRead above (when
 	// dataDir != "" and it succeeded) — so we release twice, matching the
 	// two increments, or once if the reader was never opened (dataDir=="").
+	//
+	// NOTE: DB cleanup is now handled directly in Shutdown() based on
+	// whether shutdown was graceful or forced, NOT via cleanupFuncs.
+	// This avoids the race where a timeout-abandoned Close() goroutine
+	// continues running after the process has exited.
 	releases := 1
 	if readConn != nil {
 		releases++
 	}
+	app.dbReleasesNeeded = releases
 	app.cleanupFuncs = append(
 		app.cleanupFuncs,
 		func(ctx context.Context) error {
@@ -229,41 +245,6 @@ func New(ctx context.Context, conn *sql.DB, store *config.ConfigStore) (*App, er
 				slog.Info("app: stopped run queue pump")
 			}
 			return nil
-		},
-		func(ctx context.Context) error {
-			// DB cleanup must respect the bounded shutdown context.
-			// Since db.Release/sql.DB.Close are synchronous and don't accept
-			// a context, we wrap them in a goroutine and select between completion
-			// and context expiry. This is a forced-shutdown compromise: if ctx
-			// expires before Close() finishes, we log a warning but continue;
-			// the background Close() may leak, but Shutdown() returns within its
-			// bounded time. This is documented as a deliberate trade-off.
-			type result struct {
-				err error
-			}
-			resultChan := make(chan result, 1)
-
-			go func() {
-				var err error
-				for range releases {
-					if e := db.Release(dataDir); e != nil {
-						err = e
-					}
-				}
-				resultChan <- result{err: err}
-			}()
-
-			select {
-			case res := <-resultChan:
-				return res.err
-			case <-ctx.Done():
-				// Close() did not complete within shutdownCtx timeout.
-				// The background goroutine will continue running; this is an
-				// acknowledged leak in forced-shutdown mode, but preferable to
-				// unbounded shutdown.
-				slog.Warn("DB cleanup: sql.DB.Close() did not complete within shutdown timeout - background close may leak (forced-shutdown trade-off)")
-				return ctx.Err()
-			}
 		},
 		func(ctx context.Context) error { return mcp.Close(ctx) },
 	)
@@ -1872,17 +1853,29 @@ func (app *App) Shutdown() {
 		stillBusy = app.AgentCoordinator.CancelAll()
 	}
 
-	// Forced-shutdown policy: if CancelAll reports agents still busy after the
-	// 5-second grace period, we log a warning but proceed with resource cleanup.
-	// This is the policy choice: we do not wait indefinitely for agents to finish,
-	// and we explicitly acknowledge that in-progress agent work may be incomplete.
-	// The caller (usually signal handler or command completion) gets bounded shutdown
-	// time rather than a potentially infinite hang.
+	// Shutdown policy: distinguish between graceful and forced shutdown.
+	//
+	// Graceful shutdown (stillBusy=false): All Run() goroutines finished cleanly.
+	// We can safely close resources including the DB, waiting synchronously for cleanup.
+	//
+	// Forced shutdown (stillBusy=true): Some Run() goroutines did not finish within
+	// the 5-second grace period. Closing the DB under live writers risks corruption,
+	// so we log a warning and SKIP DB cleanup. The OS will reclaim file descriptors
+	// when the process exits (which CLI callers do immediately after Shutdown()).
+	// This is the policy choice: bounded shutdown time over perfect cleanup.
+	//
+	// For library/server callers who want graceful shutdown, they should call
+	// CancelAll separately and check the return value before invoking Shutdown()
+	// with a custom policy.
 	if stillBusy {
-		slog.Warn("Shutdown: some agents did not finish within grace period - proceeding with forced shutdown (in-progress work may be incomplete)")
+		slog.Warn("Shutdown: some agents did not finish within grace period - proceeding with forced shutdown (DB will NOT be closed, in-progress work may be incomplete)")
+	} else {
+		slog.Debug("Shutdown: all agents finished gracefully - closing resources")
 	}
 
 	// Shared shutdown context for all timeout-bounded cleanup.
+	// In forced-shutdown mode we still give non-DB cleanup a bounded window,
+	// but skip DB cleanup entirely.
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -1929,6 +1922,26 @@ func (app *App) Shutdown() {
 		// All cleanup completed within timeout.
 	case <-waitTimeout:
 		slog.Error("Shutdown: cleanup did not complete within outer timeout - exiting anyway (some resources may not be fully released)")
+	}
+
+	// DB cleanup: handled here, not in cleanupFuncs, so we can distinguish
+	// graceful from forced shutdown. The policy is:
+	// - Graceful shutdown (stillBusy=false): Close the DB synchronously.
+	// - Forced shutdown (stillBusy=true): Skip DB close to avoid corrupting
+	//   live writers; the OS will reclaim file descriptors on process exit.
+	if app.dataDir != "" {
+		if !stillBusy {
+			// Graceful shutdown: wait synchronously for db.Release.
+			slog.Debug("Shutdown: closing database (graceful shutdown)")
+			for i := 0; i < app.dbReleasesNeeded; i++ {
+				if err := db.Release(app.dataDir); err != nil {
+					slog.Error("Shutdown: failed to release database connection", "error", err)
+				}
+			}
+		} else {
+			// Forced shutdown: skip DB close. Live writers may still be active.
+			slog.Warn("Shutdown: skipping database close due to forced shutdown (live writers may still be active; OS will reclaim resources on process exit)")
+		}
 	}
 }
 

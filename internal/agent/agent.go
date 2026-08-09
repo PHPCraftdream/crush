@@ -467,6 +467,16 @@ type sessionAgent struct {
 	systemPrompt       *csync.Value[string]
 	tools              *csync.Slice[fantasy.AgentTool]
 
+	// runWg tracks all active Run() calls across this agent. CancelAll waits
+	// on this WaitGroup to ensure all dispatcher goroutines have fully
+	// unwound before proceeding with shutdown. This provides a true join
+	// primitive instead of the old IsBusy() polling approach, which could
+	// report "not busy" before the actual Run() goroutine had finished
+	// its cleanup and unwound. Every entry point that starts a dispatcher
+	// (Run, RunSessionAgentCall) calls Add(), and every exit path calls
+	// Done() in a defer.
+	runWg sync.WaitGroup
+
 	// shuttingDown latches on the first CancelAll and is checked by Run
 	// before it claims any session. Round 14 closing review, blocker 1:
 	// the per-mailbox `stopped` latch only stops an EXISTING turn loop from
@@ -1200,6 +1210,13 @@ func notifyWatchdog(ctx context.Context) {
 // hadn't run yet), and got rejected with "already in use". runTurn below is
 // the extracted single-turn body; Run just loops it.
 func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy.AgentResult, error) {
+	// Track this Run() call in the agent-wide runWg so CancelAll can truly
+	// join on all active dispatcher goroutines instead of polling IsBusy().
+	// This defer fires on EVERY return from Run, including early bail-outs
+	// and all turn loop exits.
+	a.runWg.Add(1)
+	defer a.runWg.Done()
+
 	if call.Prompt == "" && !message.ContainsTextAttachment(call.Attachments) {
 		return nil, ErrEmptyPrompt
 	}
@@ -4338,19 +4355,26 @@ func (a *sessionAgent) CancelAll() (stillBusy bool) {
 		}
 	}
 
-	timeout := time.After(5 * time.Second)
-	for a.IsBusy() {
-		select {
-		case <-timeout:
-			// Grace period expired but agents are still busy. Return true
-			// so the caller can decide whether to force shutdown or wait longer.
-			return true
-		default:
-			time.Sleep(200 * time.Millisecond)
-		}
+	// Wait for all active Run() goroutines to finish. This provides a true
+	// join primitive instead of the old IsBusy() polling, which could report
+	// "not busy" before the actual Run() goroutines had unwound (defer
+	// cleanup, final DB writes, etc.). Use a 5-second timeout to match the
+	// old grace period.
+	waitDone := make(chan struct{})
+	go func() {
+		a.runWg.Wait()
+		close(waitDone)
+	}()
+
+	select {
+	case <-waitDone:
+		// All Run() goroutines have finished. Clean shutdown.
+		return false
+	case <-time.After(5 * time.Second):
+		// Grace period expired but some Run() goroutines are still running.
+		// Return true to signal forced shutdown.
+		return true
 	}
-	// All agents are now idle. Return false to indicate clean shutdown.
-	return false
 }
 
 // IsBusy reports whether ANY session this agent knows about currently has a

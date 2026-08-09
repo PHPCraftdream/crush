@@ -196,21 +196,29 @@ func Release(dataDir string) error {
 		absPath = dbPath
 	}
 
+	var entryToClose *connEntry
 	poolMu.Lock()
-	defer poolMu.Unlock()
-
 	entry, ok := pool[absPath]
 	if !ok {
+		poolMu.Unlock()
 		return nil
 	}
 
 	entry.refCount--
 	if entry.refCount > 0 {
+		poolMu.Unlock()
 		return nil
 	}
 
+	// refCount reached zero: remove from pool while holding the mutex
+	// to prevent concurrent Connect() from finding and incrementing it,
+	// then close the actual connections OUTSIDE the mutex to avoid
+	// holding poolMu during potentially slow sql.DB.Close() calls.
 	delete(pool, absPath)
-	return closeEntry(entry)
+	entryToClose = entry
+	poolMu.Unlock()
+
+	return closeEntry(entryToClose)
 }
 
 // closeEntry closes both handles in entry, tolerating readDB == db (the
