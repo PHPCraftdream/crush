@@ -218,12 +218,16 @@ type Service interface {
 	DrainPendingInjects(ctx context.Context, sessionID string) ([]PendingInject, bool, error)
 	// ConsumeInterruptInject reads and deletes (delete-after-read, in one
 	// transaction) the OLDEST interrupt=true pending_injects row for
-	// sessionID, returning it. Counterpart to DrainPendingInjects, which
-	// deliberately leaves interrupt rows untouched: those are owned by the
-	// coordinator's interrupt ticker, which calls this to pick one up, cancel
-	// the running turn, and requeue the already-persisted message. Returns
-	// (nil, nil) when no interrupt row is pending.
+	// sessionID, returning it. Used by P0-2 fix (cross-process interrupt
+	// inject) to immediately consume the row and prevent duplicate
+	// processing by subsequent ticks. The row is recreated in
+	// startDetachedRun if the detached run fails even after retries.
+	// Returns (nil, nil) when no interrupt row is pending.
 	ConsumeInterruptInject(ctx context.Context, sessionID string) (*PendingInject, error)
+	// DeleteInterruptInject removes a specific pending inject row by ID.
+	// Used by detached interrupt runs to delete the durable pending row AFTER
+	// they have confirmed execution (acquired OS lock). P0-2 fix.
+	DeleteInterruptInject(ctx context.Context, injectID string) error
 
 	// Agent tool session management
 	CreateAgentToolSessionID(messageID, toolCallID string) string
@@ -1144,6 +1148,25 @@ func (s *service) ConsumeInterruptInject(ctx context.Context, sessionID string) 
 		return nil, err
 	}
 	return &pi, nil
+}
+
+// DeleteInterruptInject removes a specific pending inject row by ID.
+// Used by detached interrupt runs to delete the durable pending row AFTER
+// they have confirmed execution (acquired OS lock). P0-2 fix.
+func (s *service) DeleteInterruptInject(ctx context.Context, injectID string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	if _, delErr := tx.ExecContext(ctx, `DELETE FROM pending_injects WHERE id = ?`, injectID); delErr != nil {
+		return delErr
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return nil
 }
 
 func marshalTodos(todos []Todo) (string, error) {

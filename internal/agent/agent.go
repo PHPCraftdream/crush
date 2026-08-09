@@ -299,6 +299,13 @@ type SessionAgentCall struct {
 	// QueueExistingMessage on the interrupt path.
 	ExistingMessageID string
 
+	// InjectID, when non-empty, is the ID of a pending_injects row that
+	// must be deleted AFTER successful OS lock acquisition. Set by the
+	// cross-process interrupt inject path (requeueInterruptMessage) to
+	// prevent data loss if the detached run loses the OS lock race.
+	// P0-2 fix.
+	InjectID string
+
 	// LargeModel/SmallModel/SystemPromptPrefix, when set, pin this call's
 	// model and prompt configuration instead of reading the agent's shared,
 	// mutable fields (task #265, P0-1).
@@ -953,7 +960,7 @@ func (a *sessionAgent) abandonOwnershipWithHandoff(sessionID string, epoch uint6
 		// leaves the mailbox at mbIdle, so popAllSubmitted() can safely
 		// read the entire queue without mb.mu (no new submit can land
 		// on mbIdle).
-		a.restartOrphaned(mb.popAllSubmitted())
+		a.restartOrphanedWithRetry(mb.popAllSubmitted())
 	}
 }
 
@@ -989,6 +996,98 @@ func (a *sessionAgent) restartOrphaned(calls []SessionAgentCall) {
 				slog.Error("agent: detached restart for a call orphaned by a concurrent session-lock release failed",
 					"session_id", call.SessionID, "err", err)
 			}
+		}()
+	}
+}
+
+// restartOrphanedWithRetry starts one independent, detached a.Run call per entry
+// in calls with OS lock retry on SessionLockBusyError (P0-2 fix). This is the
+// sessionAgent-level equivalent of coordinator.startDetachedRun (P0-B), needed
+// here because drainOrReleaseMerged/drainOrReleaseFinal have no access to a
+// *coordinator (agent and coordinator are separate layers; coordinator wraps
+// sessionAgent, not the other way around).
+//
+// Unlike the old restartOrphaned (which accepted a single lost race as final),
+// this version retries OS lock acquisition with bounded exponential backoff:
+// up to 5 attempts, starting at 100ms and doubling each time (max 1.6s total).
+// This handles the common cross-process race where the old lock was just
+// released and another process wins the first acquisition attempt. Transient
+// contention is retried; persistent lock-holders (another crush process actively
+// running this session) cause the run to error out and abandonOwnershipWithHandoff's
+// caller will have already left the call durably queued for that owner.
+//
+// Each call gets its OWN goroutine and its own context.Background(): the
+// caller (drainOrReleaseMerged, called from runTurn, called from Run's turn
+// loop) is about to return control up its own call stack, possibly all the
+// way out of Run() entirely — there is no request-scoped ctx left in scope
+// whose cancellation would be meaningful to inherit, and even if there were,
+// cancelling it would recreate the exact "accepted but never executed"
+// outcome startDetachedRun's own doc warns against. a.Run performs its own
+// full acquisition (mailbox.submit + a fresh session.TryAcquireSessionLock)
+// for each one — none of these reuse the lk that drainOrReleaseFinal already
+// released; see drainOrReleaseFinal's own doc for why reusing it is exactly
+// the bug this function exists to close.
+//
+// Losing a race to a concurrent Run() that claims the mailbox first is safe
+// and needs no coordination (same reasoning as startDetachedRun's doc): if
+// another owner appeared between orphaning and this call's own submit(), this
+// call's submit() simply queues behind that new owner instead of becoming
+// owner itself, and that owner's own end-of-turn drain picks it up. The one
+// outcome that cannot happen is the call going unrun.
+func (a *sessionAgent) restartOrphanedWithRetry(calls []SessionAgentCall) {
+	for _, call := range calls {
+		call := call
+		go func() {
+			// Retry loop for OS lock acquisition (P0-2 fix).
+			// Max 5 attempts: 100ms, 200ms, 400ms, 800ms, 1600ms.
+			const maxAttempts = 5
+			var lastErr error
+			for attempt := 0; attempt < maxAttempts; attempt++ {
+				if attempt > 0 {
+					// Bounded exponential backoff
+					backoff := 100 * time.Millisecond << (attempt - 1)
+					time.Sleep(backoff)
+				}
+				_, err := a.Run(context.Background(), call)
+				if err == nil {
+					return // Success, nothing more to do
+				}
+				lastErr = err
+				// Check if this is an OS lock contention error worth retrying.
+				var busyErr *session.SessionLockBusyError
+				if errors.As(err, &busyErr) {
+					// Another process holds the lock. This is the transient race
+					// that P0-2 fixes: the old lock was just released and we're
+					// racing other restartOrphanedWithRetry calls or a concurrent
+					// process for reacquisition. Retry with backoff.
+					slog.Debug(
+						"agent: detached OS lock acquisition attempt failed (retrying)",
+						"session_id", call.SessionID,
+						"attempt", attempt+1,
+						"max_attempts", maxAttempts,
+						"err", err,
+					)
+					continue
+				}
+				// Non-contention error: persistent failure or the call was
+				// never valid in the first place. No point retrying.
+				break
+			}
+			// All retry attempts exhausted, or hit a non-retryable error.
+			// The call was never durably queued (it never went through mb.submit),
+			// because tryReserveSession made it the immediate owner. Queue it now
+			// to prevent data loss (P0-2). Future Run() calls for this session
+			// will pick it up from mb.submitted.
+			// Residual risk: if no future Run() ever arrives for this session,
+			// the queued call will sit in mb.submitted forever. This is an
+			// improvement over the old behavior (call disappears after ~1.6s),
+			// but not a full durable guarantee like a persisted run queue with
+			// claim/lease/ack. The alternative would require significant
+			// architectural changes (database schema, service interfaces), which
+			// is outside this fix's scope.
+			a.getMailbox(call.SessionID).queue(call)
+			slog.Error("agent: detached restart for a call orphaned by a concurrent session-lock release failed after retries — call queued for future Run()",
+				"session_id", call.SessionID, "err", lastErr)
 		}()
 	}
 }

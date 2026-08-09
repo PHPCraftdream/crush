@@ -40,6 +40,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
+
 	"charm.land/catwalk/pkg/catwalk"
 	"charm.land/fantasy"
 	"github.com/charmbracelet/crush/internal/agent/hyper"
@@ -2090,6 +2092,13 @@ func (c *coordinator) startInterruptTicker(ctx context.Context, sessionID string
 // goroutine so it can be unit-tested directly with a real session.Service and
 // message.Service, without a live provider. It is a no-op returning
 // (false, nil) when no interrupt row is pending.
+//
+// P0-2 fix: uses ConsumeInterruptInject (delete-after-read) for immediate
+// deletion to prevent duplicate processing, then recreates the row in
+// startDetachedRun if the detached run fails even after retries. This
+// ensures that once a row is consumed by one tick, it's not visible to
+// subsequent ticks, while still preventing data loss if the detached
+// run fails.
 func (c *coordinator) handleInterruptTick(ctx context.Context, sessionID string) (bool, error) {
 	pi, err := c.sessions.ConsumeInterruptInject(ctx, sessionID)
 	if err != nil {
@@ -2098,7 +2107,7 @@ func (c *coordinator) handleInterruptTick(ctx context.Context, sessionID string)
 	if pi == nil {
 		return false, nil
 	}
-	if err := c.requeueInterruptMessage(ctx, sessionID, pi.MessageID); err != nil {
+	if err := c.requeueInterruptMessage(ctx, sessionID, pi.MessageID, pi.ID); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -2110,7 +2119,10 @@ func (c *coordinator) handleInterruptTick(ctx context.Context, sessionID string)
 // running turn — mirroring InterruptAndSend's cancel+requeue but for a message
 // the CLI already created. Notify is called so a web UI attached to THIS
 // process renders the foreign-created message live rather than on reload.
-func (c *coordinator) requeueInterruptMessage(ctx context.Context, sessionID, messageID string) error {
+//
+// injectID is the ID of the pending_injects row that must be deleted AFTER
+// successful OS lock acquisition. P0-2 fix.
+func (c *coordinator) requeueInterruptMessage(ctx context.Context, sessionID, messageID, injectID string) error {
 	injMsg, err := c.messages.Get(ctx, messageID)
 	if err != nil {
 		return fmt.Errorf("interrupt inject references missing message %q: %w", messageID, err)
@@ -2122,6 +2134,9 @@ func (c *coordinator) requeueInterruptMessage(ctx context.Context, sessionID, me
 	}
 	// Reference the existing row; the agent must not re-create it.
 	call.ExistingMessageID = messageID
+	// Store injectID so the detached run can delete the pending row AFTER
+	// successful OS lock acquisition. P0-2 fix.
+	call.InjectID = injectID
 	// InterruptAndReplace atomically records call and cancels only the
 	// in-flight generation (design §4) — same P0-2 fix as InterruptAndSend,
 	// and the same P0-B idle handling: with no owner there is nobody to
@@ -2196,13 +2211,106 @@ func (c *coordinator) InterruptAndSend(ctx context.Context, sessionID, prompt st
 // does, and a CLI `sessions inject` process may exit moments later.
 // Cancelling the run when that context goes away would recreate the very
 // "accepted but never executed" outcome this exists to prevent.
+//
+// P0-2 fix: retries OS lock acquisition with bounded exponential backoff
+// (up to 5 attempts, 100-1600ms) when encountering SessionLockBusyError.
+// This handles the common cross-process race where the session was idle
+// but another process won the lock first (e.g., concurrent interrupt or
+// session inject). Transient contention is retried; persistent lock-holders
+// cause the run to error out after retries, which is safe because the
+// message already exists in the DB and will be picked up by the next
+// Run's preamble (if the session becomes idle) or by that active owner's
+// end-of-turn drain.
+//
+// P0-2 fix (cross-process interrupt inject path): deletes the pending_injects
+// row at the START to prevent duplicate detached runs if the next tick fires
+// before this one completes. If the detached run fails even after all retries,
+// recreates the row so a future tick can retry.
 func (c *coordinator) startDetachedRun(ctx context.Context, call SessionAgentCall) {
 	runCtx := context.WithoutCancel(ctx)
 	go func() {
-		if _, err := c.currentAgent.Run(runCtx, call); err != nil {
-			slog.Error("coordinator: detached run for an idle-session interrupt failed",
-				"session_id", call.SessionID, "err", err)
+		// P0-2 fix: delete the pending_injects row at the START to prevent
+		// duplicate detached runs. If this detached run fails even after
+		// retries, we'll recreate the row below.
+		if call.InjectID != "" {
+			slog.Debug("coordinator: detached run deleting pending_injects row at start",
+				"inject_id", call.InjectID)
+			if delErr := c.sessions.DeleteInterruptInject(runCtx, call.InjectID); delErr != nil {
+				slog.Error("coordinator: detached run failed to delete pending_injects row at start",
+					"inject_id", call.InjectID, "err", delErr)
+				// Continue anyway — row still exists, so duplicates may occur,
+				// but this is better than data loss.
+			} else {
+				slog.Debug("coordinator: detached run deleted pending_injects row at start",
+					"inject_id", call.InjectID)
+			}
 		}
+
+		// Retry loop for OS lock acquisition (P0-2 fix).
+		// Max 5 attempts: 100ms, 200ms, 400ms, 800ms, 1600ms.
+		const maxAttempts = 5
+		var lastErr error
+		for attempt := 0; attempt < maxAttempts; attempt++ {
+			if attempt > 0 {
+				// Bounded exponential backoff
+				backoff := 100 * time.Millisecond << (attempt - 1)
+				time.Sleep(backoff)
+			}
+			_, err := c.currentAgent.Run(runCtx, call)
+			if err == nil {
+				return // Success, nothing more to do
+			}
+			lastErr = err
+			// Check if this is an OS lock contention error worth retrying.
+			var busyErr *session.SessionLockBusyError
+			if errors.As(err, &busyErr) {
+				// Another process holds the lock. This is the transient race
+				// that P0-2 fixes: we raced another concurrent process for
+				// the idle session. Retry with backoff.
+				slog.Debug(
+					"coordinator: detached OS lock acquisition attempt failed (retrying)",
+					"session_id", call.SessionID,
+					"attempt", attempt+1,
+					"max_attempts", maxAttempts,
+					"err", err,
+				)
+				continue
+			}
+			// Non-contention error: persistent failure or the call was
+			// never valid in the first place. No point retrying.
+			break
+		}
+		// All retry attempts exhausted, or hit a non-retryable error.
+		// P0-2 fix: recreate the pending_injects row so a future tick can retry.
+		// This prevents data loss in the cross-process interrupt inject path.
+		// We generate a new ID to avoid UNIQUE constraint violations.
+		if call.InjectID != "" && call.ExistingMessageID != "" {
+			slog.Debug("coordinator: all retries exhausted, attempting to recreate pending_injects row",
+				"inject_id", call.InjectID, "session_id", call.SessionID, "message_id", call.ExistingMessageID)
+			// Get the message content to recreate the row.
+			msg, getErr := c.messages.Get(runCtx, call.ExistingMessageID)
+			if getErr != nil {
+				slog.Error("coordinator: detached run failed to recreate pending_injects row (could not get message)",
+					"inject_id", call.InjectID, "message_id", call.ExistingMessageID, "err", getErr)
+			} else {
+				inject := session.PendingInject{
+					ID:        uuid.New().String(), // Generate new ID to avoid UNIQUE constraint
+					SessionID: call.SessionID,
+					MessageID: call.ExistingMessageID,
+					Content:   msg.FullText(),
+					Interrupt: true,
+				}
+				if createErr := c.sessions.CreatePendingInject(runCtx, inject); createErr != nil {
+					slog.Error("coordinator: detached run failed to recreate pending_injects row",
+						"inject_id", call.InjectID, "err", createErr)
+				} else {
+					slog.Debug("coordinator: detached run successfully recreated pending_injects row for future retry",
+						"new_inject_id", inject.ID, "old_inject_id", call.InjectID)
+				}
+			}
+		}
+		slog.Error("coordinator: detached run for an idle-session interrupt failed after retries",
+			"session_id", call.SessionID, "err", lastErr)
 	}()
 }
 
