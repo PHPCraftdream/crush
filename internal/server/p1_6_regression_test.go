@@ -40,7 +40,9 @@ func (f *fakeAlwaysBusyCoordinator) Cancel(sessionID string) {
 	f.cancelCalled = true
 }
 
-func (f *fakeAlwaysBusyCoordinator) CancelAll() {}
+func (f *fakeAlwaysBusyCoordinator) CancelAll() (stillBusy bool) {
+	return true // Always busy — the P1-6 trigger condition
+}
 
 func (f *fakeAlwaysBusyCoordinator) IsSessionBusy(sessionID string) bool {
 	return true // Always busy — the P1-6 trigger condition

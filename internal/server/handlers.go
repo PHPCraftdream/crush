@@ -290,22 +290,25 @@ func handleSendMessage(ctx context.Context, a *appPkg.App, c *Client, msg WSMess
 	} else {
 		_, err = a.AgentCoordinator.Run(agentCtx, p.SessionID, p.Content, attachments...)
 	}
-	c.hub.Broadcast(EventAgentBusy, AgentBusyPayload{SessionID: p.SessionID, Busy: false})
+	// P2-2 fix: broadcast the actual busy state derived from mailbox ownership,
+	// not from this request handler's lifetime. Run() may have returned early
+	// because the session was already owned by another turn (the call was queued),
+	// but the original owner is still active. IsSessionBusy reflects the live
+	// mailbox state and is the authoritative source of truth.
+	if !a.AgentCoordinator.IsSessionBusy(p.SessionID) {
+		c.hub.Broadcast(EventAgentBusy, AgentBusyPayload{SessionID: p.SessionID, Busy: false})
+	}
 
 	if err != nil {
 		slog.Error("ws: agent run error", "err", err)
 		c.reply(msg.ID, EventError, nil, err.Error())
 	}
 
-	// Run any compact (summarise) that was queued while the task was busy.
-	if _, queued := a.AgentCoordinator.TakeSummarizeQueue(p.SessionID); queued {
-		c.hub.Broadcast(EventSummarizeQueued, SummarizeQueuedPayload{SessionID: p.SessionID, Queued: false})
-		c.hub.Broadcast(EventAgentBusy, AgentBusyPayload{SessionID: p.SessionID, Busy: true})
-		if summarizeErr := a.AgentCoordinator.Summarize(agentCtx, p.SessionID); summarizeErr != nil {
-			slog.Error("ws: queued summarize error", "err", summarizeErr)
-		}
-		c.hub.Broadcast(EventAgentBusy, AgentBusyPayload{SessionID: p.SessionID, Busy: false})
-	}
+	// P2-1 fix: summarizeQueue is now drained by abandonOwnershipWithHandoff
+	// when the session becomes idle, not by this web handler. This ensures
+	// that pending summarise requests execute even when ownership transitions
+	// via non-web paths (CLI, detached runs, etc.). The ownership transition
+	// in abandonOwnershipWithHandoff is the authoritative drain point.
 }
 
 // handleInterruptAndSend cancels the running turn and queues a new user
@@ -1260,7 +1263,10 @@ func handleSummarizeSession(ctx context.Context, a *appPkg.App, c *Client, msg W
 		c.reply(msg.ID, EventResponse, map[string]string{"status": "queued"}, "")
 		return
 	}
-	c.hub.Broadcast(EventAgentBusy, AgentBusyPayload{SessionID: p.SessionID, Busy: false})
+	// P2-2 fix: broadcast the actual busy state derived from mailbox ownership.
+	if !a.AgentCoordinator.IsSessionBusy(p.SessionID) {
+		c.hub.Broadcast(EventAgentBusy, AgentBusyPayload{SessionID: p.SessionID, Busy: false})
+	}
 	if err != nil {
 		slog.Error("ws: summarize error", "err", err)
 		c.reply(msg.ID, EventError, nil, err.Error())
@@ -1666,7 +1672,10 @@ func handleInitializeProject(ctx context.Context, a *appPkg.App, c *Client, msg 
 	agentCtx := context.WithoutCancel(ctx)
 	c.hub.Broadcast(EventAgentBusy, AgentBusyPayload{SessionID: sess.ID, Busy: true})
 	_, runErr := a.AgentCoordinator.Run(agentCtx, sess.ID, initPrompt)
-	c.hub.Broadcast(EventAgentBusy, AgentBusyPayload{SessionID: sess.ID, Busy: false})
+	// P2-2 fix: broadcast the actual busy state derived from mailbox ownership.
+	if !a.AgentCoordinator.IsSessionBusy(sess.ID) {
+		c.hub.Broadcast(EventAgentBusy, AgentBusyPayload{SessionID: sess.ID, Busy: false})
+	}
 	if runErr != nil {
 		slog.Error("ws: initialization run error", "err", runErr)
 	}
@@ -2088,7 +2097,11 @@ func handleRerunMessage(ctx context.Context, a *appPkg.App, c *Client, msg WSMes
 	} else {
 		_, err = a.AgentCoordinator.Run(agentCtx, sessionID, text)
 	}
-	c.hub.Broadcast(EventAgentBusy, AgentBusyPayload{SessionID: sessionID, Busy: false})
+	// P2-2 fix: broadcast the actual busy state derived from mailbox ownership,
+	// not from this request handler's lifetime.
+	if !a.AgentCoordinator.IsSessionBusy(sessionID) {
+		c.hub.Broadcast(EventAgentBusy, AgentBusyPayload{SessionID: sessionID, Busy: false})
+	}
 
 	if err != nil {
 		slog.Error("ws: rerun agent error", "err", err)

@@ -398,6 +398,14 @@ type SessionAgent interface {
 	// starting a Run. Used by the "interrupt and send" path in the web
 	// server: the caller queues, then Cancel()s the running turn, and the
 	// in-flight Run() drains the queue from its cancel-handling branch.
+	//
+	// P2-1 API footgun warning: there is NO production caller of this method
+	// today (grep "QueueMessage(" outside tests returns empty). The method
+	// queues a call WITHOUT starting a runner — a caller MUST independently
+	// guarantee a Run() will drain it soon. There is no owner-side timeout.
+	// For new production code, prefer Run()/InterruptAndReplace, which provide
+	// atomic submit-and-run or handoff semantics. This method exists primarily
+	// for legacy mailbox migration tests.
 	QueueMessage(call SessionAgentCall)
 	// InterruptAndReplace atomically records call as the replacement the
 	// current owner runs next and cancels only the in-flight generation
@@ -945,6 +953,12 @@ func (a *sessionAgent) drainOrReleaseMerged(sessionID string, epoch uint64, lk *
 // error paths that exit ownership without a live turn loop, ensuring that
 // queued calls are not stranded without a runner.
 //
+// P2-1 fix: also drains summarizeQueue when the session becomes idle, ensuring
+// that pending summarise requests execute even when ownership transitions via
+// non-web paths (CLI, detached runs, etc.). Previously, only the web handler's
+// tail drained this queue, leaving summarise stranded if the session became idle
+// through any other entry point.
+//
 // It must be called with lk (if any) already released — the caller releases
 // the OS lock first to avoid the HIGH-1 window where mbIdle becomes true
 // while the lock is still held.
@@ -961,6 +975,29 @@ func (a *sessionAgent) abandonOwnershipWithHandoff(sessionID string, epoch uint6
 		// read the entire queue without mb.mu (no new submit can land
 		// on mbIdle).
 		a.restartOrphanedWithRetry(mb.popAllSubmitted())
+	}
+
+	// P2-1 fix: drain summarizeQueue after ownership is released and the session
+	// is idle. This ensures that pending summarise requests execute even when the
+	// session became idle through a non-web path (CLI, detached runs, etc.).
+	// We run this in a detached goroutine with a fresh context.Background() to
+	// avoid any dependencies on the current owner's request context.
+	if a.summarizeQueue != nil {
+		if opts, queued := a.TakeSummarizeQueue(sessionID); queued {
+			go func() {
+				if err := a.Summarize(context.Background(), sessionID, opts); err != nil {
+					if errors.Is(err, ErrSummarizeQueued) {
+						// Re-queuing due to ownership contention is expected and self-healing,
+						// not an error. Log at debug level to avoid confusing operators.
+						slog.Debug("agent: queued summarize re-queued due to ownership contention during ownership transition",
+							"session_id", sessionID)
+					} else {
+						slog.Error("agent: queued summarize failed after ownership transition",
+							"session_id", sessionID, "err", err)
+					}
+				}
+			}()
+		}
 	}
 }
 
