@@ -2024,11 +2024,26 @@ func handleRerunMessage(ctx context.Context, a *appPkg.App, c *Client, msg WSMes
 	// 1. Cancel + clear queue if busy, then poll until idle (up to 10s).
 	a.AgentCoordinator.Cancel(sessionID)
 	a.AgentCoordinator.ClearQueue(sessionID)
+	idle := false
 	for i := 0; i < 100; i++ {
 		if !a.AgentCoordinator.IsSessionBusy(sessionID) {
+			idle = true
 			break
 		}
 		time.Sleep(100 * time.Millisecond)
+	}
+
+	// P1-6 fix: fail closed if the session is still busy after the timeout.
+	// Provider/tool can legitimately respond to cancellation longer than 10s,
+	// and the old owner may still be writing to history. Proceeding would race
+	// between deletion and concurrent writes, corrupting the transcript.
+	if !idle {
+		slog.Warn("ws: rerun: session still stopping after timeout",
+			"sessionID", sessionID,
+			"messageID", p.MessageID,
+			"timeout_seconds", 10)
+		c.reply(msg.ID, EventError, nil, "session still stopping — please retry")
+		return
 	}
 
 	// 2. Delete every message AFTER the target (by CreatedAt), keep the target.
