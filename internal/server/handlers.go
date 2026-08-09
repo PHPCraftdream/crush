@@ -779,13 +779,16 @@ func handleListSessions(ctx context.Context, a *appPkg.App, c *Client, msg WSMes
 	annotateExternalOwnership(a, sessions)
 	c.reply(msg.ID, EventSessionsList, sessions, "")
 
-	// Correct any stale agent_busy state in the replay buffer by sending the
-	// server's authoritative busy state for every session to this client only
-	// (not broadcast — other clients already have accurate live state).
+	// Correct any stale agent_busy and summarize_queued state in the replay
+	// buffer by sending the server's authoritative state for every session
+	// to this client only (not broadcast — other clients already have accurate
+	// live state).
 	if a.AgentCoordinator != nil {
 		for _, s := range sessions {
 			busy := a.AgentCoordinator.IsSessionBusy(s.ID)
+			queued := a.AgentCoordinator.SummarizeQueued(s.ID)
 			c.reply("", EventAgentBusy, AgentBusyPayload{SessionID: s.ID, Busy: busy}, "")
+			c.reply("", EventSummarizeQueued, SummarizeQueuedPayload{SessionID: s.ID, Queued: queued}, "")
 		}
 	}
 }
@@ -1258,13 +1261,14 @@ func handleSummarizeSession(ctx context.Context, a *appPkg.App, c *Client, msg W
 	c.hub.Broadcast(EventAgentBusy, AgentBusyPayload{SessionID: p.SessionID, Busy: true})
 	err := a.AgentCoordinator.Summarize(agentCtx, p.SessionID, nil)
 	if errors.Is(err, agent.ErrSummarizeQueued) {
-		// Undo the busy broadcast — the session isn't busy with summarise yet.
-		c.hub.Broadcast(EventAgentBusy, AgentBusyPayload{SessionID: p.SessionID, Busy: false})
+		// The session is still busy with the owning turn that triggered the queue.
+		// Do NOT broadcast Busy: false — that would mislead clients into thinking
+		// the session is idle when it's still owned by the compaction turn.
 		c.hub.Broadcast(EventSummarizeQueued, SummarizeQueuedPayload{SessionID: p.SessionID, Queued: true})
 		c.reply(msg.ID, EventResponse, map[string]string{"status": "queued"}, "")
 		return
 	}
-	// P2-2 fix: broadcast the actual busy state derived from mailbox ownership.
+	// Broadcast the actual busy state derived from mailbox ownership.
 	if !a.AgentCoordinator.IsSessionBusy(p.SessionID) {
 		c.hub.Broadcast(EventAgentBusy, AgentBusyPayload{SessionID: p.SessionID, Busy: false})
 	}

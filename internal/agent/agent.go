@@ -3223,11 +3223,23 @@ func (a *sessionAgent) runSummarize(ctx context.Context, genCtx context.Context,
 		return err
 	}
 
-	// Success path is unchanged from before this round's fix: plain release
-	// (no handoff — this path was never the P1-1 bug), then hand the first
-	// queued entry to a synchronous, caller-ctx-scoped Run whose own error
-	// propagates as runSummarize's result, exactly as before.
+	// Success path: release ownership, drain the mailbox queue, and coalesce
+	// any pending summarize requests. If a second /compact was queued while
+	// this one was running, we discard it (coalesce) because the history has
+	// already been compressed by this successful compaction.
 	_ = mb.abandonOwnership(epoch)
+
+	// Drain any queued summarize request - if a second /compact was queued
+	// while this one was running, the history is already compressed, so we
+	// coalesce by discarding the stale queued entry rather than executing it.
+	// This is semantically correct: the queued request's goal (compress history)
+	// is already satisfied by this compaction, and avoids redundant LLM calls.
+	if a.summarizeQueue != nil {
+		if _, queued := a.TakeSummarizeQueue(sessionID); queued {
+			slog.Debug("agent: queued summarize coalesced with successful compaction, discarded stale entry",
+				"session_id", sessionID)
+		}
+	}
 
 	// Start a Run for the first queued entry. The Run becomes owner via
 	// submit() (mbIdle) and drains remaining entries via end-of-turn
