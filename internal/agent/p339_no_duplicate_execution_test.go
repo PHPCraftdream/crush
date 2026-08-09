@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,7 @@ import (
 	"charm.land/fantasy/providers/openaicompat"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/pubsub"
+	"github.com/charmbracelet/crush/internal/session"
 	"github.com/stretchr/testify/require"
 )
 
@@ -112,30 +114,29 @@ func (m *mockMessageService) Subscribe(ctx context.Context) <-chan pubsub.Event[
 // issues that occur in the error-handling path AFTER streaming completes.
 //
 // Sequence:
-//  1. Turn A owns the session, message B is queued (QueueMessage).
-//  2. Turn A fails with a non-cancel error AFTER doing real work
+//  1. Turn A fails with a non-cancel error AFTER doing real work
 //     (not immediately at startup).
-//  3. abandonOwnershipWithHandoff → restartOrphanedWithRetry([B]) executes.
-//  4. Detached Run(B) successfully creates user message for B.
-//  5. Provider streams a response (assistant message created).
-//  6. Error-handling path tries to write a final finish part, but mock DB fails.
-//  7. Verify: NO requeue (len(mb.submitted) == 0) and exactly ONE user
-//     message with B's content in history (not two, not zero).
+//  2. abandonOwnershipWithHandoff → restartOrphanedWithRetry([B]) executes.
+//  3. restartOrphanedWithRetry enqueues the call to the durable run queue.
+//  4. Pump processes the queued call.
+//  5. Detached Run(B) successfully creates user message for B.
+//  6. Provider streams a response (assistant message created).
+//  7. Error-handling path tries to write a final finish part, but mock DB fails.
+//  8. Error is wrapped in ErrCallAlreadyAttempted.
+//  9. Pump recognizes ErrCallAlreadyAttempted as terminal and does NOT retry.
+//  10. Verify: No pending entry in run queue and exactly ONE user message with B's content in history.
 //
-// REVERT CHECK PROCEDURE (VERIFIED ORCHESTRATOR):
-//  1. In agent.go restartOrphanedWithRetry (~line 1119-1137), disable the check:
+// REVERT CHECK PROCEDURE:
+//  1. In run_queue_pump.go executeEntry (~line 264-273), disable the AlreadyAttempted check:
 //     ```
-//     // BUG: Disable the ErrCallAlreadyAttempted check (P0-2 revert check)
-//     var alreadyAttempted *ErrCallAlreadyAttempted
-//     if false && errors.As(lastErr, &alreadyAttempted) {
-//     slog.Error(...)
-//     return
-//     }
+//     // BUG: Disable the AlreadyAttempted check (P339 revert check)
+//     var alreadyAttempted AlreadyAttempted
+//     if false && errors.As(err, &alreadyAttempted) && alreadyAttempted.AlreadyAttempted() {
 //     ```
 //  2. Run: go test ./internal/agent -run TestP339_NoDuplicateExecutionAfterHandoff -v
 //  3. The test will FAIL on:
-//     - "no call should be requeued after attempted execution fails" - len(mb.submitted) != 0
-//     - "exactly one user message with message B in history" - count != 1
+//     - "call should be terminal-failed (not pending for retry)" - entry would be retried
+//     - "exactly one user message with message B in history" - duplicates would appear
 //  4. Restore the check and the test will PASS.
 func TestP339_NoDuplicateExecutionAfterHandoff(t *testing.T) {
 	t.Parallel()
@@ -211,7 +212,7 @@ func TestP339_NoDuplicateExecutionAfterHandoff(t *testing.T) {
 	require.NoError(t, err)
 	t.Logf("Created seed message A: %s", seedMsg.ID)
 
-	// Queue message B via the mailbox (simulates a concurrent submit).
+	// Queue message B via the durable run queue (simulates a concurrent submit).
 	// We bypass the normal submission path to directly test restartOrphanedWithRetry.
 	messageBText := "message B"
 	orphanedCall := SessionAgentCall{
@@ -223,23 +224,61 @@ func TestP339_NoDuplicateExecutionAfterHandoff(t *testing.T) {
 	// This simulates what happens when turn A dies and hands off B.
 	sessionAgent.restartOrphanedWithRetry([]SessionAgentCall{orphanedCall})
 
-	// Wait for the detached run to complete. The sequence is:
+	// Wait for durable enqueue to complete.
+	time.Sleep(100 * time.Millisecond)
+
+	// PHASE 1: PROVE DURABLE ENQUEUE
+	// The call should be enqueued in the durable run queue.
+	pendingEntries, err := env.sessions.ListPendingRunQueueEntries(ctx)
+	require.NoError(t, err)
+	require.Len(t, pendingEntries, 1, "call should be enqueued in durable run queue")
+	require.Equal(t, sessionID, pendingEntries[0].SessionID)
+
+	// Verify the queued call data contains the expected prompt.
+	var callData session.SessionAgentCallData
+	err = json.Unmarshal([]byte(pendingEntries[0].CallData), &callData)
+	require.NoError(t, err)
+	require.Equal(t, messageBText, callData.Prompt, "queued call should contain correct prompt")
+
+	// PHASE 2: EXECUTE VIA PUMP AND VERIFY TERMINAL FAILURE
+	// Create a mock coordinator that adapts session.SessionAgentCallData to agent.SessionAgentCall
+	// and executes it through the sessionAgent.
+	mockCoord := &pumpTestCoordinator{
+		sessionAgent: sessionAgent,
+		dataDir:      env.workingDir,
+	}
+
+	// Start a pump to process queued calls.
+	pump := session.NewRunQueuePump(session.RunQueuePumpConfig{
+		Sessions:       env.sessions,
+		DataDirectory:  env.workingDir,
+		Coordinator:    mockCoord,
+		PumpInstanceID: "test-pump-p339",
+		TestTick:       func() time.Duration { return 100 * time.Millisecond },
+	})
+	pump.Start()
+	defer pump.Stop()
+
+	// Wait for the pump to process the queued call.
+	// The sequence is:
 	// 1. createUserMessage for B (call #1, succeeds)
 	// 2. PrepareStep creates assistant message (call #2, succeeds)
 	// 3. Provider streams successfully
 	// 4. Error-handling path: List() call (call #3, FAILS because failAfterCalls=2)
 	// 5. Error is wrapped in ErrCallAlreadyAttempted
-	// 6. retry tail sees wrapped error, does NOT requeue
-	time.Sleep(3 * time.Second)
+	// 6. Pump sees ErrCallAlreadyAttempted, does terminal fail (no retry)
+	require.Eventually(t, func() bool {
+		pending, checkErr := env.sessions.ListPendingRunQueueEntries(ctx)
+		if checkErr != nil {
+			return false
+		}
+		return len(pending) == 0 && mockMessages.userMessageCreated.Load()
+	}, 10*time.Second, 100*time.Millisecond, "pump should process and terminal-fail the queued call")
 
-	// VERIFY 1: No call in mb.submitted.
-	// The call should NOT be requeued because it was already attempted.
-	mb := sessionAgent.getMailbox(sessionID)
-	mb.mu.Lock()
-	submittedCalls := make([]SessionAgentCall, len(mb.submitted))
-	copy(submittedCalls, mb.submitted)
-	mb.mu.Unlock()
-	require.Equal(t, 0, len(submittedCalls), "no call should be requeued after attempted execution fails; got %d requeued calls: %v", len(submittedCalls), submittedCalls)
+	// VERIFY 1: No pending entry in run queue (terminal failure, not retry).
+	pendingEntries, err = env.sessions.ListPendingRunQueueEntries(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 0, len(pendingEntries), "call should be terminal-failed (not pending for retry)")
 
 	// VERIFY 2: Exactly one user message with message B's content in history.
 	// The detached run should have created the user message, and no second

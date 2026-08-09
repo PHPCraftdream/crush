@@ -41,6 +41,11 @@ import (
 //     a. Provider was called at least twice (once for firstCall, once for orphanedCall)
 //     b. orphanedCall.Prompt appears in the session's message history
 //
+// Since task #340 ROUND 3, the finalizer's detached run durably enqueues the
+// orphaned call instead of executing it inline, so this test also starts a
+// session.RunQueuePump (fast TestTick) to prove the queue is actually drained,
+// not just written to.
+//
 // This is the SAME execution proof pattern as p0_2_regression_test.go
 // (TestP0_2_RetryExhaustion_QueuesCall), using httptest.Server with SSE responses
 // and atomic counters inside the HTTP handler.
@@ -253,10 +258,26 @@ func TestP0_338_FinalizerReachableDespiteHungCleanup(t *testing.T) {
 	//   - Call 1: firstCall (returns error, triggers finalizer)
 	//   - Call 2+: orphaned call(s) executed by detached run
 	//
-	// The detached run uses restartOrphanedWithRetry with exponential backoff (100-1600ms),
-	// so we wait up to 10 seconds for the retry loop to complete and for the orphaned call
-	// to be executed. This is NOT an "external poke" — the finalizer ALREADY launched the
-	// detached goroutine autonomously, we're just waiting for its asynchronous completion.
+	// Since task #340 ROUND 3, restartOrphanedWithRetry no longer executes the
+	// call itself — it durably enqueues it and relies on a session.RunQueuePump
+	// to pick it up. Without a pump running, the enqueued call would sit
+	// pending forever, so we start one here (TestTick keeps its poll interval
+	// short instead of the production 3s) before waiting for execution. This
+	// is still NOT an "external poke": the finalizer autonomously durably
+	// enqueued the call the moment Run() failed; the pump is just the
+	// mandatory background executor for that queue, equivalent to what
+	// App.New() wires in production.
+	pumpCoord := &p0338PumpCoordinator{sessionAgent: sa}
+	pump := session.NewRunQueuePump(session.RunQueuePumpConfig{
+		Sessions:       sessions,
+		DataDirectory:  tmpDir,
+		Coordinator:    pumpCoord,
+		PumpInstanceID: "test-pump-p0-338",
+		TestTick:       func() time.Duration { return 100 * time.Millisecond },
+	})
+	pump.Start()
+	defer pump.Stop()
+
 	require.Eventually(t, func() bool {
 		return providerCalls.Load() >= 2
 	}, 10*time.Second, 100*time.Millisecond,
@@ -291,6 +312,33 @@ func TestP0_338_FinalizerReachableDespiteHungCleanup(t *testing.T) {
 	// The defer above will unblock it and restore the original function.
 	time.Sleep(3 * time.Second)
 
-	// Clean up the DB connection so tmpDir can be removed.
-	conn.Close()
+	// Clean up the DB connection so tmpDir can be removed. db.Connect pools
+	// connections by absolute dataDir path and additionally opens a
+	// separate read-only pool sharing the same refcount (see
+	// internal/db/connect.go) — a raw conn.Close() only closes the writer
+	// handle and leaves the reader pool's file handle open, which on
+	// Windows blocks t.TempDir()'s own RemoveAll cleanup. db.Release tears
+	// down both.
+	require.NoError(t, db.Release(tmpDir))
+}
+
+// p0338PumpCoordinator adapts session.SessionAgentCallData to agent.SessionAgentCall
+// and executes it through the exported agent.SessionAgent interface, mirroring
+// production's coordinatorAdapterImpl (internal/app/app.go) without needing the
+// unexported *coordinator/*sessionAgent types this external test package can't see.
+type p0338PumpCoordinator struct {
+	sessionAgent agent.SessionAgent
+}
+
+func (p *p0338PumpCoordinator) Run(ctx context.Context, callData session.SessionAgentCallData) (*any, error) {
+	call := agent.FromSessionAgentCallData(callData)
+	result, err := p.sessionAgent.Run(ctx, call)
+	if err != nil {
+		return nil, err
+	}
+	var anyResult any
+	if result != nil {
+		anyResult = result
+	}
+	return &anyResult, nil
 }

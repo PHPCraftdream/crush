@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -22,24 +23,24 @@ import (
 // data loss when OS lock is held for longer than the retry window (~1.6s).
 //
 // CRITICAL: This test proves BOTH persistence AND execution:
-//  1. Persistence (first phase): call is queued in mb.submitted after retry exhaustion
-//  2. Execution (second phase): a future Run() picks up the queued call and executes it
+//  1. Persistence (first phase): call is queued in durable run queue after retry exhaustion
+//  2. Execution (second phase): pump executes the queued call and completes it
 //
-// This test FAILS when mb.queue(call) is removed or commented out from the
+// This test FAILS when a.sessions.EnqueueRunQueueEntry is removed or commented out from the
 // retry exhaustion path, because the orphaned call disappears completely.
 //
 // Sequence 3 of 9 from the 2026-08-07 concurrency review audit (tasks #328-#336).
 // See docs/reviews/2026-08-07-release-concurrency-review.md P0-2 (Problem 1).
 //
 // REVERT CHECK PROCEDURE:
-//  1. In agent.go restartOrphanedWithRetry (~line 970), comment out mb.queue(call):
-//     // BUG: Don't queue the call (P0-2a revert check)
-//     // mb.queue(call)
+//  1. In agent.go restartOrphanedWithRetry (~line 1057), comment out EnqueueRunQueueEntry:
+//     // BUG: Don't enqueue to durable queue (P0-2a revert check)
+//     // if enqueueErr := a.sessions.EnqueueRunQueueEntry(context.Background(), idempotencyKey, call.SessionID, callDataJSON); enqueueErr != nil {
 //  2. Run: go test ./internal/agent -run TestP0_2_RetryExhaustion_QueuesCall -v
-//  3. The test will FAIL on TWO assertions:
-//     a. First phase: "orphaned call should be queued after retry exhaustion" - call is lost
+//  3. The test will FAIL on:
+//     a. First phase: "orphaned call should be queued in durable run queue" - call is lost
 //     b. Second phase: "provider should have been called for queued call" - no execution
-//  4. Restore mb.queue(call) and both phases will PASS.
+//  4. Restore the EnqueueRunQueueEntry call and both phases will PASS.
 func TestP0_2_RetryExhaustion_QueuesCall(t *testing.T) {
 	t.Parallel()
 
@@ -124,37 +125,63 @@ func TestP0_2_RetryExhaustion_QueuesCall(t *testing.T) {
 	// Start a detached run that will exhaust retries.
 	sessionAgent.restartOrphanedWithRetry([]SessionAgentCall{orphanedCall})
 
-	// Wait for all retry attempts to complete (5 attempts + backoff: ~1.6s total).
-	time.Sleep(2 * time.Second)
-
-	// PHASE 1: PROVE PERSISTENCE
-	// With the fix, the call should be queued in mb.submitted.
-	// Without the fix (commenting out mb.queue(call)), submitted is empty
-	// and the call is lost.
-	mb := sessionAgent.getMailbox(sessionID)
-	mb.mu.Lock()
-	submittedCalls := make([]SessionAgentCall, len(mb.submitted))
-	copy(submittedCalls, mb.submitted)
-	mb.mu.Unlock()
-	require.Len(t, submittedCalls, 1, "orphaned call should be queued after retry exhaustion")
-	require.Equal(t, orphanedCall.SessionID, submittedCalls[0].SessionID)
-	require.Equal(t, orphanedCall.Prompt, submittedCalls[0].Prompt)
-
-	// PHASE 2: PROVE EXECUTION
-	// Now simulate a "future owner comes back" scenario by releasing the OS lock.
-	// The queued call must be ACTUALLY EXECUTED by a subsequent detached run.
-	lock.Release()
-
-	// Give the detached goroutine time to finish its cleanup.
+	// Wait for durable enqueue to complete.
 	time.Sleep(100 * time.Millisecond)
 
-	// Trigger a new Run() which should pick up the queued call.
-	// We use a throwaway prompt - the queued call should execute first via popFirstSubmitted().
-	_, err = sessionAgent.Run(ctx, SessionAgentCall{
-		SessionID: sessionID,
-		Prompt:    "throwaway - queued call should execute first",
+	// PHASE 1: PROVE PERSISTENCE
+	// With the fix, the call should be queued in the durable run queue.
+	// Without the fix (commenting out EnqueueRunQueueEntry), the queue is empty
+	// and the call is lost.
+	pendingEntries, err := env.sessions.ListPendingRunQueueEntries(ctx)
+	require.NoError(t, err)
+	require.Len(t, pendingEntries, 1, "orphaned call should be queued in durable run queue after retry exhaustion")
+	require.Equal(t, sessionID, pendingEntries[0].SessionID)
+
+	// Verify the queued call data contains the expected prompt.
+	var callData session.SessionAgentCallData
+	err = json.Unmarshal([]byte(pendingEntries[0].CallData), &callData)
+	require.NoError(t, err)
+	require.Equal(t, "orphaned call", callData.Prompt, "queued call should contain correct prompt")
+
+	// PHASE 2: PROVE EXECUTION
+	// Now simulate a "future owner comes back" scenario by:
+	// 1. Starting a pump to process queued calls
+	// 2. Releasing the OS lock so the pump can acquire it
+	// 3. Waiting for the call to execute
+
+	// Create a mock coordinator that adapts session.SessionAgentCallData to agent.SessionAgentCall
+	// and executes it through the sessionAgent.
+	mockCoord := &pumpTestCoordinator{
+		sessionAgent: sessionAgent,
+		dataDir:      env.workingDir,
+	}
+
+	// Start a pump to process queued calls.
+	pump := session.NewRunQueuePump(session.RunQueuePumpConfig{
+		Sessions:       env.sessions,
+		DataDirectory:  env.workingDir,
+		Coordinator:    mockCoord,
+		PumpInstanceID: "test-pump-p0-2",
+		TestTick:       func() time.Duration { return 100 * time.Millisecond },
 	})
-	require.NoError(t, err, "Run should succeed and execute the queued call")
+	pump.Start()
+	defer pump.Stop()
+
+	// Release the OS lock so the pump can acquire it.
+	lock.Release()
+
+	// Give the pump time to process the queued call.
+	// We use Eventually to wait for:
+	// 1. The queue to be empty (call was processed)
+	// 2. The provider to be called
+	// 3. The message to appear in history
+	require.Eventually(t, func() bool {
+		pending, checkErr := env.sessions.ListPendingRunQueueEntries(ctx)
+		if checkErr != nil {
+			return false
+		}
+		return len(pending) == 0 && providerCalls.Load() >= 1
+	}, 10*time.Second, 100*time.Millisecond, "pump should process the queued call and provider should be called")
 
 	// Verify the provider was called.
 	// Without queuing (persistence gap), the orphaned call never reaches here.
@@ -181,4 +208,28 @@ func TestP0_2_RetryExhaustion_QueuesCall(t *testing.T) {
 	}
 	require.True(t, foundOrphanedContent,
 		"orphaned call's content should appear in message history after execution")
+}
+
+// pumpTestCoordinator adapts session.SessionAgentCallData to agent.SessionAgentCall
+// and executes it through the sessionAgent for testing.
+type pumpTestCoordinator struct {
+	sessionAgent *sessionAgent
+	dataDir      string
+}
+
+func (p *pumpTestCoordinator) Run(ctx context.Context, callData session.SessionAgentCallData) (*any, error) {
+	// Convert SessionAgentCallData back to SessionAgentCall using the existing conversion function
+	call := FromSessionAgentCallData(callData)
+
+	// Execute the call through the sessionAgent
+	result, err := p.sessionAgent.Run(ctx, call)
+	if err != nil {
+		return nil, err
+	}
+
+	var anyResult any
+	if result != nil {
+		anyResult = result
+	}
+	return &anyResult, nil
 }

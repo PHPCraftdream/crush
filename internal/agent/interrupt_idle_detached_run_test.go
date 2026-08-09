@@ -11,6 +11,7 @@ import (
 	"charm.land/fantasy/providers/openaicompat"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/message"
+	"github.com/charmbracelet/crush/internal/session"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -45,6 +46,11 @@ import (
 // QueueMessage(call)) makes this test time out waiting for the request,
 // and the prompt never appears in session history — see the task report
 // for the captured failure output.
+//
+// Since task #340 ROUND 3, startDetachedRun durably enqueues the call rather
+// than running it inline, so this test also starts a session.RunQueuePump
+// (fast TestTick) — without one, the enqueued call would never be drained
+// and the test would time out for an unrelated reason (no pump, not P0-B).
 func TestCoordinator_InterruptAndSend_IdleSession_ActuallyRuns(t *testing.T) {
 	env := testEnv(t)
 	dataDir := t.TempDir()
@@ -110,6 +116,22 @@ func TestCoordinator_InterruptAndSend_IdleSession_ActuallyRuns(t *testing.T) {
 		messages:     env.messages,
 		currentAgent: sa,
 	}
+
+	// Since task #340 ROUND 3, startDetachedRun durably enqueues the call
+	// instead of executing it inline — a session.RunQueuePump is the only
+	// thing that drains that queue (mirroring what App.New() wires in
+	// production). Without one running here the enqueued call would sit
+	// pending forever and the request would never reach the provider.
+	pumpCoord := &pumpTestCoordinator{sessionAgent: sa, dataDir: dataDir}
+	pump := session.NewRunQueuePump(session.RunQueuePumpConfig{
+		Sessions:       env.sessions,
+		DataDirectory:  dataDir,
+		Coordinator:    pumpCoord,
+		PumpInstanceID: "test-pump-p0b-idle",
+		TestTick:       func() time.Duration { return 100 * time.Millisecond },
+	})
+	pump.Start()
+	t.Cleanup(pump.Stop)
 
 	const interruptPrompt = "interrupt on an idle session must actually run, P0-B"
 	err = coord.InterruptAndSend(t.Context(), sess.ID, interruptPrompt, nil, nil)

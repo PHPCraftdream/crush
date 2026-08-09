@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"database/sql"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -34,6 +35,16 @@ type fakeEnv struct {
 	permissions permission.Service
 	history     history.Service
 	filetracker *filetracker.Service
+	// conn is the raw DB handle backing sessions/messages/etc. Exposed so
+	// tests can simulate a DB failure (e.g. durable-enqueue errors) by
+	// closing it directly — session.Service has no exported accessor for
+	// its underlying *sql.DB.
+	conn *sql.DB
+	// dbDir is the directory conn was opened against. Exposed so a test
+	// that closed conn to simulate an outage can reopen a fresh connection
+	// to the SAME database file (db.Connect(ctx, dbDir)) rather than
+	// accidentally standing up an unrelated, empty database.
+	dbDir string
 }
 
 type builderFunc func(t *testing.T, r *vcr.Recorder) (fantasy.LanguageModel, error)
@@ -65,7 +76,8 @@ func testEnv(t *testing.T) fakeEnv {
 	err := os.MkdirAll(workingDir, 0o755)
 	require.NoError(t, err)
 
-	conn, err := db.Connect(t.Context(), t.TempDir())
+	dbDir := t.TempDir()
+	conn, err := db.Connect(t.Context(), dbDir)
 	require.NoError(t, err)
 
 	q := db.New(conn)
@@ -88,6 +100,8 @@ func testEnv(t *testing.T) fakeEnv {
 		permissions,
 		history,
 		&filetrackerService,
+		conn,
+		dbDir,
 	}
 }
 

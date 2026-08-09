@@ -47,23 +47,17 @@ type coordinatorAdapterImpl struct {
 	coord agent.Coordinator
 }
 
-func (a *coordinatorAdapterImpl) Run(ctx context.Context, sessionID, prompt string, providerOptions map[string]any, attachments ...any) (*any, error) {
-	// TODO: ROUND 3 - support providerOptions properly. For now, we
-	// ignore them because coordinator.Run doesn't accept them in its
-	// current signature. In ROUND 3, we'll need to either:
-	// 1. Extend agent.Coordinator.Run to accept providerOptions, or
-	// 2. Reconstruct a full SessionAgentCall and call RunWithOverrides.
-	// For ROUND 2, this is acceptable because we're only fixing bugs
-	// in the existing mechanism, not migrating call-sites yet.
-
-	// Convert attachments to message.Attachment if needed
-	var msgAttachments []message.Attachment
-	for _, att := range attachments {
-		if msgAtt, ok := att.(message.Attachment); ok {
-			msgAttachments = append(msgAttachments, msgAtt)
-		}
+func (a *coordinatorAdapterImpl) Run(ctx context.Context, callData session.SessionAgentCallData) (*any, error) {
+	// Convert session.SessionAgentCallData to agent.SessionAgentCall
+	// This requires rebuilding the full Model from the serialized ModelCfg,
+	// which only the coordinator can do (it has access to provider configs
+	// and catwalk registry). Delegate to coordinator.RebuildSessionAgentCall.
+	call, err := a.coord.RebuildSessionAgentCall(ctx, callData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to rebuild session agent call: %w", err)
 	}
-	result, err := a.coord.Run(ctx, sessionID, prompt, msgAttachments...)
+
+	result, err := a.coord.RunSessionAgentCall(ctx, call)
 	// Return as any - we only care about error handling, not the result
 	var anyResult any
 	if result != nil {

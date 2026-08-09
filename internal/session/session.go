@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/crush/internal/db"
+	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/pubsub"
 	"github.com/google/uuid"
 	"github.com/zeebo/xxh3"
@@ -1295,6 +1296,66 @@ type RunQueueEntry struct {
 	TerminalFailure bool
 	CreatedAt       int64
 	UpdatedAt       int64
+}
+
+// ModelCfg is a JSON-serializable subset of config.SelectedModel
+// (task #340, ROUND 3 migration). It mirrors the JSON-tagged fields
+// of config.SelectedModel without importing the config package to avoid
+// import cycles. The coordinator (which can import config) reconstructs
+// the full Model from this data during pump execution.
+type ModelCfg struct {
+	Model            string         `json:"model"`
+	Provider         string         `json:"provider"`
+	ReasoningEffort  string         `json:"reasoning_effort,omitempty"`
+	Think            bool           `json:"think,omitempty"`
+	MaxTokens        int64          `json:"max_tokens,omitempty"`
+	Temperature      *float64       `json:"temperature,omitempty"`
+	TopP             *float64       `json:"top_p,omitempty"`
+	TopK             *int64         `json:"top_k,omitempty"`
+	FrequencyPenalty *float64       `json:"frequency_penalty,omitempty"`
+	PresencePenalty  *float64       `json:"presence_penalty,omitempty"`
+	ProviderOptions  map[string]any `json:"provider_options,omitempty"`
+}
+
+// SessionAgentCallData is a durable, serializable subset of agent.SessionAgentCall
+// that can be stored in the run queue and reconstructed after process restart.
+// It contains only the fields needed to execute a call, excluding process-local
+// pointers and transient state (task #340, ROUND 3 migration).
+//
+// This is a mirror of agent.SessionAgentCall without creating an import cycle.
+// The agent package converts between SessionAgentCall and SessionAgentCallData.
+type SessionAgentCallData struct {
+	SessionID   string
+	Prompt      string
+	Attachments []message.Attachment
+	// ProviderOptions, Temperature, TopP, TopK, FrequencyPenalty, PresencePenalty
+	// are NOT serialized here — they are pure functions of (Model, ProviderConfig)
+	// computed via mergeCallOptions/getProviderOptions during pump execution.
+	// Only ModelCfg is serialized because it contains the per-session pinned snapshot
+	// (task #265, P0-1, task #340 ROUND 3).
+	MaxOutputTokens int64
+	NonInteractive  bool
+	// SystemPromptOverride, if non-empty, replaces the agent's global system prompt
+	SystemPromptOverride string
+	// MaxCost aborts the run if total session cost exceeds this value (0 = no cap)
+	MaxCost float64
+	// MaxTokens aborts the run if total prompt+completion tokens exceed this value
+	MaxTokens int64
+	// ExistingMessageID, when non-empty, marks this call as referencing a
+	// user message that already exists in the DB (created by another process)
+	ExistingMessageID string
+	// InjectID, when non-empty, is the ID of a pending_injects row that
+	// must be deleted AFTER successful OS lock acquisition (P0-2 fix)
+	InjectID string
+	// Model configuration overrides (task #265, P0-1) - we serialize ModelCfg
+	// because it's the per-session pinned snapshot. The actual Model (with
+	// live fantasy.LanguageModel and CatwalkCfg) is reconstructed by the
+	// coordinator during pump execution (ROUND 3).
+	// Pointers, so "explicitly set" is distinguishable from "zero value"
+	LargeModel         *ModelCfg
+	SmallModel         *ModelCfg
+	SystemPromptPrefix *string
+	SystemPrompt       *string
 }
 
 // RunQueue constants

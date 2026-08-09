@@ -42,8 +42,9 @@ const RunQueueMaxAttempts = 10
 // import cycles (session → agent → session). The real app's AgentCoordinator
 // implements this interface.
 type Coordinator interface {
-	// Run executes a call for the given session. Returns the result or an error.
-	Run(ctx context.Context, sessionID, prompt string, providerOptions map[string]any, attachments ...any) (*any, error)
+	// Run executes a call for the given session using the full call data.
+	// Returns the result or an error.
+	Run(ctx context.Context, call SessionAgentCallData) (*any, error)
 }
 
 // RunQueuePumpConfig configures a RunQueuePump instance.
@@ -226,32 +227,28 @@ func (p *RunQueuePump) processEntry(ctx context.Context, entry *RunQueueEntry) {
 		return
 	}
 
-	// Parse the serialized SessionAgentCall (we use a simple map for now)
-	var call struct {
-		SessionID       string
-		Prompt          string
-		ProviderOptions map[string]any
-	}
-	if err := json.Unmarshal([]byte(leased.CallData), &call); err != nil {
-		slog.Error("run_queue_pump: failed to unmarshal call data", "id", leased.ID, "session_id", leased.SessionID, "err", err, "instance_id", p.cfg.PumpInstanceID)
-		// Don't retry this - malformed data won't fix itself
-		if err := p.cfg.Sessions.TerminalFailRunQueueEntry(ctx, leased.ID); err != nil {
-			slog.Error("run_queue_pump: terminal fail failed after unmarshal error", "id", leased.ID, "err", err, "instance_id", p.cfg.PumpInstanceID)
+	// Execute the call (detached, not blocking this pump tick)
+	go p.executeEntry(ctx, leased)
+}
+
+// executeEntry runs a leased entry and handles success/failure.
+func (p *RunQueuePump) executeEntry(ctx context.Context, leased *RunQueueEntry) {
+	// Create a fresh context for this execution (not tied to pump lifecycle)
+	execCtx := context.Background()
+
+	// Parse the call data from JSON
+	var callData SessionAgentCallData
+	if err := json.Unmarshal([]byte(leased.CallData), &callData); err != nil {
+		slog.Error("run_queue_pump: failed to parse call data", "id", leased.ID, "session_id", leased.SessionID, "err", err, "instance_id", p.cfg.PumpInstanceID)
+		// Terminal failure: malformed data can never succeed
+		if termErr := p.cfg.Sessions.TerminalFailRunQueueEntry(ctx, leased.ID); termErr != nil {
+			slog.Error("run_queue_pump: terminal fail failed", "id", leased.ID, "err", termErr, "instance_id", p.cfg.PumpInstanceID)
 		}
 		return
 	}
 
-	// Execute the call (detached, not blocking this pump tick)
-	go p.executeEntry(ctx, leased, call.SessionID, call.Prompt, call.ProviderOptions)
-}
-
-// executeEntry runs a leased entry and handles success/failure.
-func (p *RunQueuePump) executeEntry(ctx context.Context, leased *RunQueueEntry, sessionID, prompt string, providerOptions map[string]any) {
-	// Create a fresh context for this execution (not tied to pump lifecycle)
-	execCtx := context.Background()
-
 	// Attempt to execute via coordinator.Run
-	_, err := p.cfg.Coordinator.Run(execCtx, sessionID, prompt, providerOptions)
+	_, err := p.cfg.Coordinator.Run(execCtx, callData)
 
 	// Handle outcome
 	if err == nil {

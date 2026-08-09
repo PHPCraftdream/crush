@@ -93,6 +93,24 @@ func TestSessionAgent_RestartOrphaned_RunsUnderFreshLock_NotUnprotected(t *testi
 	require.NoError(t, err)
 	require.NoError(t, precheck.Release())
 
+	// Since task #340 ROUND 3, restartOrphaned durably enqueues the call
+	// instead of running it inline — a session.RunQueuePump is the only
+	// thing that drains that queue. The pump's own execution still goes
+	// through sa.Run, which still acquires a fresh OS lock, so the "lock
+	// held while restart is in flight" assertion below remains valid; it
+	// just now happens via the pump instead of directly inside
+	// restartOrphaned's goroutine.
+	pumpCoord := &pumpTestCoordinator{sessionAgent: sa, dataDir: dataDir}
+	pump := session.NewRunQueuePump(session.RunQueuePumpConfig{
+		Sessions:       env.sessions,
+		DataDirectory:  dataDir,
+		Coordinator:    pumpCoord,
+		PumpInstanceID: "test-pump-restart-orphaned",
+		TestTick:       func() time.Duration { return 100 * time.Millisecond },
+	})
+	pump.Start()
+	t.Cleanup(pump.Stop)
+
 	// Exactly what drainOrReleaseMerged does for its `orphaned` return value.
 	sa.restartOrphaned([]SessionAgentCall{{
 		SessionID:       sess.ID,
@@ -226,6 +244,21 @@ func TestMailbox_DrainOrReleaseFinal_ThenAgentRestartsOrphaned_FullPath(t *testi
 	require.False(t, hasNext, "the original caller must not be told to keep running — lk is already released")
 	require.Equal(t, SessionAgentCall{}, next)
 	require.Len(t, orphaned, 1)
+
+	// Since task #340 ROUND 3, restartOrphaned durably enqueues the call
+	// instead of running it inline — see the sibling test above for why a
+	// pump here still preserves this test's "fresh lock held while in
+	// flight" assertion.
+	pumpCoord := &pumpTestCoordinator{sessionAgent: sa, dataDir: dataDir}
+	pump := session.NewRunQueuePump(session.RunQueuePumpConfig{
+		Sessions:       env.sessions,
+		DataDirectory:  dataDir,
+		Coordinator:    pumpCoord,
+		PumpInstanceID: "test-pump-restart-orphaned-fullpath",
+		TestTick:       func() time.Duration { return 100 * time.Millisecond },
+	})
+	pump.Start()
+	t.Cleanup(pump.Stop)
 
 	// Do exactly what drainOrReleaseMerged does with `orphaned`.
 	sa.restartOrphaned(orphaned)

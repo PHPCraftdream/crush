@@ -260,7 +260,7 @@ func TestRunQueue_PumpLifecycle_GracefulShutdown(t *testing.T) {
 // Helper: mock coordinator for testing
 type mockCoordinator struct{}
 
-func (m *mockCoordinator) Run(ctx context.Context, sessionID, prompt string, providerOptions map[string]any, attachments ...any) (*any, error) {
+func (m *mockCoordinator) Run(ctx context.Context, callData session.SessionAgentCallData) (*any, error) {
 	return nil, nil
 }
 

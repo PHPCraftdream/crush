@@ -25,6 +25,7 @@ import (
 	agent "github.com/charmbracelet/crush/internal/agent"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/message"
+	"github.com/charmbracelet/crush/internal/session"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -137,6 +138,14 @@ func (m *mockCoordinatorForShutdown) SetPersistentMode(persistent bool) {
 
 func (m *mockCoordinatorForShutdown) ResetAutoResumeCounter(sessionID string) {
 	panic("unexpected: Shutdown does not call ResetAutoResumeCounter")
+}
+
+func (m *mockCoordinatorForShutdown) RebuildSessionAgentCall(ctx context.Context, data session.SessionAgentCallData) (agent.SessionAgentCall, error) {
+	panic("unexpected: Shutdown does not call RebuildSessionAgentCall")
+}
+
+func (m *mockCoordinatorForShutdown) RunSessionAgentCall(ctx context.Context, call agent.SessionAgentCall) (*fantasy.AgentResult, error) {
+	panic("unexpected: Shutdown does not call RunSessionAgentCall")
 }
 
 // TestP1_5_ShutdownOrdering_CleanupWaitsForCancelAll proves the critical

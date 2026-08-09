@@ -285,6 +285,13 @@ type Coordinator interface {
 	// for a session. Called from the human send path so a human re-entering the
 	// loop re-arms autonomy.
 	ResetAutoResumeCounter(sessionID string)
+	// RebuildSessionAgentCall reconstructs a full SessionAgentCall from SessionAgentCallData
+	// for run queue pump execution (task #340, ROUND 3 migration).
+	RebuildSessionAgentCall(ctx context.Context, data session.SessionAgentCallData) (SessionAgentCall, error)
+	// RunSessionAgentCall executes a SessionAgentCall directly for run queue pump execution
+	// (task #340, ROUND 3 migration). This bypasses the normal buildCall path since the
+	// call is already fully reconstructed with all necessary data.
+	RunSessionAgentCall(ctx context.Context, call SessionAgentCall) (*fantasy.AgentResult, error)
 }
 
 type coordinator struct {
@@ -2212,114 +2219,187 @@ func (c *coordinator) InterruptAndSend(ctx context.Context, sessionID, prompt st
 // Cancelling the run when that context goes away would recreate the very
 // "accepted but never executed" outcome this exists to prevent.
 //
-// P0-2 fix: retries OS lock acquisition with bounded exponential backoff
-// (up to 5 attempts, 100-1600ms) when encountering SessionLockBusyError.
-// This handles the common cross-process race where the session was idle
-// but another process won the lock first (e.g., concurrent interrupt or
-// session inject). Transient contention is retried; persistent lock-holders
-// cause the run to error out after retries, which is safe because the
-// message already exists in the DB and will be picked up by the next
-// Run's preamble (if the session becomes idle) or by that active owner's
-// end-of-turn drain.
+// P0-2 fix (task #340, ROUND 3 migration): durably enqueues the call to the
+// run queue instead of retrying immediately. The pump will handle all retry
+// timing and crash recovery. This eliminates data loss risks from the previous
+// bounded retry approach and ensures every accepted call gets a guaranteed
+// runner (or explicit terminal failure).
 //
-// P0-2 fix (cross-process interrupt inject path): deletes the pending_injects
-// row at the START to prevent duplicate detached runs if the next tick fires
-// before this one completes. If the detached run fails even after all retries,
-// recreates the row so a future tick can retry.
+// For the interrupt inject path (InjectID non-empty), we still delete the
+// pending_injects row at START to prevent duplicate detached runs if the
+// pump picks up the same call before we return. If durable enqueue fails, we
+// recreate the row so a future tick can retry (P0-2).
 func (c *coordinator) startDetachedRun(ctx context.Context, call SessionAgentCall) {
-	runCtx := context.WithoutCancel(ctx)
-	go func() {
-		// P0-2 fix: delete the pending_injects row at the START to prevent
-		// duplicate detached runs. If this detached run fails even after
-		// retries, we'll recreate the row below.
-		if call.InjectID != "" {
-			slog.Debug("coordinator: detached run deleting pending_injects row at start",
+	// P0-2 fix: delete the pending_injects row at the START to prevent
+	// duplicate detached runs. If durable enqueue fails, we'll recreate it.
+	if call.InjectID != "" {
+		slog.Debug("coordinator: detached run deleting pending_injects row at start",
+			"inject_id", call.InjectID)
+		if delErr := c.sessions.DeleteInterruptInject(ctx, call.InjectID); delErr != nil {
+			slog.Error("coordinator: detached run failed to delete pending_injects row at start",
+				"inject_id", call.InjectID, "err", delErr)
+			// Continue anyway — row still exists, so duplicates may occur,
+			// but this is better than data loss.
+		} else {
+			slog.Debug("coordinator: detached run deleted pending_injects row at start",
 				"inject_id", call.InjectID)
-			if delErr := c.sessions.DeleteInterruptInject(runCtx, call.InjectID); delErr != nil {
-				slog.Error("coordinator: detached run failed to delete pending_injects row at start",
-					"inject_id", call.InjectID, "err", delErr)
-				// Continue anyway — row still exists, so duplicates may occur,
-				// but this is better than data loss.
-			} else {
-				slog.Debug("coordinator: detached run deleted pending_injects row at start",
-					"inject_id", call.InjectID)
-			}
 		}
+	}
 
-		// Retry loop for OS lock acquisition (P0-2 fix).
-		// Max 5 attempts: 100ms, 200ms, 400ms, 800ms, 1600ms.
-		const maxAttempts = 5
-		var lastErr error
-		for attempt := 0; attempt < maxAttempts; attempt++ {
-			if attempt > 0 {
-				// Bounded exponential backoff
-				backoff := 100 * time.Millisecond << (attempt - 1)
-				time.Sleep(backoff)
-			}
-			_, err := c.currentAgent.Run(runCtx, call)
-			if err == nil {
-				return // Success, nothing more to do
-			}
-			lastErr = err
-			// Check if this is an OS lock contention error worth retrying.
-			var busyErr *session.SessionLockBusyError
-			if errors.As(err, &busyErr) {
-				// Another process holds the lock. This is the transient race
-				// that P0-2 fixes: we raced another concurrent process for
-				// the idle session. Retry with backoff.
-				slog.Debug(
-					"coordinator: detached OS lock acquisition attempt failed (retrying)",
-					"session_id", call.SessionID,
-					"attempt", attempt+1,
-					"max_attempts", maxAttempts,
-					"err", err,
-				)
-				continue
-			}
-			// Non-contention error: persistent failure or the call was
-			// never valid in the first place. No point retrying.
-			break
-		}
-		// All retry attempts exhausted, or hit a non-retryable error.
-		// Check if the call was already attempted (i.e., user message persisted).
-		// If so, recreating the pending_injects row would cause duplicates — task #339 fix.
-		var alreadyAttempted *ErrCallAlreadyAttempted
-		if errors.As(lastErr, &alreadyAttempted) {
-			slog.Error("coordinator: detached run failed after retries — call already attempted, NOT recreating pending_injects row to avoid duplicates",
-				"session_id", call.SessionID, "err", lastErr)
-			return
-		}
-		// P0-2 fix: recreate the pending_injects row so a future tick can retry.
-		// This prevents data loss in the cross-process interrupt inject path.
-		// We generate a new ID to avoid UNIQUE constraint violations.
+	// Generate idempotency key: sessionID + timestamp ensures uniqueness
+	// For interrupt inject path, we can use the InjectID as part of the key
+	idempotencyKey := fmt.Sprintf("%s-%d", call.SessionID, time.Now().UnixNano())
+	if call.InjectID != "" {
+		idempotencyKey = fmt.Sprintf("%s-%s", call.SessionID, call.InjectID)
+	}
+
+	// Convert to SessionAgentCallData for serialization
+	callData := ToSessionAgentCallData(call)
+	callDataJSON, err := json.Marshal(callData)
+	if err != nil {
+		slog.Error("coordinator: failed to serialize call data for durable enqueue",
+			"session_id", call.SessionID, "err", err)
+		// For interrupt inject path, recreate the row to prevent data loss
 		if call.InjectID != "" && call.ExistingMessageID != "" {
-			slog.Debug("coordinator: all retries exhausted, attempting to recreate pending_injects row",
-				"inject_id", call.InjectID, "session_id", call.SessionID, "message_id", call.ExistingMessageID)
-			// Get the message content to recreate the row.
-			msg, getErr := c.messages.Get(runCtx, call.ExistingMessageID)
-			if getErr != nil {
-				slog.Error("coordinator: detached run failed to recreate pending_injects row (could not get message)",
-					"inject_id", call.InjectID, "message_id", call.ExistingMessageID, "err", getErr)
-			} else {
-				inject := session.PendingInject{
-					ID:        uuid.New().String(), // Generate new ID to avoid UNIQUE constraint
-					SessionID: call.SessionID,
-					MessageID: call.ExistingMessageID,
-					Content:   msg.FullText(),
-					Interrupt: true,
-				}
-				if createErr := c.sessions.CreatePendingInject(runCtx, inject); createErr != nil {
-					slog.Error("coordinator: detached run failed to recreate pending_injects row",
-						"inject_id", call.InjectID, "err", createErr)
-				} else {
-					slog.Debug("coordinator: detached run successfully recreated pending_injects row for future retry",
-						"new_inject_id", inject.ID, "old_inject_id", call.InjectID)
-				}
-			}
+			c.recreatePendingInjectRow(ctx, call)
 		}
-		slog.Error("coordinator: detached run for an idle-session interrupt failed after retries",
-			"session_id", call.SessionID, "err", lastErr)
-	}()
+		return
+	}
+
+	// Durably enqueue the call BEFORE returning control (P0-2 requirement)
+	// This ensures the call will eventually be executed even if this goroutine exits
+	if enqueueErr := c.sessions.EnqueueRunQueueEntry(ctx, idempotencyKey, call.SessionID, callDataJSON); enqueueErr != nil {
+		slog.Error("coordinator: failed to durably enqueue call for recovery",
+			"session_id", call.SessionID, "err", enqueueErr)
+		// For interrupt inject path, recreate the row so a future tick can retry
+		if call.InjectID != "" && call.ExistingMessageID != "" {
+			c.recreatePendingInjectRow(ctx, call)
+		}
+		slog.Error("coordinator: durable enqueue failed, recreated pending_injects row for future retry",
+			"session_id", call.SessionID, "inject_id", call.InjectID)
+		return
+	}
+
+	slog.Debug("coordinator: durably enqueued call for pump recovery",
+		"session_id", call.SessionID, "idempotency_key", idempotencyKey, "inject_id", call.InjectID)
+}
+
+// recreatePendingInjectRow recreates a pending_injects row for future retry
+// (helper for startDetachedRun error path, P0-2 fix).
+func (c *coordinator) recreatePendingInjectRow(ctx context.Context, call SessionAgentCall) {
+	slog.Debug("coordinator: attempting to recreate pending_injects row",
+		"inject_id", call.InjectID, "session_id", call.SessionID, "message_id", call.ExistingMessageID)
+	// Get the message content to recreate the row.
+	msg, getErr := c.messages.Get(ctx, call.ExistingMessageID)
+	if getErr != nil {
+		slog.Error("coordinator: failed to recreate pending_injects row (could not get message)",
+			"inject_id", call.InjectID, "message_id", call.ExistingMessageID, "err", getErr)
+		return
+	}
+	inject := session.PendingInject{
+		ID:        uuid.New().String(), // Generate new ID to avoid UNIQUE constraint
+		SessionID: call.SessionID,
+		MessageID: call.ExistingMessageID,
+		Content:   msg.FullText(),
+		Interrupt: true,
+	}
+	if createErr := c.sessions.CreatePendingInject(ctx, inject); createErr != nil {
+		slog.Error("coordinator: failed to recreate pending_injects row",
+			"inject_id", call.InjectID, "err", createErr)
+	} else {
+		slog.Debug("coordinator: successfully recreated pending_injects row for future retry",
+			"new_inject_id", inject.ID, "old_inject_id", call.InjectID)
+	}
+}
+
+// RebuildSessionAgentCall reconstructs a full SessionAgentCall from SessionAgentCallData
+// for run queue pump execution (task #340, ROUND 3 migration).
+//
+// It reconstructs the live Model objects (with fantasy.LanguageModel and CatwalkCfg)
+// from the serialized ModelCfg using the coordinator's provider configs and catwalk registry.
+// ProviderOptions/Temperature/TopP/TopK/FrequencyPenalty/PresencePenalty are NOT
+// reconstructed here — they are pure functions of (Model, ProviderConfig) computed
+// via mergeCallOptions during normal execution path.
+func (c *coordinator) RebuildSessionAgentCall(ctx context.Context, data session.SessionAgentCallData) (SessionAgentCall, error) {
+	var largeModel, smallModel Model
+	var err error
+
+	// Determine which models to rebuild
+	var largeCfg, smallCfg config.SelectedModel
+	if data.LargeModel != nil {
+		largeCfg = fromSessionModelCfg(*data.LargeModel)
+	} else {
+		// Use default config for large model
+		largeCfg = c.cfg.Config().Models[config.SelectedModelTypeLarge]
+	}
+
+	if data.SmallModel != nil {
+		smallCfg = fromSessionModelCfg(*data.SmallModel)
+	} else {
+		// Use default config for small model
+		smallCfg = c.cfg.Config().Models[config.SelectedModelTypeSmall]
+	}
+
+	// Build both models (buildModelsFromCfg requires both)
+	largeModel, smallModel, err = c.buildModelsFromCfg(ctx, largeCfg, smallCfg, false)
+	if err != nil {
+		return SessionAgentCall{}, fmt.Errorf("failed to rebuild models from config: %w", err)
+	}
+
+	// sessionAgent.Run reads ProviderOptions/Temperature/TopP/TopK/FrequencyPenalty/
+	// PresencePenalty directly off the call (agent.go's fantasy.AgentStreamCall
+	// construction) — it does NOT recompute them from LargeModel itself. Every
+	// other call-site populates these via mergeCallOptions before the call ever
+	// reaches Run, so we must do the same here or every durably-recovered call
+	// silently loses its provider options and sampling knobs.
+	largeProviderCfg, _ := c.cfg.Config().Providers.Get(largeModel.ModelCfg.Provider)
+	providerOptions, temp, topP, topK, freqPenalty, presPenalty := mergeCallOptions(largeModel, largeProviderCfg)
+
+	return SessionAgentCall{
+		SessionID:            data.SessionID,
+		Prompt:               data.Prompt,
+		Attachments:          data.Attachments,
+		ProviderOptions:      providerOptions,
+		MaxOutputTokens:      data.MaxOutputTokens,
+		Temperature:          temp,
+		TopP:                 topP,
+		TopK:                 topK,
+		FrequencyPenalty:     freqPenalty,
+		PresencePenalty:      presPenalty,
+		NonInteractive:       data.NonInteractive,
+		SystemPromptOverride: data.SystemPromptOverride,
+		MaxCost:              data.MaxCost,
+		MaxTokens:            data.MaxTokens,
+		ExistingMessageID:    data.ExistingMessageID,
+		InjectID:             data.InjectID,
+		LargeModel:           &largeModel,
+		SmallModel:           &smallModel,
+		SystemPromptPrefix:   data.SystemPromptPrefix,
+		SystemPrompt:         data.SystemPrompt,
+	}, nil
+}
+
+// RunSessionAgentCall executes a SessionAgentCall directly for run queue pump execution
+// (task #340, ROUND 3 migration). This bypasses the normal buildCall path since the
+// call is already fully reconstructed with all necessary data.
+func (c *coordinator) RunSessionAgentCall(ctx context.Context, call SessionAgentCall) (*fantasy.AgentResult, error) {
+	if err := c.readyWg.Wait(); err != nil {
+		return nil, err
+	}
+
+	sessionID := call.SessionID
+
+	// Interrupt-inject ticker: watches pending_injects for interrupt=true rows
+	// written by `crush sessions inject --interrupt` in another process, and
+	// (on the first hit) cancels the running turn and requeues the referenced
+	// message so it picks up immediately. Bound to this turn's lifetime via
+	// tickerCtx — stopped by the defer as soon as run() returns, so no
+	// idle-process polling.
+	tickerCtx, stopTicker := context.WithCancel(ctx)
+	defer stopTicker()
+	c.startInterruptTicker(tickerCtx, sessionID)
+
+	return c.currentAgent.Run(ctx, call)
 }
 
 // InjectMessage — see Coordinator interface.

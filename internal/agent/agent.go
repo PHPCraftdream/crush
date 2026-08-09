@@ -1035,110 +1035,82 @@ func (a *sessionAgent) restartOrphaned(calls []SessionAgentCall) {
 	for _, call := range calls {
 		call := call
 		go func() {
-			if _, err := a.Run(context.Background(), call); err != nil {
-				slog.Error("agent: detached restart for a call orphaned by a concurrent session-lock release failed",
+			// Generate idempotency key: sessionID + timestamp ensures uniqueness
+			idempotencyKey := fmt.Sprintf("%s-%d", call.SessionID, time.Now().UnixNano())
+
+			// Convert to SessionAgentCallData for serialization
+			callData := ToSessionAgentCallData(call)
+			callDataJSON, err := json.Marshal(callData)
+			if err != nil {
+				slog.Error("agent: failed to serialize call data for durable enqueue",
 					"session_id", call.SessionID, "err", err)
+				return
 			}
+
+			// Durably enqueue the call BEFORE returning control (P0-2 requirement)
+			// This ensures the call will eventually be executed even if this goroutine exits
+			if enqueueErr := a.sessions.EnqueueRunQueueEntry(context.Background(), idempotencyKey, call.SessionID, callDataJSON); enqueueErr != nil {
+				slog.Error("agent: failed to durably enqueue call for recovery",
+					"session_id", call.SessionID, "err", enqueueErr)
+				// Fallback: try in-memory queue (data loss risk, but better than nothing)
+				a.getMailbox(call.SessionID).queue(call)
+				slog.Error("agent: durable enqueue failed, using in-memory fallback (data loss risk)",
+					"session_id", call.SessionID)
+				return
+			}
+
+			slog.Debug("agent: durably enqueued call for pump recovery",
+				"session_id", call.SessionID, "idempotency_key", idempotencyKey)
 		}()
 	}
 }
 
-// restartOrphanedWithRetry starts one independent, detached a.Run call per entry
-// in calls with OS lock retry on SessionLockBusyError (P0-2 fix). This is the
-// sessionAgent-level equivalent of coordinator.startDetachedRun (P0-B), needed
-// here because drainOrReleaseMerged/drainOrReleaseFinal have no access to a
-// *coordinator (agent and coordinator are separate layers; coordinator wraps
-// sessionAgent, not the other way around).
+// restartOrphanedWithRetry durably enqueues calls for recovery by the run queue pump
+// (task #340, ROUND 3 migration). This replaces the previous in-memory retry approach.
 //
-// Unlike the old restartOrphaned (which accepted a single lost race as final),
-// this version retries OS lock acquisition with bounded exponential backoff:
-// up to 5 attempts, starting at 100ms and doubling each time (max 1.6s total).
-// This handles the common cross-process race where the old lock was just
-// released and another process wins the first acquisition attempt. Transient
-// contention is retried; persistent lock-holders (another crush process actively
-// running this session) cause the run to error out and abandonOwnershipWithHandoff's
-// caller will have already left the call durably queued for that owner.
+// Each call is enqueued to the durable session_run_queue table with an idempotency key
+// derived from the session ID and a timestamp. The pump will retry the call until it
+// succeeds or encounters a terminal failure (e.g., ErrCallAlreadyAttempted).
 //
-// Each call gets its OWN goroutine and its own context.Background(): the
-// caller (drainOrReleaseMerged, called from runTurn, called from Run's turn
-// loop) is about to return control up its own call stack, possibly all the
-// way out of Run() entirely — there is no request-scoped ctx left in scope
-// whose cancellation would be meaningful to inherit, and even if there were,
-// cancelling it would recreate the exact "accepted but never executed"
-// outcome startDetachedRun's own doc warns against. a.Run performs its own
-// full acquisition (mailbox.submit + a fresh session.TryAcquireSessionLock)
-// for each one — none of these reuse the lk that drainOrReleaseFinal already
-// released; see drainOrReleaseFinal's own doc for why reusing it is exactly
-// the bug this function exists to close.
+// The caller (drainOrReleaseMerged, called from runTurn, called from Run's turn loop)
+// is about to return control up its own call stack, possibly all the way out of Run()
+// entirely. Durability via the run queue is critical here — the pump lives independently
+// of any request/turn and will continue retrying after this goroutine exits.
 //
-// Losing a race to a concurrent Run() that claims the mailbox first is safe
-// and needs no coordination (same reasoning as startDetachedRun's doc): if
-// another owner appeared between orphaning and this call's own submit(), this
-// call's submit() simply queues behind that new owner instead of becoming
-// owner itself, and that owner's own end-of-turn drain picks it up. The one
-// outcome that cannot happen is the call going unrun.
+// This replaces the old retry loop (5 attempts with backoff) with a single durable
+// enqueue operation. The pump's 3-second tick interval handles all retry timing,
+// and its lease TTL (30 seconds) handles crash recovery.
 func (a *sessionAgent) restartOrphanedWithRetry(calls []SessionAgentCall) {
 	for _, call := range calls {
 		call := call
 		go func() {
-			// Retry loop for OS lock acquisition (P0-2 fix).
-			// Max 5 attempts: 100ms, 200ms, 400ms, 800ms, 1600ms.
-			const maxAttempts = 5
-			var lastErr error
-			for attempt := 0; attempt < maxAttempts; attempt++ {
-				if attempt > 0 {
-					// Bounded exponential backoff
-					backoff := 100 * time.Millisecond << (attempt - 1)
-					time.Sleep(backoff)
-				}
-				_, err := a.Run(context.Background(), call)
-				if err == nil {
-					return // Success, nothing more to do
-				}
-				lastErr = err
-				// Check if this is an OS lock contention error worth retrying.
-				var busyErr *session.SessionLockBusyError
-				if errors.As(err, &busyErr) {
-					// Another process holds the lock. This is the transient race
-					// that P0-2 fixes: the old lock was just released and we're
-					// racing other restartOrphanedWithRetry calls or a concurrent
-					// process for reacquisition. Retry with backoff.
-					slog.Debug(
-						"agent: detached OS lock acquisition attempt failed (retrying)",
-						"session_id", call.SessionID,
-						"attempt", attempt+1,
-						"max_attempts", maxAttempts,
-						"err", err,
-					)
-					continue
-				}
-				// Non-contention error: persistent failure or the call was
-				// never valid in the first place. No point retrying.
-				break
-			}
-			// All retry attempts exhausted, or hit a non-retryable error.
-			// Check if the call was already attempted (i.e., user message persisted).
-			// If so, requeuing would cause duplicates — task #339 fix.
-			var alreadyAttempted *ErrCallAlreadyAttempted
-			if errors.As(lastErr, &alreadyAttempted) {
-				slog.Error("agent: detached restart for a call orphaned by a concurrent session-lock release failed — call already attempted, NOT requeuing to avoid duplicates",
-					"session_id", call.SessionID, "err", lastErr)
+			// Generate idempotency key: sessionID + timestamp ensures uniqueness
+			// while allowing retries of the same logical call if needed
+			idempotencyKey := fmt.Sprintf("%s-%d", call.SessionID, time.Now().UnixNano())
+
+			// Convert to SessionAgentCallData for serialization
+			callData := ToSessionAgentCallData(call)
+			callDataJSON, err := json.Marshal(callData)
+			if err != nil {
+				slog.Error("agent: failed to serialize call data for durable enqueue",
+					"session_id", call.SessionID, "err", err)
 				return
 			}
-			// The call was never durably queued (it never went through mb.submit),
-			// because tryReserveSession made it the immediate owner. Queue it now
-			// to prevent data loss (P0-2). Future Run() calls for this session
-			// will pick it up from mb.submitted.
-			// Residual risk: if no future Run() ever arrives for this session,
-			// the queued call will sit in mb.submitted forever. This is an
-			// improvement over the old behavior (call disappears after ~1.6s),
-			// but not a full durable guarantee like a persisted run queue with
-			// claim/lease/ack. The alternative would require significant
-			// architectural changes (database schema, service interfaces), which
-			// is outside this fix's scope.
-			a.getMailbox(call.SessionID).queue(call)
-			slog.Error("agent: detached restart for a call orphaned by a concurrent session-lock release failed after retries — call queued for future Run()",
-				"session_id", call.SessionID, "err", lastErr)
+
+			// Durably enqueue the call BEFORE returning control (P0-2 requirement)
+			// This ensures the call will eventually be executed even if this goroutine exits
+			if enqueueErr := a.sessions.EnqueueRunQueueEntry(context.Background(), idempotencyKey, call.SessionID, callDataJSON); enqueueErr != nil {
+				slog.Error("agent: failed to durably enqueue call for recovery",
+					"session_id", call.SessionID, "err", enqueueErr)
+				// Fallback: try in-memory queue (data loss risk, but better than nothing)
+				a.getMailbox(call.SessionID).queue(call)
+				slog.Error("agent: durable enqueue failed, using in-memory fallback (data loss risk)",
+					"session_id", call.SessionID)
+				return
+			}
+
+			slog.Debug("agent: durably enqueued call for pump recovery",
+				"session_id", call.SessionID, "idempotency_key", idempotencyKey)
 		}()
 	}
 }
