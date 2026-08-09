@@ -21,6 +21,14 @@ import (
 // artificial blocking behavior into clearHolderMetadata, proving the critical
 // invariant: unlockFile + Close happen BEFORE clearHolderMetadata, not after.
 //
+// P0 fix note: With the background cleanup fix, Release() returns immediately
+// after unlock/close, but the invariant being tested here is still valid: the
+// unlock/close happen BEFORE the cleanup goroutine even starts.
+//
+// NOTE: This test is NOT parallel because it mutates the package-global
+// clearHolderMetadataFn seam, which would create a data race with other
+// parallel tests doing the same. See task #345 for the architectural fix.
+//
 // REVERT CHECK PROCEDURE:
 //  1. In lock.go:~296, restore the old order by moving clearHolderMetadataFn(l.Path)
 //     to BEFORE unlockFile(l.f) and BEFORE f.Close():
@@ -32,8 +40,6 @@ import (
 //  3. The test will FAIL because second TryAcquireSessionLock fails while clearHolderMetadata is blocked
 //  4. Restore the fix (unlockFile first, then close, then clearHolderMetadataFn) and the test will PASS.
 func TestP1_2_ReleaseUnlocksBeforeMetadataCleanup_Hang(t *testing.T) {
-	t.Parallel()
-
 	tmpDir := t.TempDir()
 	sessionID := "test-session-p1-2-hang"
 
@@ -70,20 +76,34 @@ func TestP1_2_ReleaseUnlocksBeforeMetadataCleanup_Hang(t *testing.T) {
 		close(releaseDone)
 	}()
 
-	// Wait for Release() to start (reach the blocking clearHolderMetadataFn).
-	deadline := time.After(5 * time.Second)
+	// Wait for Release() to return (P0 fix: it returns immediately, before cleanup).
+	releaseReturned := make(chan struct{})
+	go func() {
+		<-releaseDone
+		close(releaseReturned)
+	}()
+
+	select {
+	case <-releaseReturned:
+		// Expected: Release returns quickly even though cleanup is blocked.
+	case <-time.After(100 * time.Millisecond):
+		require.Fail(t, "Release() should return within 100ms even with blocked cleanup")
+	}
+
+	// Wait for cleanup to start (proves goroutine was spawned).
+	deadline := time.After(2 * time.Second)
 	for !releaseStarted.Load() {
 		select {
 		case <-deadline:
-			require.Fail(t, "Release() did not reach clearHolderMetadataFn within 5 seconds")
+			require.Fail(t, "cleanup goroutine did not start within 2 seconds")
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
 
-	// At this point, Release() has called unlockFile and Close, but is BLOCKED
-	// in clearHolderMetadataFn. The critical invariant is that unlockFile/Close happened
-	// BEFORE the block. We prove this by trying to acquire the lock from a second
-	// goroutine - if unlockFile already happened, this should succeed.
+	// At this point, Release() has called unlockFile and Close, but the cleanup
+	// goroutine is BLOCKED in clearHolderMetadataFn. The critical invariant is that
+	// unlockFile/Close happened BEFORE the block. We prove this by trying to acquire
+	// the lock from a second goroutine - if unlockFile already happened, this should succeed.
 	acquireSuccess := make(chan struct{})
 	var lk2 *SessionLock
 
@@ -106,16 +126,20 @@ func TestP1_2_ReleaseUnlocksBeforeMetadataCleanup_Hang(t *testing.T) {
 	// Now unblock clearHolderMetadataFn so Release() can complete.
 	close(releaseBlocker)
 
-	// Wait for Release() to complete.
-	select {
-	case <-releaseDone:
-		// Expected: Release completes after unblocking.
-	case <-time.After(2 * time.Second):
-		require.Fail(t, "Release should complete within 2 seconds after unblocking clearHolderMetadataFn")
+	// Wait for cleanup to complete.
+	deadline = time.After(2 * time.Second)
+	for !releaseCompleted.Load() {
+		select {
+		case <-deadline:
+			require.Fail(t, "cleanup should complete within 2 seconds after unblocking")
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
 
-	// Verify that clearHolderMetadataFn actually ran.
-	require.True(t, releaseCompleted.Load(), "clearHolderMetadataFn should have completed")
+	// Clean up lk2 to avoid Windows file handle conflicts.
+	if lk2 != nil {
+		_ = lk2.Release()
+	}
 
 	// Clean up.
 	if lk2 != nil {
@@ -164,14 +188,16 @@ func TestP1_2_ReleaseUnlocksBeforeMetadataCleanup(t *testing.T) {
 	// Release should complete quickly (not hang on metadata cleanup).
 	require.Less(t, releaseDuration, 5*time.Second, "Release should not hang for more than 5 seconds")
 
-	// Now acquire the lock again - this proves the OS lock was released and
-	// the file descriptor was closed (otherwise this would fail).
-	lk2, err := TryAcquireSessionLock(tmpDir, sessionID)
-	require.NoError(t, err, "second acquire should succeed after Release completes")
-	require.NotNil(t, lk2, "second lock should not be nil")
-
-	// Clean up.
-	require.NoError(t, lk2.Release())
+	// With the P0 fix (cleanup holds lock through entire operation), we need
+	// to wait for cleanup to complete before trying to reacquire.
+	require.Eventually(t, func() bool {
+		lk2, err := TryAcquireSessionLock(tmpDir, sessionID)
+		if err == nil && lk2 != nil {
+			_ = lk2.Release()
+			return true
+		}
+		return false
+	}, 2*time.Second, 10*time.Millisecond, "second acquire should eventually succeed after cleanup completes")
 }
 
 // TestP1_2_ReleaseIdempotentWithHungCleanup verifies that calling Release()
@@ -226,10 +252,13 @@ func TestP1_2_ReleaseClosesFileDescriptor(t *testing.T) {
 	_, err = os.Stat(lk1.Path)
 	require.NoError(t, err, "lock file should still exist after release")
 
-	// Acquire the lock again - this proves the OS lock was released and
-	// the file descriptor was closed (otherwise the second acquire would fail).
-	lk2, err := TryAcquireSessionLock(tmpDir, sessionID)
-	require.NoError(t, err, "second acquire should succeed")
+	// With the P0 fix (cleanup holds lock through entire operation), we need
+	// to wait for cleanup to complete before trying to reacquire.
+	var lk2 *SessionLock
+	require.Eventually(t, func() bool {
+		lk2, err = TryAcquireSessionLock(tmpDir, sessionID)
+		return err == nil && lk2 != nil
+	}, 2*time.Second, 10*time.Millisecond, "second acquire should eventually succeed after cleanup completes")
 	require.NotNil(t, lk2)
 
 	// Clean up.
@@ -274,11 +303,92 @@ func TestP1_2_ConcurrentReleaseDoesNotDeadlock(t *testing.T) {
 	}
 }
 
+// TestP0_ReleaseReturnsImmediatelyDuringHungCleanup proves that Release()
+// returns control to the caller immediately after unlock/close, even if
+// metadata cleanup is blocked forever. This is the critical fix for the
+// FREEZE mechanism: the mailbox state machine can transition to mbIdle
+// without waiting for potentially-infinite filesystem I/O.
+//
+// NOTE: This test is NOT parallel because it mutates the package-global
+// clearHolderMetadataFn seam, which would create a data race with other
+// parallel tests doing the same. See task #345 for the architectural fix.
+//
+// REVERT CHECK PROCEDURE:
+//  1. In lock.go Release(), change "go clearHolderMetadataFn(path)" back to
+//     "clearHolderMetadataFn(l.Path)" (remove the "go " keyword).
+//  2. Run: go test ./internal/session -run TestP0_ReleaseReturnsImmediatelyDuringHungCleanup -v
+//  3. The test will FAIL because Release() does not return while cleanup is blocked.
+//  4. Restore the fix (add "go " back) and the test will PASS.
+func TestP0_ReleaseReturnsImmediatelyDuringHungCleanup(t *testing.T) {
+	tmpDir := t.TempDir()
+	sessionID := "test-session-p0-freeze-fix"
+
+	// Acquire the first lock.
+	lk1, err := TryAcquireSessionLock(tmpDir, sessionID)
+	require.NoError(t, err, "first TryAcquireSessionLock should succeed")
+	require.NotNil(t, lk1)
+
+	// Inject a FOREVER-blocking version of clearHolderMetadataFn.
+	// It will block on cleanupBlocker channel and NEVER unblock.
+	var cleanupStarted atomic.Bool
+	cleanupBlocker := make(chan struct{}) // Never closed
+	clearHolderMetadataOriginal := clearHolderMetadataFn
+
+	clearHolderMetadataFn = func(path string) {
+		cleanupStarted.Store(true)
+		<-cleanupBlocker // Block forever - this simulates hung FS/AV/SMB
+		clearHolderMetadataOriginal(path)
+	}
+	defer func() {
+		clearHolderMetadataFn = clearHolderMetadataOriginal
+	}()
+
+	// Call Release() and measure how long it takes.
+	// CRITICAL: It should return IMMEDIATELY (within 100ms), not wait for cleanup.
+	releaseStart := time.Now()
+	releaseErr := lk1.Release()
+	releaseDuration := time.Since(releaseStart)
+
+	require.NoError(t, releaseErr, "Release should succeed")
+	require.Less(t, releaseDuration, 100*time.Millisecond,
+		"Release() should return immediately even with hung cleanup, got %v", releaseDuration)
+
+	// Verify that cleanup goroutine actually started (proves the "go" keyword is there).
+	deadline := time.After(2 * time.Second)
+	for !cleanupStarted.Load() {
+		select {
+		case <-deadline:
+			require.Fail(t, "cleanup goroutine did not start within 2 seconds")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	// CRITICAL PROOF: Even though cleanup is blocked forever, the OS lock
+	// is already free. Another process can acquire it.
+	lk2, err := TryAcquireSessionLock(tmpDir, sessionID)
+	require.NoError(t, err, "second acquire should succeed while first cleanup is blocked")
+	require.NotNil(t, lk2)
+
+	// Verify the second owner's PID is correctly written.
+	pid := ReadLockPID(lk2.Path)
+	require.Equal(t, lk2.HolderPID, pid, "second lock should have its own PID")
+
+	// Cleanup the second lock.
+	require.NoError(t, lk2.Release())
+
+	// Note: We don't unblock cleanupBlocker because it's meant to block forever.
+	// The goroutine will be GC'd when the test completes. This is fine for a test.
+}
+
 // TestP1_2_ReleaseClearsMetadata verifies that Release() does attempt to clear
 // metadata (PID, sidecar) even if the file is reopened for that purpose.
 // We can verify this by checking that the lock file is empty after release.
+//
+// NOTE: With the P0 fix (background cleanup), this test now checks that
+// cleanup EVENTUALLY happens, not that it happens before Release() returns.
+// We need to wait for the background goroutine to complete.
 func TestP1_2_ReleaseClearsMetadata(t *testing.T) {
-	t.Parallel()
+	// Not parallel - depends on clean global seam state
 
 	tmpDir := t.TempDir()
 	sessionID := "test-session-p1-2-metadata-clear"
@@ -294,9 +404,12 @@ func TestP1_2_ReleaseClearsMetadata(t *testing.T) {
 	// Release the lock.
 	require.NoError(t, lk.Release())
 
-	// Verify the lock file is now empty (PID cleared).
-	pid = ReadLockPID(lk.Path)
-	require.Equal(t, 0, pid, "lock file should have PID 0 after release")
+	// With background cleanup, we need to wait a bit for the goroutine to complete.
+	// Give it 2 seconds - cleanup should be very fast on a local tmpdir.
+	require.Eventually(t, func() bool {
+		pid := ReadLockPID(lk.Path)
+		return pid == 0
+	}, 2*time.Second, 10*time.Millisecond, "lock file should have PID 0 after release")
 
 	// Verify the sidecar file is gone.
 	sidecarPath := pidSidecarPath(lk.Path)

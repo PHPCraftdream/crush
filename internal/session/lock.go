@@ -251,22 +251,31 @@ func acquireSessionLockFile(path string) (*SessionLock, error) {
 // Release stops the heartbeat, unlocks and closes the lock file.
 // Safe to call on nil. Idempotent and concurrency-safe.
 //
-// P1-2 fix (2026-08-09): The order of operations is now:
+// P0 fix (2026-08-09): The order of operations is now:
 //  1. Stop the heartbeat goroutine (close(l.stop)).
 //  2. Unlock the OS-level lock (unlockFile) - this is the critical correctness-critical step.
 //  3. Close the file descriptor (f.Close).
 //  4. Clear diagnostic metadata (clearHolderMetadata) - best-effort cleanup that can hang.
+//     IMPORTANT: This now runs in a BACKGROUND goroutine. The function returns
+//     immediately after unlock/close, ensuring that callers (mailbox state machine)
+//     are not blocked by potentially-infinite filesystem I/O.
 //
 // The old order (clear metadata BEFORE unlock/close) meant that a hung filesystem,
 // AV scan, or SMB share during clearHolderMetadata (Truncate/Seek/Sync/Remove) would
 // prevent the OS lock from ever being released, wedging the session forever.
 //
-// The new order prioritizes releasing the OS lock AND closing the file descriptor BEFORE
-// any diagnostic cleanup that can hang. If clearHolderMetadata hangs after close, the OS
-// lock is already gone and the file descriptor is already closed - no session wedged state,
-// no resource leak. The only downside is that clearHolderMetadata must now operate on a
-// closed file, so we pass only the path (not the open file handle) and let it reopen
-// the file just for the metadata operations.
+// Even after the P1-2 reordering (unlock/close first, THEN cleanup), Release() still
+// waited synchronously for cleanup to complete before returning. This meant that
+// if cleanup hung, the mailbox state machine would be stuck in mbReleasing state
+// forever - no new owner could take over, even though the OS lock was already free.
+//
+// The new order prioritizes releasing the OS lock AND closing the file descriptor AND
+// returning control to the caller BEFORE any diagnostic cleanup that can hang. If
+// clearHolderMetadata hangs in the background, the OS lock is already gone, the file
+// descriptor is already closed, and the mailbox has already transitioned to mbIdle -
+// no session wedged state, no resource leak. The only downside is that clearHolderMetadata
+// must now operate on a closed file, so we pass only the path (not the open file handle)
+// and let it reopen the file just for the metadata operations.
 //
 // Before actually unlocking, it wipes the PID it stamped into both the
 // primary lock file and the sidecar (see clearHolderMetadata). This
@@ -279,6 +288,10 @@ func acquireSessionLockFile(path string) (*SessionLock, error) {
 // process. The lock FILE itself is deliberately left in place — see
 // acquireSessionLockFile and the package doc for why unlinking the path
 // is unsafe/unnecessary; only its content is cleared.
+//
+// Data race safety: The background goroutine captures `path` by value, so there's
+// no race on `l.Path` even if `l` is garbage-collected after Release() returns.
+// The sync.Once ensures the release body (including goroutine spawn) runs at most once.
 func (l *SessionLock) Release() error {
 	if l == nil {
 		return nil
@@ -289,7 +302,7 @@ func (l *SessionLock) Release() error {
 			close(l.stop)
 		}
 		if l.f != nil {
-			// P1-2 fix: unlock and close FIRST, before any diagnostic cleanup that can hang.
+			// P0 fix: unlock and close FIRST, before any diagnostic cleanup that can hang.
 			// The OS lock and file descriptor are the correctness-critical resources -
 			// releasing/closing them is the priority. Metadata cleanup is best-effort.
 			unlockErr := unlockFile(l.f)
@@ -299,15 +312,21 @@ func (l *SessionLock) Release() error {
 			} else if closeErr != nil {
 				releaseErr = closeErr
 			}
+
+			// Capture path by value for the background goroutine.
+			path := l.Path
+
 			// Clear diagnostic metadata (best-effort, may hang on slow FS/AV/SMB).
-			// This runs AFTER unlockFile and Close, so a hang here does NOT block
-			// lock release or leak file descriptors. We pass only the path since
-			// the file is already closed; clearHolderMetadataFn will reopen if needed.
+			// This runs AFTER unlockFile and Close in a BACKGROUND goroutine, so:
+			//   - A hang here does NOT block Release() from returning.
+			//   - A hang here does NOT block mailbox state transition (caller sees mbIdle immediately).
+			//   - The OS lock is already free for new owners to acquire.
 			//
-			// clearHolderMetadataFn is a test seam (package-level var) so tests can
-			// inject blocking behavior to prove unlock/close happen before metadata
-			// cleanup (see TestP1_2_ReleaseUnlocksBeforeMetadataCleanup_Hang).
-			clearHolderMetadataFn(l.Path)
+			// We pass only the path since the file is already closed; clearHolderMetadataFn
+			// will reopen if needed. clearHolderMetadataFn is a test seam (package-level var)
+			// so tests can inject blocking behavior to prove unlock/close happen before
+			// metadata cleanup.
+			go clearHolderMetadataFn(path)
 		}
 	})
 	return releaseErr
@@ -362,6 +381,37 @@ func (l *SessionLock) RecordActivity() {
 // posture as writePIDSidecar) and must never block Release from
 // actually unlocking/closing the file — a stuck holder that can't be
 // released would be strictly worse than a stale PID left on disk.
+//
+// P0 fix (2026-08-09): a "reacquire and check before truncating" guard
+// (attempt a non-blocking tryLockFile; skip cleanup if someone else holds
+// it) was tried here to narrow the clobber window described above, and
+// reverted. Even that minimal check — tryLockFile immediately followed by
+// unlockFile, no held duration at all in the common case — was enough,
+// under real Go-scheduler contention (many parallel goroutines/tests
+// competing for CPU), to occasionally delay the background goroutine's
+// syscalls long enough to collide with a caller's own fast re-acquire of
+// the SAME session id it just released: internal/agent's retry loops
+// (restartOrphanedWithRetry/startDetachedRun, 100-800ms backoff) and
+// several of its pre-existing tests (mailbox_lock_test.go,
+// run_defer_wedge_test.go, run_legacy_queue_reclaim_test.go,
+// run_queue_drain_test.go, compact_lock_test.go) assert that the OS lock
+// is reacquirable essentially immediately once Release() returns, with no
+// grace period — and under load, this repeatedly reproduced real, not
+// flaky-in-isolation, self-collisions where a caller's own next acquire
+// attempt observed SessionLockBusyError against ITS OWN prior release's
+// background cleanup goroutine, not a genuine external holder. That is a
+// worse regression than the narrow clobber window it was meant to close.
+//
+// So this function is intentionally unconditional: it never re-touches the
+// OS lock at all, only the plain Truncate/Remove file operations below,
+// matching this package's stated philosophy that the OS lock alone is the
+// source of truth for ownership (see the package doc on SessionLock) —
+// stale metadata here is a narrow, accepted, cosmetic risk (a `sessions
+// kill`/`sessions why` reader could briefly see a just-released holder's
+// old PID), never a correctness one: nothing downstream trusts this
+// metadata for a destructive decision without independently re-probing the
+// real OS lock first (see sessions_kill.go's probeThenKillHolder and its
+// final lockHolderProvablyDead re-check immediately before removal).
 func clearHolderMetadata(path string) {
 	// Reopen the file just for metadata operations.
 	f, err := os.OpenFile(path, os.O_RDWR, 0o644)

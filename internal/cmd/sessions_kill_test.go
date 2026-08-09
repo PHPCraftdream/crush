@@ -142,7 +142,15 @@ func TestProbeThenKillHolder_StalePIDNotKilled(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, lk.Release())
 
+	// With background cleanup (P0 fix), we need to wait for the cleanup
+	// goroutine to complete before we directly write to the lock file.
+	// Otherwise, cleanup still holds the OS lock and os.WriteFile fails
+	// with "another process has locked a portion of the file" on Windows.
 	lockPath := filepath.Join(dataDir, "locks", "session-stale-pid-id.lock")
+	require.Eventually(t, func() bool {
+		return session.ReadLockPID(lockPath) == 0
+	}, 2*time.Second, 10*time.Millisecond, "cleanup should complete before simulating stale PID")
+
 	require.NoError(t, os.WriteFile(lockPath, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0o644))
 
 	kr := probeThenKillHolder(dataDir, "stale-pid-id", os.Getpid(), time.Second)

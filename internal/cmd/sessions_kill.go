@@ -120,6 +120,18 @@ func sessionsKillCmdRun(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("could not confirm the lock holder is dead; lock file left in place at %s", lockPath)
 	}
 
+	// If the probe above took the "already dead" branch (probeThenKillHolder's
+	// own TryAcquireSessionLock+Release), that Release() returns as soon as
+	// its synchronous unlock/close finish (session.SessionLock's Mechanism-1
+	// fix) — its background metadata-cleanup goroutine can still briefly hold
+	// the OS lock (re-acquired for a Truncate/Sync) afterward. Without
+	// waiting for it to settle, the SECOND probe immediately below could
+	// spuriously observe SessionLockBusyError against our OWN prior release,
+	// not a genuine new holder, and wrongly refuse to remove an already-dead
+	// lock. This is a bounded wait on a background goroutine finishing
+	// syscalls that normally take microseconds — not a new unbounded block.
+	waitForLockMetadataSettled(lockPath, wait)
+
 	// Final OS-level proof immediately before the destructive remove: a NEW
 	// owner may have grabbed the session between the kill above and now. If
 	// the real OS lock is currently held (or its state is unknown), leave the
@@ -133,6 +145,34 @@ func sessionsKillCmdRun(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Fprintf(os.Stderr, "removed lock %s\n", lockPath)
 	return nil
+}
+
+// waitForLockMetadataSettled polls lockPath's recorded PID until it reads 0
+// (cleared) or budget elapses. Used between two back-to-back probes
+// (TryAcquireSessionLock+Release cycles) against the same lock path: a probe's
+// own Release() returns as soon as its synchronous unlock/close finish (see
+// session.SessionLock.Release's Mechanism-1 doc comment), while its
+// background metadata-cleanup goroutine can still briefly hold the OS lock
+// (re-acquired for its own Truncate/Sync) afterward. A second probe launched
+// immediately can otherwise race that goroutine and observe
+// SessionLockBusyError against the FIRST probe's own in-flight cleanup,
+// mistaking it for a genuine new holder. Bounded by budget (capped at 2s,
+// since cleanup normally finishes in microseconds — this only ever waits
+// meaningfully under genuine filesystem contention, which the caller's own
+// lockHolderProvablyDead re-check handles safely either way). Best-effort:
+// never returns an error, since a caller-visible timeout here would be worse
+// than falling through to the caller's own authoritative probe.
+func waitForLockMetadataSettled(lockPath string, budget time.Duration) {
+	if budget <= 0 || budget > 2*time.Second {
+		budget = 2 * time.Second
+	}
+	deadline := time.Now().Add(budget)
+	for time.Now().Before(deadline) {
+		if session.ReadLockPID(lockPath) == 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // holderState constants describe what probeThenKillHolder concluded and did.

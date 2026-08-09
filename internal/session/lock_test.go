@@ -33,7 +33,13 @@ func TestTryAcquireSessionLock_HappyPath(t *testing.T) {
 	// holder once the OS recycles that PID number for an unrelated
 	// process (see clearHolderMetadata).
 	require.NoError(t, lk.Release())
-	assert.Equal(t, 0, ReadLockPID(lk.Path),
+
+	// With background cleanup (P0 fix), we need to wait for the cleanup goroutine
+	// to complete before checking the PID. Give it 2 seconds - cleanup should be
+	// very fast on a local tmpdir.
+	require.Eventually(t, func() bool {
+		return ReadLockPID(lk.Path) == 0
+	}, 2*time.Second, 10*time.Millisecond,
 		"after release, the lock file/sidecar must not carry the old holder's PID")
 }
 
@@ -42,6 +48,12 @@ func TestTryAcquireSessionLock_ReleaseAllowsReacquire(t *testing.T) {
 	lk1, err := TryAcquireSessionLock(dir, "audit-A")
 	require.NoError(t, err)
 	require.NoError(t, lk1.Release())
+
+	// Wait for background cleanup to complete before reacquiring.
+	// This is necessary because cleanup momentarily rechecks the lock.
+	require.Eventually(t, func() bool {
+		return ReadLockPID(filepath.Join(dir, "locks", "session-audit-A.lock")) == 0
+	}, 2*time.Second, 10*time.Millisecond, "cleanup should complete before reacquire")
 
 	// After Release, a fresh acquire of the same session id must succeed.
 	lk2, err := TryAcquireSessionLock(dir, "audit-A")

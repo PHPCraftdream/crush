@@ -79,6 +79,16 @@ func TestSessionsLocks_ReadOnlyByDefault_StaleLockNotPruned(t *testing.T) {
 	// afterward or the real run below would not see a stale-by-mtime entry.
 	require.True(t, lockHolderProvablyDead(dataDir, sessionID),
 		"precondition: lock must be provably dead for the --prune gate to be the only barrier")
+	// lockHolderProvablyDead's own Release() returns as soon as its
+	// synchronous unlock/close finish (session.SessionLock's Mechanism-1
+	// fix) — its background metadata-cleanup goroutine can still be holding
+	// the OS lock through its own Truncate/Sync for a brief moment
+	// afterward. Wait for it to finish before overwriting the lock file
+	// directly below, or this raw os.WriteFile can collide with that held
+	// lock on Windows (mandatory LockFileEx) and fail spuriously.
+	require.Eventually(t, func() bool {
+		return session.ReadLockPID(lockPath) == 0
+	}, 2*time.Second, 10*time.Millisecond, "precondition probe's background cleanup should finish")
 	require.NoError(t, os.WriteFile(lockPath, []byte(fmt.Sprintf("%d\n", 999999)), 0o644))
 	require.NoError(t, os.Chtimes(lockPath, old, old))
 
@@ -278,6 +288,15 @@ func TestSessionsReset_ForceHoldsLockDuringDBReset(t *testing.T) {
 	require.ErrorAs(t, err2, &busyErr, "contention must be reported as a busy error, not some other failure")
 
 	require.NoError(t, lk.Release())
+
+	// With background cleanup (P0 fix), we need to wait for the cleanup
+	// goroutine to complete before reacquiring. The cleanup goroutine now
+	// holds the OS lock through Truncate/Sync, so acquisition will fail
+	// until it completes.
+	lockPath := filepath.Join(dataDir, "locks", "session-"+sanitiseSessionIDForFilename(sessionID)+".lock")
+	require.Eventually(t, func() bool {
+		return session.ReadLockPID(lockPath) == 0
+	}, 2*time.Second, 10*time.Millisecond, "cleanup should complete before reacquire")
 
 	// After release, the session is free again (the empty lock file remains,
 	// harmless — but acquisition must succeed).
