@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/charmbracelet/crush/internal/pubsub"
 	"github.com/charmbracelet/crush/internal/session"
@@ -194,6 +195,38 @@ func (m *mockSessionService) ConsumeInterruptInject(context.Context, string) (*s
 }
 
 func (m *mockSessionService) DeleteInterruptInject(context.Context, string) error {
+	return nil
+}
+
+func (m *mockSessionService) EnqueueRunQueueEntry(context.Context, string, string, []byte) error {
+	return nil
+}
+
+func (m *mockSessionService) LeaseRunQueueEntry(context.Context, string, string, time.Duration) (*session.RunQueueEntry, error) {
+	return nil, nil
+}
+
+func (m *mockSessionService) AckRunQueueEntry(context.Context, string) (string, error) {
+	return "", nil
+}
+
+func (m *mockSessionService) NackRunQueueEntry(context.Context, string, string) error {
+	return nil
+}
+
+func (m *mockSessionService) TerminalFailRunQueueEntry(context.Context, string) error {
+	return nil
+}
+
+func (m *mockSessionService) ListPendingRunQueueEntries(context.Context) ([]session.RunQueueEntry, error) {
+	return nil, nil
+}
+
+func (m *mockSessionService) ListStaleLeasedRunQueueEntries(context.Context, int64) ([]session.RunQueueEntry, error) {
+	return nil, nil
+}
+
+func (m *mockSessionService) CleanupExpiredLeases(context.Context, int64) error {
 	return nil
 }
 

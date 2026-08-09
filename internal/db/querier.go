@@ -10,6 +10,12 @@ import (
 )
 
 type Querier interface {
+	// Mark a leased entry as successfully completed (terminal).
+	// Removes it from the queue (acked is terminal, no longer needed).
+	AckRunQueueEntry(ctx context.Context, id string) (string, error)
+	// Reset stale leased entries back to pending (lease expiry recovery).
+	// Run periodically to recover from crashed pump instances.
+	CleanupExpiredLeases(ctx context.Context, arg CleanupExpiredLeasesParams) error
 	CountMessagesBySession(ctx context.Context, sessionID string) (int64, error)
 	CreateFile(ctx context.Context, arg CreateFileParams) (File, error)
 	CreateMessage(ctx context.Context, arg CreateMessageParams) (Message, error)
@@ -39,6 +45,7 @@ type Querier interface {
 	DeleteSession(ctx context.Context, id string) error
 	DeleteSessionFiles(ctx context.Context, sessionID string) error
 	DeleteSessionMessages(ctx context.Context, sessionID string) error
+	EnqueueRunQueueEntry(ctx context.Context, arg EnqueueRunQueueEntryParams) (SessionRunQueue, error)
 	GetAverageResponseTime(ctx context.Context) (int64, error)
 	// call_tree_activity.sql: freshest message activity across a session's whole
 	// descendant call tree (root + every sub-agent session reachable via
@@ -71,7 +78,11 @@ type Querier interface {
 	GetHourDayHeatmap(ctx context.Context) ([]GetHourDayHeatmapRow, error)
 	GetLastSession(ctx context.Context) (Session, error)
 	GetMessage(ctx context.Context, id string) (Message, error)
+	// Get the oldest pending entry for a session (for transactional lease).
+	GetOldestPendingRunQueueEntryForSession(ctx context.Context, sessionID string) (SessionRunQueue, error)
 	GetRecentActivity(ctx context.Context) ([]GetRecentActivityRow, error)
+	// Get a single entry by ID.
+	GetRunQueueEntry(ctx context.Context, id string) (SessionRunQueue, error)
 	GetSessionByID(ctx context.Context, id string) (Session, error)
 	// Returns the child's current cost and the amount already charged to the
 	// parent (parent_cost_accounted). Used by TransferChildCostToParent inside
@@ -123,6 +134,8 @@ type Querier interface {
 	// parent) and across processes (orchestrator with parallel crush runs).
 	// Returns the updated row so the caller can refresh its snapshot.
 	IncrementSessionCost(ctx context.Context, arg IncrementSessionCostParams) (Session, error)
+	// Claim a specific entry by ID (call after GetOldestPendingRunQueueEntryForSession in a transaction).
+	LeaseRunQueueEntryByID(ctx context.Context, arg LeaseRunQueueEntryByIDParams) (SessionRunQueue, error)
 	ListAllSessionPermissions(ctx context.Context) ([]SessionPermission, error)
 	// Returns every session including children (no parent_session_id filter).
 	// Used by sessions gc to enumerate all sessions for garbage collection.
@@ -184,9 +197,13 @@ type Querier interface {
 	ListMessagesBySessionPaginated(ctx context.Context, arg ListMessagesBySessionPaginatedParams) ([]Message, error)
 	ListNewFiles(ctx context.Context) ([]File, error)
 	ListPendingInjectsBySession(ctx context.Context, sessionID string) ([]PendingInject, error)
+	// Get all pending entries (for pump scanning across all sessions).
+	ListPendingRunQueueEntries(ctx context.Context) ([]SessionRunQueue, error)
 	ListSessionPermissions(ctx context.Context, sessionID string) ([]SessionPermission, error)
 	ListSessionReadFiles(ctx context.Context, sessionID string) ([]ReadFile, error)
 	ListSessions(ctx context.Context) ([]Session, error)
+	// Get all leased entries with expired leases (for pump lease recovery).
+	ListStaleLeasedRunQueueEntries(ctx context.Context, leaseExpiresAt sql.NullInt64) ([]SessionRunQueue, error)
 	// Returns every session whose parent_session_id matches the argument,
 	// ordered oldest-first so callers reconstructing a fan-out get the
 	// sub-agent results in dispatch order.
@@ -204,6 +221,9 @@ type Querier interface {
 	// session_id is empty for global rules; we accept either empty or the
 	// exact session_id so the same query handles both.
 	MatchSessionPermission(ctx context.Context, arg MatchSessionPermissionParams) (string, error)
+	// Release a leased entry back to pending state (non-terminal failure, retry later).
+	// Increments attempts but does NOT set terminal_failure.
+	NackRunQueueEntry(ctx context.Context, arg NackRunQueueEntryParams) (SessionRunQueue, error)
 	RecordFileRead(ctx context.Context, arg RecordFileReadParams) error
 	RenameSession(ctx context.Context, arg RenameSessionParams) error
 	// Marks the child's full current cost as charged to the parent, so the
@@ -212,6 +232,9 @@ type Querier interface {
 	// IncrementSessionCost so a crash between the two cannot leave the parent
 	// charged but the child's accounting lagging (or vice versa).
 	SetParentCostAccounted(ctx context.Context, arg SetParentCostAccountedParams) error
+	// Mark a leased entry as terminal failure (no retry, even if attempts < max).
+	// Used for ErrCallAlreadyAttempted-type errors where retry would cause duplicates.
+	TerminalFailRunQueueEntry(ctx context.Context, id string) (string, error)
 	UpdateMessage(ctx context.Context, arg UpdateMessageParams) error
 	UpdateMessagePinned(ctx context.Context, arg UpdateMessagePinnedParams) error
 	UpdatePermissionEnabled(ctx context.Context, arg UpdatePermissionEnabledParams) error

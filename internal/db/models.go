@@ -106,3 +106,18 @@ type SessionPermission struct {
 	CreatedAt int64  `json:"created_at"`
 	Enabled   int64  `json:"enabled"`
 }
+
+type SessionRunQueue struct {
+	ID              string         `json:"id"`
+	SessionID       string         `json:"session_id"`
+	CallData        string         `json:"call_data"`
+	Status          string         `json:"status"`
+	LeasedBy        sql.NullString `json:"leased_by"`
+	LeasedAt        sql.NullInt64  `json:"leased_at"`
+	LeaseExpiresAt  sql.NullInt64  `json:"lease_expires_at"`
+	Attempts        int64          `json:"attempts"`
+	LastError       sql.NullString `json:"last_error"`
+	TerminalFailure int64          `json:"terminal_failure"`
+	CreatedAt       int64          `json:"created_at"`
+	UpdatedAt       int64          `json:"updated_at"`
+}

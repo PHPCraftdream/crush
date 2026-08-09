@@ -27,6 +27,10 @@ import (
 // This is the typed signal designed to fix task #339 (P0, regression from
 // commit 37f1820d) while preserving task #340's protection (data loss on
 // retry exhaustion).
+//
+// This type implements the AlreadyAttempted() marker interface, which is
+// used by the session run queue pump to detect terminal failures across
+// package boundaries (task #340 ROUND 2 fix for type incompatibility bug).
 type ErrCallAlreadyAttempted struct {
 	Err error
 }
@@ -37,4 +41,11 @@ func (e *ErrCallAlreadyAttempted) Error() string {
 
 func (e *ErrCallAlreadyAttempted) Unwrap() error {
 	return e.Err
+}
+
+// AlreadyAttempted implements the marker interface for cross-package
+// terminal failure detection. This method is called by the session run
+// queue pump to distinguish retryable errors from terminal ones.
+func (e *ErrCallAlreadyAttempted) AlreadyAttempted() bool {
+	return true
 }

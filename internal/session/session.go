@@ -240,6 +240,16 @@ type Service interface {
 	CreateAgentToolSessionID(messageID, toolCallID string) string
 	ParseAgentToolSessionID(sessionID string) (messageID string, toolCallID string, ok bool)
 	IsAgentToolSession(sessionID string) bool
+
+	// Durable run queue for orphaned/detached calls (task #340)
+	EnqueueRunQueueEntry(ctx context.Context, idempotencyKey, sessionID string, callData []byte) error
+	LeaseRunQueueEntry(ctx context.Context, sessionID, leasedBy string, leaseTTL time.Duration) (*RunQueueEntry, error)
+	AckRunQueueEntry(ctx context.Context, id string) (string, error)
+	NackRunQueueEntry(ctx context.Context, id, lastError string) error
+	TerminalFailRunQueueEntry(ctx context.Context, id string) error
+	ListPendingRunQueueEntries(ctx context.Context) ([]RunQueueEntry, error)
+	ListStaleLeasedRunQueueEntries(ctx context.Context, beforeTime int64) ([]RunQueueEntry, error)
+	CleanupExpiredLeases(ctx context.Context, beforeTime int64) error
 }
 
 type service struct {
@@ -1268,4 +1278,196 @@ func (s *service) ParseAgentToolSessionID(sessionID string) (messageID string, t
 func (s *service) IsAgentToolSession(sessionID string) bool {
 	_, _, ok := s.ParseAgentToolSessionID(sessionID)
 	return ok
+}
+
+// RunQueueEntry represents a durable orphaned/detached call that needs execution.
+// It wraps SessionAgentCall data serialized as JSON for persistence.
+type RunQueueEntry struct {
+	ID              string
+	SessionID       string
+	CallData        string // JSON-serialized SessionAgentCall
+	Status          string // pending | leased | acked
+	LeasedBy        string
+	LeasedAt        int64
+	LeaseExpiresAt  int64
+	Attempts        int64
+	LastError       string
+	TerminalFailure bool
+	CreatedAt       int64
+	UpdatedAt       int64
+}
+
+// RunQueue constants
+const (
+	RunQueueStatusPending = "pending"
+	RunQueueStatusLeased  = "leased"
+	// acked is terminal and not stored (acked entries are deleted)
+)
+
+// EnqueueRunQueueEntry adds a call to the durable run queue.
+// The caller should generate idempotencyKey ONCE and reuse it across retries.
+// Returns error if the enqueue fails (caller should not proceed without durability).
+func (s *service) EnqueueRunQueueEntry(ctx context.Context, idempotencyKey, sessionID string, callData []byte) error {
+	if idempotencyKey == "" {
+		idempotencyKey = uuid.NewString()
+	}
+	now := time.Now().Unix()
+	_, err := s.q.EnqueueRunQueueEntry(ctx, db.EnqueueRunQueueEntryParams{
+		ID:        idempotencyKey,
+		SessionID: sessionID,
+		CallData:  string(callData),
+		CreatedAt: now,
+		UpdatedAt: now,
+	})
+	return err
+}
+
+// LeaseRunQueueEntry atomically claims the oldest pending entry for a session.
+// Returns nil, nil if no pending entry exists (not an error).
+// Uses the same transactional pattern as ConsumeInterruptInject:
+//  1. SELECT the oldest pending entry
+//  2. UPDATE it to leased status in the same transaction
+//  3. Return the leased entry
+//
+// The leasedBy and leaseExpiresAt are set to track who owns the entry and
+// when it expires (allowing recovery from crashed pump instances).
+func (s *service) LeaseRunQueueEntry(ctx context.Context, sessionID, leasedBy string, leaseTTL time.Duration) (*RunQueueEntry, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	qtx := s.q.WithTx(tx)
+
+	// Step 1: Find the oldest pending entry for this session
+	candidate, err := qtx.GetOldestPendingRunQueueEntryForSession(ctx, sessionID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil // No pending entries
+		}
+		return nil, err
+	}
+
+	// Step 2: Lease it (atomic claim)
+	now := time.Now().Unix()
+	leasedAt := now
+	leaseExpiresAt := now + int64(leaseTTL.Seconds())
+
+	leased, err := qtx.LeaseRunQueueEntryByID(ctx, db.LeaseRunQueueEntryByIDParams{
+		LeasedBy:       sql.NullString{String: leasedBy, Valid: leasedBy != ""},
+		LeasedAt:       sql.NullInt64{Int64: leasedAt, Valid: true},
+		LeaseExpiresAt: sql.NullInt64{Int64: leaseExpiresAt, Valid: true},
+		UpdatedAt:      now,
+		ID:             candidate.ID,
+	})
+	if err != nil {
+		// Another goroutine leased it between the SELECT and UPDATE
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+
+	return dbToRunQueueEntry(leased), nil
+}
+
+// AckRunQueueEntry marks a leased entry as successfully completed (terminal).
+// Deletes the entry from the queue. Returns the deleted ID.
+func (s *service) AckRunQueueEntry(ctx context.Context, id string) (string, error) {
+	deletedID, err := s.q.AckRunQueueEntry(ctx, id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", fmt.Errorf("run queue entry %q not found or not in leased state", id)
+	}
+	return deletedID, err
+}
+
+// NackRunQueueEntry releases a leased entry back to pending state (retry later).
+// Used for transient errors where retry is safe and necessary.
+// Increments attempts count and records the error message.
+func (s *service) NackRunQueueEntry(ctx context.Context, id, lastError string) error {
+	now := time.Now().Unix()
+	_, err := s.q.NackRunQueueEntry(ctx, db.NackRunQueueEntryParams{
+		LastError: sql.NullString{String: lastError, Valid: lastError != ""},
+		UpdatedAt: now,
+		ID:        id,
+	})
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("run queue entry %q not found or not in leased state", id)
+	}
+	return err
+}
+
+// TerminalFailRunQueueEntry marks a leased entry as terminal failure (no retry).
+// Used for ErrCallAlreadyAttempted-type errors where retry would cause duplicates.
+// Deletes the entry from the queue permanently.
+func (s *service) TerminalFailRunQueueEntry(ctx context.Context, id string) error {
+	_, err := s.q.TerminalFailRunQueueEntry(ctx, id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("run queue entry %q not found or not in leased state", id)
+	}
+	return err
+}
+
+// ListPendingRunQueueEntries returns all pending entries across all sessions.
+// Used by the pump to scan for work.
+func (s *service) ListPendingRunQueueEntries(ctx context.Context) ([]RunQueueEntry, error) {
+	rows, err := s.q.ListPendingRunQueueEntries(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return dbSliceToRunQueueEntries(rows), nil
+}
+
+// ListStaleLeasedRunQueueEntries returns all leased entries with expired leases.
+// Used by the pump to recover entries from crashed instances.
+func (s *service) ListStaleLeasedRunQueueEntries(ctx context.Context, beforeTime int64) ([]RunQueueEntry, error) {
+	rows, err := s.q.ListStaleLeasedRunQueueEntries(ctx, sql.NullInt64{Int64: beforeTime, Valid: true})
+	if err != nil {
+		return nil, err
+	}
+	return dbSliceToRunQueueEntries(rows), nil
+}
+
+// CleanupExpiredLeases resets stale leased entries back to pending state.
+// This is a maintenance operation that should run periodically.
+func (s *service) CleanupExpiredLeases(ctx context.Context, beforeTime int64) error {
+	now := time.Now().Unix()
+	return s.q.CleanupExpiredLeases(ctx, db.CleanupExpiredLeasesParams{
+		UpdatedAt:      now,
+		LeaseExpiresAt: sql.NullInt64{Int64: beforeTime, Valid: true},
+	})
+}
+
+// Helper functions to convert between DB and domain types
+
+func dbToRunQueueEntry(entry db.SessionRunQueue) *RunQueueEntry {
+	return &RunQueueEntry{
+		ID:              entry.ID,
+		SessionID:       entry.SessionID,
+		CallData:        entry.CallData,
+		Status:          entry.Status,
+		LeasedBy:        entry.LeasedBy.String,
+		LeasedAt:        entry.LeasedAt.Int64,
+		LeaseExpiresAt:  entry.LeaseExpiresAt.Int64,
+		Attempts:        entry.Attempts,
+		LastError:       entry.LastError.String,
+		TerminalFailure: entry.TerminalFailure == 1,
+		CreatedAt:       entry.CreatedAt,
+		UpdatedAt:       entry.UpdatedAt,
+	}
+}
+
+func dbSliceToRunQueueEntries(entries []db.SessionRunQueue) []RunQueueEntry {
+	result := make([]RunQueueEntry, len(entries))
+	for i, e := range entries {
+		if converted := dbToRunQueueEntry(e); converted != nil {
+			result[i] = *converted
+		}
+	}
+	return result
 }

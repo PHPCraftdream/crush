@@ -24,6 +24,12 @@ func New(db DBTX) *Queries {
 func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	q := Queries{db: db}
 	var err error
+	if q.ackRunQueueEntryStmt, err = db.PrepareContext(ctx, ackRunQueueEntry); err != nil {
+		return nil, fmt.Errorf("error preparing query AckRunQueueEntry: %w", err)
+	}
+	if q.cleanupExpiredLeasesStmt, err = db.PrepareContext(ctx, cleanupExpiredLeases); err != nil {
+		return nil, fmt.Errorf("error preparing query CleanupExpiredLeases: %w", err)
+	}
 	if q.countMessagesBySessionStmt, err = db.PrepareContext(ctx, countMessagesBySession); err != nil {
 		return nil, fmt.Errorf("error preparing query CountMessagesBySession: %w", err)
 	}
@@ -63,6 +69,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.deleteSessionMessagesStmt, err = db.PrepareContext(ctx, deleteSessionMessages); err != nil {
 		return nil, fmt.Errorf("error preparing query DeleteSessionMessages: %w", err)
 	}
+	if q.enqueueRunQueueEntryStmt, err = db.PrepareContext(ctx, enqueueRunQueueEntry); err != nil {
+		return nil, fmt.Errorf("error preparing query EnqueueRunQueueEntry: %w", err)
+	}
 	if q.getAverageResponseTimeStmt, err = db.PrepareContext(ctx, getAverageResponseTime); err != nil {
 		return nil, fmt.Errorf("error preparing query GetAverageResponseTime: %w", err)
 	}
@@ -90,8 +99,14 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.getMessageStmt, err = db.PrepareContext(ctx, getMessage); err != nil {
 		return nil, fmt.Errorf("error preparing query GetMessage: %w", err)
 	}
+	if q.getOldestPendingRunQueueEntryForSessionStmt, err = db.PrepareContext(ctx, getOldestPendingRunQueueEntryForSession); err != nil {
+		return nil, fmt.Errorf("error preparing query GetOldestPendingRunQueueEntryForSession: %w", err)
+	}
 	if q.getRecentActivityStmt, err = db.PrepareContext(ctx, getRecentActivity); err != nil {
 		return nil, fmt.Errorf("error preparing query GetRecentActivity: %w", err)
+	}
+	if q.getRunQueueEntryStmt, err = db.PrepareContext(ctx, getRunQueueEntry); err != nil {
+		return nil, fmt.Errorf("error preparing query GetRunQueueEntry: %w", err)
 	}
 	if q.getSessionByIDStmt, err = db.PrepareContext(ctx, getSessionByID); err != nil {
 		return nil, fmt.Errorf("error preparing query GetSessionByID: %w", err)
@@ -122,6 +137,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	}
 	if q.incrementSessionCostStmt, err = db.PrepareContext(ctx, incrementSessionCost); err != nil {
 		return nil, fmt.Errorf("error preparing query IncrementSessionCost: %w", err)
+	}
+	if q.leaseRunQueueEntryByIDStmt, err = db.PrepareContext(ctx, leaseRunQueueEntryByID); err != nil {
+		return nil, fmt.Errorf("error preparing query LeaseRunQueueEntryByID: %w", err)
 	}
 	if q.listAllSessionPermissionsStmt, err = db.PrepareContext(ctx, listAllSessionPermissions); err != nil {
 		return nil, fmt.Errorf("error preparing query ListAllSessionPermissions: %w", err)
@@ -159,6 +177,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.listPendingInjectsBySessionStmt, err = db.PrepareContext(ctx, listPendingInjectsBySession); err != nil {
 		return nil, fmt.Errorf("error preparing query ListPendingInjectsBySession: %w", err)
 	}
+	if q.listPendingRunQueueEntriesStmt, err = db.PrepareContext(ctx, listPendingRunQueueEntries); err != nil {
+		return nil, fmt.Errorf("error preparing query ListPendingRunQueueEntries: %w", err)
+	}
 	if q.listSessionPermissionsStmt, err = db.PrepareContext(ctx, listSessionPermissions); err != nil {
 		return nil, fmt.Errorf("error preparing query ListSessionPermissions: %w", err)
 	}
@@ -167,6 +188,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	}
 	if q.listSessionsStmt, err = db.PrepareContext(ctx, listSessions); err != nil {
 		return nil, fmt.Errorf("error preparing query ListSessions: %w", err)
+	}
+	if q.listStaleLeasedRunQueueEntriesStmt, err = db.PrepareContext(ctx, listStaleLeasedRunQueueEntries); err != nil {
+		return nil, fmt.Errorf("error preparing query ListStaleLeasedRunQueueEntries: %w", err)
 	}
 	if q.listSubSessionsStmt, err = db.PrepareContext(ctx, listSubSessions); err != nil {
 		return nil, fmt.Errorf("error preparing query ListSubSessions: %w", err)
@@ -177,6 +201,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.matchSessionPermissionStmt, err = db.PrepareContext(ctx, matchSessionPermission); err != nil {
 		return nil, fmt.Errorf("error preparing query MatchSessionPermission: %w", err)
 	}
+	if q.nackRunQueueEntryStmt, err = db.PrepareContext(ctx, nackRunQueueEntry); err != nil {
+		return nil, fmt.Errorf("error preparing query NackRunQueueEntry: %w", err)
+	}
 	if q.recordFileReadStmt, err = db.PrepareContext(ctx, recordFileRead); err != nil {
 		return nil, fmt.Errorf("error preparing query RecordFileRead: %w", err)
 	}
@@ -185,6 +212,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	}
 	if q.setParentCostAccountedStmt, err = db.PrepareContext(ctx, setParentCostAccounted); err != nil {
 		return nil, fmt.Errorf("error preparing query SetParentCostAccounted: %w", err)
+	}
+	if q.terminalFailRunQueueEntryStmt, err = db.PrepareContext(ctx, terminalFailRunQueueEntry); err != nil {
+		return nil, fmt.Errorf("error preparing query TerminalFailRunQueueEntry: %w", err)
 	}
 	if q.updateMessageStmt, err = db.PrepareContext(ctx, updateMessage); err != nil {
 		return nil, fmt.Errorf("error preparing query UpdateMessage: %w", err)
@@ -209,6 +239,16 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 
 func (q *Queries) Close() error {
 	var err error
+	if q.ackRunQueueEntryStmt != nil {
+		if cerr := q.ackRunQueueEntryStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing ackRunQueueEntryStmt: %w", cerr)
+		}
+	}
+	if q.cleanupExpiredLeasesStmt != nil {
+		if cerr := q.cleanupExpiredLeasesStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing cleanupExpiredLeasesStmt: %w", cerr)
+		}
+	}
 	if q.countMessagesBySessionStmt != nil {
 		if cerr := q.countMessagesBySessionStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing countMessagesBySessionStmt: %w", cerr)
@@ -274,6 +314,11 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing deleteSessionMessagesStmt: %w", cerr)
 		}
 	}
+	if q.enqueueRunQueueEntryStmt != nil {
+		if cerr := q.enqueueRunQueueEntryStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing enqueueRunQueueEntryStmt: %w", cerr)
+		}
+	}
 	if q.getAverageResponseTimeStmt != nil {
 		if cerr := q.getAverageResponseTimeStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing getAverageResponseTimeStmt: %w", cerr)
@@ -319,9 +364,19 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing getMessageStmt: %w", cerr)
 		}
 	}
+	if q.getOldestPendingRunQueueEntryForSessionStmt != nil {
+		if cerr := q.getOldestPendingRunQueueEntryForSessionStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing getOldestPendingRunQueueEntryForSessionStmt: %w", cerr)
+		}
+	}
 	if q.getRecentActivityStmt != nil {
 		if cerr := q.getRecentActivityStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing getRecentActivityStmt: %w", cerr)
+		}
+	}
+	if q.getRunQueueEntryStmt != nil {
+		if cerr := q.getRunQueueEntryStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing getRunQueueEntryStmt: %w", cerr)
 		}
 	}
 	if q.getSessionByIDStmt != nil {
@@ -372,6 +427,11 @@ func (q *Queries) Close() error {
 	if q.incrementSessionCostStmt != nil {
 		if cerr := q.incrementSessionCostStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing incrementSessionCostStmt: %w", cerr)
+		}
+	}
+	if q.leaseRunQueueEntryByIDStmt != nil {
+		if cerr := q.leaseRunQueueEntryByIDStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing leaseRunQueueEntryByIDStmt: %w", cerr)
 		}
 	}
 	if q.listAllSessionPermissionsStmt != nil {
@@ -434,6 +494,11 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing listPendingInjectsBySessionStmt: %w", cerr)
 		}
 	}
+	if q.listPendingRunQueueEntriesStmt != nil {
+		if cerr := q.listPendingRunQueueEntriesStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing listPendingRunQueueEntriesStmt: %w", cerr)
+		}
+	}
 	if q.listSessionPermissionsStmt != nil {
 		if cerr := q.listSessionPermissionsStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing listSessionPermissionsStmt: %w", cerr)
@@ -447,6 +512,11 @@ func (q *Queries) Close() error {
 	if q.listSessionsStmt != nil {
 		if cerr := q.listSessionsStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing listSessionsStmt: %w", cerr)
+		}
+	}
+	if q.listStaleLeasedRunQueueEntriesStmt != nil {
+		if cerr := q.listStaleLeasedRunQueueEntriesStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing listStaleLeasedRunQueueEntriesStmt: %w", cerr)
 		}
 	}
 	if q.listSubSessionsStmt != nil {
@@ -464,6 +534,11 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing matchSessionPermissionStmt: %w", cerr)
 		}
 	}
+	if q.nackRunQueueEntryStmt != nil {
+		if cerr := q.nackRunQueueEntryStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing nackRunQueueEntryStmt: %w", cerr)
+		}
+	}
 	if q.recordFileReadStmt != nil {
 		if cerr := q.recordFileReadStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing recordFileReadStmt: %w", cerr)
@@ -477,6 +552,11 @@ func (q *Queries) Close() error {
 	if q.setParentCostAccountedStmt != nil {
 		if cerr := q.setParentCostAccountedStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing setParentCostAccountedStmt: %w", cerr)
+		}
+	}
+	if q.terminalFailRunQueueEntryStmt != nil {
+		if cerr := q.terminalFailRunQueueEntryStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing terminalFailRunQueueEntryStmt: %w", cerr)
 		}
 	}
 	if q.updateMessageStmt != nil {
@@ -548,6 +628,8 @@ func (q *Queries) queryRow(ctx context.Context, stmt *sql.Stmt, query string, ar
 type Queries struct {
 	db                                          DBTX
 	tx                                          *sql.Tx
+	ackRunQueueEntryStmt                        *sql.Stmt
+	cleanupExpiredLeasesStmt                    *sql.Stmt
 	countMessagesBySessionStmt                  *sql.Stmt
 	createFileStmt                              *sql.Stmt
 	createMessageStmt                           *sql.Stmt
@@ -561,6 +643,7 @@ type Queries struct {
 	deleteSessionStmt                           *sql.Stmt
 	deleteSessionFilesStmt                      *sql.Stmt
 	deleteSessionMessagesStmt                   *sql.Stmt
+	enqueueRunQueueEntryStmt                    *sql.Stmt
 	getAverageResponseTimeStmt                  *sql.Stmt
 	getCallTreeActivityStmt                     *sql.Stmt
 	getCallTreeActivityBatchStmt                *sql.Stmt
@@ -570,7 +653,9 @@ type Queries struct {
 	getHourDayHeatmapStmt                       *sql.Stmt
 	getLastSessionStmt                          *sql.Stmt
 	getMessageStmt                              *sql.Stmt
+	getOldestPendingRunQueueEntryForSessionStmt *sql.Stmt
 	getRecentActivityStmt                       *sql.Stmt
+	getRunQueueEntryStmt                        *sql.Stmt
 	getSessionByIDStmt                          *sql.Stmt
 	getSessionCostAccountingStmt                *sql.Stmt
 	getToolUsageStmt                            *sql.Stmt
@@ -581,6 +666,7 @@ type Queries struct {
 	getUsageByHourStmt                          *sql.Stmt
 	getUsageByModelStmt                         *sql.Stmt
 	incrementSessionCostStmt                    *sql.Stmt
+	leaseRunQueueEntryByIDStmt                  *sql.Stmt
 	listAllSessionPermissionsStmt               *sql.Stmt
 	listAllSessionsStmt                         *sql.Stmt
 	listAllUserMessagesStmt                     *sql.Stmt
@@ -593,15 +679,19 @@ type Queries struct {
 	listMessagesBySessionPaginatedStmt          *sql.Stmt
 	listNewFilesStmt                            *sql.Stmt
 	listPendingInjectsBySessionStmt             *sql.Stmt
+	listPendingRunQueueEntriesStmt              *sql.Stmt
 	listSessionPermissionsStmt                  *sql.Stmt
 	listSessionReadFilesStmt                    *sql.Stmt
 	listSessionsStmt                            *sql.Stmt
+	listStaleLeasedRunQueueEntriesStmt          *sql.Stmt
 	listSubSessionsStmt                         *sql.Stmt
 	listUserMessagesBySessionStmt               *sql.Stmt
 	matchSessionPermissionStmt                  *sql.Stmt
+	nackRunQueueEntryStmt                       *sql.Stmt
 	recordFileReadStmt                          *sql.Stmt
 	renameSessionStmt                           *sql.Stmt
 	setParentCostAccountedStmt                  *sql.Stmt
+	terminalFailRunQueueEntryStmt               *sql.Stmt
 	updateMessageStmt                           *sql.Stmt
 	updateMessagePinnedStmt                     *sql.Stmt
 	updatePermissionEnabledStmt                 *sql.Stmt
@@ -612,31 +702,36 @@ type Queries struct {
 
 func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 	return &Queries{
-		db:                                          tx,
-		tx:                                          tx,
-		countMessagesBySessionStmt:                  q.countMessagesBySessionStmt,
-		createFileStmt:                              q.createFileStmt,
-		createMessageStmt:                           q.createMessageStmt,
-		createPendingInjectStmt:                     q.createPendingInjectStmt,
-		createSessionStmt:                           q.createSessionStmt,
-		createSessionPermissionStmt:                 q.createSessionPermissionStmt,
-		deleteFileStmt:                              q.deleteFileStmt,
-		deleteMessageStmt:                           q.deleteMessageStmt,
-		deletePendingInjectStmt:                     q.deletePendingInjectStmt,
-		deletePermissionStmt:                        q.deletePermissionStmt,
-		deleteSessionStmt:                           q.deleteSessionStmt,
-		deleteSessionFilesStmt:                      q.deleteSessionFilesStmt,
-		deleteSessionMessagesStmt:                   q.deleteSessionMessagesStmt,
-		getAverageResponseTimeStmt:                  q.getAverageResponseTimeStmt,
-		getCallTreeActivityStmt:                     q.getCallTreeActivityStmt,
-		getCallTreeActivityBatchStmt:                q.getCallTreeActivityBatchStmt,
-		getFileStmt:                                 q.getFileStmt,
-		getFileByPathAndSessionStmt:                 q.getFileByPathAndSessionStmt,
-		getFileReadStmt:                             q.getFileReadStmt,
-		getHourDayHeatmapStmt:                       q.getHourDayHeatmapStmt,
-		getLastSessionStmt:                          q.getLastSessionStmt,
-		getMessageStmt:                              q.getMessageStmt,
+		db:                           tx,
+		tx:                           tx,
+		ackRunQueueEntryStmt:         q.ackRunQueueEntryStmt,
+		cleanupExpiredLeasesStmt:     q.cleanupExpiredLeasesStmt,
+		countMessagesBySessionStmt:   q.countMessagesBySessionStmt,
+		createFileStmt:               q.createFileStmt,
+		createMessageStmt:            q.createMessageStmt,
+		createPendingInjectStmt:      q.createPendingInjectStmt,
+		createSessionStmt:            q.createSessionStmt,
+		createSessionPermissionStmt:  q.createSessionPermissionStmt,
+		deleteFileStmt:               q.deleteFileStmt,
+		deleteMessageStmt:            q.deleteMessageStmt,
+		deletePendingInjectStmt:      q.deletePendingInjectStmt,
+		deletePermissionStmt:         q.deletePermissionStmt,
+		deleteSessionStmt:            q.deleteSessionStmt,
+		deleteSessionFilesStmt:       q.deleteSessionFilesStmt,
+		deleteSessionMessagesStmt:    q.deleteSessionMessagesStmt,
+		enqueueRunQueueEntryStmt:     q.enqueueRunQueueEntryStmt,
+		getAverageResponseTimeStmt:   q.getAverageResponseTimeStmt,
+		getCallTreeActivityStmt:      q.getCallTreeActivityStmt,
+		getCallTreeActivityBatchStmt: q.getCallTreeActivityBatchStmt,
+		getFileStmt:                  q.getFileStmt,
+		getFileByPathAndSessionStmt:  q.getFileByPathAndSessionStmt,
+		getFileReadStmt:              q.getFileReadStmt,
+		getHourDayHeatmapStmt:        q.getHourDayHeatmapStmt,
+		getLastSessionStmt:           q.getLastSessionStmt,
+		getMessageStmt:               q.getMessageStmt,
+		getOldestPendingRunQueueEntryForSessionStmt: q.getOldestPendingRunQueueEntryForSessionStmt,
 		getRecentActivityStmt:                       q.getRecentActivityStmt,
+		getRunQueueEntryStmt:                        q.getRunQueueEntryStmt,
 		getSessionByIDStmt:                          q.getSessionByIDStmt,
 		getSessionCostAccountingStmt:                q.getSessionCostAccountingStmt,
 		getToolUsageStmt:                            q.getToolUsageStmt,
@@ -647,6 +742,7 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		getUsageByHourStmt:                          q.getUsageByHourStmt,
 		getUsageByModelStmt:                         q.getUsageByModelStmt,
 		incrementSessionCostStmt:                    q.incrementSessionCostStmt,
+		leaseRunQueueEntryByIDStmt:                  q.leaseRunQueueEntryByIDStmt,
 		listAllSessionPermissionsStmt:               q.listAllSessionPermissionsStmt,
 		listAllSessionsStmt:                         q.listAllSessionsStmt,
 		listAllUserMessagesStmt:                     q.listAllUserMessagesStmt,
@@ -659,15 +755,19 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		listMessagesBySessionPaginatedStmt:          q.listMessagesBySessionPaginatedStmt,
 		listNewFilesStmt:                            q.listNewFilesStmt,
 		listPendingInjectsBySessionStmt:             q.listPendingInjectsBySessionStmt,
+		listPendingRunQueueEntriesStmt:              q.listPendingRunQueueEntriesStmt,
 		listSessionPermissionsStmt:                  q.listSessionPermissionsStmt,
 		listSessionReadFilesStmt:                    q.listSessionReadFilesStmt,
 		listSessionsStmt:                            q.listSessionsStmt,
+		listStaleLeasedRunQueueEntriesStmt:          q.listStaleLeasedRunQueueEntriesStmt,
 		listSubSessionsStmt:                         q.listSubSessionsStmt,
 		listUserMessagesBySessionStmt:               q.listUserMessagesBySessionStmt,
 		matchSessionPermissionStmt:                  q.matchSessionPermissionStmt,
+		nackRunQueueEntryStmt:                       q.nackRunQueueEntryStmt,
 		recordFileReadStmt:                          q.recordFileReadStmt,
 		renameSessionStmt:                           q.renameSessionStmt,
 		setParentCostAccountedStmt:                  q.setParentCostAccountedStmt,
+		terminalFailRunQueueEntryStmt:               q.terminalFailRunQueueEntryStmt,
 		updateMessageStmt:                           q.updateMessageStmt,
 		updateMessagePinnedStmt:                     q.updateMessagePinnedStmt,
 		updatePermissionEnabledStmt:                 q.updatePermissionEnabledStmt,

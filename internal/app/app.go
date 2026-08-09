@@ -41,6 +41,37 @@ import (
 	"github.com/charmbracelet/x/term"
 )
 
+// coordinatorAdapterImpl wraps agent.Coordinator to satisfy session.Coordinator,
+// avoiding an import cycle (session → agent → session).
+type coordinatorAdapterImpl struct {
+	coord agent.Coordinator
+}
+
+func (a *coordinatorAdapterImpl) Run(ctx context.Context, sessionID, prompt string, providerOptions map[string]any, attachments ...any) (*any, error) {
+	// TODO: ROUND 3 - support providerOptions properly. For now, we
+	// ignore them because coordinator.Run doesn't accept them in its
+	// current signature. In ROUND 3, we'll need to either:
+	// 1. Extend agent.Coordinator.Run to accept providerOptions, or
+	// 2. Reconstruct a full SessionAgentCall and call RunWithOverrides.
+	// For ROUND 2, this is acceptable because we're only fixing bugs
+	// in the existing mechanism, not migrating call-sites yet.
+
+	// Convert attachments to message.Attachment if needed
+	var msgAttachments []message.Attachment
+	for _, att := range attachments {
+		if msgAtt, ok := att.(message.Attachment); ok {
+			msgAttachments = append(msgAttachments, msgAtt)
+		}
+	}
+	result, err := a.coord.Run(ctx, sessionID, prompt, msgAttachments...)
+	// Return as any - we only care about error handling, not the result
+	var anyResult any
+	if result != nil {
+		anyResult = result
+	}
+	return &anyResult, err
+}
+
 type App struct {
 	Sessions    session.Service
 	Messages    message.Service
@@ -49,6 +80,10 @@ type App struct {
 	FileTracker filetracker.Service
 
 	AgentCoordinator agent.Coordinator
+
+	// RunQueuePump is the background pump for durable orphaned/detached calls (task #340).
+	// It scans session_run_queue periodically and executes pending work.
+	RunQueuePump *session.RunQueuePump
 
 	config *config.ConfigStore
 
@@ -158,6 +193,27 @@ func New(ctx context.Context, conn *sql.DB, store *config.ConfigStore) (*App, er
 
 	go mcp.Initialize(ctx, app.Permissions, store)
 
+	// Start the run queue pump (task #340). This pump ensures that once a call
+	// is enqueued as durable, it will eventually be executed by some process,
+	// independent of which specific request/turn originated it. The pump lives
+	// for the lifetime of the process and is stopped during Shutdown().
+	//
+	// We wrap the real coordinator in an adapter to avoid import cycles.
+	var coordinatorAdapter session.Coordinator
+	if app.AgentCoordinator != nil {
+		coordinatorAdapter = &coordinatorAdapterImpl{coord: app.AgentCoordinator}
+	}
+
+	if dataDir != "" {
+		app.RunQueuePump = session.NewRunQueuePump(session.RunQueuePumpConfig{
+			Sessions:      app.Sessions,
+			DataDirectory: dataDir,
+			Coordinator:   coordinatorAdapter,
+		})
+		app.RunQueuePump.Start()
+		slog.Info("app: started run queue pump", "data_dir", dataDir)
+	}
+
 	// Release the shared database connection(s) on shutdown. The pool
 	// closes the underlying *sql.DB when the last reference is released.
 	// One Release call is needed per Connect/ConnectRead call this process
@@ -171,6 +227,15 @@ func New(ctx context.Context, conn *sql.DB, store *config.ConfigStore) (*App, er
 	}
 	app.cleanupFuncs = append(
 		app.cleanupFuncs,
+		func(ctx context.Context) error {
+			// Stop the run queue pump (task #340). This must complete before DB
+			// close to ensure no pump goroutines are writing when we close the connection.
+			if app.RunQueuePump != nil {
+				app.RunQueuePump.Stop()
+				slog.Info("app: stopped run queue pump")
+			}
+			return nil
+		},
 		func(ctx context.Context) error {
 			// DB cleanup must respect the bounded shutdown context.
 			// Since db.Release/sql.DB.Close are synchronous and don't accept
