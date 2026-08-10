@@ -43,30 +43,22 @@ func TestP1_2_ReleaseUnlocksBeforeMetadataCleanup_Hang(t *testing.T) {
 	tmpDir := t.TempDir()
 	sessionID := "test-session-p1-2-hang"
 
-	// Acquire the first lock.
-	lk1, err := TryAcquireSessionLock(tmpDir, sessionID)
-	require.NoError(t, err, "first TryAcquireSessionLock should succeed")
-	require.NotNil(t, lk1)
-
-	// Inject a blocking version of clearHolderMetadataFn.
-	// It will block on releaseBlocker channel until the test unblocks it.
+	// Prepare blocking channels and flags for test coordination.
 	var releaseStarted atomic.Bool
 	var releaseCompleted atomic.Bool
 	releaseBlocker := make(chan struct{})
-	clearHolderMetadataOriginal := clearHolderMetadataFn
 
-	clearHolderMetadataFn = func(path string) {
+	// Acquire the first lock with a blocking cleanup function.
+	lk1, err := TryAcquireSessionLockWithOptions(tmpDir, sessionID, WithClearHolderMetadataFn(func(path string) {
 		releaseStarted.Store(true)
 		// Block until the test signals to proceed.
 		<-releaseBlocker
 		// Call the original implementation.
-		clearHolderMetadataOriginal(path)
+		clearHolderMetadata(path)
 		releaseCompleted.Store(true)
-	}
-	// Restore the original function after the test.
-	defer func() {
-		clearHolderMetadataFn = clearHolderMetadataOriginal
-	}()
+	}))
+	require.NoError(t, err, "first TryAcquireSessionLock should succeed")
+	require.NotNil(t, lk1)
 
 	// Start Release() in a goroutine. It should acquire the OS lock, call
 	// unlockFile/close, then BLOCK on our injected clearHolderMetadataFn.
@@ -323,25 +315,19 @@ func TestP0_ReleaseReturnsImmediatelyDuringHungCleanup(t *testing.T) {
 	tmpDir := t.TempDir()
 	sessionID := "test-session-p0-freeze-fix"
 
-	// Acquire the first lock.
-	lk1, err := TryAcquireSessionLock(tmpDir, sessionID)
-	require.NoError(t, err, "first TryAcquireSessionLock should succeed")
-	require.NotNil(t, lk1)
-
 	// Inject a FOREVER-blocking version of clearHolderMetadataFn.
 	// It will block on cleanupBlocker channel and NEVER unblock.
 	var cleanupStarted atomic.Bool
 	cleanupBlocker := make(chan struct{}) // Never closed
-	clearHolderMetadataOriginal := clearHolderMetadataFn
 
-	clearHolderMetadataFn = func(path string) {
+	// Acquire the first lock with the blocking cleanup function.
+	lk1, err := TryAcquireSessionLockWithOptions(tmpDir, sessionID, WithClearHolderMetadataFn(func(path string) {
 		cleanupStarted.Store(true)
 		<-cleanupBlocker // Block forever - this simulates hung FS/AV/SMB
-		clearHolderMetadataOriginal(path)
-	}
-	defer func() {
-		clearHolderMetadataFn = clearHolderMetadataOriginal
-	}()
+		clearHolderMetadata(path)
+	}))
+	require.NoError(t, err, "first TryAcquireSessionLock should succeed")
+	require.NotNil(t, lk1)
 
 	// Call Release() and measure how long it takes.
 	// CRITICAL: It should return IMMEDIATELY (within 100ms), not wait for cleanup.

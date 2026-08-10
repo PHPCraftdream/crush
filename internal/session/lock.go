@@ -65,31 +65,17 @@ const LockStaleDuration = lockStaleDuration
 // liveness forever" check in the codebase.
 const MaxPidFallbackAge = maxPidFallbackAge
 
-// clearHolderMetadataFn is the function used by Release to clear diagnostic
-// metadata from the lock file. Can be replaced in tests to inject blocking
-// behavior for proving release order invariants (see TestP1_2_ReleaseUnlocksBeforeMetadataCleanup_Hang).
-//
-// Exported as SetClearHolderMetadataFn for agent package tests that need to
-// inject hung cleanup to prove abandonOwnershipWithHandoff reachability.
-var clearHolderMetadataFn = clearHolderMetadata
+// LockOption is a functional option for configuring SessionLock behavior.
+// Used primarily by tests to inject blocking behavior.
+type LockOption func(*SessionLock)
 
-// SetClearHolderMetadataFn replaces the clearHolderMetadataFn function for
-// testing purposes. Used by agent package tests to inject hung cleanup and
-// prove that abandonOwnershipWithHandoff finalizer is always reachable
-// even when Release() would block on diagnostic cleanup.
-// Must be called with the original function in a defer to restore state.
-func SetClearHolderMetadataFn(fn func(path string)) func() {
-	original := clearHolderMetadataFn
-	clearHolderMetadataFn = fn
-	return func() {
-		clearHolderMetadataFn = original
+// WithClearHolderMetadataFn sets the function used by Release() to clear
+// diagnostic metadata from the lock file. Used by tests to inject blocking
+// behavior to prove unlock/close happen before metadata cleanup.
+func WithClearHolderMetadataFn(fn func(path string)) LockOption {
+	return func(lk *SessionLock) {
+		lk.clearHolderMetadataFn = fn
 	}
-}
-
-// GetClearHolderMetadataFn returns the current clearHolderMetadataFn function
-// for testing purposes.
-func GetClearHolderMetadataFn() func(path string) {
-	return clearHolderMetadataFn
 }
 
 // SessionLock is an inter-process exclusive lock for a single session ID.
@@ -131,6 +117,11 @@ type SessionLock struct {
 	// timer, so a genuinely wedged process (no forward progress) stops
 	// looking alive to diagnostics after one interval.
 	active atomic.Bool
+	// clearHolderMetadataFn is the function called by Release() in a
+	// background goroutine to clear diagnostic metadata from the lock file.
+	// Set in the constructor; tests can inject blocking behavior via
+	// LockOption to prove unlock/close happen before metadata cleanup.
+	clearHolderMetadataFn func(path string)
 }
 
 // SessionLockBusyError is returned by TryAcquireSessionLock when the
@@ -169,6 +160,15 @@ func TryAcquireSessionLockWithTimeout(dataDir, sessionID string, timeoutSec int6
 }
 
 func TryAcquireSessionLock(dataDir, sessionID string) (*SessionLock, error) {
+	return TryAcquireSessionLockWithOptions(dataDir, sessionID)
+}
+
+// TryAcquireSessionLockWithOptions attempts to acquire an exclusive lock for the
+// given sessionID under <dataDir>/locks/. Returns a *SessionLock on
+// success (caller MUST Release()). Returns *SessionLockBusyError if
+// another live process holds the lock. Other errors returned as-is.
+// Accepts optional LockOption parameters for test configuration.
+func TryAcquireSessionLockWithOptions(dataDir, sessionID string, opts ...LockOption) (*SessionLock, error) {
 	if dataDir == "" {
 		return nil, fmt.Errorf("TryAcquireSessionLock: dataDir is empty")
 	}
@@ -192,7 +192,7 @@ func TryAcquireSessionLock(dataDir, sessionID string) (*SessionLock, error) {
 	// of the same session at once (see package doc).
 	logStaleDiagnostics(path)
 
-	lk, err := acquireSessionLockFile(path)
+	lk, err := acquireSessionLockFileWithOptions(path, opts)
 	if err == nil {
 		return lk, nil
 	}
@@ -204,7 +204,8 @@ func TryAcquireSessionLock(dataDir, sessionID string) (*SessionLock, error) {
 	return nil, busyErr
 }
 
-// acquireSessionLockFile opens (creating if necessary) the lock file at
+// acquireSessionLockFileWithOptions is like acquireSessionLockFile but accepts
+// LockOption parameters for test configuration. It opens the lock file at
 // path and attempts to take the OS-level advisory lock on THAT SAME
 // file/inode/handle. There is no "remove the file, make a new one"
 // fallback anywhere in this path: unlinking a path out from under an
@@ -226,7 +227,7 @@ func TryAcquireSessionLock(dataDir, sessionID string) (*SessionLock, error) {
 // somebody else holds the OS lock right now, full stop. No mtime
 // threshold, no PID liveness probe, nothing overrides that — we return
 // SessionLockBusyError unconditionally.
-func acquireSessionLockFile(path string) (*SessionLock, error) {
+func acquireSessionLockFileWithOptions(path string, opts []LockOption) (*SessionLock, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("TryAcquireSessionLock: open lock file: %w", err)
@@ -264,7 +265,17 @@ func acquireSessionLockFile(path string) (*SessionLock, error) {
 	}
 
 	stop := make(chan struct{})
-	lk := &SessionLock{Path: path, HolderPID: myPID, f: f, stop: stop}
+	lk := &SessionLock{
+		Path:                  path,
+		HolderPID:             myPID,
+		f:                     f,
+		stop:                  stop,
+		clearHolderMetadataFn: clearHolderMetadata, // Default implementation
+	}
+	// Apply any lock options (e.g., test injection of blocking cleanup)
+	for _, opt := range opts {
+		opt(lk)
+	}
 	go heartbeat(path, stop, &lk.active)
 
 	return lk, nil
@@ -335,8 +346,9 @@ func (l *SessionLock) Release() error {
 				releaseErr = closeErr
 			}
 
-			// Capture path by value for the background goroutine.
+			// Capture path and cleanup function by value for the background goroutine.
 			path := l.Path
+			cleanupFn := l.clearHolderMetadataFn
 
 			// Clear diagnostic metadata (best-effort, may hang on slow FS/AV/SMB).
 			// This runs AFTER unlockFile and Close in a BACKGROUND goroutine, so:
@@ -344,11 +356,11 @@ func (l *SessionLock) Release() error {
 			//   - A hang here does NOT block mailbox state transition (caller sees mbIdle immediately).
 			//   - The OS lock is already free for new owners to acquire.
 			//
-			// We pass only the path since the file is already closed; clearHolderMetadataFn
-			// will reopen if needed. clearHolderMetadataFn is a test seam (package-level var)
-			// so tests can inject blocking behavior to prove unlock/close happen before
-			// metadata cleanup.
-			go clearHolderMetadataFn(path)
+			// We pass only the path since the file is already closed; cleanupFn
+			// will reopen if needed. cleanupFn is a field on SessionLock, set in
+			// the constructor, so tests can inject blocking behavior via LockOption
+			// to prove unlock/close happen before metadata cleanup.
+			go cleanupFn(path)
 		}
 	})
 	return releaseErr

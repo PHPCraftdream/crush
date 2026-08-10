@@ -29,14 +29,16 @@ import (
 //     finalizer's detached run, proven by provider call count and message history.
 //
 // The test:
-//  1. Injects a blocking version of clearHolderMetadataFn via the
-//     package-global seam in internal/session/lock.go.
+//  1. Injects a blocking version of clearHolderMetadataFn via SessionAgentOptions.LockOptions
+//     (using session.WithClearHolderMetadataFn).
 //  2. Starts a Run() that acquires the OS lock.
 //  3. The first call to the provider returns an error via a custom context,
 //     causing Run() to error out quickly and trigger the finalizer.
 //  4. Verifies that Run() returns quickly (within 200ms) even though cleanup
 //     is blocked — this proves Release() defer doesn't block.
-//  5. Verifies that the finalizer abandonOwnershipWithHandoff actually ran
+//  5. Verifies that the cleanup goroutine actually started (proves it was spawned).
+//  6. Verifies that the OS lock is available even while cleanup is blocked.
+//  7. Verifies that the finalizer abandonOwnershipWithHandoff actually ran
 //     and correctly handed off the orphaned call via two proofs:
 //     a. Provider was called at least twice (once for firstCall, once for orphanedCall)
 //     b. orphanedCall.Prompt appears in the session's message history
@@ -50,13 +52,12 @@ import (
 // (TestP0_2_RetryExhaustion_QueuesCall), using httptest.Server with SSE responses
 // and atomic counters inside the HTTP handler.
 //
-// NOTE: This test is NOT parallel because it mutates the package-global
-// clearHolderMetadataFn seam in internal/session/lock.go, which would create
-// a data race with other parallel tests doing the same.
+// NOTE: This test is NOT parallel because it mutates package-local state that
+// would create a data race with other parallel tests doing the same.
 //
 // REVERT CHECK PROCEDURE:
-//  1. In lock.go Release(), change "go clearHolderMetadataFn(path)" back to
-//     "clearHolderMetadataFn(l.Path)" (remove the "go " keyword).
+//  1. In lock.go Release(), change "go cleanupFn(path)" back to "cleanupFn(path)"
+//     (remove the "go " keyword) in the background goroutine launch.
 //  2. Run: go test ./internal/agent -run TestP0_338_FinalizerReachableDespiteHungCleanup -v
 //  3. The test will FAIL because Run() hangs forever on Release().
 //  4. Restore the fix (add "go " back) and the test will PASS.
@@ -135,7 +136,13 @@ func TestP0_338_FinalizerReachableDespiteHungCleanup(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// Create a sessionAgent with dataDir so it acquires the OS lock.
+	// Inject the hung cleanup BEFORE starting Run, so it's active for the Release() defer.
+	// We use SessionAgentOptions.LockOptions to inject the hung cleanup function.
+	cleanupStarted := atomic.Bool{}
+	cleanupUnblock := make(chan struct{})
+
+	// Create a sessionAgent with dataDir so it acquires the OS lock, and inject
+	// the hung cleanup via LockOptions.
 	sa := agent.NewSessionAgent(agent.SessionAgentOptions{
 		DataDirectory: tmpDir,
 		LargeModel:    model,
@@ -144,7 +151,27 @@ func TestP0_338_FinalizerReachableDespiteHungCleanup(t *testing.T) {
 		Messages:      messages,
 		IsYolo:        true,
 		SystemPrompt:  "You are a test assistant.",
+		LockOptions: []session.LockOption{
+			session.WithClearHolderMetadataFn(func(path string) {
+				t.Logf("cleanup goroutine started for path: %s", path)
+				cleanupStarted.Store(true)
+				// Block for 2 seconds to prove the point, then unblock to avoid process cleanup issues.
+				select {
+				case <-time.After(2 * time.Second):
+					t.Logf("cleanup goroutine unblocking after timeout")
+					// Timeout - unblock and proceed with cleanup
+				case <-cleanupUnblock:
+					t.Logf("cleanup goroutine unblocking via explicit unblock")
+					// Explicit unblock (used in cleanup phase)
+				}
+				t.Logf("cleanup goroutine completed")
+			}),
+		},
 	})
+	defer func() {
+		// Unblock cleanup before test completes to avoid leaving stuck goroutines
+		close(cleanupUnblock)
+	}()
 
 	// Queue an orphaned call BEFORE starting Run — it will become orphaned when Run fails.
 	orphanedCall := agent.SessionAgentCall{
@@ -152,33 +179,6 @@ func TestP0_338_FinalizerReachableDespiteHungCleanup(t *testing.T) {
 		Prompt:    "orphaned call",
 	}
 	sa.QueueMessage(orphanedCall)
-
-	// Inject the hung cleanup BEFORE starting Run, so it's active for the Release() defer.
-	// We use the exported SetClearHolderMetadataFn to inject the hung cleanup.
-	cleanupStarted := atomic.Bool{}
-	cleanupUnblock := make(chan struct{})
-	clearHolderMetadataOriginal := session.GetClearHolderMetadataFn()
-
-	restoreFn := session.SetClearHolderMetadataFn(func(path string) {
-		t.Logf("cleanup goroutine started for path: %s", path)
-		cleanupStarted.Store(true)
-		// Block for 2 seconds to prove the point, then unblock to avoid process cleanup issues.
-		select {
-		case <-time.After(2 * time.Second):
-			t.Logf("cleanup goroutine unblocking after timeout")
-			// Timeout - unblock and proceed with cleanup
-		case <-cleanupUnblock:
-			t.Logf("cleanup goroutine unblocking via explicit unblock")
-			// Explicit unblock (used in cleanup phase)
-		}
-		clearHolderMetadataOriginal(path)
-		t.Logf("cleanup goroutine completed")
-	})
-	defer func() {
-		// Unblock cleanup before test completes to avoid leaving stuck goroutines
-		close(cleanupUnblock)
-		restoreFn()
-	}()
 
 	// Start the first Run that will acquire the lock and then fail.
 	firstCall := agent.SessionAgentCall{
@@ -203,7 +203,7 @@ func TestP0_338_FinalizerReachableDespiteHungCleanup(t *testing.T) {
 		require.Less(t, runDuration, 200*time.Millisecond,
 			"Run() should return within 200ms even with hung cleanup, got %v", runDuration)
 		require.Error(t, runErr, "Run should fail")
-		// The error message indicates Run() failed (expected since our provider returns HTTP 500).
+		// The error message indicates Run() failed (expected since our provider returns HTTP 400).
 		// What matters is that Run() returned quickly, proving Release() defer didn't block.
 	case <-time.After(5 * time.Second):
 		currentCalls := providerCalls.Load()
@@ -307,10 +307,6 @@ func TestP0_338_FinalizerReachableDespiteHungCleanup(t *testing.T) {
 	}, 10*time.Second, 100*time.Millisecond,
 		"Orphaned call prompt should appear in message history "+
 			"(proving the call was actually executed, not just queued)")
-
-	// Allow time for the blocked cleanup goroutine to finish before test completes.
-	// The defer above will unblock it and restore the original function.
-	time.Sleep(3 * time.Second)
 
 	// Clean up the DB connection so tmpDir can be removed. db.Connect pools
 	// connections by absolute dataDir path and additionally opens a

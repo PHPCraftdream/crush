@@ -234,16 +234,12 @@ func TestP2_3_ManualCompactionWatchdogCatchesIdleStall(t *testing.T) {
 		},
 	}
 
-	// Override the test seam for fast watchdog behavior.
-	shortTick := 100 * time.Millisecond
-	oldTick := testStreamWatchdogTick
-	testStreamWatchdogTick = func() time.Duration { return shortTick }
-	defer func() { testStreamWatchdogTick = oldTick }()
-
 	env := testEnv(t)
-	// Inject a SHORT streamIdleTimeout so the test runs fast.
-	// The real production default is 10 minutes, but that would make the test too slow.
+	// Inject a SHORT streamIdleTimeout and streamWatchdogTick so the test runs fast.
+	// The real production default is 10 minutes idle timeout and 30s tick,
+	// but that would make the test too slow.
 	shortIdleTimeout := 500 * time.Millisecond
+	shortTick := 100 * time.Millisecond
 	a := NewSessionAgent(SessionAgentOptions{
 		LargeModel:           model,
 		SmallModel:           model,
@@ -254,6 +250,7 @@ func TestP2_3_ManualCompactionWatchdogCatchesIdleStall(t *testing.T) {
 		Tools:                []fantasy.AgentTool{},
 		DisableAutoSummarize: true,
 		StreamIdleTimeout:    shortIdleTimeout,
+		StreamWatchdogTick:   shortTick,
 	})
 	sa := a.(*sessionAgent)
 

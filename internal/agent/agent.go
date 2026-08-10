@@ -89,10 +89,6 @@ const (
 	streamWatchdogTick = 30 * time.Second
 )
 
-// testStreamWatchdogTick is a test seam for overriding streamWatchdogTick
-// in tests that need fast watchdog behavior (e.g., P2_3 regression tests).
-var testStreamWatchdogTick = func() time.Duration { return streamWatchdogTick }
-
 const (
 	// toolExecutionMaxDefault is the never-freeze backstop: the maximum
 	// wall-clock a single tool may run while the stream watchdog is paused
@@ -506,10 +502,18 @@ type sessionAgent struct {
 	// every Run() on this agent. Set from Options.StreamIdleTimeoutSeconds
 	// via SessionAgentOptions at construction. 0 = use the default.
 	streamIdleTimeout time.Duration
+	// streamWatchdogTick, when > 0, overrides streamWatchdogTick for every
+	// Run()/Summarize() on this agent. Set from SessionAgentOptions at
+	// construction. 0 = use the default (30s).
+	streamWatchdogTick time.Duration
 	// dataDir is the absolute path to .crush/, used for the per-session
 	// inter-process file lock. Empty means locking is disabled (legacy
 	// callers / tests). Plumbed from SessionAgentOptions.DataDirectory.
 	dataDir string
+	// lockOptions holds session.LockOption values passed from
+	// SessionAgentOptions. Used when the agent acquires inter-process locks
+	// via session.TryAcquireSessionLockWithOptions. Primarily for tests.
+	lockOptions []session.LockOption
 	// checkpointInterval is plumbed from SessionAgentOptions.
 	// When > 0 the Run method starts a coalescing ticker that flushes
 	// in-memory streaming Parts to DB mid-step, bounding text loss on
@@ -667,6 +671,17 @@ type SessionAgentOptions struct {
 	// the built-in default; primarily exposed for tests that want a short
 	// bound instead of waiting out the real one.
 	TitleGenerationMaxDuration time.Duration
+	// StreamWatchdogTick overrides streamWatchdogTick when > 0 — the interval
+	// at which the stream watchdog checks for stalls. 0 = use the built-in
+	// default (30s); primarily exposed for tests that need fast watchdog
+	// behavior (e.g., P2_3 regression tests).
+	StreamWatchdogTick time.Duration
+	// LockOptions allows tests to inject options into SessionLock acquisition
+	// (e.g., WithClearHolderMetadataFn for hung cleanup tests). Passed to
+	// session.TryAcquireSessionLockWithOptions when the agent acquires
+	// inter-process locks. Primarily exposed for regression tests like
+	// TestP0_338_FinalizerReachableDespiteHungCleanup.
+	LockOptions []session.LockOption
 }
 
 func NewSessionAgent(
@@ -688,7 +703,9 @@ func NewSessionAgent(
 		summarizeQueue:             csync.NewMap[string, *SummarizeSnapshot](),
 		mailboxes:                  csync.NewMap[string, *mailbox](),
 		streamIdleTimeout:          opts.StreamIdleTimeout,
+		streamWatchdogTick:         opts.StreamWatchdogTick,
 		dataDir:                    opts.DataDirectory,
+		lockOptions:                opts.LockOptions,
 		checkpointInterval:         opts.CheckpointInterval,
 		timeoutExtendsOnProgress:   opts.TimeoutExtendsOnProgress,
 		timeoutHardCap:             opts.TimeoutHardCap,
@@ -787,6 +804,18 @@ func (a *sessionAgent) effectiveTitleGenerationMaxDuration() time.Duration {
 		titleGenerationMaxDuration = a.titleGenerationMaxDuration
 	}
 	return titleGenerationMaxDuration
+}
+
+// effectiveStreamWatchdogTick resolves the interval at which the stream
+// watchdog checks for stalls for THIS agent. 0 falls back to the default
+// (streamWatchdogTick, 30s). Primarily exposed for tests that need fast
+// watchdog behavior (e.g., P2_3 regression tests).
+func (a *sessionAgent) effectiveStreamWatchdogTick() time.Duration {
+	tick := streamWatchdogTick
+	if a.streamWatchdogTick > 0 {
+		tick = a.streamWatchdogTick
+	}
+	return tick
 }
 
 // logProviderWarnings emits each fantasy CallWarning from a step at WARN
@@ -1321,7 +1350,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	var lk *session.SessionLock
 	if a.dataDir != "" {
 		var lockErr error
-		lk, lockErr = session.TryAcquireSessionLock(a.dataDir, call.SessionID)
+		lk, lockErr = session.TryAcquireSessionLockWithOptions(a.dataDir, call.SessionID, a.lockOptions...)
 		if lockErr != nil {
 			var busyErr *session.SessionLockBusyError
 			if errors.As(lockErr, &busyErr) {
@@ -1799,7 +1828,7 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 	toolCleanupGrace := a.effectiveToolCleanupGrace()
 	var watchdogCauseVal atomic.Int32 // stores watchdogCause
 	wd := startStreamWatchdog(
-		genCtx, cancel, idleTimeout, testStreamWatchdogTick(),
+		genCtx, cancel, idleTimeout, a.effectiveStreamWatchdogTick(),
 		// The closure itself is deliberately a thin dispatch to a named
 		// method (task #243): a unit test can construct a minimal
 		// *sessionAgent and call handleWatchdogFire directly, exercising
@@ -3097,7 +3126,7 @@ func (a *sessionAgent) runSummarize(ctx context.Context, genCtx context.Context,
 	// Start stream watchdog to detect idle stalls in the summarization stream
 	var watchdogCauseVal atomic.Int32
 	wd := startStreamWatchdog(
-		genCtx, cancel, idleTimeout, testStreamWatchdogTick(),
+		genCtx, cancel, idleTimeout, a.effectiveStreamWatchdogTick(),
 		// Use a simple callback - just log and cancel (no tools to report)
 		func(elapsed time.Duration, cause watchdogCause) {
 			watchdogCauseVal.Store(int32(cause))
@@ -3152,7 +3181,7 @@ func (a *sessionAgent) runSummarize(ctx context.Context, genCtx context.Context,
 	var lk *session.SessionLock
 	if a.dataDir != "" {
 		var lockErr error
-		lk, lockErr = session.TryAcquireSessionLock(a.dataDir, sessionID)
+		lk, lockErr = session.TryAcquireSessionLockWithOptions(a.dataDir, sessionID, a.lockOptions...)
 		if lockErr != nil {
 			var busyErr *session.SessionLockBusyError
 			if errors.As(lockErr, &busyErr) {
