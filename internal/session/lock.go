@@ -33,6 +33,36 @@ const (
 	// roughly in sync by hand if toolExecutionMaxDefault ever changes
 	// meaningfully.
 	maxPidFallbackAge = 60 * time.Minute
+
+	// releaseMetadataCleanupBound caps how long Release() waits for
+	// clearHolderMetadataFn to finish before giving up and letting it
+	// continue in the background. This is a deliberate compromise between
+	// two requirements that would otherwise conflict:
+	//   - Release() must never hang the caller on a genuinely slow/hung
+	//     filesystem, AV scan, or SMB share (the original task #337 fix —
+	//     unbounded I/O here used to freeze the whole mailbox).
+	//   - The PID must actually be cleared from the lock file BEFORE
+	//     Release() returns in the overwhelmingly common case (healthy
+	//     local disk, clear completes in microseconds), or a process that
+	//     exits immediately after Release() (crash, kill -9, fast normal
+	//     exit) never gives the background goroutine a scheduling
+	//     opportunity to run at all — Go does not wait for goroutines on
+	//     process exit — leaving a stale, still-plausible-looking PID in
+	//     the lock file that a LATER process's InspectSessionLock reads as
+	//     Live via the PID-liveness fallback, permanently skipping
+	//     recovery for that orphaned session (found in the final @oh
+	//     review of tasks #337-349, P1-1 — TestRecoverInterruptedTurns_
+	//     NoLiveHolder_StillRecovers regressed by task #337 itself).
+	// 50ms comfortably covers real local-disk truncate/remove latency
+	// (microseconds, even with a generous safety margin) while still
+	// bounding the pathological-hang case far below "unbounded" — a large
+	// improvement over the pre-#337 behavior even in the worst case. Kept
+	// deliberately small: TestReleaseGate_1_MetadataCleanupBlockedForever
+	// (task #348) asserts Run() returns within 200ms of a PERMANENTLY
+	// blocked cleanup — this bound must stay well under that margin so a
+	// genuinely stuck cleanup still doesn't meaningfully regress that
+	// guarantee.
+	releaseMetadataCleanupBound = 50 * time.Millisecond
 )
 
 // LockStaleDuration is the exported view of lockStaleDuration, for callers
@@ -351,16 +381,38 @@ func (l *SessionLock) Release() error {
 			cleanupFn := l.clearHolderMetadataFn
 
 			// Clear diagnostic metadata (best-effort, may hang on slow FS/AV/SMB).
-			// This runs AFTER unlockFile and Close in a BACKGROUND goroutine, so:
-			//   - A hang here does NOT block Release() from returning.
-			//   - A hang here does NOT block mailbox state transition (caller sees mbIdle immediately).
-			//   - The OS lock is already free for new owners to acquire.
+			// This runs AFTER unlockFile and Close, in a goroutine, so:
+			//   - The OS lock is already free for new owners to acquire
+			//     regardless of how long this takes.
+			//   - A hang here does NOT block mailbox state transition beyond
+			//     releaseMetadataCleanupBound (caller sees mbIdle within that
+			//     bound at worst, not never).
+			//
+			// Release() waits up to releaseMetadataCleanupBound for this to
+			// finish before returning — bounded, not unbounded, so the
+			// overwhelmingly common case (healthy local disk, clear
+			// completes in microseconds) still fully clears the PID before
+			// Release() returns, exactly like the pre-task-#337 synchronous
+			// behavior, while a genuinely stuck FS/AV/SMB still cannot hang
+			// the caller past the bound (P1-1 fix, see the doc comment on
+			// releaseMetadataCleanupBound for the full rationale — a
+			// process that exits immediately after an unbounded-async
+			// Release() never gave the cleanup goroutine a chance to run at
+			// all, leaving a stale, still-plausible PID behind).
 			//
 			// We pass only the path since the file is already closed; cleanupFn
 			// will reopen if needed. cleanupFn is a field on SessionLock, set in
 			// the constructor, so tests can inject blocking behavior via LockOption
 			// to prove unlock/close happen before metadata cleanup.
-			go cleanupFn(path)
+			cleanupDone := make(chan struct{})
+			go func() {
+				cleanupFn(path)
+				close(cleanupDone)
+			}()
+			select {
+			case <-cleanupDone:
+			case <-time.After(releaseMetadataCleanupBound):
+			}
 		}
 	})
 	return releaseErr

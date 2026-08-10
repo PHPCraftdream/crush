@@ -102,10 +102,21 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   `go test -run TestReleaseGate ./internal/agent/... ./internal/app/...`):
   - **`SessionLock.Release()` could still leave the mailbox permanently
     stuck in `mbOwned`/`mbReleasing`** if the unbounded filesystem I/O
-    in its diagnostic-metadata cleanup hung — the OS-level unlock now
-    happens on a background goroutine, unconditionally decoupled from
-    that cleanup, and cleanup can no longer clobber a lock a fresh
-    holder has since re-acquired.
+    in its diagnostic-metadata cleanup hung — the OS-level unlock and
+    file close now happen synchronously, first, unconditionally; the
+    best-effort diagnostic-metadata cleanup (clearing the stale PID a
+    `sessions kill`/`sessions why` reader could otherwise see) moved to
+    a goroutine that Release() waits on for a short bound (50ms) before
+    giving up and letting it finish in the background — long enough to
+    cover real disk I/O, short enough that a genuinely stuck filesystem
+    still can't meaningfully delay the caller. (A stricter guard that
+    re-checked the OS lock before touching the metadata was tried and
+    reverted: under real scheduler contention it occasionally collided
+    with the SAME process's own fast re-acquire of a session it had just
+    released, which was a worse regression than the narrow, accepted,
+    cosmetic risk it was meant to close — see `sessions_kill.go`'s
+    re-probe of the real OS lock immediately before any destructive
+    action, which is what actually guards against a stale PID mattering.)
   - **Detached/orphaned calls that exhausted their retry budget had no
     guaranteed runner** — some could be lost entirely instead of
     landing in a durable queue. Replaced the three separate ad hoc

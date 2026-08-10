@@ -214,6 +214,10 @@ func (m *mockSessionService) NackRunQueueEntry(context.Context, string, string) 
 	return nil
 }
 
+func (m *mockSessionService) NackRunQueueEntryNoAttemptPenalty(context.Context, string, string) error {
+	return nil
+}
+
 func (m *mockSessionService) TerminalFailRunQueueEntry(context.Context, string) error {
 	return nil
 }

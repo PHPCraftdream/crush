@@ -157,7 +157,6 @@ SET status = 'leased',
     leased_by = ?,
     leased_at = ?,
     lease_expires_at = ?,
-    attempts = attempts + 1,
     updated_at = ?
 WHERE id = ? AND status = 'pending'
 RETURNING id, session_id, call_data, status, leased_by, leased_at, lease_expires_at, attempts, last_error, terminal_failure, created_at, updated_at
@@ -172,6 +171,11 @@ type LeaseRunQueueEntryByIDParams struct {
 }
 
 // Claim a specific entry by ID (call after GetOldestPendingRunQueueEntryForSession in a transaction).
+// Does not increment attempts: leasing only claims the row for execution.
+// Only NackRunQueueEntry counts an attempt, exactly once per completed,
+// failed execution. Counting both here and in NackRunQueueEntry
+// double-counted every failure cycle, silently halving the effective value
+// of RunQueueMaxAttempts.
 func (q *Queries) LeaseRunQueueEntryByID(ctx context.Context, arg LeaseRunQueueEntryByIDParams) (SessionRunQueue, error) {
 	row := q.queryRow(ctx, q.leaseRunQueueEntryByIDStmt, leaseRunQueueEntryByID,
 		arg.LeasedBy,
@@ -307,6 +311,51 @@ type NackRunQueueEntryParams struct {
 // Increments attempts but does NOT set terminal_failure.
 func (q *Queries) NackRunQueueEntry(ctx context.Context, arg NackRunQueueEntryParams) (SessionRunQueue, error) {
 	row := q.queryRow(ctx, q.nackRunQueueEntryStmt, nackRunQueueEntry, arg.LastError, arg.UpdatedAt, arg.ID)
+	var i SessionRunQueue
+	err := row.Scan(
+		&i.ID,
+		&i.SessionID,
+		&i.CallData,
+		&i.Status,
+		&i.LeasedBy,
+		&i.LeasedAt,
+		&i.LeaseExpiresAt,
+		&i.Attempts,
+		&i.LastError,
+		&i.TerminalFailure,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const nackRunQueueEntryNoAttemptPenalty = `-- name: NackRunQueueEntryNoAttemptPenalty :one
+UPDATE session_run_queue
+SET status = 'pending',
+    leased_by = NULL,
+    leased_at = NULL,
+    lease_expires_at = NULL,
+    last_error = ?,
+    updated_at = ?
+WHERE id = ? AND status = 'leased'
+RETURNING id, session_id, call_data, status, leased_by, leased_at, lease_expires_at, attempts, last_error, terminal_failure, created_at, updated_at
+`
+
+type NackRunQueueEntryNoAttemptPenaltyParams struct {
+	LastError sql.NullString `json:"last_error"`
+	UpdatedAt int64          `json:"updated_at"`
+	ID        string         `json:"id"`
+}
+
+// Release a leased entry back to pending state without counting it as an
+// attempt. Used specifically for session.SessionLockBusyError: another live
+// process legitimately holding the OS session lock is routine, expected
+// contention, not a failure of the call itself, and must never count toward
+// RunQueueMaxAttempts. Without this, the durable queue would delete
+// accepted user work after nothing more than a few turns of ordinary lock
+// contention.
+func (q *Queries) NackRunQueueEntryNoAttemptPenalty(ctx context.Context, arg NackRunQueueEntryNoAttemptPenaltyParams) (SessionRunQueue, error) {
+	row := q.queryRow(ctx, q.nackRunQueueEntryNoAttemptPenaltyStmt, nackRunQueueEntryNoAttemptPenalty, arg.LastError, arg.UpdatedAt, arg.ID)
 	var i SessionRunQueue
 	err := row.Scan(
 		&i.ID,

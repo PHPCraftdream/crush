@@ -20,7 +20,13 @@ import (
 // Design principles (from task #340, P0-2 review):
 //   - Independent of request/turn lifecycle (not a child goroutine of Run())
 //   - One pump per process (or per dataDir - resolved to "per process" here)
-//   - Uses TryAcquireSessionLock to avoid contention with active sessions
+//   - Never acquires the session OS lock itself — it drives execution
+//     through Coordinator.Run, which goes through the normal
+//     TryAcquireSessionLock path exactly like any other caller (a
+//     SessionLockBusyError from ordinary lock contention is handled by
+//     processEntry's NackRunQueueEntryNoAttemptPenalty path, see below —
+//     the pump does not pre-check or avoid contention, it just doesn't
+//     let contention drain the durable queue).
 //   - Respects ErrCallAlreadyAttempted as terminal (no retry)
 //   - Graceful shutdown via context cancellation
 //
@@ -52,7 +58,11 @@ type RunQueuePumpConfig struct {
 	// Sessions is the session service for enqueue/lease/ack operations.
 	Sessions Service
 
-	// DataDirectory is the workspace root for OS lock acquisition.
+	// DataDirectory is currently unused by RunQueuePump itself (the pump
+	// never touches the OS lock directly — see the design-principles doc
+	// comment on RunQueuePump). Kept for now since callers already pass
+	// it and a future pump-level use (e.g. direct lock probing) may want
+	// it; if it stays unused, consider removing it in a follow-up pass.
 	DataDirectory string
 
 	// Coordinator is the agent coordinator that will execute leased calls.
@@ -218,6 +228,21 @@ func (p *RunQueuePump) processEntry(ctx context.Context, entry *RunQueueEntry) {
 			// Raced with another pump instance leasing/consuming it first.
 			return
 		}
+		if leased.ID != entry.ID {
+			// LeaseRunQueueEntry claims the OLDEST PENDING entry for the
+			// session, not a specific entry by ID — if another pump instance
+			// raced us and already consumed the attempts-exhausted entry we
+			// scanned, this lease can land on a DIFFERENT, healthy,
+			// never-executed entry for the same session (e.g. a fresh call
+			// queued after the scan). Terminal-failing THAT entry would
+			// silently delete legitimate, unattempted work. Release it
+			// unharmed (no attempt penalty — this pump did nothing wrong to
+			// it) and let a future tick handle it normally.
+			if nackErr := p.cfg.Sessions.NackRunQueueEntryNoAttemptPenalty(ctx, leased.ID, "released: leased entry did not match the attempts-exhausted entry scanned for terminal-fail"); nackErr != nil {
+				slog.Error("run_queue_pump: release of mismatched lease failed", "id", leased.ID, "session_id", leased.SessionID, "err", nackErr, "instance_id", p.cfg.PumpInstanceID)
+			}
+			return
+		}
 		if err := p.cfg.Sessions.TerminalFailRunQueueEntry(ctx, leased.ID); err != nil {
 			slog.Error("run_queue_pump: terminal fail failed", "id", leased.ID, "session_id", leased.SessionID, "err", err, "instance_id", p.cfg.PumpInstanceID)
 		}
@@ -284,6 +309,22 @@ func (p *RunQueuePump) executeEntry(ctx context.Context, leased *RunQueueEntry) 
 			slog.Error("run_queue_pump: terminal fail failed", "id", leased.ID, "err", termErr, "instance_id", p.cfg.PumpInstanceID)
 		}
 		slog.Warn("run_queue_pump: entry terminal failed (already attempted)", "id", leased.ID, "session_id", leased.SessionID, "err", err, "instance_id", p.cfg.PumpInstanceID)
+		return
+	}
+
+	// SessionLockBusyError means another live process legitimately holds the
+	// OS session lock right now — ordinary, expected contention (a normal
+	// turn can hold it for as long as a full LLM turn takes), not a failure
+	// of the call itself. It must never count toward RunQueueMaxAttempts:
+	// counting it would let a few turns' worth of routine contention
+	// silently delete accepted user work once attempts exhausts (found in
+	// the final @oh review of tasks #337-349 — P0-2).
+	var busyErr *SessionLockBusyError
+	if errors.As(err, &busyErr) {
+		if nackErr := p.cfg.Sessions.NackRunQueueEntryNoAttemptPenalty(ctx, leased.ID, err.Error()); nackErr != nil {
+			slog.Error("run_queue_pump: no-penalty nack failed", "id", leased.ID, "err", nackErr, "instance_id", p.cfg.PumpInstanceID)
+		}
+		slog.Debug("run_queue_pump: entry blocked by session lock contention, will retry without attempt penalty", "id", leased.ID, "session_id", leased.SessionID, "instance_id", p.cfg.PumpInstanceID)
 		return
 	}
 

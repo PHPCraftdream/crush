@@ -247,6 +247,7 @@ type Service interface {
 	LeaseRunQueueEntry(ctx context.Context, sessionID, leasedBy string, leaseTTL time.Duration) (*RunQueueEntry, error)
 	AckRunQueueEntry(ctx context.Context, id string) (string, error)
 	NackRunQueueEntry(ctx context.Context, id, lastError string) error
+	NackRunQueueEntryNoAttemptPenalty(ctx context.Context, id, lastError string) error
 	TerminalFailRunQueueEntry(ctx context.Context, id string) error
 	ListPendingRunQueueEntries(ctx context.Context) ([]RunQueueEntry, error)
 	ListStaleLeasedRunQueueEntries(ctx context.Context, beforeTime int64) ([]RunQueueEntry, error)
@@ -1453,6 +1454,26 @@ func (s *service) AckRunQueueEntry(ctx context.Context, id string) (string, erro
 func (s *service) NackRunQueueEntry(ctx context.Context, id, lastError string) error {
 	now := time.Now().Unix()
 	_, err := s.q.NackRunQueueEntry(ctx, db.NackRunQueueEntryParams{
+		LastError: sql.NullString{String: lastError, Valid: lastError != ""},
+		UpdatedAt: now,
+		ID:        id,
+	})
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("run queue entry %q not found or not in leased state", id)
+	}
+	return err
+}
+
+// NackRunQueueEntryNoAttemptPenalty releases a leased entry back to pending
+// state WITHOUT incrementing its attempts count. Used for
+// SessionLockBusyError: ordinary lock contention from another live process
+// is expected, routine behavior, not a failure of the call itself, and must
+// never count toward RunQueueMaxAttempts (see run_queue_pump.go's
+// executeEntry) — otherwise the durable queue would silently delete
+// accepted work after nothing more than a few turns of normal contention.
+func (s *service) NackRunQueueEntryNoAttemptPenalty(ctx context.Context, id, lastError string) error {
+	now := time.Now().Unix()
+	_, err := s.q.NackRunQueueEntryNoAttemptPenalty(ctx, db.NackRunQueueEntryNoAttemptPenaltyParams{
 		LastError: sql.NullString{String: lastError, Valid: lastError != ""},
 		UpdatedAt: now,
 		ID:        id,

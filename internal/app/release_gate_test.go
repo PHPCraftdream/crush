@@ -70,10 +70,21 @@ func (b *blockingTool) SetProviderOptions(_ fantasy.ProviderOptions) {}
 // agent.NewSessionAgent directly with a thin Coordinator adapter.
 //
 // REVERT CHECK PROCEDURE:
-//  1. In agent.go's CancelAll, revert to old IsBusy() polling (or remove runWg.Add/Done from Run())
+//  1. In agent.go's Run(), remove the `a.runWg.Add(1)` / `defer a.runWg.Done()`
+//     pair at the top of the function.
+//     (Reverting CancelAll to the OLD IsBusy()-polling loop instead, as an
+//     earlier version of this comment suggested, is NOT a valid revert
+//     check for this test: a blocked Run() correctly leaves the mailbox in
+//     mbOwned for the whole test, so IsBusy() would ALSO correctly report
+//     stillBusy=true — polling and the runWg.Wait() join converge on the
+//     same observable result for this specific "genuinely still blocked"
+//     scenario. The two differ only in edge cases IsBusy()-polling handled
+//     incorrectly — see task #343's own history — not in this test's
+//     shape. Only removing the runWg instrumentation itself breaks the
+//     join CancelAll relies on.)
 //  2. Run: go test -run TestReleaseGate_7_ShutdownWithNonCooperativeAgent -v
 //  3. FAIL: CancelAll returns immediately, stillBusy=false, DB gets closed under live writer
-//  4. Restore runWg.Wait() and PASS
+//  4. Restore the runWg.Add/Done pair and PASS
 func TestReleaseGate_7_ShutdownWithNonCooperativeAgent(t *testing.T) {
 	dataDir := t.TempDir()
 

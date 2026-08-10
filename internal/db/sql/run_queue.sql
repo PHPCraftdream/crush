@@ -22,12 +22,16 @@ LIMIT 1;
 
 -- name: LeaseRunQueueEntryByID :one
 -- Claim a specific entry by ID (call after GetOldestPendingRunQueueEntryForSession in a transaction).
+-- Does not increment attempts: leasing only claims the row for execution.
+-- Only NackRunQueueEntry counts an attempt, exactly once per completed,
+-- failed execution. Counting both here and in NackRunQueueEntry
+-- double-counted every failure cycle, silently halving the effective value
+-- of RunQueueMaxAttempts.
 UPDATE session_run_queue
 SET status = 'leased',
     leased_by = ?,
     leased_at = ?,
     lease_expires_at = ?,
-    attempts = attempts + 1,
     updated_at = ?
 WHERE id = ? AND status = 'pending'
 RETURNING *;
@@ -49,6 +53,24 @@ SET status = 'pending',
     lease_expires_at = NULL,
     last_error = ?,
     attempts = attempts + 1,
+    updated_at = ?
+WHERE id = ? AND status = 'leased'
+RETURNING *;
+
+-- name: NackRunQueueEntryNoAttemptPenalty :one
+-- Release a leased entry back to pending state without counting it as an
+-- attempt. Used specifically for session.SessionLockBusyError: another live
+-- process legitimately holding the OS session lock is routine, expected
+-- contention, not a failure of the call itself, and must never count toward
+-- RunQueueMaxAttempts. Without this, the durable queue would delete
+-- accepted user work after nothing more than a few turns of ordinary lock
+-- contention.
+UPDATE session_run_queue
+SET status = 'pending',
+    leased_by = NULL,
+    leased_at = NULL,
+    lease_expires_at = NULL,
+    last_error = ?,
     updated_at = ?
 WHERE id = ? AND status = 'leased'
 RETURNING *;

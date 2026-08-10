@@ -254,7 +254,14 @@ func TestRunQueue_PumpLifecycle_GracefulShutdown(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	pump2.Stop()
 
-	require.True(t, true, "pump lifecycle test completed")
+	// Stop() must be idempotent — a caller that stops an already-stopped
+	// pump (e.g. a redundant shutdown-path call) must not hang or panic.
+	// If Stop() were NOT idempotent (e.g. it unconditionally called
+	// p.cancel() and p.wg.Wait() a second time on an already-nil/finished
+	// wg), this call would either panic or hang, and — since this is not
+	// run in its own goroutine — the whole test would time out rather than
+	// reach this point.
+	require.NotPanics(t, func() { pump2.Stop() }, "Stop() must be safe to call more than once")
 }
 
 // Helper: mock coordinator for testing

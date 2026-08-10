@@ -43,21 +43,40 @@ import (
 
 // coordinatorAdapterImpl wraps agent.Coordinator to satisfy session.Coordinator,
 // avoiding an import cycle (session → agent → session).
+//
+// Reads app.AgentCoordinator lazily, on every Run() call, rather than
+// capturing it once at construction time: the pump is started in App.New
+// BEFORE InitCoderAgent assigns app.AgentCoordinator (InitCoderAgent runs
+// near the end of New, after the pump is already ticking), so capturing a
+// snapshot at construction time would permanently wire the pump to a nil
+// coordinator — it would silently stay in scan-only mode for the entire
+// process lifetime, never actually executing any durably-queued call. See
+// the "app: coordinator not ready yet" error below for what happens if a
+// tick still manages to race InitCoderAgent (the pump retries next tick;
+// this is not expected in practice given InitCoderAgent runs synchronously
+// during App.New, before New returns and before any caller could enqueue
+// work, but the lazy read costs nothing and removes the ordering hazard
+// entirely rather than relying on that timing).
 type coordinatorAdapterImpl struct {
-	coord agent.Coordinator
+	app *App
 }
 
 func (a *coordinatorAdapterImpl) Run(ctx context.Context, callData session.SessionAgentCallData) (*any, error) {
+	coord := a.app.AgentCoordinator
+	if coord == nil {
+		return nil, fmt.Errorf("app: coordinator not ready yet")
+	}
+
 	// Convert session.SessionAgentCallData to agent.SessionAgentCall
 	// This requires rebuilding the full Model from the serialized ModelCfg,
 	// which only the coordinator can do (it has access to provider configs
 	// and catwalk registry). Delegate to coordinator.RebuildSessionAgentCall.
-	call, err := a.coord.RebuildSessionAgentCall(ctx, callData)
+	call, err := coord.RebuildSessionAgentCall(ctx, callData)
 	if err != nil {
 		return nil, fmt.Errorf("failed to rebuild session agent call: %w", err)
 	}
 
-	result, err := a.coord.RunSessionAgentCall(ctx, call)
+	result, err := coord.RunSessionAgentCall(ctx, call)
 	// Return as any - we only care about error handling, not the result
 	var anyResult any
 	if result != nil {
@@ -202,17 +221,16 @@ func New(ctx context.Context, conn *sql.DB, store *config.ConfigStore) (*App, er
 	// independent of which specific request/turn originated it. The pump lives
 	// for the lifetime of the process and is stopped during Shutdown().
 	//
-	// We wrap the real coordinator in an adapter to avoid import cycles.
-	var coordinatorAdapter session.Coordinator
-	if app.AgentCoordinator != nil {
-		coordinatorAdapter = &coordinatorAdapterImpl{coord: app.AgentCoordinator}
-	}
-
+	// We wrap the real coordinator in an adapter to avoid import cycles. The
+	// adapter reads app.AgentCoordinator lazily (see coordinatorAdapterImpl's
+	// doc comment) because InitCoderAgent — which assigns AgentCoordinator —
+	// runs AFTER this point in App.New; capturing app.AgentCoordinator by
+	// value here would always capture nil, permanently disabling execution.
 	if dataDir != "" {
 		app.RunQueuePump = session.NewRunQueuePump(session.RunQueuePumpConfig{
 			Sessions:      app.Sessions,
 			DataDirectory: dataDir,
-			Coordinator:   coordinatorAdapter,
+			Coordinator:   &coordinatorAdapterImpl{app: app},
 		})
 		app.RunQueuePump.Start()
 		slog.Info("app: started run queue pump", "data_dir", dataDir)

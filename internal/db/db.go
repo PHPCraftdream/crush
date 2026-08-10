@@ -204,6 +204,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.nackRunQueueEntryStmt, err = db.PrepareContext(ctx, nackRunQueueEntry); err != nil {
 		return nil, fmt.Errorf("error preparing query NackRunQueueEntry: %w", err)
 	}
+	if q.nackRunQueueEntryNoAttemptPenaltyStmt, err = db.PrepareContext(ctx, nackRunQueueEntryNoAttemptPenalty); err != nil {
+		return nil, fmt.Errorf("error preparing query NackRunQueueEntryNoAttemptPenalty: %w", err)
+	}
 	if q.recordFileReadStmt, err = db.PrepareContext(ctx, recordFileRead); err != nil {
 		return nil, fmt.Errorf("error preparing query RecordFileRead: %w", err)
 	}
@@ -539,6 +542,11 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing nackRunQueueEntryStmt: %w", cerr)
 		}
 	}
+	if q.nackRunQueueEntryNoAttemptPenaltyStmt != nil {
+		if cerr := q.nackRunQueueEntryNoAttemptPenaltyStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing nackRunQueueEntryNoAttemptPenaltyStmt: %w", cerr)
+		}
+	}
 	if q.recordFileReadStmt != nil {
 		if cerr := q.recordFileReadStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing recordFileReadStmt: %w", cerr)
@@ -688,6 +696,7 @@ type Queries struct {
 	listUserMessagesBySessionStmt               *sql.Stmt
 	matchSessionPermissionStmt                  *sql.Stmt
 	nackRunQueueEntryStmt                       *sql.Stmt
+	nackRunQueueEntryNoAttemptPenaltyStmt       *sql.Stmt
 	recordFileReadStmt                          *sql.Stmt
 	renameSessionStmt                           *sql.Stmt
 	setParentCostAccountedStmt                  *sql.Stmt
@@ -764,6 +773,7 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		listUserMessagesBySessionStmt:               q.listUserMessagesBySessionStmt,
 		matchSessionPermissionStmt:                  q.matchSessionPermissionStmt,
 		nackRunQueueEntryStmt:                       q.nackRunQueueEntryStmt,
+		nackRunQueueEntryNoAttemptPenaltyStmt:       q.nackRunQueueEntryNoAttemptPenaltyStmt,
 		recordFileReadStmt:                          q.recordFileReadStmt,
 		renameSessionStmt:                           q.renameSessionStmt,
 		setParentCostAccountedStmt:                  q.setParentCostAccountedStmt,

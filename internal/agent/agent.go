@@ -1060,54 +1060,15 @@ func (a *sessionAgent) abandonOwnershipWithHandoff(sessionID string, epoch uint6
 // access to a *coordinator (agent and coordinator are separate layers;
 // coordinator wraps sessionAgent, not the other way around).
 //
-// Task #340, ROUND 3 migration: each goroutine durably enqueues its call to
-// the session_run_queue table (session.EnqueueRunQueueEntry) BEFORE
-// returning, instead of calling a.Run directly. The independent
-// RunQueuePump (not this goroutine, not any turn loop) is what actually
-// executes the call later. This is a deliberate change from the earlier
-// "call a.Run and log on error" design: a single failed a.Run attempt used
-// to be terminal (the call was simply lost), whereas durable enqueue +
-// pump retry means the call is guaranteed a runner (or an explicit
-// terminal failure recorded in the queue) even across process restarts.
-//
-// Each call gets its OWN goroutine and its own context.Background() only
-// for the enqueue call itself: the caller (drainOrReleaseMerged, called
-// from runTurn, called from Run's turn loop) is about to return control up
-// its own call stack, possibly all the way out of Run() entirely — there
-// is no request-scoped ctx left in scope whose cancellation would be
-// meaningful to inherit.
+// Task #340, ROUND 3 migration made this byte-identical to
+// restartOrphanedWithRetry (both now durably enqueue via the run queue
+// pump instead of the old direct-retry-loop design that originally
+// distinguished them) — kept as a separate name for existing call sites
+// and tests rather than a blanket rename, but implemented as a thin alias
+// so the actual enqueue logic has exactly one copy. See
+// restartOrphanedWithRetry's doc comment for the full design rationale.
 func (a *sessionAgent) restartOrphaned(calls []SessionAgentCall) {
-	for _, call := range calls {
-		call := call
-		go func() {
-			// Generate idempotency key: sessionID + timestamp ensures uniqueness
-			idempotencyKey := fmt.Sprintf("%s-%d", call.SessionID, time.Now().UnixNano())
-
-			// Convert to SessionAgentCallData for serialization
-			callData := ToSessionAgentCallData(call)
-			callDataJSON, err := json.Marshal(callData)
-			if err != nil {
-				slog.Error("agent: failed to serialize call data for durable enqueue",
-					"session_id", call.SessionID, "err", err)
-				return
-			}
-
-			// Durably enqueue the call BEFORE returning control (P0-2 requirement)
-			// This ensures the call will eventually be executed even if this goroutine exits
-			if enqueueErr := a.sessions.EnqueueRunQueueEntry(context.Background(), idempotencyKey, call.SessionID, callDataJSON); enqueueErr != nil {
-				slog.Error("agent: failed to durably enqueue call for recovery",
-					"session_id", call.SessionID, "err", enqueueErr)
-				// Fallback: try in-memory queue (data loss risk, but better than nothing)
-				a.getMailbox(call.SessionID).queue(call)
-				slog.Error("agent: durable enqueue failed, using in-memory fallback (data loss risk)",
-					"session_id", call.SessionID)
-				return
-			}
-
-			slog.Debug("agent: durably enqueued call for pump recovery",
-				"session_id", call.SessionID, "idempotency_key", idempotencyKey)
-		}()
-	}
+	a.restartOrphanedWithRetry(calls)
 }
 
 // restartOrphanedWithRetry durably enqueues calls for recovery by the run queue pump
@@ -1125,6 +1086,12 @@ func (a *sessionAgent) restartOrphaned(calls []SessionAgentCall) {
 // This replaces the old retry loop (5 attempts with backoff) with a single durable
 // enqueue operation. The pump's 3-second tick interval handles all retry timing,
 // and its lease TTL (30 seconds) handles crash recovery.
+//
+// Each call gets its OWN goroutine and its own context.Background() only
+// for the enqueue call itself: the caller is about to return control up its
+// own call stack, possibly all the way out of Run() entirely — there is no
+// request-scoped ctx left in scope whose cancellation would be meaningful
+// to inherit.
 func (a *sessionAgent) restartOrphanedWithRetry(calls []SessionAgentCall) {
 	for _, call := range calls {
 		call := call
