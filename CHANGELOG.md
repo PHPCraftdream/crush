@@ -1067,3 +1067,38 @@ finished the mailbox migration:
   fallback overwriting a *later* turn's real title with the placeholder
   name — had no regression test at all despite being a named, previously
   fixed defect. It does now.
+- **A final `@oh` review of the release gate suite above found six more
+  real defects, then a second confirming pass over that very fix found
+  six new ones introduced by it** — both rounds independently
+  re-verified (never accepted from review narration alone), each with a
+  genuine FAIL→PASS revert-check.
+  - First pass: a durable queue entry whose lease mismatched the one
+    the pump actually scanned could be terminal-failed by ID instead of
+    released back to pending, deleting the wrong entry; a busy OS
+    session lock (routine, expected contention from another live
+    process) was counted as a failed attempt toward the queue's max-
+    retries budget exactly like a genuine failure, exhausting healthy
+    entries under load; `SessionLock.Release()`'s metadata cleanup ran
+    fully async with zero wait, so a caller could observe a stale PID
+    immediately after `Release()` returned; and a couple of doc-comment
+    corrections.
+  - Second pass, on the fix for the first: `App.New()` started the run
+    queue pump *before* `InitCoderAgent` assigned the coordinator it
+    reads — an unsynchronized data race per Go's memory model between
+    `InitCoderAgent`'s write and the pump's read, plus a work-loss path
+    where an already-started pump could dead-letter a durable entry if
+    `InitCoderAgent` failed or the app was unconfigured. Fixed by moving
+    pump construction and `Start()` to strictly after `InitCoderAgent`
+    succeeds, removing the hazard architecturally. Also: a new pump-
+    wiring regression test called real `app.New()` without environment
+    isolation (the same failure class that once hung a stress run for
+    9+ minutes, see `internal/cmd/providers_test.go`); removing the
+    lease-attempt increment from the lease query (part of the first
+    pass's fix) left crashed/hung executions never accumulating
+    attempts via lease-expiry cleanup, risking an endless retry loop
+    for a poison entry; and further doc-comment corrections, including
+    an assertion in `docs/release_gate_summary.md` that a regression
+    was "confirmed pre-existing via `git stash`" — a check performed
+    after the regressing commits were already on `main`, with nothing
+    left to stash back to; it is a genuine regression, and was already
+    fixed by the bounded synchronous wait mentioned above.
