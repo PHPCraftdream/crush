@@ -2217,8 +2217,11 @@ func (c *coordinator) InterruptAndSend(ctx context.Context, sessionID, prompt st
 	return nil
 }
 
-// startDetachedRun runs call in its own goroutine, for the idle-session
-// paths of InterruptAndSend / requeueInterruptMessage (P0-B).
+// startDetachedRun durably enqueues call for the idle-session paths of
+// InterruptAndSend / requeueInterruptMessage (P0-B). Despite the name (kept
+// for git-blame continuity with the pre-#340 version), it no longer runs
+// call itself, in a goroutine or otherwise — see the task #340 paragraph
+// below for what changed and why.
 //
 // Those paths used to call QueueMessage(call) when InterruptAndReplace
 // reported no owner. That is a runnerless queue: with the session idle
@@ -2227,26 +2230,21 @@ func (c *coordinator) InterruptAndSend(ctx context.Context, sessionID, prompt st
 // (and, through it, the web client) had already been told the message was
 // "queued". For a user pressing interrupt on a session that had just
 // finished, or landing in the race right after a release, the message
-// simply never ran. Starting the run here is what the mailbox's own
+// simply never ran. Durably enqueuing here is what the mailbox's own
 // contract says the caller must do when it is handed "no owner" (see
 // mailbox.interruptAndReplace's doc).
 //
-// Losing the race to a concurrent Run() is safe and needs no coordination:
-// SessionAgent.Run submits through the mailbox, so if an owner appeared in
-// the meantime this call is queued behind it and that owner drains it —
-// the one thing that cannot happen either way is the call going unrun.
-//
-// The context is detached (WithoutCancel) because the caller's ctx is
-// request-scoped: the web handler returns as soon as InterruptAndSend
-// does, and a CLI `sessions inject` process may exit moments later.
-// Cancelling the run when that context goes away would recreate the very
-// "accepted but never executed" outcome this exists to prevent.
-//
-// P0-2 fix (task #340, ROUND 3 migration): durably enqueues the call to the
-// run queue instead of retrying immediately. The pump will handle all retry
-// timing and crash recovery. This eliminates data loss risks from the previous
-// bounded retry approach and ensures every accepted call gets a guaranteed
-// runner (or explicit terminal failure).
+// Task #340, ROUND 3 migration: durably enqueues the call to the
+// session_run_queue table (session.EnqueueRunQueueEntry) synchronously, in
+// the CALLER's own goroutine and ctx — no longer spawns its own goroutine
+// and no longer wraps ctx in context.WithoutCancel. The independent
+// RunQueuePump is what actually executes the call later; this function's
+// job ends once the durable-enqueue write has committed (or, on enqueue
+// failure, once the pending_injects row has been recreated below). This
+// eliminates data loss risks from the previous bounded-retry-then-log
+// approach and ensures every accepted call gets a guaranteed runner (or an
+// explicit terminal failure recorded in the queue), even across process
+// restarts.
 //
 // For the interrupt inject path (InjectID non-empty), we still delete the
 // pending_injects row at START to prevent duplicate detached runs if the

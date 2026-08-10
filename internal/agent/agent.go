@@ -1054,30 +1054,28 @@ func (a *sessionAgent) abandonOwnershipWithHandoff(sessionID string, epoch uint6
 	}
 }
 
-// restartOrphaned starts one independent, detached a.Run call per entry in
-// calls — the sessionAgent-level equivalent of coordinator.startDetachedRun
-// (P0-B), needed here because drainOrReleaseMerged/drainOrReleaseFinal have
-// no access to a *coordinator (agent and coordinator are separate layers;
+// restartOrphaned starts one detached goroutine per entry in calls — the
+// sessionAgent-level equivalent of coordinator.startDetachedRun (P0-B),
+// needed here because drainOrReleaseMerged/drainOrReleaseFinal have no
+// access to a *coordinator (agent and coordinator are separate layers;
 // coordinator wraps sessionAgent, not the other way around).
 //
-// Each call gets its OWN goroutine and its own context.Background(): the
-// caller (drainOrReleaseMerged, called from runTurn, called from Run's turn
-// loop) is about to return control up its own call stack, possibly all the
-// way out of Run() entirely — there is no request-scoped ctx left in scope
-// whose cancellation would be meaningful to inherit, and even if there were,
-// cancelling it would recreate the exact "accepted but never executed"
-// outcome startDetachedRun's own doc warns against. a.Run performs its own
-// full acquisition (mailbox.submit + a fresh session.TryAcquireSessionLock)
-// for each one — none of these reuse the lk that drainOrReleaseFinal already
-// released; see drainOrReleaseFinal's own doc for why reusing it is exactly
-// the bug this function exists to close.
+// Task #340, ROUND 3 migration: each goroutine durably enqueues its call to
+// the session_run_queue table (session.EnqueueRunQueueEntry) BEFORE
+// returning, instead of calling a.Run directly. The independent
+// RunQueuePump (not this goroutine, not any turn loop) is what actually
+// executes the call later. This is a deliberate change from the earlier
+// "call a.Run and log on error" design: a single failed a.Run attempt used
+// to be terminal (the call was simply lost), whereas durable enqueue +
+// pump retry means the call is guaranteed a runner (or an explicit
+// terminal failure recorded in the queue) even across process restarts.
 //
-// Losing a race to a concurrent Run() that claims the mailbox first is safe
-// and needs no coordination (same reasoning as startDetachedRun's doc): if
-// another owner appears between orphaning and this call's own submit(), this
-// call's submit() simply queues behind that new owner instead of becoming
-// owner itself, and that owner's own end-of-turn drain picks it up. The one
-// outcome that cannot happen is the call going unrun.
+// Each call gets its OWN goroutine and its own context.Background() only
+// for the enqueue call itself: the caller (drainOrReleaseMerged, called
+// from runTurn, called from Run's turn loop) is about to return control up
+// its own call stack, possibly all the way out of Run() entirely — there
+// is no request-scoped ctx left in scope whose cancellation would be
+// meaningful to inherit.
 func (a *sessionAgent) restartOrphaned(calls []SessionAgentCall) {
 	for _, call := range calls {
 		call := call

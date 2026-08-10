@@ -354,9 +354,19 @@ func (mb *mailbox) submit(call SessionAgentCall, dispatcherCancel context.Cancel
 	// NOT held, so the OS lock is not actually free yet even though a turn
 	// loop isn't either — becoming owner here would race a concurrent
 	// TryAcquireSessionLock against this call's own in-flight release. See
-	// the mbReleasing const's doc. drainOrReleaseFinal's finalize step hands
-	// this queued call back to the still-live turn loop once release()
-	// returns, so it is not stranded.
+	// the mbReleasing const's doc.
+	//
+	// This call is NOT stranded once release() returns, but the fate
+	// depends on WHICH state it landed in:
+	//   - mbOwned: the current turn loop is still genuinely alive and its
+	//     own end-of-turn drain (drainOrRelease/drainOrReleaseFinal) picks
+	//     this call up as its next turn in the normal way.
+	//   - mbReleasing: by the time release() returns there is no turn loop
+	//     left to hand this to — the caller that was releasing is already
+	//     on its way out. drainOrReleaseFinal's Case 4 (see its own doc)
+	//     reports this call as orphaned, and drainOrReleaseMerged restarts
+	//     it via restartOrphaned — a detached durable-queue enqueue (task
+	//     #340), NOT a handoff to any "still-live" loop.
 	mb.submitted = append(mb.submitted, call)
 	return false, 0 // caller queues and returns nil, exactly like today
 }
@@ -1143,12 +1153,38 @@ func (mb *mailbox) popFirstSubmitted() (SessionAgentCall, bool) {
 	return first, true
 }
 
-// popAllSubmitted removes and returns ALL entries from the submitted queue,
-// regardless of mailbox state. Used by abandonOwnershipWithHandoff to start
-// detached runs for all work left in the mailbox after a non-cancel error.
-// This method is safe to call when state is mbIdle (which abandonOwnership
-// guarantees), because no new submit can land on mbIdle — they all queue
-// into submitted under the same lock.
+// popAllSubmitted removes and returns ALL entries currently in the
+// submitted queue, regardless of mailbox state. Used by
+// abandonOwnershipWithHandoff to start detached runs for all work left in
+// the mailbox after a non-cancel error.
+//
+// popFirstSubmitted/popAllSubmitted remain the only submitted-queue
+// mutators that take no epoch argument (contrast drainOrRelease/
+// drainOrReleaseFinal, which reject a stale epoch). This was previously
+// documented as safe because "no new submit can land on mbIdle — they all
+// queue into submitted under the same lock" — that statement describes
+// submit()'s own behavior correctly, but does NOT cover queue() (used by
+// QueueMessage and the legacy re-queue paths), which appends to submitted
+// unconditionally regardless of mailbox state.
+//
+// The actual, narrower guarantee: abandonOwnershipWithHandoff calls
+// mb.abandonOwnership(epoch) and this method as TWO SEPARATE lock
+// acquisitions, not one atomic section. Between them, a new submit() can
+// legitimately become the new owner (mbIdle -> mbOwned, epoch bumped), and
+// if that NEW owner's session then receives an unrelated queue() call
+// (e.g. a concurrent QueueMessage for the same session) before this method
+// runs, popAllSubmitted has no epoch check to exclude it — it will
+// scoop up an entry that logically belongs to the new owner's era and
+// hand it to restartOrphanedWithRetry instead of leaving it for the new
+// owner's own end-of-turn drain.
+//
+// As of this writing that is a REORDERING defect, not a data-loss one: the
+// call still gets a runner (restartOrphanedWithRetry durably enqueues it,
+// task #340), just via the detached path instead of the new owner's normal
+// turn. If a future change makes that distinction matter (e.g. ordering
+// guarantees callers start depending on), give popAllSubmitted the same
+// epoch parameter drainOrRelease/drainOrReleaseFinal already have, rather
+// than assuming this doc comment alone keeps the two in sync.
 func (mb *mailbox) popAllSubmitted() []SessionAgentCall {
 	mb.mu.Lock()
 	defer mb.mu.Unlock()
