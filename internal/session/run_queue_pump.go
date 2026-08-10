@@ -200,12 +200,26 @@ type AlreadyAttempted interface {
 
 // processEntry attempts to lease and execute a single run queue entry.
 func (p *RunQueuePump) processEntry(ctx context.Context, entry *RunQueueEntry) {
-	// Skip if attempts exceeded (unless terminal failure flag is set)
+	// Skip if attempts exceeded (unless terminal failure flag is set).
+	// TerminalFailRunQueueEntry only deletes rows in 'leased' state, but an
+	// attempts-exhausted entry sits in 'pending' (that's how it was scanned
+	// here) — it must be leased first, or the DELETE never matches and this
+	// same entry gets re-scanned and re-fails to terminal-fail on every
+	// subsequent tick forever.
 	if entry.Attempts >= RunQueueMaxAttempts && !entry.TerminalFailure {
 		slog.Warn("run_queue_pump: entry exceeded max attempts, terminal failing",
 			"id", entry.ID, "session_id", entry.SessionID, "attempts", entry.Attempts, "instance_id", p.cfg.PumpInstanceID)
-		if err := p.cfg.Sessions.TerminalFailRunQueueEntry(ctx, entry.ID); err != nil {
-			slog.Error("run_queue_pump: terminal fail failed", "id", entry.ID, "err", err, "instance_id", p.cfg.PumpInstanceID)
+		leased, err := p.cfg.Sessions.LeaseRunQueueEntry(ctx, entry.SessionID, p.cfg.PumpInstanceID, RunQueueLeaseTTL)
+		if err != nil {
+			slog.Error("run_queue_pump: lease for terminal-fail failed", "id", entry.ID, "session_id", entry.SessionID, "err", err, "instance_id", p.cfg.PumpInstanceID)
+			return
+		}
+		if leased == nil {
+			// Raced with another pump instance leasing/consuming it first.
+			return
+		}
+		if err := p.cfg.Sessions.TerminalFailRunQueueEntry(ctx, leased.ID); err != nil {
+			slog.Error("run_queue_pump: terminal fail failed", "id", leased.ID, "session_id", leased.SessionID, "err", err, "instance_id", p.cfg.PumpInstanceID)
 		}
 		return
 	}
