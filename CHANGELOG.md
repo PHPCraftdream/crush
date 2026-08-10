@@ -1148,3 +1148,15 @@ finished the mailbox migration:
     test before the real fix was written — the renewal landed
     essentially the same deadline leasing had already set, since it
     fired almost instantly after the lease was taken.
+  - Fifth pass: the four queries that finalize a leased entry (ack,
+    two kinds of release-back-to-pending, terminal-fail) matched on
+    the row's id and leased status alone, with no check that the
+    caller was still the current lease holder. If an executor ever
+    lost its lease to a recovery (rare after the fourth pass's
+    renewal loop, but not impossible under a severe scheduling stall),
+    its late-arriving Ack or Nack could silently mutate or delete a
+    row a different, currently-live executor now owned. All four
+    queries are now scoped to the current lease holder. The reviewer's
+    own verdict on this pass: the underlying concurrency design is
+    settled, and this was the last targeted follow-up needed rather
+    than the start of another full review round.
