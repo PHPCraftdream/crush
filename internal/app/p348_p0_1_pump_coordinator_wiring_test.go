@@ -174,6 +174,12 @@ func TestAppNew_RunQueuePump_ExecutesRealEnqueuedCall(t *testing.T) {
 		Provider: "openaicompat",
 		Model:    "probe",
 	})
+	// SetupAgents populates cfg.Agents (including AgentCoder, which
+	// App.InitCoderAgent requires) — see
+	// p348_p0_1_ordering_race_test.go's identical setup for the full
+	// explanation of why this is needed here (found via a CI-only failure
+	// that never reproduced on this machine).
+	store.SetupAgents()
 
 	conn, err := db.Connect(context.Background(), dataDir)
 	require.NoError(t, err)

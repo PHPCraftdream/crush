@@ -1694,6 +1694,23 @@ func (app *App) GetDefaultSmallModel(providerID string) config.SelectedModel {
 func (app *App) InitCoderAgent(ctx context.Context) error {
 	coderAgentCfg := app.config.Config().Agents[config.AgentCoder]
 	if coderAgentCfg.ID == "" {
+		// Self-heal: config.Load/reload always call SetupAgents once
+		// IsConfigured() becomes true, but a caller that mutates
+		// Providers/SelectedModel directly on an already-published config
+		// (bypassing Load/reload entirely — a test-only pattern; found via
+		// a CI-only failure this exact class of gap caused, "coder agent
+		// configuration is missing", that never reproduced on a dev machine
+		// with some stray provider config making IsConfigured() true at
+		// initial Init) never triggers that population. SetupAgents is
+		// idempotent (derives Agents purely from Options/DisabledTools, no
+		// I/O), so re-deriving it here on a genuine miss is safe and closes
+		// the whole class of gap at the one place every caller (test or
+		// production) funnels through, rather than requiring every caller
+		// to remember an explicit SetupAgents call of their own.
+		app.config.SetupAgents()
+		coderAgentCfg = app.config.Config().Agents[config.AgentCoder]
+	}
+	if coderAgentCfg.ID == "" {
 		return fmt.Errorf("coder agent configuration is missing")
 	}
 	var err error

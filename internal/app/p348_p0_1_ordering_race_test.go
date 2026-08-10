@@ -141,6 +141,21 @@ func TestAppNew_RunQueuePump_OrderingRace(t *testing.T) {
 		Provider: "openaicompat",
 		Model:    "probe",
 	})
+	// SetupAgents populates cfg.Agents (including AgentCoder, which
+	// App.InitCoderAgent requires) — normally invoked automatically inside
+	// config.Load/reload, but only when IsConfigured() is already true at
+	// that point. Here, config.Init above ran against a genuinely empty temp
+	// dir with no providers on disk, so IsConfigured() was false and
+	// SetupAgents was never called; the Providers.Set/SetSelectedModelRuntime
+	// calls above mutate the config directly and do not trigger it either.
+	// Found via a CI-only failure ("coder agent configuration is missing")
+	// that never reproduced locally — this machine's config isolation
+	// apparently still picks up a stray real provider from outside the
+	// intended sandbox, making IsConfigured() true early enough to mask the
+	// bug; a genuinely clean environment (CI, or any other dev machine)
+	// reliably hits it. See ConfigStore.SetupAgents's own doc for the same
+	// documented pattern used by coordinator_test.go's role/worker fixtures.
+	store.SetupAgents()
 
 	conn, err := db.Connect(context.Background(), dataDir)
 	require.NoError(t, err)
