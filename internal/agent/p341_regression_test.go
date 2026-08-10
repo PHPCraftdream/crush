@@ -140,6 +140,9 @@ func TestP341_ConcurrentSetModelsSummarizeUsesTargetSessionSnapshot(t *testing.T
 		BaseURL:            srvA.URL,
 		APIKey:             "probe",
 		SystemPromptPrefix: "prefix-a",
+		Models: []catwalk.Model{
+			{ID: "model-a", Name: "model-a", ContextWindow: 200000, DefaultMaxTokens: 1000},
+		},
 	}
 	providerCfgB := config.ProviderConfig{
 		ID:                 "openaicompat",
@@ -152,6 +155,21 @@ func TestP341_ConcurrentSetModelsSummarizeUsesTargetSessionSnapshot(t *testing.T
 	cfg, err := config.Init(env.workingDir, "", false)
 	require.NoError(t, err)
 	cfg.Config().Providers.Set("openaicompat", providerCfgA)
+	// NewCoordinator's buildAgentModels needs a selected large/small model
+	// to construct the coordinator at all — found via a CI-only failure
+	// ("large model not selected") that never reproduced locally (some
+	// unidentified environment leak on the dev machine apparently made this
+	// already true). The actual value here only matters for this initial
+	// construction: coord.currentAgent.SetModels(modelA, modelA) right below
+	// immediately overwrites it with this test's own directly-built models.
+	cfg.SetSelectedModelRuntime(config.SelectedModelTypeLarge, config.SelectedModel{
+		Provider: "openaicompat",
+		Model:    "model-a",
+	})
+	cfg.SetSelectedModelRuntime(config.SelectedModelTypeSmall, config.SelectedModel{
+		Provider: "openaicompat",
+		Model:    "model-a",
+	})
 
 	c, err := NewCoordinator(t.Context(), cfg, env.sessions, env.messages, env.permissions, env.history, *env.filetracker, nil)
 	require.NoError(t, err)

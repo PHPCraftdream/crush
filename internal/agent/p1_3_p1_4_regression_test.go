@@ -103,8 +103,29 @@ func TestP1_3_CoordinatorSummarizeSingleRead(t *testing.T) {
 	cfg, err := config.Init(env.workingDir, "", false)
 	require.NoError(t, err)
 	cfg.Config().Providers.Set("openaicompat", config.ProviderConfig{
-		ID:   "openaicompat",
-		Type: openaicompat.Name,
+		ID:      "openaicompat",
+		Type:    openaicompat.Name,
+		BaseURL: srv.URL,
+		APIKey:  "probe",
+		Models: []catwalk.Model{
+			{ID: "model-a", Name: "model-a", ContextWindow: 200000, DefaultMaxTokens: 1000},
+		},
+	})
+	// NewCoordinator's buildAgentModels needs a selected large/small model
+	// to construct the coordinator at all — found via a CI-only failure
+	// ("large model not selected") that never reproduced locally (some
+	// unidentified environment leak on the dev machine apparently made this
+	// already true). The actual value here is thrown away immediately below
+	// (coord.currentAgent is overwritten with spyAgent), so any provider/
+	// model pair that resolves cleanly is fine — reusing the same
+	// provider/model this test already built its spy model from.
+	cfg.SetSelectedModelRuntime(config.SelectedModelTypeLarge, config.SelectedModel{
+		Provider: "openaicompat",
+		Model:    "model-a",
+	})
+	cfg.SetSelectedModelRuntime(config.SelectedModelTypeSmall, config.SelectedModel{
+		Provider: "openaicompat",
+		Model:    "model-a",
 	})
 
 	// Create a coordinator with the spy agent.

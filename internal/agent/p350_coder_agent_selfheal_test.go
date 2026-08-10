@@ -46,8 +46,11 @@ package agent
 //  4. Restore the self-heal block and PASS.
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
+	"charm.land/catwalk/pkg/catwalk"
 	"charm.land/fantasy/providers/openaicompat"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/stretchr/testify/require"
@@ -56,11 +59,36 @@ import (
 func TestReleaseGate_P350_NewCoordinatorSelfHealsMissingAgentsMap(t *testing.T) {
 	env := testEnv(t)
 
+	// Server is never actually called — NewCoordinator only needs to
+	// construct a language-model client (buildAgentModels), not stream
+	// from it, but a syntactically valid, non-empty BaseURL is required.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("provider must not be called — this test only exercises coordinator construction")
+	}))
+	t.Cleanup(srv.Close)
+
 	cfg, err := config.Init(env.workingDir, "", false)
 	require.NoError(t, err)
 	cfg.Config().Providers.Set("openaicompat", config.ProviderConfig{
-		ID:   "openaicompat",
-		Type: openaicompat.Name,
+		ID:      "openaicompat",
+		Type:    openaicompat.Name,
+		BaseURL: srv.URL,
+		APIKey:  "probe",
+		Models: []catwalk.Model{
+			{ID: "probe", Name: "probe", ContextWindow: 200000, DefaultMaxTokens: 1000},
+		},
+	})
+	// NewCoordinator's buildAgentModels needs a selected large/small model
+	// to construct the coordinator at all, independently of the
+	// Agents[AgentCoder] self-heal this test targets — found via a CI-only
+	// failure ("large model not selected") that never reproduced locally.
+	cfg.SetSelectedModelRuntime(config.SelectedModelTypeLarge, config.SelectedModel{
+		Provider: "openaicompat",
+		Model:    "probe",
+	})
+	cfg.SetSelectedModelRuntime(config.SelectedModelTypeSmall, config.SelectedModel{
+		Provider: "openaicompat",
+		Model:    "probe",
 	})
 	require.True(t, cfg.Config().IsConfigured(), "a provider must be configured for this test to be meaningful")
 
