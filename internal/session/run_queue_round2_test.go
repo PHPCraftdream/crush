@@ -58,7 +58,7 @@ func TestRunQueue_EnqueueLeaseAck_Lifecycle(t *testing.T) {
 	require.Empty(t, pending, "should have no pending entries after lease")
 
 	// Ack the entry (simulating successful execution)
-	deletedID, err := svc.AckRunQueueEntry(ctx, leased.ID)
+	deletedID, err := svc.AckRunQueueEntry(ctx, leased.ID, "pump-instance-1")
 	require.NoError(t, err)
 	require.Equal(t, idempotencyKey, deletedID, "ack should return the deleted id")
 
@@ -203,7 +203,7 @@ func TestRunQueue_TerminalFailureVsRetry(t *testing.T) {
 	require.NotNil(t, leased)
 
 	// Test that TerminalFailRunQueueEntry works (SQL typo fix verification)
-	err = svc.TerminalFailRunQueueEntry(ctx, leased.ID)
+	err = svc.TerminalFailRunQueueEntry(ctx, leased.ID, "pump-instance-1")
 	require.NoError(t, err, "terminal fail should succeed (SQL typo fix verified)")
 
 	// Verify the entry is COMPLETELY GONE (not just marked terminal)

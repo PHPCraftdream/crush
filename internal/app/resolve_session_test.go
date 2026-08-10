@@ -210,19 +210,19 @@ func (m *mockSessionService) RenewRunQueueLease(context.Context, string, string,
 	return false, nil
 }
 
-func (m *mockSessionService) AckRunQueueEntry(context.Context, string) (string, error) {
+func (m *mockSessionService) AckRunQueueEntry(context.Context, string, string) (string, error) {
 	return "", nil
 }
 
-func (m *mockSessionService) NackRunQueueEntry(context.Context, string, string) error {
+func (m *mockSessionService) NackRunQueueEntry(context.Context, string, string, string) error {
 	return nil
 }
 
-func (m *mockSessionService) NackRunQueueEntryNoAttemptPenalty(context.Context, string, string) error {
+func (m *mockSessionService) NackRunQueueEntryNoAttemptPenalty(context.Context, string, string, string) error {
 	return nil
 }
 
-func (m *mockSessionService) TerminalFailRunQueueEntry(context.Context, string) error {
+func (m *mockSessionService) TerminalFailRunQueueEntry(context.Context, string, string) error {
 	return nil
 }
 

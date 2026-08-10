@@ -12,14 +12,26 @@ import (
 
 const ackRunQueueEntry = `-- name: AckRunQueueEntry :one
 DELETE FROM session_run_queue
-WHERE id = ? AND status = 'leased'
+WHERE id = ? AND status = 'leased' AND leased_by = ?
 RETURNING id
 `
 
+type AckRunQueueEntryParams struct {
+	ID       string         `json:"id"`
+	LeasedBy sql.NullString `json:"leased_by"`
+}
+
 // Mark a leased entry as successfully completed (terminal).
 // Removes it from the queue (acked is terminal, no longer needed).
-func (q *Queries) AckRunQueueEntry(ctx context.Context, id string) (string, error) {
-	row := q.queryRow(ctx, q.ackRunQueueEntryStmt, ackRunQueueEntry, id)
+// Scoped to the current lease owner (found by the fifth @oh review pass over
+// #337-349): without this, an executor that lost its lease to a
+// CleanupExpiredLeases recovery (a rare residual now that executeEntry
+// renews its lease for the duration of a real turn, but not impossible
+// under a pathological scheduling stall) could Ack a row a DIFFERENT,
+// currently-live executor now owns, deleting work out from under it.
+func (q *Queries) AckRunQueueEntry(ctx context.Context, arg AckRunQueueEntryParams) (string, error) {
+	row := q.queryRow(ctx, q.ackRunQueueEntryStmt, ackRunQueueEntry, arg.ID, arg.LeasedBy)
+	var id string
 	err := row.Scan(&id)
 	return id, err
 }
@@ -306,7 +318,7 @@ SET status = 'pending',
     last_error = ?,
     attempts = attempts + 1,
     updated_at = ?
-WHERE id = ? AND status = 'leased'
+WHERE id = ? AND status = 'leased' AND leased_by = ?
 RETURNING id, session_id, call_data, status, leased_by, leased_at, lease_expires_at, attempts, last_error, terminal_failure, created_at, updated_at
 `
 
@@ -314,12 +326,19 @@ type NackRunQueueEntryParams struct {
 	LastError sql.NullString `json:"last_error"`
 	UpdatedAt int64          `json:"updated_at"`
 	ID        string         `json:"id"`
+	LeasedBy  sql.NullString `json:"leased_by"`
 }
 
 // Release a leased entry back to pending state (non-terminal failure, retry later).
 // Increments attempts but does NOT set terminal_failure.
+// Scoped to the current lease owner, same as AckRunQueueEntry.
 func (q *Queries) NackRunQueueEntry(ctx context.Context, arg NackRunQueueEntryParams) (SessionRunQueue, error) {
-	row := q.queryRow(ctx, q.nackRunQueueEntryStmt, nackRunQueueEntry, arg.LastError, arg.UpdatedAt, arg.ID)
+	row := q.queryRow(ctx, q.nackRunQueueEntryStmt, nackRunQueueEntry,
+		arg.LastError,
+		arg.UpdatedAt,
+		arg.ID,
+		arg.LeasedBy,
+	)
 	var i SessionRunQueue
 	err := row.Scan(
 		&i.ID,
@@ -346,7 +365,7 @@ SET status = 'pending',
     lease_expires_at = NULL,
     last_error = ?,
     updated_at = ?
-WHERE id = ? AND status = 'leased'
+WHERE id = ? AND status = 'leased' AND leased_by = ?
 RETURNING id, session_id, call_data, status, leased_by, leased_at, lease_expires_at, attempts, last_error, terminal_failure, created_at, updated_at
 `
 
@@ -354,6 +373,7 @@ type NackRunQueueEntryNoAttemptPenaltyParams struct {
 	LastError sql.NullString `json:"last_error"`
 	UpdatedAt int64          `json:"updated_at"`
 	ID        string         `json:"id"`
+	LeasedBy  sql.NullString `json:"leased_by"`
 }
 
 // Release a leased entry back to pending state without counting it as an
@@ -362,9 +382,16 @@ type NackRunQueueEntryNoAttemptPenaltyParams struct {
 // contention, not a failure of the call itself, and must never count toward
 // RunQueueMaxAttempts. Without this, the durable queue would delete
 // accepted user work after nothing more than a few turns of ordinary lock
-// contention.
+// contention. Also used for the ErrCallQueuedNotExecuted backoff path and
+// for releasing a mismatched attempts-exhausted lease unharmed.
+// Scoped to the current lease owner, same as AckRunQueueEntry.
 func (q *Queries) NackRunQueueEntryNoAttemptPenalty(ctx context.Context, arg NackRunQueueEntryNoAttemptPenaltyParams) (SessionRunQueue, error) {
-	row := q.queryRow(ctx, q.nackRunQueueEntryNoAttemptPenaltyStmt, nackRunQueueEntryNoAttemptPenalty, arg.LastError, arg.UpdatedAt, arg.ID)
+	row := q.queryRow(ctx, q.nackRunQueueEntryNoAttemptPenaltyStmt, nackRunQueueEntryNoAttemptPenalty,
+		arg.LastError,
+		arg.UpdatedAt,
+		arg.ID,
+		arg.LeasedBy,
+	)
 	var i SessionRunQueue
 	err := row.Scan(
 		&i.ID,
@@ -412,14 +439,21 @@ func (q *Queries) RenewRunQueueLease(ctx context.Context, arg RenewRunQueueLease
 
 const terminalFailRunQueueEntry = `-- name: TerminalFailRunQueueEntry :one
 DELETE FROM session_run_queue
-WHERE id = ? AND status = 'leased'
+WHERE id = ? AND status = 'leased' AND leased_by = ?
 RETURNING id
 `
 
+type TerminalFailRunQueueEntryParams struct {
+	ID       string         `json:"id"`
+	LeasedBy sql.NullString `json:"leased_by"`
+}
+
 // Mark a leased entry as terminal failure (no retry, even if attempts < max).
 // Used for ErrCallAlreadyAttempted-type errors where retry would cause duplicates.
-func (q *Queries) TerminalFailRunQueueEntry(ctx context.Context, id string) (string, error) {
-	row := q.queryRow(ctx, q.terminalFailRunQueueEntryStmt, terminalFailRunQueueEntry, id)
+// Scoped to the current lease owner, same as AckRunQueueEntry.
+func (q *Queries) TerminalFailRunQueueEntry(ctx context.Context, arg TerminalFailRunQueueEntryParams) (string, error) {
+	row := q.queryRow(ctx, q.terminalFailRunQueueEntryStmt, terminalFailRunQueueEntry, arg.ID, arg.LeasedBy)
+	var id string
 	err := row.Scan(&id)
 	return id, err
 }

@@ -24,7 +24,7 @@ import (
 //     through Coordinator.Run, which goes through the normal
 //     TryAcquireSessionLock path exactly like any other caller (a
 //     SessionLockBusyError from ordinary lock contention is handled by
-//     processEntry's NackRunQueueEntryNoAttemptPenalty path, see below —
+//     executeEntry's NackRunQueueEntryNoAttemptPenalty path, see below —
 //     the pump does not pre-check or avoid contention, it just doesn't
 //     let contention drain the durable queue).
 //   - Respects ErrCallAlreadyAttempted as terminal (no retry)
@@ -72,14 +72,24 @@ type Coordinator interface {
 // like an ordinary success (would Ack/delete a durable row for work that
 // has not actually run yet — the queued-mailbox copy is only as durable as
 // the owning process staying alive long enough to drain it) and must NOT be
-// retried like an ordinary failure either (mailbox.submit unconditionally
-// appends on every call, so nacking-and-retrying every tick would append a
-// new duplicate of the same call on every attempt, all of which the owner
-// eventually runs when it drains its queue). The entry is left exactly as
-// leased and untouched; RunQueueLeaseTTL's natural expiry (via
-// CleanupExpiredLeases) is the only recovery path, giving the external
-// owner a full lease window to drain the queued call before another
-// attempt is made.
+// retried on every tick like an ordinary failure either (mailbox.submit
+// unconditionally appends on every call, so nacking-and-retrying every tick
+// would append a new duplicate of the same call on every attempt, all of
+// which the owner eventually runs when it drains its queue).
+//
+// Fixed by the fourth @oh review pass over #337-349: an earlier version of
+// this doc (and the code) left the entry exactly as leased and untouched,
+// relying on RunQueueLeaseTTL's natural expiry (via CleanupExpiredLeases) as
+// the only recovery path — but that cleanup unconditionally counts an
+// attempt on every recovery, so a session that stayed externally busy for a
+// few lease windows would have its accepted, never-actually-failed work
+// silently dead-lettered. The entry is instead released immediately via
+// NackRunQueueEntryNoAttemptPenalty (never counts an attempt) paired with a
+// local RunQueuePump.busyBackoffUntil deadline that stops THIS pump instance
+// specifically from re-attempting the same session before a full lease
+// window has passed — see that field's doc for the full rationale,
+// including why a naive lease-renewal-based backoff was tried first and
+// found not to work.
 var ErrCallQueuedNotExecuted = errors.New("run_queue_pump: call was queued into an already-owned session, not executed")
 
 // RunQueuePumpConfig configures a RunQueuePump instance.
@@ -297,6 +307,25 @@ func (p *RunQueuePump) tick() {
 		slog.Warn("run_queue_pump: cleanup expired leases failed", "err", err, "instance_id", p.cfg.PumpInstanceID)
 	}
 
+	// Step 1.5: sweep expired busyBackoffUntil entries. processEntry's own
+	// lazy delete (see there) only fires when a PENDING entry for that
+	// session is actually rescanned — a session whose entry was acked,
+	// terminal-failed, or picked up by a different pump instance in the
+	// meantime never gets rescanned, so its key would otherwise linger in
+	// this map for the rest of the process lifetime. Found by the fifth
+	// @oh review pass over #337-349 (unbounded growth, not a correctness
+	// bug — a stale key can only ever make this pump wait slightly longer
+	// than necessary before trying a session again, never cause incorrect
+	// behavior).
+	now := time.Now()
+	p.busyBackoffMu.Lock()
+	for sessionID, until := range p.busyBackoffUntil {
+		if !now.Before(until) {
+			delete(p.busyBackoffUntil, sessionID)
+		}
+	}
+	p.busyBackoffMu.Unlock()
+
 	// Step 2: Scan for pending entries (and now-recovered stale leases)
 	pending, err := p.cfg.Sessions.ListPendingRunQueueEntries(ctx)
 	if err != nil {
@@ -398,12 +427,12 @@ func (p *RunQueuePump) processEntry(ctx context.Context, entry *RunQueueEntry) {
 			// silently delete legitimate, unattempted work. Release it
 			// unharmed (no attempt penalty — this pump did nothing wrong to
 			// it) and let a future tick handle it normally.
-			if nackErr := p.cfg.Sessions.NackRunQueueEntryNoAttemptPenalty(ctx, leased.ID, "released: leased entry did not match the attempts-exhausted entry scanned for terminal-fail"); nackErr != nil {
+			if nackErr := p.cfg.Sessions.NackRunQueueEntryNoAttemptPenalty(ctx, leased.ID, p.cfg.PumpInstanceID, "released: leased entry did not match the attempts-exhausted entry scanned for terminal-fail"); nackErr != nil {
 				slog.Error("run_queue_pump: release of mismatched lease failed", "id", leased.ID, "session_id", leased.SessionID, "err", nackErr, "instance_id", p.cfg.PumpInstanceID)
 			}
 			return
 		}
-		if err := p.cfg.Sessions.TerminalFailRunQueueEntry(ctx, leased.ID); err != nil {
+		if err := p.cfg.Sessions.TerminalFailRunQueueEntry(ctx, leased.ID, p.cfg.PumpInstanceID); err != nil {
 			slog.Error("run_queue_pump: terminal fail failed", "id", leased.ID, "session_id", leased.SessionID, "err", err, "instance_id", p.cfg.PumpInstanceID)
 		}
 		return
@@ -456,7 +485,7 @@ func (p *RunQueuePump) executeEntry(ctx context.Context, leased *RunQueueEntry) 
 	if err := json.Unmarshal([]byte(leased.CallData), &callData); err != nil {
 		slog.Error("run_queue_pump: failed to parse call data", "id", leased.ID, "session_id", leased.SessionID, "err", err, "instance_id", p.cfg.PumpInstanceID)
 		// Terminal failure: malformed data can never succeed
-		if termErr := p.cfg.Sessions.TerminalFailRunQueueEntry(ctx, leased.ID); termErr != nil {
+		if termErr := p.cfg.Sessions.TerminalFailRunQueueEntry(ctx, leased.ID, p.cfg.PumpInstanceID); termErr != nil {
 			slog.Error("run_queue_pump: terminal fail failed", "id", leased.ID, "err", termErr, "instance_id", p.cfg.PumpInstanceID)
 		}
 		return
@@ -482,7 +511,15 @@ func (p *RunQueuePump) executeEntry(ctx context.Context, leased *RunQueueEntry) 
 	renewalsDone := make(chan struct{})
 	go func() {
 		defer close(renewalsDone)
-		ticker := time.NewTicker(p.leaseTTL() / 3)
+		// time.NewTicker panics on a non-positive interval — clamp so a
+		// pathologically tiny TestLeaseTTL (a test foot-gun, never a
+		// production value) can't crash the pump instead of just renewing
+		// unnecessarily often.
+		renewInterval := p.leaseTTL() / 3
+		if renewInterval <= 0 {
+			renewInterval = time.Millisecond
+		}
+		ticker := time.NewTicker(renewInterval)
 		defer ticker.Stop()
 		for {
 			select {
@@ -502,11 +539,14 @@ func (p *RunQueuePump) executeEntry(ctx context.Context, leased *RunQueueEntry) 
 					// cancellation wired to execCtx (renewing is
 					// best-effort, not ownership-enforcing), so the
 					// in-flight Coordinator.Run call is left to finish on
-					// its own; the eventual Ack/Nack below will then
-					// correctly fail to match (logged, not silently
-					// treated as success) since the row belongs to
-					// whatever re-leased it. Surfaced loudly since it
-					// means real duplicate work may follow.
+					// its own; the eventual Ack/Nack/TerminalFail below
+					// will then correctly fail to match (logged, not
+					// silently treated as success) since those queries
+					// are scoped to `leased_by = PumpInstanceID` (found by
+					// the fifth @oh review pass — this WAS a real gap
+					// before that scoping existed) and the row now
+					// belongs to whatever re-leased it. Surfaced loudly
+					// since it means real duplicate work may follow.
 					slog.Error("run_queue_pump: lost lease ownership during renewal, another owner has taken this entry", "id", leased.ID, "session_id", leased.SessionID, "instance_id", p.cfg.PumpInstanceID)
 					return
 				}
@@ -534,7 +574,7 @@ func (p *RunQueuePump) executeEntry(ctx context.Context, leased *RunQueueEntry) 
 	// Handle outcome
 	if err == nil {
 		// Success: ack the entry (delete it)
-		if _, ackErr := p.cfg.Sessions.AckRunQueueEntry(ctx, leased.ID); ackErr != nil {
+		if _, ackErr := p.cfg.Sessions.AckRunQueueEntry(ctx, leased.ID, p.cfg.PumpInstanceID); ackErr != nil {
 			slog.Error("run_queue_pump: ack failed after success", "id", leased.ID, "session_id", leased.SessionID, "err", ackErr, "instance_id", p.cfg.PumpInstanceID)
 		}
 		slog.Info("run_queue_pump: executed entry successfully", "id", leased.ID, "session_id", leased.SessionID, "instance_id", p.cfg.PumpInstanceID)
@@ -575,7 +615,7 @@ func (p *RunQueuePump) executeEntry(ctx context.Context, leased *RunQueueEntry) 
 	// CleanupExpiredLeases still reaped the row — and charged an attempt
 	// — after essentially one ordinary TTL window, same as doing nothing.
 	if errors.Is(err, ErrCallQueuedNotExecuted) {
-		if nackErr := p.cfg.Sessions.NackRunQueueEntryNoAttemptPenalty(ctx, leased.ID, "queued into an externally-owned in-process session, not executed"); nackErr != nil {
+		if nackErr := p.cfg.Sessions.NackRunQueueEntryNoAttemptPenalty(ctx, leased.ID, p.cfg.PumpInstanceID, "queued into an externally-owned in-process session, not executed"); nackErr != nil {
 			slog.Error("run_queue_pump: no-penalty release after queued-not-executed failed", "id", leased.ID, "session_id", leased.SessionID, "err", nackErr, "instance_id", p.cfg.PumpInstanceID)
 		}
 		p.busyBackoffMu.Lock()
@@ -591,7 +631,7 @@ func (p *RunQueuePump) executeEntry(ctx context.Context, leased *RunQueueEntry) 
 	var alreadyAttempted AlreadyAttempted
 	if errors.As(err, &alreadyAttempted) && alreadyAttempted.AlreadyAttempted() {
 		// Terminal failure (no retry) - protects against duplicates
-		if termErr := p.cfg.Sessions.TerminalFailRunQueueEntry(ctx, leased.ID); termErr != nil {
+		if termErr := p.cfg.Sessions.TerminalFailRunQueueEntry(ctx, leased.ID, p.cfg.PumpInstanceID); termErr != nil {
 			slog.Error("run_queue_pump: terminal fail failed", "id", leased.ID, "err", termErr, "instance_id", p.cfg.PumpInstanceID)
 		}
 		slog.Warn("run_queue_pump: entry terminal failed (already attempted)", "id", leased.ID, "session_id", leased.SessionID, "err", err, "instance_id", p.cfg.PumpInstanceID)
@@ -607,7 +647,7 @@ func (p *RunQueuePump) executeEntry(ctx context.Context, leased *RunQueueEntry) 
 	// the final @oh review of tasks #337-349 — P0-2).
 	var busyErr *SessionLockBusyError
 	if errors.As(err, &busyErr) {
-		if nackErr := p.cfg.Sessions.NackRunQueueEntryNoAttemptPenalty(ctx, leased.ID, err.Error()); nackErr != nil {
+		if nackErr := p.cfg.Sessions.NackRunQueueEntryNoAttemptPenalty(ctx, leased.ID, p.cfg.PumpInstanceID, err.Error()); nackErr != nil {
 			slog.Error("run_queue_pump: no-penalty nack failed", "id", leased.ID, "err", nackErr, "instance_id", p.cfg.PumpInstanceID)
 		}
 		slog.Debug("run_queue_pump: entry blocked by session lock contention, will retry without attempt penalty", "id", leased.ID, "session_id", leased.SessionID, "instance_id", p.cfg.PumpInstanceID)
@@ -615,7 +655,7 @@ func (p *RunQueuePump) executeEntry(ctx context.Context, leased *RunQueueEntry) 
 	}
 
 	// Retryable failure: nack and let the pump retry on next tick
-	if nackErr := p.cfg.Sessions.NackRunQueueEntry(ctx, leased.ID, err.Error()); nackErr != nil {
+	if nackErr := p.cfg.Sessions.NackRunQueueEntry(ctx, leased.ID, p.cfg.PumpInstanceID, err.Error()); nackErr != nil {
 		slog.Error("run_queue_pump: nack failed", "id", leased.ID, "err", nackErr, "instance_id", p.cfg.PumpInstanceID)
 	}
 	slog.Debug("run_queue_pump: entry failed, will retry", "id", leased.ID, "session_id", leased.SessionID, "err", err, "attempts", leased.Attempts+1, "instance_id", p.cfg.PumpInstanceID)

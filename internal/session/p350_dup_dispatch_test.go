@@ -308,6 +308,9 @@ func TestReleaseGate_P350_QueuedNotExecutedNeitherAcksNorSpamRetries(t *testing.
 	require.NoError(t, err)
 	require.Len(t, pending, 1, "the entry must still exist, released back to pending — not acked/deleted for work that never actually ran")
 	require.Equal(t, sess.ID, pending[0].SessionID)
+	// This assertion has the same fast-round-trip timing dependency as
+	// TestReleaseGate_P350_QueuedNotExecutedBacksOffWithoutAttemptPenalty's
+	// own attempts==0 check — see that test's doc comment for why.
 	require.Equal(t, int64(0), pending[0].Attempts, "must not have incurred an attempt penalty for external contention")
 }
 
@@ -380,10 +383,18 @@ func TestReleaseGate_P350_LeaseRenewedDuringLongExecution(t *testing.T) {
 		return coord.calls.Load() >= 1
 	}, 2*time.Second, 10*time.Millisecond, "the entry must be leased and execution started")
 
-	// Hold the call in flight across several TTL windows (1s each) — long
-	// enough that, without renewal, CleanupExpiredLeases would have reset
-	// this entry to pending and a later tick would have leased and
-	// dispatched a second, duplicate execution.
+	// Hold the call in flight across several TTL windows (1s each). Note:
+	// this specific mid-hold assertion alone does NOT discriminate renewal
+	// from no-renewal — the inFlight guard (third pass) already blocks a
+	// same-tick/self-race duplicate for as long as this goroutine is
+	// tracked as running, regardless of whether the DB lease itself has
+	// expired underneath it. The assertion below THIS one (after
+	// coord.release is closed) is what actually distinguishes the two: if
+	// renewal never happened, the row already flipped to pending during
+	// this sleep, and closing the gate lets the ALREADY-DISPATCHED first
+	// goroutine finish while a SECOND, independently-leased goroutine gets
+	// to run too — see the revert-check procedure above, which fails at
+	// that later assertion, not this one.
 	time.Sleep(3500 * time.Millisecond) // ~3.5 TTL windows at 1s
 	require.Equal(t, int64(1), coord.calls.Load(), "no second dispatch should have occurred while the first call is still genuinely in flight, across multiple TTL windows")
 
@@ -435,8 +446,21 @@ func (c *queuedNotExecutedThenSuccessCoordinator) Run(ctx context.Context, callD
 //
 // Unlike TestReleaseGate_P350_LeaseRenewedDuringLongExecution, this backoff
 // is tracked purely in-memory (RunQueuePump.busyBackoffUntil, a time.Time,
-// not a Unix-seconds DB column) — a fast TestLeaseTTL is safe to use here
-// and does not hit the second-granularity truncation issue described there.
+// not a Unix-seconds DB column), so a fast TestLeaseTTL is used here.
+//
+// Honest caveat (found by the fifth @oh review pass): the fast TestLeaseTTL
+// (30ms) DOES still hit the same second-granularity truncation as the
+// initial LeaseRunQueueEntry call (`int64((30ms).Seconds())` == 0), so the
+// row's own lease_expires_at is effectively "now" the instant it is leased —
+// the assertion below that attempts stays exactly 0 relies on this test's
+// own lease→Nack round trip completing faster than one CleanupExpiredLeases
+// cycle (one pump tick, 20ms here), not on a hard timing invariant. This has
+// not been observed to flake across many runs (the round trip is a fast,
+// local, synchronous call chain), but a slow/loaded CI runner could in
+// principle interleave a cleanup pass between lease and Nack and charge one
+// spurious attempt. If this test ever flakes on `attempts == 0`, that is the
+// mechanism to suspect first — not a regression in the backoff fix itself.
+//
 // A first version of this fix tried achieving backoff via a single
 // RenewRunQueueLease call instead; that failed this very test (attempts
 // still reached RunQueueMaxAttempts in the ordinary ~10 TTL windows) because

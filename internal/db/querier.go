@@ -12,7 +12,13 @@ import (
 type Querier interface {
 	// Mark a leased entry as successfully completed (terminal).
 	// Removes it from the queue (acked is terminal, no longer needed).
-	AckRunQueueEntry(ctx context.Context, id string) (string, error)
+	// Scoped to the current lease owner (found by the fifth @oh review pass over
+	// #337-349): without this, an executor that lost its lease to a
+	// CleanupExpiredLeases recovery (a rare residual now that executeEntry
+	// renews its lease for the duration of a real turn, but not impossible
+	// under a pathological scheduling stall) could Ack a row a DIFFERENT,
+	// currently-live executor now owns, deleting work out from under it.
+	AckRunQueueEntry(ctx context.Context, arg AckRunQueueEntryParams) (string, error)
 	// Reset stale leased entries back to pending (lease expiry recovery).
 	// Run periodically to recover from crashed pump instances.
 	// Increments attempts: a lease that expired without a matching Ack/Nack
@@ -236,6 +242,7 @@ type Querier interface {
 	MatchSessionPermission(ctx context.Context, arg MatchSessionPermissionParams) (string, error)
 	// Release a leased entry back to pending state (non-terminal failure, retry later).
 	// Increments attempts but does NOT set terminal_failure.
+	// Scoped to the current lease owner, same as AckRunQueueEntry.
 	NackRunQueueEntry(ctx context.Context, arg NackRunQueueEntryParams) (SessionRunQueue, error)
 	// Release a leased entry back to pending state without counting it as an
 	// attempt. Used specifically for session.SessionLockBusyError: another live
@@ -243,7 +250,9 @@ type Querier interface {
 	// contention, not a failure of the call itself, and must never count toward
 	// RunQueueMaxAttempts. Without this, the durable queue would delete
 	// accepted user work after nothing more than a few turns of ordinary lock
-	// contention.
+	// contention. Also used for the ErrCallQueuedNotExecuted backoff path and
+	// for releasing a mismatched attempts-exhausted lease unharmed.
+	// Scoped to the current lease owner, same as AckRunQueueEntry.
 	NackRunQueueEntryNoAttemptPenalty(ctx context.Context, arg NackRunQueueEntryNoAttemptPenaltyParams) (SessionRunQueue, error)
 	RecordFileRead(ctx context.Context, arg RecordFileReadParams) error
 	RenameSession(ctx context.Context, arg RenameSessionParams) error
@@ -263,7 +272,8 @@ type Querier interface {
 	SetParentCostAccounted(ctx context.Context, arg SetParentCostAccountedParams) error
 	// Mark a leased entry as terminal failure (no retry, even if attempts < max).
 	// Used for ErrCallAlreadyAttempted-type errors where retry would cause duplicates.
-	TerminalFailRunQueueEntry(ctx context.Context, id string) (string, error)
+	// Scoped to the current lease owner, same as AckRunQueueEntry.
+	TerminalFailRunQueueEntry(ctx context.Context, arg TerminalFailRunQueueEntryParams) (string, error)
 	UpdateMessage(ctx context.Context, arg UpdateMessageParams) error
 	UpdateMessagePinned(ctx context.Context, arg UpdateMessagePinnedParams) error
 	UpdatePermissionEnabled(ctx context.Context, arg UpdatePermissionEnabledParams) error

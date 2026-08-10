@@ -252,10 +252,18 @@ type Service interface {
 	// did not apply for that reason; the caller must treat false as "this
 	// execution no longer owns the row" rather than retry the renewal.
 	RenewRunQueueLease(ctx context.Context, id, leasedBy string, newExpiresAt int64) (bool, error)
-	AckRunQueueEntry(ctx context.Context, id string) (string, error)
-	NackRunQueueEntry(ctx context.Context, id, lastError string) error
-	NackRunQueueEntryNoAttemptPenalty(ctx context.Context, id, lastError string) error
-	TerminalFailRunQueueEntry(ctx context.Context, id string) error
+	// AckRunQueueEntry, NackRunQueueEntry, NackRunQueueEntryNoAttemptPenalty,
+	// and TerminalFailRunQueueEntry all take leasedBy and only affect the
+	// row if it is CURRENTLY still leased by that same value — found by the
+	// fifth @oh review pass over #337-349: without this, an executor that
+	// lost its lease to a CleanupExpiredLeases recovery (rare now that
+	// executeEntry renews its lease for the duration of a real turn, but not
+	// impossible under a pathological scheduling stall) could otherwise
+	// mutate/delete a row a DIFFERENT, currently-live executor now owns.
+	AckRunQueueEntry(ctx context.Context, id, leasedBy string) (string, error)
+	NackRunQueueEntry(ctx context.Context, id, leasedBy, lastError string) error
+	NackRunQueueEntryNoAttemptPenalty(ctx context.Context, id, leasedBy, lastError string) error
+	TerminalFailRunQueueEntry(ctx context.Context, id, leasedBy string) error
 	ListPendingRunQueueEntries(ctx context.Context) ([]RunQueueEntry, error)
 	ListStaleLeasedRunQueueEntries(ctx context.Context, beforeTime int64) ([]RunQueueEntry, error)
 	CleanupExpiredLeases(ctx context.Context, beforeTime int64) error
@@ -1459,58 +1467,70 @@ func (s *service) RenewRunQueueLease(ctx context.Context, id, leasedBy string, n
 }
 
 // AckRunQueueEntry marks a leased entry as successfully completed (terminal).
-// Deletes the entry from the queue. Returns the deleted ID.
-func (s *service) AckRunQueueEntry(ctx context.Context, id string) (string, error) {
-	deletedID, err := s.q.AckRunQueueEntry(ctx, id)
+// Deletes the entry from the queue, but only if it is still leased by
+// leasedBy. Returns the deleted ID.
+func (s *service) AckRunQueueEntry(ctx context.Context, id, leasedBy string) (string, error) {
+	deletedID, err := s.q.AckRunQueueEntry(ctx, db.AckRunQueueEntryParams{
+		ID:       id,
+		LeasedBy: sql.NullString{String: leasedBy, Valid: leasedBy != ""},
+	})
 	if errors.Is(err, sql.ErrNoRows) {
-		return "", fmt.Errorf("run queue entry %q not found or not in leased state", id)
+		return "", fmt.Errorf("run queue entry %q not found, not in leased state, or no longer leased by %q", id, leasedBy)
 	}
 	return deletedID, err
 }
 
-// NackRunQueueEntry releases a leased entry back to pending state (retry later).
+// NackRunQueueEntry releases a leased entry back to pending state (retry
+// later), but only if it is still leased by leasedBy.
 // Used for transient errors where retry is safe and necessary.
 // Increments attempts count and records the error message.
-func (s *service) NackRunQueueEntry(ctx context.Context, id, lastError string) error {
+func (s *service) NackRunQueueEntry(ctx context.Context, id, leasedBy, lastError string) error {
 	now := time.Now().Unix()
 	_, err := s.q.NackRunQueueEntry(ctx, db.NackRunQueueEntryParams{
 		LastError: sql.NullString{String: lastError, Valid: lastError != ""},
 		UpdatedAt: now,
 		ID:        id,
+		LeasedBy:  sql.NullString{String: leasedBy, Valid: leasedBy != ""},
 	})
 	if errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("run queue entry %q not found or not in leased state", id)
+		return fmt.Errorf("run queue entry %q not found, not in leased state, or no longer leased by %q", id, leasedBy)
 	}
 	return err
 }
 
 // NackRunQueueEntryNoAttemptPenalty releases a leased entry back to pending
-// state WITHOUT incrementing its attempts count. Used for
-// SessionLockBusyError: ordinary lock contention from another live process
-// is expected, routine behavior, not a failure of the call itself, and must
-// never count toward RunQueueMaxAttempts (see run_queue_pump.go's
-// executeEntry) — otherwise the durable queue would silently delete
-// accepted work after nothing more than a few turns of normal contention.
-func (s *service) NackRunQueueEntryNoAttemptPenalty(ctx context.Context, id, lastError string) error {
+// state WITHOUT incrementing its attempts count, but only if it is still
+// leased by leasedBy. Used for SessionLockBusyError: ordinary lock
+// contention from another live process is expected, routine behavior, not a
+// failure of the call itself, and must never count toward
+// RunQueueMaxAttempts (see run_queue_pump.go's executeEntry) — otherwise the
+// durable queue would silently delete accepted work after nothing more than
+// a few turns of normal contention.
+func (s *service) NackRunQueueEntryNoAttemptPenalty(ctx context.Context, id, leasedBy, lastError string) error {
 	now := time.Now().Unix()
 	_, err := s.q.NackRunQueueEntryNoAttemptPenalty(ctx, db.NackRunQueueEntryNoAttemptPenaltyParams{
 		LastError: sql.NullString{String: lastError, Valid: lastError != ""},
 		UpdatedAt: now,
 		ID:        id,
+		LeasedBy:  sql.NullString{String: leasedBy, Valid: leasedBy != ""},
 	})
 	if errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("run queue entry %q not found or not in leased state", id)
+		return fmt.Errorf("run queue entry %q not found, not in leased state, or no longer leased by %q", id, leasedBy)
 	}
 	return err
 }
 
-// TerminalFailRunQueueEntry marks a leased entry as terminal failure (no retry).
+// TerminalFailRunQueueEntry marks a leased entry as terminal failure (no
+// retry), but only if it is still leased by leasedBy.
 // Used for ErrCallAlreadyAttempted-type errors where retry would cause duplicates.
 // Deletes the entry from the queue permanently.
-func (s *service) TerminalFailRunQueueEntry(ctx context.Context, id string) error {
-	_, err := s.q.TerminalFailRunQueueEntry(ctx, id)
+func (s *service) TerminalFailRunQueueEntry(ctx context.Context, id, leasedBy string) error {
+	_, err := s.q.TerminalFailRunQueueEntry(ctx, db.TerminalFailRunQueueEntryParams{
+		ID:       id,
+		LeasedBy: sql.NullString{String: leasedBy, Valid: leasedBy != ""},
+	})
 	if errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("run queue entry %q not found or not in leased state", id)
+		return fmt.Errorf("run queue entry %q not found, not in leased state, or no longer leased by %q", id, leasedBy)
 	}
 	return err
 }

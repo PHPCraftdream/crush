@@ -52,13 +52,20 @@ WHERE id = ? AND status = 'leased' AND leased_by = ?;
 -- name: AckRunQueueEntry :one
 -- Mark a leased entry as successfully completed (terminal).
 -- Removes it from the queue (acked is terminal, no longer needed).
+-- Scoped to the current lease owner (found by the fifth @oh review pass over
+-- #337-349): without this, an executor that lost its lease to a
+-- CleanupExpiredLeases recovery (a rare residual now that executeEntry
+-- renews its lease for the duration of a real turn, but not impossible
+-- under a pathological scheduling stall) could Ack a row a DIFFERENT,
+-- currently-live executor now owns, deleting work out from under it.
 DELETE FROM session_run_queue
-WHERE id = ? AND status = 'leased'
+WHERE id = ? AND status = 'leased' AND leased_by = ?
 RETURNING id;
 
 -- name: NackRunQueueEntry :one
 -- Release a leased entry back to pending state (non-terminal failure, retry later).
 -- Increments attempts but does NOT set terminal_failure.
+-- Scoped to the current lease owner, same as AckRunQueueEntry.
 UPDATE session_run_queue
 SET status = 'pending',
     leased_by = NULL,
@@ -67,7 +74,7 @@ SET status = 'pending',
     last_error = ?,
     attempts = attempts + 1,
     updated_at = ?
-WHERE id = ? AND status = 'leased'
+WHERE id = ? AND status = 'leased' AND leased_by = ?
 RETURNING *;
 
 -- name: NackRunQueueEntryNoAttemptPenalty :one
@@ -77,7 +84,9 @@ RETURNING *;
 -- contention, not a failure of the call itself, and must never count toward
 -- RunQueueMaxAttempts. Without this, the durable queue would delete
 -- accepted user work after nothing more than a few turns of ordinary lock
--- contention.
+-- contention. Also used for the ErrCallQueuedNotExecuted backoff path and
+-- for releasing a mismatched attempts-exhausted lease unharmed.
+-- Scoped to the current lease owner, same as AckRunQueueEntry.
 UPDATE session_run_queue
 SET status = 'pending',
     leased_by = NULL,
@@ -85,14 +94,15 @@ SET status = 'pending',
     lease_expires_at = NULL,
     last_error = ?,
     updated_at = ?
-WHERE id = ? AND status = 'leased'
+WHERE id = ? AND status = 'leased' AND leased_by = ?
 RETURNING *;
 
 -- name: TerminalFailRunQueueEntry :one
 -- Mark a leased entry as terminal failure (no retry, even if attempts < max).
 -- Used for ErrCallAlreadyAttempted-type errors where retry would cause duplicates.
+-- Scoped to the current lease owner, same as AckRunQueueEntry.
 DELETE FROM session_run_queue
-WHERE id = ? AND status = 'leased'
+WHERE id = ? AND status = 'leased' AND leased_by = ?
 RETURNING id;
 
 -- name: ListPendingRunQueueEntries :many
