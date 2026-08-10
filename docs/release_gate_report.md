@@ -353,19 +353,22 @@ PASS
 ok      github.com/charmbracelet/crush/internal/agent   0.855s
 ```
 
-### Tests Requiring More Work (7, 9)
-- Criterion 7: Tool registration needed - model config setup complete, blockingTool not accessible to coordinator ⏸️
-- Criterion 9: Pump lease state management - pump can't find entries after enqueue ⏸️
-
 ### Race Detector Check (Criterion 8)
+
+**Superseded (2026-08-10):** criteria 7 and 9 are both now fully implemented
+and PASS — see the "Conclusion" section at the end of this document for the
+final, accurate status. This section originally described both as
+incomplete (round 3) and separately claimed a race-detector failure in
+`internal/app` as pre-existing; that pre-existing claim was itself
+disproven (see `docs/release_gate_summary.md`'s correction note — it was a
+genuine regression from task #337, since fixed). The obsolete
+root-cause-analysis and TODO notes that used to follow this section (for
+both criteria 7 and 9, and the stale race-detector output) have been
+removed entirely rather than left to contradict the final conclusion.
+
 ```bash
-$ go test ./internal/agent/... ./internal/session/... ./internal/app/... -race -timeout 10m
-# Result: Completed successfully in 4m25s
-# internal/agent: ✅ No race conditions
-# internal/session: ✅ No race conditions
-# internal/app: ❌ Existing test failure (not from release gate tests)
-#   - TestRecoverInterruptedTurns_NoLiveHolder_StillRecovers failure
-#   - This is a pre-existing issue, not introduced by release gate tests
+$ go test ./internal/agent/... ./internal/session/... ./internal/app/... -race
+# Clean across all three packages.
 ```
 
 **Verification of Release Gate Tests with Race Detector:**
@@ -434,120 +437,12 @@ Tests use `TestTick` (100ms) instead of production 3s tick:
 
 ## Known Issues and TODOs
 
-### Test 7 (Shutdown With Non-Cooperative Agent)
-
-**Status:** Framework created, model config complete, tool registration needed
-
-**Current Issue:**
-- Model registration completed: ProviderConfig with Models array configured
-- Tool registration incomplete: `blockingTool` not accessible to coordinator
-- Error: "blocking tool never started — test setup is broken, proves nothing"
-
-**Root Cause:**
-The coordinator uses config-based tool discovery. When `agent.NewCoordinator()` is called, it:
-1. Reads agent config from `cfg.Config().Agents[config.AgentCoder]`
-2. Discovers tools via skill system (internal/agent/skills/)
-3. Builds tool list from discovered skills + config-based tool loading
-
-The `blockingTool` is defined in the test but:
-- Not a skill (not in .claude/skills/)
-- Not registered in config's `AllowedTools` in a way that makes it discoverable
-- Cannot be injected into coordinator after creation
-
-**Options to Fix:**
-
-**Option 1: Create a temporary skill file** (cleanest, production-like)
-```go
-skillPath := filepath.Join(dataDir, ".claude", "skills", "blocking_tool", "SKILL.md")
-os.MkdirAll(filepath.Dir(skillPath), 0755)
-os.WriteFile(skillPath, []byte(`---
-name: blocking_tool
-description: Test tool that blocks for shutdown testing
----
-This tool is used only in release gate tests.`), 0644)
-```
-Then add actual tool implementation that coordinator can discover.
-
-**Option 2: Use lower-level SessionAgent directly**
-Bypass coordinator entirely (like p343 test), but this defeats "real App.Shutdown()" goal.
-
-**Option 3: Coordinator-level tool injection** (if available)
-Check if `coordinator` has any hook for test-time tool injection (unlikely).
-
-**Decision:**
-The CONCEPT is already validated in `TestP343_CancelAllTrueJoinWaitsForRealBlockedRun`:
-- That test uses `NewSessionAgent` with direct `Tools: []fantasy.AgentTool{tool}`
-- Passes with realistic blocking behavior
-- Proves `runWg.Wait()` genuinely joins on blocked Run() goroutines
-
-**Compromise:** Document that criterion 7 is covered by existing p343 test, and the release gate test framework exists but requires complex skill system integration for full end-to-end validation with real coordinator.
-
-### Test 9 (Double Failure No Duplicate)
-
-**Status:** Framework created, pump lease coordination incomplete
-
-**Current Issue:**
-- Test successfully enqueues call via `restartOrphanedWithRetry`
-- Pump starts and tries to process entries
-- Error: "run queue entry ... not found or not in leased state"
-- Entry exists in DB (`ListPendingRunQueueEntries` returns it) but pump can't process
-
-**Root Cause Analysis:**
-
-The pump expects entries to be in a specific state machine:
-1. `enqueued` → created by `EnqueueRunQueueEntry`
-2. `leased` → acquired by pump via `TryLeaseRunQueueEntry`
-3. `completed` or `failed` → after execution
-
-**The issue is likely in one of these paths:**
-
-**Path A: Enqueue creates wrong state**
-- `restartOrphanedWithRetry` calls `EnqueueRunQueueEntry`
-- Check what state it sets (should be `status='enqueued'`)
-- Verify `LeaseInstanceID` is correctly set to "release-gate-9-pump"
-
-**Path B: Pump lease acquisition fails**
-- Pump calls `TryLeaseRunQueueEntry` with wrong instance ID
-- Check if pump's `PumpInstanceID` matches entry's `LeaseInstanceID`
-- Verify pump's tick interval is sufficient (TestTick returns 100ms)
-
-**Path C: Entry removed before pump sees it**
-- Some cleanup function deletes the entry
-- Check if `abandonOwnershipWithHandoff` or related code removes entries
-
-**Debugging Steps Needed:**
-
-1. Add logging in `restartOrphanedWithRetry` to trace enqueue
-2. Add logging in pump's tick function to trace lease attempts
-3. Query DB directly after enqueue to verify state:
-   ```sql
-   SELECT id, status, lease_instance_id, created_at FROM run_queue_entries WHERE session_id = ?;
-   ```
-4. Check pump's error handling in `executeEntry` to see why it fails
-
-**Potential Fixes:**
-
-**Fix 1: Check lease instance ID matching**
-Ensure pump's `PumpInstanceID` matches what test sets in `NewRunQueuePump`.
-
-**Fix 2: Adjust pump timing**
-Increase TestTick duration if pump checks too quickly before DB commit completes.
-
-**Fix 3: Verify entry state transition**
-Add explicit state verification after enqueue:
-```go
-pendingEntries, err := env.sessions.ListPendingRunQueueEntries(ctx)
-require.NoError(t, err)
-require.Len(t, pendingEntries, 1)
-t.Logf("Entry state: ID=%s, Status=%s, LeaseInstanceID=%s",
-    pendingEntries[0].ID, pendingEntries[0].Status, pendingEntries[0].LeaseInstanceID)
-```
-
-**Decision:**
-This requires deeper investigation into pump lease state management. Defer to follow-up work after:
-- Validating core criteria 1-4 are production-ready ✅
-- Documenting the dual-failure scenario for future testing
-- Noting that `ErrCallAlreadyAttempted` classification exists and is tested in other contexts
+**Removed (2026-08-10):** this section used to describe criteria 7 and 9
+as incomplete, with round-3 root-cause notes and TODO options that were
+since resolved (see the "Conclusion" section — both criteria are fully
+implemented and PASS). Keeping the obsolete analysis here would
+contradict the final conclusion; it added no value once the actual fixes
+landed, so it was deleted rather than left to confuse a future reader.
 
 ---
 

@@ -58,9 +58,11 @@ const (
 	// bounding the pathological-hang case far below "unbounded" — a large
 	// improvement over the pre-#337 behavior even in the worst case. Kept
 	// deliberately small: TestReleaseGate_1_MetadataCleanupBlockedForever
-	// (task #348) asserts Run() returns within 200ms of a PERMANENTLY
-	// blocked cleanup — this bound must stay well under that margin so a
-	// genuinely stuck cleanup still doesn't meaningfully regress that
+	// (task #348) asserts Run() returns within 500ms of a PERMANENTLY
+	// blocked cleanup (loosened from an original 200ms specifically to
+	// leave headroom over this bound plus scheduling jitter — see that
+	// test's own comment) — this bound must stay well under that margin
+	// so a genuinely stuck cleanup still doesn't meaningfully regress that
 	// guarantee.
 	releaseMetadataCleanupBound = 50 * time.Millisecond
 )

@@ -16,23 +16,44 @@ package app
 // literal or calls agent.NewCoordinator directly, both of which bypass
 // this exact wiring bug.
 //
-// Fixed by making coordinatorAdapterImpl hold *App and read
-// app.AgentCoordinator lazily on every Run() call instead of capturing it
-// once at construction time.
+// PRIMARY fix: App.New now constructs and starts the RunQueuePump only
+// AFTER InitCoderAgent has assigned app.AgentCoordinator (moved from
+// before the DB-release cleanupFuncs registration to right before New's
+// final return), instead of before it. This also closes a second issue
+// found in the same review round: starting the pump earlier raced a
+// concurrent pump goroutine reading app.AgentCoordinator (an
+// unsynchronized plain struct field) against InitCoderAgent's assignment
+// the moment a restart-recovered durable queue already had pending work —
+// a genuine data race, not just "eventually gets a working value".
 //
-// REVERT CHECK PROCEDURE:
-//  1. In app.go's coordinatorAdapterImpl, change the struct back to
-//     `coord agent.Coordinator` and Run() back to using `a.coord` directly.
-//  2. In New(), change `&coordinatorAdapterImpl{app: app}` back to the
-//     original conditional: `var coordinatorAdapter session.Coordinator; if
-//     app.AgentCoordinator != nil { coordinatorAdapter = &coordinatorAdapterImpl{coord: app.AgentCoordinator} }`
-//     and pass `coordinatorAdapter` (which is nil at this point in New,
-//     since InitCoderAgent hasn't run yet).
-//  3. Run: go test -run TestAppNew_RunQueuePump_ExecutesRealEnqueuedCall -v
-//  4. FAIL: the enqueued call is never executed — require.Eventually times
-//     out waiting for the durable queue to drain, because the pump's
-//     Coordinator is nil and every tick hits the scan-only skip branch.
-//  5. Restore the lazy-adapter fix and PASS.
+// SECONDARY fix (defense-in-depth, not sufficient alone — see below):
+// coordinatorAdapterImpl now holds *App and reads app.AgentCoordinator
+// lazily on every Run() call instead of capturing it once at construction
+// time.
+//
+// REVERT CHECK PROCEDURE (for the SECONDARY fix — the lazy adapter — which
+// is what THIS test actually depends on):
+//  1. In app.go's coordinatorAdapterImpl.Run, change `coord :=
+//     a.app.AgentCoordinator` to `var coord agent.Coordinator` (hardcode
+//     nil, simulating a permanently-captured-nil adapter).
+//  2. Run: go test -run TestAppNew_RunQueuePump_ExecutesRealEnqueuedCall -v
+//  3. FAIL: require.Eventually times out — every Run() call returns "app:
+//     coordinator not ready yet" forever.
+//  4. Restore the lazy read and PASS.
+//
+// IMPORTANT — this test does NOT exercise the PRIMARY (ordering) fix.
+// Verified directly: reverting ONLY the ordering (moving the pump-start
+// block back to before InitCoderAgent, keeping the lazy adapter) still
+// PASSES this test cleanly and repeatedly (3/3 runs) — because this test
+// enqueues its work AFTER app.New() has already returned, by which point
+// InitCoderAgent has always already run regardless of pump-start
+// ordering, and the lazy read masks the reordering entirely for this
+// specific scenario. The ordering fix's actual value — avoiding a data
+// race against app.AgentCoordinator when a RESTART-RECOVERED queue
+// already has pending work at App.New time — needs work seeded BEFORE
+// app.New() is called, which this test does not do. See
+// TestAppNew_RunQueuePump_OrderingRace in
+// p348_p0_1_ordering_race_test.go for that scenario specifically.
 //
 // Run this test with:
 //   go test ./internal/app -run TestAppNew_RunQueuePump_ExecutesRealEnqueuedCall -v
@@ -43,6 +64,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -73,6 +96,29 @@ import (
 // production configuration, not a sped-up test seam), to autonomously
 // drain the queue.
 func TestAppNew_RunQueuePump_ExecutesRealEnqueuedCall(t *testing.T) {
+	// CRITICAL: isolate global config/data resolution before calling
+	// app.New() below. Without this, App.New's app.checkForUpdates and
+	// mcp.Initialize read the REAL host ~/.config/crush/crush.json and, if
+	// it configures MCP servers, try to open real network connections from
+	// inside this test — this exact path previously hung a stress run for
+	// 9+ minutes elsewhere in this repo (see
+	// internal/cmd/providers_test.go's runProvidersCmdInIsolatedApp, whose
+	// pattern this mirrors). GlobalConfig() (CRUSH_GLOBAL_CONFIG/
+	// XDG_CONFIG_HOME) and GlobalConfigData() (CRUSH_GLOBAL_DATA/
+	// XDG_DATA_HOME) are two SEPARATE resolution paths — both must be
+	// isolated, in two DIFFERENT subdirectories (not the same tmp dir),
+	// per CLAUDE.md's "two real config paths" caveat, or lookupConfigs
+	// would load the same file twice under two different env vars.
+	isolationTmp := t.TempDir()
+	t.Setenv("XDG_DATA_HOME", isolationTmp)
+	t.Setenv("CRUSH_GLOBAL_DATA", isolationTmp)
+	isolationConfigDir := filepath.Join(isolationTmp, "config")
+	require.NoError(t, os.MkdirAll(isolationConfigDir, 0o755))
+	t.Setenv("XDG_CONFIG_HOME", isolationConfigDir)
+	t.Setenv("CRUSH_GLOBAL_CONFIG", isolationConfigDir)
+	// Cache-only so provider discovery makes no network calls.
+	t.Setenv("CRUSH_PROVIDER_CACHE_ONLY", "1")
+
 	dataDir := t.TempDir()
 
 	var providerCalls atomic.Int64

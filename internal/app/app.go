@@ -45,18 +45,25 @@ import (
 // avoiding an import cycle (session → agent → session).
 //
 // Reads app.AgentCoordinator lazily, on every Run() call, rather than
-// capturing it once at construction time: the pump is started in App.New
-// BEFORE InitCoderAgent assigns app.AgentCoordinator (InitCoderAgent runs
-// near the end of New, after the pump is already ticking), so capturing a
-// snapshot at construction time would permanently wire the pump to a nil
-// coordinator — it would silently stay in scan-only mode for the entire
-// process lifetime, never actually executing any durably-queued call. See
-// the "app: coordinator not ready yet" error below for what happens if a
-// tick still manages to race InitCoderAgent (the pump retries next tick;
-// this is not expected in practice given InitCoderAgent runs synchronously
-// during App.New, before New returns and before any caller could enqueue
-// work, but the lazy read costs nothing and removes the ordering hazard
-// entirely rather than relying on that timing).
+// capturing it once at construction time.
+//
+// History (P0-1, found in the final @oh review of tasks #337-349): this
+// adapter used to be constructed with the run queue pump BEFORE
+// InitCoderAgent assigned app.AgentCoordinator, so an eager-capture struct
+// permanently captured nil, silently disabling the pump for the entire
+// process lifetime. The PRIMARY fix was reordering App.New so the pump is
+// now only constructed and started AFTER InitCoderAgent succeeds (see the
+// pump construction site near the end of New) — by the time this adapter
+// is built, app.AgentCoordinator is already correctly assigned, so an
+// eager capture would work correctly too.
+//
+// The lazy read here is kept anyway as defense-in-depth, not as the
+// primary fix — verified directly: reverting ONLY this adapter to eager
+// capture (while keeping the corrected pump-start ordering) does NOT
+// reproduce the original bug. It costs nothing and removes any future
+// ordering hazard if App.New's construction sequence changes again,
+// without depending on that ordering being preserved by every future
+// edit.
 type coordinatorAdapterImpl struct {
 	app *App
 }
@@ -216,26 +223,6 @@ func New(ctx context.Context, conn *sql.DB, store *config.ConfigStore) (*App, er
 
 	go mcp.Initialize(ctx, app.Permissions, store)
 
-	// Start the run queue pump (task #340). This pump ensures that once a call
-	// is enqueued as durable, it will eventually be executed by some process,
-	// independent of which specific request/turn originated it. The pump lives
-	// for the lifetime of the process and is stopped during Shutdown().
-	//
-	// We wrap the real coordinator in an adapter to avoid import cycles. The
-	// adapter reads app.AgentCoordinator lazily (see coordinatorAdapterImpl's
-	// doc comment) because InitCoderAgent — which assigns AgentCoordinator —
-	// runs AFTER this point in App.New; capturing app.AgentCoordinator by
-	// value here would always capture nil, permanently disabling execution.
-	if dataDir != "" {
-		app.RunQueuePump = session.NewRunQueuePump(session.RunQueuePumpConfig{
-			Sessions:      app.Sessions,
-			DataDirectory: dataDir,
-			Coordinator:   &coordinatorAdapterImpl{app: app},
-		})
-		app.RunQueuePump.Start()
-		slog.Info("app: started run queue pump", "data_dir", dataDir)
-	}
-
 	// Release the shared database connection(s) on shutdown. The pool
 	// closes the underlying *sql.DB when the last reference is released.
 	// One Release call is needed per Connect/ConnectRead call this process
@@ -274,6 +261,40 @@ func New(ctx context.Context, conn *sql.DB, store *config.ConfigStore) (*App, er
 	}
 	if err := app.InitCoderAgent(ctx); err != nil {
 		return nil, fmt.Errorf("failed to initialize coder agent: %w", err)
+	}
+
+	// Start the run queue pump (task #340) only AFTER InitCoderAgent has
+	// assigned app.AgentCoordinator. This pump ensures that once a call is
+	// enqueued as durable (including by a PREVIOUS process — the queue
+	// survives restarts, which is the entire point of task #340), it will
+	// eventually be executed. The pump lives for the lifetime of the
+	// process and is stopped during Shutdown() (see the cleanupFuncs
+	// registration above, which is nil-safe and already covers this).
+	//
+	// This ordering (not just coordinatorAdapterImpl's lazy field read) is
+	// itself required, not merely nice-to-have: starting the pump earlier
+	// — even with a lazy-reading adapter — raced a fresh AgentCoordinator
+	// assignment against a concurrent pump goroutine reading the same
+	// unsynchronized interface field the moment a restart-recovered queue
+	// already had pending work (found in the final @oh review of
+	// #337-349's own fix commit for P0-1 — a genuine data race per Go's
+	// memory model on a plain struct field, not just "would eventually get
+	// a working value"). Starting the pump only after InitCoderAgent's
+	// synchronous assignment has already happened on this same goroutine
+	// removes the race entirely, and also removes the separate failure
+	// mode where a pump with a permanently-nil coordinator (config never
+	// configured, or InitCoderAgent failing) would otherwise treat
+	// "coordinator not ready" as an ordinary retryable failure and
+	// eventually dead-letter (delete) durably-accepted work it was never
+	// going to get a chance to run anyway.
+	if dataDir != "" {
+		app.RunQueuePump = session.NewRunQueuePump(session.RunQueuePumpConfig{
+			Sessions:      app.Sessions,
+			DataDirectory: dataDir,
+			Coordinator:   &coordinatorAdapterImpl{app: app},
+		})
+		app.RunQueuePump.Start()
+		slog.Info("app: started run queue pump", "data_dir", dataDir)
 	}
 
 	return app, nil

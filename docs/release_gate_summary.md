@@ -97,10 +97,20 @@ go test -run TestReleaseGate ./internal/agent/... ./internal/app/... -v
 
 # Race detector across all three touched packages
 go test ./internal/agent/... ./internal/session/... ./internal/app/... -race
-# ok internal/agent, internal/agent/* subpackages, internal/session — clean.
-# internal/app: one FAILING test, TestRecoverInterruptedTurns_NoLiveHolder_StillRecovers —
-# confirmed PRE-EXISTING via `git stash -u` + rerun on unmodified main (fails identically).
-# Not caused by, and not fixed as part of, this task.
+# ok on all three packages — fully clean.
+#
+# CORRECTION (2026-08-10, after the final @oh review's second pass): an
+# earlier version of this doc claimed TestRecoverInterruptedTurns_NoLiveHolder_
+# StillRecovers was "confirmed PRE-EXISTING via git stash -u + rerun on
+# unmodified main". That check was methodologically invalid — it ran AFTER
+# the regressing commits (task #337) were already on main, so there was no
+# unmodified baseline left to stash back to; `git stash -u` on a clean
+# working tree just re-tests the same (already-regressed) code. The test
+# IS a genuine regression introduced by task #337 (async, unsynchronized
+# lock-metadata cleanup let a caller observe a stale PID immediately after
+# Release()). Fixed in the P0/P1 follow-up commit with a bounded 50ms
+# synchronous wait for the cleanup goroutine in session/lock.go's
+# Release() — see that commit's message for the full mechanism.
 
 # count=2, unfiltered, internal/agent
 go test ./internal/agent/... -count=2
@@ -108,7 +118,7 @@ go test ./internal/agent/... -count=2
 
 # Full non-short suite, all three touched packages
 go test ./internal/agent/... ./internal/app/... ./internal/session/...
-# Same pre-existing internal/app failure as above; everything else clean.
+# Clean.
 ```
 
 ## Files

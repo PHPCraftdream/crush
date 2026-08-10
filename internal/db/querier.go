@@ -15,6 +15,13 @@ type Querier interface {
 	AckRunQueueEntry(ctx context.Context, id string) (string, error)
 	// Reset stale leased entries back to pending (lease expiry recovery).
 	// Run periodically to recover from crashed pump instances.
+	// Increments attempts: a lease that expired without a matching Ack/Nack
+	// means whatever was executing it (a pump process, a goroutine) died or
+	// hung mid-execution without ever completing a normal outcome. Without
+	// counting this as an attempt, a poison entry whose execution always
+	// kills the process before it can Ack or Nack would accumulate attempts=0
+	// forever and never reach RunQueueMaxAttempts, looping indefinitely
+	// instead of eventually being dead-lettered.
 	CleanupExpiredLeases(ctx context.Context, arg CleanupExpiredLeasesParams) error
 	CountMessagesBySession(ctx context.Context, sessionID string) (int64, error)
 	CreateFile(ctx context.Context, arg CreateFileParams) (File, error)
