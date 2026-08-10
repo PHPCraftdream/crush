@@ -1102,3 +1102,24 @@ finished the mailbox migration:
     after the regressing commits were already on `main`, with nothing
     left to stash back to; it is a genuine regression, and was already
     fixed by the bounded synchronous wait mentioned above.
+  - Third pass, on `run_queue_pump.go`'s original design (in-range for
+    the durable run queue itself, not either fix round): the pump
+    could Ack (delete) a durable queue entry whose call was never
+    actually executed, only appended to another live, in-process
+    owner's mailbox queue — reachable both from a self-inflicted
+    lease-expiry race (the 30-second lease TTL is far shorter than a
+    real LLM turn, and execution never renewed its lease) and from two
+    distinct queued entries for one session being dispatched back to
+    back within the same pump tick. Either way, the second dispatch's
+    call was silently duplicated into the first's mailbox (re-run when
+    the owner drained its queue) while its own durable row was wrongly
+    deleted — data loss if the process crashed before the mailbox
+    drained, a duplicate turn if it didn't. Fixed by tracking which
+    sessions this pump instance currently has an execution in flight
+    for and refusing to lease further entries for the same session
+    until it clears (closes the self-inflicted paths at the source),
+    plus a distinct signal for the residual case of a genuinely
+    external owner (neither Acked, since the work has not run, nor
+    immediately retried, since that would itself append another
+    duplicate — left leased for the existing lease-expiry mechanism to
+    naturally recover).
