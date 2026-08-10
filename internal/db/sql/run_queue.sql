@@ -37,6 +37,18 @@ SET status = 'leased',
 WHERE id = ? AND status = 'pending'
 RETURNING *;
 
+-- name: RenewRunQueueLease :execrows
+-- Extend a lease expiry while its owner is still genuinely working on it,
+-- or to back off a lease without counting a failed attempt. Scoped to
+-- status = leased AND leased_by = ? so a lease already reassigned to a
+-- different owner (this owner lost the race to a prior CleanupExpiredLeases
+-- recovery) is never silently extended out from under the new owner:
+-- execrows reports 0 rows in that case, which the caller must treat as
+-- meaning it is no longer this executor's lease to keep alive.
+UPDATE session_run_queue
+SET lease_expires_at = ?
+WHERE id = ? AND status = 'leased' AND leased_by = ?;
+
 -- name: AckRunQueueEntry :one
 -- Mark a leased entry as successfully completed (terminal).
 -- Removes it from the queue (acked is terminal, no longer needed).

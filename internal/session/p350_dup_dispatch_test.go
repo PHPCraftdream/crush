@@ -1,44 +1,81 @@
 package session_test
 
-// P350 regression tests (found in the third @oh review pass over #337-349,
-// 2026-08-10): run_queue_pump.go's executeEntry treated Coordinator.Run's
-// nil error as unconditional success and Acked (deleted) the durable row
-// regardless of whether the call actually ran. agent.sessionAgent.Run
-// returns (nil, nil) — not an error — when the target session is already
-// owned by a live, in-process turn: the call is merely appended to that
-// owner's mailbox queue (mailbox.submit unconditionally appends, no dedup),
-// not executed by this call.
+// P350 regression tests (found across the third and fourth @oh review
+// passes over #337-349, 2026-08-10): run_queue_pump.go's executeEntry
+// treated Coordinator.Run's nil error as unconditional success and Acked
+// (deleted) the durable row regardless of whether the call actually ran.
+// agent.sessionAgent.Run returns (nil, nil) — not an error — when the
+// target session is already owned by a live, in-process turn: the call is
+// merely appended to that owner's mailbox queue (mailbox.submit
+// unconditionally appends, no dedup), not executed by this call.
 //
-// This was reachable two ways, both closed by this round's fix:
-//  1. Self-inflicted: RunQueueLeaseTTL (30s) is far shorter than a real LLM
-//     turn can take, and executeEntry never renewed its lease while
-//     Coordinator.Run was in flight, so CleanupExpiredLeases could return
-//     an entry to pending while the goroutine executing it was still
-//     genuinely running — the next tick then leased and dispatched a
-//     SECOND goroutine for the same session.
-//  2. Same-tick: tick() leases and `go executeEntry`-dispatches entries one
-//     at a time in a single pass; two distinct durably-queued entries for
-//     the same session (e.g. two calls queued while a process was down)
-//     could be leased and dispatched back to back within the same tick,
-//     before either had run long enough to matter.
+// This was reachable three ways:
+//  1. Same-tick (third pass): tick() leases and `go executeEntry`-dispatches
+//     entries one at a time in a single pass; two distinct durably-queued
+//     entries for the same session (e.g. two calls queued while a process
+//     was down) could be leased and dispatched back to back within the
+//     same tick, before either had run long enough to matter.
+//  2. Sequential self-inflicted (found by the third pass, actually fixed by
+//     the fourth): RunQueueLeaseTTL (30s) is far shorter than a real LLM
+//     turn can take. The third pass's inFlight guard (below) does NOT
+//     close this path on its own — inFlight only blocks a SECOND
+//     concurrent dispatch while the first goroutine is still tracked as
+//     busy; it does nothing about the underlying DB row silently flipping
+//     from 'leased' to 'pending' out from under a still-running execution.
+//     Without lease renewal, CleanupExpiredLeases would do exactly that
+//     after 30s, and the ORIGINAL goroutine's own eventual AckRunQueueEntry
+//     (`WHERE status = leased`) would then silently fail to match (logged,
+//     not delete anything), leaving the row pending for a LATER tick to
+//     lease and dispatch — a genuine duplicate execution of the same turn,
+//     sequential rather than concurrent, but exactly as harmful.
+//  3. External busy-then-recovered (found by the fourth pass): the original
+//     fix for ErrCallQueuedNotExecuted (see below) left the entry exactly
+//     as leased and untouched, relying solely on CleanupExpiredLeases's
+//     natural lease-expiry as its recovery path — but that same cleanup
+//     unconditionally increments attempts on every recovery. A session
+//     that stayed externally busy for RunQueueMaxAttempts lease windows (a
+//     few minutes) would have its accepted, never-actually-failed work
+//     silently dead-lettered (deleted) — the same class of bug
+//     SessionLockBusyError's no-attempt-penalty handling exists to prevent
+//     for the equivalent cross-process OS-lock case.
 //
-// Fixed two ways:
+// Fixed:
 //  1. RunQueuePump.inFlight tracks session IDs with an executeEntry
 //     goroutine currently running FROM THIS PUMP INSTANCE; processEntry
 //     refuses to lease a pending entry for a session already in that set.
-//     This closes both paths above at the source — the pump itself can
-//     never concurrently dispatch two entries for one session.
-//  2. session.ErrCallQueuedNotExecuted is returned by
+//     Closes path 1 above at the source — the pump itself can never
+//     concurrently dispatch two entries for one session.
+//  2. executeEntry now runs a renewal loop (ticker at leaseTTL/3) alongside
+//     Coordinator.Run, calling the new RenewRunQueueLease query to push
+//     lease_expires_at forward — scoped to `status = leased AND leased_by
+//     = ?` so a lease already reassigned to a different owner is never
+//     silently extended out from under it. Closes path 2: a still-running
+//     execution's lease can no longer expire underneath it under normal
+//     scheduling.
+//  3. session.ErrCallQueuedNotExecuted is returned by
 //     coordinatorAdapterImpl.Run when the underlying call returns (nil,
 //     nil) — i.e. queued into a genuinely EXTERNAL live owner the inFlight
-//     guard has no visibility into (e.g. a concurrent web/CLI request in
-//     the same process). executeEntry treats this specially: it must NOT
-//     Ack (the row would be deleted for work that has not actually run)
-//     and must NOT immediately Nack-and-retry either (mailbox.submit
-//     appends unconditionally on every call, so retrying every tick would
-//     append a new duplicate on every attempt). The entry is left exactly
-//     as leased; RunQueueLeaseTTL's natural expiry is the only recovery
-//     path.
+//     guard has no visibility into. executeEntry treats this specially: no
+//     Ack (the row would be deleted for work that has not actually run),
+//     and — closing path 3 — an immediate
+//     NackRunQueueEntryNoAttemptPenalty release (never counts an attempt,
+//     mirroring SessionLockBusyError's own handling) paired with a LOCAL
+//     RunQueuePump.busyBackoffUntil deadline so THIS pump instance does not
+//     immediately re-lease and re-dispatch the same entry on the very next
+//     tick — mailbox.submit appends unconditionally on every call, so an
+//     uncontrolled retry loop would append a new duplicate on every
+//     attempt. A single RenewRunQueueLease call was tried first and did NOT
+//     work: it happens almost instantly after the original lease, barely
+//     extending lease_expires_at beyond what leasing already set, so
+//     CleanupExpiredLeases still reaped the row (and charged an attempt)
+//     after essentially one ordinary TTL window — same as doing nothing.
+//
+// RunQueueLeaseTTL itself (30s) is not test-overridable, which made path 2
+// impossible to exercise deterministically and quickly with a real timed
+// test — RunQueuePumpConfig.TestLeaseTTL (mirroring the existing TestTick
+// seam) was added to close that gap; see
+// TestReleaseGate_P350_LeaseRenewedDuringLongExecution and
+// TestReleaseGate_P350_QueuedNotExecutedBacksOffWithoutAttemptPenalty below.
 
 import (
 	"context"
@@ -214,12 +251,19 @@ func (c *queuedNotExecutedCoordinator) Run(ctx context.Context, callData session
 // that when Coordinator.Run reports ErrCallQueuedNotExecuted, executeEntry
 // does not Ack (delete) the durable row — since the work has not actually
 // run — and does not immediately retry it either (which would append a new
-// duplicate to the external owner's mailbox on every tick).
+// duplicate to the external owner's mailbox on every tick): the row is
+// released (visible as pending again, matching SessionLockBusyError's own
+// no-penalty handling) but this pump instance's local busyBackoffUntil
+// deadline prevents IT from re-leasing the same session again immediately.
 //
 // REVERT CHECK PROCEDURE:
 //  1. In run_queue_pump.go's executeEntry, remove the
 //     `errors.Is(err, ErrCallQueuedNotExecuted)` branch (falls through to
-//     the generic Nack path).
+//     the generic Nack path, which DOES increment attempts — a different,
+//     already-covered regression) — or, to specifically target the
+//     no-immediate-retry guarantee this test checks, remove just the
+//     `p.busyBackoffUntil[...] = ...` line while keeping the
+//     NackRunQueueEntryNoAttemptPenalty call.
 //  2. Run: go test -run TestReleaseGate_P350_QueuedNotExecutedNeitherAcksNorSpamRetries -v
 //  3. FAIL: calls grows well past 1 across several ticks (spam-retried)
 //     instead of staying pinned at 1.
@@ -242,6 +286,7 @@ func TestReleaseGate_P350_QueuedNotExecutedNeitherAcksNorSpamRetries(t *testing.
 		Coordinator:    coord,
 		PumpInstanceID: "queued-not-executed-pump",
 		TestTick:       func() time.Duration { return 20 * time.Millisecond },
+		TestLeaseTTL:   500 * time.Millisecond,
 	})
 	pump.Start()
 	defer pump.Stop()
@@ -250,25 +295,202 @@ func TestReleaseGate_P350_QueuedNotExecutedNeitherAcksNorSpamRetries(t *testing.
 		return coord.calls.Load() >= 1
 	}, 2*time.Second, 10*time.Millisecond, "the entry must be leased and attempted at least once")
 
-	// Let many more ticks elapse. RunQueueLeaseTTL is 30s (not test-
-	// overridable), so within this window the lease cannot have naturally
-	// expired — if the entry were being Nacked back to pending instead of
-	// left leased, it would be re-leased and re-dispatched on nearly every
-	// tick, and calls would grow well past 1.
-	time.Sleep(300 * time.Millisecond) // ~15 ticks at 20ms
-	require.Equal(t, int64(1), coord.calls.Load(), "must not be retried while still within its lease window — retrying would append a duplicate to the external owner's mailbox on every attempt")
+	// Let many more ticks elapse, well within the local busy-backoff window
+	// (500ms) — if the entry were being re-leased and re-dispatched on
+	// every tick instead of respecting the local backoff, calls would grow
+	// well past 1.
+	time.Sleep(300 * time.Millisecond) // ~15 ticks at 20ms, still < 500ms backoff
+	require.Equal(t, int64(1), coord.calls.Load(), "must not be retried while still within its local busy-backoff window — retrying would append a duplicate to the external owner's mailbox on every attempt")
 
 	// Must not have been Acked (deleted) either: it should still exist,
-	// durably, in the 'leased' state. ListStaleLeasedRunQueueEntries with a
-	// far-future cutoff matches ANY currently-leased entry regardless of
-	// whether its lease has actually expired yet.
-	farFuture := time.Now().Add(time.Hour).Unix()
-	leased, err := svc.ListStaleLeasedRunQueueEntries(ctx, farFuture)
-	require.NoError(t, err)
-	require.Len(t, leased, 1, "the entry must still exist in the leased state — not acked/deleted for work that never actually ran")
-	require.Equal(t, sess.ID, leased[0].SessionID)
-
+	// durably, released back to pending (not leased forever, not gone).
 	pending, err := svc.ListPendingRunQueueEntries(ctx)
 	require.NoError(t, err)
-	require.Empty(t, pending, "must not have been nacked back to pending either — that would let the very next tick re-dispatch and append another duplicate")
+	require.Len(t, pending, 1, "the entry must still exist, released back to pending — not acked/deleted for work that never actually ran")
+	require.Equal(t, sess.ID, pending[0].SessionID)
+	require.Equal(t, int64(0), pending[0].Attempts, "must not have incurred an attempt penalty for external contention")
+}
+
+// slowCoordinator blocks every call until release is closed, tracking how
+// many times it has been entered. Simulates a real, long-running LLM turn.
+type slowCoordinator struct {
+	calls   atomic.Int64
+	release chan struct{}
+}
+
+func (c *slowCoordinator) Run(ctx context.Context, callData session.SessionAgentCallData) (*any, error) {
+	c.calls.Add(1)
+	<-c.release
+	var result any = "ok"
+	return &result, nil
+}
+
+// TestReleaseGate_P350_LeaseRenewedDuringLongExecution proves that a call
+// held in flight across SEVERAL lease TTL windows is executed exactly once
+// — the lease-renewal loop must keep the entry's row genuinely 'leased' for
+// the whole duration, so CleanupExpiredLeases never returns it to pending
+// while it is still running, and no later tick dispatches a duplicate.
+//
+// Uses RunQueuePumpConfig.TestLeaseTTL to make RunQueueLeaseTTL's normally
+// non-overridable 30s window fast enough to actually cross multiple times
+// within a test's real-time budget. TestLeaseTTL is kept at a full second
+// (not sub-second): lease_expires_at is stored as Unix SECONDS (see
+// internal/db/migrations/20260809000001_add_session_run_queue.sql and every
+// existing `.Unix()`-based computation in run_queue_pump.go/session.go), so
+// a sub-second TTL is silently truncated to 0 by `int64(ttl.Seconds())` in
+// LeaseRunQueueEntry and produces non-deterministic, boundary-dependent
+// behavior — confirmed by hand: an earlier version of this test using
+// TestLeaseTTL=150ms failed unpredictably for exactly this reason. A whole
+// 1-second TTL sidesteps the truncation (adding exactly 1 second to `now`
+// always advances `.Unix()` by exactly 1, regardless of the sub-second
+// offset within the current second) at the cost of a slower test.
+//
+// REVERT CHECK PROCEDURE:
+//  1. In run_queue_pump.go's executeEntry, disable the renewal loop, e.g.
+//     change `case <-ticker.C:` to `case <-(chan time.Time)(nil):` (never
+//     fires) or wrap the ticker-case body in `if false {`.
+//  2. Run: go test -run TestReleaseGate_P350_LeaseRenewedDuringLongExecution -v -race -count=5
+//  3. FAIL: coord.calls ends up >= 2 — the entry was re-leased and
+//     re-dispatched mid-execution once its lease expired unrenewed.
+//  4. Restore the renewal loop and PASS.
+func TestReleaseGate_P350_LeaseRenewedDuringLongExecution(t *testing.T) {
+	t.Parallel()
+
+	sess, svc := setupTestSession(t, "test-session-lease-renewal")
+	ctx := t.Context()
+
+	callData := map[string]any{"SessionID": sess.ID, "Prompt": "long running call"}
+	callDataJSON, err := json.Marshal(callData)
+	require.NoError(t, err)
+	require.NoError(t, svc.EnqueueRunQueueEntry(ctx, "lease-renewal-probe", sess.ID, callDataJSON))
+
+	coord := &slowCoordinator{release: make(chan struct{})}
+
+	pump := session.NewRunQueuePump(session.RunQueuePumpConfig{
+		Sessions:       svc,
+		Coordinator:    coord,
+		PumpInstanceID: "lease-renewal-pump",
+		TestTick:       func() time.Duration { return 50 * time.Millisecond },
+		TestLeaseTTL:   1 * time.Second,
+	})
+	pump.Start()
+	defer pump.Stop()
+
+	require.Eventually(t, func() bool {
+		return coord.calls.Load() >= 1
+	}, 2*time.Second, 10*time.Millisecond, "the entry must be leased and execution started")
+
+	// Hold the call in flight across several TTL windows (1s each) — long
+	// enough that, without renewal, CleanupExpiredLeases would have reset
+	// this entry to pending and a later tick would have leased and
+	// dispatched a second, duplicate execution.
+	time.Sleep(3500 * time.Millisecond) // ~3.5 TTL windows at 1s
+	require.Equal(t, int64(1), coord.calls.Load(), "no second dispatch should have occurred while the first call is still genuinely in flight, across multiple TTL windows")
+
+	close(coord.release)
+
+	require.Eventually(t, func() bool {
+		pending, checkErr := svc.ListPendingRunQueueEntries(ctx)
+		if checkErr != nil {
+			return false
+		}
+		return len(pending) == 0
+	}, 2*time.Second, 10*time.Millisecond, "entry should be acked once the long call finally completes")
+
+	// Sustained check, matching this file's established pattern for
+	// distinguishing "durably gone" from "transiently leased".
+	for range 5 {
+		time.Sleep(20 * time.Millisecond)
+		pending, checkErr := svc.ListPendingRunQueueEntries(ctx)
+		require.NoError(t, checkErr)
+		require.Empty(t, pending)
+	}
+
+	require.Equal(t, int64(1), coord.calls.Load(), "the long-running call must have been executed exactly once — renewal must have kept its lease alive across multiple TTL windows, preventing a duplicate dispatch")
+}
+
+// queuedNotExecutedThenSuccessCoordinator returns ErrCallQueuedNotExecuted
+// for its first N calls, then succeeds — simulating a session that stays
+// externally busy (owned by another live, in-process turn) for a while
+// before freeing up.
+type queuedNotExecutedThenSuccessCoordinator struct {
+	busyUntilCall int64
+	calls         atomic.Int64
+}
+
+func (c *queuedNotExecutedThenSuccessCoordinator) Run(ctx context.Context, callData session.SessionAgentCallData) (*any, error) {
+	n := c.calls.Add(1)
+	if n <= c.busyUntilCall {
+		return nil, session.ErrCallQueuedNotExecuted
+	}
+	var result any = "ok"
+	return &result, nil
+}
+
+// TestReleaseGate_P350_QueuedNotExecutedBacksOffWithoutAttemptPenalty proves
+// that an entry blocked purely by ErrCallQueuedNotExecuted (a genuinely
+// external live owner) survives far more than RunQueueMaxAttempts local
+// backoff cycles without being dead-lettered (deleted), and is executed
+// successfully once the external owner frees up.
+//
+// Unlike TestReleaseGate_P350_LeaseRenewedDuringLongExecution, this backoff
+// is tracked purely in-memory (RunQueuePump.busyBackoffUntil, a time.Time,
+// not a Unix-seconds DB column) — a fast TestLeaseTTL is safe to use here
+// and does not hit the second-granularity truncation issue described there.
+// A first version of this fix tried achieving backoff via a single
+// RenewRunQueueLease call instead; that failed this very test (attempts
+// still reached RunQueueMaxAttempts in the ordinary ~10 TTL windows) because
+// the renewal happens almost instantly after the original lease was taken,
+// barely extending lease_expires_at beyond what leasing already set.
+//
+// REVERT CHECK PROCEDURE:
+//  1. In run_queue_pump.go's executeEntry, replace the
+//     NackRunQueueEntryNoAttemptPenalty + busyBackoffUntil branch under
+//     `errors.Is(err, ErrCallQueuedNotExecuted)` with a no-op (or restore
+//     the single RenewRunQueueLease call — either reproduces the bug).
+//  2. Run: go test -run TestReleaseGate_P350_QueuedNotExecutedBacksOffWithoutAttemptPenalty -v -race
+//  3. FAIL: the entry is dead-lettered (deleted) well before busyUntilCall
+//     is reached — require.Eventually for "eventually called past
+//     busyUntilCall" times out.
+//  4. Restore the fix and PASS.
+func TestReleaseGate_P350_QueuedNotExecutedBacksOffWithoutAttemptPenalty(t *testing.T) {
+	t.Parallel()
+
+	sess, svc := setupTestSession(t, "test-session-queued-backoff")
+	ctx := t.Context()
+
+	callData := map[string]any{"SessionID": sess.ID, "Prompt": "test prompt"}
+	callDataJSON, err := json.Marshal(callData)
+	require.NoError(t, err)
+	require.NoError(t, svc.EnqueueRunQueueEntry(ctx, "queued-backoff-probe", sess.ID, callDataJSON))
+
+	// Far more than RunQueueMaxAttempts (10) — if ErrCallQueuedNotExecuted
+	// still counted as an attempt (the pre-fix behavior), the entry would
+	// be dead-lettered long before reaching this many cycles.
+	coord := &queuedNotExecutedThenSuccessCoordinator{busyUntilCall: 25}
+
+	pump := session.NewRunQueuePump(session.RunQueuePumpConfig{
+		Sessions:       svc,
+		Coordinator:    coord,
+		PumpInstanceID: "queued-backoff-pump",
+		TestTick:       func() time.Duration { return 20 * time.Millisecond },
+		TestLeaseTTL:   30 * time.Millisecond,
+	})
+	pump.Start()
+	defer pump.Stop()
+
+	require.Eventually(t, func() bool {
+		return coord.calls.Load() > coord.busyUntilCall
+	}, 5*time.Second, 20*time.Millisecond,
+		"coordinator must eventually be called past busyUntilCall — if this times out, the entry "+
+			"was dead-lettered (deleted) before reaching that call count, meaning ErrCallQueuedNotExecuted "+
+			"recoveries are still counting toward RunQueueMaxAttempts")
+
+	require.Eventually(t, func() bool {
+		pending, checkErr := svc.ListPendingRunQueueEntries(ctx)
+		if checkErr != nil {
+			return false
+		}
+		return len(pending) == 0
+	}, 2*time.Second, 10*time.Millisecond, "entry should eventually be acked once the external owner frees up")
 }

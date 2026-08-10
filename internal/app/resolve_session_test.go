@@ -206,6 +206,10 @@ func (m *mockSessionService) LeaseRunQueueEntry(context.Context, string, string,
 	return nil, nil
 }
 
+func (m *mockSessionService) RenewRunQueueLease(context.Context, string, string, int64) (bool, error) {
+	return false, nil
+}
+
 func (m *mockSessionService) AckRunQueueEntry(context.Context, string) (string, error) {
 	return "", nil
 }

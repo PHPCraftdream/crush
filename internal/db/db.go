@@ -213,6 +213,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.renameSessionStmt, err = db.PrepareContext(ctx, renameSession); err != nil {
 		return nil, fmt.Errorf("error preparing query RenameSession: %w", err)
 	}
+	if q.renewRunQueueLeaseStmt, err = db.PrepareContext(ctx, renewRunQueueLease); err != nil {
+		return nil, fmt.Errorf("error preparing query RenewRunQueueLease: %w", err)
+	}
 	if q.setParentCostAccountedStmt, err = db.PrepareContext(ctx, setParentCostAccounted); err != nil {
 		return nil, fmt.Errorf("error preparing query SetParentCostAccounted: %w", err)
 	}
@@ -557,6 +560,11 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing renameSessionStmt: %w", cerr)
 		}
 	}
+	if q.renewRunQueueLeaseStmt != nil {
+		if cerr := q.renewRunQueueLeaseStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing renewRunQueueLeaseStmt: %w", cerr)
+		}
+	}
 	if q.setParentCostAccountedStmt != nil {
 		if cerr := q.setParentCostAccountedStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing setParentCostAccountedStmt: %w", cerr)
@@ -699,6 +707,7 @@ type Queries struct {
 	nackRunQueueEntryNoAttemptPenaltyStmt       *sql.Stmt
 	recordFileReadStmt                          *sql.Stmt
 	renameSessionStmt                           *sql.Stmt
+	renewRunQueueLeaseStmt                      *sql.Stmt
 	setParentCostAccountedStmt                  *sql.Stmt
 	terminalFailRunQueueEntryStmt               *sql.Stmt
 	updateMessageStmt                           *sql.Stmt
@@ -776,6 +785,7 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		nackRunQueueEntryNoAttemptPenaltyStmt:       q.nackRunQueueEntryNoAttemptPenaltyStmt,
 		recordFileReadStmt:                          q.recordFileReadStmt,
 		renameSessionStmt:                           q.renameSessionStmt,
+		renewRunQueueLeaseStmt:                      q.renewRunQueueLeaseStmt,
 		setParentCostAccountedStmt:                  q.setParentCostAccountedStmt,
 		terminalFailRunQueueEntryStmt:               q.terminalFailRunQueueEntryStmt,
 		updateMessageStmt:                           q.updateMessageStmt,

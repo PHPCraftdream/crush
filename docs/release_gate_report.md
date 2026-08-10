@@ -541,8 +541,11 @@ immediately after `Release()`), fixed with a bounded 50ms synchronous wait for t
 goroutine in `internal/session/lock.go`'s `Release()`. See `docs/release_gate_summary.md`'s own
 correction note for the same fix described in full.
 
-Two further `@oh` review passes over this document's own release-gate work each found genuine
+Three further `@oh` review passes over this document's own release-gate work each found genuine
 defects introduced by the previous pass's fix (see `CHANGELOG.md`'s "Fixed" entry for the full
-list) — most recently a data race and a duplicate-execution/data-loss path in the run queue pump,
-both closed with regression tests in `internal/session/p350_dup_dispatch_test.go` and
-`internal/app/p348_p0_1_ordering_race_test.go`.
+list): a data race in `App.New`'s pump-construction ordering (second pass, regression test
+`internal/app/p348_p0_1_ordering_race_test.go`); a duplicate-execution/data-loss path in the run
+queue pump reachable both from same-tick double dispatch and from sequential re-dispatch after a
+lease expired mid-execution (third and fourth passes, regression tests in
+`internal/session/p350_dup_dispatch_test.go`), the latter closed by adding a lease-renewal loop to
+`executeEntry` so a still-running execution's lease cannot expire out from under it.

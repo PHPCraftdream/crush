@@ -247,6 +247,14 @@ type Querier interface {
 	NackRunQueueEntryNoAttemptPenalty(ctx context.Context, arg NackRunQueueEntryNoAttemptPenaltyParams) (SessionRunQueue, error)
 	RecordFileRead(ctx context.Context, arg RecordFileReadParams) error
 	RenameSession(ctx context.Context, arg RenameSessionParams) error
+	// Extend a lease expiry while its owner is still genuinely working on it,
+	// or to back off a lease without counting a failed attempt. Scoped to
+	// status = leased AND leased_by = ? so a lease already reassigned to a
+	// different owner (this owner lost the race to a prior CleanupExpiredLeases
+	// recovery) is never silently extended out from under the new owner:
+	// execrows reports 0 rows in that case, which the caller must treat as
+	// meaning it is no longer this executor's lease to keep alive.
+	RenewRunQueueLease(ctx context.Context, arg RenewRunQueueLeaseParams) (int64, error)
 	// Marks the child's full current cost as charged to the parent, so the
 	// next TransferChildCostToParent call charges only new cost accrued above
 	// this point. Run inside the same transaction as the parent's

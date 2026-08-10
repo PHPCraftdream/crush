@@ -245,6 +245,13 @@ type Service interface {
 	// Durable run queue for orphaned/detached calls (task #340)
 	EnqueueRunQueueEntry(ctx context.Context, idempotencyKey, sessionID string, callData []byte) error
 	LeaseRunQueueEntry(ctx context.Context, sessionID, leasedBy string, leaseTTL time.Duration) (*RunQueueEntry, error)
+	// RenewRunQueueLease extends id's lease expiry, but ONLY if it is still
+	// leased by leasedBy — a lease already reassigned to a different owner
+	// (this owner lost the race to a prior CleanupExpiredLeases recovery) is
+	// never silently extended. Returns false (no error) when the renewal
+	// did not apply for that reason; the caller must treat false as "this
+	// execution no longer owns the row" rather than retry the renewal.
+	RenewRunQueueLease(ctx context.Context, id, leasedBy string, newExpiresAt int64) (bool, error)
 	AckRunQueueEntry(ctx context.Context, id string) (string, error)
 	NackRunQueueEntry(ctx context.Context, id, lastError string) error
 	NackRunQueueEntryNoAttemptPenalty(ctx context.Context, id, lastError string) error
@@ -1436,6 +1443,19 @@ func (s *service) LeaseRunQueueEntry(ctx context.Context, sessionID, leasedBy st
 	}
 
 	return dbToRunQueueEntry(leased), nil
+}
+
+// RenewRunQueueLease — see the Service interface for the full contract.
+func (s *service) RenewRunQueueLease(ctx context.Context, id, leasedBy string, newExpiresAt int64) (bool, error) {
+	rows, err := s.q.RenewRunQueueLease(ctx, db.RenewRunQueueLeaseParams{
+		LeaseExpiresAt: sql.NullInt64{Int64: newExpiresAt, Valid: true},
+		ID:             id,
+		LeasedBy:       sql.NullString{String: leasedBy, Valid: leasedBy != ""},
+	})
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
 }
 
 // AckRunQueueEntry marks a leased entry as successfully completed (terminal).

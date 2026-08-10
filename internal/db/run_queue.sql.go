@@ -383,6 +383,33 @@ func (q *Queries) NackRunQueueEntryNoAttemptPenalty(ctx context.Context, arg Nac
 	return i, err
 }
 
+const renewRunQueueLease = `-- name: RenewRunQueueLease :execrows
+UPDATE session_run_queue
+SET lease_expires_at = ?
+WHERE id = ? AND status = 'leased' AND leased_by = ?
+`
+
+type RenewRunQueueLeaseParams struct {
+	LeaseExpiresAt sql.NullInt64  `json:"lease_expires_at"`
+	ID             string         `json:"id"`
+	LeasedBy       sql.NullString `json:"leased_by"`
+}
+
+// Extend a lease expiry while its owner is still genuinely working on it,
+// or to back off a lease without counting a failed attempt. Scoped to
+// status = leased AND leased_by = ? so a lease already reassigned to a
+// different owner (this owner lost the race to a prior CleanupExpiredLeases
+// recovery) is never silently extended out from under the new owner:
+// execrows reports 0 rows in that case, which the caller must treat as
+// meaning it is no longer this executor's lease to keep alive.
+func (q *Queries) RenewRunQueueLease(ctx context.Context, arg RenewRunQueueLeaseParams) (int64, error) {
+	result, err := q.exec(ctx, q.renewRunQueueLeaseStmt, renewRunQueueLease, arg.LeaseExpiresAt, arg.ID, arg.LeasedBy)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const terminalFailRunQueueEntry = `-- name: TerminalFailRunQueueEntry :one
 DELETE FROM session_run_queue
 WHERE id = ? AND status = 'leased'
