@@ -1123,3 +1123,28 @@ finished the mailbox migration:
     immediately retried, since that would itself append another
     duplicate — left leased for the existing lease-expiry mechanism to
     naturally recover).
+  - Fourth pass: the third pass's fix above closed concurrent
+    duplicate dispatch but not SEQUENTIAL duplicate dispatch — the
+    30-second lease TTL is far shorter than a real LLM turn, and
+    without lease renewal the durable row could flip back to pending
+    while its own execution was still genuinely running; the eventual
+    Ack would then silently fail to match, leaving the row for a LATER
+    tick to lease and dispatch again — a real duplicate execution on
+    any turn longer than 30 seconds, i.e. most real turns. Fixed with
+    a lease-renewal loop that keeps a long-running execution's row
+    genuinely leased for its whole duration. Separately, the third
+    pass's "leave it leased, do nothing" handling for the
+    externally-owned case relied on the same lease-expiry cleanup that
+    unconditionally counts an attempt on every recovery — a session
+    that stayed externally busy for a few minutes would have its
+    accepted, never-actually-failed work silently deleted once
+    attempts exhausted, the same class of bug the OS-lock-contention
+    case was already protected against. Fixed via an immediate,
+    no-attempt-penalty release paired with a local backoff deadline
+    that prevents this pump instance specifically from re-attempting
+    the same session too soon (a different process remains free to try
+    immediately). A first attempt at this second fix (a single lease
+    renewal call) was tried and found not to work by an isolated debug
+    test before the real fix was written — the renewal landed
+    essentially the same deadline leasing had already set, since it
+    fired almost instantly after the lease was taken.
