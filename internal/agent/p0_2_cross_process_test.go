@@ -191,7 +191,30 @@ func TestP0_2_CrossProcessInterrupt_RowRecreatedOnFailure(t *testing.T) {
 		t.Logf("Row was recreated despite DB being closed. This is unexpected but not a test failure.")
 	}
 
-	// Now let's test the SUCCESSFUL path with a pump
+	// Now let's test the SUCCESSFUL path with a pump.
+	// PHASE 2 (independent, not chained from PHASE 1): PROVE DURABLE ENQUEUE + PUMP EXECUTION.
+	// This creates a NEW pending_injects row (injectPhase2) and verifies the pump
+	// picks it up and executes it. This is a separate "happy path" test that proves
+	// durable enqueue and pump execution work in isolation.
+	//
+	// NOTE: This does NOT prove the full chain "PHASE 1's recreated row → picked up by pump → executed".
+	// Proving that chain would require either:
+	//   - PHASE 1 to NOT close the DB, then PHASE 2 to use that same reopened DB and verify
+	//     the EXACT recreated row (by ID) was picked up and executed; OR
+	//   - A third phase that reconnects to the original DB after PHASE 1 closes it and
+	//     verifies the recreated row was picked up.
+	//
+	// Both options are expensive (require additional complex state management or significant
+	// restructuring). The current approach - testing recreate-on-failure (PHASE 1) and
+	// durable-enqueue+pump-execution (PHASE 2) as two separate invariants - provides
+	// meaningful coverage while keeping the test maintainable. The doc-comment below
+	// reflects this separation.
+	//
+	// REVERT CHECK:
+	//   - The code above (PHASE 1, lines ~120-192) proves recreate-on-failure in this same test
+	//   - This subtest (PHASE 2, below) proves durable enqueue + pump execution
+	//   - Neither is a regression test for changes since #340 (which fixed both issues)
+	//
 	// Create a NEW pending_injects row for phase 2
 	injectPhase2 := session.PendingInject{
 		ID:        "test-inject-id-phase2-" + sess.ID,

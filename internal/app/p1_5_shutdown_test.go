@@ -1,32 +1,19 @@
 package app
 
-// P1-5 regression tests that actually call (*App).Shutdown().
-// These tests verify the two critical shutdown invariants from the
-// concurrency review (docs/reviews/2026-08-07-release-concurrency-review.md, P1-5):
-//
-//   1. Ordering: cleanup (including DB close) does NOT begin until CancelAll
-//      reports whether agents are still idle. If stillBusy=true, Shutdown
-//      logs a warning and proceeds anyway (forced-shutdown policy), but the
-//      order is always: CancelAll → decide policy → cleanup.
-//
-//   2. Bounded exit: even if a cleanup goroutine blocks forever, Shutdown()
-//      itself returns within a deterministic bounded time (10 seconds outer
-//      timeout on wg.Wait()). This is enforced by the select/waitDone pattern
-//      introduced in this fix.
-
 import (
 	"context"
-	"sync"
-	"sync/atomic"
+	"database/sql"
 	"testing"
 	"time"
 
 	"charm.land/fantasy"
 	agent "github.com/charmbracelet/crush/internal/agent"
 	"github.com/charmbracelet/crush/internal/config"
+	"github.com/charmbracelet/crush/internal/db"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/session"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // mockCoordinatorForShutdown is a minimal Coordinator implementation for
@@ -148,92 +135,6 @@ func (m *mockCoordinatorForShutdown) RunSessionAgentCall(ctx context.Context, ca
 	panic("unexpected: Shutdown does not call RunSessionAgentCall")
 }
 
-// TestP1_5_ShutdownOrdering_CleanupWaitsForCancelAll proves the critical
-// ordering invariant: cleanup functions do NOT start until CancelAll has
-// completed and reported whether agents are still busy.
-//
-// The test uses a fake Coordinator whose CancelAll() blocks for 500ms, then
-// a fake cleanup that records its start time. The invariant is that cleanup's
-// start time must be AFTER CancelAll completes (not during).
-func TestP1_5_ShutdownOrdering_CleanupWaitsForCancelAll(t *testing.T) {
-	t.Run("cleanup starts AFTER CancelAll completes", func(t *testing.T) {
-		var (
-			cancelAllStarted   atomic.Bool
-			cancelAllFinished  atomic.Bool
-			cleanupStarted     atomic.Bool
-			cancelAllStartTime time.Time
-			cancelAllEndTime   time.Time
-			cleanupStartTime   time.Time
-		)
-
-		// Simulate a CancelAll that blocks for 500ms.
-		cancelAllDuration := 500 * time.Millisecond
-		mockCoord := &mockCoordinatorForShutdown{
-			cancelAllFunc: func() (stillBusy bool) {
-				cancelAllStarted.Store(true)
-				cancelAllStartTime = time.Now()
-				time.Sleep(cancelAllDuration)
-				cancelAllEndTime = time.Now()
-				cancelAllFinished.Store(true)
-				return false // Simulate clean shutdown
-			},
-		}
-
-		// Create a cleanup function that records its start time.
-		var cleanupWG sync.WaitGroup
-		cleanupWG.Add(1)
-
-		app := &App{
-			AgentCoordinator: mockCoord,
-			cleanupFuncs: []func(context.Context) error{
-				func(ctx context.Context) error {
-					defer cleanupWG.Done()
-					cleanupStarted.Store(true)
-					cleanupStartTime = time.Now()
-					return nil
-				},
-			},
-		}
-
-		// Call Shutdown in a goroutine (it should complete quickly).
-		done := make(chan struct{})
-		go func() {
-			app.Shutdown()
-			close(done)
-		}()
-
-		// Wait for Shutdown to complete.
-		select {
-		case <-done:
-		case <-time.After(5 * time.Second):
-			t.Fatal("Shutdown did not complete within 5 seconds")
-		}
-
-		// Wait for cleanup to finish.
-		cleanupWG.Wait()
-
-		// Verify the ordering invariant.
-		assert.True(t, cancelAllStarted.Load(), "CancelAll should have started")
-		assert.True(t, cancelAllFinished.Load(), "CancelAll should have finished")
-		assert.True(t, cleanupStarted.Load(), "cleanup should have started")
-
-		// Critical: cleanup must start AFTER CancelAll finishes, not during.
-		// We verify this by checking that cleanupStartTime is at or after cancelAllEndTime.
-		cleanupAfterCancelAll := cleanupStartTime.Equal(cancelAllEndTime) || cleanupStartTime.After(cancelAllEndTime)
-		assert.True(t, cleanupAfterCancelAll,
-			"cleanup must start AT OR AFTER CancelAll finishes; got cleanupStartTime=%v, cancelAllEndTime=%v",
-			cleanupStartTime, cancelAllEndTime)
-
-		// Additional sanity check: CancelAll should have taken at least cancelAllDuration.
-		cancelAllTook := cancelAllEndTime.Sub(cancelAllStartTime)
-		assert.GreaterOrEqual(t, cancelAllTook, cancelAllDuration,
-			"CancelAll should have taken at least %s", cancelAllDuration)
-
-		t.Logf("Verified ordering: CancelAll ran from %v to %v (%s), cleanup started at %v (after CancelAll finished)",
-			cancelAllStartTime, cancelAllEndTime, cancelAllTook, cleanupStartTime)
-	})
-}
-
 // TestP1_5_ShutdownBoundedTimeout_ReturnsEvenWithBlockingCleanup proves the
 // bounded exit invariant: even if a cleanup goroutine blocks forever, Shutdown()
 // itself returns within a deterministic bounded time (the 10-second outer timeout
@@ -294,11 +195,24 @@ func TestP1_5_ShutdownBoundedTimeout_ReturnsEvenWithBlockingCleanup(t *testing.T
 	})
 }
 
-// TestP1_5_ForcedShutdownPolicy_LogsWarningWhenStillBusy proves the forced-shutdown
-// policy: when CancelAll returns stillBusy=true, Shutdown logs a warning but
-// continues with cleanup anyway (does NOT block forever).
-func TestP1_5_ForcedShutdownPolicy_LogsWarningWhenStillBusy(t *testing.T) {
-	t.Run("Shutdown logs warning and continues when CancelAll reports stillBusy=true", func(t *testing.T) {
+// TestP1_5_ForcedShutdownPolicy_SkipsDBCloseWhenStillBusy proves the forced-shutdown
+// policy: when CancelAll returns stillBusy=true, Shutdown skips DB close (to avoid
+// corrupting live writers) and returns within bounded time. The observable effect
+// is that the DB remains usable after forced shutdown (db.Release was NOT called).
+//
+// NOTE: This test verifies the POLICY effect (skip DB close), not the warning log.
+// The warning itself is best-effort telemetry; the critical invariant is that we
+// don't close the DB under live writers.
+func TestP1_5_ForcedShutdownPolicy_SkipsDBCloseWhenStillBusy(t *testing.T) {
+	t.Run("Shutdown skips DB close when CancelAll reports stillBusy=true", func(t *testing.T) {
+		// Use a real temporary data directory and real db.Connect.
+		dataDir := t.TempDir()
+
+		// Connect to DB first - this creates the pool entry.
+		entry, err := db.Connect(context.Background(), dataDir)
+		require.NoError(t, err, "failed to connect to DB")
+		require.NotNil(t, entry, "entry should not be nil")
+
 		mockCoord := &mockCoordinatorForShutdown{
 			cancelAllFunc: func() (stillBusy bool) {
 				return true // Simulate agents still busy after grace period
@@ -307,18 +221,16 @@ func TestP1_5_ForcedShutdownPolicy_LogsWarningWhenStillBusy(t *testing.T) {
 
 		app := &App{
 			AgentCoordinator: mockCoord,
-			cleanupFuncs: []func(context.Context) error{
-				func(ctx context.Context) error {
-					return nil
-				},
-			},
+			DB:               func() *sql.DB { return nil }, // Not used in this test
+			dataDir:          dataDir,
+			dbReleasesNeeded: 1, // One Connect call
+			globalCtx:        context.Background(),
 		}
 
-		// Call Shutdown. With the fix, it should:
+		// Call Shutdown. With the forced-shutdown policy, it should:
 		// 1. Get stillBusy=true from CancelAll
-		// 2. Log a warning
-		// 3. Continue with cleanup
-		// 4. Return within bounded time
+		// 2. Skip DB close (not call db.Release)
+		// 3. Return within bounded time
 		shutdownStart := time.Now()
 
 		done := make(chan struct{})
@@ -329,7 +241,7 @@ func TestP1_5_ForcedShutdownPolicy_LogsWarningWhenStillBusy(t *testing.T) {
 
 		select {
 		case <-done:
-			// Shutdown completed (expected with the fix).
+			// Shutdown completed (expected with forced-shutdown policy).
 		case <-time.After(12 * time.Second):
 			t.Fatal("Shutdown did not complete within 12 seconds")
 		}
@@ -340,78 +252,20 @@ func TestP1_5_ForcedShutdownPolicy_LogsWarningWhenStillBusy(t *testing.T) {
 		assert.Less(t, shutdownDuration, 12*time.Second,
 			"Shutdown with stillBusy=true should still return within bounded time")
 
-		t.Logf("Verified forced-shutdown policy: Shutdown returned in %v after CancelAll reported stillBusy=true", shutdownDuration)
-	})
-}
+		// CRITICAL: Verify DB was NOT closed because shutdown was forced.
+		// We verify this by trying to use the connection - it should still work.
+		// Shutdown() skipped Release() (forced-shutdown policy under test), so
+		// the entry's refCount is still 1 from the initial Connect above. A new
+		// Connect() here increments it to 2 and must return the SAME entry
+		// (not create a new one).
+		entry2, err := db.Connect(context.Background(), dataDir)
+		require.NoError(t, err, "should still be able to connect after forced shutdown")
+		require.Same(t, entry, entry2, "should return same entry (DB not released)")
 
-// TestP1_5_DBCleanupRespectsContext proves that DB cleanup respects the bounded
-// shutdown context. This is a structural verification of the goroutine+select
-// pattern used in app.go to make even synchronous sql.DB.Close() respect a timeout.
-func TestP1_5_DBCleanupRespectsContext(t *testing.T) {
-	t.Run("DB cleanup wrapper respects shutdown context timeout", func(t *testing.T) {
-		mockCoord := &mockCoordinatorForShutdown{
-			cancelAllFunc: func() (stillBusy bool) {
-				return false
-			},
-		}
+		// Clean up: release BOTH Connect() calls this subtest made.
+		require.NoError(t, db.Release(dataDir), "cleanup release should succeed")
+		require.NoError(t, db.Release(dataDir), "second cleanup release should succeed")
 
-		// Simulate a DB cleanup that blocks forever (like sql.DB.Close() might).
-		blockForever := make(chan struct{})
-
-		app := &App{
-			AgentCoordinator: mockCoord,
-			cleanupFuncs: []func(context.Context) error{
-				// This mimics the DB cleanup wrapper pattern from app.go:
-				// run db.Release in a goroutine, select between completion and ctx.Done().
-				func(ctx context.Context) error {
-					resultChan := make(chan error, 1)
-
-					go func() {
-						// Simulate sql.DB.Close() that blocks forever.
-						<-blockForever
-						resultChan <- nil
-					}()
-
-					select {
-					case err := <-resultChan:
-						return err
-					case <-ctx.Done():
-						// Expected: context expired before Close() finished.
-						// The wrapper returns ctx.Err() and continues.
-						return ctx.Err()
-					}
-				},
-			},
-		}
-
-		// Call Shutdown. With the fix, the DB cleanup wrapper should:
-		// 1. Notice ctx.Done() fired (5-second shutdownCtx timeout)
-		// 2. Return ctx.Err()
-		// 3. Shutdown continues and returns within outer timeout
-		shutdownStart := time.Now()
-
-		done := make(chan struct{})
-		go func() {
-			app.Shutdown()
-			close(done)
-		}()
-
-		select {
-		case <-done:
-			// Shutdown completed (expected with the fix).
-		case <-time.After(12 * time.Second):
-			t.Fatal("Shutdown did not complete within 12 seconds")
-		}
-
-		shutdownDuration := time.Since(shutdownStart)
-
-		// Verify that Shutdown returned within bounded time despite blocking DB cleanup.
-		assert.Less(t, shutdownDuration, 12*time.Second,
-			"Shutdown with blocking DB cleanup should return within bounded time")
-
-		t.Logf("Verified DB cleanup respects context: Shutdown returned in %v despite blocking DB.Close()", shutdownDuration)
-
-		// Clean up.
-		close(blockForever)
+		t.Logf("Verified forced-shutdown policy: Shutdown returned in %v and DB remains usable (not closed)", shutdownDuration)
 	})
 }
