@@ -110,6 +110,11 @@ func TestRunQueue_LeaseTTLExpiration(t *testing.T) {
 	pending, err = svc.ListPendingRunQueueEntries(ctx)
 	require.NoError(t, err)
 	require.Len(t, pending, 1, "expired lease should now appear as pending")
+	// NEW-3 (found in the second @oh review pass over #337-349): lease
+	// expiry must count as an attempt — a poison entry whose execution
+	// always crashes/hangs before a normal Ack/Nack would otherwise
+	// accumulate attempts=0 forever and never reach RunQueueMaxAttempts.
+	require.Equal(t, int64(1), pending[0].Attempts, "CleanupExpiredLeases must increment attempts on lease-expiry recovery")
 
 	// Try to lease again with a different instance ID
 	leased2, err := svc.LeaseRunQueueEntry(ctx, sess.ID, "pump-instance-2", 5*time.Second)
@@ -117,6 +122,7 @@ func TestRunQueue_LeaseTTLExpiration(t *testing.T) {
 	require.NotNil(t, leased2, "should be able to lease expired entry")
 	require.Equal(t, "pump-instance-2", leased2.LeasedBy, "should be leased by new instance")
 	require.True(t, leased2.LeasedAt >= leased.LeasedAt, "new lease should have later timestamp")
+	require.Equal(t, int64(1), leased2.Attempts, "the lease-expiry attempt count must carry through into the re-lease")
 }
 
 // TestRunQueue_ConcurrentLeases_Idempotency tests concurrent lease attempts

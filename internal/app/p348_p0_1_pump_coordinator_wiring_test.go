@@ -118,6 +118,16 @@ func TestAppNew_RunQueuePump_ExecutesRealEnqueuedCall(t *testing.T) {
 	t.Setenv("CRUSH_GLOBAL_CONFIG", isolationConfigDir)
 	// Cache-only so provider discovery makes no network calls.
 	t.Setenv("CRUSH_PROVIDER_CACHE_ONLY", "1")
+	// KNOWN LIMITATION (found in the third @oh review pass over #337-349):
+	// this isolation does NOT cover skill discovery under App.New's prompt
+	// construction, which reads the real ~/.claude/skills directory via
+	// internal/home.Dir() — a package-level var captured ONCE from
+	// os.UserHomeDir() at process/package init, before any test's
+	// t.Setenv("HOME"/"USERPROFILE", ...) can possibly run, so no per-test
+	// env override can isolate it. This is read-only (no network, so not
+	// the 9+ minute hang class the rest of this block guards against), but
+	// it does make host-dependent details (discovered skill count, built
+	// prompt length) vary by machine — do not assert on those.
 
 	dataDir := t.TempDir()
 

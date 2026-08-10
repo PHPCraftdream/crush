@@ -49,9 +49,38 @@ const RunQueueMaxAttempts = 10
 // implements this interface.
 type Coordinator interface {
 	// Run executes a call for the given session using the full call data.
-	// Returns the result or an error.
+	// Returns the result or an error. Implementations MUST return
+	// ErrCallQueuedNotExecuted (not a nil error) if the call was merely
+	// appended to an already-owned session's in-process queue rather than
+	// actually executed by this call — see that error's doc.
 	Run(ctx context.Context, call SessionAgentCallData) (*any, error)
 }
+
+// ErrCallQueuedNotExecuted is returned by Coordinator.Run when the target
+// session was already owned by a live, in-process turn at the moment of the
+// call: the call was appended to that owner's own mailbox queue to be run
+// as a later turn, not executed by this call. This is NOT a failure of the
+// call and NOT a signal that the current owner is a stale/foreign process —
+// it can legitimately be this same pump instance's OWN prior execution of a
+// different (or the same, self-raced) entry for that session; see the
+// RunQueuePump.inFlight field's doc, which prevents the pump from ever
+// causing this itself. What remains, once inFlight closes the self-inflicted
+// paths, is a genuinely external live owner (e.g. a web/CLI request running
+// concurrently in this same process outside pump control).
+//
+// executeEntry treats this specially (see there): it must NOT be handled
+// like an ordinary success (would Ack/delete a durable row for work that
+// has not actually run yet — the queued-mailbox copy is only as durable as
+// the owning process staying alive long enough to drain it) and must NOT be
+// retried like an ordinary failure either (mailbox.submit unconditionally
+// appends on every call, so nacking-and-retrying every tick would append a
+// new duplicate of the same call on every attempt, all of which the owner
+// eventually runs when it drains its queue). The entry is left exactly as
+// leased and untouched; RunQueueLeaseTTL's natural expiry (via
+// CleanupExpiredLeases) is the only recovery path, giving the external
+// owner a full lease window to drain the queued call before another
+// attempt is made.
+var ErrCallQueuedNotExecuted = errors.New("run_queue_pump: call was queued into an already-owned session, not executed")
 
 // RunQueuePumpConfig configures a RunQueuePump instance.
 type RunQueuePumpConfig struct {
@@ -87,6 +116,44 @@ type RunQueuePump struct {
 	started bool
 	startMu sync.Mutex
 
+	// inFlight tracks session IDs with an executeEntry goroutine currently
+	// running, guarded by inFlightMu. Found by the third @oh review pass
+	// over #337-349 (in-range for #340's original design): Coordinator.Run
+	// returns (nil, nil) when the target session is already owned
+	// in-process — the call was merely appended to the current owner's
+	// mailbox queue (mailbox.submit), not actually executed. executeEntry
+	// treated err == nil as unconditional success and Acked (deleted) the
+	// durable row regardless, so a second concurrent dispatch for the same
+	// session could delete a row whose only remaining copy of the work now
+	// lives purely in an in-memory mailbox queue — lost for good if that
+	// process crashes before draining it, or silently re-run as a
+	// duplicate turn once it does drain.
+	//
+	// This is reachable without any external contention, self-inflicted by
+	// the pump alone: RunQueueLeaseTTL (30s) is far shorter than a real
+	// LLM turn can take, and executeEntry never renews its lease while
+	// Coordinator.Run is in flight, so CleanupExpiredLeases can return an
+	// entry to pending while the goroutine executing it is still genuinely
+	// running — the next tick then leases and dispatches a SECOND goroutine
+	// for the same session. It is also reachable with no lease-expiry
+	// involved at all: tick() leases and dispatches entries one at a time
+	// in a single pass (LeaseRunQueueEntry claims the oldest pending entry
+	// PER SESSION), so two distinct durably-queued entries for the same
+	// session — e.g. two calls queued while a process was down — are
+	// leased and `go executeEntry`-dispatched back to back within the same
+	// tick, before either has run long enough to matter.
+	//
+	// inFlight closes both paths at the source: processEntry refuses to
+	// lease a pending entry whose session already has an executeEntry
+	// goroutine running FROM THIS PUMP INSTANCE, so this pump can never
+	// concurrently (or via a self-caused lease-expiry) dispatch two
+	// entries for the same session. See executeEntry's own Run()-result
+	// handling for the narrower residual case this does NOT cover: a
+	// genuinely external, non-pump owner (e.g. a live user-facing
+	// process) holding the session when the pump attempts it.
+	inFlight   map[string]struct{}
+	inFlightMu sync.Mutex
+
 	// Test seam for waiting for a tick in tests
 	tickCh chan struct{}
 }
@@ -98,10 +165,11 @@ func NewRunQueuePump(cfg RunQueuePumpConfig) *RunQueuePump {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &RunQueuePump{
-		cfg:    cfg,
-		ctx:    ctx,
-		cancel: cancel,
-		tickCh: make(chan struct{}, 1),
+		cfg:      cfg,
+		ctx:      ctx,
+		cancel:   cancel,
+		inFlight: make(map[string]struct{}),
+		tickCh:   make(chan struct{}, 1),
 	}
 }
 
@@ -210,6 +278,19 @@ type AlreadyAttempted interface {
 
 // processEntry attempts to lease and execute a single run queue entry.
 func (p *RunQueuePump) processEntry(ctx context.Context, entry *RunQueueEntry) {
+	// Refuse to lease ANY entry for a session this pump instance already
+	// has an executeEntry goroutine running for — see the inFlight field's
+	// doc for why (self-inflicted lease-expiry race, and same-tick
+	// same-session double dispatch). Left pending; a later tick retries
+	// once that goroutine finishes and releases the session.
+	p.inFlightMu.Lock()
+	_, busy := p.inFlight[entry.SessionID]
+	p.inFlightMu.Unlock()
+	if busy {
+		slog.Debug("run_queue_pump: session already has an execution in flight from this pump, deferring", "id", entry.ID, "session_id", entry.SessionID, "instance_id", p.cfg.PumpInstanceID)
+		return
+	}
+
 	// Skip if attempts exceeded (unless terminal failure flag is set).
 	// TerminalFailRunQueueEntry only deletes rows in 'leased' state, but an
 	// attempts-exhausted entry sits in 'pending' (that's how it was scanned
@@ -266,12 +347,28 @@ func (p *RunQueuePump) processEntry(ctx context.Context, entry *RunQueueEntry) {
 		return
 	}
 
+	// Mark this session in flight BEFORE dispatching, under the same lock
+	// processEntry's own busy-check above uses — closes the check-then-act
+	// window between that check and this dispatch (both run synchronously
+	// within tick()'s single-threaded per-entry loop, so there is no
+	// concurrent processEntry call to race against, but the mark must still
+	// land before executeEntry's goroutine can possibly finish and unmark).
+	p.inFlightMu.Lock()
+	p.inFlight[leased.SessionID] = struct{}{}
+	p.inFlightMu.Unlock()
+
 	// Execute the call (detached, not blocking this pump tick)
 	go p.executeEntry(ctx, leased)
 }
 
 // executeEntry runs a leased entry and handles success/failure.
 func (p *RunQueuePump) executeEntry(ctx context.Context, leased *RunQueueEntry) {
+	defer func() {
+		p.inFlightMu.Lock()
+		delete(p.inFlight, leased.SessionID)
+		p.inFlightMu.Unlock()
+	}()
+
 	// Create a fresh context for this execution (not tied to pump lifecycle)
 	execCtx := context.Background()
 
@@ -296,6 +393,18 @@ func (p *RunQueuePump) executeEntry(ctx context.Context, leased *RunQueueEntry) 
 			slog.Error("run_queue_pump: ack failed after success", "id", leased.ID, "session_id", leased.SessionID, "err", ackErr, "instance_id", p.cfg.PumpInstanceID)
 		}
 		slog.Info("run_queue_pump: executed entry successfully", "id", leased.ID, "session_id", leased.SessionID, "instance_id", p.cfg.PumpInstanceID)
+		return
+	}
+
+	// ErrCallQueuedNotExecuted means the call was appended to a genuinely
+	// external live owner's mailbox (inFlight already rules out this being
+	// the pump's own doing) rather than executed by this attempt — see that
+	// error's doc for why it must be treated as neither success nor an
+	// ordinary retryable failure. Leave the entry exactly as leased and do
+	// nothing further; RunQueueLeaseTTL's natural expiry is the recovery
+	// path once the external owner has had a full lease window to drain it.
+	if errors.Is(err, ErrCallQueuedNotExecuted) {
+		slog.Debug("run_queue_pump: call was queued into an externally-owned session, leaving leased for natural expiry", "id", leased.ID, "session_id", leased.SessionID, "instance_id", p.cfg.PumpInstanceID)
 		return
 	}
 

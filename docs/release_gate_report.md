@@ -503,7 +503,17 @@ the exhausted entry, due to a `status='leased'` vs `status='pending'` mismatch i
 **Files:**
 - `internal/agent/release_gate_test.go` — Tests 1-6, 8-9
 - `internal/app/release_gate_test.go` — Test 7
-- `internal/session/run_queue_pump.go` — production fix (max-attempts leased-state bug)
+- `internal/session/run_queue_pump.go` — production fix (max-attempts leased-state bug,
+  lease-race/duplicate-dispatch guard, `ErrCallQueuedNotExecuted` handling)
+- `internal/session/lock.go` — bounded synchronous wait for metadata cleanup on `Release()`
+- `internal/app/app.go` — `RunQueuePump` construction/start moved to after `InitCoderAgent`
+- `internal/db/sql/run_queue.sql` — `CleanupExpiredLeases` attempt accounting
+- `internal/app/p348_p0_1_pump_coordinator_wiring_test.go`,
+  `internal/app/p348_p0_1_ordering_race_test.go`,
+  `internal/session/p348_p0_2_lock_busy_no_attempt_penalty_test.go`,
+  `internal/session/p348_p2_1_lease_mismatch_test.go`,
+  `internal/session/p350_dup_dispatch_test.go` — regression tests added across the
+  first, second, and third `@oh` review passes
 
 **No External Poke Rule Compliance:**
 - All passing tests genuinely verify autonomous mechanisms
@@ -512,12 +522,27 @@ the exhausted entry, due to a `status='leased'` vs `status='pending'` mismatch i
 
 **Production Readiness Decision:**
 
-**Tasks #337-347 are PRODUCTION-READY.**
+**Tasks #337-349 are PRODUCTION-READY**, as of the third `@oh` review pass's fixes
+(2026-08-10).
 
-All 9 criteria from both review rounds are proven by `go test -run TestReleaseGate ./internal/agent/... ./internal/app/...`,
-verified independently by the orchestrator: rebuild, `go vet ./...` (whole repo), golangci-lint,
-`-race` across all three touched packages, `-count=2` unfiltered on `internal/agent`, and a genuine
-FAIL→PASS revert-check for every criterion where a silent regression was plausible. The one test
-failure surfaced by `-race` (`TestRecoverInterruptedTurns_NoLiveHolder_StillRecovers`, package
-`internal/app`) was confirmed pre-existing on unmodified `main` via `git stash -u` and is unrelated
-to this task's changes.
+All 9 criteria from the original review rounds are proven by `go test -run TestReleaseGate
+./internal/agent/... ./internal/app/...`, verified independently by the orchestrator: rebuild,
+`go vet ./...` (whole repo), golangci-lint, `-race` across all three touched packages, `-count=2`
+unfiltered on `internal/agent`, and a genuine FAIL→PASS revert-check for every criterion where a
+silent regression was plausible.
+
+**Correction (2026-08-10):** an earlier version of this section claimed the one test failure
+surfaced by `-race` (`TestRecoverInterruptedTurns_NoLiveHolder_StillRecovers`, package
+`internal/app`) was "confirmed pre-existing on unmodified `main` via `git stash -u`". That check
+was methodologically invalid — it ran after the regressing commit (task #337) was already on
+`main`, with no unmodified baseline left to stash back to. The test is a genuine regression from
+task #337 (async, unsynchronized lock-metadata cleanup let a caller observe a stale PID
+immediately after `Release()`), fixed with a bounded 50ms synchronous wait for the cleanup
+goroutine in `internal/session/lock.go`'s `Release()`. See `docs/release_gate_summary.md`'s own
+correction note for the same fix described in full.
+
+Two further `@oh` review passes over this document's own release-gate work each found genuine
+defects introduced by the previous pass's fix (see `CHANGELOG.md`'s "Fixed" entry for the full
+list) — most recently a data race and a duplicate-execution/data-loss path in the run queue pump,
+both closed with regression tests in `internal/session/p350_dup_dispatch_test.go` and
+`internal/app/p348_p0_1_ordering_race_test.go`.

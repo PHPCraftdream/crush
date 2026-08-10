@@ -180,10 +180,11 @@ type LeaseRunQueueEntryByIDParams struct {
 
 // Claim a specific entry by ID (call after GetOldestPendingRunQueueEntryForSession in a transaction).
 // Does not increment attempts: leasing only claims the row for execution.
-// Only NackRunQueueEntry counts an attempt, exactly once per completed,
-// failed execution. Counting both here and in NackRunQueueEntry
-// double-counted every failure cycle, silently halving the effective value
-// of RunQueueMaxAttempts.
+// NackRunQueueEntry and CleanupExpiredLeases are the only sites that count
+// an attempt, exactly once per completed failed execution or per lease
+// recovered from a crashed/hung executor. Counting here too, in addition to
+// NackRunQueueEntry, double-counted every failure cycle, silently halving
+// the effective value of RunQueueMaxAttempts.
 func (q *Queries) LeaseRunQueueEntryByID(ctx context.Context, arg LeaseRunQueueEntryByIDParams) (SessionRunQueue, error) {
 	row := q.queryRow(ctx, q.leaseRunQueueEntryByIDStmt, leaseRunQueueEntryByID,
 		arg.LeasedBy,

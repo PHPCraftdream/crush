@@ -84,6 +84,17 @@ func (a *coordinatorAdapterImpl) Run(ctx context.Context, callData session.Sessi
 	}
 
 	result, err := coord.RunSessionAgentCall(ctx, call)
+	if result == nil && err == nil {
+		// The session was already owned by a live, in-process turn: the
+		// call was appended to that owner's mailbox queue rather than
+		// executed by this call (agent.sessionAgent.Run returns (nil, nil)
+		// for this case — see tryReserveSession). Report this distinctly
+		// so the pump does not treat it as an ordinary success (which
+		// would Ack/delete a durable row for work that has not actually
+		// run) — see session.ErrCallQueuedNotExecuted's doc for the full
+		// rationale, found by the third @oh review pass over #337-349.
+		return nil, session.ErrCallQueuedNotExecuted
+	}
 	// Return as any - we only care about error handling, not the result
 	var anyResult any
 	if result != nil {
