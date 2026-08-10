@@ -221,6 +221,49 @@ func Release(dataDir string) error {
 	return closeEntry(entryToClose)
 }
 
+// ReleaseAll forcibly closes the pooled connection for dataDir and removes
+// it from the pool, regardless of its current reference count. A no-op
+// (returns nil) if no entry exists for dataDir, matching Release's own
+// behavior in that case.
+//
+// Intended for tests that need to guarantee a specific dataDir's connection
+// is fully closed at teardown, even when the number of paired Connect/
+// ConnectRead calls a caller made isn't fully known or a cooperating
+// caller's own cleanup may have left references outstanding on purpose.
+// App.Shutdown's forced-shutdown path is exactly such a case: it
+// deliberately skips calling Release at all (to avoid closing a DB out from
+// under a still-active live writer in real CLI/server use, where the
+// process exits immediately after and the OS reclaims the handle) — a test
+// binary does NOT exit after one test, so relying on a single paired
+// Release call in that scenario silently leaves the entry's refCount above
+// zero forever, leaking the underlying file handle for the rest of the test
+// binary's life. On Windows specifically, that leaked handle then makes
+// t.TempDir()'s own RemoveAll cleanup fail (unlike POSIX, Windows will not
+// delete a file that still has an open handle).
+//
+// Scoped to dataDir's own absolute path only — safe to call from a single
+// test's cleanup even when other tests use the pool concurrently (e.g. via
+// t.Parallel()) for DIFFERENT dataDirs, unlike ResetPool which tears down
+// every pooled entry process-wide.
+func ReleaseAll(dataDir string) error {
+	dbPath := filepath.Join(dataDir, "crush.db")
+	absPath, err := filepath.Abs(dbPath)
+	if err != nil {
+		absPath = dbPath
+	}
+
+	poolMu.Lock()
+	entry, ok := pool[absPath]
+	if !ok {
+		poolMu.Unlock()
+		return nil
+	}
+	delete(pool, absPath)
+	poolMu.Unlock()
+
+	return closeEntry(entry)
+}
+
 // closeEntry closes both handles in entry, tolerating readDB == db (the
 // fallback path in connect() when the read-only pool failed to open, or in
 // principle any future caller that intentionally shares one *sql.DB between

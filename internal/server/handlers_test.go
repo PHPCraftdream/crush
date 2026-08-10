@@ -76,7 +76,19 @@ func newAttachmentsTestApp(t *testing.T, workingDir, dataDir string) *appPkg.App
 
 	conn, err := db.Connect(t.Context(), resolvedDataDir)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = db.Release(resolvedDataDir) })
+	// ReleaseAll, not Release: App.Shutdown's forced-shutdown path (taken
+	// whenever an agent doesn't finish within its grace period — several
+	// tests using this helper deliberately install a coordinator that never
+	// stops being busy, to test fails-closed behavior) intentionally skips
+	// calling Release at all, so a single paired Release call here can leave
+	// the pool entry's refCount above zero forever once app.New's own
+	// internal Connect/ConnectRead calls are counted — silently leaking the
+	// DB file handle for the rest of this test binary's life and breaking
+	// t.TempDir()'s own cleanup on Windows (found investigating a real,
+	// consistently-reproducing pre-push CI failure). ReleaseAll guarantees
+	// this dataDir's connection is fully closed regardless of how Shutdown
+	// behaved — see its own doc for why this is safe under t.Parallel().
+	t.Cleanup(func() { _ = db.ReleaseAll(resolvedDataDir) })
 
 	a, err := appPkg.New(t.Context(), conn, store)
 	require.NoError(t, err)
