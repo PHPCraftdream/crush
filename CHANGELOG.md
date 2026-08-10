@@ -93,6 +93,69 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
     releases the OS lock, triggers the real pickup path, and asserts on
     an atomic provider-call counter plus message history.
 
+- **Thirteen more release-blocking concurrency findings from the
+  2026-08-09 follow-up review round** (see
+  `docs/reviews/2026-08-09-release-concurrency-followup-review.md` and
+  `docs/reviews/2026-08-09-oh-round-review.md`), closed and
+  independently verified with an executable release-gate suite (see
+  `docs/release_gate_summary.md`, `docs/release_gate_report.md`,
+  `go test -run TestReleaseGate ./internal/agent/... ./internal/app/...`):
+  - **`SessionLock.Release()` could still leave the mailbox permanently
+    stuck in `mbOwned`/`mbReleasing`** if the unbounded filesystem I/O
+    in its diagnostic-metadata cleanup hung — the OS-level unlock now
+    happens on a background goroutine, unconditionally decoupled from
+    that cleanup, and cleanup can no longer clobber a lock a fresh
+    holder has since re-acquired.
+  - **Detached/orphaned calls that exhausted their retry budget had no
+    guaranteed runner** — some could be lost entirely instead of
+    landing in a durable queue. Replaced the three separate ad hoc
+    detached-run policies (`restartOrphaned` / `restartOrphanedWithRetry`
+    / `startDetachedRun`) with one durable per-session run queue
+    (`session_run_queue`) and an independent `RunQueuePump` that
+    autonomously picks up and executes queued calls, including across
+    process restarts.
+  - **Retry tails could requeue and re-execute a call that had already
+    left a persistent trace**, producing duplicate provider calls and
+    duplicate messages — retryable vs. terminal failures are now
+    classified via an `AlreadyAttempted` marker interface
+    (`ErrCallAlreadyAttempted`), and a call already recorded is never
+    replayed.
+  - **Manual/queued summary (`/compact`) could pick up a different
+    session's model or provider mid-flight** if models were changed
+    concurrently — it now resolves and freezes one immutable snapshot
+    (model, provider options, prompt prefix) from the target session at
+    the start of the call.
+  - **A second manual `/compact` requested while the first was still
+    running could get stranded** — the queued request is now drained
+    and coalesced from every terminal ownership transition, not just
+    the web handler's own code path.
+  - **Shutdown could close the database while a non-cooperative agent
+    was still genuinely running**, and forced shutdown could hold the
+    global DB connection-pool mutex across a slow `sql.DB.Close()` —
+    graceful shutdown now does a real join on every live dispatcher
+    (not a polling loop) before releasing the DB, and forced shutdown
+    skips the DB release entirely rather than risk closing it under a
+    live writer.
+  - **Provider cancellation on ctx timeout wasn't a verified contract
+    per adapter** — added a conformance suite covering every HTTP
+    provider category (openaicompat, openai, anthropic, azure, bedrock,
+    vercel, openrouter) plus the CLI-provider process-tree-kill path,
+    each proving a hung stream stops within 5 seconds of cancellation.
+  - **A durable-queue entry that exhausted its max retry attempts could
+    never actually be removed from the queue** — the cleanup call
+    required the entry to be in the `leased` state, but an
+    attempts-exhausted entry is scanned while still `pending`, so the
+    delete silently never matched and the pump re-attempted (and
+    re-failed) the same cleanup on every tick, forever. Fixed to lease
+    the entry before the terminal-fail delete.
+  - Several package-global mutable test seams used under `t.Parallel()`
+    (a data-race and cross-test-pollution risk) were replaced with
+    per-instance functional options, and a batch of regression tests
+    from this round that had silently weakened over revisions (sleep-
+    based races, gutted fault injections, mock-only coverage of the
+    riskiest changes) were rewritten to restore their original
+    guarantees.
+
 - **`sessions locks` showed a healthy, actively-working session as
   "offline"** — observed live: a session sat at `PULSE_AGE == ELAPSED ==
   36s` while the process was alive and running real tool calls. The
