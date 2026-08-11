@@ -1328,3 +1328,146 @@ finished the mailbox migration:
     (`os.CreateTemp`'s default `0600`, never chmod'd back up before the
     rename, unlike the codebase's own `fsext.AtomicWriteFile`
     convention it was modeled on).
+
+- **Fifteen findings from a 2026-08-11 release-readiness concurrency
+  review, closed and independently verified** (3 release blockers, 5
+  high-priority, 6 medium-priority items — see
+  `docs/reviews/2026-08-11-release-readiness-concurrency-and-code-review.md`).
+  This round covers the core session/mailbox/durable-queue lifecycle,
+  the same subsystem seven prior review passes already hardened; every
+  fix was implemented via a delegated `/crush` session and then
+  independently re-verified: the diff read line by line, every new test
+  checked for whether it would actually fail without the fix, and every
+  safety/concurrency-critical fix personally revert-checked (temporarily
+  undone, confirmed the exact predicted failure, restored, confirmed
+  green again). That verification pass itself found real, non-trivial
+  bugs in most of the delegated diffs, listed inline below.
+  - **A durable-queue call could execute twice after handoff into a
+    busy session's mailbox** — `mailbox.submit` unconditionally
+    appended durable-originated calls to the in-memory queue even
+    though the durable row itself is already the retry path, so the
+    live owner would run the in-memory copy and the pump would
+    independently re-lease and run the same durable row after backoff.
+    Calls originating from the durable queue no longer get a second,
+    redundant in-memory queue entry.
+  - **An "accepted" call — an idle interrupt, or orphaned mailbox work
+    found during release — could still be lost before its durable-queue
+    commit, with no error surfacing anywhere** — `startDetachedRun` and
+    `restartOrphaned` both silently swallowed enqueue failures. Both
+    now propagate the failure to their own callers instead of
+    discarding it; for the cross-process interrupt-inject path, a
+    failed durable enqueue now recreates the `pending_injects` row for
+    a future retry instead of vanishing.
+  - **`RunQueuePump.Stop()` returned before in-flight `executeEntry`
+    workers finished**, so a shutdown could drop an Ack/Nack that was
+    mid-flight and cause the same durable row to be re-run after
+    restart. `Stop()` now joins a `workerWg` covering every dispatched
+    worker (5-second grace, matching `CancelAll`'s own pattern), guarded
+    by an admission gate that closes the same class of "check state,
+    then start work" race the fix itself was designed to prevent —
+    found in the delegated diff's own new code during verification.
+  - **`CancelAll`'s shutdown join didn't cover manual `Summarize()`
+    calls or the title-generation goroutine** — a summarize/title
+    operation still writing to the database after `CancelAll` returned
+    could race a subsequent session teardown. Both are now covered by
+    the same `runWg` `CancelAll` already joins, via an admission gate
+    (`admitMu`/`shuttingDown`) that closes the same
+    check-then-`Add` race pattern found in the RunQueuePump fix above —
+    Go's `sync.WaitGroup` forbids a concurrent `Add(positive)` starting
+    from zero unless it happens-before a concurrent `Wait()`, and an
+    unsynchronized "check shutting-down, then Add" is a real bug even
+    when each half looks correct in isolation.
+  - **A lease lost during execution didn't stop the in-flight,
+    non-idempotent LLM/tool work still running under it** — the
+    execution context stayed uncancellable after a lease-loss recovery
+    reassigned the row to a new owner, so both the original executor
+    and the new owner could run the same call concurrently. The
+    execution context is now cancelled the moment lease loss is
+    detected, and outcome writes (Ack/Nack/terminal-fail) are skipped
+    once that happens rather than racing the new owner's own writes.
+  - **FIFO ordering for the durable queue was undefined for two calls
+    enqueued within the same second** — `created_at` alone isn't a
+    stable sort key at one-second resolution. Added an implicit-`rowid`
+    tie-breaker to both scan queries (SQLite gives every non-`WITHOUT
+    ROWID` table a free, already-monotonic rowid — no migration
+    needed).
+  - **The pump's fan-out after a backlog or restart was unbounded** — a
+    large recovery backlog could dispatch unlimited concurrent
+    `executeEntry` workers at once. Added a bounded semaphore (10
+    concurrent by default, test-overridable) that every dispatch path
+    acquires before leasing and releases on every exit.
+  - **Async lock-metadata cleanup could clobber a new, live owner's
+    PID** — after a slow `Release()`'s best-effort cleanup goroutine
+    outlives its bound, it could still overwrite a `.pid` sidecar a
+    brand-new owner had since written. Added a generation-versioned
+    `.gen` sidecar; cleanup now compares its recorded generation
+    against the current one and skips only on a genuine positive
+    mismatch (a missing or unreadable sidecar still falls back to the
+    pre-fix unconditional cleanup, closing a regression the delegated
+    diff's first attempt introduced by treating "missing" the same as
+    "mismatched").
+  - **The durable-queue "idempotency key" was actually a fresh unique ID
+    on every call, not a stable retry key** — generated from
+    `time.Now().UnixNano()` each time, so a caller-level retry of the
+    same logical request produced a different key and could create a
+    second durable row for what should be one logical call. Added a
+    `LogicalCallID`, generated once when a call is first constructed,
+    and keyed idempotency off `SessionID+LogicalCallID` (falling back to
+    the old timestamp behavior only if unexpectedly empty). Making the
+    key genuinely stable exposed a second gap the naive fix alone would
+    have made worse — `EnqueueRunQueueEntry`'s insert had no conflict
+    handling at all — closed with `ON CONFLICT(id) DO NOTHING`.
+  - **`agentguard`'s sub-agent recursion guard was still bypassable via
+    `env -S`/`--split-string`**, and `CheckWindowSafety` used a
+    separately-maintained wrapper list that had already drifted from
+    the main guard once before (the exact class of bug a prior review
+    round's `env`/`nice`/`timeout` fix closed for the primary path
+    only). `env -S`/`--split-string` payloads are now recursively
+    re-checked, and both guards now share one `resolveCommandHead`
+    helper so the wrapper-stripping logic can't diverge between them
+    again.
+  - **The Codex CLI provider's MCP token was still exposed via a
+    `?token=` URL query parameter**, visible in argv/
+    `/proc/<pid>/cmdline` — unlike the Gemini/Qwen providers, which
+    already use an `Authorization` header. Moved to an environment
+    variable referenced through Codex's own `bearer_token_env_var`
+    config key, verified against the actually-installed `codex` CLI
+    (not assumed from documentation) to confirm the mechanism works and
+    is never persisted to `~/.codex/config.toml`.
+  - **The SSRF guard's range denylist missed several IANA
+    special-purpose ranges** not covered by any Go stdlib `net.IP`
+    method — CGNAT (`100.64.0.0/10`), the IPv4 benchmark range
+    (`198.18.0.0/15`), the TEST-NET-1/2/3 documentation ranges, the
+    reserved `240.0.0.0/4` block, and IPv6 equivalents (discard-only,
+    documentation, ORCHIDv2). Added a static CIDR table checked
+    alongside the existing loopback/private/link-local/unspecified
+    checks, with 42 new boundary test cases.
+  - **The mailbox's ownership-exit finalizer could hand a newer era's
+    queued work to the wrong recovery path** — releasing ownership and
+    draining any leftover queued work were two separate lock
+    acquisitions, leaving a window where a new owner's own queued call
+    could be misrouted into detached recovery instead of staying for
+    that owner's normal end-of-turn drain. Both steps are now one
+    atomic critical section.
+  - **Recovery-subsystem architecture cleanup**: audited which of six
+    documented complexity/drift smells in the run-queue pump were
+    already resolved by the fixes above before touching anything (per
+    this task's own explicit instruction) — three were already closed,
+    two were genuinely still open and fixed (an unused
+    `RunQueuePumpConfig.DataDirectory` field removed; the pump's
+    "executed entry successfully" log no longer prints unconditionally
+    when the following database ack actually failed), and two are
+    flagged as legitimate future-scoped work rather than force-fit into
+    a mechanical cleanup pass (the file's line growth from this round's
+    own correctness fixes; a `terminal_failure` column that is
+    currently dead state, since a terminal failure deletes the row
+    rather than ever setting the flag — closing it properly needs a
+    schema migration on the exactly-once durable queue this whole round
+    protects, judged out of scope here).
+
+- **Two UI bugs: switching a model in the web UI mutated global config
+  instead of the current session** — reported live during this round.
+  Model resolution is now a pure function of `(session, config)` instead
+  of mutating shared agent state, and the global-default vs
+  session-scoped model APIs are split, fixing the server call sites that
+  were building a system prompt from the wrong (globally-mutated) model.
