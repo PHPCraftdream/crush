@@ -518,6 +518,30 @@ type sessionAgent struct {
 	// belongs to a process that is exiting.
 	shuttingDown atomic.Bool
 
+	// admitMu/stopping form the admission gate that closes a real "Add
+	// concurrently with Wait" race between Run()/Summarize's runWg.Add(1)
+	// and CancelAll's runWg.Wait(). P1-1: Run/Summarize used to call
+	// runWg.Add(1) and then check shuttingDown as two separate,
+	// unsynchronized steps. Between the Add and the check, a concurrent
+	// CancelAll could set shuttingDown and spin up its runWg.Wait() goroutine
+	// while the counter was still 0 — Wait() could then return (nothing to
+	// wait for) a moment before the Add(1) landed, which either panics
+	// ("Add called concurrently with Wait", per the sync.WaitGroup contract:
+	// "calls with a positive delta that start when the counter is zero
+	// must happen before a Wait") or lets a new Run/Summarize start after
+	// CancelAll has already told its caller shutdown was safe.
+	//
+	// The fix: shuttingDown is only ever flipped false->true, and every
+	// read (Run/Summarize via tryAdmitRunWg) and the one write (CancelAll)
+	// happen under admitMu. So either the Run/Summarize critical section
+	// runs entirely before CancelAll's (shuttingDown was still false:
+	// runWg.Add(1) is guaranteed to complete, and complete-before, CancelAll's
+	// subsequent cancel+Wait-spawn), or it runs entirely after (shuttingDown
+	// is already true: tryAdmitRunWg bails out and never calls Add at all).
+	// There is no interleaving left where Add and Wait can race.
+	// Pattern mirrors P0-3's RunQueuePump.admitMu/stopping gate.
+	admitMu sync.Mutex
+
 	isSubAgent           bool
 	sessions             session.Service
 	messages             message.Service
@@ -1276,13 +1300,6 @@ func notifyWatchdog(ctx context.Context) {
 // hadn't run yet), and got rejected with "already in use". runTurn below is
 // the extracted single-turn body; Run just loops it.
 func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy.AgentResult, error) {
-	// Track this Run() call in the agent-wide runWg so CancelAll can truly
-	// join on all active dispatcher goroutines instead of polling IsBusy().
-	// This defer fires on EVERY return from Run, including early bail-outs
-	// and all turn loop exits.
-	a.runWg.Add(1)
-	defer a.runWg.Done()
-
 	if call.Prompt == "" && !message.ContainsTextAttachment(call.Attachments) {
 		return nil, ErrEmptyPrompt
 	}
@@ -1294,10 +1311,16 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	// mailbox is created: the per-mailbox `stopped` latch can only stop an
 	// existing turn loop, and CancelAll's sweep cannot reach a mailbox that
 	// does not exist yet. See the shuttingDown field's doc for the call
-	// paths that reach here after the sweep.
-	if a.shuttingDown.Load() {
+	// paths that reach here after the sweep. This check is combined with
+	// runWg registration under admitMu (tryAdmitRunWg) to close the
+	// P1-1 race: without the mutex, a concurrent CancelAll could set
+	// shuttingDown and start its Wait goroutine while the counter was
+	// still 0, letting Wait return before Add(1) landed (panics or
+	// admits work after "shutdown complete").
+	if !a.tryAdmitRunWg() {
 		return nil, ErrAgentShuttingDown
 	}
+	defer a.runWg.Done()
 
 	// runCtx/runCancel span the WHOLE dispatcher (every turn + every
 	// preamble). The loop derives a per-turn turnCtx from runCtx (#284) so
@@ -1814,6 +1837,12 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 		// genCtx's own cancellation somehow doesn't unblock it.
 		titleCtx, titleCancel := context.WithTimeout(genCtx, a.effectiveTitleGenerationMaxDuration())
 		titleDone = make(chan struct{})
+		// Safe without admission gate: runWg.Add(1) here is always called
+		// from inside an already-admitted Run() call, so runWg counter is
+		// guaranteed >= 1 at this point. Per sync.WaitGroup contract, Add(1)
+		// when counter is > 0 may happen at any time, including concurrently
+		// with Wait. The real race P1-1 closes is Add starting when counter is
+		// zero and Wait starts between the check and the Add.
 		a.runWg.Add(1)
 		go func() {
 			defer close(titleDone)
@@ -3121,8 +3150,14 @@ func (a *sessionAgent) Summarize(ctx context.Context, sessionID string, snapshot
 	// Track this Summarize() call in the agent-wide runWg so CancelAll can join
 	// on manual compactions that might be writing to the DB (P0-4).
 	// This defer fires on EVERY return from Summarize, including the queued
-	// early-return path and all error paths.
-	a.runWg.Add(1)
+	// early-return path and all error paths. The check and Add are gated
+	// under admitMu (tryAdmitRunWg) to close the P1-1 race: without the mutex,
+	// a concurrent CancelAll could set shuttingDown and start its Wait goroutine
+	// while the counter was still 0, letting Wait return before Add(1) landed
+	// (panics or admits work after "shutdown complete").
+	if !a.tryAdmitRunWg() {
+		return ErrAgentShuttingDown
+	}
 	defer a.runWg.Done()
 
 	// Atomic check-and-reserve (#268/P0-4, design §6): beginCompact makes
@@ -4403,6 +4438,21 @@ func (a *sessionAgent) InjectMessage(ctx context.Context, call SessionAgentCall)
 	return msg, nil
 }
 
+// tryAdmitRunWg atomically checks shuttingDown and registers one unit of
+// work in runWg — see admitMu's doc for why the check and the Add must be
+// one operation relative to CancelAll's own critical section (closes a
+// real "Add concurrently with Wait" race, P1-1). Returns false (does NOT
+// call Add) if shutdown has already begun.
+func (a *sessionAgent) tryAdmitRunWg() bool {
+	a.admitMu.Lock()
+	defer a.admitMu.Unlock()
+	if a.shuttingDown.Load() {
+		return false
+	}
+	a.runWg.Add(1)
+	return true
+}
+
 func (a *sessionAgent) CancelAll() (stillBusy bool) {
 	// Refuse all FUTURE Run() calls before touching anything else (closing
 	// review, blocker 1). This must come first and must live on the agent
@@ -4410,7 +4460,9 @@ func (a *sessionAgent) CancelAll() (stillBusy bool) {
 	// that already exist, and mailboxes are created lazily, so a Run for a
 	// session id the sweep never saw would otherwise get a fresh mailbox
 	// with stopped == false and run a full turn nothing will cancel.
+	a.admitMu.Lock()
 	a.shuttingDown.Store(true)
+	a.admitMu.Unlock()
 
 	// Latch EVERY mailbox closed FIRST, before cancelling anything (round
 	// 14 review, P0-C). Ordering is what makes the shutdown terminal: a
