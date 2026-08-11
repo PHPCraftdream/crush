@@ -353,6 +353,18 @@ type SessionAgentCall struct {
 	// requeueInterruptMessage), FromDurableQueue is false and the mailbox queue
 	// is the only retry path, so submit's normal mb.submitted behavior applies.
 	FromDurableQueue bool
+
+	// LogicalCallID is a stable identifier for this logical request, generated
+	// ONCE when the call is first created (e.g. in buildCall). It is used as the
+	// idempotency key for durable enqueue operations (task #340), ensuring that
+	// retries of the same logical request reuse the same session_run_queue row
+	// instead of creating duplicates. P2-1 fix.
+	//
+	// Previously, the idempotency key was generated from time.Now().UnixNano()
+	// at enqueue time, which meant each retry got a different key — breaking the
+	// idempotency contract and potentially creating multiple durable rows for the
+	// same logical request.
+	LogicalCallID string
 }
 
 // turnConfig is the immutable per-call snapshot of everything model- and
@@ -1127,9 +1139,17 @@ func (a *sessionAgent) restartOrphanedWithRetry(calls []SessionAgentCall) error 
 		go func() {
 			defer wg.Done()
 
-			// Generate idempotency key: sessionID + timestamp ensures uniqueness
-			// while allowing retries of the same logical call if needed
-			idempotencyKey := fmt.Sprintf("%s-%d", call.SessionID, time.Now().UnixNano())
+			// P2-1: Generate idempotency key from LogicalCallID (stable per logical request)
+			// instead of timestamp (which changes on every retry). Fallback to timestamp
+			// with warning if LogicalCallID is empty (should not happen in normal flow).
+			var idempotencyKey string
+			if call.LogicalCallID != "" {
+				idempotencyKey = fmt.Sprintf("%s-%s", call.SessionID, call.LogicalCallID)
+			} else {
+				slog.Warn("agent: LogicalCallID is empty, falling back to timestamp-based idempotency key (non-idempotent retries)",
+					"session_id", call.SessionID)
+				idempotencyKey = fmt.Sprintf("%s-%d", call.SessionID, time.Now().UnixNano())
+			}
 
 			// Convert to SessionAgentCallData for serialization
 			callData := ToSessionAgentCallData(call)

@@ -1,4 +1,10 @@
 -- name: EnqueueRunQueueEntry :one
+-- ON CONFLICT DO NOTHING makes this idempotent on id (P2-1): a caller that
+-- retries with the same, stable idempotency key must not error just because
+-- its own earlier attempt already committed the row. Returns zero rows on
+-- conflict (sql.ErrNoRows to the :one caller) rather than the pre-existing
+-- row's contents; the caller (session.EnqueueRunQueueEntry) treats that
+-- specifically as "already enqueued", not as a failure.
 INSERT INTO session_run_queue (
     id,
     session_id,
@@ -9,6 +15,7 @@ INSERT INTO session_run_queue (
     created_at,
     updated_at
 ) VALUES (?, ?, ?, 'pending', 0, 0, ?, ?)
+ON CONFLICT(id) DO NOTHING
 RETURNING *;
 
 -- name: GetOldestPendingRunQueueEntryForSession :one

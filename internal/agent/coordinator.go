@@ -881,6 +881,7 @@ func (c *coordinator) buildCall(ctx context.Context, sessionID, prompt string, p
 		PresencePenalty:      presPenalty,
 		SystemPromptOverride: sessionSystemPrompt,
 		LargeModel:           &pinnedLarge,
+		LogicalCallID:        uuid.New().String(), // P2-1: generate stable ID once
 	}
 	// Pinning matters more here than in runInternal: this call is QUEUED as a
 	// replacement and may not start for a while, so the gap between "options
@@ -984,6 +985,7 @@ func (c *coordinator) runInternal(ctx context.Context, sessionID string, prompt 
 		MaxCost:              maxCost,
 		MaxTokens:            maxTokensRunLimit,
 		LargeModel:           &pinnedLarge,
+		LogicalCallID:        uuid.New().String(), // P2-1: generate stable ID once
 	}
 	// Overrides pin small model / prefix / base prompt too; pin() leaves
 	// LargeModel as set above when pinned is nil, and rewrites it to the same
@@ -2456,11 +2458,19 @@ func (c *coordinator) startDetachedRun(ctx context.Context, call SessionAgentCal
 		}
 	}
 
-	// Generate idempotency key: sessionID + timestamp ensures uniqueness
-	// For interrupt inject path, we can use the InjectID as part of the key
-	idempotencyKey := fmt.Sprintf("%s-%d", call.SessionID, time.Now().UnixNano())
-	if call.InjectID != "" {
+	// P2-1: Generate idempotency key from LogicalCallID (stable per logical request)
+	// instead of timestamp (which changes on every retry). Fallback to timestamp
+	// with warning if LogicalCallID is empty (should not happen in normal flow).
+	// For interrupt inject path, we can use the InjectID as part of the key.
+	var idempotencyKey string
+	if call.LogicalCallID != "" {
+		idempotencyKey = fmt.Sprintf("%s-%s", call.SessionID, call.LogicalCallID)
+	} else if call.InjectID != "" {
 		idempotencyKey = fmt.Sprintf("%s-%s", call.SessionID, call.InjectID)
+	} else {
+		slog.Warn("coordinator: LogicalCallID is empty, falling back to timestamp-based idempotency key (non-idempotent retries)",
+			"session_id", call.SessionID)
+		idempotencyKey = fmt.Sprintf("%s-%d", call.SessionID, time.Now().UnixNano())
 	}
 
 	// Convert to SessionAgentCallData for serialization

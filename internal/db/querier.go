@@ -58,6 +58,12 @@ type Querier interface {
 	DeleteSession(ctx context.Context, id string) error
 	DeleteSessionFiles(ctx context.Context, sessionID string) error
 	DeleteSessionMessages(ctx context.Context, sessionID string) error
+	// ON CONFLICT DO NOTHING makes this idempotent on id (P2-1): a caller that
+	// retries with the same, stable idempotency key must not error just because
+	// its own earlier attempt already committed the row. Returns zero rows on
+	// conflict (sql.ErrNoRows to the :one caller) rather than the pre-existing
+	// row's contents; the caller (session.EnqueueRunQueueEntry) treats that
+	// specifically as "already enqueued", not as a failure.
 	EnqueueRunQueueEntry(ctx context.Context, arg EnqueueRunQueueEntryParams) (SessionRunQueue, error)
 	GetAverageResponseTime(ctx context.Context) (int64, error)
 	// call_tree_activity.sql: freshest message activity across a session's whole

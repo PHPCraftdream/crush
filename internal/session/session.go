@@ -1384,6 +1384,13 @@ const (
 // EnqueueRunQueueEntry adds a call to the durable run queue.
 // The caller should generate idempotencyKey ONCE and reuse it across retries.
 // Returns error if the enqueue fails (caller should not proceed without durability).
+//
+// Idempotent on idempotencyKey (P2-1): the underlying INSERT uses
+// ON CONFLICT(id) DO NOTHING, so retrying with the SAME key after an earlier
+// attempt already committed the row is a no-op, not an error. sqlc's :one
+// query reports that as sql.ErrNoRows (zero rows returned on conflict) —
+// treated here as success, since the durable row this call wanted to exist
+// already does.
 func (s *service) EnqueueRunQueueEntry(ctx context.Context, idempotencyKey, sessionID string, callData []byte) error {
 	if idempotencyKey == "" {
 		idempotencyKey = uuid.NewString()
@@ -1396,6 +1403,9 @@ func (s *service) EnqueueRunQueueEntry(ctx context.Context, idempotencyKey, sess
 		CreatedAt: now,
 		UpdatedAt: now,
 	})
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
 	return err
 }
 
