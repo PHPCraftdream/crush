@@ -85,6 +85,33 @@ func TestIsForbiddenSSRFAddress(t *testing.T) {
 	})
 }
 
+// TestSSRFGuardedClient_DisablesProxy is the regression test for a bypass
+// an independent @oh review found: http.DefaultTransport.Clone() inherits
+// Proxy: ProxyFromEnvironment, and the Control hook only ever sees the
+// address actually dialed. If HTTP_PROXY/HTTPS_PROXY is set in the
+// environment, Control would see the PROXY's address, not the request's
+// real target — so a guarded client would tunnel straight past the check
+// to whatever host the proxied request line names, including a forbidden
+// one. The guard must disable Transport-level proxying outright rather
+// than trust an unvalidated proxy hop.
+func TestSSRFGuardedClient_DisablesProxy(t *testing.T) {
+	t.Parallel()
+
+	guarded := NewSSRFGuardedClient(5*time.Second, false)
+	guardedTransport, ok := guarded.Transport.(*http.Transport)
+	require.True(t, ok, "guarded client must use *http.Transport")
+	require.Nil(t, guardedTransport.Proxy,
+		"a guarded (allowPrivate=false) transport must not honor any proxy — "+
+			"otherwise Control only ever validates the proxy's address, not the real target")
+
+	allowed := NewSSRFGuardedClient(5*time.Second, true)
+	allowedTransport, ok := allowed.Transport.(*http.Transport)
+	require.True(t, ok, "allow-private client must use *http.Transport")
+	require.NotNil(t, allowedTransport.Proxy,
+		"the allowPrivate=true escape hatch must keep normal proxy support "+
+			"(it already trusts the operator with unrestricted network access)")
+}
+
 // TestSSRFGuardedClient_BlocksLoopback proves the dial-time guard fires
 // against a real httptest.Server (which binds 127.0.0.1): a guarded
 // client's request fails and the error chain contains errSSRFBlocked.

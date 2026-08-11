@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -115,4 +116,45 @@ func TestDownloadTool_SuccessfulDownloadWritesCompleteFile(t *testing.T) {
 	got, err := os.ReadFile(filepath.Join(workingDir, "ok.txt"))
 	require.NoError(t, err)
 	require.Equal(t, content, string(got))
+}
+
+// TestDownloadTool_WritesFileWithReadablePermissions is the regression test
+// for a gap an independent @oh review found in the temp-file+rename fix
+// above: os.CreateTemp creates its file 0600 (owner-only), and unlike
+// fsext.AtomicWriteFile's own convention, the rename path here never
+// chmod'd it back up before the rename — silently changing a downloaded
+// file's permissions from world-readable (os.Create's old 0666&^umask) to
+// owner-only. Skipped on Windows, where os.FileMode bits don't carry the
+// same POSIX meaning.
+func TestDownloadTool_WritesFileWithReadablePermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX file permission bits don't apply on Windows")
+	}
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "content")
+	}))
+	t.Cleanup(srv.Close)
+
+	workingDir := t.TempDir()
+	ctx := context.WithValue(context.Background(), SessionIDContextKey, "test-session")
+
+	tool := NewDownloadTool(&mockPermissionService{}, workingDir, NewSSRFGuardedClient(5*time.Second, true))
+
+	input, err := json.Marshal(DownloadParams{URL: srv.URL, FilePath: "readable.txt"})
+	require.NoError(t, err)
+
+	resp, err := tool.Run(ctx, fantasy.ToolCall{
+		ID:    "test-call",
+		Name:  DownloadToolName,
+		Input: string(input),
+	})
+	require.NoError(t, err)
+	require.False(t, resp.IsError)
+
+	info, err := os.Stat(filepath.Join(workingDir, "readable.txt"))
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0o644), info.Mode().Perm(),
+		"downloaded file must be world-readable (0644), not the 0600 os.CreateTemp defaults to")
 }

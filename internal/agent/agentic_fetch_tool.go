@@ -52,15 +52,13 @@ var agenticFetchPromptTmpl []byte
 
 func (c *coordinator) agenticFetchTool(_ context.Context, client *http.Client) (fantasy.AgentTool, error) {
 	if client == nil {
-		transport := http.DefaultTransport.(*http.Transport).Clone()
-		transport.MaxIdleConns = 100
-		transport.MaxIdleConnsPerHost = 10
-		transport.IdleConnTimeout = 90 * time.Second
-
-		client = &http.Client{
-			Timeout:   30 * time.Second,
-			Transport: transport,
-		}
+		// SSRF-guarded by default: agentic_fetch takes a model-controlled
+		// URL (and hands it, plus this same client, to the web_fetch/
+		// web_search/sourcegraph tools of the spawned sub-agent), so it
+		// carries the same loopback/private/metadata exfiltration risk
+		// download/fetch were guarded against — see
+		// internal/agent/tools/ssrf_guard.go.
+		client = tools.NewSSRFGuardedClient(30*time.Second, false)
 	}
 
 	return fantasy.NewParallelAgentTool(

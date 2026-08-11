@@ -231,6 +231,55 @@ func TestSaveFilePartsDisambiguatesCollidingFilenames(t *testing.T) {
 	}
 }
 
+// TestSaveFilePartsDisambiguatesMixedCollidingFilenames is the regression
+// test for a gap an independent @oh review found in the first version of
+// the collision fix above: usedNames tracked a per-ORIGINAL-name counter,
+// so a mixed input where a later part's literal filename happened to match
+// an earlier collision's GENERATED name ("image.png", "image.png",
+// "image-1.png") still silently overwrote the second entry — the first
+// "image.png" collision disambiguated to "image-1.png", and the third,
+// literal "image-1.png" then reused that exact generated name. Fixed by
+// tracking the set of final on-disk names actually handed out instead of a
+// counter keyed by the original name.
+func TestSaveFilePartsDisambiguatesMixedCollidingFilenames(t *testing.T) {
+	msgs := fantasy.Prompt{
+		{Role: fantasy.MessageRoleUser, Content: []fantasy.MessagePart{
+			fantasy.FilePart{Filename: "image.png", Data: []byte("FIRST"), MediaType: "image/png"},
+		}},
+		{Role: fantasy.MessageRoleUser, Content: []fantasy.MessagePart{
+			fantasy.FilePart{Filename: "image.png", Data: []byte("SECOND"), MediaType: "image/png"},
+		}},
+		{Role: fantasy.MessageRoleUser, Content: []fantasy.MessagePart{
+			fantasy.FilePart{Filename: "image-1.png", Data: []byte("THIRD"), MediaType: "image/png"},
+		}},
+	}
+
+	tmpDir, paths, err := saveFileParts(msgs)
+	if err != nil {
+		t.Fatalf("saveFileParts() error: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	if len(paths[0]) != 1 || len(paths[1]) != 1 || len(paths[2]) != 1 {
+		t.Fatalf("expected 1 file each for msg 0, 1, and 2, got %v", paths)
+	}
+	p0, p1, p2 := paths[0][0], paths[1][0], paths[2][0]
+	if p0 == p1 || p0 == p2 || p1 == p2 {
+		t.Fatalf("all three colliding filenames must resolve to DISTINCT paths, got %q %q %q", p0, p1, p2)
+	}
+
+	want := map[string]string{p0: "FIRST", p1: "SECOND", p2: "THIRD"}
+	for path, wantContent := range want {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(data) != wantContent {
+			t.Errorf("content of %q = %q, want %q — a later entry must not have overwritten an earlier one", path, data, wantContent)
+		}
+	}
+}
+
 func TestSaveFilePartsNoFiles(t *testing.T) {
 	msgs := fantasy.Prompt{
 		fantasy.NewUserMessage("just text"),

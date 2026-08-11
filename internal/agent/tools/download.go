@@ -175,6 +175,16 @@ func NewDownloadTool(permissions permission.Service, workingDir string, client *
 				cleanupTmp()
 				return fantasy.NewTextErrorResponse(fmt.Sprintf("download exceeds the %d byte limit", MaxDownloadBytes)), nil
 			}
+			// os.CreateTemp creates the file 0600; match fsext.AtomicWriteFile's
+			// convention (chmod before rename) so a downloaded file ends up with
+			// the same permissive-by-default mode os.Create used to give it,
+			// instead of silently becoming unreadable by other local users/
+			// processes (found by an independent @oh review of this fix).
+			if err := tmpFile.Chmod(0o644); err != nil {
+				tmpFile.Close()
+				cleanupTmp()
+				return fantasy.ToolResponse{}, fmt.Errorf("failed to set output file permissions: %w", err)
+			}
 			if err := tmpFile.Sync(); err != nil {
 				tmpFile.Close()
 				cleanupTmp()

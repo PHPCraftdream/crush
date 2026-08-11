@@ -89,6 +89,18 @@ func ssrfControlHook(network, address string, _ syscall.RawConn) error {
 // with a plain dialer (no Control hook), which is the explicit local-dev
 // / self-hosted escape hatch for operators who need to fetch from
 // 127.0.0.1 or an internal host. Production wiring passes false.
+//
+// Proxy bypass (found by an independent @oh review of the guard itself):
+// http.DefaultTransport.Clone() inherits Proxy: ProxyFromEnvironment.
+// Control only ever sees the address actually dialed — if HTTP_PROXY/
+// HTTPS_PROXY is set, that address is the proxy, not the request's real
+// target, so a guarded client would tunnel straight past the check to
+// whatever host the request line names (including a forbidden one). When
+// the guard is active we disable Transport-level proxying entirely
+// rather than silently trusting an unvalidated proxy hop; a caller that
+// truly needs both an egress proxy AND fetches from private ranges
+// should build its own client with allowPrivate=true instead of relying
+// on the guarded default.
 func applySSRFGuard(transport *http.Transport, allowPrivate bool) {
 	if allowPrivate {
 		transport.DialContext = (&net.Dialer{
@@ -97,6 +109,7 @@ func applySSRFGuard(transport *http.Transport, allowPrivate bool) {
 		}).DialContext
 		return
 	}
+	transport.Proxy = nil
 	transport.DialContext = (&net.Dialer{
 		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,

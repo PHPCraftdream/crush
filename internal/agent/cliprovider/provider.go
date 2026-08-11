@@ -1601,7 +1601,7 @@ func saveFileParts(msgs fantasy.Prompt) (tempDir string, filePaths map[int][]str
 	}
 
 	filePaths = make(map[int][]string)
-	usedNames := make(map[string]int)
+	usedNames := make(map[string]bool)
 	for seq, e := range entries {
 		name := e.fp.Filename
 		if name == "" {
@@ -1624,13 +1624,29 @@ func saveFileParts(msgs fantasy.Prompt) (tempDir string, filePaths map[int][]str
 		// common (non-colliding) case; append a "-N" suffix only when
 		// needed, mirroring saveAttachmentToDisk's own reasoning in
 		// internal/server/handlers.go.
+		//
+		// usedNames tracks the FINAL on-disk names actually handed out,
+		// not the original requested names — an independent review of
+		// the first version of this fix (which kept a per-original-name
+		// counter) found it still collided on a mixed set like
+		// ["image.png", "image.png", "image-1.png"]: the second
+		// "image.png" disambiguated to "image-1.png", and the literal
+		// third entry then silently reused (overwrote) that same
+		// generated name. Looping against the used-name set instead of a
+		// single counter closes that gap for any input ordering.
 		finalName := name
-		if n := usedNames[name]; n > 0 {
+		if usedNames[finalName] {
 			ext := filepath.Ext(name)
 			base := strings.TrimSuffix(name, ext)
-			finalName = fmt.Sprintf("%s-%d%s", base, n, ext)
+			for n := 1; ; n++ {
+				candidate := fmt.Sprintf("%s-%d%s", base, n, ext)
+				if !usedNames[candidate] {
+					finalName = candidate
+					break
+				}
+			}
 		}
-		usedNames[name]++
+		usedNames[finalName] = true
 
 		path := filepath.Join(tempDir, finalName)
 		if werr := os.WriteFile(path, e.fp.Data, 0o644); werr != nil {

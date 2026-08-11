@@ -22,15 +22,11 @@ var webSearchDescriptionTpl = template.Must(
 // NewWebSearchTool creates a web search tool for sub-agents (no permissions needed).
 func NewWebSearchTool(client *http.Client) fantasy.AgentTool {
 	if client == nil {
-		transport := http.DefaultTransport.(*http.Transport).Clone()
-		transport.MaxIdleConns = 100
-		transport.MaxIdleConnsPerHost = 10
-		transport.IdleConnTimeout = 90 * time.Second
-
-		client = &http.Client{
-			Timeout:   30 * time.Second,
-			Transport: transport,
-		}
+		// SSRF-guarded for consistency with the other model-facing HTTP
+		// tools — see ssrf_guard.go. The search endpoint itself is fixed,
+		// not model-controlled, so this is defense-in-depth rather than
+		// closing a direct exfiltration path.
+		client = NewSSRFGuardedClient(30*time.Second, false)
 	}
 
 	return fantasy.NewParallelAgentTool(

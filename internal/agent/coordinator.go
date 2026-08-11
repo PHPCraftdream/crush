@@ -1537,6 +1537,18 @@ func (c *coordinator) buildToolsAgentConfig(agent config.Agent, isSubAgent bool)
 func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubAgent bool) ([]fantasy.AgentTool, error) {
 	agent = c.buildToolsAgentConfig(agent, isSubAgent)
 
+	// SSRF guard escape hatch (Options.AllowPrivateNetworkFetch, off by
+	// default): when enabled, every model-facing HTTP tool below gets an
+	// explicit allowPrivate=true client instead of letting its own nil
+	// fallback build the guarded default. See ssrf_guard.go.
+	allowPrivateNetworkFetch := c.cfg.Config().Options.AllowPrivateNetworkFetch
+	fetchClient := func(timeout time.Duration) *http.Client {
+		if !allowPrivateNetworkFetch {
+			return nil
+		}
+		return tools.NewSSRFGuardedClient(timeout, true)
+	}
+
 	var allTools []fantasy.AgentTool
 	if slices.Contains(agent.AllowedTools, AgentToolName) {
 		agentTool, err := c.agentTool(ctx)
@@ -1547,7 +1559,7 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubA
 	}
 
 	if slices.Contains(agent.AllowedTools, tools.AgenticFetchToolName) {
-		agenticFetchTool, err := c.agenticFetchTool(ctx, nil)
+		agenticFetchTool, err := c.agenticFetchTool(ctx, fetchClient(30*time.Second))
 		if err != nil {
 			return nil, err
 		}
@@ -1594,15 +1606,15 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubA
 		tools.NewCrushLogsTool(logFile),
 		tools.NewJobOutputTool(),
 		tools.NewJobKillTool(),
-		tools.NewDownloadTool(c.permissions, c.cfg.WorkingDir(), nil),
+		tools.NewDownloadTool(c.permissions, c.cfg.WorkingDir(), fetchClient(5*time.Minute)),
 		tools.NewEditTool(c.permissions, c.history, c.filetracker, c.cfg.WorkingDir()),
 		tools.NewMultiEditTool(c.permissions, c.history, c.filetracker, c.cfg.WorkingDir()),
-		tools.NewFetchTool(c.permissions, c.cfg.WorkingDir(), nil),
+		tools.NewFetchTool(c.permissions, c.cfg.WorkingDir(), fetchClient(30*time.Second)),
 		tools.NewGlobTool(c.cfg.WorkingDir()),
 		tools.NewGrepTool(c.cfg.WorkingDir(), c.cfg.Config().Tools.Grep),
 		tools.NewLsTool(c.permissions, c.cfg.WorkingDir(), c.cfg.Config().Tools.Ls),
 		tools.NewReadDelegationTranscriptTool(c.sessions, c.messages),
-		tools.NewSourcegraphTool(nil),
+		tools.NewSourcegraphTool(fetchClient(30*time.Second)),
 		tools.NewTodosTool(c.sessions),
 		tools.NewViewTool(c.permissions, c.filetracker, c.skillTracker, c.cfg.WorkingDir(), c.cfg.Config().Options.SkillsPaths...),
 		tools.NewWriteTool(c.permissions, c.history, c.filetracker, c.cfg.WorkingDir()),

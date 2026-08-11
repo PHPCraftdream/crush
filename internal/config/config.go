@@ -395,6 +395,15 @@ type Options struct {
 	Progress                  *bool        `json:"progress,omitempty" jsonschema:"description=Show indeterminate progress updates during long operations,default=true"`
 	DisableNotifications      bool         `json:"disable_notifications,omitempty" jsonschema:"description=Disable desktop notifications,default=false"`
 	DisabledSkills            []string     `json:"disabled_skills,omitempty" jsonschema:"description=List of skill names to disable and hide from the agent,example=crush-config"`
+	// AllowPrivateNetworkFetch disables the SSRF guard (see
+	// internal/agent/tools/ssrf_guard.go) on download/fetch/agentic_fetch/
+	// web_fetch/web_search/sourcegraph, letting the model reach
+	// loopback/private/link-local addresses (e.g. a local dev server on
+	// 127.0.0.1 or an internal host). Off by default: the guard exists to
+	// stop a prompt-injected or malicious model from exfiltrating cloud
+	// instance-metadata (169.254.169.254 et al.) through final_text.
+	// Enable only in trusted local-dev/self-hosted setups.
+	AllowPrivateNetworkFetch bool `json:"allow_private_network_fetch,omitempty" jsonschema:"description=Allow download/fetch/web tools to reach loopback/private/link-local network addresses. Off by default as an SSRF defense-in-depth measure; enable only for trusted local-dev/self-hosted use.,default=false"`
 	// StreamIdleTimeoutSeconds overrides the default 3-minute stream
 	// watchdog timeout (see internal/agent/stream_watchdog.go). The
 	// watchdog cancels the LLM streaming request if the provider stops
