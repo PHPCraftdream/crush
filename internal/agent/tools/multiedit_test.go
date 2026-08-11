@@ -49,15 +49,15 @@ func (m *mockPermissionService) SubscribeNotifications(ctx context.Context) <-ch
 // Fork merge note: persistent-permission CRUD methods that satisfy the
 // fork-extended Service interface. No-ops in tests — see view_test.go for the
 // matching pattern.
-func (m *mockPermissionService) ListSessionPermissions(sessionID string) ([]db.SessionPermission, error) {
+func (m *mockPermissionService) ListSessionPermissions(ctx context.Context, sessionID string) ([]db.SessionPermission, error) {
 	return nil, nil
 }
 
-func (m *mockPermissionService) UpdatePermissionEnabled(ruleID string, enabled bool) error {
+func (m *mockPermissionService) UpdatePermissionEnabled(ctx context.Context, ruleID string, enabled bool) error {
 	return nil
 }
 
-func (m *mockPermissionService) DeletePermission(ruleID string) error {
+func (m *mockPermissionService) DeletePermission(ctx context.Context, ruleID string) error {
 	return nil
 }
 

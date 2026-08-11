@@ -45,15 +45,15 @@ func (m *mockBashPermissionService) SubscribeNotifications(ctx context.Context) 
 	return make(<-chan pubsub.Event[permission.PermissionNotification])
 }
 
-func (m *mockBashPermissionService) ListSessionPermissions(string) ([]db.SessionPermission, error) {
+func (m *mockBashPermissionService) ListSessionPermissions(context.Context, string) ([]db.SessionPermission, error) {
 	return nil, nil
 }
 
-func (m *mockBashPermissionService) UpdatePermissionEnabled(string, bool) error {
+func (m *mockBashPermissionService) UpdatePermissionEnabled(context.Context, string, bool) error {
 	return nil
 }
 
-func (m *mockBashPermissionService) DeletePermission(string) error {
+func (m *mockBashPermissionService) DeletePermission(context.Context, string) error {
 	return nil
 }
 
@@ -214,15 +214,15 @@ func (m *recordingPermissionService) SubscribeNotifications(ctx context.Context)
 // (ListSessionPermissions / UpdatePermissionEnabled / DeletePermission)
 // for the WebUI's permissions modal. Stub them so the upstream
 // recordingPermissionService satisfies our extended interface.
-func (m *recordingPermissionService) ListSessionPermissions(sessionID string) ([]db.SessionPermission, error) {
+func (m *recordingPermissionService) ListSessionPermissions(ctx context.Context, sessionID string) ([]db.SessionPermission, error) {
 	return nil, nil
 }
 
-func (m *recordingPermissionService) UpdatePermissionEnabled(ruleID string, enabled bool) error {
+func (m *recordingPermissionService) UpdatePermissionEnabled(ctx context.Context, ruleID string, enabled bool) error {
 	return nil
 }
 
-func (m *recordingPermissionService) DeletePermission(ruleID string) error {
+func (m *recordingPermissionService) DeletePermission(ctx context.Context, ruleID string) error {
 	return nil
 }
 

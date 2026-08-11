@@ -243,15 +243,15 @@ func (m *mockViewPermissionService) SubscribeNotifications(ctx context.Context) 
 // interface that exposes the persistent-permission CRUD to the web UI. The
 // mock implementations are intentionally no-ops because none of the view-tool
 // paths touch persisted rules.
-func (m *mockViewPermissionService) ListSessionPermissions(sessionID string) ([]db.SessionPermission, error) {
+func (m *mockViewPermissionService) ListSessionPermissions(ctx context.Context, sessionID string) ([]db.SessionPermission, error) {
 	return nil, nil
 }
 
-func (m *mockViewPermissionService) UpdatePermissionEnabled(ruleID string, enabled bool) error {
+func (m *mockViewPermissionService) UpdatePermissionEnabled(ctx context.Context, ruleID string, enabled bool) error {
 	return nil
 }
 
-func (m *mockViewPermissionService) DeletePermission(ruleID string) error {
+func (m *mockViewPermissionService) DeletePermission(ctx context.Context, ruleID string) error {
 	return nil
 }
 
