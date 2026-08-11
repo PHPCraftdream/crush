@@ -75,7 +75,8 @@ func RefreshDockerMCPAvailability() bool {
 		dockerMCPAvailabilityCache.mu.Unlock()
 		return available, nil
 	})
-	return v.(bool)
+	available, _ := v.(bool)
+	return available
 }
 
 // IsDockerMCPEnabled checks if Docker MCP is already configured.
