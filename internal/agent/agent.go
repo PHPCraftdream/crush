@@ -339,6 +339,20 @@ type SessionAgentCall struct {
 	// turn then falls back to the agent's shared systemPrompt, which is
 	// exactly the field another session's override rewrites.
 	SystemPrompt *string
+
+	// FromDurableQueue is true when this call originates from the durable
+	// run queue (task #340). When true and the session's mailbox is already
+	// owned by another in-process turn, mailbox.submit does NOT append this
+	// call to mb.submitted — the durable row itself provides the retry path,
+	// so no in-process handoff is needed. This prevents double-execution
+	// where both the live owner (draining mb.submitted) and the pump (after
+	// its backoff expires) would execute the same logical request independently
+	// (P0-1 in docs/reviews/2026-08-11-release-readiness-concurrency-and-code-review.md).
+	//
+	// For non-durable calls (web/CLI turns, cross-process interrupt-inject via
+	// requeueInterruptMessage), FromDurableQueue is false and the mailbox queue
+	// is the only retry path, so submit's normal mb.submitted behavior applies.
+	FromDurableQueue bool
 }
 
 // turnConfig is the immutable per-call snapshot of everything model- and

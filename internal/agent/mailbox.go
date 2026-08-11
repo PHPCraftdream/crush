@@ -367,7 +367,19 @@ func (mb *mailbox) submit(call SessionAgentCall, dispatcherCancel context.Cancel
 	//     reports this call as orphaned, and drainOrReleaseMerged restarts
 	//     it via restartOrphaned — a detached durable-queue enqueue (task
 	//     #340), NOT a handoff to any "still-live" loop.
-	mb.submitted = append(mb.submitted, call)
+	//
+	// P0-1 fix (docs/reviews/2026-08-11-release-readiness-concurrency-and-code-review.md):
+	// calls FROM the durable queue (call.FromDurableQueue) do NOT get enqueued
+	// in mb.submitted here. The durable row itself is already the retry path,
+	// and the pump will re-lease it after its backoff expires (see
+	// RunQueuePump.executeEntry's ErrCallQueuedNotExecuted handling).
+	// Enqueuing here would create a double-execution hazard: the live owner
+	// would execute the mb.submitted copy, then after backoff the pump would
+	// execute the same durable row again independently. For non-durable calls,
+	// the mailbox queue IS the only retry path, so they are enqueued normally.
+	if !call.FromDurableQueue {
+		mb.submitted = append(mb.submitted, call)
+	}
 	return false, 0 // caller queues and returns nil, exactly like today
 }
 

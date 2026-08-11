@@ -2432,6 +2432,10 @@ func (c *coordinator) RebuildSessionAgentCall(ctx context.Context, data session.
 		SmallModel:           &smallModel,
 		SystemPromptPrefix:   data.SystemPromptPrefix,
 		SystemPrompt:         data.SystemPrompt,
+		// Mark as originating from the durable queue so mailbox.submit can
+		// skip mb.submitted for this call (P0-1: avoid double-execution).
+		// See agent.SessionAgentCall.FromDurableQueue documentation.
+		FromDurableQueue: true,
 	}, nil
 }
 

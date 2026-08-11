@@ -47,6 +47,67 @@ func TestMailbox_Submit_QueuesWhenAlreadyOwned(t *testing.T) {
 	require.Equal(t, second, mb.submitted[0])
 }
 
+// TestMailbox_Submit_DurableCallSkipsQueueWhenAlreadyOwned is the direct
+// unit-level regression test for P0-1
+// (docs/reviews/2026-08-11-release-readiness-concurrency-and-code-review.md):
+// a call with FromDurableQueue=true must NOT be appended to mb.submitted
+// when the mailbox is already owned — the durable row itself is the retry
+// path (RunQueuePump re-leases it after ErrCallQueuedNotExecuted's backoff),
+// so queuing a second copy here would let both the live owner (draining
+// mb.submitted) and the pump (re-leasing the durable row) execute the same
+// logical request independently.
+//
+// The crush-delegated fix's own test (p0_1_durable_double_execution_test.go
+// in internal/session) exercises this indirectly through a mocked
+// Coordinator that never touches the real mailbox — verified by hand that
+// it still passes with the `if !call.FromDurableQueue` guard removed, i.e.
+// it does not actually prove the fix. This test targets the exact line
+// instead.
+//
+// REVERT CHECK: remove the `if !call.FromDurableQueue` guard in submit()
+// (restore unconditional `mb.submitted = append(mb.submitted, call)`), this
+// test fails (submitted becomes length 1 instead of 0); restore the guard,
+// it passes again.
+func TestMailbox_Submit_DurableCallSkipsQueueWhenAlreadyOwned(t *testing.T) {
+	mb := &mailbox{}
+	first := SessionAgentCall{SessionID: "s1", Prompt: "live owner's own turn"}
+	durable := SessionAgentCall{SessionID: "s1", Prompt: "durable retry", FromDurableQueue: true}
+
+	becomeOwner1, epoch1 := mb.submit(first, func() {})
+	require.True(t, becomeOwner1)
+	require.NotZero(t, epoch1)
+
+	becomeOwner2, epoch2 := mb.submit(durable, func() {})
+	require.False(t, becomeOwner2, "submit while owned must not become owner regardless of FromDurableQueue")
+	require.Zero(t, epoch2)
+	require.Equal(t, mbOwned, mb.state, "state must remain owned")
+	require.Empty(t, mb.submitted,
+		"a durable-queue call must NOT be appended to mb.submitted when the mailbox is busy — "+
+			"the durable row is its own retry path; queuing it here would double-execute it "+
+			"once via the live owner's drain and once via the pump's re-lease after backoff")
+}
+
+// TestMailbox_Submit_NonDurableCallStillQueuesWhenAlreadyOwned is the
+// companion proving the P0-1 fix does not change behavior for ordinary
+// (non-durable) calls — the fast in-process handoff via mb.submitted must
+// still work for normal web/CLI turns and cross-process interrupt-injects,
+// which have no durable row backing them and rely on the mailbox queue as
+// their ONLY retry path.
+func TestMailbox_Submit_NonDurableCallStillQueuesWhenAlreadyOwned(t *testing.T) {
+	mb := &mailbox{}
+	first := SessionAgentCall{SessionID: "s1", Prompt: "live owner's own turn"}
+	ordinary := SessionAgentCall{SessionID: "s1", Prompt: "ordinary web turn", FromDurableQueue: false}
+
+	becomeOwner1, _ := mb.submit(first, func() {})
+	require.True(t, becomeOwner1)
+
+	becomeOwner2, epoch2 := mb.submit(ordinary, func() {})
+	require.False(t, becomeOwner2)
+	require.Zero(t, epoch2)
+	require.Len(t, mb.submitted, 1, "an ordinary (non-durable) call must still be queued in mb.submitted")
+	require.Equal(t, ordinary, mb.submitted[0])
+}
+
 // TestMailbox_Submit_QueuesWhenReleasing is the direct unit-level companion
 // to the invariant-table/lock tests: submit() must treat mbReleasing (#296/
 // P1-C) exactly like mbOwned — queue the call rather than become owner —
