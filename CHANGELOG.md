@@ -1296,3 +1296,35 @@ finished the mailbox migration:
     reserved for a future web UI surface) now accept a caller `ctx`
     instead of using `context.Background()` internally; a misplaced
     doc-comment was moved to the function it actually documents.
+
+  **Closing independent review of this round's own fixes** found 1
+  blocker and 3 bugs in the fixes above — all confirmed and closed the
+  same way, with revert-checks on the security-relevant ones:
+  - **The new SSRF guard only covered 2 of 6 model-facing HTTP tools**
+    — `download`/`fetch` were guarded, but `agentic_fetch`, `web_fetch`
+    (which `agentic_fetch`'s spawned sub-agent gets, and which
+    explicitly skips the permission system), `web_search`, and
+    `sourcegraph` each built their own unguarded client, leaving the
+    exact exfiltration path the guard was supposed to close still open
+    through those four. All six now share the same guarded default.
+  - **The guard's documented "inject a client with `allowPrivate=true`"
+    escape hatch didn't actually exist anywhere in production wiring**
+    — a routine local-dev fetch (`http://localhost:3000/...`) was
+    permanently blocked with no way to restore it short of a code
+    change. Added an off-by-default `allow_private_network_fetch`
+    config option, wired through to all six guarded tools.
+  - **The guard was bypassable via `HTTP_PROXY`/`HTTPS_PROXY`** — the
+    dial-time check only ever sees the address actually dialed, which
+    is the proxy's address when one is configured, not the request's
+    real target. The guarded transport now disables proxying outright.
+  - **The attachment-filename-collision fix (above) still collided on
+    a mixed input set** — e.g. `["image.png", "image.png",
+    "image-1.png"]`: the second `image.png` disambiguated to
+    `image-1.png`, and the third, literal `image-1.png` then silently
+    reused that generated name. Fixed by tracking the set of names
+    actually written instead of a per-original-name counter.
+  - **The download atomic-write fix (above) silently dropped the
+    downloaded file's permissions** from world-readable to owner-only
+    (`os.CreateTemp`'s default `0600`, never chmod'd back up before the
+    rename, unlike the codebase's own `fsext.AtomicWriteFile`
+    convention it was modeled on).
