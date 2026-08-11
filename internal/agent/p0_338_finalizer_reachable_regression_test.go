@@ -152,7 +152,7 @@ func TestP0_338_FinalizerReachableDespiteHungCleanup(t *testing.T) {
 		IsYolo:        true,
 		SystemPrompt:  "You are a test assistant.",
 		LockOptions: []session.LockOption{
-			session.WithClearHolderMetadataFn(func(path string) {
+			session.WithClearHolderMetadataFn(func(path string, expectedGeneration string) {
 				t.Logf("cleanup goroutine started for path: %s", path)
 				cleanupStarted.Store(true)
 				// Block for 2 seconds to prove the point, then unblock to avoid process cleanup issues.

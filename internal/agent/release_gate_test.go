@@ -126,7 +126,7 @@ func TestReleaseGate_1_MetadataCleanupBlockedForever(t *testing.T) {
 		IsYolo:       true,
 		SystemPrompt: "You are a test assistant.",
 		LockOptions: []session.LockOption{
-			session.WithClearHolderMetadataFn(func(path string) {
+			session.WithClearHolderMetadataFn(func(path string, expectedGeneration string) {
 				cleanupStarted.Store(true)
 				// PERMANENTLY BLOCK
 				select {
