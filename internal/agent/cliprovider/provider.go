@@ -937,8 +937,12 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 			if err != nil {
 				slog.Warn("cliprovider: failed to start qwen MCP server", "err", err)
 			} else {
-				// Remove stale entry first, then register with current URL+token.
-				deregisterQwenMCP(id)
+				// registerQwenMCP below unconditionally replaces
+				// mcpServers[id] with a fresh map, so a leading
+				// deregister-then-register here was always redundant
+				// (removed: it also used to unsafely delete a possibly
+				// concurrent session's live entry — see
+				// deregisterQwenMCP's own doc for the full story).
 				if regErr := registerQwenMCP(id, mcpSrv.mcpURL()); regErr != nil {
 					slog.Warn("cliprovider: failed to register qwen MCP server", "err", regErr)
 					mcpSrv.stop()
@@ -982,7 +986,12 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 			if err != nil {
 				slog.Warn("cliprovider: failed to start gemini MCP server", "err", err)
 			} else {
-				deregisterGeminiMCP(id)
+				// registerGeminiMCP below unconditionally replaces
+				// mcpServers[id] with a fresh map, so a leading
+				// deregister-then-register here was always redundant
+				// (removed: it also used to unsafely delete a possibly
+				// concurrent session's live entry — see
+				// deregisterGeminiMCP's own doc for the full story).
 				if regErr := registerGeminiMCP(id, mcpSrv.addr, mcpSrv.token); regErr != nil {
 					slog.Warn("cliprovider: failed to register gemini MCP server", "err", regErr)
 					mcpSrv.stop()
@@ -1368,10 +1377,15 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 			defer os.RemoveAll(attachTmpDir)
 		}
 		if qwenMCPName != "" {
-			defer deregisterQwenMCP(qwenMCPName)
+			// Pass the exact url this call registered (mcpSrv is
+			// guaranteed non-nil here: qwenMCPName is only set after a
+			// successful registerQwenMCP above, using this same mcpSrv) —
+			// see deregisterQwenMCP's doc for why an unconditional delete
+			// is unsafe.
+			defer deregisterQwenMCP(qwenMCPName, mcpSrv.mcpURL())
 		}
 		if geminiMCPName != "" {
-			defer deregisterGeminiMCP(geminiMCPName)
+			defer deregisterGeminiMCP(geminiMCPName, mcpSrv.addr)
 		}
 
 		// Ensure the child process is reaped and its output fds are cleaned up
@@ -1589,6 +1603,7 @@ func saveFileParts(msgs fantasy.Prompt) (tempDir string, filePaths map[int][]str
 	}
 
 	filePaths = make(map[int][]string)
+	usedNames := make(map[string]int)
 	for seq, e := range entries {
 		name := e.fp.Filename
 		if name == "" {
@@ -1600,7 +1615,26 @@ func saveFileParts(msgs fantasy.Prompt) (tempDir string, filePaths map[int][]str
 		}
 		// Sanitize: keep only the base name.
 		name = filepath.Base(name)
-		path := filepath.Join(tempDir, name)
+
+		// Disambiguate on collision (found by a full-project @crush
+		// --role reviewer audit): two FileParts sharing the same base
+		// filename (e.g. two "image.png" attachments from different
+		// messages) used to silently write to the same path — the
+		// second os.WriteFile overwrote the first, but both entries'
+		// filePaths still pointed at that one path, now containing only
+		// the last write's content. Preserve the original name in the
+		// common (non-colliding) case; append a "-N" suffix only when
+		// needed, mirroring saveAttachmentToDisk's own reasoning in
+		// internal/server/handlers.go.
+		finalName := name
+		if n := usedNames[name]; n > 0 {
+			ext := filepath.Ext(name)
+			base := strings.TrimSuffix(name, ext)
+			finalName = fmt.Sprintf("%s-%d%s", base, n, ext)
+		}
+		usedNames[name]++
+
+		path := filepath.Join(tempDir, finalName)
 		if werr := os.WriteFile(path, e.fp.Data, 0o644); werr != nil {
 			slog.Warn("cliprovider: failed to write attachment", "path", path, "err", werr)
 			continue

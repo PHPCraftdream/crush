@@ -227,24 +227,7 @@ func NewBashTool(permissions permission.Service, workingDir string, attribution 
 			// Determine working directory
 			execWorkingDir := cmp.Or(params.WorkingDir, workingDir)
 
-			isSafeReadOnly := false
-			cmdLower := strings.ToLower(params.Command)
-
-			// Only single simple commands qualify for the safe-read-only
-			// fast-path. A compound command (chaining, backgrounding,
-			// substitution, subshell) always goes through the permission
-			// prompt, so a safe prefix can never smuggle a second command
-			// (e.g. "git status && rm -rf /", or "git status\nrm -rf /").
-			if !shell.IsCompoundCommand(params.Command) {
-				for _, safe := range safeCommands {
-					if strings.HasPrefix(cmdLower, safe) {
-						if len(cmdLower) == len(safe) || cmdLower[len(safe)] == ' ' || cmdLower[len(safe)] == '-' {
-							isSafeReadOnly = true
-							break
-						}
-					}
-				}
-			}
+			isSafeReadOnly := isSafeReadOnlyCommand(params.Command)
 
 			sessionID := GetSessionFromContext(ctx)
 			if sessionID == "" {

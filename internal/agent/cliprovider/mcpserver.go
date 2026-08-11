@@ -864,10 +864,25 @@ func registerQwenMCP(serverName, url string) error {
 	return fsext.AtomicWriteFile(path, data, 0o644)
 }
 
-// deregisterQwenMCP removes the crush MCP entry from ~/.qwen/settings.json.
+// deregisterQwenMCP removes the crush MCP entry from ~/.qwen/settings.json,
+// but ONLY if it still points at expectedURL — the exact url this specific
+// call's own registerQwenMCP wrote.
+//
+// serverName is a STABLE per-workingDir ID (see qwenMCPID), so two
+// concurrent crush sessions in the same project both integrating with Qwen
+// share one mcpServers[serverName] entry: registerQwenMCP unconditionally
+// overwrites it with whichever session called last, and an unconditional
+// delete here used to remove the entry regardless of which session
+// currently owned it — found by a full-project @crush --role reviewer
+// audit. Session A finishing first would delete session B's still-active
+// registration (B's own overwrite already replaced A's url with B's own),
+// breaking qwen's ability to reconnect to B's MCP server for the rest of
+// B's session. Comparing the stored url first makes this call a safe no-op
+// once a later session has taken over the shared name, instead of
+// clobbering that later session's entry.
 //
 // Fork patch (concurrency): same flock + atomic-write as registerQwenMCP.
-func deregisterQwenMCP(serverName string) {
+func deregisterQwenMCP(serverName, expectedURL string) {
 	path, err := qwenSettingsPath()
 	if err != nil {
 		return
@@ -887,6 +902,14 @@ func deregisterQwenMCP(serverName string) {
 	}
 	mcpServers, _ := settings["mcpServers"].(map[string]any)
 	if mcpServers == nil {
+		return
+	}
+	entry, ok := mcpServers[serverName].(map[string]any)
+	if !ok {
+		return
+	}
+	if storedURL, _ := entry["httpUrl"].(string); storedURL != expectedURL {
+		slog.Debug("cliprovider: qwen MCP entry no longer ours, leaving it for its current owner", "name", serverName)
 		return
 	}
 	delete(mcpServers, serverName)
@@ -994,10 +1017,15 @@ func registerGeminiMCP(serverName, addr, token string) error {
 	return fsext.AtomicWriteFile(path, data, 0o644)
 }
 
-// deregisterGeminiMCP removes the crush MCP entry from ~/.gemini/settings.json.
+// deregisterGeminiMCP removes the crush MCP entry from
+// ~/.gemini/settings.json, but ONLY if it still points at expectedAddr —
+// the exact addr this specific call's own registerGeminiMCP wrote. See
+// deregisterQwenMCP's doc for why an unconditional delete is unsafe when
+// two concurrent sessions in the same project share one stable server name
+// (serverName, from geminiMCPID).
 //
 // Fork patch (concurrency): flock + atomic-write — see registerQwenMCP.
-func deregisterGeminiMCP(serverName string) {
+func deregisterGeminiMCP(serverName, expectedAddr string) {
 	path, err := geminiSettingsPath()
 	if err != nil {
 		return
@@ -1017,6 +1045,14 @@ func deregisterGeminiMCP(serverName string) {
 	}
 	mcpServers, _ := settings["mcpServers"].(map[string]any)
 	if mcpServers == nil {
+		return
+	}
+	entry, ok := mcpServers[serverName].(map[string]any)
+	if !ok {
+		return
+	}
+	if storedURL, _ := entry["url"].(string); storedURL != "http://"+expectedAddr+"/mcp" {
+		slog.Debug("cliprovider: gemini MCP entry no longer ours, leaving it for its current owner", "name", serverName)
 		return
 	}
 	delete(mcpServers, serverName)

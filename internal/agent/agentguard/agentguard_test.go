@@ -153,6 +153,65 @@ func TestCheck_BlocksExecAndNohupWrappers(t *testing.T) {
 	}
 }
 
+// B-2 regression test (found by a full-project @crush --role reviewer
+// audit, 2026-08-11): env/nice/timeout were missing from the wrapper
+// strip-list, so "env claude ...", "nice claude ...", "timeout 30 claude
+// ..." all bypassed this guard entirely — head stayed "env"/"nice"/
+// "timeout", never matching deniedAgents. Doubly dangerous in combination
+// with the sibling B-1 bug (these same three names were also in
+// tools/safe.go's safeCommands, skipping the permission prompt too), so a
+// single "env claude --dangerously-skip-permissions ..." bypassed both the
+// recursion guard and the permission prompt at once.
+//
+// REVERT CHECK PROCEDURE:
+//  1. In agentguard.go's checkSegment, remove the "env", "nice", "timeout"
+//     cases from the stripLoop switch (restore the original 4-case bare
+//     `for (head == "exec" || ...) ...` loop).
+//  2. Run: go test ./internal/agent/agentguard -run TestCheck_BlocksEnvNiceTimeoutWrappers -v
+//  3. FAIL: none of these commands are blocked.
+//  4. Restore the strip cases and PASS.
+func TestCheck_BlocksEnvNiceTimeoutWrappers(t *testing.T) {
+	cases := []string{
+		"env claude -p test",
+		"env -i claude -p test",
+		"env FOO=bar BAZ=qux claude -p test",
+		"env -u PATH claude -p test",
+		"nice claude -p test",
+		"nice -n 10 claude -p test",
+		"timeout 30 claude -p test",
+		"timeout -k 5 30 claude -p test",
+		"timeout --signal=KILL 30 claude -p test",
+		// Stacked wrappers: env wrapping nohup wrapping the real agent.
+		"env nohup claude -p test",
+	}
+	for _, cmd := range cases {
+		t.Run(cmd, func(t *testing.T) {
+			err := Check(cmd)
+			require.Error(t, err, "must block the agent invocation wrapped by env/nice/timeout")
+			var de *DeniedError
+			require.True(t, errors.As(err, &de))
+			assert.Equal(t, "claude", de.Tool)
+		})
+	}
+}
+
+// TestCheck_EnvNiceTimeoutAllowHarmlessCommands proves the fix didn't
+// overcorrect: env/nice/timeout wrapping an ordinary, non-agent command are
+// still allowed.
+func TestCheck_EnvNiceTimeoutAllowHarmlessCommands(t *testing.T) {
+	cases := []string{
+		"env echo hi",
+		"env FOO=bar npm test",
+		"nice -n 10 npm run build",
+		"timeout 30 npm test",
+	}
+	for _, cmd := range cases {
+		t.Run(cmd, func(t *testing.T) {
+			assert.NoError(t, Check(cmd))
+		})
+	}
+}
+
 func TestCanonicalName(t *testing.T) {
 	cases := []struct {
 		in, want string

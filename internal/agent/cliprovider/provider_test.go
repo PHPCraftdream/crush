@@ -175,6 +175,62 @@ func TestSaveFileParts(t *testing.T) {
 	}
 }
 
+// TestSaveFilePartsDisambiguatesCollidingFilenames is a BUG-3 regression
+// test (found by a full-project @crush --role reviewer audit, 2026-08-11):
+// two FileParts sharing the same base filename (e.g. two "image.png"
+// attachments from different messages) used to silently write to the same
+// path — the second os.WriteFile overwrote the first, but both entries'
+// filePaths still pointed at that one path, now containing only the last
+// write's content.
+//
+// REVERT CHECK PROCEDURE:
+//  1. In provider.go's saveFileParts, remove the usedNames-based
+//     disambiguation (use `name` directly as `finalName` unconditionally).
+//  2. Run: go test ./internal/agent/cliprovider -run TestSaveFilePartsDisambiguatesCollidingFilenames -v
+//  3. FAIL: both paths point at the same file, containing only the second
+//     write's content.
+//  4. Restore the disambiguation and PASS.
+func TestSaveFilePartsDisambiguatesCollidingFilenames(t *testing.T) {
+	msgs := fantasy.Prompt{
+		{Role: fantasy.MessageRoleUser, Content: []fantasy.MessagePart{
+			fantasy.FilePart{Filename: "image.png", Data: []byte("FIRST_IMAGE"), MediaType: "image/png"},
+		}},
+		{Role: fantasy.MessageRoleUser, Content: []fantasy.MessagePart{
+			fantasy.FilePart{Filename: "image.png", Data: []byte("SECOND_IMAGE"), MediaType: "image/png"},
+		}},
+	}
+
+	tmpDir, paths, err := saveFileParts(msgs)
+	if err != nil {
+		t.Fatalf("saveFileParts() error: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	if len(paths[0]) != 1 || len(paths[1]) != 1 {
+		t.Fatalf("expected 1 file each for msg 0 and msg 1, got %v", paths)
+	}
+	path1, path2 := paths[0][0], paths[1][0]
+	if path1 == path2 {
+		t.Fatalf("colliding filenames must be written to DIFFERENT paths, both resolved to %q", path1)
+	}
+
+	data1, err := os.ReadFile(path1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data1) != "FIRST_IMAGE" {
+		t.Errorf("first file content = %q, want %q — the second write must not have overwritten it", data1, "FIRST_IMAGE")
+	}
+
+	data2, err := os.ReadFile(path2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data2) != "SECOND_IMAGE" {
+		t.Errorf("second file content = %q, want %q", data2, "SECOND_IMAGE")
+	}
+}
+
 func TestSaveFilePartsNoFiles(t *testing.T) {
 	msgs := fantasy.Prompt{
 		fantasy.NewUserMessage("just text"),

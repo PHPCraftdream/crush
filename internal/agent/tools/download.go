@@ -32,6 +32,15 @@ type DownloadPermissionsParams struct {
 
 const DownloadToolName = "download"
 
+// MaxDownloadBytes bounds how much of the response body download will
+// write to disk. Found missing by a full-project @crush --role reviewer
+// audit: without a limit, a URL serving an unbounded stream (or a slow-drip
+// server exploiting Timeout=0, which only bounds the HTTP client's overall
+// deadline, not response size) could fill the disk. 500 MiB is generous for
+// the tool's normal use (docs, small datasets, archives) while still being
+// a hard ceiling.
+const MaxDownloadBytes = 500 * 1024 * 1024
+
 //go:embed download.md.tpl
 var downloadDescriptionTmpl []byte
 
@@ -139,19 +148,47 @@ func NewDownloadTool(permissions permission.Service, workingDir string, client *
 				return fantasy.ToolResponse{}, fmt.Errorf("failed to create parent directories: %w", err)
 			}
 
-			// Create the output file
-			outFile, err := os.Create(filePath)
+			// Write to a temp file in the same directory, then rename over
+			// filePath — a network failure or ctx-cancel mid-copy must
+			// never leave a truncated file at filePath for a later
+			// view/edit to read as valid content. Mirrors
+			// fsext.AtomicWriteFile's pattern, but streaming (via io.Copy
+			// from a size-limited reader) since downloads can be large
+			// enough that buffering the whole body first would be wasteful.
+			tmpFile, err := os.CreateTemp(filepath.Dir(filePath), filepath.Base(filePath)+".*.tmp")
 			if err != nil {
 				return fantasy.ToolResponse{}, fmt.Errorf("failed to create output file: %w", err)
 			}
-			defer outFile.Close()
+			tmpPath := tmpFile.Name()
+			cleanupTmp := func() { _ = os.Remove(tmpPath) }
 
-			// Copy data without an explicit size limit.
-			// The overall download is still constrained by the HTTP client's timeout
-			// and any upstream server limits.
-			bytesWritten, err := io.Copy(outFile, resp.Body)
+			// Read one byte past the limit so an oversized body is detected
+			// (bytesWritten > MaxDownloadBytes) rather than silently
+			// truncated to exactly the limit and reported as a "complete"
+			// download.
+			bytesWritten, err := io.Copy(tmpFile, io.LimitReader(resp.Body, MaxDownloadBytes+1))
 			if err != nil {
+				tmpFile.Close()
+				cleanupTmp()
 				return fantasy.ToolResponse{}, fmt.Errorf("failed to write file: %w", err)
+			}
+			if bytesWritten > MaxDownloadBytes {
+				tmpFile.Close()
+				cleanupTmp()
+				return fantasy.NewTextErrorResponse(fmt.Sprintf("download exceeds the %d byte limit", MaxDownloadBytes)), nil
+			}
+			if err := tmpFile.Sync(); err != nil {
+				tmpFile.Close()
+				cleanupTmp()
+				return fantasy.ToolResponse{}, fmt.Errorf("failed to flush output file: %w", err)
+			}
+			if err := tmpFile.Close(); err != nil {
+				cleanupTmp()
+				return fantasy.ToolResponse{}, fmt.Errorf("failed to close output file: %w", err)
+			}
+			if err := os.Rename(tmpPath, filePath); err != nil {
+				cleanupTmp()
+				return fantasy.ToolResponse{}, fmt.Errorf("failed to finalize downloaded file: %w", err)
 			}
 
 			contentType := resp.Header.Get("Content-Type")

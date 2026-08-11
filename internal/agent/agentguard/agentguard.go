@@ -173,8 +173,37 @@ func checkSegment(segment string) error {
 	head := tokens[i]
 	rest := tokens[i+1:]
 
-	// Strip leading "exec" / "command" / "time" wrappers (best effort).
-	for (head == "exec" || head == "command" || head == "time" || head == "nohup") && len(rest) > 0 {
+	// Strip leading command-wrapper utilities (best effort — enough to
+	// reach the wrapped command in ordinary invocations, not a full
+	// argument parser for each utility). "env", "nice", and "timeout" were
+	// found missing here by a full-project @crush --role reviewer audit:
+	// "env claude ...", "nice claude ...", "timeout 30 claude ..." all
+	// bypassed this guard entirely (head stayed "env"/"nice"/"timeout",
+	// never matching deniedAgents below) — the exact recursion class this
+	// package exists to close, and doubly dangerous in combination with
+	// the sibling bug where these same three names were also in
+	// tools/safe.go's safeCommands, skipping the permission prompt too.
+stripLoop:
+	for {
+		switch head {
+		case "exec", "command", "time", "nohup":
+			// No flags of their own to skip.
+		case "env":
+			rest = stripEnvWrapperArgs(rest)
+		case "nice":
+			rest = stripLeadingFlags(rest, niceValueFlags)
+		case "timeout":
+			rest = stripLeadingFlags(rest, timeoutValueFlags)
+			if len(rest) > 0 {
+				// timeout's own required positional: DURATION.
+				rest = rest[1:]
+			}
+		default:
+			break stripLoop
+		}
+		if len(rest) == 0 {
+			break stripLoop
+		}
 		head = rest[0]
 		rest = rest[1:]
 	}
@@ -383,6 +412,73 @@ func isEnvAssignment(tok string) bool {
 		return false
 	}
 	return true
+}
+
+// niceValueFlags and timeoutValueFlags list nice/timeout flags that consume
+// a separate following argument (as opposed to boolean flags), so
+// stripLeadingFlags knows to skip two tokens, not one, for these.
+var (
+	niceValueFlags = map[string]bool{
+		"-n": true, "--adjustment": true,
+	}
+	timeoutValueFlags = map[string]bool{
+		"-k": true, "--kill-after": true,
+		"-s": true, "--signal": true,
+	}
+)
+
+// stripLeadingFlags consumes leading flag tokens (and one value each, for
+// flags in valueFlags) until the first non-flag token, returning the
+// remaining tokens starting there. Best-effort — does not claim to handle
+// every flag form (e.g. --flag=value) for every utility, only common
+// invocation shapes.
+func stripLeadingFlags(tokens []string, valueFlags map[string]bool) []string {
+	i := 0
+	for i < len(tokens) && strings.HasPrefix(tokens[i], "-") {
+		if valueFlags[tokens[i]] {
+			i += 2
+		} else {
+			i++
+		}
+	}
+	if i > len(tokens) {
+		i = len(tokens)
+	}
+	return tokens[i:]
+}
+
+// stripEnvWrapperArgs consumes env's own leading VAR=value assignments and
+// common flags (-i, -0, -u NAME, -C dir, -S string, --), returning the
+// remaining tokens starting at the wrapped command. Best-effort — matches
+// the same "good enough to reach the real command" bar as the rest of this
+// file's wrapper handling, not a full GNU env argument parser.
+func stripEnvWrapperArgs(tokens []string) []string {
+	i := 0
+	for i < len(tokens) {
+		t := tokens[i]
+		if t == "--" {
+			i++
+			break
+		}
+		if isEnvAssignment(t) {
+			i++
+			continue
+		}
+		if strings.HasPrefix(t, "-") {
+			switch t {
+			case "-u", "--unset", "-C", "--chdir", "-S", "--split-string":
+				i += 2
+			default:
+				i++
+			}
+			continue
+		}
+		break
+	}
+	if i > len(tokens) {
+		i = len(tokens)
+	}
+	return tokens[i:]
 }
 
 // splitChained breaks the command on top-level &&, ||, ;, |. Naive — does
