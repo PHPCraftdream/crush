@@ -99,6 +99,10 @@ func (m *mockCoordinatorForShutdown) BuildSystemPrompt(ctx context.Context) (str
 	panic("unexpected: Shutdown does not call BuildSystemPrompt")
 }
 
+func (m *mockCoordinatorForShutdown) BuildSystemPromptForSession(ctx context.Context, sessionID string) (string, error) {
+	panic("unexpected: Shutdown does not call BuildSystemPromptForSession")
+}
+
 func (m *mockCoordinatorForShutdown) UpdateSessionSystemPrompt(ctx context.Context, sessionID, prompt string) error {
 	panic("unexpected: Shutdown does not call UpdateSessionSystemPrompt")
 }

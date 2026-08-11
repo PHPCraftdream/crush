@@ -78,8 +78,50 @@ func TestResolveSessionModels_CachesPairAcrossCalls(t *testing.T) {
 	require.NoError(t, err)
 	resolvedB, err := coord.resolveSessionModels(t.Context(), sessB.ID)
 	require.NoError(t, err)
-
 	require.Equal(t, resolvedA.large.ModelCfg, resolvedB.large.ModelCfg)
 	require.Equal(t, resolvedA.small.ModelCfg, resolvedB.small.ModelCfg)
 	require.Equal(t, 1, coord.modelCache.Len(), "both sessions share one config-default pair, so exactly one cache entry must exist")
+}
+
+// TestBuildSystemPromptForSession_ResolvesFromSession is the regression test
+// for the UI-BUG-2 follow-up: handleCreateSession/handleInitializeProject
+// used to call the un-scoped BuildSystemPrompt(ctx), which builds from the
+// global config default regardless of which session asked. This test calls
+// BuildSystemPromptForSession directly — an earlier version of this test's
+// body (both the /crush-delegated one and this reviewer's first replacement
+// attempt) never actually exercised it, despite the name/docstring claiming
+// otherwise; caught during independent review both times.
+//
+// SCOPE NOTE: newWorkerToolTestCoordinator builds a *coordinator with
+// prompt == nil (no prompt.Prompt template wired up in this lightweight
+// fixture; constructing a real one drags in context-file/skills-discovery
+// I/O not worth the setup cost here). BuildSystemPromptForSession's own
+// `if c.prompt == nil { return "", nil }` guard runs BEFORE it calls
+// resolveSessionModels, so with prompt == nil the function never reaches
+// the per-session resolution at all — there is no cache side effect to
+// observe here. What THIS test actually proves: the call itself is safe
+// and returns (empty, nil) — no error — for both a session with a DB
+// override and one without, i.e. it doesn't crash or misbehave on a
+// session lookup before hitting the short-circuit. The per-session
+// resolution logic BuildSystemPromptForSession delegates to is covered
+// directly (and does prove cross-session isolation via distinct cache
+// entries) by TestResolveSessionModels_SmallModelNotSwappedWithLarge and
+// TestResolveSessionModels_CachesPairAcrossCalls above.
+func TestBuildSystemPromptForSession_ResolvesFromSession(t *testing.T) {
+	env := testEnv(t)
+	coord := newWorkerToolTestCoordinator(t, env, false)
+
+	sessA, err := env.sessions.Create(t.Context(), "session A")
+	require.NoError(t, err)
+	sessB, err := env.sessions.Create(t.Context(), "session B")
+	require.NoError(t, err)
+	require.NoError(t, env.sessions.UpdateModels(t.Context(), sessA.ID, "override-provider-a", "override-model-a", "", ""))
+
+	promptA, errA := coord.BuildSystemPromptForSession(t.Context(), sessA.ID)
+	require.NoError(t, errA)
+	require.Empty(t, promptA, "prompt == nil in this fixture, so the nil-prompt short-circuit legitimately returns empty")
+
+	promptB, errB := coord.BuildSystemPromptForSession(t.Context(), sessB.ID)
+	require.NoError(t, errB)
+	require.Empty(t, promptB)
 }

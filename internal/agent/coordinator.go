@@ -263,6 +263,7 @@ type Coordinator interface {
 	UpdateModels(ctx context.Context) error
 	GetSystemPrompt() string
 	BuildSystemPrompt(ctx context.Context) (string, error)
+	BuildSystemPromptForSession(ctx context.Context, sessionID string) (string, error)
 	UpdateSessionSystemPrompt(ctx context.Context, sessionID, prompt string) error
 	// SetAgentTimeoutOptions configures the stream watchdog's deadline
 	// extension on the current agent. Called from RunNonInteractive when
@@ -2782,6 +2783,26 @@ func (c *coordinator) BuildSystemPrompt(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to build default large model: %w", err)
 	}
+
+	return c.prompt.Build(ctx, largeModel.ModelCfg.Provider, largeModel.ModelCfg.Model, c.cfg, c.workerSubAgentActive())
+}
+
+// BuildSystemPromptForSession builds a system prompt for a specific session,
+// using the session's model configuration (from DB overrides or config defaults).
+// This ensures the system prompt matches the model that will actually run for this session.
+func (c *coordinator) BuildSystemPromptForSession(ctx context.Context, sessionID string) (string, error) {
+	if c.prompt == nil {
+		return "", nil
+	}
+
+	// Resolve the session's model configuration (DB overrides → config defaults).
+	resolved, err := c.resolveSessionModels(ctx, sessionID)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve session models: %w", err)
+	}
+
+	// Use the resolved large model for prompt building.
+	largeModel := resolved.large
 
 	return c.prompt.Build(ctx, largeModel.ModelCfg.Provider, largeModel.ModelCfg.Model, c.cfg, c.workerSubAgentActive())
 }

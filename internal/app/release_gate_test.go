@@ -351,6 +351,11 @@ func (a *sessionAgentCoordinatorAdapter) BuildSystemPrompt(ctx context.Context) 
 	return a.sessionAgent.SystemPrompt(), nil
 }
 
+// BuildSystemPromptForSession - minimal implementation for test compatibility (not used by App.Shutdown())
+func (a *sessionAgentCoordinatorAdapter) BuildSystemPromptForSession(ctx context.Context, sessionID string) (string, error) {
+	return a.sessionAgent.SystemPrompt(), nil
+}
+
 // UpdateSessionSystemPrompt - minimal implementation for test compatibility (not used by App.Shutdown())
 func (a *sessionAgentCoordinatorAdapter) UpdateSessionSystemPrompt(ctx context.Context, sessionID, prompt string) error {
 	// For this test, just return nil - not used by App.Shutdown()

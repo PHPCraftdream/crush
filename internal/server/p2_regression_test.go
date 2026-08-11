@@ -108,6 +108,10 @@ func (f *fakeIsSessionBusyCoordinator) BuildSystemPrompt(ctx context.Context) (s
 	return "", nil
 }
 
+func (f *fakeIsSessionBusyCoordinator) BuildSystemPromptForSession(ctx context.Context, sessionID string) (string, error) {
+	return "", nil
+}
+
 func (f *fakeIsSessionBusyCoordinator) UpdateSessionSystemPrompt(ctx context.Context, sessionID, prompt string) error {
 	return nil
 }

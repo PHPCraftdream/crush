@@ -275,6 +275,10 @@ func (m *modelCallSpyAgent) BuildSystemPrompt(ctx context.Context) (string, erro
 	return "", nil
 }
 
+func (m *modelCallSpyAgent) BuildSystemPromptForSession(ctx context.Context, sessionID string) (string, error) {
+	return "", nil
+}
+
 func (m *modelCallSpyAgent) UpdateSessionSystemPrompt(ctx context.Context, sessionID, prompt string) error {
 	return nil
 }

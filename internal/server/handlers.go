@@ -601,7 +601,7 @@ func handleCreateSession(ctx context.Context, a *appPkg.App, c *Client, msg WSMe
 
 	// Generate and save the system prompt for the new session.
 	if a.AgentCoordinator != nil {
-		if sp, err := a.AgentCoordinator.BuildSystemPrompt(ctx); err == nil && sp != "" {
+		if sp, err := a.AgentCoordinator.BuildSystemPromptForSession(ctx, sess.ID); err == nil && sp != "" {
 			if err := a.AgentCoordinator.UpdateSessionSystemPrompt(ctx, sess.ID, sp); err == nil {
 				if updated, err := a.Sessions.Get(ctx, sess.ID); err == nil {
 					sess = updated
@@ -1656,14 +1656,21 @@ func handleInitializeProject(ctx context.Context, a *appPkg.App, c *Client, msg 
 		return
 	}
 
-	// Set default models from config.
+	// Set default models from config (both large and small).
 	cfg := store.Config()
+	var lp, lm, smallProvider, smallModel string
 	if large, ok := cfg.Models[config.SelectedModelTypeLarge]; ok {
-		_ = a.Sessions.UpdateModels(ctx, sess.ID, large.Provider, large.Model, "", "")
+		lp, lm = large.Provider, large.Model
+	}
+	if small, ok := cfg.Models[config.SelectedModelTypeSmall]; ok {
+		smallProvider, smallModel = small.Provider, small.Model
+	}
+	if lp != "" || smallProvider != "" {
+		_ = a.Sessions.UpdateModels(ctx, sess.ID, lp, lm, smallProvider, smallModel)
 	}
 
 	// Build and save the system prompt.
-	if sp, buildErr := a.AgentCoordinator.BuildSystemPrompt(ctx); buildErr == nil && sp != "" {
+	if sp, buildErr := a.AgentCoordinator.BuildSystemPromptForSession(ctx, sess.ID); buildErr == nil && sp != "" {
 		_ = a.AgentCoordinator.UpdateSessionSystemPrompt(ctx, sess.ID, sp)
 	}
 
