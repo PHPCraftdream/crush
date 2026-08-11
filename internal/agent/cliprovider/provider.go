@@ -1644,11 +1644,6 @@ func saveFileParts(msgs fantasy.Prompt) (tempDir string, filePaths map[int][]str
 	return tempDir, filePaths, nil
 }
 
-// formatPrompt converts a fantasy.Prompt into a single text string for the CLI.
-// The full conversation (system prompt + message history) is formatted so the
-// CLI model receives as much context as possible.
-// filePaths maps message indices to on-disk file paths for attached files;
-// nil means no files were attached.
 // hashPromptPrefix returns a hash of all messages except the last user message.
 // Used to detect conversation edits/deletes that would make a CLI session stale.
 func hashPromptPrefix(msgs fantasy.Prompt) uint64 {
@@ -1695,6 +1690,11 @@ func extractLatestUserMessage(msgs fantasy.Prompt, filePaths map[int][]string) s
 	return formatPrompt(msgs, filePaths)
 }
 
+// formatPrompt converts a fantasy.Prompt into a single text string for the CLI.
+// The full conversation (system prompt + message history) is formatted so the
+// CLI model receives as much context as possible.
+// filePaths maps message indices to on-disk file paths for attached files;
+// nil means no files were attached.
 func formatPrompt(msgs fantasy.Prompt, filePaths map[int][]string) string {
 	var sb strings.Builder
 	for i, msg := range msgs {
