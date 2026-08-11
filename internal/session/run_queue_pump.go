@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -591,8 +592,20 @@ func (p *RunQueuePump) executeEntry(ctx context.Context, leased *RunQueueEntry) 
 	dbCtx, dbCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer dbCancel()
 
-	// Create a fresh context for this execution (not tied to pump lifecycle)
-	execCtx := context.Background()
+	// Create a cancellable context for execution. This allows us to cancel
+	// Coordinator.Run if we lose lease ownership during the renewal loop (P1-2).
+	// Without this, the executor would continue doing real work (LLM calls,
+	// tool execution, writing messages) even after a different pump instance
+	// has taken ownership of the lease, potentially causing duplicate execution.
+	execCtx, execCancel := context.WithCancel(context.Background())
+	defer execCancel()
+
+	// leaseLost tracks whether this execution lost its lease ownership during
+	// the renewal loop. When true, we skip all outcome writes (Ack/Nack/TerminalFail)
+	// since the row no longer belongs to this executor — the new owner will
+	// handle the outcome. This is a read-after-write flag: the renewal goroutine
+	// sets it atomically, and the main execution reads it after Coordinator.Run.
+	var leaseLost atomic.Bool
 
 	// Parse the call data from JSON
 	var callData SessionAgentCallData
@@ -650,19 +663,22 @@ func (p *RunQueuePump) executeEntry(ctx context.Context, leased *RunQueueEntry) 
 				if !ok {
 					// The lease was already reassigned to a different
 					// owner — this execution has lost the race and can no
-					// longer safely keep the lease alive. There is no
-					// cancellation wired to execCtx (renewing is
-					// best-effort, not ownership-enforcing), so the
-					// in-flight Coordinator.Run call is left to finish on
-					// its own; the eventual Ack/Nack/TerminalFail below
+					// longer safely keep the lease alive. Cancel execCtx
+					// immediately to stop the in-flight Coordinator.Run
+					// (P1-2). The eventual Ack/Nack/TerminalFail below
 					// will then correctly fail to match (logged, not
 					// silently treated as success) since those queries
 					// are scoped to `leased_by = PumpInstanceID` (found by
 					// the fifth @oh review pass — this WAS a real gap
 					// before that scoping existed) and the row now
-					// belongs to whatever re-leased it. Surfaced loudly
-					// since it means real duplicate work may follow.
-					slog.Error("run_queue_pump: lost lease ownership during renewal, another owner has taken this entry", "id", leased.ID, "session_id", leased.SessionID, "instance_id", p.cfg.PumpInstanceID)
+					// belongs to whatever re-leased it. We set leaseLost
+					// so the main execution path knows to skip the outcome
+					// write entirely and log a clear "aborted due to lease
+					// loss" message instead of a confusing "0 rows matched"
+					// error.
+					leaseLost.Store(true)
+					execCancel()
+					slog.Error("run_queue_pump: lost lease ownership during renewal, canceling in-flight execution", "id", leased.ID, "session_id", leased.SessionID, "instance_id", p.cfg.PumpInstanceID)
 					return
 				}
 			}
@@ -685,6 +701,18 @@ func (p *RunQueuePump) executeEntry(ctx context.Context, leased *RunQueueEntry) 
 	// actually took it; this execution's own Nack did.
 	stopRenewing()
 	<-renewalsDone
+
+	// P1-2: If lease ownership was lost during the renewal loop, skip all
+	// outcome writes. The row no longer belongs to this executor (the new
+	// owner will handle Ack/Nack/TerminalFail), and attempting to write
+	// would fail with "0 rows matched" and produce confusing log messages.
+	// The leaseLost flag is set atomically by the renewal goroutine when
+	// RenewRunQueueLease returns !ok, and execCancel() is called there
+	// to stop the in-flight Coordinator.Run as early as possible.
+	if leaseLost.Load() {
+		slog.Debug("run_queue_pump: execution aborted due to lease loss, skipping outcome write (reconciliation deferred to new owner)", "id", leased.ID, "session_id", leased.SessionID, "instance_id", p.cfg.PumpInstanceID)
+		return
+	}
 
 	// Handle outcome
 	if err == nil {
