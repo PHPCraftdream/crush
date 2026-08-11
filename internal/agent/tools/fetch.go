@@ -45,15 +45,13 @@ func fetchDescription() string {
 
 func NewFetchTool(permissions permission.Service, workingDir string, client *http.Client) fantasy.AgentTool {
 	if client == nil {
-		transport := http.DefaultTransport.(*http.Transport).Clone()
-		transport.MaxIdleConns = 100
-		transport.MaxIdleConnsPerHost = 10
-		transport.IdleConnTimeout = 90 * time.Second
-
-		client = &http.Client{
-			Timeout:   30 * time.Second,
-			Transport: transport,
-		}
+		// Default client is SSRF-guarded: it blocks dials to
+		// loopback/private/link-local/metadata ranges so a
+		// prompt-injected or malicious model can't exfiltrate cloud
+		// metadata (169.254.169.254 et al.) via a fetch. A caller that
+		// legitimately needs loopback passes its own client built with
+		// NewSSRFGuardedClient(timeout, true).
+		client = NewSSRFGuardedClient(30*time.Second, false)
 	}
 
 	return fantasy.NewParallelAgentTool(

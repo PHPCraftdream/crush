@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"charm.land/fantasy"
 	"github.com/stretchr/testify/require"
@@ -54,7 +55,11 @@ func TestDownloadTool_NoTruncatedFileOnMidCopyFailure(t *testing.T) {
 	workingDir := t.TempDir()
 	ctx := context.WithValue(context.Background(), SessionIDContextKey, "test-session")
 
-	tool := NewDownloadTool(&mockPermissionService{}, workingDir, nil)
+	// These tests exercise the atomic-write behaviour, not the SSRF
+	// guard, so they use a client that explicitly allows loopback
+	// (httptest.Server listens on 127.0.0.1). The SSRF behaviour itself
+	// is covered in ssrf_guard_test.go.
+	tool := NewDownloadTool(&mockPermissionService{}, workingDir, NewSSRFGuardedClient(5*time.Second, true))
 
 	input, err := json.Marshal(DownloadParams{URL: srv.URL, FilePath: "downloaded.bin"})
 	require.NoError(t, err)
@@ -94,7 +99,7 @@ func TestDownloadTool_SuccessfulDownloadWritesCompleteFile(t *testing.T) {
 	workingDir := t.TempDir()
 	ctx := context.WithValue(context.Background(), SessionIDContextKey, "test-session")
 
-	tool := NewDownloadTool(&mockPermissionService{}, workingDir, nil)
+	tool := NewDownloadTool(&mockPermissionService{}, workingDir, NewSSRFGuardedClient(5*time.Second, true))
 
 	input, err := json.Marshal(DownloadParams{URL: srv.URL, FilePath: "ok.txt"})
 	require.NoError(t, err)
