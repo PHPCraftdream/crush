@@ -123,13 +123,16 @@ func sessionsKillCmdRun(cmd *cobra.Command, args []string) error {
 	// If the probe above took the "already dead" branch (probeThenKillHolder's
 	// own TryAcquireSessionLock+Release), that Release() returns as soon as
 	// its synchronous unlock/close finish (session.SessionLock's Mechanism-1
-	// fix) — its background metadata-cleanup goroutine can still briefly hold
-	// the OS lock (re-acquired for a Truncate/Sync) afterward. Without
-	// waiting for it to settle, the SECOND probe immediately below could
-	// spuriously observe SessionLockBusyError against our OWN prior release,
-	// not a genuine new holder, and wrongly refuse to remove an already-dead
-	// lock. This is a bounded wait on a background goroutine finishing
-	// syscalls that normally take microseconds — not a new unbounded block.
+	// fix) — its background metadata-cleanup goroutine continues running
+	// without the OS lock. The generation-aware clearHolderMetadata
+	// will skip destructive operations if a new owner has already acquired
+	// the lock, so this wait is not strictly required for correctness,
+	// but it avoids racing the background goroutine's file operations.
+	// Without waiting, the SECOND probe immediately below could spuriously
+	// observe SessionLockBusyError against our OWN prior release's
+	// background cleanup goroutine. This is a bounded wait on a background
+	// goroutine finishing syscalls that normally take microseconds — not a new
+	// unbounded block.
 	waitForLockMetadataSettled(lockPath, wait)
 
 	// Final OS-level proof immediately before the destructive remove: a NEW
@@ -152,16 +155,23 @@ func sessionsKillCmdRun(cmd *cobra.Command, args []string) error {
 // (TryAcquireSessionLock+Release cycles) against the same lock path: a probe's
 // own Release() returns as soon as its synchronous unlock/close finish (see
 // session.SessionLock.Release's Mechanism-1 doc comment), while its
-// background metadata-cleanup goroutine can still briefly hold the OS lock
-// (re-acquired for its own Truncate/Sync) afterward. A second probe launched
-// immediately can otherwise race that goroutine and observe
-// SessionLockBusyError against the FIRST probe's own in-flight cleanup,
+// background metadata-cleanup goroutine continues running without the OS lock.
+// A second probe launched immediately can otherwise race that goroutine and
+// observe SessionLockBusyError against the FIRST probe's own in-flight cleanup,
 // mistaking it for a genuine new holder. Bounded by budget (capped at 2s,
 // since cleanup normally finishes in microseconds — this only ever waits
 // meaningfully under genuine filesystem contention, which the caller's own
 // lockHolderProvablyDead re-check handles safely either way). Best-effort:
 // never returns an error, since a caller-visible timeout here would be worse
 // than falling through to the caller's own authoritative probe.
+//
+// Note: As of the generation-aware clearHolderMetadata fix, this function
+// is no longer strictly required for correctness — clearHolderMetadata
+// will skip destructive operations if a new owner has already acquired the
+// lock via its generation check — but it remains useful to avoid the narrow
+// window where the background goroutine is still mid-cleanup and the second
+// probe could spuriously observe contention against the first release's
+// own cleanup goroutine.
 func waitForLockMetadataSettled(lockPath string, budget time.Duration) {
 	if budget <= 0 || budget > 2*time.Second {
 		budget = 2 * time.Second

@@ -104,7 +104,9 @@ type LockOption func(*SessionLock)
 // WithClearHolderMetadataFn sets the function used by Release() to clear
 // diagnostic metadata from the lock file. Used by tests to inject blocking
 // behavior to prove unlock/close happen before metadata cleanup.
-func WithClearHolderMetadataFn(fn func(path string)) LockOption {
+// The function takes the lock file path and the expected generation token;
+// if the current generation on disk does not match, cleanup is skipped.
+func WithClearHolderMetadataFn(fn func(path string, expectedGeneration string)) LockOption {
 	return func(lk *SessionLock) {
 		lk.clearHolderMetadataFn = fn
 	}
@@ -149,11 +151,17 @@ type SessionLock struct {
 	// timer, so a genuinely wedged process (no forward progress) stops
 	// looking alive to diagnostics after one interval.
 	active atomic.Bool
+	// generation is a unique token for this specific acquire instance,
+	// used to prevent stale cleanup goroutines from clobbering a new
+	// owner's metadata. Generated as "PID-nanoseconds" at acquire time.
+	generation string
 	// clearHolderMetadataFn is the function called by Release() in a
 	// background goroutine to clear diagnostic metadata from the lock file.
-	// Set in the constructor; tests can inject blocking behavior via
-	// LockOption to prove unlock/close happen before metadata cleanup.
-	clearHolderMetadataFn func(path string)
+	// Takes the lock path and expected generation token; cleanup is skipped
+	// if the current generation on disk does not match. Set in the constructor;
+	// tests can inject blocking behavior via LockOption to prove unlock/close
+	// happen before metadata cleanup.
+	clearHolderMetadataFn func(path string, expectedGeneration string)
 }
 
 // SessionLockBusyError is returned by TryAcquireSessionLock when the
@@ -280,11 +288,13 @@ func acquireSessionLockFileWithOptions(path string, opts []LockOption) (*Session
 	}
 
 	myPID := os.Getpid()
+	generation := fmt.Sprintf("%d-%d", myPID, time.Now().UnixNano())
 	_ = f.Truncate(0)
 	_, _ = f.Seek(0, 0)
 	_, _ = fmt.Fprintf(f, "%d\n", myPID)
 	_ = f.Sync()
 	writePIDSidecar(path, myPID, 0)
+	writeGenerationSidecar(path, generation)
 
 	// Touch the file now so mtime is fresh from the start. mtime is a
 	// diagnostic aid only (surfaced via InspectSessionLock / `sessions
@@ -300,6 +310,7 @@ func acquireSessionLockFileWithOptions(path string, opts []LockOption) (*Session
 	lk := &SessionLock{
 		Path:                  path,
 		HolderPID:             myPID,
+		generation:            generation,
 		f:                     f,
 		stop:                  stop,
 		clearHolderMetadataFn: clearHolderMetadata, // Default implementation
@@ -378,8 +389,9 @@ func (l *SessionLock) Release() error {
 				releaseErr = closeErr
 			}
 
-			// Capture path and cleanup function by value for the background goroutine.
+			// Capture path, generation, and cleanup function by value for the background goroutine.
 			path := l.Path
+			generation := l.generation
 			cleanupFn := l.clearHolderMetadataFn
 
 			// Clear diagnostic metadata (best-effort, may hang on slow FS/AV/SMB).
@@ -402,13 +414,13 @@ func (l *SessionLock) Release() error {
 			// Release() never gave the cleanup goroutine a chance to run at
 			// all, leaving a stale, still-plausible PID behind).
 			//
-			// We pass only the path since the file is already closed; cleanupFn
-			// will reopen if needed. cleanupFn is a field on SessionLock, set in
-			// the constructor, so tests can inject blocking behavior via LockOption
+			// We pass only the path and generation since the file is already closed;
+			// cleanupFn will reopen if needed. cleanupFn is a field on SessionLock,
+			// set in the constructor, so tests can inject blocking behavior via LockOption
 			// to prove unlock/close happen before metadata cleanup.
 			cleanupDone := make(chan struct{})
 			go func() {
-				cleanupFn(path)
+				cleanupFn(path, generation)
 				close(cleanupDone)
 			}()
 			select {
@@ -443,10 +455,15 @@ func (l *SessionLock) RecordActivity() {
 }
 
 // clearHolderMetadata wipes the PID/timeout previously stamped into the
-// lock file's own content and removes the never-locked sidecar file,
+// lock file's own content and removes the never-locked sidecar files,
 // so a cleanly-released lock does not leave a stale, plausible-looking
 // PID behind for a later `sessions kill`/`sessions why` to misread as a
 // live holder (see Release's doc comment).
+//
+// Takes expectedGeneration for this holder's acquire instance; cleanup
+// is skipped if the current generation on disk does not match (indicating
+// a new owner has already acquired the lock). This prevents a stale cleanup
+// goroutine from clobbering a new owner's metadata.
 //
 // P1-2 fix (2026-08-09): Now takes only the path (not an open file *os.File)
 // because Release() now closes the file before calling this. This function
@@ -455,7 +472,7 @@ func (l *SessionLock) RecordActivity() {
 // is already released.
 //
 // WARNING: This function performs file I/O operations (open/Truncate/Seek/Sync
-// on the lock file and Remove on the sidecar) that can hang indefinitely
+// on the lock file and Remove on the sidecars) that can hang indefinitely
 // on slow/unavailable filesystems, AV scans, or SMB shares. For this reason,
 // Release() calls this AFTER unlocking the OS lock and closing the file.
 // This means clearHolderMetadata runs WITHOUT holding the OS lock, so:
@@ -490,24 +507,60 @@ func (l *SessionLock) RecordActivity() {
 // background cleanup goroutine, not a genuine external holder. That is a
 // worse regression than the narrow clobber window it was meant to close.
 //
-// So this function is intentionally unconditional: it never re-touches the
-// OS lock at all, only the plain Truncate/Remove file operations below,
-// matching this package's stated philosophy that the OS lock alone is the
-// source of truth for ownership (see the package doc on SessionLock) —
-// stale metadata here is a narrow, accepted, cosmetic risk (a `sessions
-// kill`/`sessions why` reader could briefly see a just-released holder's
-// old PID), never a correctness one: nothing downstream trusts this
-// metadata for a destructive decision without independently re-probing the
-// real OS lock first (see sessions_kill.go's probeThenKillHolder and its
-// final lockHolderProvablyDead re-check immediately before removal).
-func clearHolderMetadata(path string) {
+// So this function is intentionally unconditional with respect to the OS
+// lock: it never re-touches the OS lock at all, only the plain file
+// operations below. The generation check provides a best-effort
+// compare-and-delete guard without the OS-lock reacquire that was
+// previously shown to cause false self-contention under load. This
+// narrows the clobber window from ~50ms (releaseMetadataCleanupBound) to
+// microseconds (the TOCTOU gap between reading the generation sidecar
+// and performing the destructive operations) — a best-effort improvement
+// for diagnosability, not an absolute guarantee. The residual TOCTOU gap
+// remains: a new owner could acquire and write its generation between our
+// read and our truncate/remove, but this window is orders of magnitude
+// smaller than the original and cannot be closed without re-acquiring the
+// OS lock (which has its own regression hazards as documented above).
+func clearHolderMetadata(path string, expectedGeneration string) {
+	// Read the current generation from disk. Only a POSITIVE mismatch (the
+	// file exists and contains a DIFFERENT generation) is treated as
+	// evidence that a new owner has already acquired the lock — skip
+	// cleanup in that case to avoid clobbering their metadata.
+	//
+	// A missing file (os.IsNotExist) is deliberately NOT treated as "a new
+	// owner is present": it just as plausibly means this holder's own
+	// writeGenerationSidecar call failed at acquire time (best-effort,
+	// logged but never fatal — see that function's doc) or this is an
+	// old-format lock predating the generation mechanism. Treating "missing"
+	// as "skip" turns an occasional, harmless sidecar-write hiccup into a
+	// PID that never clears on release again, ever — a regression worse
+	// than the narrow clobber window this fix exists to close. Absent
+	// positive evidence of a new owner, fall back to the pre-fix
+	// unconditional cleanup behavior.
+	currentGenBytes, err := os.ReadFile(generationSidecarPath(path))
+	switch {
+	case err == nil && string(currentGenBytes) != expectedGeneration:
+		slog.Debug("session lock: skipping metadata cleanup for stale release",
+			"path", path,
+			"expected_generation", expectedGeneration,
+			"current_generation", string(currentGenBytes))
+		return
+	case err != nil && !os.IsNotExist(err):
+		slog.Warn("session lock: failed to read generation sidecar during cleanup, proceeding with cleanup anyway",
+			"path", path, "err", err)
+	}
+	// Either the generation matched, the sidecar was missing (no positive
+	// evidence of a new owner), or reading it failed for a reason other
+	// than not-exist (also no positive evidence) — proceed with cleanup.
 	// Reopen the file just for metadata operations.
 	f, err := os.OpenFile(path, os.O_RDWR, 0o644)
 	if err != nil {
 		slog.Warn("session lock: failed to reopen lock file for metadata clear", "path", path, "err", err)
-		// Still try to remove the sidecar even if we can't open the main file
+		// Still try to remove the sidecars even if we can't open the main file
 		if sidecarErr := os.Remove(pidSidecarPath(path)); sidecarErr != nil && !os.IsNotExist(sidecarErr) {
 			slog.Warn("session lock: failed to remove PID sidecar on release", "path", path, "err", sidecarErr)
+		}
+		if genErr := os.Remove(generationSidecarPath(path)); genErr != nil && !os.IsNotExist(genErr) {
+			slog.Warn("session lock: failed to remove generation sidecar on release", "path", path, "err", genErr)
 		}
 		return
 	}
@@ -522,6 +575,9 @@ func clearHolderMetadata(path string) {
 	}
 	if err := os.Remove(pidSidecarPath(path)); err != nil && !os.IsNotExist(err) {
 		slog.Warn("session lock: failed to remove PID sidecar on release", "path", path, "err", err)
+	}
+	if err := os.Remove(generationSidecarPath(path)); err != nil && !os.IsNotExist(err) {
+		slog.Warn("session lock: failed to remove generation sidecar on release", "path", path, "err", err)
 	}
 }
 
@@ -745,6 +801,13 @@ func pidSidecarPath(lockPath string) string {
 	return lockPath + ".pid"
 }
 
+// generationSidecarPath returns the companion file that carries a unique
+// generation token for each acquire instance. Used to prevent stale cleanup
+// goroutines from clobbering a new owner's metadata.
+func generationSidecarPath(lockPath string) string {
+	return lockPath + ".gen"
+}
+
 // writePIDSidecar (re)writes the sidecar file next to a session lock with
 // the holder's PID and (optionally) its --timeout budget in seconds,
 // mirroring what's stamped into the lock file itself. Unlike the lock
@@ -764,6 +827,17 @@ func writePIDSidecar(lockPath string, pid int, timeoutSec int64) {
 	}
 	if err := os.WriteFile(pidSidecarPath(lockPath), []byte(content), 0o644); err != nil {
 		slog.Warn("session lock: failed to write PID sidecar", "path", lockPath, "err", err)
+	}
+}
+
+// writeGenerationSidecar writes the unique generation token for this acquire
+// instance. Called immediately after successful OS lock acquisition. Best-effort:
+// a write failure only degrades the protection against metadata clobber and is
+// logged, never returned as an error — the OS lock remains the sole source of
+// truth for correctness.
+func writeGenerationSidecar(lockPath, generation string) {
+	if err := os.WriteFile(generationSidecarPath(lockPath), []byte(generation), 0o644); err != nil {
+		slog.Warn("session lock: failed to write generation sidecar", "path", lockPath, "err", err)
 	}
 }
 

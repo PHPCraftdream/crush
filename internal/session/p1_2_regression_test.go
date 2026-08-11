@@ -49,12 +49,12 @@ func TestP1_2_ReleaseUnlocksBeforeMetadataCleanup_Hang(t *testing.T) {
 	releaseBlocker := make(chan struct{})
 
 	// Acquire the first lock with a blocking cleanup function.
-	lk1, err := TryAcquireSessionLockWithOptions(tmpDir, sessionID, WithClearHolderMetadataFn(func(path string) {
+	lk1, err := TryAcquireSessionLockWithOptions(tmpDir, sessionID, WithClearHolderMetadataFn(func(path string, expectedGeneration string) {
 		releaseStarted.Store(true)
 		// Block until the test signals to proceed.
 		<-releaseBlocker
 		// Call the original implementation.
-		clearHolderMetadata(path)
+		clearHolderMetadata(path, expectedGeneration)
 		releaseCompleted.Store(true)
 	}))
 	require.NoError(t, err, "first TryAcquireSessionLock should succeed")
@@ -321,10 +321,10 @@ func TestP0_ReleaseReturnsImmediatelyDuringHungCleanup(t *testing.T) {
 	cleanupBlocker := make(chan struct{}) // Never closed
 
 	// Acquire the first lock with the blocking cleanup function.
-	lk1, err := TryAcquireSessionLockWithOptions(tmpDir, sessionID, WithClearHolderMetadataFn(func(path string) {
+	lk1, err := TryAcquireSessionLockWithOptions(tmpDir, sessionID, WithClearHolderMetadataFn(func(path string, expectedGeneration string) {
 		cleanupStarted.Store(true)
 		<-cleanupBlocker // Block forever - this simulates hung FS/AV/SMB
-		clearHolderMetadata(path)
+		clearHolderMetadata(path, expectedGeneration)
 	}))
 	require.NoError(t, err, "first TryAcquireSessionLock should succeed")
 	require.NotNil(t, lk1)
