@@ -135,8 +135,10 @@ type CLISpec struct {
 	// bypass Gemini's own confirmation prompts.
 	GeminiMCPIntegration bool
 	// CodexMCPIntegration starts crush's MCP server and passes its URL to
-	// codex via a -c flag (inline config override), so no persistent changes
-	// are made to ~/.codex/config.toml.
+	// codex via -c flags (inline config override), so no persistent changes
+	// are made to ~/.codex/config.toml. The token is passed via the
+	// CRUSH_CODEX_MCP_TOKEN environment variable, which codex reads via
+	// bearer_token_env_var and sends as Authorization: Bearer header.
 	CodexMCPIntegration bool
 	// SupportsResume enables --resume <session_id> for CLI models that
 	// support it (Claude CLI). This lets the CLI reload its own conversation
@@ -404,6 +406,34 @@ func codexParseUsageLine(line []byte) (fantasy.Usage, bool) {
 		OutputTokens: ev.Usage.OutputTokens,
 		TotalTokens:  inputTotal + ev.Usage.OutputTokens,
 	}, true
+}
+
+// codexMCPTokenEnvVar is the name of the environment variable crush sets on
+// the codex child process to carry the MCP auth token (P2-3). Passing the
+// token via an env var + Authorization: Bearer header, instead of embedding
+// it in the -c inline config override's URL as a query parameter, avoids
+// exposing it in the process list (argv is visible via `ps` / a Windows
+// process viewer / `/proc/<pid>/cmdline`; env vars set on a child process
+// are not). Verified against the locally installed codex CLI
+// (@openai/codex) that an inline `-c mcp_servers.<name>.bearer_token_env_var=
+// <VAR>` override is recognized identically to the persisted
+// `codex mcp add --bearer-token-env-var` form (`codex mcp list` reports
+// "Bearer token" auth for an entry configured this way, entirely in-memory
+// — never written to ~/.codex/config.toml).
+const codexMCPTokenEnvVar = "CRUSH_CODEX_MCP_TOKEN"
+
+// codexMCPConfigArgs returns the -c inline config override args that
+// register crush's MCP server (listening on addr) with codex, with the auth
+// token referenced by environment variable name rather than embedded in the
+// URL — see codexMCPTokenEnvVar's doc. Extracted as a pure function so the
+// no-token-in-argv property can be tested directly, without spawning the
+// real MCP server or the codex binary.
+func codexMCPConfigArgs(addr string) []string {
+	urlNoToken := "http://" + addr + "/mcp"
+	return []string{
+		"-c", fmt.Sprintf("mcp_servers.crush.url=%q", urlNoToken),
+		"-c", "mcp_servers.crush.bearer_token_env_var=" + codexMCPTokenEnvVar,
+	}
 }
 
 // codexArgs returns a BuildArgs func for a codex CLI model.
@@ -1005,15 +1035,15 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 
 	// Codex MCP integration: pass crush's MCP server URL to codex via -c flag
 	// (inline config override). No persistent changes to ~/.codex/config.toml.
-	// The token is embedded in the URL as a query parameter so the server can
-	// authenticate requests without needing env-var injection.
+	// The token is passed via environment variable and Authorization: Bearer header
+	// to avoid leaking secrets in process lists (query params are visible in /proc/<pid>/cmdline).
 	if m.spec.CodexMCPIntegration && m.perms != nil {
 		var err error
 		mcpSrv, err = newCrushMCPServer(ctx, m.perms, m.sessions, sessionID, m.workingDir, "", m.mcpProxy)
 		if err != nil {
 			slog.Warn("cliprovider: failed to start codex MCP server", "err", err)
 		} else {
-			args = append(args, "-c", fmt.Sprintf("mcp_servers.crush.url=%q", mcpSrv.mcpURL()))
+			args = append(args, codexMCPConfigArgs(mcpSrv.addr)...)
 			slog.Info("cliprovider: codex MCP configured", "addr", mcpSrv.addr)
 		}
 	}
@@ -1202,6 +1232,13 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 		cmd.Dir = m.workingDir
 		if useStdin {
 			cmd.Stdin = strings.NewReader(prompt)
+		}
+
+		// For Codex MCP integration, set the token env var referenced by
+		// codexMCPConfigArgs's bearer_token_env_var override — see
+		// codexMCPTokenEnvVar's doc for why this stays out of argv.
+		if m.spec.CodexMCPIntegration && mcpSrv != nil {
+			cmd.Env = append(os.Environ(), codexMCPTokenEnvVar+"="+mcpSrv.token)
 		}
 		slog.Info(
 			"cliprovider: launching pipe mode",

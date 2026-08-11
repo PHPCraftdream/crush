@@ -1813,3 +1813,73 @@ func processAlive(pid int) bool {
 	// kill -0 returns 0 if alive, non-zero otherwise; Run returns nil on 0 exit.
 	return exec.CommandContext(context.Background(), "kill", "-0", fmt.Sprintf("%d", pid)).Run() == nil
 }
+
+// TestCodexMCPConfigArgs_NoTokenInArgs is a regression test for P2-3:
+// codexMCPConfigArgs (the actual production function that builds the -c
+// inline overrides passed to the codex CLI's argv) must never embed the raw
+// MCP token in the URL or anywhere else in its returned args — argv is
+// visible to any local user via `ps` / a process viewer / /proc/<pid>/cmdline,
+// unlike an environment variable set only on the child process.
+//
+// SCOPE NOTE (added on independent review): the delegated /crush fix's own
+// version of this test never called codexMCPConfigArgs (or any other
+// production function) at all — every assertion compared hand-written
+// string literals to themselves (e.g. `expectedEnvVar != "CRUSH_CODEX_MCP_TOKEN"`,
+// comparing the constant to its own value) or checked CLISpec.BuildArgs,
+// which builds the codex CLI's BASE args ("exec --json -m ...") and never
+// includes the MCP-related -c flags at all — those are appended separately,
+// later, inside Stream(). Reverting the actual fix left this test green
+// unchanged — the eighth vacuous-test occurrence this round. Fixed by
+// extracting the MCP arg-building logic out of Stream() into the pure,
+// directly-testable codexMCPConfigArgs function (see provider.go), and
+// rewriting this test to call it for real.
+//
+// REVERT CHECK PROCEDURE:
+//  1. In provider.go's codexMCPConfigArgs, revert to embedding the token in
+//     the URL: `"http://" + addr + "/mcp?token=" + token` (passing a token
+//     param in) instead of the bare URL + bearer_token_env_var override.
+//  2. Run: go test ./internal/agent/cliprovider -run TestCodexMCPConfigArgs -v
+//  3. FAIL: the returned args contain "?token=".
+//  4. Restore the fix and PASS.
+func TestCodexMCPConfigArgs_NoTokenInArgs(t *testing.T) {
+	args := codexMCPConfigArgs("127.0.0.1:54321")
+
+	for _, arg := range args {
+		if strings.Contains(arg, "?token=") || strings.Contains(arg, "token=") && !strings.Contains(arg, "bearer_token_env_var") {
+			t.Errorf("codexMCPConfigArgs must never embed the raw token in argv, found in: %q (all args: %v)", arg, args)
+		}
+	}
+
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "mcp_servers.crush.url=\"http://127.0.0.1:54321/mcp\"") {
+		t.Errorf("codexMCPConfigArgs must set a plain MCP URL with no query string, got: %v", args)
+	}
+	if !strings.Contains(joined, "mcp_servers.crush.bearer_token_env_var="+codexMCPTokenEnvVar) {
+		t.Errorf("codexMCPConfigArgs must reference %s as the bearer_token_env_var, got: %v", codexMCPTokenEnvVar, args)
+	}
+}
+
+// TestCodexMCPConfigArgs_UsesRealServerToken exercises codexMCPConfigArgs
+// against a genuinely running crushMCPServer (not a hand-written literal
+// like the test above), confirming the fix holds against the actual random
+// token newCrushMCPServer generates, not just a placeholder addr string.
+func TestCodexMCPConfigArgs_UsesRealServerToken(t *testing.T) {
+	srv, err := newCrushMCPServer(context.Background(), nil, nil, "", t.TempDir(), "", nil)
+	if err != nil {
+		t.Fatalf("newCrushMCPServer: %v", err)
+	}
+	t.Cleanup(srv.stop)
+
+	args := codexMCPConfigArgs(srv.addr)
+	joined := strings.Join(args, " ")
+
+	if strings.Contains(joined, srv.token) {
+		t.Errorf("codexMCPConfigArgs must never embed the real MCP server's token in its returned args, got: %v", args)
+	}
+	if strings.Contains(joined, "?token=") {
+		t.Errorf("codexMCPConfigArgs must not produce a query-param token, got: %v", args)
+	}
+	if !strings.Contains(joined, "mcp_servers.crush.bearer_token_env_var="+codexMCPTokenEnvVar) {
+		t.Errorf("codexMCPConfigArgs must reference %s as the bearer_token_env_var, got: %v", codexMCPTokenEnvVar, args)
+	}
+}
