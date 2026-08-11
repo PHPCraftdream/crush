@@ -1160,3 +1160,44 @@ finished the mailbox migration:
     own verdict on this pass: the underlying concurrency design is
     settled, and this was the last targeted follow-up needed rather
     than the start of another full review round.
+
+- **Three more bugs found while pushing and monitoring CI for the whole
+  #337-349 batch** (this range had accumulated 39 unpushed commits and
+  had not been tested against a genuinely clean environment until this
+  push) — all confirmed as real via independent local reproduction and
+  revert-checks, not accepted from CI's report alone:
+  - **A forced app shutdown could leak the database file handle for the
+    rest of a test binary's process lifetime**, breaking Go's own
+    `t.TempDir()` cleanup on Windows ("process cannot access the
+    file"). `App.Shutdown()`'s forced-shutdown path (taken whenever an
+    agent doesn't finish within its grace period) intentionally skips
+    releasing the database — correct for a real CLI/server process,
+    which exits immediately after and lets the OS reclaim the handle —
+    but a test helper that paired one `db.Connect` with exactly one
+    `db.Release` assumed Shutdown always contributed its own share of
+    releases, silently leaving the pool's reference count above zero
+    forever whenever a test deliberately exercised the forced-shutdown
+    path. Fixed with a new `db.ReleaseAll(dataDir)`, scoped to just
+    that data directory's own pool entry, that guarantees teardown
+    regardless of how many releases Shutdown's own policy performed.
+  - **Building the coordinator could fail with "coder agent
+    configuration is missing"/"coder agent not configured" outside of
+    a normal config-file load** — `config.Load`/reload only populate
+    the coder agent's config entry when a provider was already
+    configured at the exact moment they run; several tests (and,
+    structurally, any future caller) that configure a provider
+    programmatically after an initial empty load bypass that entirely.
+    Fixed by making both `App.InitCoderAgent` and
+    `agent.NewCoordinator` self-heal: derive the missing config on the
+    spot (a cheap, side-effect-free operation) instead of requiring
+    every caller to remember to trigger it themselves.
+  - **The same class of gap for the selected large/small model** — a
+    handful of coordinator tests configured a provider but never
+    selected a model to use with it, silently relying on the same
+    leftover state the previous bug's fix now closes off. Unlike the
+    coder-agent-config gap, this one is not self-healed in production
+    code (correctly re-deriving a default model selection needs a
+    resolved provider registry, which risks reintroducing a
+    network-dependent test hang this codebase has hit before) — fixed
+    by giving each affected test its own explicit model selection
+    instead.
