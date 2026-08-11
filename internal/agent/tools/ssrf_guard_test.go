@@ -62,11 +62,92 @@ func TestIsForbiddenSSRFAddress(t *testing.T) {
 		{"unspecified v4", "0.0.0.0", true},
 		{"unspecified v6", "::", true},
 
+		// IANA Special-Purpose Address Registry — IPv4 ranges not covered by stdlib.
+		// CGNAT (RFC 6598).
+		{"cgnat 100.64.0.0/10 start", "100.64.0.1", true},
+		{"cgnat 100.64.0.0/10 end", "100.127.255.255", true},
+		{"cgnat 100.64.0.0/10 just outside", "100.63.255.255", false},
+		{"cgnat 100.64.0.0/10 just outside high", "100.128.0.0", false},
+
+		// Benchmarking (RFC 2544).
+		{"benchmark 198.18.0.0/15 start", "198.18.0.1", true},
+		{"benchmark 198.18.0.0/15 end", "198.19.255.255", true},
+		{"benchmark 198.18.0.0/15 just outside", "198.17.255.255", false},
+		{"benchmark 198.18.0.0/15 just outside high", "198.20.0.0", false},
+
+		// IETF Protocol Assignments (RFC 6890).
+		{"ietf protocol 192.0.0.0/24 start", "192.0.0.1", true},
+		{"ietf protocol 192.0.0.0/24 end", "192.0.0.255", true},
+		{"ietf protocol 192.0.0.0/24 just outside", "191.255.255.255", false},
+		{"ietf protocol 192.0.0.0/24 just outside high", "192.0.1.0", false},
+
+		// TEST-NET-1 (RFC 5737).
+		{"test-net-1 192.0.2.0/24 start", "192.0.2.0", true},
+		{"test-net-1 192.0.2.0/24 end", "192.0.2.255", true},
+		{"test-net-1 192.0.2.0/24 just outside", "192.0.1.255", false},
+		{"test-net-1 192.0.2.0/24 just outside high", "192.0.3.0", false},
+
+		// TEST-NET-2 (RFC 5737).
+		{"test-net-2 198.51.100.0/24 start", "198.51.100.0", true},
+		{"test-net-2 198.51.100.0/24 end", "198.51.100.255", true},
+		{"test-net-2 198.51.100.0/24 just outside", "198.51.99.255", false},
+		{"test-net-2 198.51.100.0/24 just outside high", "198.51.101.0", false},
+
+		// TEST-NET-3 (RFC 5737).
+		{"test-net-3 203.0.113.0/24 start", "203.0.113.0", true},
+		{"test-net-3 203.0.113.0/24 end", "203.0.113.255", true},
+		{"test-net-3 203.0.113.0/24 just outside", "203.0.112.255", false},
+		{"test-net-3 203.0.113.0/24 just outside high", "203.0.114.0", false},
+
+		// Reserved Class E (RFC 1112).
+		{"reserved 240.0.0.0/4 start", "240.0.0.1", true},
+		{"reserved 240.0.0.0/4 end", "255.255.255.254", true},
+		{"reserved 240.0.0.0/4 just outside", "239.255.255.255", false},
+
+		// Limited broadcast.
+		{"limited broadcast 255.255.255.255/32", "255.255.255.255", true},
+
+		// IANA Special-Purpose Address Registry — IPv6 ranges not covered by stdlib.
+		// Discard-Only (RFC 6666).
+		{"discard-only 100::/64 start", "100::1", true},
+		{"discard-only 100::/64 end", "100::ffff:ffff:ffff:ffff", true},
+		{"discard-only 100::/64 just outside", "fffe::", false},
+
+		// Documentation (RFC 3849).
+		{"doc 2001:db8::/32 start", "2001:db8::1", true},
+		{"doc 2001:db8::/32 end", "2001:db8:ffff:ffff:ffff:ffff:ffff:ffff", true},
+		{"doc 2001:db8::/32 just outside", "2001:db7::", false},
+
+		// Documentation (RFC 9637).
+		{"doc 3fff::/20 start", "3fff::1", true},
+		{"doc 3fff::/20 end", "3fff:0fff:ffff:ffff:ffff:ffff:ffff:ffff", true},
+		{"doc 3fff::/20 just outside", "3ffe:ffff:ffff:ffff:ffff:ffff:ffff:ffff", false},
+
+		// ORCHIDv2 (RFC 7343).
+		{"orchidv2 2001:20::/28 start", "2001:20::1", true},
+		{"orchidv2 2001:20::/28 end", "2001:2f:ffff:ffff:ffff:ffff:ffff:ffff", true},
+		{"orchidv2 2001:20::/28 just outside", "2001:1f:ffff:ffff:ffff:ffff:ffff:ffff", false},
+
 		// Public — must NOT be blocked (false-positive regression guard).
 		{"public v4 a", "8.8.8.8", false},
 		{"public v4 b", "1.1.1.1", false},
+		{"public v4 near cgnat low", "100.63.255.254", false},
+		{"public v4 near cgnat high", "100.128.0.1", false},
+		{"public v4 near benchmark low", "198.17.255.254", false},
+		{"public v4 near benchmark high", "198.20.0.1", false},
+		{"public v4 near test-net-1 low", "192.0.1.254", false},
+		{"public v4 near test-net-1 high", "192.0.3.1", false},
+		{"public v4 near test-net-2 low", "198.51.99.254", false},
+		{"public v4 near test-net-2 high", "198.51.101.1", false},
+		{"public v4 near test-net-3 low", "203.0.112.254", false},
+		{"public v4 near test-net-3 high", "203.0.114.1", false},
+		{"public v4 near reserved", "239.255.255.254", false},
 		{"public v6 cloudflare", "2606:4700:4700::1111", false},
 		{"public v6 google", "2001:4860:4860::8888", false},
+		{"public v6 near doc 2001:db8::/32 low", "2001:db7::ffff", false},
+		{"public v6 near doc 2001:db8::/32 high", "2001:db9::", false},
+		{"public v6 near doc 3fff::/20 low", "3ffe:ffff:ffff:ffff:ffff:ffff:ffff:ffff", false},
+		{"public v6 near doc 3fff::/20 high", "4000::", false},
 	}
 
 	for _, tc := range cases {

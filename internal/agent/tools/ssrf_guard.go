@@ -31,6 +31,51 @@ import (
 	"time"
 )
 
+// reservedSpecialPurposeCIDRs contains IPv4/IPv6 ranges from IANA Special-Purpose
+// Address Registries that are not covered by net.IP's stdlib methods but must
+// still be blocked by the SSRF guard. Built at package init time via net.ParseCIDR.
+var reservedSpecialPurposeCIDRs []net.IPNet
+
+func init() {
+	// IPv4 Special-Purpose Address Registry ranges not covered by stdlib:
+	ciders := []string{
+		"100.64.0.0/10",      // Shared Address Space (CGNAT), RFC 6598
+		"198.18.0.0/15",      // Network Interconnect Device Benchmark Testing, RFC 2544
+		"192.0.0.0/24",       // IETF Protocol Assignments, RFC 6890
+		"192.0.2.0/24",       // TEST-NET-1, Documentation, RFC 5737
+		"198.51.100.0/24",    // TEST-NET-2, Documentation, RFC 5737
+		"203.0.113.0/24",     // TEST-NET-3, Documentation, RFC 5737
+		"240.0.0.0/4",        // Reserved (formerly Class E), RFC 1112
+		"255.255.255.255/32", // Limited broadcast, not a valid HTTP target
+
+		// IPv6 Special-Purpose Address Registry ranges not covered by stdlib:
+		"100::/64",      // Discard-Only Address Block, RFC 6666
+		"2001:db8::/32", // Documentation, RFC 3849
+		"3fff::/20",     // Documentation, RFC 9637
+		"2001:20::/28",  // ORCHIDv2, RFC 7343
+	}
+
+	reservedSpecialPurposeCIDRs = make([]net.IPNet, 0, len(ciders))
+	for _, cidr := range ciders {
+		_, ipNet, err := net.ParseCIDR(cidr)
+		if err != nil {
+			panic(fmt.Sprintf("failed to parse reserved CIDR %q: %v", cidr, err))
+		}
+		reservedSpecialPurposeCIDRs = append(reservedSpecialPurposeCIDRs, *ipNet)
+	}
+}
+
+// isReservedSpecialPurposeAddress checks whether ip falls into any IANA
+// special-purpose range not already covered by net.IP's stdlib methods.
+func isReservedSpecialPurposeAddress(ip net.IP) bool {
+	for _, cidr := range reservedSpecialPurposeCIDRs {
+		if cidr.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
 // errSSRFBlocked is the sentinel a forbidden dial resolves to. It is
 // wrapped into the tool's error path; tests assert on it via
 // errors.Is instead of string-matching.
@@ -49,6 +94,13 @@ var errSSRFBlocked = errors.New("blocked by SSRF guard: destination resolves to 
 //     GCP, Azure, Alibaba, Oracle and others.
 //   - IsLinkLocalMulticast and IsUnspecified (0.0.0.0, ::): not real
 //     HTTP targets, rejected for completeness.
+//   - IANA Special-Purpose Address Registry ranges not covered by stdlib:
+//   - IPv4: 100.64.0.0/10 (CGNAT, RFC 6598), 198.18.0.0/15 (Benchmark, RFC 2544),
+//     192.0.0.0/24 (Protocol Assignments, RFC 6890), 192.0.2.0/24 (TEST-NET-1, RFC 5737),
+//     198.51.100.0/24 (TEST-NET-2, RFC 5737), 203.0.113.0/24 (TEST-NET-3, RFC 5737),
+//     240.0.0.0/4 (Reserved, RFC 1112), 255.255.255.255/32 (Limited broadcast).
+//   - IPv6: 100::/64 (Discard-Only, RFC 6666), 2001:db8::/32 (Documentation, RFC 3849),
+//     3fff::/20 (Documentation, RFC 9637), 2001:20::/28 (ORCHIDv2, RFC 7343).
 //
 // A nil ip is treated as forbidden: the caller is expected to have
 // parsed one already, and an unparseable dial address is itself the
@@ -61,7 +113,8 @@ func isForbiddenSSRFAddress(ip net.IP) bool {
 		ip.IsPrivate() ||
 		ip.IsLinkLocalUnicast() ||
 		ip.IsLinkLocalMulticast() ||
-		ip.IsUnspecified()
+		ip.IsUnspecified() ||
+		isReservedSpecialPurposeAddress(ip)
 }
 
 // ssrfControlHook is the net.Dialer.Control callback. For "tcp"/"udp"
