@@ -1319,7 +1319,9 @@ func (s *ConfigStore) ImportCopilot() (*oauth.Token, bool) {
 	}
 
 	slog.Info("Found existing GitHub Copilot token on disk. Authenticating...")
-	token, err := copilot.RefreshToken(context.TODO(), diskToken)
+	refreshCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	token, err := copilot.RefreshToken(refreshCtx, diskToken)
 	if err != nil {
 		slog.Error("Unable to import GitHub Copilot token", "error", err)
 		return nil, false
