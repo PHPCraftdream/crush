@@ -293,9 +293,8 @@ func New(ctx context.Context, conn *sql.DB, store *config.ConfigStore) (*App, er
 	// going to get a chance to run anyway.
 	if dataDir != "" {
 		app.RunQueuePump = session.NewRunQueuePump(session.RunQueuePumpConfig{
-			Sessions:      app.Sessions,
-			DataDirectory: dataDir,
-			Coordinator:   &coordinatorAdapterImpl{app: app},
+			Sessions:    app.Sessions,
+			Coordinator: &coordinatorAdapterImpl{app: app},
 		})
 		app.RunQueuePump.Start()
 		slog.Info("app: started run queue pump", "data_dir", dataDir)

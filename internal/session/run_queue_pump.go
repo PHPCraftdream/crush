@@ -112,13 +112,6 @@ type RunQueuePumpConfig struct {
 	// Sessions is the session service for enqueue/lease/ack operations.
 	Sessions Service
 
-	// DataDirectory is currently unused by RunQueuePump itself (the pump
-	// never touches the OS lock directly — see the design-principles doc
-	// comment on RunQueuePump). Kept for now since callers already pass
-	// it and a future pump-level use (e.g. direct lock probing) may want
-	// it; if it stays unused, consider removing it in a follow-up pass.
-	DataDirectory string
-
 	// Coordinator is the agent coordinator that will execute leased calls.
 	// Set to nil for pump instances that only scan/cleanup (no execution).
 	Coordinator Coordinator
@@ -789,11 +782,16 @@ func (p *RunQueuePump) executeEntry(ctx context.Context, leased *RunQueueEntry) 
 
 	// Handle outcome
 	if err == nil {
-		// Success: ack the entry (delete it)
+		// Success: ack the entry (delete it). The "executed successfully" log
+		// must be conditioned on the ack itself succeeding (P2-6) — logging it
+		// unconditionally previously claimed success even when the row was
+		// never actually deleted, which is misleading for anyone debugging a
+		// row that keeps reappearing after an Ack failure.
 		if _, ackErr := p.cfg.Sessions.AckRunQueueEntry(dbCtx, leased.ID, p.cfg.PumpInstanceID); ackErr != nil {
 			slog.Error("run_queue_pump: ack failed after success", "id", leased.ID, "session_id", leased.SessionID, "err", ackErr, "instance_id", p.cfg.PumpInstanceID)
+		} else {
+			slog.Info("run_queue_pump: executed entry successfully", "id", leased.ID, "session_id", leased.SessionID, "instance_id", p.cfg.PumpInstanceID)
 		}
-		slog.Info("run_queue_pump: executed entry successfully", "id", leased.ID, "session_id", leased.SessionID, "instance_id", p.cfg.PumpInstanceID)
 		return
 	}
 

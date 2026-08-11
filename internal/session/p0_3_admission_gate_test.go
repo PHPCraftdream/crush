@@ -72,7 +72,6 @@ func TestP0_3_AdmissionGateRejectsAfterStopping(t *testing.T) {
 
 	pump := NewRunQueuePump(RunQueuePumpConfig{
 		Sessions:       svc,
-		DataDirectory:  dataDir,
 		Coordinator:    noopCoordinator{},
 		PumpInstanceID: "p0-3-gate-test-pump",
 	})

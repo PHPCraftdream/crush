@@ -78,7 +78,6 @@ func TestReleaseGate_P2_1_LeaseMismatchDoesNotDeleteWrongEntry(t *testing.T) {
 
 	pump := NewRunQueuePump(RunQueuePumpConfig{
 		Sessions:       svc,
-		DataDirectory:  dataDir,
 		PumpInstanceID: "p2-1-test-pump",
 	})
 
