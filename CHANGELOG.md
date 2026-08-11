@@ -1471,3 +1471,36 @@ finished the mailbox migration:
   of mutating shared agent state, and the global-default vs
   session-scoped model APIs are split, fixing the server call sites that
   were building a system prompt from the wrong (globally-mutated) model.
+
+  **Closing independent review of this round's own fixes** (an
+  18-commit range) returned a NO-GO with one build failure and one new
+  release blocker, both introduced within the round itself — all
+  confirmed and closed the same way, with a personal revert-check on
+  the concurrency-relevant one:
+  - **`internal/agent` did not compile under `go test`** — the
+    recovery-subsystem cleanup above (the `DataDirectory` field
+    removal) was verified only against the two `internal/session`
+    packages it touched, missing ten more call sites in
+    `internal/agent` that also set the now-removed field. Every
+    regression test this round produced under `internal/agent` had
+    not actually run since that commit landed. All ten sites fixed;
+    `go vet ./...` is now clean except one pre-existing, unrelated
+    finding.
+  - **A long-running turn could be executed twice** — the very
+    `RunQueuePump.Stop()` fix earlier in this round introduced a
+    single 30-second database-write context created before
+    `Coordinator.Run` was even called, then reused for both lease
+    renewal and the final outcome write. Any real turn longer than 30
+    seconds silently stopped renewing its lease and then failed to
+    Ack/Nack with "context deadline exceeded," leaving the row
+    leased/pending for the next tick to re-lease and re-execute —
+    exactly the duplicate-execution bug that `Stop()` fix exists to
+    prevent, reintroduced by the same commit. Fixed by minting a fresh
+    write budget per individual database call instead of one shared,
+    prematurely-started context; the renewal loop's own lifecycle is
+    now independent of that budget so it survives the whole turn.
+  - **A second instance of the mailbox era-boundary reordering gap**
+    (see the mailbox finalizer fix above) was found in a code path the
+    original fix didn't touch — the manual-compaction success path
+    that hands off to the next queued summarize request. Closed with
+    the same atomic-pop pattern as the original fix.
