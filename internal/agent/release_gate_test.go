@@ -517,7 +517,7 @@ func TestReleaseGate_3_CrossProcessInterruptAutoResumed(t *testing.T) {
 	}
 
 	// Call startDetachedRun - it should enqueue the call to durable run queue.
-	coord.startDetachedRun(ctx, call)
+	require.NoError(t, coord.startDetachedRun(ctx, call))
 
 	// Wait for durable enqueue to complete.
 	time.Sleep(100 * time.Millisecond)

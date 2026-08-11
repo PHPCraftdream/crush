@@ -1082,7 +1082,9 @@ func (a *sessionAgent) abandonOwnershipWithHandoff(sessionID string, epoch uint6
 // so the actual enqueue logic has exactly one copy. See
 // restartOrphanedWithRetry's doc comment for the full design rationale.
 func (a *sessionAgent) restartOrphaned(calls []SessionAgentCall) {
-	a.restartOrphanedWithRetry(calls)
+	if err := a.restartOrphanedWithRetry(calls); err != nil {
+		slog.Error("agent: restartOrphaned failed", "err", err)
+	}
 }
 
 // restartOrphanedWithRetry durably enqueues calls for recovery by the run queue pump
@@ -1092,24 +1094,39 @@ func (a *sessionAgent) restartOrphaned(calls []SessionAgentCall) {
 // derived from the session ID and a timestamp. The pump will retry the call until it
 // succeeds or encounters a terminal failure (e.g., ErrCallAlreadyAttempted).
 //
-// The caller (drainOrReleaseMerged, called from runTurn, called from Run's turn loop)
-// is about to return control up its own call stack, possibly all the way out of Run()
-// entirely. Durability via the run queue is critical here — the pump lives independently
-// of any request/turn and will continue retrying after this goroutine exits.
+// P0-2 fix: made this function SYNCHRONOUS relative to its caller. It now waits for
+// all durable enqueues to complete before returning, ensuring that no calls are lost
+// between when the caller returns control and when the DB write commits. The caller
+// (drainOrReleaseMerged, called from runTurn, called from Run's turn loop) is about to
+// return control up its own call stack, possibly all the way out of Run() entirely.
+// Durability via the run queue is critical here — the pump lives independently of any
+// request/turn and will continue retrying after this function returns. By making the
+// enqueue synchronous, we eliminate the data-loss window where a process crash after
+// this function returns but before the goroutine's DB write commits would lose the call.
 //
 // This replaces the old retry loop (5 attempts with backoff) with a single durable
 // enqueue operation. The pump's 3-second tick interval handles all retry timing,
 // and its lease TTL (30 seconds) handles crash recovery.
 //
-// Each call gets its OWN goroutine and its own context.Background() only
-// for the enqueue call itself: the caller is about to return control up its
-// own call stack, possibly all the way out of Run() entirely — there is no
-// request-scoped ctx left in scope whose cancellation would be meaningful
-// to inherit.
-func (a *sessionAgent) restartOrphanedWithRetry(calls []SessionAgentCall) {
-	for _, call := range calls {
-		call := call
+// Error handling: If any call fails to enqueue, we attempt to fall back to in-memory
+// queue with a warning, but this is NOT guaranteed to execute (if the session is idle,
+// there may be no runner to drain it). The function returns an error if any enqueue
+// fails, allowing the caller to log this as a critical failure. For marshal failures,
+// the call is truly lost — there is no recovery path possible.
+func (a *sessionAgent) restartOrphanedWithRetry(calls []SessionAgentCall) error {
+	if len(calls) == 0 {
+		return nil
+	}
+
+	var wg sync.WaitGroup
+	errors := make([]error, len(calls))
+
+	for i, call := range calls {
+		i, call := i, call
+		wg.Add(1)
 		go func() {
+			defer wg.Done()
+
 			// Generate idempotency key: sessionID + timestamp ensures uniqueness
 			// while allowing retries of the same logical call if needed
 			idempotencyKey := fmt.Sprintf("%s-%d", call.SessionID, time.Now().UnixNano())
@@ -1120,18 +1137,28 @@ func (a *sessionAgent) restartOrphanedWithRetry(calls []SessionAgentCall) {
 			if err != nil {
 				slog.Error("agent: failed to serialize call data for durable enqueue",
 					"session_id", call.SessionID, "err", err)
+				errors[i] = fmt.Errorf("failed to serialize call data: %w", err)
 				return
 			}
 
+			// Use a bounded context with timeout for the enqueue operation.
+			// We don't inherit the caller's ctx because it may be cancelled (the
+			// caller is about to return control up its own call stack). We use
+			// context.Background() with a 30-second timeout to ensure the enqueue
+			// doesn't hang forever.
+			enqueueCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+
 			// Durably enqueue the call BEFORE returning control (P0-2 requirement)
 			// This ensures the call will eventually be executed even if this goroutine exits
-			if enqueueErr := a.sessions.EnqueueRunQueueEntry(context.Background(), idempotencyKey, call.SessionID, callDataJSON); enqueueErr != nil {
+			if enqueueErr := a.sessions.EnqueueRunQueueEntry(enqueueCtx, idempotencyKey, call.SessionID, callDataJSON); enqueueErr != nil {
 				slog.Error("agent: failed to durably enqueue call for recovery",
 					"session_id", call.SessionID, "err", enqueueErr)
 				// Fallback: try in-memory queue (data loss risk, but better than nothing)
 				a.getMailbox(call.SessionID).queue(call)
 				slog.Error("agent: durable enqueue failed, using in-memory fallback (data loss risk)",
 					"session_id", call.SessionID)
+				errors[i] = fmt.Errorf("failed to durably enqueue call: %w", enqueueErr)
 				return
 			}
 
@@ -1139,6 +1166,17 @@ func (a *sessionAgent) restartOrphanedWithRetry(calls []SessionAgentCall) {
 				"session_id", call.SessionID, "idempotency_key", idempotencyKey)
 		}()
 	}
+
+	// Wait for all enqueues to complete before returning
+	wg.Wait()
+
+	// Return first non-nil error, if any
+	for _, err := range errors {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // activityNotifyContextKey is the context key under which runTurn stores a

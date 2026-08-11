@@ -2357,7 +2357,9 @@ func (c *coordinator) requeueInterruptMessage(ctx context.Context, sessionID, me
 	// and the same P0-B idle handling: with no owner there is nobody to
 	// drain a queued call, so start the run instead of stranding it.
 	if !c.currentAgent.InterruptAndReplace(sessionID, call) {
-		c.startDetachedRun(ctx, call)
+		if err := c.startDetachedRun(ctx, call); err != nil {
+			return fmt.Errorf("failed to enqueue interrupt inject for idle session %s: %w", sessionID, err)
+		}
 	}
 
 	// The row was created by a foreign process (`crush sessions inject`), so
@@ -2397,7 +2399,9 @@ func (c *coordinator) InterruptAndSend(ctx context.Context, sessionID, prompt st
 	// and nobody is running who would ever drain a queued call — so we must
 	// start the run ourselves (P0-B).
 	if !c.currentAgent.InterruptAndReplace(sessionID, call) {
-		c.startDetachedRun(ctx, call)
+		if err := c.startDetachedRun(ctx, call); err != nil {
+			return fmt.Errorf("failed to enqueue interrupt for idle session %s: %w", sessionID, err)
+		}
 	}
 	return nil
 }
@@ -2435,7 +2439,7 @@ func (c *coordinator) InterruptAndSend(ctx context.Context, sessionID, prompt st
 // pending_injects row at START to prevent duplicate detached runs if the
 // pump picks up the same call before we return. If durable enqueue fails, we
 // recreate the row so a future tick can retry (P0-2).
-func (c *coordinator) startDetachedRun(ctx context.Context, call SessionAgentCall) {
+func (c *coordinator) startDetachedRun(ctx context.Context, call SessionAgentCall) error {
 	// P0-2 fix: delete the pending_injects row at the START to prevent
 	// duplicate detached runs. If durable enqueue fails, we'll recreate it.
 	if call.InjectID != "" {
@@ -2469,7 +2473,7 @@ func (c *coordinator) startDetachedRun(ctx context.Context, call SessionAgentCal
 		if call.InjectID != "" && call.ExistingMessageID != "" {
 			c.recreatePendingInjectRow(ctx, call)
 		}
-		return
+		return fmt.Errorf("failed to serialize call data for durable enqueue: %w", err)
 	}
 
 	// Durably enqueue the call BEFORE returning control (P0-2 requirement)
@@ -2481,13 +2485,15 @@ func (c *coordinator) startDetachedRun(ctx context.Context, call SessionAgentCal
 		if call.InjectID != "" && call.ExistingMessageID != "" {
 			c.recreatePendingInjectRow(ctx, call)
 		}
-		slog.Error("coordinator: durable enqueue failed, recreated pending_injects row for future retry",
-			"session_id", call.SessionID, "inject_id", call.InjectID)
-		return
+		// For non-inject interrupts, there is no fallback — the call is lost.
+		// Return error so the caller can handle it (e.g., surface to HTTP response).
+		// For inject interrupts, we've recreated the row so a future tick will retry.
+		return fmt.Errorf("failed to durably enqueue call for recovery: %w", enqueueErr)
 	}
 
 	slog.Debug("coordinator: durably enqueued call for pump recovery",
 		"session_id", call.SessionID, "idempotency_key", idempotencyKey, "inject_id", call.InjectID)
+	return nil
 }
 
 // recreatePendingInjectRow recreates a pending_injects row for future retry

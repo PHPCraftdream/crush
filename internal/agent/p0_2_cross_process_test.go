@@ -164,7 +164,8 @@ func TestP0_2_CrossProcessInterrupt_RowRecreatedOnFailure(t *testing.T) {
 	// 1. Delete the row at start (this will fail because DB is closed, but we ignore it)
 	// 2. Try to durably enqueue (this will fail because DB is closed)
 	// 3. Recreate the row (this will also fail because DB is closed)
-	coord.startDetachedRun(ctx, call)
+	startErr := coord.startDetachedRun(ctx, call)
+	require.Error(t, startErr, "startDetachedRun should fail when DB is closed")
 
 	// Wait for the goroutine to complete
 	time.Sleep(100 * time.Millisecond)
@@ -277,7 +278,7 @@ func TestP0_2_CrossProcessInterrupt_RowRecreatedOnFailure(t *testing.T) {
 		messages:     newEnv.messages,
 		currentAgent: origAgent,
 	}
-	coordPhase2.startDetachedRun(ctx, callPhase2)
+	require.NoError(t, coordPhase2.startDetachedRun(ctx, callPhase2))
 
 	// Wait for durable enqueue to complete.
 	time.Sleep(100 * time.Millisecond)
