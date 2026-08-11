@@ -24,7 +24,7 @@ SELECT id, session_id, call_data, status, leased_by, leased_at, lease_expires_at
        attempts, last_error, terminal_failure, created_at, updated_at
 FROM session_run_queue
 WHERE session_id = ? AND status = 'pending'
-ORDER BY created_at ASC
+ORDER BY created_at ASC, rowid ASC
 LIMIT 1;
 
 -- name: LeaseRunQueueEntryByID :one
@@ -116,7 +116,7 @@ RETURNING id;
 -- Get all pending entries (for pump scanning across all sessions).
 SELECT * FROM session_run_queue
 WHERE status = 'pending'
-ORDER BY created_at ASC;
+ORDER BY created_at ASC, rowid ASC;
 
 -- name: ListStaleLeasedRunQueueEntries :many
 -- Get all leased entries with expired leases (for pump lease recovery).

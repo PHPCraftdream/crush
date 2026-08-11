@@ -127,7 +127,7 @@ SELECT id, session_id, call_data, status, leased_by, leased_at, lease_expires_at
        attempts, last_error, terminal_failure, created_at, updated_at
 FROM session_run_queue
 WHERE session_id = ? AND status = 'pending'
-ORDER BY created_at ASC
+ORDER BY created_at ASC, rowid ASC
 LIMIT 1
 `
 
@@ -233,7 +233,7 @@ func (q *Queries) LeaseRunQueueEntryByID(ctx context.Context, arg LeaseRunQueueE
 const listPendingRunQueueEntries = `-- name: ListPendingRunQueueEntries :many
 SELECT id, session_id, call_data, status, leased_by, leased_at, lease_expires_at, attempts, last_error, terminal_failure, created_at, updated_at FROM session_run_queue
 WHERE status = 'pending'
-ORDER BY created_at ASC
+ORDER BY created_at ASC, rowid ASC
 `
 
 // Get all pending entries (for pump scanning across all sessions).
