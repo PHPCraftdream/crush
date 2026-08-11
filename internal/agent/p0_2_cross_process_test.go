@@ -291,7 +291,6 @@ func TestP0_2_CrossProcessInterrupt_RowRecreatedOnFailure(t *testing.T) {
 	// Only now start the pump to process the queued call.
 	pump := session.NewRunQueuePump(session.RunQueuePumpConfig{
 		Sessions:       newEnv.sessions,
-		DataDirectory:  newEnv.workingDir,
 		Coordinator:    mockCoord,
 		PumpInstanceID: "test-pump-p0-2-cross",
 		TestTick:       func() time.Duration { return 100 * time.Millisecond },

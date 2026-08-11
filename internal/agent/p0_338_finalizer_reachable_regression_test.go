@@ -270,7 +270,6 @@ func TestP0_338_FinalizerReachableDespiteHungCleanup(t *testing.T) {
 	pumpCoord := &p0338PumpCoordinator{sessionAgent: sa}
 	pump := session.NewRunQueuePump(session.RunQueuePumpConfig{
 		Sessions:       sessions,
-		DataDirectory:  tmpDir,
 		Coordinator:    pumpCoord,
 		PumpInstanceID: "test-pump-p0-338",
 		TestTick:       func() time.Duration { return 100 * time.Millisecond },

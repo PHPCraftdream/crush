@@ -103,7 +103,6 @@ func TestSessionAgent_RestartOrphaned_RunsUnderFreshLock_NotUnprotected(t *testi
 	pumpCoord := &pumpTestCoordinator{sessionAgent: sa, dataDir: dataDir}
 	pump := session.NewRunQueuePump(session.RunQueuePumpConfig{
 		Sessions:       env.sessions,
-		DataDirectory:  dataDir,
 		Coordinator:    pumpCoord,
 		PumpInstanceID: "test-pump-restart-orphaned",
 		TestTick:       func() time.Duration { return 100 * time.Millisecond },
@@ -256,7 +255,6 @@ func TestMailbox_DrainOrReleaseFinal_ThenAgentRestartsOrphaned_FullPath(t *testi
 	pumpCoord := &pumpTestCoordinator{sessionAgent: sa, dataDir: dataDir}
 	pump := session.NewRunQueuePump(session.RunQueuePumpConfig{
 		Sessions:       env.sessions,
-		DataDirectory:  dataDir,
 		Coordinator:    pumpCoord,
 		PumpInstanceID: "test-pump-restart-orphaned-fullpath",
 		TestTick:       func() time.Duration { return 100 * time.Millisecond },

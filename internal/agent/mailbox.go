@@ -1215,6 +1215,46 @@ func (mb *mailbox) abandonOwnershipAndPopSubmitted(epoch uint64) []SessionAgentC
 	return all
 }
 
+// abandonOwnershipAndPopFirstSubmitted atomically releases mailbox
+// ownership and returns the FIRST entry in the submitted queue, leaving
+// any remaining entries in place for the next owner's own end-of-turn
+// drain. This is the popFirstSubmitted counterpart to
+// abandonOwnershipAndPopSubmitted above: runSummarize's manual-compaction
+// success path (agent.go) needs exactly popFirstSubmitted's existing
+// "pop only the first entry, leave the rest queued" semantics, but
+// sequencing abandonOwnership() and popFirstSubmitted() as two separate
+// lock acquisitions there reopened the identical era-boundary reordering
+// window abandonOwnershipAndPopSubmitted was added to close for the
+// "pop all" case — found during the closing review of the release-
+// readiness round, since P2-5's fix only touched
+// abandonOwnershipWithHandoff and this second call site was missed.
+//
+// epoch must be the value submit() returned when granting the caller
+// ownership. If the mailbox's current epoch has since moved on, this is a
+// safe no-op that returns (zero value, false) and touches nothing.
+func (mb *mailbox) abandonOwnershipAndPopFirstSubmitted(epoch uint64) (SessionAgentCall, bool) {
+	mb.mu.Lock()
+	defer mb.mu.Unlock()
+
+	if mb.epoch != epoch {
+		return SessionAgentCall{}, false
+	}
+	if mb.replacement != nil {
+		mb.submitted = append(mb.submitted, *mb.replacement)
+		mb.replacement = nil
+	}
+	mb.state = mbIdle
+	mb.current.cancel = nil
+	mb.dispatcherCancel = nil
+
+	if len(mb.submitted) == 0 {
+		return SessionAgentCall{}, false
+	}
+	first := mb.submitted[0]
+	mb.submitted = mb.submitted[1:]
+	return first, true
+}
+
 // popAllSubmitted removes and returns ALL entries currently in the
 // submitted queue, regardless of mailbox state. Used by
 // abandonOwnershipWithHandoff to start detached runs for all work left in

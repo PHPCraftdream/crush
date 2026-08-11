@@ -319,7 +319,6 @@ func TestReleaseGate_2_OSLockHeldPastRetryWindow(t *testing.T) {
 	// Start pump BEFORE releasing lock - pump will poll but can't acquire lock yet.
 	pump := session.NewRunQueuePump(session.RunQueuePumpConfig{
 		Sessions:       env.sessions,
-		DataDirectory:  env.workingDir,
 		Coordinator:    &p0338PumpCoordinator{sessionAgent: sa},
 		PumpInstanceID: "release-gate-2-pump",
 		TestTick:       func() time.Duration { return 100 * time.Millisecond },
@@ -530,7 +529,6 @@ func TestReleaseGate_3_CrossProcessInterruptAutoResumed(t *testing.T) {
 	// Start pump - it will AUTONOMOUSLY process the queued call.
 	pump := session.NewRunQueuePump(session.RunQueuePumpConfig{
 		Sessions:       env.sessions,
-		DataDirectory:  env.workingDir,
 		Coordinator:    &p0338PumpCoordinator{sessionAgent: sa},
 		PumpInstanceID: "release-gate-3-pump",
 		TestTick:       func() time.Duration { return 100 * time.Millisecond },
@@ -962,7 +960,6 @@ func TestReleaseGate_9_DoubleFailureNoDuplicate(t *testing.T) {
 	// Start pump with TestTick - it will AUTONOMOUSLY execute the queued call.
 	pump := session.NewRunQueuePump(session.RunQueuePumpConfig{
 		Sessions:       env.sessions,
-		DataDirectory:  env.workingDir,
 		Coordinator:    &p0338PumpCoordinator{sessionAgent: sa},
 		PumpInstanceID: "release-gate-9-pump",
 		TestTick:       func() time.Duration { return 100 * time.Millisecond },

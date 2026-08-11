@@ -251,7 +251,6 @@ func TestP339_NoDuplicateExecutionAfterHandoff(t *testing.T) {
 	// Start a pump to process queued calls.
 	pump := session.NewRunQueuePump(session.RunQueuePumpConfig{
 		Sessions:       env.sessions,
-		DataDirectory:  env.workingDir,
 		Coordinator:    mockCoord,
 		PumpInstanceID: "test-pump-p339",
 		TestTick:       func() time.Duration { return 100 * time.Millisecond },

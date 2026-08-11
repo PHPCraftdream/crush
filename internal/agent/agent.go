@@ -3376,7 +3376,15 @@ func (a *sessionAgent) runSummarize(ctx context.Context, genCtx context.Context,
 	// any pending summarize requests. If a second /compact was queued while
 	// this one was running, we discard it (coalesce) because the history has
 	// already been compressed by this successful compaction.
-	_ = mb.abandonOwnership(epoch)
+	//
+	// Uses the atomic abandonOwnershipAndPopFirstSubmitted (P2-5 follow-up)
+	// instead of a separate abandonOwnership() + popFirstSubmitted() pair —
+	// two independent lock acquisitions here left the same era-boundary
+	// reordering window abandonOwnershipWithHandoff's own P2-5 fix closed
+	// for the "pop all" case: a new owner's submit()+queue() landing in the
+	// gap between them could get scooped into firstQueued below instead of
+	// staying queued for that owner's own turn.
+	firstQueued, hasNext := mb.abandonOwnershipAndPopFirstSubmitted(epoch)
 
 	// Drain any queued summarize request - if a second /compact was queued
 	// while this one was running, the history is already compressed, so we
@@ -3390,10 +3398,6 @@ func (a *sessionAgent) runSummarize(ctx context.Context, genCtx context.Context,
 		}
 	}
 
-	// Start a Run for the first queued entry. The Run becomes owner via
-	// submit() (mbIdle) and drains remaining entries via end-of-turn
-	// drainOrReleaseFinal calls.
-	firstQueued, hasNext := mb.popFirstSubmitted()
 	if !hasNext {
 		return nil
 	}

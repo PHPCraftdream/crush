@@ -125,7 +125,6 @@ func TestCoordinator_InterruptAndSend_IdleSession_ActuallyRuns(t *testing.T) {
 	pumpCoord := &pumpTestCoordinator{sessionAgent: sa, dataDir: dataDir}
 	pump := session.NewRunQueuePump(session.RunQueuePumpConfig{
 		Sessions:       env.sessions,
-		DataDirectory:  dataDir,
 		Coordinator:    pumpCoord,
 		PumpInstanceID: "test-pump-p0b-idle",
 		TestTick:       func() time.Duration { return 100 * time.Millisecond },

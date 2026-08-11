@@ -245,3 +245,121 @@ func TestMailbox_AbandonOwnershipAndPopSubmitted_EraBoundaryReorderingClosed(t *
 		}
 	}
 }
+
+// TestMailbox_AbandonOwnershipAndPopFirstSubmitted_EpochMismatch mirrors
+// TestMailbox_AbandonOwnershipAndPopSubmitted_EpochMismatch for the
+// popFirstSubmitted counterpart (runSummarize's manual-compaction success
+// path, agent.go) added as a P2-5 follow-up: a stale epoch must be a safe
+// no-op.
+func TestMailbox_AbandonOwnershipAndPopFirstSubmitted_EpochMismatch(t *testing.T) {
+	t.Parallel()
+
+	mb := &mailbox{
+		state: mbOwned,
+		epoch: 2,
+		current: generation{
+			id:     1,
+			cancel: func() {},
+		},
+		dispatcherCancel: func() {},
+		submitted: []SessionAgentCall{
+			{SessionID: "s1", Prompt: "queued for new era"},
+		},
+	}
+
+	call, hasNext := mb.abandonOwnershipAndPopFirstSubmitted(1)
+
+	require.False(t, hasNext, "must report no work for a stale epoch")
+	require.Equal(t, SessionAgentCall{}, call)
+	require.Equal(t, mbOwned, mb.state, "state must not change")
+	require.Equal(t, uint64(2), mb.epoch, "epoch must not change")
+	require.NotNil(t, mb.current.cancel, "current.cancel must not be cleared")
+	require.Len(t, mb.submitted, 1, "submitted must not be touched")
+}
+
+// TestMailbox_AbandonOwnershipAndPopFirstSubmitted_HasWork verifies that
+// only the FIRST entry is popped, folded replacement included when it sorts
+// first by append order, and the remaining entries stay queued for the next
+// owner's own drain — matching popFirstSubmitted's existing "pop one, leave
+// the rest" contract, now made epoch-atomic.
+func TestMailbox_AbandonOwnershipAndPopFirstSubmitted_HasWork(t *testing.T) {
+	t.Parallel()
+
+	mb := &mailbox{
+		state: mbOwned,
+		epoch: 1,
+		current: generation{
+			id:     1,
+			cancel: func() {},
+		},
+		dispatcherCancel: func() {},
+		submitted: []SessionAgentCall{
+			{SessionID: "s1", Prompt: "first"},
+			{SessionID: "s1", Prompt: "second"},
+		},
+	}
+
+	call, hasNext := mb.abandonOwnershipAndPopFirstSubmitted(1)
+
+	require.True(t, hasNext)
+	require.Equal(t, "first", call.Prompt)
+	require.Equal(t, mbIdle, mb.state, "state must be mbIdle")
+	require.Nil(t, mb.current.cancel, "current.cancel must be cleared")
+	require.Nil(t, mb.dispatcherCancel, "dispatcherCancel must be cleared")
+	require.Len(t, mb.submitted, 1, "only the first entry is popped")
+	require.Equal(t, "second", mb.submitted[0].Prompt, "the rest stays queued for the next owner")
+}
+
+// TestMailbox_AbandonOwnershipAndPopFirstSubmitted_EraBoundaryReorderingClosed
+// is the popFirstSubmitted-counterpart stress test to
+// TestMailbox_AbandonOwnershipAndPopSubmitted_EraBoundaryReorderingClosed
+// above — see that test's doc for the reasoning on why this cannot force a
+// deterministic repro (no window exists to force it into) and instead
+// checks the invariant holds under real, unsynchronized concurrent racing.
+func TestMailbox_AbandonOwnershipAndPopFirstSubmitted_EraBoundaryReorderingClosed(t *testing.T) {
+	t.Parallel()
+
+	const iterations = 500
+
+	for i := 0; i < iterations; i++ {
+		mb := &mailbox{
+			state: mbOwned,
+			epoch: 1,
+			current: generation{
+				id:     1,
+				cancel: func() {},
+			},
+			dispatcherCancel: func() {},
+			submitted: []SessionAgentCall{
+				{SessionID: "s1", Prompt: "old era queued work"},
+			},
+		}
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		var call SessionAgentCall
+		var hasNext bool
+		go func() {
+			defer wg.Done()
+			call, hasNext = mb.abandonOwnershipAndPopFirstSubmitted(1)
+		}()
+		go func() {
+			defer wg.Done()
+			mb.submit(SessionAgentCall{SessionID: "s1", Prompt: "new era first"}, func() {})
+			mb.queue(SessionAgentCall{SessionID: "s1", Prompt: "new era second (via queue)"})
+		}()
+
+		wg.Wait()
+
+		require.True(t, hasNext, "old era's own queued work must be popped")
+		require.Equal(t, "old era queued work", call.Prompt)
+
+		if call.Prompt == "new era second (via queue)" {
+			require.Equal(t, uint64(1), mb.epoch,
+				"new era second can only legitimately appear in the old "+
+					"era's pop if submit() never got a chance to bump the "+
+					"epoch before the atomic call ran")
+		}
+	}
+}

@@ -141,6 +141,18 @@ type RunQueuePumpConfig struct {
 	// to verify the bounded-concurrency guarantee holds even under
 	// extreme backlog pressure.
 	TestMaxConcurrentExecutions int
+
+	// TestDBWriteTimeout is a test seam for overriding the 30s budget
+	// newDBCtx() gives each individual outcome/renewal DB write in
+	// executeEntry. 0 = use the production 30s. Added to deterministically
+	// and quickly reproduce a real regression found in the closing review
+	// of the release-readiness round: a single dbCtx created once at
+	// executeEntry's entry, before Coordinator.Run, was reused for the
+	// post-Run outcome write too — so any turn longer than 30s hit an
+	// already-expired context on its Ack/Nack/TerminalFail call. Without
+	// this seam, exercising that bug needs a real Coordinator.Run call that
+	// blocks for 30+ real seconds.
+	TestDBWriteTimeout time.Duration
 }
 
 // leaseTTL returns the effective lease TTL for this pump instance —
@@ -160,6 +172,15 @@ func (p *RunQueuePump) maxConcurrentExecutions() int {
 		return p.cfg.TestMaxConcurrentExecutions
 	}
 	return RunQueueMaxConcurrentExecutions
+}
+
+// dbWriteTimeout returns the effective per-write DB context budget —
+// cfg.TestDBWriteTimeout if set, otherwise the production 30 seconds.
+func (p *RunQueuePump) dbWriteTimeout() time.Duration {
+	if p.cfg.TestDBWriteTimeout > 0 {
+		return p.cfg.TestDBWriteTimeout
+	}
+	return 30 * time.Second
 }
 
 // RunQueuePump is a background pump for the durable run queue.
@@ -649,14 +670,25 @@ func (p *RunQueuePump) executeEntry(ctx context.Context, leased *RunQueueEntry) 
 		p.inFlightMu.Unlock()
 	}()
 
-	// Create a separate context for DB writes that outlives the pump lifecycle.
-	// This ensures Ack/Nack/TerminalFail can still write to the database even
-	// after Stop() has canceled p.ctx. Critical for P0-3: without this, a worker
-	// that successfully completes Coordinator.Run would fail to record its outcome
-	// in the database when the pump is stopped mid-shutdown, leaving the row
-	// leased/pending and causing duplicate execution after restart.
-	dbCtx, dbCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer dbCancel()
+	// newDBCtx creates a fresh, short-lived (30s) context for a single DB
+	// write, deliberately rooted in context.Background() rather than p.ctx or
+	// execCtx: it must outlive both the pump's own lifecycle (Ack/Nack/
+	// TerminalFail must still be able to write after Stop() has canceled
+	// p.ctx — the original P0-3 rationale) and, separately, the in-flight
+	// Coordinator.Run call.
+	//
+	// A single dbCtx created once at function entry (the original P0-3
+	// shape) does NOT work: its 30s deadline is measured from before
+	// Coordinator.Run is ever called, but Run can legitimately take minutes
+	// for a real turn. Reusing that same, already-expired context for the
+	// post-Run outcome write (Ack/Nack/TerminalFail) made every such write
+	// fail with "context deadline exceeded" for any turn over 30s, leaving
+	// the row leased/pending and causing the exact duplicate-execution bug
+	// P0-3 exists to prevent — found during the closing review of this
+	// round. Each DB write below now gets its own fresh 30s budget instead.
+	newDBCtx := func() (context.Context, context.CancelFunc) {
+		return context.WithTimeout(context.Background(), p.dbWriteTimeout())
+	}
 
 	// Create a cancellable context for execution. This allows us to cancel
 	// Coordinator.Run if we lose lease ownership during the renewal loop (P1-2).
@@ -678,14 +710,25 @@ func (p *RunQueuePump) executeEntry(ctx context.Context, leased *RunQueueEntry) 
 	if err := json.Unmarshal([]byte(leased.CallData), &callData); err != nil {
 		slog.Error("run_queue_pump: failed to parse call data", "id", leased.ID, "session_id", leased.SessionID, "err", err, "instance_id", p.cfg.PumpInstanceID)
 		// Terminal failure: malformed data can never succeed
-		if termErr := p.cfg.Sessions.TerminalFailRunQueueEntry(dbCtx, leased.ID, p.cfg.PumpInstanceID); termErr != nil {
+		parseDBCtx, parseDBCancel := newDBCtx()
+		defer parseDBCancel()
+		if termErr := p.cfg.Sessions.TerminalFailRunQueueEntry(parseDBCtx, leased.ID, p.cfg.PumpInstanceID); termErr != nil {
 			slog.Error("run_queue_pump: terminal fail failed", "id", leased.ID, "err", termErr, "instance_id", p.cfg.PumpInstanceID)
 		}
 		return
 	}
 
 	// Renew this lease periodically while Coordinator.Run is in flight.
-	// Use dbCtx for renewal writes (not ctx) to survive pump shutdown.
+	// renewCtx is rooted in context.Background(), NOT newDBCtx()'s 30s
+	// budget: it must stay alive for the entire duration of Coordinator.Run,
+	// which can legitimately run far longer than 30s, and is only ever
+	// cancelled by stopRenewing() once Run returns (or by execCtx-driven
+	// lease loss below). Each individual RenewRunQueueLease call still gets
+	// its own fresh, short-lived DB context via newDBCtx() — a single
+	// long-lived context would eventually starve a single slow DB call from
+	// ever timing out, and a single short-lived one reused across ticks
+	// would (as found in the closing review of this round) expire well
+	// before the loop's own natural lifetime ends.
 	// Found by the fourth @oh review pass over #337-349: RunQueueLeaseTTL
 	// (30s) is far shorter than a real LLM turn, and without renewal
 	// CleanupExpiredLeases would return this entry to pending — status
@@ -701,7 +744,7 @@ func (p *RunQueuePump) executeEntry(ctx context.Context, leased *RunQueueEntry) 
 	// a long turn under all but pathological scheduling delays (a >20s
 	// stall between renewal ticks) — see the doc below on what happens if
 	// renewal itself ever loses the race.
-	renewCtx, stopRenewing := context.WithCancel(dbCtx)
+	renewCtx, stopRenewing := context.WithCancel(context.Background())
 	renewalsDone := make(chan struct{})
 	go func() {
 		defer close(renewalsDone)
@@ -721,7 +764,9 @@ func (p *RunQueuePump) executeEntry(ctx context.Context, leased *RunQueueEntry) 
 				return
 			case <-ticker.C:
 				newExpiresAt := time.Now().Add(p.leaseTTL()).Unix()
-				ok, err := p.cfg.Sessions.RenewRunQueueLease(dbCtx, leased.ID, p.cfg.PumpInstanceID, newExpiresAt)
+				renewDBCtx, renewDBCancel := newDBCtx()
+				ok, err := p.cfg.Sessions.RenewRunQueueLease(renewDBCtx, leased.ID, p.cfg.PumpInstanceID, newExpiresAt)
+				renewDBCancel()
 				if err != nil {
 					slog.Warn("run_queue_pump: lease renewal failed, will retry next interval", "id", leased.ID, "session_id", leased.SessionID, "err", err, "instance_id", p.cfg.PumpInstanceID)
 					continue
@@ -779,6 +824,13 @@ func (p *RunQueuePump) executeEntry(ctx context.Context, leased *RunQueueEntry) 
 		slog.Debug("run_queue_pump: execution aborted due to lease loss, skipping outcome write (reconciliation deferred to new owner)", "id", leased.ID, "session_id", leased.SessionID, "instance_id", p.cfg.PumpInstanceID)
 		return
 	}
+
+	// Fresh 30s budget for the outcome write below, created only now —
+	// AFTER Coordinator.Run has already returned — not at function entry.
+	// See newDBCtx's own doc for why reusing one context across the
+	// entire Run() call was the bug.
+	dbCtx, dbCancel := newDBCtx()
+	defer dbCancel()
 
 	// Handle outcome
 	if err == nil {
