@@ -2575,6 +2575,19 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 				}
 				return fmt.Errorf("session %s cancelled by user", call.SessionID)
 			}
+			// BUG-4 (full-project reviewer audit, 2026-08-11): these abort
+			// paths (max-cost, max-tokens, and peak-hours below) stop the
+			// turn ONLY via the cancelFunc looked up from activeRequests —
+			// returning an error from OnStepFinish alone does NOT break
+			// fantasy's loop (see the peak-hours note ~30 lines below). This
+			// is safe today ONLY because runTurn stores the turn's genCtx
+			// cancel via activeRequests.Set before the agent.Stream call
+			// whose OnStepFinish looks it up, and nothing ever calls
+			// activeRequests.Del for this key (entries live forever — see
+			// IsBusy's doc). Any future change that reclaims an
+			// activeRequests entry before the turn ends silently turns these
+			// aborts into no-ops: the error is returned but the turn keeps
+			// running. Pinned by TestActiveRequests_HoldsLiveCancelDuringTurn.
 			if call.MaxCost > 0 && updatedSession.Cost > call.MaxCost {
 				slog.Warn(
 					"agent: aborting — max-cost exceeded",
