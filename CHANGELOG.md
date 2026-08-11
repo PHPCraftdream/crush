@@ -1201,3 +1201,98 @@ finished the mailbox migration:
     network-dependent test hang this codebase has hit before) — fixed
     by giving each affected test its own explicit model selection
     instead.
+
+- **Eleven findings from a full-project `crush run --role reviewer`
+  audit, closed and independently verified** (2 security blockers, 4
+  bugs, 5 code-smell items with a code change — see the full report
+  referenced from `docs/checkpoints/2026-08-11-0805.md`). Unlike prior
+  rounds, this sweep covered the whole repository rather than one
+  subsystem: `internal/cmd`, `internal/agent/cliprovider`,
+  `internal/agent/tools`, `internal/config`, `internal/permission`,
+  `internal/csync`. Every finding was independently re-verified by
+  reading the actual code before acting, and every code change shipped
+  with a genuine revert-check (temporarily undone, confirmed the exact
+  predicted failure, restored, confirmed pass again).
+  - **`env`/`nice`/`nohup`/`time`/`timeout` in the bash tool's
+    "safe read-only command" allowlist let a model bypass the
+    permission prompt entirely** — these are command-wrappers that run
+    an arbitrary subcommand (`env rm -rf ./secrets`, `timeout 10
+    ./exfil.sh`), so matching the allowlist's prefix check skipped
+    `permissions.Request()` completely, defeating `--restrict-run`'s
+    deny-by-default guarantee. All five removed from the allowlist
+    (`printenv` kept as the safe alternative to bare `env`).
+  - **The same wrapper class bypassed the sub-agent recursion guard
+    too** — `agentguard`'s strip-list only recognized `exec`/`command`/
+    `time`/`nohup`, so `env claude -p ...`, `nice claude ...`, `timeout
+    30 claude ...` all slipped past it, and combined with the bug
+    above, a single command could bypass both the permission system
+    and the recursion guard at once. Added flag-aware stripping for
+    `env`/`nice`/`timeout` (they take their own leading flags/
+    positional args before the real command, unlike the pre-existing
+    bare wrappers).
+  - **A failed or cancelled `download` left a truncated file on disk
+    with no size limit on the transfer** — a later `view`/`edit` would
+    read the partial file as valid content. Rewritten to a temp-file +
+    atomic-rename pattern (matching `fsext.AtomicWriteFile`'s existing
+    convention) with a new 500 MiB cap.
+  - **A CLI-provider session's MCP server registration could be
+    deleted out from under a still-running concurrent session in the
+    same project** — Gemini/Qwen MCP registration uses a stable
+    per-project server name by design (survives process restarts), but
+    the matching deregister-on-exit deleted that entry unconditionally
+    even if a newer session had since overwritten it with its own
+    endpoint. Deregister now compares against the exact value its own
+    registration wrote and is a no-op if someone else now owns the
+    entry.
+  - **Two attachments with the same filename in one CLI-provider
+    request silently overwrote each other on disk** — both message
+    entries kept pointing at the same, last-write-wins file. Fixed with
+    filename-collision disambiguation, mirroring the pattern the web
+    server's own attachment handler already uses.
+  - **The max-cost/max-tokens budget-cap enforcement's turn-stopping
+    mechanism turned out to rely on an undocumented, easy-to-break
+    invariant** — investigated as a possible fifth bug, but confirmed
+    (independently, twice) to be structurally unreachable in the
+    current code: the internal map that budget-cap's abort path reads
+    a cancel function from is populated before the turn's first
+    callback can ever run, and nothing in the codebase ever clears that
+    entry early. Not an active bug today, so left as a pinned regression
+    test plus a warning comment instead of restructuring sensitive
+    turn-lifecycle code for a scenario that can't currently occur.
+  - **The Qwen CLI MCP integration used a 32-bit-entropy stable ID as
+    its auth token, passed via a `?token=` URL query parameter that
+    gets logged** — justified in code as "qwen doesn't support custom
+    headers." Re-checked against the actually-installed qwen CLI
+    package and found that claim outdated: it does support a `headers`
+    field on HTTP MCP servers. Switched to `Authorization: Bearer`
+    with a full 256-bit random token, matching the Claude/Gemini/Codex
+    integrations.
+  - **The MCP server's built-in tools (Bash/Read/Write/Glob/Grep) each
+    generated two unrelated UUIDs per call** — one for internal event
+    tracking, one for the permission request — leaving the permission-
+    notification stream uncorrelated with the tool-event stream for
+    the same call. Unified to one ID per call, matching the pattern the
+    external-MCP-tool handler already used.
+  - **`download`/`fetch` had no defense against a model (directly, or
+    via a prompt-injected web page) requesting an internal or
+    cloud-metadata URL** (e.g. `http://169.254.169.254/latest/
+    meta-data/`) and leaking the response into `final_text` — the only
+    prior gate was the permission system, which auto-approves in
+    non-interactive `crush run`/web contexts. Added a shared SSRF guard
+    that blocks loopback/private/link-local/metadata destinations at
+    dial time (`net.Dialer.Control`, which sees the actually-resolved
+    IP after DNS lookup but before connect — closes both the trivial
+    bypass and DNS-rebinding). Callers that legitimately need loopback
+    (local dev, self-hosted) inject their own client via the tools'
+    existing `*http.Client` constructor parameter.
+  - Two smaller findings closed without behavior risk: a `go vet`
+    warning about a value-receiver copying a mutex was investigated and
+    left as the existing, correctly-suppressed no-op (the "fix" would
+    have broken config JSON-schema generation or config-file loading,
+    depending on which half of the conflict was resolved); an unchecked
+    type assertion on a `singleflight` result was switched to the
+    comma-ok form; a copilot token refresh gained a 30s timeout; three
+    session-permission CRUD methods (currently unused in production,
+    reserved for a future web UI surface) now accept a caller `ctx`
+    instead of using `context.Background()` internally; a misplaced
+    doc-comment was moved to the function it actually documents.
