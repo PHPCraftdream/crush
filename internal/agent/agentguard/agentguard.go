@@ -152,11 +152,25 @@ func Check(command string) error {
 	return nil
 }
 
-func checkSegment(segment string) error {
-	tokens := tokenize(segment)
+// splitStringResult holds the result of resolving a command head,
+// including any split-string payloads that need recursive checking.
+type splitStringResult struct {
+	headCanon    string   // canonicalized command name
+	rest         []string // remaining arguments after wrappers
+	splitStrings []string // collected -S/--split-string payloads
+}
+
+// resolveCommandHead strips wrapper utilities and env assignments from a
+// tokenized command, returning the canonicalized head, remaining arguments,
+// and any split-string payloads collected along the way.
+//
+// This is a shared helper used by both checkSegment and
+// checkSegmentWindowSafety to ensure consistent wrapper handling.
+func resolveCommandHead(tokens []string) splitStringResult {
 	if len(tokens) == 0 {
-		return nil
+		return splitStringResult{}
 	}
+
 	// Skip leading env-var assignments (VAR=value VAR2=value cmd ...).
 	i := 0
 	for i < len(tokens) && strings.Contains(tokens[i], "=") && !strings.HasPrefix(tokens[i], "-") {
@@ -168,10 +182,11 @@ func checkSegment(segment string) error {
 		}
 	}
 	if i >= len(tokens) {
-		return nil
+		return splitStringResult{}
 	}
 	head := tokens[i]
 	rest := tokens[i+1:]
+	splitStrings := []string{}
 
 	// Strip leading command-wrapper utilities (best effort — enough to
 	// reach the wrapped command in ordinary invocations, not a full
@@ -180,16 +195,14 @@ func checkSegment(segment string) error {
 	// "env claude ...", "nice claude ...", "timeout 30 claude ..." all
 	// bypassed this guard entirely (head stayed "env"/"nice"/"timeout",
 	// never matching deniedAgents below) — the exact recursion class this
-	// package exists to close, and doubly dangerous in combination with
-	// the sibling bug where these same three names were also in
-	// tools/safe.go's safeCommands, skipping the permission prompt too.
+	// package exists to close.
 stripLoop:
 	for {
 		switch head {
 		case "exec", "command", "time", "nohup":
 			// No flags of their own to skip.
 		case "env":
-			rest = stripEnvWrapperArgs(rest)
+			rest, splitStrings = stripEnvWrapperArgsWithSplitStrings(rest)
 		case "nice":
 			rest = stripLeadingFlags(rest, niceValueFlags)
 		case "timeout":
@@ -217,10 +230,34 @@ stripLoop:
 	// Strip path + extension.
 	headCanon := canonicalName(head)
 
+	return splitStringResult{
+		headCanon:    headCanon,
+		rest:         rest,
+		splitStrings: splitStrings,
+	}
+}
+
+func checkSegment(segment string) error {
+	tokens := tokenize(segment)
+	res := resolveCommandHead(tokens)
+
+	// Recursively check any split-string payloads collected during wrapper stripping.
+	for _, ss := range res.splitStrings {
+		if err := Check(ss); err != nil {
+			return err
+		}
+	}
+
+	if res.headCanon == "" {
+		return nil
+	}
+	headCanon := res.headCanon
+	rest := res.rest
+
 	// Direct denied agent?
 	if reason, ok := deniedAgents[headCanon]; ok {
 		return &DeniedError{
-			Tool:    head,
+			Tool:    headCanon,
 			Reason:  "AI agent CLI invocation is blocked by crush's architecture (would recurse / multiply cost). Tool: " + reason,
 			Snippet: segment,
 		}
@@ -335,30 +372,21 @@ func checkSegmentWindowSafety(segment string) *WindowOpenerError {
 	if len(tokens) == 0 {
 		return nil
 	}
-	i := 0
-	for i < len(tokens) && strings.Contains(tokens[i], "=") && !strings.HasPrefix(tokens[i], "-") {
-		if isEnvAssignment(tokens[i]) {
-			i++
-		} else {
-			break
+
+	res := resolveCommandHead(tokens)
+
+	// Recursively check any split-string payloads collected during wrapper stripping.
+	for _, ss := range res.splitStrings {
+		if err := CheckWindowSafety(ss); err != nil {
+			return err
 		}
 	}
-	if i >= len(tokens) {
+
+	if res.headCanon == "" {
 		return nil
 	}
-	head := tokens[i]
-	rest := tokens[i+1:]
-
-	for (head == "exec" || head == "command" || head == "time" || head == "nohup") && len(rest) > 0 {
-		head = rest[0]
-		rest = rest[1:]
-	}
-	for head == "&" && len(rest) > 0 {
-		head = rest[0]
-		rest = rest[1:]
-	}
-
-	headCanon := canonicalName(head)
+	headCanon := res.headCanon
+	rest := res.rest
 
 	if windowOpenerVerbs[headCanon] {
 		return &WindowOpenerError{Verb: headCanon, Snippet: segment}
@@ -447,13 +475,17 @@ func stripLeadingFlags(tokens []string, valueFlags map[string]bool) []string {
 	return tokens[i:]
 }
 
-// stripEnvWrapperArgs consumes env's own leading VAR=value assignments and
-// common flags (-i, -0, -u NAME, -C dir, -S string, --), returning the
-// remaining tokens starting at the wrapped command. Best-effort — matches
+// stripEnvWrapperArgsWithSplitStrings consumes env's own leading VAR=value
+// assignments and common flags (-i, -0, -u NAME, -C dir, -S string, --),
+// returning the remaining tokens starting at the wrapped command and any
+// -S/--split-string payloads collected along the way (P2-2: these payloads
+// are re-split and executed by env itself, so callers must recursively
+// re-check them — see resolveCommandHead's callers). Best-effort — matches
 // the same "good enough to reach the real command" bar as the rest of this
 // file's wrapper handling, not a full GNU env argument parser.
-func stripEnvWrapperArgs(tokens []string) []string {
+func stripEnvWrapperArgsWithSplitStrings(tokens []string) ([]string, []string) {
 	i := 0
+	splitStrings := []string{}
 	for i < len(tokens) {
 		t := tokens[i]
 		if t == "--" {
@@ -466,10 +498,22 @@ func stripEnvWrapperArgs(tokens []string) []string {
 		}
 		if strings.HasPrefix(t, "-") {
 			switch t {
-			case "-u", "--unset", "-C", "--chdir", "-S", "--split-string":
+			case "-u", "--unset", "-C", "--chdir":
+				i += 2
+			case "-S", "--split-string":
+				if i+1 < len(tokens) {
+					splitStrings = append(splitStrings, tokens[i+1])
+				}
 				i += 2
 			default:
-				i++
+				// Check for --split-string=VALUE form.
+				if strings.HasPrefix(t, "--split-string=") {
+					value := strings.TrimPrefix(t, "--split-string=")
+					splitStrings = append(splitStrings, value)
+					i++
+				} else {
+					i++
+				}
 			}
 			continue
 		}
@@ -478,7 +522,7 @@ func stripEnvWrapperArgs(tokens []string) []string {
 	if i > len(tokens) {
 		i = len(tokens)
 	}
-	return tokens[i:]
+	return tokens[i:], splitStrings
 }
 
 // splitChained breaks the command on top-level &&, ||, ;, |. Naive — does

@@ -378,3 +378,146 @@ func TestCheckWindowSafety_ErrorReportsVerbAndSnippet(t *testing.T) {
 	assert.Equal(t, "start", winErr.Verb)
 	assert.Equal(t, "start notepad.exe", winErr.Snippet)
 }
+
+// P2-2 regression tests (2026-08-11 release readiness review):
+// Part 1: env -S/--split-string bypass - GNU env's -S flag parses its
+// value as a command string and executes it. Without recursive checking,
+// "env -S 'claude -p test'" bypasses the guard entirely.
+//
+// REVERT CHECK PROCEDURE:
+//  1. Comment out the split-string recursion loop in checkSegment
+//  2. Run: go test ./internal/agent/agentguard -run TestCheck_BlocksEnvSplitStringBypass -v
+//  3. FAIL: all these commands return nil instead of *DeniedError
+//  4. Restore the loop and PASS.
+func TestCheck_BlocksEnvSplitStringBypass(t *testing.T) {
+	cases := []string{
+		// -S with space-separated value
+		"env -S 'claude -p test'",
+		"env -S \"claude -p test\"",
+		// --split-string with space-separated value
+		"env --split-string 'claude -p test'",
+		"env --split-string \"claude -p test\"",
+		// --split-string=VALUE form (GNU long option with =)
+		"env --split-string='claude -p test'",
+		"env --split-string=\"claude -p test\"",
+		// Multiple split-strings - first one triggers block
+		"env -S 'echo hello' -S 'claude -p test' echo ignored",
+		// Combined with other env flags
+		"env -i -S 'claude -p test'",
+		"env FOO=bar -S 'claude -p test'",
+		// Stacked with other wrappers
+		"nice -n 10 env -S 'claude -p test'",
+		"timeout 30 env -S 'claude -p test'",
+		// Package runner inside split-string (must be caught after recursion)
+		"env -S 'npx @anthropic-ai/claude-code'",
+		// Shell wrapper inside split-string (must be caught after recursion)
+		"env -S 'bash -c claude'",
+	}
+	for _, cmd := range cases {
+		t.Run(cmd, func(t *testing.T) {
+			err := Check(cmd)
+			require.Error(t, err, "must block agent invocation via env -S: %s", cmd)
+			var de *DeniedError
+			require.True(t, errors.As(err, &de), "expected DeniedError, got %T for: %s", err, cmd)
+			assert.Contains(t, strings.ToLower(de.Error()), "blocked")
+		})
+	}
+}
+
+// Part 2: checkSegmentWindowSafety missing env/nice/timeout wrappers.
+// Before the fix, checkSegmentWindowSafety had its own hardcoded list
+// of wrappers (only exec/command/time/nohup + &) that didn't include
+// env/nice/timeout. This meant "env start notepad" bypassed the
+// window-safety check because head never reached "start".
+//
+// REVERT CHECK PROCEDURE:
+//  1. In checkSegmentWindowSafety, restore the old manual wrapper loop
+//     (before resolveCommandHead refactoring):
+//     for (head == "exec" || head == "command" || head == "time" || head == "nohup") ...
+//  2. Run: go test ./internal/agent/agentguard -run TestCheckWindowSafety_BlocksEnvNiceTimeoutWrappers -v
+//  3. FAIL: env/nice/timeout variants return nil instead of *WindowOpenerError
+//  4. Restore resolveCommandHead usage and PASS.
+func TestCheckWindowSafety_BlocksEnvNiceTimeoutWrappers(t *testing.T) {
+	cases := []struct {
+		cmd      string
+		expected string // the verb we expect in the error
+	}{
+		// env wrapping start
+		{"env start notepad.exe", "start"},
+		{"env -i start notepad.exe", "start"},
+		{"env FOO=bar Start-Process notepad.exe", "start-process"},
+		// nice wrapping start
+		{"nice -n 10 start notepad.exe", "start"},
+		{"nice Start-Process notepad.exe", "start-process"},
+		// timeout wrapping start
+		{"timeout 30 start notepad.exe", "start"},
+		{"timeout --signal=KILL 30 Start-Process notepad.exe", "start-process"},
+		// Stacked: env wrapping nice wrapping start
+		{"env nice -n 10 start notepad.exe", "start"},
+		// Through shell wrapper too (double recursion)
+		{`bash -c "env start notepad.exe"`, "start"},
+		{`powershell -c "env start notepad.exe"`, "start"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.cmd, func(t *testing.T) {
+			err := CheckWindowSafety(tc.cmd)
+			require.Error(t, err, "must block window opener via env/nice/timeout wrapper: %s", tc.cmd)
+			var winErr *WindowOpenerError
+			require.ErrorAs(t, err, &winErr, "expected WindowOpenerError, got %T for: %s", err, tc.cmd)
+			assert.Equal(t, tc.expected, winErr.Verb)
+		})
+	}
+}
+
+// Test that split-string recursion works in CheckWindowSafety too.
+// "env -S 'start notepad'" should be caught because the -S payload
+// gets recursively checked.
+func TestCheckWindowSafety_BlocksEnvSplitStringWithWindowOpener(t *testing.T) {
+	cases := []string{
+		"env -S 'start notepad.exe'",
+		"env --split-string='Start-Process notepad.exe'",
+		"env -S \"Start-Job notepad.exe\"",
+	}
+	for _, cmd := range cases {
+		t.Run(cmd, func(t *testing.T) {
+			err := CheckWindowSafety(cmd)
+			require.Error(t, err, "must block window opener via env -S recursion: %s", cmd)
+			var winErr *WindowOpenerError
+			require.ErrorAs(t, err, &winErr)
+		})
+	}
+}
+
+// Test that env -S with harmless content is allowed (no false positives).
+func TestCheck_EnvSplitStringAllowsHarmless(t *testing.T) {
+	cases := []string{
+		"env -S 'echo hello'",
+		"env -S 'git status'",
+		"env -S 'go build ./...'",
+		"env --split-string='ls -la'",
+	}
+	for _, cmd := range cases {
+		t.Run(cmd, func(t *testing.T) {
+			assert.NoError(t, Check(cmd))
+		})
+	}
+}
+
+// Test that env/nice/timeout wrapping harmless commands is still allowed.
+func TestCheckWindowSafety_EnvNiceTimeoutAllowsHarmlessCommands(t *testing.T) {
+	cases := []string{
+		"env echo hi",
+		"env FOO=bar npm test",
+		"nice -n 10 npm run build",
+		"timeout 30 npm test",
+		// With window-safe commands inside
+		"env git status",
+		"nice ls -la",
+		"timeout 10 echo done",
+	}
+	for _, cmd := range cases {
+		t.Run(cmd, func(t *testing.T) {
+			assert.Nil(t, CheckWindowSafety(cmd))
+		})
+	}
+}
