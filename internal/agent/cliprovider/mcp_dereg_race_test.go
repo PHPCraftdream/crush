@@ -72,32 +72,32 @@ func TestDeregisterQwenMCP_DoesNotClobberNewerSession(t *testing.T) {
 	const serverName = "crush-test-shared"
 
 	// Session A registers first.
-	require.NoError(t, registerQwenMCP(serverName, "http://127.0.0.1:5001/mcp"))
+	require.NoError(t, registerQwenMCP(serverName, "127.0.0.1:5001", "token-a"))
 
 	// Session B (concurrent, same project+provider) overwrites with its
 	// own URL — this is the existing, accepted "last write wins" behavior
 	// for register; the bug this test targets is specifically about
 	// deregister.
-	require.NoError(t, registerQwenMCP(serverName, "http://127.0.0.1:5002/mcp"))
+	require.NoError(t, registerQwenMCP(serverName, "127.0.0.1:5002", "token-b"))
 
 	url, ok := readQwenMCPServerURL(t, home, serverName)
 	require.True(t, ok)
 	require.Equal(t, "http://127.0.0.1:5002/mcp", url, "session B's registration must be the current one on disk")
 
-	// Session A finishes and deregisters using ITS OWN (now-stale) url —
+	// Session A finishes and deregisters using ITS OWN (now-stale) addr —
 	// must be a no-op, must NOT delete session B's still-active entry.
-	deregisterQwenMCP(serverName, "http://127.0.0.1:5001/mcp")
+	deregisterQwenMCP(serverName, "127.0.0.1:5001")
 
 	url, ok = readQwenMCPServerURL(t, home, serverName)
 	require.True(t, ok, "session B's entry must still exist — session A's stale deregister must not have deleted it")
 	require.Equal(t, "http://127.0.0.1:5002/mcp", url, "session B's entry must be untouched")
 
-	// Session B finishes and deregisters using its OWN (current) url —
+	// Session B finishes and deregisters using its OWN (current) addr —
 	// this one must actually remove the entry.
-	deregisterQwenMCP(serverName, "http://127.0.0.1:5002/mcp")
+	deregisterQwenMCP(serverName, "127.0.0.1:5002")
 
 	_, ok = readQwenMCPServerURL(t, home, serverName)
-	require.False(t, ok, "session B's own deregister, with the matching url, must remove the entry")
+	require.False(t, ok, "session B's own deregister, with the matching addr, must remove the entry")
 }
 
 func readGeminiMCPServerURL(t *testing.T, home, serverName string) (string, bool) {

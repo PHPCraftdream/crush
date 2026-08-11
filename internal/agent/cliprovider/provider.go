@@ -126,8 +126,7 @@ type CLISpec struct {
 	// QwenMCPIntegration starts crush's MCP server and registers it in
 	// ~/.qwen/settings.json under a stable per-project ID stored in
 	// <workingDir>/.crush/qwen-mcp-id. The entry is removed when the CLI
-	// process exits. The MCP server runs without Bearer-token auth because
-	// qwen's settings format does not support custom HTTP headers.
+	// process exits. Uses Authorization: Bearer header for auth.
 	QwenMCPIntegration bool
 	// GeminiMCPIntegration starts crush's MCP server and registers it in
 	// ~/.gemini/settings.json under a stable per-project ID stored in
@@ -923,17 +922,16 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 	// Qwen MCP integration: register crush's MCP server in ~/.qwen/settings.json
 	// using a stable per-project ID stored in <workingDir>/.crush/qwen-mcp-id.
 	// Qwen doesn't support --mcp-config, so we write the settings directly.
-	// No Bearer token is used (qwen's format doesn't support custom headers);
-	// the server is localhost-only with a random port.
+	// The Authorization: Bearer header is stored in the settings (qwen CLI
+	// supports custom headers for httpUrl transports); the server is
+	// localhost-only with a random port.
 	if m.spec.QwenMCPIntegration && m.perms != nil {
 		id, idErr := qwenMCPID(m.workingDir)
 		if idErr != nil {
 			slog.Warn("cliprovider: failed to get qwen MCP ID", "err", idErr)
 		} else {
-			// Use the stable project ID as the token — it's unique per project and
-			// already stored in .crush/qwen-mcp-id, so no separate secret is needed.
 			var err error
-			mcpSrv, err = newCrushMCPServer(ctx, m.perms, m.sessions, sessionID, m.workingDir, id, m.mcpProxy)
+			mcpSrv, err = newCrushMCPServer(ctx, m.perms, m.sessions, sessionID, m.workingDir, "", m.mcpProxy)
 			if err != nil {
 				slog.Warn("cliprovider: failed to start qwen MCP server", "err", err)
 			} else {
@@ -943,7 +941,7 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 				// (removed: it also used to unsafely delete a possibly
 				// concurrent session's live entry — see
 				// deregisterQwenMCP's own doc for the full story).
-				if regErr := registerQwenMCP(id, mcpSrv.mcpURL()); regErr != nil {
+				if regErr := registerQwenMCP(id, mcpSrv.addr, mcpSrv.token); regErr != nil {
 					slog.Warn("cliprovider: failed to register qwen MCP server", "err", regErr)
 					mcpSrv.stop()
 					mcpSrv = nil
@@ -1377,12 +1375,12 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 			defer os.RemoveAll(attachTmpDir)
 		}
 		if qwenMCPName != "" {
-			// Pass the exact url this call registered (mcpSrv is
+			// Pass the exact addr this call registered (mcpSrv is
 			// guaranteed non-nil here: qwenMCPName is only set after a
 			// successful registerQwenMCP above, using this same mcpSrv) —
 			// see deregisterQwenMCP's doc for why an unconditional delete
 			// is unsafe.
-			defer deregisterQwenMCP(qwenMCPName, mcpSrv.mcpURL())
+			defer deregisterQwenMCP(qwenMCPName, mcpSrv.addr)
 		}
 		if geminiMCPName != "" {
 			defer deregisterGeminiMCP(geminiMCPName, mcpSrv.addr)

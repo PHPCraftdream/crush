@@ -820,15 +820,15 @@ func qwenSettingsPath() (string, error) {
 
 // registerQwenMCP adds the crush MCP server to ~/.qwen/settings.json.
 // It removes any stale entry with the same name first, then writes the new URL.
-// The token is embedded in the URL as a query parameter (?token=...) since
-// qwen's settings format does not support custom HTTP headers.
+// The Authorization: Bearer header is stored in the settings so Qwen sends it
+// with each MCP request.
 //
 // Fork patch (concurrency): the read-modify-write of settings.json is
 // guarded by a sibling .lock file so parallel `crush run` processes (or
 // concurrent crush + qwen invocations) cannot stomp each other's
 // entries, and the write itself is atomic so a kill mid-write cannot
 // leave a half-truncated settings.json. See CHANGELOG.fork.md.
-func registerQwenMCP(serverName, url string) error {
+func registerQwenMCP(serverName, addr, token string) error {
 	path, err := qwenSettingsPath()
 	if err != nil {
 		return err
@@ -853,19 +853,22 @@ func registerQwenMCP(serverName, url string) error {
 		mcpServers = map[string]any{}
 	}
 	mcpServers[serverName] = map[string]any{
-		"httpUrl": url,
+		"httpUrl": "http://" + addr + "/mcp",
+		"headers": map[string]string{
+			"Authorization": "Bearer " + token,
+		},
 	}
 	settings["mcpServers"] = mcpServers
 	data, err := json.MarshalIndent(settings, "", "  ")
 	if err != nil {
 		return err
 	}
-	slog.Info("cliprovider: registered qwen MCP server", "name", serverName, "url", url)
+	slog.Info("cliprovider: registered qwen MCP server", "name", serverName, "addr", addr)
 	return fsext.AtomicWriteFile(path, data, 0o644)
 }
 
 // deregisterQwenMCP removes the crush MCP entry from ~/.qwen/settings.json,
-// but ONLY if it still points at expectedURL — the exact url this specific
+// but ONLY if it still points at expectedAddr — the exact addr this specific
 // call's own registerQwenMCP wrote.
 //
 // serverName is a STABLE per-workingDir ID (see qwenMCPID), so two
@@ -882,7 +885,7 @@ func registerQwenMCP(serverName, url string) error {
 // clobbering that later session's entry.
 //
 // Fork patch (concurrency): same flock + atomic-write as registerQwenMCP.
-func deregisterQwenMCP(serverName, expectedURL string) {
+func deregisterQwenMCP(serverName, expectedAddr string) {
 	path, err := qwenSettingsPath()
 	if err != nil {
 		return
@@ -908,7 +911,7 @@ func deregisterQwenMCP(serverName, expectedURL string) {
 	if !ok {
 		return
 	}
-	if storedURL, _ := entry["httpUrl"].(string); storedURL != expectedURL {
+	if storedURL, _ := entry["httpUrl"].(string); storedURL != "http://"+expectedAddr+"/mcp" {
 		slog.Debug("cliprovider: qwen MCP entry no longer ours, leaving it for its current owner", "name", serverName)
 		return
 	}
