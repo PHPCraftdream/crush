@@ -251,17 +251,10 @@ func New(ctx context.Context, conn *sql.DB, store *config.ConfigStore) (*App, er
 		releases++
 	}
 	app.dbReleasesNeeded = releases
+	// Run queue pump stop is now handled in Shutdown() synchronously (after CancelAll)
+	// to capture the stillBusy return value, not in cleanupFuncs.
 	app.cleanupFuncs = append(
 		app.cleanupFuncs,
-		func(ctx context.Context) error {
-			// Stop the run queue pump (task #340). This must complete before DB
-			// close to ensure no pump goroutines are writing when we close the connection.
-			if app.RunQueuePump != nil {
-				app.RunQueuePump.Stop()
-				slog.Info("app: stopped run queue pump")
-			}
-			return nil
-		},
 		func(ctx context.Context) error { return mcp.Close(ctx) },
 	)
 
@@ -1918,6 +1911,15 @@ func (app *App) Shutdown() {
 	var stillBusy bool
 	if app.AgentCoordinator != nil {
 		stillBusy = app.AgentCoordinator.CancelAll()
+	}
+
+	// Stop the run queue pump (task #340 P0-3). This must complete before DB
+	// close to ensure no pump goroutines are writing when we close the connection.
+	// Pump.Stop() returns true if shutdown was forced (workers still running after grace).
+	if app.RunQueuePump != nil {
+		pumpStillBusy := app.RunQueuePump.Stop()
+		stillBusy = stillBusy || pumpStillBusy
+		slog.Info("app: stopped run queue pump")
 	}
 
 	// Shutdown policy: distinguish between graceful and forced shutdown.

@@ -131,7 +131,11 @@ func TestCoordinator_InterruptAndSend_IdleSession_ActuallyRuns(t *testing.T) {
 		TestTick:       func() time.Duration { return 100 * time.Millisecond },
 	})
 	pump.Start()
-	t.Cleanup(pump.Stop)
+	t.Cleanup(func() {
+		// Pump.Stop() now returns a bool indicating forced shutdown.
+		// In test cleanup, we don't need to check it.
+		_ = pump.Stop()
+	})
 
 	const interruptPrompt = "interrupt on an idle session must actually run, P0-B"
 	err = coord.InterruptAndSend(t.Context(), sess.ID, interruptPrompt, nil, nil)

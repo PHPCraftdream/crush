@@ -146,6 +146,40 @@ type RunQueuePump struct {
 	started bool
 	startMu sync.Mutex
 
+	// workerWg tracks all executeEntry goroutines, ensuring Stop() waits
+	// for them to finish before returning. Critical for P0-3: without this,
+	// Stop() can return while workers are still writing Ack/Nack/TerminalFail
+	// to the database, causing rows to remain leased/pending after restart.
+	// Pattern documented for reuse in P0-4 (agent.Summarize) and P1-1.
+	workerWg sync.WaitGroup
+
+	// admitMu/stopping form the admission gate that closes a real "Add
+	// concurrently with Wait" race an earlier version of this fix
+	// introduced: processEntry checked p.ctx.Err() and then called
+	// workerWg.Add(1) as two separate, unsynchronized steps. Between the
+	// check and the Add, Stop() could cancel p.ctx and start its
+	// workerWg.Wait() goroutine while the counter was still 0 — Wait()
+	// could then return (nothing to wait for) and Stop() could report
+	// "stopped gracefully" a moment before the Add(1) actually landed,
+	// which either panics ("Add called concurrently with Wait", per the
+	// sync.WaitGroup contract: "calls with a positive delta that start
+	// when the counter is zero must happen before a Wait") or, if it
+	// doesn't panic, lets a brand-new worker start after Stop() has
+	// already told the caller (App.Shutdown) it is safe to close the DB —
+	// reintroducing the exact class of bug P0-3 exists to close, just one
+	// level down.
+	//
+	// The fix: stopping is only ever flipped false->true, and every read
+	// (processEntry) and the one write (Stop) happen under admitMu. So
+	// either processEntry's critical section runs entirely before Stop's
+	// (stopping was still false: Add(1) is guaranteed to complete, and
+	// complete-before, Stop's subsequent cancel()+Wait()-spawn), or it
+	// runs entirely after (stopping is already true: processEntry bails
+	// out and never calls Add at all). There is no interleaving left where
+	// Add and Wait can race.
+	admitMu  sync.Mutex
+	stopping bool
+
 	// inFlight tracks session IDs with an executeEntry goroutine currently
 	// running, guarded by inFlightMu. Found by the third @oh review pass
 	// over #337-349 (in-range for #340's original design): Coordinator.Run
@@ -259,17 +293,51 @@ func (p *RunQueuePump) Start() {
 }
 
 // Stop gracefully shuts down the pump goroutine.
-// Waits for the current tick to complete before returning.
-func (p *RunQueuePump) Stop() {
+// Waits for all in-flight executeEntry workers to finish with a 5-second grace period.
+// Returns true if shutdown was forced (workers still running after grace period),
+// false if all workers finished gracefully.
+// Pattern: matches internal/agent/agent.go CancelAll's 5-second grace + stillBusy return.
+func (p *RunQueuePump) Stop() bool {
 	p.startMu.Lock()
 	defer p.startMu.Unlock()
 	if !p.started {
-		return
+		return false
 	}
+
+	// Step 0: flip the admission gate BEFORE cancelling or waiting — see
+	// the stopping field's doc. This must happen first so that any
+	// processEntry call already past its own admitMu section (Add done)
+	// is guaranteed visible to workerWg before we ever call Wait().
+	p.admitMu.Lock()
+	p.stopping = true
+	p.admitMu.Unlock()
+
+	// Step 1: Cancel the main pump context first to stop new lease/dispatch.
+	// This ensures tick() stops accepting new work BEFORE we wait for workers.
 	p.cancel()
-	p.wg.Wait()
-	p.started = false
-	slog.Info("run_queue_pump: stopped", "instance_id", p.cfg.PumpInstanceID)
+
+	// Step 2: Wait for all in-flight workers with a 5-second grace period.
+	// Workers must complete their DB writes (Ack/Nack/TerminalFail) before we
+	// consider shutdown complete.
+	workerDone := make(chan struct{})
+	go func() {
+		p.workerWg.Wait()
+		close(workerDone)
+	}()
+
+	select {
+	case <-workerDone:
+		// All workers finished. Now wait for the main run() loop to exit.
+		p.wg.Wait()
+		p.started = false
+		slog.Info("run_queue_pump: stopped gracefully", "instance_id", p.cfg.PumpInstanceID)
+		return false
+	case <-time.After(5 * time.Second):
+		// Grace period expired but workers are still running. Return true to
+		// signal forced shutdown. The caller (App.Shutdown) must not close the DB.
+		slog.Warn("run_queue_pump: forced shutdown (workers still running after 5s grace)", "instance_id", p.cfg.PumpInstanceID)
+		return true
+	}
 }
 
 // run is the main pump loop.
@@ -465,17 +533,63 @@ func (p *RunQueuePump) processEntry(ctx context.Context, entry *RunQueueEntry) {
 	p.inFlight[leased.SessionID] = struct{}{}
 	p.inFlightMu.Unlock()
 
+	// Refuse to start a new worker once shutdown has begun, and register
+	// the one that IS started with workerWg — both under admitMu, so the
+	// check and the Add are one atomic operation relative to Stop()'s own
+	// critical section (see admitMu/stopping's doc: an unsynchronized
+	// check-then-Add here raced Stop()'s cancel+Wait sequence and could
+	// either panic ("Add called concurrently with Wait") or let a new
+	// worker start after Stop() had already told its caller shutdown was
+	// safe — undoing the fix this task exists to make).
+	p.admitMu.Lock()
+	if p.stopping {
+		p.admitMu.Unlock()
+		// inFlight was marked above (before this gate); it is only ever
+		// cleared by executeEntry's defer, which will now never run for
+		// this entry, so clear it here or the session would appear
+		// permanently busy to this pump instance.
+		p.inFlightMu.Lock()
+		delete(p.inFlight, leased.SessionID)
+		p.inFlightMu.Unlock()
+		// Release the lease immediately instead of leaving the row
+		// "leased" for up to a full leaseTTL: any pump instance (this
+		// process on restart, or a different live process) can then pick
+		// it up as soon as it next ticks. No attempt penalty — this pump
+		// never actually attempted it. Use an independent, short-lived
+		// context rather than p.ctx: p.cancel() may already have fired or
+		// be about to, and this write must not be lost to that same race.
+		nackCtx, nackCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if nackErr := p.cfg.Sessions.NackRunQueueEntryNoAttemptPenalty(nackCtx, leased.ID, p.cfg.PumpInstanceID, "run_queue_pump: shutting down, releasing lease without executing"); nackErr != nil {
+			slog.Warn("run_queue_pump: release-on-shutdown nack failed, entry will recover via lease expiry", "id", leased.ID, "session_id", leased.SessionID, "err", nackErr, "instance_id", p.cfg.PumpInstanceID)
+		}
+		nackCancel()
+		return
+	}
+	p.workerWg.Add(1)
+	p.admitMu.Unlock()
+
 	// Execute the call (detached, not blocking this pump tick)
 	go p.executeEntry(ctx, leased)
 }
 
 // executeEntry runs a leased entry and handles success/failure.
 func (p *RunQueuePump) executeEntry(ctx context.Context, leased *RunQueueEntry) {
+	defer p.workerWg.Done()
+
 	defer func() {
 		p.inFlightMu.Lock()
 		delete(p.inFlight, leased.SessionID)
 		p.inFlightMu.Unlock()
 	}()
+
+	// Create a separate context for DB writes that outlives the pump lifecycle.
+	// This ensures Ack/Nack/TerminalFail can still write to the database even
+	// after Stop() has canceled p.ctx. Critical for P0-3: without this, a worker
+	// that successfully completes Coordinator.Run would fail to record its outcome
+	// in the database when the pump is stopped mid-shutdown, leaving the row
+	// leased/pending and causing duplicate execution after restart.
+	dbCtx, dbCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer dbCancel()
 
 	// Create a fresh context for this execution (not tied to pump lifecycle)
 	execCtx := context.Background()
@@ -485,13 +599,14 @@ func (p *RunQueuePump) executeEntry(ctx context.Context, leased *RunQueueEntry) 
 	if err := json.Unmarshal([]byte(leased.CallData), &callData); err != nil {
 		slog.Error("run_queue_pump: failed to parse call data", "id", leased.ID, "session_id", leased.SessionID, "err", err, "instance_id", p.cfg.PumpInstanceID)
 		// Terminal failure: malformed data can never succeed
-		if termErr := p.cfg.Sessions.TerminalFailRunQueueEntry(ctx, leased.ID, p.cfg.PumpInstanceID); termErr != nil {
+		if termErr := p.cfg.Sessions.TerminalFailRunQueueEntry(dbCtx, leased.ID, p.cfg.PumpInstanceID); termErr != nil {
 			slog.Error("run_queue_pump: terminal fail failed", "id", leased.ID, "err", termErr, "instance_id", p.cfg.PumpInstanceID)
 		}
 		return
 	}
 
 	// Renew this lease periodically while Coordinator.Run is in flight.
+	// Use dbCtx for renewal writes (not ctx) to survive pump shutdown.
 	// Found by the fourth @oh review pass over #337-349: RunQueueLeaseTTL
 	// (30s) is far shorter than a real LLM turn, and without renewal
 	// CleanupExpiredLeases would return this entry to pending — status
@@ -507,7 +622,7 @@ func (p *RunQueuePump) executeEntry(ctx context.Context, leased *RunQueueEntry) 
 	// a long turn under all but pathological scheduling delays (a >20s
 	// stall between renewal ticks) — see the doc below on what happens if
 	// renewal itself ever loses the race.
-	renewCtx, stopRenewing := context.WithCancel(ctx)
+	renewCtx, stopRenewing := context.WithCancel(dbCtx)
 	renewalsDone := make(chan struct{})
 	go func() {
 		defer close(renewalsDone)
@@ -527,7 +642,7 @@ func (p *RunQueuePump) executeEntry(ctx context.Context, leased *RunQueueEntry) 
 				return
 			case <-ticker.C:
 				newExpiresAt := time.Now().Add(p.leaseTTL()).Unix()
-				ok, err := p.cfg.Sessions.RenewRunQueueLease(ctx, leased.ID, p.cfg.PumpInstanceID, newExpiresAt)
+				ok, err := p.cfg.Sessions.RenewRunQueueLease(dbCtx, leased.ID, p.cfg.PumpInstanceID, newExpiresAt)
 				if err != nil {
 					slog.Warn("run_queue_pump: lease renewal failed, will retry next interval", "id", leased.ID, "session_id", leased.SessionID, "err", err, "instance_id", p.cfg.PumpInstanceID)
 					continue
@@ -574,7 +689,7 @@ func (p *RunQueuePump) executeEntry(ctx context.Context, leased *RunQueueEntry) 
 	// Handle outcome
 	if err == nil {
 		// Success: ack the entry (delete it)
-		if _, ackErr := p.cfg.Sessions.AckRunQueueEntry(ctx, leased.ID, p.cfg.PumpInstanceID); ackErr != nil {
+		if _, ackErr := p.cfg.Sessions.AckRunQueueEntry(dbCtx, leased.ID, p.cfg.PumpInstanceID); ackErr != nil {
 			slog.Error("run_queue_pump: ack failed after success", "id", leased.ID, "session_id", leased.SessionID, "err", ackErr, "instance_id", p.cfg.PumpInstanceID)
 		}
 		slog.Info("run_queue_pump: executed entry successfully", "id", leased.ID, "session_id", leased.SessionID, "instance_id", p.cfg.PumpInstanceID)
@@ -615,7 +730,7 @@ func (p *RunQueuePump) executeEntry(ctx context.Context, leased *RunQueueEntry) 
 	// CleanupExpiredLeases still reaped the row — and charged an attempt
 	// — after essentially one ordinary TTL window, same as doing nothing.
 	if errors.Is(err, ErrCallQueuedNotExecuted) {
-		if nackErr := p.cfg.Sessions.NackRunQueueEntryNoAttemptPenalty(ctx, leased.ID, p.cfg.PumpInstanceID, "queued into an externally-owned in-process session, not executed"); nackErr != nil {
+		if nackErr := p.cfg.Sessions.NackRunQueueEntryNoAttemptPenalty(dbCtx, leased.ID, p.cfg.PumpInstanceID, "queued into an externally-owned in-process session, not executed"); nackErr != nil {
 			slog.Error("run_queue_pump: no-penalty release after queued-not-executed failed", "id", leased.ID, "session_id", leased.SessionID, "err", nackErr, "instance_id", p.cfg.PumpInstanceID)
 		}
 		p.busyBackoffMu.Lock()
@@ -631,7 +746,7 @@ func (p *RunQueuePump) executeEntry(ctx context.Context, leased *RunQueueEntry) 
 	var alreadyAttempted AlreadyAttempted
 	if errors.As(err, &alreadyAttempted) && alreadyAttempted.AlreadyAttempted() {
 		// Terminal failure (no retry) - protects against duplicates
-		if termErr := p.cfg.Sessions.TerminalFailRunQueueEntry(ctx, leased.ID, p.cfg.PumpInstanceID); termErr != nil {
+		if termErr := p.cfg.Sessions.TerminalFailRunQueueEntry(dbCtx, leased.ID, p.cfg.PumpInstanceID); termErr != nil {
 			slog.Error("run_queue_pump: terminal fail failed", "id", leased.ID, "err", termErr, "instance_id", p.cfg.PumpInstanceID)
 		}
 		slog.Warn("run_queue_pump: entry terminal failed (already attempted)", "id", leased.ID, "session_id", leased.SessionID, "err", err, "instance_id", p.cfg.PumpInstanceID)
@@ -647,7 +762,7 @@ func (p *RunQueuePump) executeEntry(ctx context.Context, leased *RunQueueEntry) 
 	// the final @oh review of tasks #337-349 — P0-2).
 	var busyErr *SessionLockBusyError
 	if errors.As(err, &busyErr) {
-		if nackErr := p.cfg.Sessions.NackRunQueueEntryNoAttemptPenalty(ctx, leased.ID, p.cfg.PumpInstanceID, err.Error()); nackErr != nil {
+		if nackErr := p.cfg.Sessions.NackRunQueueEntryNoAttemptPenalty(dbCtx, leased.ID, p.cfg.PumpInstanceID, err.Error()); nackErr != nil {
 			slog.Error("run_queue_pump: no-penalty nack failed", "id", leased.ID, "err", nackErr, "instance_id", p.cfg.PumpInstanceID)
 		}
 		slog.Debug("run_queue_pump: entry blocked by session lock contention, will retry without attempt penalty", "id", leased.ID, "session_id", leased.SessionID, "instance_id", p.cfg.PumpInstanceID)
@@ -655,7 +770,7 @@ func (p *RunQueuePump) executeEntry(ctx context.Context, leased *RunQueueEntry) 
 	}
 
 	// Retryable failure: nack and let the pump retry on next tick
-	if nackErr := p.cfg.Sessions.NackRunQueueEntry(ctx, leased.ID, p.cfg.PumpInstanceID, err.Error()); nackErr != nil {
+	if nackErr := p.cfg.Sessions.NackRunQueueEntry(dbCtx, leased.ID, p.cfg.PumpInstanceID, err.Error()); nackErr != nil {
 		slog.Error("run_queue_pump: nack failed", "id", leased.ID, "err", nackErr, "instance_id", p.cfg.PumpInstanceID)
 	}
 	slog.Debug("run_queue_pump: entry failed, will retry", "id", leased.ID, "session_id", leased.SessionID, "err", err, "attempts", leased.Attempts+1, "instance_id", p.cfg.PumpInstanceID)
