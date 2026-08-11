@@ -1165,10 +1165,76 @@ func (mb *mailbox) popFirstSubmitted() (SessionAgentCall, bool) {
 	return first, true
 }
 
+// abandonOwnershipAndPopSubmitted atomically releases mailbox ownership and
+// returns ALL entries currently in the submitted queue. This is the atomic
+// combination of abandonOwnership() and popAllSubmitted() that closes the
+// era-boundary reordering gap described in popAllSubmitted's doc comment.
+//
+// epoch must be the value submit() returned when granting the caller ownership.
+// If the mailbox's current epoch has since moved on — a different, later caller
+// became owner — this is a safe no-op that returns nil and touches nothing,
+// since whatever is in submitted now belongs to that later owner.
+//
+// This method holds mb.mu for the entire operation: it first checks the epoch,
+// then folds any pending replacement into submitted, flips state to mbIdle,
+// clears current.cancel/dispatcherCancel, and finally copies and clears the
+// submitted queue — all without releasing mb.mu in between. This ensures that
+// no concurrent submit() can become the new owner and add work to submitted
+// after the epoch check but before the pop, preventing the race where work from
+// a new era would be handed to restartOrphanedWithRetry instead of being left
+// for the new owner's own drain.
+//
+// Returns nil (not an empty slice) when there is no queued work, matching
+// popAllSubmitted's semantics for consistency with existing callers and tests.
+func (mb *mailbox) abandonOwnershipAndPopSubmitted(epoch uint64) []SessionAgentCall {
+	mb.mu.Lock()
+	defer mb.mu.Unlock()
+
+	if mb.epoch != epoch {
+		return nil
+	}
+	// Fold any pending replacement into submitted so the next owner
+	// treats it as a normal queued follow-up, not as a pre-emption
+	// target for reclaimReplacementOrKeep. A replacement left in
+	// mb.replacement across an era boundary would silently jump the
+	// queue of whatever the next owner's first turn happens to be.
+	if mb.replacement != nil {
+		mb.submitted = append(mb.submitted, *mb.replacement)
+		mb.replacement = nil
+	}
+	// Copy the submitted queue BEFORE clearing it.
+	var all []SessionAgentCall
+	if len(mb.submitted) > 0 {
+		all = make([]SessionAgentCall, len(mb.submitted))
+		copy(all, mb.submitted)
+		mb.submitted = mb.submitted[:0]
+	}
+	mb.state = mbIdle
+	mb.current.cancel = nil // preserve id (monotonic, see the field doc) — only the cancel func is spent
+	mb.dispatcherCancel = nil
+	return all
+}
+
 // popAllSubmitted removes and returns ALL entries currently in the
 // submitted queue, regardless of mailbox state. Used by
 // abandonOwnershipWithHandoff to start detached runs for all work left in
 // the mailbox after a non-cancel error.
+//
+// IMPORTANT: This method does NOT check epochs. If called outside the
+// abandonOwnershipWithHandoff path (or any other path that does not
+// already hold exclusive control over the mailbox's era), it can return
+// work that belongs to a later ownership era. For finalizer paths that
+// need epoch safety, use abandonOwnershipAndPopSubmitted instead, which
+// combines abandonOwnership and popAllSubmitted into a single atomic
+// operation that checks the epoch before popping.
+//
+// The era-boundary reordering gap that this doc comment originally
+// described (see the comment preserved below for historical context) is
+// now closed by abandonOwnershipAndPopSubmitted, which abandonOwnershipWithHandoff
+// uses exclusively. Callers should NOT manually sequence abandonOwnership
+// followed by popAllSubmitted, as that would re-open the gap.
+//
+// HISTORICAL CONTEXT (preserved for reference):
 //
 // popFirstSubmitted/popAllSubmitted remain the only submitted-queue
 // mutators that take no epoch argument (contrast drainOrRelease/

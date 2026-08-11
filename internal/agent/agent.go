@@ -1062,22 +1062,31 @@ func (a *sessionAgent) drainOrReleaseMerged(sessionID string, epoch uint64, lk *
 // tail drained this queue, leaving summarise stranded if the session became idle
 // through any other entry point.
 //
+// P2-5 fix: uses the atomic mb.abandonOwnershipAndPopSubmitted method instead
+// of separately calling mb.abandonOwnership(epoch) followed by
+// mb.popAllSubmitted(). The two-call sequence had a race window where a new
+// owner could submit() (transitioning mbIdle -> mbOwned with a new epoch) and
+// then queue() work, which popAllSubmitted would incorrectly hand off to
+// restartOrphanedWithRetry instead of leaving it for the new owner's own drain.
+// The atomic version closes this gap by checking the epoch and popping the
+// submitted queue in a single critical section.
+//
 // It must be called with lk (if any) already released — the caller releases
 // the OS lock first to avoid the HIGH-1 window where mbIdle becomes true
 // while the lock is still held.
 func (a *sessionAgent) abandonOwnershipWithHandoff(sessionID string, epoch uint64) {
 	mb := a.getMailbox(sessionID)
-	if hadWork := mb.abandonOwnership(epoch); hadWork {
+	if popped := mb.abandonOwnershipAndPopSubmitted(epoch); popped != nil {
 		slog.Error(
 			"agent.Run: calls were pending when ownership had to be abandoned — starting detached runs to ensure they execute",
 			"session_id", sessionID,
 		)
 		// Start detached runs for all work left in the mailbox.
-		// abandonOwnership folds replacement into submitted and
-		// leaves the mailbox at mbIdle, so popAllSubmitted() can safely
-		// read the entire queue without mb.mu (no new submit can land
-		// on mbIdle).
-		a.restartOrphanedWithRetry(mb.popAllSubmitted())
+		// abandonOwnershipAndPopSubmitted already folded replacement into
+		// submitted, cleared current.cancel/dispatcherCancel, and left the
+		// mailbox at mbIdle atomically, so the work we have here is exactly
+		// what belonged to this era and nothing from a later one.
+		a.restartOrphanedWithRetry(popped)
 	}
 
 	// P2-1 fix: drain summarizeQueue after ownership is released and the session
