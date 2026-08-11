@@ -326,7 +326,7 @@ func registerBashTool(srv *mcp.Server, perms permission.Service, workingDir stri
 
 		granted, err := perms.Request(ctx, permission.CreatePermissionRequest{
 			SessionID:   mcpSessionID,
-			ToolCallID:  uuid.New().String(),
+			ToolCallID:  id,
 			ToolName:    "bash",
 			Description: input.Description,
 			Action:      "run",
@@ -374,7 +374,7 @@ func registerViewTool(srv *mcp.Server, perms permission.Service, workingDir stri
 		path := resolvePath(input.Path, workingDir)
 		granted, err := perms.Request(ctx, permission.CreatePermissionRequest{
 			SessionID:   mcpSessionID,
-			ToolCallID:  uuid.New().String(),
+			ToolCallID:  id,
 			ToolName:    "view",
 			Description: "Read file: " + input.Path,
 			Action:      "read",
@@ -460,7 +460,7 @@ func registerWriteTool(srv *mcp.Server, perms permission.Service, workingDir str
 		path := resolvePath(input.Path, workingDir)
 		granted, err := perms.Request(ctx, permission.CreatePermissionRequest{
 			SessionID:   mcpSessionID,
-			ToolCallID:  uuid.New().String(),
+			ToolCallID:  id,
 			ToolName:    "write",
 			Description: "Write file: " + input.Path,
 			Action:      "write",
@@ -506,7 +506,7 @@ func registerGlobTool(srv *mcp.Server, perms permission.Service, workingDir stri
 
 		granted, err := perms.Request(ctx, permission.CreatePermissionRequest{
 			SessionID:   mcpSessionID,
-			ToolCallID:  uuid.New().String(),
+			ToolCallID:  id,
 			ToolName:    "glob",
 			Description: "Find files: " + input.Pattern,
 			Action:      "read",
@@ -559,7 +559,7 @@ func registerGrepTool(srv *mcp.Server, perms permission.Service, workingDir stri
 
 		granted, err := perms.Request(ctx, permission.CreatePermissionRequest{
 			SessionID:   mcpSessionID,
-			ToolCallID:  uuid.New().String(),
+			ToolCallID:  id,
 			ToolName:    "grep",
 			Description: "Search: " + input.Pattern,
 			Action:      "read",
