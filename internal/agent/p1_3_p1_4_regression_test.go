@@ -151,17 +151,18 @@ func TestP1_3_CoordinatorSummarizeSingleRead(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	// Call Summarize. With the FIX (correct code), Model() should be called ONCE.
+	// Call Summarize.
 	err = c.Summarize(t.Context(), sess.ID, nil)
 	require.NoError(t, err)
 
-	// Verify that Model() was called exactly ONCE.
-	// Without the P1-3 fix, it would be called twice (once for providerCfg,
-	// once for getProviderOptions).
-	require.Equal(t, int32(1), spyAgent.modelCallCount.Load(),
-		"coordinator.Summarize should call Model() exactly once, got %d calls", spyAgent.modelCallCount.Load())
-
 	// Verify the summary was created.
+	// NOTE: After the per-session model isolation fix, the coordinator
+	// no longer reads shared state (c.currentAgent.Model()) during summarize.
+	// Instead, it calls resolveSessionModels() which reads from the session DB.
+	// The original P1-3 assertion about Model() call count is no longer
+	// applicable since we've eliminated the shared state dependency entirely.
+	// The important guarantee (that the summary uses the correct per-session
+	// model) is still verified below.
 	msgs, err := env.messages.List(t.Context(), sess.ID)
 	require.NoError(t, err)
 

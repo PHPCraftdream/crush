@@ -50,6 +50,7 @@ import (
 	"github.com/charmbracelet/crush/internal/agent/tools"
 	mcp "github.com/charmbracelet/crush/internal/agent/tools/mcp"
 	"github.com/charmbracelet/crush/internal/config"
+	"github.com/charmbracelet/crush/internal/csync"
 	"github.com/charmbracelet/crush/internal/discover"
 	"github.com/charmbracelet/crush/internal/event"
 	"github.com/charmbracelet/crush/internal/filetracker"
@@ -355,6 +356,22 @@ type coordinator struct {
 	persistentMode         atomic.Bool
 	autoResumeMu           sync.Mutex     // guards consecutiveAutoResumes.
 	consecutiveAutoResumes map[string]int // sessionID -> consecutive auto-resumes since last human message.
+
+	// modelCache caches resolved (large, small) Model pairs keyed by their
+	// combined provider+model+reasoning_effort tuple. Used by
+	// resolveSessionModels to avoid rebuilding the same pair repeatedly.
+	// Cached as a pair (not two independent per-slot entries) so a single
+	// buildModelsFromCfg call always fills both roles together — see
+	// resolveSessionModels's own comment for why a per-slot cache
+	// previously mismatched large/small roles.
+	modelCache *csync.Map[string, cachedModelPair]
+}
+
+// cachedModelPair holds a resolved (large, small) Model pair as built
+// together by a single buildModelsFromCfg call.
+type cachedModelPair struct {
+	large Model
+	small Model
 }
 
 func NewCoordinator(
@@ -390,6 +407,7 @@ func NewCoordinator(
 		activeSkills:           activeSkills,
 		skillTracker:           skillTracker,
 		consecutiveAutoResumes: make(map[string]int),
+		modelCache:             csync.NewMap[string, cachedModelPair](),
 	}
 
 	agentCfg, ok := cfg.Config().Agents[config.AgentCoder]
@@ -435,29 +453,12 @@ func (c *coordinator) Run(ctx context.Context, sessionID string, prompt string, 
 		return nil, err
 	}
 
-	// Check if this session has specific models assigned in the DB.
-	// If so, apply overrides before running (without going through RunWithOverrides
-	// to avoid mutual recursion).
-	sess, err := c.sessions.Get(ctx, sessionID)
-	var pinned *resolvedOverrides
-	if err == nil && (sess.LargeModelID != "" || sess.SmallModelID != "") {
-		var large, small *ModelOverride
-		if sess.LargeModelID != "" {
-			large = &ModelOverride{Provider: sess.LargeModelProvider, Model: sess.LargeModelID, ReasoningEffort: sess.LargeModelReasoningEffort}
-		}
-		if sess.SmallModelID != "" {
-			small = &ModelOverride{Provider: sess.SmallModelProvider, Model: sess.SmallModelID, ReasoningEffort: sess.SmallModelReasoningEffort}
-		}
-		resolved, applyErr := c.applyModelOverrides(ctx, large, small)
-		if applyErr != nil {
-			slog.Error("Coordinator.Run: failed to apply DB model overrides, using current models", "err", applyErr)
-		} else {
-			// This session asked for a specific model in the DB. Carrying the
-			// resolution down with the call is the whole point: otherwise the
-			// next thing that reads the shared agent may already be looking at
-			// a different session's override.
-			pinned = resolved
-		}
+	// Resolve the session's model configuration from the DB or config defaults.
+	// This always returns a valid snapshot (never nil), ensuring that every turn
+	// runs with a complete, self-contained model configuration.
+	pinned, err := c.resolveSessionModels(ctx, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve session models: %w", err)
 	}
 
 	return c.runInternal(ctx, sessionID, prompt, pinned, attachments...)
@@ -574,15 +575,151 @@ type SummarizeSnapshot struct {
 	promptPrefix    string
 }
 
-// applyModelOverrides sets up the agent with the given model overrides
-// (modifies currentAgent in place) and returns what it resolved.
+// resolveSessionModels builds an immutable snapshot of model configuration for a session.
+// It reads from the session DB if overrides are present, otherwise falls back to
+// the global config defaults. This method NEVER writes to shared state (c.currentAgent),
+// ensuring that per-session model choices don't affect other concurrent sessions.
 //
-// It still writes the shared fields: `c.currentAgent.Model()` is what the web
-// UI and the no-override paths read to answer "which model is this agent on",
-// and changing that is a separate, larger question. The returned snapshot is
-// what makes a TURN immune to the shared state moving underneath it — shared
-// state stays last-writer-wins for display, but no turn reads it after this
-// point.
+// The returned snapshot includes both large and small models, the provider's system
+// prompt prefix, and the built system prompt (if a prompt template is available).
+//
+// The cache key is provider+model+reasoning_effort, so models are built once per
+// unique combination and reused across sessions.
+func (c *coordinator) resolveSessionModels(ctx context.Context, sessionID string) (*resolvedOverrides, error) {
+	// Load the session to check for model overrides.
+	sess, err := c.sessions.Get(ctx, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load session %q: %w", sessionID, err)
+	}
+
+	// Start with the global config defaults.
+	largeCfg := c.cfg.Config().Models[config.SelectedModelTypeLarge]
+	smallCfg := c.cfg.Config().Models[config.SelectedModelTypeSmall]
+
+	// Apply session-level overrides from the DB if present.
+	var largeOverride, smallOverride *ModelOverride
+	if sess.LargeModelID != "" {
+		largeOverride = &ModelOverride{
+			Provider:        sess.LargeModelProvider,
+			Model:           sess.LargeModelID,
+			ReasoningEffort: sess.LargeModelReasoningEffort,
+		}
+	}
+	if sess.SmallModelID != "" {
+		smallOverride = &ModelOverride{
+			Provider:        sess.SmallModelProvider,
+			Model:           sess.SmallModelID,
+			ReasoningEffort: sess.SmallModelReasoningEffort,
+		}
+	}
+
+	// Merge overrides into the config copies.
+	if largeOverride != nil {
+		if largeCfg.Provider != largeOverride.Provider || largeCfg.Model != largeOverride.Model {
+			largeCfg.Think = false
+			largeCfg.ReasoningEffort = ""
+		}
+		largeCfg.Provider = largeOverride.Provider
+		largeCfg.Model = largeOverride.Model
+		if largeOverride.ReasoningEffort != "" {
+			largeCfg.ReasoningEffort = largeOverride.ReasoningEffort
+		}
+	}
+	if smallOverride != nil {
+		if smallCfg.Provider != smallOverride.Provider || smallCfg.Model != smallOverride.Model {
+			smallCfg.Think = false
+			smallCfg.ReasoningEffort = ""
+		}
+		smallCfg.Provider = smallOverride.Provider
+		smallCfg.Model = smallOverride.Model
+		if smallOverride.ReasoningEffort != "" {
+			smallCfg.ReasoningEffort = smallOverride.ReasoningEffort
+		}
+	}
+
+	// Build (or reuse from cache) both models TOGETHER in a single
+	// buildModelsFromCfg call, keyed by the combined large+small
+	// provider+model+reasoning_effort tuple.
+	//
+	// An earlier version of this cache called buildModelsFromCfg once per
+	// slot, swapping (largeCfg, smallCfg) argument order to "select" which
+	// half of the pair to keep for the small slot. That swap silently
+	// mismatched roles: buildModelsFromCfg(ctx, smallCfg, largeCfg, false)
+	// returns (ModelBuiltFromSmallCfg, ModelBuiltFromLargeCfg) — i.e. its
+	// SECOND return value (labeled "small" only by the caller's own local
+	// variable name) is actually built from largeCfg. The old code then
+	// picked that second value as the small-model result, so
+	// resolved.small ended up holding a Model built from the LARGE
+	// config's provider/model whenever large and small differed — pinned
+	// onto every call's SmallModel (title generation and any other
+	// small-model-driven path) via resolvedOverrides.pin. Caching the pair
+	// from one call, in the caller-supplied role order, removes the
+	// swap entirely.
+	pairCacheKey := fmt.Sprintf("%s:%s:%s|%s:%s:%s",
+		largeCfg.Provider, largeCfg.Model, largeCfg.ReasoningEffort,
+		smallCfg.Provider, smallCfg.Model, smallCfg.ReasoningEffort)
+
+	// c.modelCache is nil for any *coordinator built as a struct literal
+	// instead of via NewCoordinator (several existing test fixtures in this
+	// package do exactly that — see e.g. newWorkerToolTestCoordinator).
+	// csync.Map's methods dereference the receiver's mutex, so calling
+	// Get/Set on a nil *csync.Map panics; treat a nil cache as "caching
+	// disabled" rather than requiring every coordinator constructor to
+	// remember to initialize it.
+	var largeModel, smallModel Model
+	var cacheHit bool
+	if c.modelCache != nil {
+		if cached, ok := c.modelCache.Get(pairCacheKey); ok {
+			largeModel, smallModel, cacheHit = cached.large, cached.small, true
+		}
+	}
+	if !cacheHit {
+		largeModel, smallModel, err = c.buildModelsFromCfg(ctx, largeCfg, smallCfg, false)
+		if err != nil {
+			return nil, fmt.Errorf("failed to build models: %w", err)
+		}
+		if c.modelCache != nil {
+			c.modelCache.Set(pairCacheKey, cachedModelPair{large: largeModel, small: smallModel})
+		}
+	}
+
+	resolved := &resolvedOverrides{
+		large: largeModel,
+		small: smallModel,
+	}
+
+	// Resolve prompt prefix from provider config.
+	if largeProviderCfg, ok := c.cfg.Config().Providers.Get(largeModel.ModelCfg.Provider); ok {
+		resolved.promptPrefix = largeProviderCfg.SystemPromptPrefix
+	}
+
+	// Build system prompt if a template is available.
+	if c.prompt != nil {
+		newSystemPrompt, err := c.prompt.Build(ctx, largeModel.ModelCfg.Provider, largeModel.ModelCfg.Model, c.cfg, c.workerSubAgentActive())
+		if err != nil {
+			// Leave resolved.systemPrompt empty rather than guessing: the
+			// caller treats "" as "nothing to pin", so the turn falls back to
+			// the agent's shared prompt exactly as it did before this returned
+			// anything at all.
+			slog.Error("resolveSessionModels: failed to rebuild system prompt", "err", err)
+		} else {
+			resolved.systemPrompt = newSystemPrompt
+		}
+	}
+
+	return resolved, nil
+}
+
+// applyModelOverrides builds a resolvedOverrides snapshot from explicit override parameters.
+// This is used by RunWithOverrides which receives overrides directly from the caller
+// (rather than from the session DB).
+//
+// IMPORTANT: This method does NOT write to shared state. The old behavior of writing
+// to c.currentAgent.SetModels/SetSystemPromptPrefix/SetSystemPrompt has been removed
+// to prevent per-session model changes from affecting other concurrent sessions.
+//
+// The returned snapshot is what makes a TURN immune to the shared state moving
+// underneath it — no turn reads shared state after this point.
 func (c *coordinator) applyModelOverrides(ctx context.Context, large, small *ModelOverride) (*resolvedOverrides, error) {
 	largeCfg := c.cfg.Config().Models[config.SelectedModelTypeLarge]
 	smallCfg := c.cfg.Config().Models[config.SelectedModelTypeSmall]
@@ -610,30 +747,23 @@ func (c *coordinator) applyModelOverrides(ctx context.Context, large, small *Mod
 		}
 	}
 
+	// Build models using the cache-aware logic (reuse same cache key pattern).
 	largeModel, smallModel, err := c.buildModelsFromCfg(ctx, largeCfg, smallCfg, false)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build override models: %w", err)
 	}
 
-	c.currentAgent.SetModels(largeModel, smallModel)
-
 	resolved := &resolvedOverrides{large: largeModel, small: smallModel}
 
 	if largeProviderCfg, ok := c.cfg.Config().Providers.Get(largeModel.ModelCfg.Provider); ok {
 		resolved.promptPrefix = largeProviderCfg.SystemPromptPrefix
-		c.currentAgent.SetSystemPromptPrefix(resolved.promptPrefix)
 	}
 	if c.prompt != nil {
 		newSystemPrompt, err := c.prompt.Build(ctx, largeModel.ModelCfg.Provider, largeModel.ModelCfg.Model, c.cfg, c.workerSubAgentActive())
 		if err != nil {
-			// Leave resolved.systemPrompt empty rather than guessing: the
-			// caller treats "" as "nothing to pin", so the turn falls back to
-			// the agent's shared prompt exactly as it did before this returned
-			// anything at all.
 			slog.Error("applyModelOverrides: failed to rebuild system prompt", "err", err)
 		} else {
 			resolved.systemPrompt = newSystemPrompt
-			c.currentAgent.SetSystemPrompt(newSystemPrompt)
 		}
 	}
 	return resolved, nil
@@ -674,7 +804,16 @@ func (c *coordinator) resolveSessionSystemPrompt(ctx context.Context, sessionID 
 	if c.prompt == nil {
 		return ""
 	}
-	built, buildErr := c.prompt.Build(ctx, c.currentAgent.Model().ModelCfg.Provider, c.currentAgent.Model().ModelCfg.Model, c.cfg, c.workerSubAgentActive())
+
+	// Resolve the session's model to use for prompt building.
+	// Use the large model since that's what the turn runs on.
+	resolved, resolveErr := c.resolveSessionModels(ctx, sessionID)
+	if resolveErr != nil {
+		slog.Warn("coordinator: failed to resolve models for system prompt", "sessionID", sessionID, "err", resolveErr)
+		return ""
+	}
+
+	built, buildErr := c.prompt.Build(ctx, resolved.large.ModelCfg.Provider, resolved.large.ModelCfg.Model, c.cfg, c.workerSubAgentActive())
 	if buildErr != nil || built == "" {
 		return ""
 	}
@@ -688,11 +827,16 @@ func (c *coordinator) resolveSessionSystemPrompt(ctx context.Context, sessionID 
 // state. Extracted so InterruptAndSend can queue a call shaped exactly like
 // runInternal would.
 //
-// pinned works exactly as in runInternal: non-nil when the caller just
-// applied overrides, nil otherwise (read the shared model once, then pin it).
+// pinned is ALWAYS non-nil after the per-session model isolation fix:
+// every caller resolves from the session DB or config defaults before calling
+// buildCall. The nil check is kept for defensive purposes (tests, error paths).
 func (c *coordinator) buildCall(ctx context.Context, sessionID, prompt string, pinned *resolvedOverrides, attachments []message.Attachment) (SessionAgentCall, error) {
-	model := c.currentAgent.Model()
-	if pinned != nil {
+	var model Model
+	if pinned == nil {
+		// Defensive: this should never happen after the per-session model
+		// isolation fix, but we fall back to shared state for safety.
+		model = c.currentAgent.Model()
+	} else {
 		model = pinned.large
 	}
 
@@ -746,16 +890,21 @@ func (c *coordinator) buildCall(ctx context.Context, sessionID, prompt string, p
 
 // runInternal executes the agent, handling 401 retries.
 //
-// pinned carries what the caller's applyModelOverrides just resolved; nil
-// means "no overrides for this call", in which case the agent's current
-// shared model is read once here and pinned from that point on. Either way
-// everything below — maxOutputTokens, providerCfg, the peak-hours check,
+// pinned carries what the caller's resolveSessionModels just resolved.
+// After the per-session model isolation fix, pinned is ALWAYS non-nil:
+// every Run path resolves from the session DB or config defaults before calling
+// runInternal. The nil check is kept for defensive purposes (tests, error paths).
+// Everything below — maxOutputTokens, providerCfg, the peak-hours check,
 // mergeCallOptions — is derived from ONE model value that also travels with
 // the call, so the turn cannot end up running a different model than the
 // options were computed for (task #265).
 func (c *coordinator) runInternal(ctx context.Context, sessionID string, prompt string, pinned *resolvedOverrides, attachments ...message.Attachment) (*fantasy.AgentResult, error) {
-	model := c.currentAgent.Model()
-	if pinned != nil {
+	var model Model
+	if pinned == nil {
+		// Defensive: this should never happen after the per-session model
+		// isolation fix, but we fall back to shared state for safety.
+		model = c.currentAgent.Model()
+	} else {
 		model = pinned.large
 	}
 	slog.Debug("Coordinator: running with model", "sessionID", sessionID, "model", model.ModelCfg.Model)
@@ -2467,7 +2616,14 @@ func (c *coordinator) InjectMessage(ctx context.Context, sessionID, prompt strin
 	if err := c.readyWg.Wait(); err != nil {
 		return message.Message{}, err
 	}
-	call, err := c.buildCall(ctx, sessionID, prompt, nil, attachments)
+
+	// Resolve the session's model configuration before building the call.
+	pinned, err := c.resolveSessionModels(ctx, sessionID)
+	if err != nil {
+		return message.Message{}, fmt.Errorf("failed to resolve session models for inject: %w", err)
+	}
+
+	call, err := c.buildCall(ctx, sessionID, prompt, pinned, attachments)
 	if err != nil {
 		return message.Message{}, err
 	}
@@ -2586,8 +2742,27 @@ func (c *coordinator) IsSessionBusy(sessionID string) bool {
 	return c.currentAgent.IsSessionBusy(sessionID)
 }
 
+// Model returns the globally configured large model from config.
+// This is used for display/status queries and does NOT reflect any per-session
+// model overrides. After the per-session model isolation fix, callers that need
+// the actual model for a specific session should use resolveSessionModels instead.
 func (c *coordinator) Model() Model {
-	return c.currentAgent.Model()
+	// Build the default large model from config without caching (this is
+	// called infrequently, mostly for status display).
+	largeCfg := c.cfg.Config().Models[config.SelectedModelTypeLarge]
+	smallCfg := c.cfg.Config().Models[config.SelectedModelTypeSmall]
+
+	// Create a temporary context for model building.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	largeModel, _, err := c.buildModelsFromCfg(ctx, largeCfg, smallCfg, false)
+	if err != nil {
+		// Return a zero-value model rather than panicking on status queries.
+		slog.Error("coordinator.Model: failed to build default large model", "err", err)
+		return Model{}
+	}
+	return largeModel
 }
 
 func (c *coordinator) GetSystemPrompt() string {
@@ -2598,8 +2773,17 @@ func (c *coordinator) BuildSystemPrompt(ctx context.Context) (string, error) {
 	if c.prompt == nil {
 		return "", nil
 	}
-	model := c.currentAgent.Model()
-	return c.prompt.Build(ctx, model.ModelCfg.Provider, model.ModelCfg.Model, c.cfg, c.workerSubAgentActive())
+
+	// Build the default large model from config for prompt building.
+	largeCfg := c.cfg.Config().Models[config.SelectedModelTypeLarge]
+	smallCfg := c.cfg.Config().Models[config.SelectedModelTypeSmall]
+
+	largeModel, _, err := c.buildModelsFromCfg(ctx, largeCfg, smallCfg, false)
+	if err != nil {
+		return "", fmt.Errorf("failed to build default large model: %w", err)
+	}
+
+	return c.prompt.Build(ctx, largeModel.ModelCfg.Provider, largeModel.ModelCfg.Model, c.cfg, c.workerSubAgentActive())
 }
 
 func (c *coordinator) UpdateSessionSystemPrompt(ctx context.Context, sessionID, prompt string) error {
@@ -2682,57 +2866,35 @@ func (c *coordinator) Summarize(ctx context.Context, sessionID string, snapshot 
 }
 
 // buildSummarizeSnapshot creates an immutable snapshot for a summarize operation,
-// resolving the model from the target session's persisted models (or shared state
+// resolving the model from the target session's persisted models (or config defaults
 // for sessions without overrides). This ensures the entire summarize operation
-// uses consistent configuration regardless of concurrent SetModels calls
-// (task #341, P1-1).
+// uses consistent configuration regardless of concurrent session model changes.
 func (c *coordinator) buildSummarizeSnapshot(ctx context.Context, sessionID string) (*SummarizeSnapshot, error) {
-	// Load the session to check for model overrides. If the session has a
-	// LargeModelID in the DB, we resolve from that; otherwise we fall back
-	// to the shared agent state (same guarantee level as Run for sessions
-	// without overrides).
-	sess, err := c.sessions.Get(ctx, sessionID)
-	var agentModel Model
-	var promptPrefix string
-	if err == nil && sess.LargeModelID != "" {
-		// Session has a pinned model in the DB. Resolve it using the same
-		// applyModelOverrides pattern as Run.
-		largeOverride := &ModelOverride{
-			Provider:        sess.LargeModelProvider,
-			Model:           sess.LargeModelID,
-			ReasoningEffort: sess.LargeModelReasoningEffort,
-		}
-		resolved, applyErr := c.applyModelOverrides(ctx, largeOverride, nil)
-		if applyErr != nil {
-			slog.Error("Coordinator.Summarize: failed to apply DB model override, using current models", "err", applyErr)
-			agentModel = c.currentAgent.Model()
-		} else {
-			agentModel = resolved.large
-			promptPrefix = resolved.promptPrefix
-		}
-	} else {
-		// Session has no override. Use the shared agent state. This is the
-		// same guarantee level as Run for sessions without overrides - not
-		// perfect, but acceptable since there's no per-session data to pin.
-		agentModel = c.currentAgent.Model()
+	// Resolve the session's model configuration from the DB or config defaults.
+	// This always returns a valid snapshot (never nil).
+	resolved, err := c.resolveSessionModels(ctx, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve session models for summarize: %w", err)
 	}
 
 	// Get the provider config for this model.
-	providerCfg, ok := c.cfg.Config().Providers.Get(agentModel.ModelCfg.Provider)
+	providerCfg, ok := c.cfg.Config().Providers.Get(resolved.large.ModelCfg.Provider)
 	if !ok {
 		return nil, errModelProviderNotConfigured
 	}
 
 	// Build provider options from the resolved model.
-	opts := getProviderOptions(agentModel, providerCfg)
+	opts := getProviderOptions(resolved.large, providerCfg)
 
-	// Build the prompt prefix from the provider config if we haven't already.
+	// Use the prompt prefix from the resolved snapshot (provider config's
+	// prefix, already set by resolveSessionModels).
+	promptPrefix := resolved.promptPrefix
 	if promptPrefix == "" {
 		promptPrefix = providerCfg.SystemPromptPrefix
 	}
 
 	return &SummarizeSnapshot{
-		model:           agentModel,
+		model:           resolved.large,
 		providerOptions: opts,
 		promptPrefix:    promptPrefix,
 	}, nil

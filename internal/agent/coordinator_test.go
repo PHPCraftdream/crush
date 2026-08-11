@@ -18,6 +18,7 @@ import (
 	"charm.land/fantasy/providers/openaicompat"
 	"github.com/charmbracelet/crush/internal/agent/tools"
 	"github.com/charmbracelet/crush/internal/config"
+	"github.com/charmbracelet/crush/internal/csync"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/session"
 	"github.com/stretchr/testify/assert"
@@ -1956,6 +1957,7 @@ func newWorkerToolTestCoordinator(t *testing.T, env fakeEnv, includeWorker bool)
 		permissions: env.permissions,
 		history:     env.history,
 		filetracker: *env.filetracker,
+		modelCache:  csync.NewMap[string, cachedModelPair](),
 	}
 }
 
