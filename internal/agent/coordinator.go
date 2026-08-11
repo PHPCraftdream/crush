@@ -393,18 +393,24 @@ func NewCoordinator(
 	}
 
 	agentCfg, ok := cfg.Config().Agents[config.AgentCoder]
-	if !ok {
+	if !ok || agentCfg.ID == "" {
 		// Self-heal: config.Load/reload always call SetupAgents once
 		// IsConfigured() becomes true, but a caller that mutates
 		// Providers/SelectedModel directly on an already-published config
 		// (bypassing Load/reload entirely — a test-only pattern; found via
 		// a CI-only failure this exact class of gap caused,
 		// errCoderAgentNotConfigured, that never reproduced on a dev
-		// machine with some unidentified environment leak making
-		// IsConfigured() true at initial Init) never triggers that
-		// population. SetupAgents is idempotent (derives Agents purely
-		// from Options/DisabledTools, no I/O), so re-deriving it here on a
-		// genuine miss is safe. See
+		// machine because cliprovider.Available() synthesizes a local-cli
+		// provider whenever claude/gemini/codex/qwen is on PATH, making
+		// IsConfigured() true at initial Init regardless of any
+		// CRUSH_GLOBAL_*/XDG_* isolation — confirmed by the sixth @oh
+		// review pass) never triggers that population. Also guards against
+		// Agents[AgentCoder] being present but zero-value (ok==true,
+		// ID=="") — the bare `!ok` check alone would skip self-heal for
+		// that case and build a coder agent with an empty ID/AllowedTools.
+		// SetupAgents is idempotent (derives Agents purely from Options/
+		// DisabledTools, no I/O), so re-deriving it here on a genuine miss
+		// is safe. See
 		// p350_coder_agent_selfheal_test.go for a deterministic
 		// regression test that does not depend on any environment leak.
 		cfg.SetupAgents()

@@ -150,6 +150,15 @@ func TestP341_ConcurrentSetModelsSummarizeUsesTargetSessionSnapshot(t *testing.T
 		BaseURL:            srvB.URL,
 		APIKey:             "probe",
 		SystemPromptPrefix: "prefix-b",
+		// Matches providerCfgA's own Models entry (found by the sixth @oh
+		// review pass): unused by this test's current assertions (B is
+		// only ever swapped in via cfg.Config().Providers.Set, never fed
+		// through buildAgentModels/UpdateModels), but keeping it symmetric
+		// avoids a latent errLargeModelNotFound trap if this test is ever
+		// extended to call either after the seam swaps B in.
+		Models: []catwalk.Model{
+			{ID: "model-b", Name: "model-b", ContextWindow: 200000, DefaultMaxTokens: 1000},
+		},
 	}
 
 	cfg, err := config.Init(env.workingDir, "", false)

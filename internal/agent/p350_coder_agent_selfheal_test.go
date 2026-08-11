@@ -13,14 +13,17 @@ package agent
 // entirely, so SetupAgents never runs and cfg.Agents[AgentCoder] stays
 // empty even though IsConfigured() has since become true.
 //
-// This was masked on the orchestrator's own dev machine: some environment
-// leak (never fully identified — CRUSH_GLOBAL_CONFIG/CRUSH_GLOBAL_DATA/
-// XDG_CONFIG_HOME/XDG_DATA_HOME isolation did not reproduce it either)
-// apparently makes IsConfigured() already true at the moment config.Init
-// runs, so SetupAgents fires during that initial call and the gap never
-// surfaces locally. It reproduces reliably on a genuinely clean environment
-// (GitHub Actions CI, all three OS runners) as "coder agent not configured"
-// / "coder agent configuration is missing".
+// This was masked on the orchestrator's own dev machine: identified by the
+// sixth @oh review pass — internal/config/load.go's cliprovider.Available()
+// synthesizes a local-cli provider whenever claude/gemini/codex/qwen is on
+// PATH, making IsConfigured() already true at the moment config.Init runs
+// (regardless of CRUSH_GLOBAL_CONFIG/CRUSH_GLOBAL_DATA/XDG_CONFIG_HOME/
+// XDG_DATA_HOME isolation, since PATH detection isn't file-based), so
+// SetupAgents fires during that initial call and the gap never surfaces
+// locally on a machine with any of those CLIs installed. It reproduces
+// reliably on a genuinely clean environment (GitHub Actions CI, all three OS
+// runners) as "coder agent not configured" / "coder agent configuration is
+// missing".
 //
 // Fixed at the root, in NewCoordinator (here) and App.InitCoderAgent
 // (internal/app/app.go): both now self-heal by calling cfg.SetupAgents()

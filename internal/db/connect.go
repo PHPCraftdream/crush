@@ -259,6 +259,14 @@ func ReleaseAll(dataDir string) error {
 		return nil
 	}
 	delete(pool, absPath)
+	// Zero the refCount before unlocking (found by the sixth @oh review
+	// pass): this entry is already unlinked from the pool, so nothing can
+	// legitimately observe it again through Connect/Release — but zeroing
+	// it defensively means a caller that (incorrectly) still held a
+	// reference to this now-detached entry and later calls Release on it
+	// cannot under-decrement a DIFFERENT, freshly-created entry for the
+	// same dataDir path.
+	entry.refCount = 0
 	poolMu.Unlock()
 
 	return closeEntry(entry)
