@@ -1814,8 +1814,10 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 		// genCtx's own cancellation somehow doesn't unblock it.
 		titleCtx, titleCancel := context.WithTimeout(genCtx, a.effectiveTitleGenerationMaxDuration())
 		titleDone = make(chan struct{})
+		a.runWg.Add(1)
 		go func() {
 			defer close(titleDone)
+			defer a.runWg.Done()
 			defer titleCancel()
 			a.generateTitle(titleCtx, call.SessionID, call.Prompt, cfg)
 		}()
@@ -3116,6 +3118,13 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 var ErrSummarizeQueued = errors.New("summarize queued")
 
 func (a *sessionAgent) Summarize(ctx context.Context, sessionID string, snapshot *SummarizeSnapshot) error {
+	// Track this Summarize() call in the agent-wide runWg so CancelAll can join
+	// on manual compactions that might be writing to the DB (P0-4).
+	// This defer fires on EVERY return from Summarize, including the queued
+	// early-return path and all error paths.
+	a.runWg.Add(1)
+	defer a.runWg.Done()
+
 	// Atomic check-and-reserve (#268/P0-4, design §6): beginCompact makes
 	// us the sole owner of sessionID's mailbox or returns false if a turn
 	// or another compaction already owns it. This replaces the old
