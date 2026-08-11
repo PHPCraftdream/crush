@@ -44,6 +44,20 @@ const RunQueueLeaseTTL = 30 * time.Second
 // are removed immediately regardless of attempts count.
 const RunQueueMaxAttempts = 10
 
+// MaxConcurrentExecutions: maximum number of executeEntry goroutines that
+// can run simultaneously across all sessions. Without this limit, a process
+// crash followed by a large backlog would spawn one goroutine per pending
+// entry in a single tick, potentially creating hundreds of concurrent
+// provider streams, DB connections, and subprocesses — indistinguishable
+// from a hang and prone to rate-limit/retry storms.
+// 10 is a reasonable default for typical resource constraints: one turn
+// can hold ~1-2 HTTP connections (LLM request + tools) plus a few SQLite
+// writers, so 10 concurrent turns stay within practical limits for a
+// single-process Crush instance. Each session still has its own inFlight
+// guard, so multiple entries for the same session never run concurrently
+// even if the pool is not full.
+const RunQueueMaxConcurrentExecutions = 10
+
 // Coordinator interface is a minimal subset for executing queued calls.
 // We use this instead of importing the full agent.Coordinator to avoid
 // import cycles (session → agent → session). The real app's AgentCoordinator
@@ -127,6 +141,13 @@ type RunQueuePumpConfig struct {
 	// pass over #337-349, which noted the existing tests could not
 	// exercise post-expiry behavior at all.
 	TestLeaseTTL time.Duration
+
+	// TestMaxConcurrentExecutions is a test seam for overriding
+	// RunQueueMaxConcurrentExecutions. 0 = use the production constant.
+	// Allows regression tests to force an artificially small pool size
+	// to verify the bounded-concurrency guarantee holds even under
+	// extreme backlog pressure.
+	TestMaxConcurrentExecutions int
 }
 
 // leaseTTL returns the effective lease TTL for this pump instance —
@@ -136,6 +157,16 @@ func (p *RunQueuePump) leaseTTL() time.Duration {
 		return p.cfg.TestLeaseTTL
 	}
 	return RunQueueLeaseTTL
+}
+
+// maxConcurrentExecutions returns the effective maximum concurrent
+// executions for this pump instance — cfg.TestMaxConcurrentExecutions
+// if non-zero, otherwise the production RunQueueMaxConcurrentExecutions.
+func (p *RunQueuePump) maxConcurrentExecutions() int {
+	if p.cfg.TestMaxConcurrentExecutions > 0 {
+		return p.cfg.TestMaxConcurrentExecutions
+	}
+	return RunQueueMaxConcurrentExecutions
 }
 
 // RunQueuePump is a background pump for the durable run queue.
@@ -259,6 +290,15 @@ type RunQueuePump struct {
 	busyBackoffUntil map[string]time.Time
 	busyBackoffMu    sync.Mutex
 
+	// execSem is a bounded semaphore that limits total concurrent
+	// executeEntry goroutines across all sessions. Unlike inFlight
+	// (which is per-session), this prevents unbounded fan-out after
+	// a process crash with a large backlog — without it, a single
+	// tick would spawn one goroutine per pending entry, potentially
+	// creating hundreds of concurrent provider streams, DB connections,
+	// and subprocesses. P1-4 fix (docs/reviews/2026-08-11).
+	execSem chan struct{}
+
 	// Test seam for waiting for a tick in tests
 	tickCh chan struct{}
 }
@@ -269,7 +309,7 @@ func NewRunQueuePump(cfg RunQueuePumpConfig) *RunQueuePump {
 		cfg.PumpInstanceID = fmt.Sprintf("pump-%d", time.Now().UnixNano())
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	return &RunQueuePump{
+	p := &RunQueuePump{
 		cfg:              cfg,
 		ctx:              ctx,
 		cancel:           cancel,
@@ -277,6 +317,9 @@ func NewRunQueuePump(cfg RunQueuePumpConfig) *RunQueuePump {
 		busyBackoffUntil: make(map[string]time.Time),
 		tickCh:           make(chan struct{}, 1),
 	}
+	// execSem must be initialized after p is constructed, so maxConcurrentExecutions() works
+	p.execSem = make(chan struct{}, p.maxConcurrentExecutions())
+	return p
 }
 
 // Start begins the pump goroutine. Safe to call multiple times (idempotent).
@@ -468,6 +511,24 @@ func (p *RunQueuePump) processEntry(ctx context.Context, entry *RunQueueEntry) {
 		return
 	}
 
+	// Attempt to acquire a slot from the bounded worker pool (P1-4).
+	// Non-blocking: if the pool is full, leave this entry entirely
+	// untouched for the next tick rather than leasing it. This prevents
+	// unbounded fan-out after a process crash with a large backlog.
+	select {
+	case p.execSem <- struct{}{}:
+		// Slot acquired, proceed below to lease and dispatch
+	default:
+		slog.Debug("run_queue_pump: worker pool full, deferring", "id", entry.ID, "session_id", entry.SessionID, "instance_id", p.cfg.PumpInstanceID)
+		return
+	}
+
+	// releaseSlot is a helper for returning a slot to the pool on error paths.
+	// Must only be called if a slot was acquired above.
+	releaseSlot := func() {
+		<-p.execSem
+	}
+
 	// Skip if attempts exceeded (unless terminal failure flag is set).
 	// TerminalFailRunQueueEntry only deletes rows in 'leased' state, but an
 	// attempts-exhausted entry sits in 'pending' (that's how it was scanned
@@ -480,10 +541,12 @@ func (p *RunQueuePump) processEntry(ctx context.Context, entry *RunQueueEntry) {
 		leased, err := p.cfg.Sessions.LeaseRunQueueEntry(ctx, entry.SessionID, p.cfg.PumpInstanceID, p.leaseTTL())
 		if err != nil {
 			slog.Error("run_queue_pump: lease for terminal-fail failed", "id", entry.ID, "session_id", entry.SessionID, "err", err, "instance_id", p.cfg.PumpInstanceID)
+			releaseSlot()
 			return
 		}
 		if leased == nil {
 			// Raced with another pump instance leasing/consuming it first.
+			releaseSlot()
 			return
 		}
 		if leased.ID != entry.ID {
@@ -499,17 +562,20 @@ func (p *RunQueuePump) processEntry(ctx context.Context, entry *RunQueueEntry) {
 			if nackErr := p.cfg.Sessions.NackRunQueueEntryNoAttemptPenalty(ctx, leased.ID, p.cfg.PumpInstanceID, "released: leased entry did not match the attempts-exhausted entry scanned for terminal-fail"); nackErr != nil {
 				slog.Error("run_queue_pump: release of mismatched lease failed", "id", leased.ID, "session_id", leased.SessionID, "err", nackErr, "instance_id", p.cfg.PumpInstanceID)
 			}
+			releaseSlot()
 			return
 		}
 		if err := p.cfg.Sessions.TerminalFailRunQueueEntry(ctx, leased.ID, p.cfg.PumpInstanceID); err != nil {
 			slog.Error("run_queue_pump: terminal fail failed", "id", leased.ID, "session_id", leased.SessionID, "err", err, "instance_id", p.cfg.PumpInstanceID)
 		}
+		releaseSlot()
 		return
 	}
 
 	// Skip if no coordinator (pump in scan-only mode)
 	if p.cfg.Coordinator == nil {
 		slog.Debug("run_queue_pump: no coordinator, skipping execution", "id", entry.ID, "session_id", entry.SessionID, "instance_id", p.cfg.PumpInstanceID)
+		releaseSlot()
 		return
 	}
 
@@ -517,10 +583,12 @@ func (p *RunQueuePump) processEntry(ctx context.Context, entry *RunQueueEntry) {
 	leased, err := p.cfg.Sessions.LeaseRunQueueEntry(ctx, entry.SessionID, p.cfg.PumpInstanceID, p.leaseTTL())
 	if err != nil {
 		slog.Error("run_queue_pump: lease failed", "id", entry.ID, "session_id", entry.SessionID, "err", err, "instance_id", p.cfg.PumpInstanceID)
+		releaseSlot()
 		return
 	}
 	if leased == nil {
 		// Another pump leased it between the scan and our attempt
+		releaseSlot()
 		return
 	}
 
@@ -564,6 +632,7 @@ func (p *RunQueuePump) processEntry(ctx context.Context, entry *RunQueueEntry) {
 			slog.Warn("run_queue_pump: release-on-shutdown nack failed, entry will recover via lease expiry", "id", leased.ID, "session_id", leased.SessionID, "err", nackErr, "instance_id", p.cfg.PumpInstanceID)
 		}
 		nackCancel()
+		releaseSlot()
 		return
 	}
 	p.workerWg.Add(1)
@@ -576,6 +645,10 @@ func (p *RunQueuePump) processEntry(ctx context.Context, entry *RunQueueEntry) {
 // executeEntry runs a leased entry and handles success/failure.
 func (p *RunQueuePump) executeEntry(ctx context.Context, leased *RunQueueEntry) {
 	defer p.workerWg.Done()
+
+	// Release the semaphore slot when execution completes (P1-4).
+	// This guarantees the slot is returned even on panic or any error path.
+	defer func() { <-p.execSem }()
 
 	defer func() {
 		p.inFlightMu.Lock()
