@@ -278,19 +278,16 @@ func (s *service) Update(ctx context.Context, message Message) error {
 	// is safely discarded.
 	var dbErr error
 	if partialCheckpoint {
+		// A nil error here covers both outcomes (1 row updated, or 0 rows
+		// skipped because a terminal finish already landed) — sqlc's :exec
+		// result type can't distinguish them, but the WHERE clause is what
+		// prevents the race either way, so no branch on the row count is
+		// needed.
 		dbErr = s.q.UpdateMessageIfNotTerminal(ctx, db.UpdateMessageIfNotTerminalParams{
 			ID:         message.ID,
 			Parts:      string(parts),
 			FinishedAt: finishedAt,
 		})
-		// Log the skip case (0 rows affected) as a hint that a race was
-		// prevented. This is expected during shutdown when a checkpoint
-		// unblocks after the terminal write has already landed.
-		if dbErr == nil {
-			// The update succeeded (either 0 or 1 row). We can't distinguish
-			// 0 rows from sqlc's :exec result type, but we know the race was
-			// prevented by the WHERE clause, which is sufficient.
-		}
 	} else {
 		dbErr = s.q.UpdateMessage(ctx, db.UpdateMessageParams{
 			ID:         message.ID,
