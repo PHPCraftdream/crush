@@ -587,6 +587,9 @@ type SummarizeSnapshot struct {
 // Results are cached per unique (config generation, provider+model+reasoning_effort) pair.
 // The config generation is included so that any config change (reload, credential update,
 // etc.) invalidates the cache, preventing stale clients from being reused (task #341, P1-3).
+//
+// All config reads use a single atomic Snapshot() call to prevent reading config fields
+// from different generations (task #341, P1-3).
 func (c *coordinator) resolveSessionModels(ctx context.Context, sessionID string) (*resolvedOverrides, error) {
 	// Load the session to check for model overrides.
 	sess, err := c.sessions.Get(ctx, sessionID)
@@ -594,9 +597,13 @@ func (c *coordinator) resolveSessionModels(ctx context.Context, sessionID string
 		return nil, fmt.Errorf("failed to load session %q: %w", sessionID, err)
 	}
 
+	// Atomically capture config and generation in a single snapshot to prevent
+	// torn reads across reloads (task #341, P1-3).
+	cfg, gen := c.cfg.Snapshot()
+
 	// Start with the global config defaults.
-	largeCfg := c.cfg.Config().Models[config.SelectedModelTypeLarge]
-	smallCfg := c.cfg.Config().Models[config.SelectedModelTypeSmall]
+	largeCfg := cfg.Models[config.SelectedModelTypeLarge]
+	smallCfg := cfg.Models[config.SelectedModelTypeSmall]
 
 	// Apply session-level overrides from the DB if present.
 	var largeOverride, smallOverride *ModelOverride
@@ -660,8 +667,11 @@ func (c *coordinator) resolveSessionModels(ctx context.Context, sessionID string
 	// small-model-driven path) via resolvedOverrides.pin. Caching the pair
 	// from one call, in the caller-supplied role order, removes the
 	// swap entirely.
+	//
+	// Use the atomic generation from Snapshot(), not a separate Generation()
+	// call, to ensure consistency (task #341, P1-3).
 	pairCacheKey := fmt.Sprintf("gen:%d|%s:%s:%s|%s:%s:%s",
-		c.cfg.Generation(),
+		gen,
 		largeCfg.Provider, largeCfg.Model, largeCfg.ReasoningEffort,
 		smallCfg.Provider, smallCfg.Model, smallCfg.ReasoningEffort)
 
@@ -680,7 +690,7 @@ func (c *coordinator) resolveSessionModels(ctx context.Context, sessionID string
 		}
 	}
 	if !cacheHit {
-		largeModel, smallModel, err = c.buildModelsFromCfg(ctx, largeCfg, smallCfg, false)
+		largeModel, smallModel, err = c.buildModelsFromCfg(ctx, cfg, largeCfg, smallCfg, false)
 		if err != nil {
 			return nil, fmt.Errorf("failed to build models: %w", err)
 		}
@@ -694,8 +704,12 @@ func (c *coordinator) resolveSessionModels(ctx context.Context, sessionID string
 		small: smallModel,
 	}
 
-	// Resolve prompt prefix from provider config.
-	if largeProviderCfg, ok := c.cfg.Config().Providers.Get(largeModel.ModelCfg.Provider); ok {
+	// Resolve prompt prefix from provider config using the same atomic snapshot.
+	largeProviderCfg, ok := cfg.Providers.Get(largeModel.ModelCfg.Provider)
+	if !ok {
+		return nil, fmt.Errorf("large model provider %s not configured", largeModel.ModelCfg.Provider)
+	}
+	if largeProviderCfg.SystemPromptPrefix != "" {
 		resolved.promptPrefix = largeProviderCfg.SystemPromptPrefix
 	}
 
@@ -759,14 +773,15 @@ func (c *coordinator) applyModelOverrides(ctx context.Context, large, small *Mod
 	// the config generation which we'd need to recompute here. The cost of
 	// building the fantasy.LanguageModel client is paid once per override use,
 	// which is acceptable since overrides are explicitly opt-in per-call.
-	largeModel, smallModel, err := c.buildModelsFromCfg(ctx, largeCfg, smallCfg, false)
+	cfg, _ := c.cfg.Snapshot()
+	largeModel, smallModel, err := c.buildModelsFromCfg(ctx, cfg, largeCfg, smallCfg, false)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build override models: %w", err)
 	}
 
 	resolved := &resolvedOverrides{large: largeModel, small: smallModel}
 
-	if largeProviderCfg, ok := c.cfg.Config().Providers.Get(largeModel.ModelCfg.Provider); ok {
+	if largeProviderCfg, ok := cfg.Providers.Get(largeModel.ModelCfg.Provider); ok {
 		resolved.promptPrefix = largeProviderCfg.SystemPromptPrefix
 	}
 	if c.prompt != nil {
@@ -994,9 +1009,76 @@ func (c *coordinator) runInternal(ctx context.Context, sessionID string, prompt 
 	// LargeModel as set above when pinned is nil, and rewrites it to the same
 	// value when it isn't (model was taken FROM pinned.large).
 	pinned.pin(&agentCall)
+
+	// trackCall is a pointer to the current call so we can rebuild it after
+	// a 401 credential refresh (task #341, P1-2).
+	trackCall := &agentCall
 	run := func() (*fantasy.AgentResult, error) {
-		return c.currentAgent.Run(ctx, agentCall)
+		return c.currentAgent.Run(ctx, *trackCall)
 	}
+
+	// rebuildCall reconstructs the call after credential refresh, preserving
+	// the logical request ID and other fields but using fresh models with new
+	// credentials (task #341, P1-2).
+	rebuildCall := func() error {
+		// Resolve fresh models with updated credentials.
+		pinned, err := c.resolveSessionModels(ctx, sessionID)
+		if err != nil {
+			return fmt.Errorf("failed to resolve models after credential refresh: %w", err)
+		}
+
+		// Rebuild the call with the new models, preserving all logical fields.
+		model := pinned.large
+		maxOutputTokens := model.CatwalkCfg.DefaultMaxTokens
+		if model.ModelCfg.MaxTokens != 0 {
+			maxOutputTokens = model.ModelCfg.MaxTokens
+		}
+
+		// Re-filter attachments for the new model's image support.
+		if !model.CatwalkCfg.SupportsImages && attachments != nil {
+			filteredAttachments := make([]message.Attachment, 0, len(attachments))
+			for _, att := range attachments {
+				if att.IsText() {
+					filteredAttachments = append(filteredAttachments, att)
+				}
+			}
+			attachments = filteredAttachments
+		}
+
+		// Get provider config again from fresh snapshot.
+		providerCfg, ok := c.cfg.Config().Providers.Get(model.ModelCfg.Provider)
+		if !ok {
+			return errModelProviderNotConfigured
+		}
+
+		mergedOptions, temp, topP, topK, freqPenalty, presPenalty := mergeCallOptions(model, providerCfg)
+
+		pinnedLarge := model
+		newCall := SessionAgentCall{
+			SessionID:            trackCall.SessionID,
+			Prompt:               trackCall.Prompt,
+			Attachments:          attachments,
+			MaxOutputTokens:      maxOutputTokens,
+			ProviderOptions:      mergedOptions,
+			Temperature:          temp,
+			TopP:                 topP,
+			TopK:                 topK,
+			FrequencyPenalty:     freqPenalty,
+			PresencePenalty:      presPenalty,
+			SystemPromptOverride: trackCall.SystemPromptOverride,
+			MaxCost:              trackCall.MaxCost,
+			MaxTokens:            trackCall.MaxTokens,
+			LargeModel:           &pinnedLarge,
+			LogicalCallID:        trackCall.LogicalCallID, // Preserve logical ID
+			ExistingMessageID:    trackCall.ExistingMessageID,
+			InjectID:             trackCall.InjectID,
+			FromDurableQueue:     trackCall.FromDurableQueue,
+		}
+		pinned.pin(&newCall)
+		*trackCall = newCall
+		return nil
+	}
+
 	// Interrupt-inject ticker: watches pending_injects for interrupt=true rows
 	// written by `crush sessions inject --interrupt` in another process, and
 	// (on the first hit) cancels the running turn and requeues the referenced
@@ -1014,7 +1096,7 @@ func (c *coordinator) runInternal(ctx context.Context, sessionID string, prompt 
 		var err error
 		result, err = run()
 		return err
-	})
+	}, rebuildCall)
 	logTurnSkillUsage(sessionID, prompt, c.activeSkills, c.skillTracker, beforeLoaded)
 
 	// Notify only if still unauthorized after retry — a successful
@@ -1876,12 +1958,15 @@ func (c *coordinator) buildAgentModels(ctx context.Context, isSubAgent bool) (Mo
 		largeModelCfg = c.cfg.Config().Models[config.SelectedModelTypeWorker]
 	}
 
-	return c.buildModelsFromCfg(ctx, largeModelCfg, smallModelCfg, isSubAgent)
+	cfg, _ := c.cfg.Snapshot()
+	return c.buildModelsFromCfg(ctx, cfg, largeModelCfg, smallModelCfg, isSubAgent)
 }
 
 // buildModelsFromCfg builds Model objects from explicit SelectedModel configs.
-func (c *coordinator) buildModelsFromCfg(ctx context.Context, largeModelCfg, smallModelCfg config.SelectedModel, isSubAgent bool) (Model, Model, error) {
-	largeProviderCfg, ok := c.cfg.Config().Providers.Get(largeModelCfg.Provider)
+// The cfg parameter must be from a single atomic Snapshot() call to ensure
+// consistency across all provider reads (task #341, P1-3).
+func (c *coordinator) buildModelsFromCfg(ctx context.Context, cfg *config.Config, largeModelCfg, smallModelCfg config.SelectedModel, isSubAgent bool) (Model, Model, error) {
+	largeProviderCfg, ok := cfg.Providers.Get(largeModelCfg.Provider)
 	if !ok {
 		return Model{}, Model{}, errLargeModelProviderNotConfigured
 	}
@@ -1891,7 +1976,7 @@ func (c *coordinator) buildModelsFromCfg(ctx context.Context, largeModelCfg, sma
 		return Model{}, Model{}, err
 	}
 
-	smallProviderCfg, ok := c.cfg.Config().Providers.Get(smallModelCfg.Provider)
+	smallProviderCfg, ok := cfg.Providers.Get(smallModelCfg.Provider)
 	if !ok {
 		return Model{}, Model{}, errSmallModelProviderNotConfigured
 	}
@@ -2691,24 +2776,25 @@ func (c *coordinator) RebuildSessionAgentCall(ctx context.Context, data session.
 	var largeModel, smallModel Model
 	var err error
 
-	// Determine which models to rebuild
+	// Determine which models to rebuild using a single atomic snapshot.
+	cfg, _ := c.cfg.Snapshot()
 	var largeCfg, smallCfg config.SelectedModel
 	if data.LargeModel != nil {
 		largeCfg = fromSessionModelCfg(*data.LargeModel)
 	} else {
 		// Use default config for large model
-		largeCfg = c.cfg.Config().Models[config.SelectedModelTypeLarge]
+		largeCfg = cfg.Models[config.SelectedModelTypeLarge]
 	}
 
 	if data.SmallModel != nil {
 		smallCfg = fromSessionModelCfg(*data.SmallModel)
 	} else {
 		// Use default config for small model
-		smallCfg = c.cfg.Config().Models[config.SelectedModelTypeSmall]
+		smallCfg = cfg.Models[config.SelectedModelTypeSmall]
 	}
 
 	// Build both models (buildModelsFromCfg requires both)
-	largeModel, smallModel, err = c.buildModelsFromCfg(ctx, largeCfg, smallCfg, false)
+	largeModel, smallModel, err = c.buildModelsFromCfg(ctx, cfg, largeCfg, smallCfg, false)
 	if err != nil {
 		return SessionAgentCall{}, fmt.Errorf("failed to rebuild models from config: %w", err)
 	}
@@ -2912,14 +2998,15 @@ func (c *coordinator) IsSessionBusy(sessionID string) bool {
 func (c *coordinator) Model() Model {
 	// Build the default large model from config without caching (this is
 	// called infrequently, mostly for status display).
-	largeCfg := c.cfg.Config().Models[config.SelectedModelTypeLarge]
-	smallCfg := c.cfg.Config().Models[config.SelectedModelTypeSmall]
+	cfg, _ := c.cfg.Snapshot()
+	largeCfg := cfg.Models[config.SelectedModelTypeLarge]
+	smallCfg := cfg.Models[config.SelectedModelTypeSmall]
 
 	// Create a temporary context for model building.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	largeModel, _, err := c.buildModelsFromCfg(ctx, largeCfg, smallCfg, false)
+	largeModel, _, err := c.buildModelsFromCfg(ctx, cfg, largeCfg, smallCfg, false)
 	if err != nil {
 		// Return a zero-value model rather than panicking on status queries.
 		slog.Error("coordinator.Model: failed to build default large model", "err", err)
@@ -2938,10 +3025,11 @@ func (c *coordinator) BuildSystemPrompt(ctx context.Context) (string, error) {
 	}
 
 	// Build the default large model from config for prompt building.
-	largeCfg := c.cfg.Config().Models[config.SelectedModelTypeLarge]
-	smallCfg := c.cfg.Config().Models[config.SelectedModelTypeSmall]
+	cfg, _ := c.cfg.Snapshot()
+	largeCfg := cfg.Models[config.SelectedModelTypeLarge]
+	smallCfg := cfg.Models[config.SelectedModelTypeSmall]
 
-	largeModel, _, err := c.buildModelsFromCfg(ctx, largeCfg, smallCfg, false)
+	largeModel, _, err := c.buildModelsFromCfg(ctx, cfg, largeCfg, smallCfg, false)
 	if err != nil {
 		return "", fmt.Errorf("failed to build default large model: %w", err)
 	}
@@ -3057,7 +3145,9 @@ func (c *coordinator) Summarize(ctx context.Context, sessionID string, snapshot 
 		return c.currentAgent.Summarize(ctx, sessionID, snapshot)
 	}
 
-	return c.runWithUnauthorizedRetry(ctx, providerCfg, summarize)
+	// Summarize doesn't need a rebuild callback since it uses a pre-built
+	// snapshot that doesn't capture a provider client.
+	return c.runWithUnauthorizedRetry(ctx, providerCfg, summarize, nil)
 }
 
 // buildSummarizeSnapshot creates an immutable snapshot for a summarize operation,
@@ -3161,18 +3251,30 @@ func checkPeakHours(providerCfg config.ProviderConfig) error {
 }
 
 // runWithUnauthorizedRetry executes fn. If fn returns a 401 error, it
-// attempts to refresh credentials and re-runs fn once. Returns the
-// final error: from the retry if a retry was attempted, otherwise from
-// the original run. Callers that need to notify the user on persistent
+// attempts to refresh credentials and rebuilds the call before retrying.
+// Returns the final error: from the retry if a retry was attempted, otherwise
+// from the original run. Callers that need to notify the user on persistent
 // failure should check isUnauthorized on the returned error.
 //
-// After credential refresh, the model cache is cleared via UpdateModels,
-// so subsequent resolveSessionModels calls rebuild models with fresh
-// credentials rather than reusing cached stale clients (task #341, P1-3).
-func (c *coordinator) runWithUnauthorizedRetry(ctx context.Context, providerCfg config.ProviderConfig, fn func() error) error {
+// After credential refresh, rebuildCall is invoked to reconstruct the call
+// with fresh credentials, ensuring the retry uses a new provider client
+// rather than the stale pinned client from the original attempt (task #341,
+// P1-2).
+func (c *coordinator) runWithUnauthorizedRetry(ctx context.Context, providerCfg config.ProviderConfig, fn func() error, rebuildCall func() error) error {
 	err := fn()
 	if err != nil && c.isUnauthorized(err) {
 		if retryErr := c.retryAfterUnauthorized(ctx, providerCfg); retryErr == nil {
+			// After credential refresh, rebuild the call with fresh models
+			// to use the new provider client (task #341, P1-2). rebuildCall
+			// is nil for callers that don't pin a call to a specific model
+			// snapshot (e.g. summarize, sub-agent delegation) — fn() itself
+			// re-resolves what it needs on each invocation for those paths,
+			// so there is nothing to rebuild.
+			if rebuildCall != nil {
+				if rebuildErr := rebuildCall(); rebuildErr != nil {
+					return rebuildErr
+				}
+			}
 			return fn()
 		}
 	}
@@ -3364,7 +3466,7 @@ func (c *coordinator) runSubAgent(ctx context.Context, params subAgentParams) (f
 		var runErr error
 		result, runErr = run()
 		return runErr
-	})
+	}, nil)
 	// Notify only if still unauthorized after retry.
 	if err != nil && c.isUnauthorized(err) && c.notify != nil && model.ModelCfg.Provider == hyper.Name {
 		c.notify.Publish(pubsub.CreatedEvent, notify.Notification{

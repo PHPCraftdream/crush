@@ -214,6 +214,15 @@ func (s *ConfigStore) Generation() uint64 {
 	return s.loadSnapshot().generation
 }
 
+// Snapshot returns both the config and its generation atomically from a single
+// storeSnapshot. This prevents reading config and generation separately and
+// getting inconsistent results if a reload occurs between the two reads
+// (task #341, P1-3).
+func (s *ConfigStore) Snapshot() (*Config, uint64) {
+	sn := s.loadSnapshot()
+	return sn.config, sn.generation
+}
+
 // WorkingDir returns the current working directory.
 func (s *ConfigStore) WorkingDir() string {
 	return s.workingDir
@@ -1022,11 +1031,12 @@ func (s *ConfigStore) SetProviderAPIKey(scope Scope, providerID string, apiKey a
 	return nil
 }
 
-// SetProviderRuntimeConfig updates a provider's config in the CURRENT
-// generation's Providers map. It is for in-memory-only provider updates that
-// are NOT persisted to disk — e.g. re-resolving an API key template after a
-// 401 error in the coordinator. A subsequent reload will rebuild Providers
-// from disk (re-resolving the template), discarding this change by design.
+// SetProviderRuntimeConfig updates a provider's config and increments the
+// generation, publishing a new snapshot. It is for in-memory-only provider
+// updates that are NOT persisted to disk — e.g. re-resolving an API key
+// template after a 401 error in the coordinator. A subsequent reload will
+// rebuild Providers from disk (re-resolving the template), discarding this
+// change by design.
 //
 // publishMu is held so no concurrent reload can swap the Providers
 // *csync.Map between loadSnapshot() and .Set(). Each reload creates a brand
@@ -1034,10 +1044,17 @@ func (s *ConfigStore) SetProviderAPIKey(scope Scope, providerID string, apiKey a
 // Map.UnmarshalJSON which allocates a fresh inner map; setDefaults creates a
 // fresh NewMap if unmarshal left it nil), so without this lock the .Set()
 // could land in an already-orphaned map that no reader sees.
+//
+// Unlike the old implementation that mutated in-place without incrementing
+// generation, this now publishes a new snapshot with an incremented generation,
+// ensuring the cache key contract is honored (task #341, P1-3).
 func (s *ConfigStore) SetProviderRuntimeConfig(providerID string, pc ProviderConfig) {
 	s.publishMu.Lock()
 	defer s.publishMu.Unlock()
-	s.loadSnapshot().config.Providers.Set(providerID, pc)
+	cur := s.loadSnapshot()
+	next := cur.clone()
+	next.config.Providers.Set(providerID, pc)
+	s.publishLocked(next)
 }
 
 // copilotRefreshTokenFn and hyperExchangeTokenFn indirect the two external
@@ -1115,16 +1132,9 @@ func (s *ConfigStore) RefreshOAuthToken(ctx context.Context, scope Scope, provid
 		providerConfig.SetupGitHubCopilot()
 	}
 
-	// Re-capture the Providers map here instead of reusing the `providers`
-	// local captured at the top of this function: copilot.RefreshToken /
-	// hyper.ExchangeToken above made a network round-trip, and a concurrent
-	// reload could have published a brand new *csync.Map (every reload
-	// allocates a fresh one, see SetProviderRuntimeConfig's doc comment)
-	// while that call was in flight. Writing into the stale `providers`
-	// local would land in an already-orphaned map invisible to any reader
-	// of the current snapshot — exactly the bug applyToken already avoids
-	// by re-loading the snapshot immediately before its Set.
-	s.loadSnapshot().config.Providers.Set(providerID, providerConfig)
+	// Use SetProviderRuntimeConfig to publish a new snapshot with incremented
+	// generation, ensuring cache invalidation works correctly (task #341, P1-3).
+	s.SetProviderRuntimeConfig(providerID, providerConfig)
 
 	if err := s.SetConfigFields(scope, map[string]any{
 		fmt.Sprintf("providers.%s.api_key", providerID): refreshedToken.AccessToken,
@@ -1136,16 +1146,15 @@ func (s *ConfigStore) RefreshOAuthToken(ctx context.Context, scope Scope, provid
 	return nil
 }
 
-// applyToken updates the in-memory provider config with the given token.
-// Providers is a *csync.Map (its own internal RWMutex), so Set is safe to
-// call directly here without a copy-on-write config swap.
+// applyToken updates the in-memory provider config with the given token
+// and publishes a new snapshot with incremented generation (task #341, P1-3).
 func (s *ConfigStore) applyToken(providerConfig ProviderConfig, token *oauth.Token, providerID string) error {
 	providerConfig.OAuthToken = token
 	providerConfig.APIKey = token.AccessToken
 	if providerID == string(catwalk.InferenceProviderCopilot) {
 		providerConfig.SetupGitHubCopilot()
 	}
-	s.loadSnapshot().config.Providers.Set(providerID, providerConfig)
+	s.SetProviderRuntimeConfig(providerID, providerConfig)
 	return nil
 }
 
