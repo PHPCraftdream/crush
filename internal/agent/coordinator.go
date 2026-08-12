@@ -2579,6 +2579,7 @@ func (c *coordinator) RebuildSessionAgentCall(ctx context.Context, data session.
 
 	return SessionAgentCall{
 		SessionID:            data.SessionID,
+		LogicalCallID:        data.LogicalCallID, // P2-1 fix: restore stable ID
 		Prompt:               data.Prompt,
 		Attachments:          data.Attachments,
 		ProviderOptions:      providerOptions,

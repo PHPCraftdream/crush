@@ -1349,6 +1349,9 @@ type SessionAgentCallData struct {
 	// computed via mergeCallOptions/getProviderOptions during pump execution.
 	// Only ModelCfg is serialized because it contains the per-session pinned snapshot
 	// (task #265, P0-1, task #340 ROUND 3).
+	// LogicalCallID is the stable identifier for this logical request, used to build
+	// the idempotency key for durable queue operations (P2-1 fix).
+	LogicalCallID   string
 	MaxOutputTokens int64
 	NonInteractive  bool
 	// SystemPromptOverride, if non-empty, replaces the agent's global system prompt

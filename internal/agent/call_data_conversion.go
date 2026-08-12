@@ -52,6 +52,9 @@ func fromSessionModelCfg(cfg session.ModelCfg) config.SelectedModel {
 //     during pump execution ( ROUND 3 design decision).
 //   - The live fantasy.LanguageModel and CatwalkCfg in Model are NOT serializable
 //     and will be reconstructed by coordinator.RebuildSessionAgentCall.
+//
+// LogicalCallID is serialized to ensure the stable idempotency key survives
+// the durable serialization boundary (P2-1 fix, P0-1 release blocker).
 func ToSessionAgentCallData(call SessionAgentCall) session.SessionAgentCallData {
 	var largeModel, smallModel *session.ModelCfg
 	if call.LargeModel != nil {
@@ -65,6 +68,7 @@ func ToSessionAgentCallData(call SessionAgentCall) session.SessionAgentCallData 
 
 	return session.SessionAgentCallData{
 		SessionID:            call.SessionID,
+		LogicalCallID:        call.LogicalCallID,
 		Prompt:               call.Prompt,
 		Attachments:          call.Attachments,
 		MaxOutputTokens:      call.MaxOutputTokens,
@@ -87,9 +91,13 @@ func ToSessionAgentCallData(call SessionAgentCall) session.SessionAgentCallData 
 // This function only converts the data that was serialized. The full Model
 // (with live fantasy.LanguageModel and CatwalkCfg) will be reconstructed by
 // coordinator.RebuildSessionAgentCall.
+//
+// LogicalCallID is restored to ensure the stable idempotency key survives
+// the durable serialization boundary (P2-1 fix, P0-1 release blocker).
 func FromSessionAgentCallData(callData session.SessionAgentCallData) SessionAgentCall {
 	return SessionAgentCall{
 		SessionID:            callData.SessionID,
+		LogicalCallID:        callData.LogicalCallID,
 		Prompt:               callData.Prompt,
 		Attachments:          callData.Attachments,
 		MaxOutputTokens:      callData.MaxOutputTokens,

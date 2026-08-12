@@ -1172,6 +1172,25 @@ func (a *sessionAgent) restartOrphanedWithRetry(calls []SessionAgentCall) error 
 		go func() {
 			defer wg.Done()
 
+			// P0-1 fix: do NOT re-enqueue calls that originated from the durable queue.
+			// These calls already have a durable row that will be retried by the pump.
+			// Re-enqueueing would create a duplicate row (with the same idempotency key
+			// if LogicalCallID is present, or a different key if LogicalCallID is lost),
+			// leading to potential duplicate execution.
+			//
+			// When a pump processes a durable call and then fails (e.g., due to replacement
+			// or interrupt), the pump will Nack the row back to pending state. The pump
+			// (or another pump) will then re-lease and retry the SAME row. No new row
+			// needs to be created.
+			//
+			// Calls with FromDurableQueue=false (e.g., direct web/CLI turns) need enqueue
+			// because they don't have a durable row yet.
+			if call.FromDurableQueue {
+				slog.Debug("agent: skipping durable enqueue for FromDurableQueue call (already has a durable row)",
+					"session_id", call.SessionID)
+				return
+			}
+
 			// P2-1: Generate idempotency key from LogicalCallID (stable per logical request)
 			// instead of timestamp (which changes on every retry). Fallback to timestamp
 			// with warning if LogicalCallID is empty (should not happen in normal flow).
