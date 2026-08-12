@@ -5,6 +5,7 @@ import (
 
 	"charm.land/catwalk/pkg/catwalk"
 	"github.com/charmbracelet/crush/internal/config"
+	"github.com/charmbracelet/crush/internal/csync"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -84,9 +85,18 @@ func TestCoordinator_InterruptAndSend_UnknownProvider_Errors(t *testing.T) {
 	// Note: not registering the provider config below makes buildCall fail.
 	cfg, err := config.Init(env.workingDir, "", false)
 	require.NoError(t, err)
-	coord := &coordinator{cfg: cfg, sessions: env.sessions}
+	coord := &coordinator{
+		cfg:        cfg,
+		sessions:   env.sessions,
+		modelCache: csync.NewMap[string, cachedModelPair](),
+	}
 
 	sess, err := env.sessions.Create(t.Context(), "test")
+	require.NoError(t, err)
+
+	// Set up the session with an unknown provider override.
+	// This will cause resolveSessionModels to fail when building models.
+	err = env.sessions.UpdateModels(t.Context(), sess.ID, "ghost-provider", "ghost-model", "", "")
 	require.NoError(t, err)
 
 	mock := &mockSessionAgent{
@@ -97,7 +107,7 @@ func TestCoordinator_InterruptAndSend_UnknownProvider_Errors(t *testing.T) {
 	coord.currentAgent = mock
 
 	err = coord.InterruptAndSend(t.Context(), sess.ID, "hello", nil, nil)
-	require.Error(t, err)
+	require.Error(t, err, "InterruptAndSend must error when model resolution fails")
 	assert.Empty(t, mock.queuedCalls, "queue must not be touched when build fails")
 	assert.Empty(t, mock.cancelled, "Cancel must not be called when build fails")
 	assert.Empty(t, mock.interruptAndReplaced, "InterruptAndReplace must not be called when build fails")

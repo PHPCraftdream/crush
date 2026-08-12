@@ -265,15 +265,41 @@ func TestBuildCall_PinsModelEvenWithoutOverrides(t *testing.T) {
 	env := testEnv(t)
 	cfg, err := config.Init(env.workingDir, "", false)
 	require.NoError(t, err)
-	cfg.Config().Providers.Set(providerID, config.ProviderConfig{ID: providerID})
+	cfg.Config().Providers.Set(providerID, config.ProviderConfig{
+		ID:   providerID,
+		Type: "openai",
+		Models: []catwalk.Model{
+			{ID: "test-large-model", Name: "Test Large", DefaultMaxTokens: 4096},
+			{ID: "test-small-model", Name: "Test Small", DefaultMaxTokens: 4096},
+		},
+	})
 
-	coord := &coordinator{cfg: cfg, sessions: env.sessions, messages: env.messages}
+	// Set up default models so resolveSessionModels can build them.
+	cfg.Config().Models[config.SelectedModelTypeLarge] = config.SelectedModel{
+		Provider: providerID,
+		Model:    "test-large-model",
+	}
+	cfg.Config().Models[config.SelectedModelTypeSmall] = config.SelectedModel{
+		Provider: providerID,
+		Model:    "test-small-model",
+	}
+
+	coord := &coordinator{
+		cfg:        cfg,
+		sessions:   env.sessions,
+		messages:   env.messages,
+		modelCache: csync.NewMap[string, cachedModelPair](),
+	}
 	coord.currentAgent = newMockAgent(providerID, 4096, nil)
 
 	sess, err := env.sessions.Create(t.Context(), "buildcall-pin")
 	require.NoError(t, err)
 
-	call, err := coord.buildCall(t.Context(), sess.ID, "prompt", nil, nil)
+	// Resolve models from session DB or config defaults (no override in this case).
+	pinned, err := coord.resolveSessionModels(t.Context(), sess.ID)
+	require.NoError(t, err)
+
+	call, err := coord.buildCall(t.Context(), sess.ID, "prompt", pinned, nil)
 	require.NoError(t, err)
 
 	require.NotNil(t, call.LargeModel,

@@ -207,6 +207,13 @@ func (s *ConfigStore) Config() *Config {
 	return s.loadSnapshot().config
 }
 
+// Generation returns the current generation number of the config snapshot.
+// The generation is incremented on every config mutation (reload, set operations, etc.).
+// Callers can use this to detect when config has changed and invalidate caches.
+func (s *ConfigStore) Generation() uint64 {
+	return s.loadSnapshot().generation
+}
+
 // WorkingDir returns the current working directory.
 func (s *ConfigStore) WorkingDir() string {
 	return s.workingDir
