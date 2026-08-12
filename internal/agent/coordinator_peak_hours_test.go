@@ -8,8 +8,10 @@ import (
 	"testing"
 	"time"
 
+	"charm.land/catwalk/pkg/catwalk"
 	"charm.land/fantasy"
 	"github.com/charmbracelet/crush/internal/config"
+	"github.com/charmbracelet/crush/internal/csync"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -72,18 +74,30 @@ func TestCheckPeakHours_AllowsOutsideWindow(t *testing.T) {
 func TestSetAllowPeakHours_BypassesRunInternal(t *testing.T) {
 	const providerID = "test-peak"
 	w := peakWindowAroundNow()
-	providerCfg := config.ProviderConfig{ID: providerID, PeakHours: w}
+	providerCfg := config.ProviderConfig{
+		ID:        providerID,
+		Type:      "openai",
+		PeakHours: w,
+		Models: []catwalk.Model{
+			{ID: "test-model", Name: "Test Model", DefaultMaxTokens: 4096},
+		},
+	}
 
 	env := testEnv(t)
 	cfg, err := config.Init(env.workingDir, "", false)
 	require.NoError(t, err)
 	cfg.Config().Providers.Set(providerID, providerCfg)
+	cfg.Config().Models[config.SelectedModelTypeLarge] = config.SelectedModel{
+		Provider: providerID,
+		Model:    "test-model",
+	}
 	// runInternal's retry path calls lastAssistantMessage -> c.messages, so
 	// wire the real message service (matches appendAssistant's setup).
 	coord := &coordinator{
-		cfg:      cfg,
-		sessions: env.sessions,
-		messages: env.messages,
+		cfg:        cfg,
+		sessions:   env.sessions,
+		messages:   env.messages,
+		modelCache: csync.NewMap[string, cachedModelPair](),
 	}
 
 	agentReached := false
@@ -94,9 +108,17 @@ func TestSetAllowPeakHours_BypassesRunInternal(t *testing.T) {
 	// runInternal reads c.currentAgent.Model(); the mock supplies it.
 	coord.currentAgent = agent
 
+	// Create a session for model resolution.
+	sess, err := env.sessions.Create(t.Context(), "peak-bypass")
+	require.NoError(t, err)
+
+	// Resolve models for the session.
+	pinned, err := coord.resolveSessionModels(t.Context(), sess.ID)
+	require.NoError(t, err)
+
 	// Sanity: without the bypass, runInternal must refuse BEFORE reaching the
 	// agent. (This is the "test must fail without the fix" leg.)
-	_, err = coord.runInternal(t.Context(), "sess", "prompt", nil)
+	_, err = coord.runInternal(t.Context(), sess.ID, "prompt", pinned)
 	require.Error(t, err, "without bypass, in-window peak_hours must refuse")
 	assert.ErrorIs(t, err, errProviderPeakHours)
 	assert.False(t, agentReached, "agent.Run must NOT be reached when peak_hours refuses")
@@ -105,18 +127,18 @@ func TestSetAllowPeakHours_BypassesRunInternal(t *testing.T) {
 	// the refusal must not fire.
 	coord.SetAllowPeakHours(true)
 	// runInternal needs a real session row for resolveSessionSystemPrompt /
-	// retry bookkeeping; create one.
-	sess, err := env.sessions.Create(t.Context(), "peak-bypass")
+	// retry bookkeeping; re-resolve models to get a fresh pinned.
+	pinned, err = coord.resolveSessionModels(t.Context(), sess.ID)
 	require.NoError(t, err)
 
-	res, err := coord.runInternal(t.Context(), sess.ID, "prompt", nil)
+	res, err := coord.runInternal(t.Context(), sess.ID, "prompt", pinned)
 	require.NoError(t, err, "with bypass armed, peak_hours must NOT refuse")
 	require.NotNil(t, res)
 	assert.True(t, agentReached, "agent.Run must be reached when --allow-peak-hours bypass is armed")
 
 	// The bypass is one-shot: a second run without re-arming must refuse again.
 	agentReached = false
-	_, err = coord.runInternal(t.Context(), sess.ID, "prompt", nil)
+	_, err = coord.runInternal(t.Context(), sess.ID, "prompt", pinned)
 	require.Error(t, err, "bypass must be consumed after one Run; second run refuses again")
 	assert.ErrorIs(t, err, errProviderPeakHours)
 	assert.False(t, agentReached)

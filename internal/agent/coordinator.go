@@ -838,18 +838,15 @@ func (c *coordinator) resolveSessionSystemPrompt(ctx context.Context, sessionID 
 // state. Extracted so InterruptAndSend can queue a call shaped exactly like
 // runInternal would.
 //
-// pinned is ALWAYS non-nil after the per-session model isolation fix:
-// every caller resolves from the session DB or config defaults before calling
-// buildCall. The nil check is kept for defensive purposes (tests, error paths).
+// pinned is ALWAYS non-nil: every caller resolves from the session DB or
+// config defaults before calling buildCall. This ensures session-scoped model
+// overrides are respected even on cross-process paths (e.g., interrupt requeue).
 func (c *coordinator) buildCall(ctx context.Context, sessionID, prompt string, pinned *resolvedOverrides, attachments []message.Attachment) (SessionAgentCall, error) {
-	var model Model
 	if pinned == nil {
-		// Defensive: this should never happen after the per-session model
-		// isolation fix, but we fall back to shared state for safety.
-		model = c.currentAgent.Model()
-	} else {
-		model = pinned.large
+		return SessionAgentCall{}, errors.New("buildCall: pinned is required; caller must resolve session models first")
 	}
+
+	model := pinned.large
 
 	maxTokens := model.CatwalkCfg.DefaultMaxTokens
 	if model.ModelCfg.MaxTokens != 0 {
@@ -903,22 +900,18 @@ func (c *coordinator) buildCall(ctx context.Context, sessionID, prompt string, p
 // runInternal executes the agent, handling 401 retries.
 //
 // pinned carries what the caller's resolveSessionModels just resolved.
-// After the per-session model isolation fix, pinned is ALWAYS non-nil:
-// every Run path resolves from the session DB or config defaults before calling
-// runInternal. The nil check is kept for defensive purposes (tests, error paths).
-// Everything below — maxOutputTokens, providerCfg, the peak-hours check,
-// mergeCallOptions — is derived from ONE model value that also travels with
-// the call, so the turn cannot end up running a different model than the
-// options were computed for (task #265).
+// pinned is ALWAYS non-nil: every Run path resolves from the session DB or
+// config defaults before calling runInternal. Everything below —
+// maxOutputTokens, providerCfg, the peak-hours check, mergeCallOptions —
+// is derived from ONE model value that also travels with the call, so the
+// turn cannot end up running a different model than the options were
+// computed for (task #265).
 func (c *coordinator) runInternal(ctx context.Context, sessionID string, prompt string, pinned *resolvedOverrides, attachments ...message.Attachment) (*fantasy.AgentResult, error) {
-	var model Model
 	if pinned == nil {
-		// Defensive: this should never happen after the per-session model
-		// isolation fix, but we fall back to shared state for safety.
-		model = c.currentAgent.Model()
-	} else {
-		model = pinned.large
+		return nil, errors.New("runInternal: pinned is required; caller must resolve session models first")
 	}
+
+	model := pinned.large
 	slog.Debug("Coordinator: running with model", "sessionID", sessionID, "model", model.ModelCfg.Model)
 
 	maxOutputTokens := model.CatwalkCfg.DefaultMaxTokens
@@ -2355,7 +2348,15 @@ func (c *coordinator) requeueInterruptMessage(ctx context.Context, sessionID, me
 		return fmt.Errorf("interrupt inject references missing message %q: %w", messageID, err)
 	}
 
-	call, err := c.buildCall(ctx, sessionID, injMsg.FullText(), nil, nil)
+	// Resolve the session's model configuration from the DB or config defaults.
+	// This ensures that an interrupt requeue respects the session's persisted
+	// model override (if any) rather than falling back to the shared/global model.
+	pinned, err := c.resolveSessionModels(ctx, sessionID)
+	if err != nil {
+		return fmt.Errorf("failed to resolve session models for interrupt requeue: %w", err)
+	}
+
+	call, err := c.buildCall(ctx, sessionID, injMsg.FullText(), pinned, nil)
 	if err != nil {
 		return err
 	}
@@ -2396,6 +2397,15 @@ func (c *coordinator) InterruptAndSend(ctx context.Context, sessionID, prompt st
 		resolved, applyErr := c.applyModelOverrides(ctx, large, small)
 		if applyErr != nil {
 			return applyErr
+		}
+		pinned = resolved
+	} else {
+		// No explicit overrides: resolve from session DB or config defaults.
+		// This ensures that an interrupt respects the session's persisted model
+		// override (if any) rather than falling back to the shared/global model.
+		resolved, resolveErr := c.resolveSessionModels(ctx, sessionID)
+		if resolveErr != nil {
+			return fmt.Errorf("failed to resolve session models for interrupt: %w", resolveErr)
 		}
 		pinned = resolved
 	}
