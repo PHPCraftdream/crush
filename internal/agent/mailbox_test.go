@@ -141,6 +141,77 @@ func TestMailbox_InterruptAndReplace_NoOwnerWhenReleasing(t *testing.T) {
 	require.Nil(t, mb.replacement, "interruptAndReplace must not record a replacement when it reports no owner")
 }
 
+// TestMailbox_InterruptAndReplace_DurableCallSkipsReplacement is the direct
+// unit-level regression test for P0-1 interrupt double-execution
+// (docs/reviews/2026-08-12-post-fix-release-readiness-follow-up.md):
+// InterruptAndReplace must NOT set mb.replacement when FromDurableQueue=true,
+// otherwise the interrupt executes twice: once via mb.replacement (live owner)
+// and once via the pump (durable row).
+//
+// The durable queue is now the sole owner of interrupt calls. InterruptAndReplace
+// still cancels the in-flight generation (if any) but skips recording mb.replacement
+// for durable calls, because the durable row itself is the execution path.
+//
+// REVERT CHECK: remove the `if !call.FromDurableQueue` guard in interruptAndReplace
+// (restore unconditional `mb.replacement = &call`), this test fails (replacement
+// is set instead of remaining nil); restore the guard, it passes again.
+func TestMailbox_InterruptAndReplace_DurableCallSkipsReplacement(t *testing.T) {
+	mb := &mailbox{
+		state:   mbOwned,
+		epoch:   1,
+		current: generation{id: 1, cancel: func() {}},
+	}
+
+	// Interrupt with a durable-queue call (FromDurableQueue=true)
+	durableCall := SessionAgentCall{
+		SessionID:        "s1",
+		Prompt:           "interrupt from durable queue",
+		FromDurableQueue: true,
+	}
+
+	cancel, hadOwner := mb.interruptAndReplace(durableCall)
+
+	require.True(t, hadOwner, "interruptAndReplace should report there was a live owner")
+	require.NotNil(t, cancel, "interruptAndReplace should return a cancel function for the in-flight generation")
+
+	// KEY ASSERTION: mb.replacement must remain NIL for durable calls
+	// If mb.replacement were set, the live owner would execute it immediately
+	// while the durable row remained pending for the pump to execute again.
+	require.Nil(t, mb.replacement,
+		"interruptAndReplace must NOT set mb.replacement for FromDurableQueue=true calls "+
+			"— the durable queue is the sole owner; setting mb.replacement would cause double-execution")
+}
+
+// TestMailbox_InterruptAndReplace_NonDurableCallStillSetsReplacement is the
+// companion proving the fix does not change behavior for ordinary (non-durable)
+// interrupts — the fast in-process handoff via mb.replacement must still work
+// for normal interrupts that don't have a durable row backing them.
+func TestMailbox_InterruptAndReplace_NonDurableCallStillSetsReplacement(t *testing.T) {
+	mb := &mailbox{
+		state:   mbOwned,
+		epoch:   1,
+		current: generation{id: 1, cancel: func() {}},
+	}
+
+	// Interrupt with a non-durable call (FromDurableQueue=false)
+	ordinaryCall := SessionAgentCall{
+		SessionID:        "s1",
+		Prompt:           "ordinary interrupt",
+		FromDurableQueue: false,
+	}
+
+	cancel, hadOwner := mb.interruptAndReplace(ordinaryCall)
+
+	require.True(t, hadOwner, "interruptAndReplace should report there was a live owner")
+	require.NotNil(t, cancel, "interruptAndReplace should return a cancel function")
+
+	// KEY ASSERTION: mb.replacement SHOULD be set for non-durable calls
+	// This is the normal interrupt path: mb.replacement is the in-process handoff
+	// from InterruptAndReplace to the next generation.
+	require.NotNil(t, mb.replacement, "interruptAndReplace must set mb.replacement for non-durable calls")
+	require.Equal(t, ordinaryCall, *mb.replacement, "mb.replacement should be the interrupt call")
+}
+
 func TestMailbox_DrainOrRelease_WithQueuedItem(t *testing.T) {
 	mb := &mailbox{
 		state:     mbOwned,

@@ -2359,6 +2359,11 @@ func (c *coordinator) handleInterruptTick(ctx context.Context, sessionID string)
 	call.ExistingMessageID = pi.MessageID
 	call.InjectID = pi.ID
 
+	// Mark as originating from the durable queue so InterruptAndReplace skips
+	// mb.replacement to avoid double-execution (P0-1 fix). The pump will execute
+	// the durable row directly; we only cancel the in-flight generation here.
+	call.FromDurableQueue = true
+
 	// Generate idempotency key
 	var idempotencyKey string
 	if call.LogicalCallID != "" {

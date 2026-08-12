@@ -1638,19 +1638,18 @@ func TestHandleInterruptTick(t *testing.T) {
 		require.NoError(t, err)
 		assert.True(t, fired)
 
-		// requeueInterruptMessage now routes through InterruptAndReplace
-		// (design §4 / P0-2): the old QueueMessage-then-Cancel two-step
-		// deterministically wiped its own queued message, because Cancel
-		// cleared the queue. The mock's InterruptAndReplace reports it
-		// interrupted a live turn, so the QueueMessage fallback — which
-		// only covers the idle-session case — must not fire, and no
-		// separate Cancel is issued (InterruptAndReplace cancels the
-		// in-flight generation itself, atomically with recording the
-		// replacement).
+		// P0-1 fix (docs/reviews/2026-08-12-post-fix-release-readiness-follow-up.md):
+		// handleInterruptTick now marks the call with FromDurableQueue=true and
+		// InterruptAndReplace skips mb.replacement for such calls to avoid
+		// double-execution. The durable queue is now the sole owner; only the
+		// current generation is cancelled. The test still verifies InterruptAndReplace
+		// was called (to cancel the in-flight turn) and that the call has
+		// FromDurableQueue=true set.
 		require.Len(t, agent.interruptAndReplaced, 1)
 		q := agent.interruptAndReplaced[0]
 		assert.Equal(t, msg.ID, q.ExistingMessageID, "must reference existing message, not create a new one")
 		assert.Equal(t, "stop and do X", q.Prompt)
+		assert.True(t, q.FromDurableQueue, "must be marked as from durable queue to skip mb.replacement")
 		assert.Empty(t, agent.queuedCalls, "must not fall back to QueueMessage when a live turn was interrupted")
 		assert.Empty(t, agent.cancelled, "InterruptAndReplace cancels the generation itself — no separate Cancel call")
 

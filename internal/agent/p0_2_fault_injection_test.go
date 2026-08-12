@@ -94,6 +94,10 @@ func TestP0_2_FaultInjection_InterruptTickAtomicTransaction(t *testing.T) {
 		require.Nil(t, pi, "row should be gone after atomic enqueue")
 
 		// Verify a run queue entry was created
+		// P0-1 fix: the durable queue is now the sole owner of interrupt calls.
+		// The interrupt was enqueued durably and the current generation was
+		// cancelled (via InterruptAndReplace), but mb.replacement was NOT set
+		// to avoid double-execution. The pump will execute the durable row.
 		entries, err := env.sessions.ListPendingRunQueueEntries(ctx)
 		require.NoError(t, err)
 		require.Len(t, entries, 1, "should have one run queue entry")
