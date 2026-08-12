@@ -204,16 +204,16 @@ func TestP0_2_FaultInjection_RecreateRowReturnsError(t *testing.T) {
 	require.NoError(t, err)
 
 	call := SessionAgentCall{
-		SessionID:        sess.ID,
+		SessionID:         sess.ID,
 		ExistingMessageID: msg.ID,
-		InjectID:         "test-inject-id",
+		InjectID:          "test-inject-id",
 	}
 
 	// Mock CreatePendingInject to fail by using a closed DB connection
 	// (simulating a DB outage during recreation)
 	originalSessions := coord.sessions
 	coord.sessions = &mockFailingSessionService{
-		Service:               originalSessions,
+		Service:                originalSessions,
 		createPendingInjectErr: fmt.Errorf("simulated CreatePendingInject failure"),
 	}
 
