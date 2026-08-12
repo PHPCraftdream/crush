@@ -515,12 +515,29 @@ func (l *SessionLock) RecordActivity() {
 // narrows the clobber window from ~50ms (releaseMetadataCleanupBound) to
 // microseconds (the TOCTOU gap between reading the generation sidecar
 // and performing the destructive operations) — a best-effort improvement
-// for diagnosability, not an absolute guarantee. The residual TOCTOU gap
-// remains: a new owner could acquire and write its generation between our
-// read and our truncate/remove, but this window is orders of magnitude
-// smaller than the original and cannot be closed without re-acquiring the
-// OS lock (which has its own regression hazards as documented above).
+// for diagnosability, not an absolute guarantee.
+//
+// ACCEPTED RISK (2026-08-12, docs/reviews/2026-08-12-post-fix-release-readiness-review.md, P2-1):
+// The residual microsecond TOCTOU gap here is explicitly accepted as a
+// diagnostic-only risk. A new owner could theoretically acquire and write
+// its generation between our read and truncate/remove, briefly exposing
+// their PID to `sessions kill`/`sessions why`/`sessions locks`. This is
+// cosmetic: the OS lock alone is the correctness source of truth, and
+// nothing downstream trusts this metadata for a destructive decision
+// without independently re-probing the OS lock first (see
+// sessions_kill.go's probeThenKillHolder and its lockHolderProvablyDead
+// final re-check). Closing this gap architecturally would require
+// re-acquiring the OS lock, which has already been tried and reverted
+// multiple times (commit ac0536c4, task #337) for causing false
+// SessionLockBusyError self-collisions under real scheduler load — a
+// worse regression than the narrow diagnostic window. The current
+// microsecond gap is the optimal trade-off: it protects the fast-retry
+// invariant while making clobber astronomically unlikely.
 func clearHolderMetadata(path string, expectedGeneration string) {
+	// ACCEPTED RISK (2026-08-12, docs/reviews/2026-08-12-post-fix-release-readiness-review.md, P2-1):
+	// This is a TOCTOU check; see the function's doc comment for why this
+	// microsecond window is accepted as the optimal trade-off.
+	//
 	// Read the current generation from disk. Only a POSITIVE mismatch (the
 	// file exists and contains a DIFFERENT generation) is treated as
 	// evidence that a new owner has already acquired the lock — skip
