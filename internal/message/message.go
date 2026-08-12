@@ -276,14 +276,15 @@ func (s *service) Update(ctx context.Context, message Message) error {
 	// UpdateMessageIfNotTerminal skips the update (0 rows affected), which
 	// is the correct outcome: the terminal state wins, the stale checkpoint
 	// is safely discarded.
+	var rowsAffected int64
 	var dbErr error
 	if partialCheckpoint {
-		// A nil error here covers both outcomes (1 row updated, or 0 rows
-		// skipped because a terminal finish already landed) — sqlc's :exec
-		// result type can't distinguish them, but the WHERE clause is what
-		// prevents the race either way, so no branch on the row count is
-		// needed.
-		dbErr = s.q.UpdateMessageIfNotTerminal(ctx, db.UpdateMessageIfNotTerminalParams{
+		// The DB update is conditional: it only touches rows that still
+		// have finished_at IS NULL (no terminal finish yet). If a real
+		// terminal finish landed concurrently, this returns 0 rows affected,
+		// meaning the stale partial checkpoint lost and must NOT be published
+		// to avoid reverting the UI to an incomplete state.
+		rowsAffected, dbErr = s.q.UpdateMessageIfNotTerminal(ctx, db.UpdateMessageIfNotTerminalParams{
 			ID:         message.ID,
 			Parts:      string(parts),
 			FinishedAt: finishedAt,
@@ -294,6 +295,7 @@ func (s *service) Update(ctx context.Context, message Message) error {
 			Parts:      string(parts),
 			FinishedAt: finishedAt,
 		})
+		rowsAffected = 1 // Terminal update always wins
 	}
 	if dbErr != nil {
 		return dbErr
@@ -312,14 +314,21 @@ func (s *service) Update(ctx context.Context, message Message) error {
 	//
 	//   - Partial checkpoint (Finish.Partial == true, written by the
 	//     auto-checkpoint ticker every ~2s during streaming):
-	//     best-effort Publish. Such a snapshot is superseded seconds
-	//     later by the next ticker tick or the real Finish; losing one
-	//     tick for a slow subscriber is harmless because the next
+	//     best-effort Publish, but ONLY if the update actually touched
+	//     the DB (rowsAffected > 0). A stale checkpoint that returns 0 rows
+	//     because a terminal finish already landed must NOT be published,
+	//     or the UI will show the last event as an incomplete partial snapshot.
+	//     Losing a tick for a slow subscriber is harmless because the next
 	//     update re-establishes current state. Routing it through
 	//     PublishMustDeliver would make every ~2s checkpoint pay the
 	//     full bounded-blocking wait per slow subscriber for nothing.
 	if partialCheckpoint {
-		s.Publish(pubsub.UpdatedEvent, message.Clone())
+		// P0-2: Only publish partial checkpoint if we actually updated the DB.
+		// If rowsAffected == 0, a terminal finish already won and publishing
+		// a stale partial would revert the UI to an incomplete state.
+		if rowsAffected > 0 {
+			s.Publish(pubsub.UpdatedEvent, message.Clone())
+		}
 	} else {
 		s.PublishMustDeliver(ctx, pubsub.UpdatedEvent, message.Clone())
 	}

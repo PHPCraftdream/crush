@@ -286,7 +286,7 @@ type Querier interface {
 	// A checkpoint writes with Partial=true (finished_at NULL), so this condition rejects
 	// the update if finished_at is already non-NULL (real terminal finish).
 	// Returns number of rows affected (0 = skipped because already terminal, 1 = updated).
-	UpdateMessageIfNotTerminal(ctx context.Context, arg UpdateMessageIfNotTerminalParams) error
+	UpdateMessageIfNotTerminal(ctx context.Context, arg UpdateMessageIfNotTerminalParams) (int64, error)
 	UpdateMessagePinned(ctx context.Context, arg UpdateMessagePinnedParams) error
 	UpdatePermissionEnabled(ctx context.Context, arg UpdatePermissionEnabledParams) error
 	UpdateSessionModels(ctx context.Context, arg UpdateSessionModelsParams) error

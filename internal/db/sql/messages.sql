@@ -45,7 +45,7 @@ SET
     updated_at = strftime('%s', 'now')
 WHERE id = ?;
 
--- name: UpdateMessageIfNotTerminal :exec
+-- name: UpdateMessageIfNotTerminal :execrows
 -- P0-4 fix: Only update if the message does NOT already have a non-partial finish.
 -- This prevents a hung checkpoint from overwriting a terminal finish after unblocking.
 -- A checkpoint writes with Partial=true (finished_at NULL), so this condition rejects
