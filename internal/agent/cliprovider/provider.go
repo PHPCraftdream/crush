@@ -1165,20 +1165,32 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 			ptycmd := p.CommandContext(ctx, binaryPath, args...)
 			ptycmd.Dir = m.workingDir
 			if startErr := ptycmd.Start(); startErr == nil {
-				// Fork patch (operator UX, debug): log the full command-line
-				// + prompt length + first/last 200 chars of the prompt so
-				// silent-claude-exit cases ("claude died in 68ms with empty
-				// stderr") can be reproduced post-mortem from the log.
-				slog.Info(
-					"cliprovider: using PTY",
-					"binary", binaryPath,
-					"args", strings.Join(args, " "),
-					"argsCount", len(args),
-					"argsByteLen", argsByteLen(args),
-					"promptLen", len(prompt),
-					"promptHead", clipString(prompt, 200),
-					"promptTail", tailString(prompt, 200),
-				)
+				// Log command-line diagnostics. In production mode, args are sanitized
+				// to remove sensitive values (prompts, tokens). In diagnostic mode
+				// (CRUSH_CLIPROVIDER_LOG_RAW_PROMPT=1), the full args are logged.
+				// The promptHead/promptTail fields are only included in diagnostic mode.
+				argsToLog := strings.Join(sanitizeArgs(args), " ")
+				if logRawPromptEnabled() {
+					slog.Info(
+						"cliprovider: using PTY",
+						"binary", binaryPath,
+						"args", argsToLog,
+						"argsCount", len(args),
+						"argsByteLen", argsByteLen(args),
+						"promptLen", len(prompt),
+						"promptHead", clipString(prompt, 200),
+						"promptTail", tailString(prompt, 200),
+					)
+				} else {
+					slog.Info(
+						"cliprovider: using PTY",
+						"binary", binaryPath,
+						"args", argsToLog,
+						"argsCount", len(args),
+						"argsByteLen", argsByteLen(args),
+						"promptLen", len(prompt),
+					)
+				}
 				// go-pty's unixPty.Start() (cmd_unix.go) sets cmd.Stdin/Stdout/
 				// Stderr = pty.slave directly — our own process keeps its own
 				// open handle to the slave end in addition to the child's
@@ -1308,18 +1320,36 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 		if m.spec.CodexMCPIntegration && mcpSrv != nil {
 			cmd.Env = append(os.Environ(), codexMCPTokenEnvVar+"="+mcpSrv.token)
 		}
-		slog.Info(
-			"cliprovider: launching pipe mode",
-			"binary", m.spec.Binary,
-			"args", strings.Join(args, " "),
-			"argsCount", len(args),
-			"argsByteLen", argsByteLen(args),
-			"useStdin", useStdin,
-			"promptLen", len(prompt),
-			"promptHead", clipString(prompt, 200),
-			"promptTail", tailString(prompt, 200),
-			"noPTY", m.spec.NoPTY,
-		)
+		// Log command-line diagnostics. In production mode, args are sanitized
+		// to remove sensitive values (prompts, tokens). In diagnostic mode
+		// (CRUSH_CLIPROVIDER_LOG_RAW_PROMPT=1), the full args are logged.
+		// The promptHead/promptTail fields are only included in diagnostic mode.
+		argsToLog := strings.Join(sanitizeArgs(args), " ")
+		if logRawPromptEnabled() {
+			slog.Info(
+				"cliprovider: launching pipe mode",
+				"binary", m.spec.Binary,
+				"args", argsToLog,
+				"argsCount", len(args),
+				"argsByteLen", argsByteLen(args),
+				"useStdin", useStdin,
+				"promptLen", len(prompt),
+				"promptHead", clipString(prompt, 200),
+				"promptTail", tailString(prompt, 200),
+				"noPTY", m.spec.NoPTY,
+			)
+		} else {
+			slog.Info(
+				"cliprovider: launching pipe mode",
+				"binary", m.spec.Binary,
+				"args", argsToLog,
+				"argsCount", len(args),
+				"argsByteLen", argsByteLen(args),
+				"useStdin", useStdin,
+				"promptLen", len(prompt),
+				"noPTY", m.spec.NoPTY,
+			)
+		}
 
 		// For NoPTY models (e.g. npx wrappers), merge stdout and stderr
 		// into a single reader via io.Pipe + concurrent copy goroutines.
@@ -1892,4 +1922,46 @@ func tailString(s string, n int) string {
 		return s
 	}
 	return fmt.Sprintf("(+%d skipped)…", len(s)-n) + s[len(s)-n:]
+}
+
+// logRawPromptEnabled returns true when raw prompt logging is explicitly enabled
+// via the CRUSH_CLIPROVIDER_LOG_RAW_PROMPT environment variable. This is an
+// opt-in diagnostic mode for debugging CLI invocation issues — it defaults to
+// false to avoid leaking sensitive data (system prompts, API keys, tokens) into logs.
+func logRawPromptEnabled() bool {
+	return os.Getenv("CRUSH_CLIPROVIDER_LOG_RAW_PROMPT") == "1"
+}
+
+// sanitizeArgs returns a safe-to-log version of args by redacting values of
+// sensitive flags (like -p/--prompt) while preserving flag names and safe values
+// (like config file paths). In normal mode, only flag names are logged for sensitive
+// args. In diagnostic mode (CRUSH_CLIPROVIDER_LOG_RAW_PROMPT=1), the original args
+// are returned as-is for debugging.
+func sanitizeArgs(args []string) []string {
+	if logRawPromptEnabled() {
+		// Diagnostic mode: return original args
+		return args
+	}
+
+	var result []string
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+
+		// Known sensitive flags that may contain user data or secrets
+		isSensitiveFlag := false
+		switch arg {
+		case "-p", "--prompt":
+			isSensitiveFlag = true
+		}
+
+		if isSensitiveFlag && i+1 < len(args) {
+			// Redact the value: keep flag name, replace value with placeholder
+			result = append(result, arg, "[REDACTED]")
+			i++ // Skip the next arg (the value)
+		} else {
+			// Keep safe flags and their values (e.g., --model sonnet, --mcp-config /path/to/file)
+			result = append(result, arg)
+		}
+	}
+	return result
 }
