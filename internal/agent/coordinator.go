@@ -584,8 +584,9 @@ type SummarizeSnapshot struct {
 // The returned snapshot includes both large and small models, the provider's system
 // prompt prefix, and the built system prompt (if a prompt template is available).
 //
-// The cache key is provider+model+reasoning_effort, so models are built once per
-// unique combination and reused across sessions.
+// Results are cached per unique (config generation, provider+model+reasoning_effort) pair.
+// The config generation is included so that any config change (reload, credential update,
+// etc.) invalidates the cache, preventing stale clients from being reused (task #341, P1-3).
 func (c *coordinator) resolveSessionModels(ctx context.Context, sessionID string) (*resolvedOverrides, error) {
 	// Load the session to check for model overrides.
 	sess, err := c.sessions.Get(ctx, sessionID)
@@ -640,7 +641,10 @@ func (c *coordinator) resolveSessionModels(ctx context.Context, sessionID string
 
 	// Build (or reuse from cache) both models TOGETHER in a single
 	// buildModelsFromCfg call, keyed by the combined large+small
-	// provider+model+reasoning_effort tuple.
+	// provider+model+reasoning_effort tuple PLUS the config generation.
+	// The generation is included so that any config change (reload, credential
+	// update, etc.) invalidates the cache, preventing stale clients from being
+	// reused (task #341, P1-3).
 	//
 	// An earlier version of this cache called buildModelsFromCfg once per
 	// slot, swapping (largeCfg, smallCfg) argument order to "select" which
@@ -656,7 +660,8 @@ func (c *coordinator) resolveSessionModels(ctx context.Context, sessionID string
 	// small-model-driven path) via resolvedOverrides.pin. Caching the pair
 	// from one call, in the caller-supplied role order, removes the
 	// swap entirely.
-	pairCacheKey := fmt.Sprintf("%s:%s:%s|%s:%s:%s",
+	pairCacheKey := fmt.Sprintf("gen:%d|%s:%s:%s|%s:%s:%s",
+		c.cfg.Generation(),
 		largeCfg.Provider, largeCfg.Model, largeCfg.ReasoningEffort,
 		smallCfg.Provider, smallCfg.Model, smallCfg.ReasoningEffort)
 
@@ -748,7 +753,12 @@ func (c *coordinator) applyModelOverrides(ctx context.Context, large, small *Mod
 		}
 	}
 
-	// Build models using the cache-aware logic (reuse same cache key pattern).
+	// Build models directly without using the cache — model overrides are
+	// transient, per-run values that don't benefit from caching (each override
+	// is unique to the caller's request), and the cache key pattern requires
+	// the config generation which we'd need to recompute here. The cost of
+	// building the fantasy.LanguageModel client is paid once per override use,
+	// which is acceptable since overrides are explicitly opt-in per-call.
 	largeModel, smallModel, err := c.buildModelsFromCfg(ctx, largeCfg, smallCfg, false)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build override models: %w", err)
@@ -2834,6 +2844,8 @@ func (c *coordinator) SetAgentTimeoutOptions(extendsOnProgress bool, hardCap tim
 }
 
 func (c *coordinator) UpdateModels(ctx context.Context) error {
+	c.clearModelCache()
+
 	// build the models again so we make sure we get the latest config
 	large, small, err := c.buildAgentModels(ctx, false)
 	if err != nil {
@@ -2857,6 +2869,16 @@ func (c *coordinator) UpdateModels(ctx context.Context) error {
 	}
 	c.currentAgent.SetTools(tools)
 	return nil
+}
+
+// clearModelCache empties the model cache, forcing the next resolveSessionModels
+// call to rebuild models from the current config. This is called after credential
+// updates (OAuth token refresh, API key re-resolution) to ensure cached models
+// with stale clients are not reused (task #341, P1-3).
+func (c *coordinator) clearModelCache() {
+	if c.modelCache != nil {
+		c.modelCache.Reset(make(map[string]cachedModelPair))
+	}
 }
 
 func (c *coordinator) QueuedPrompts(sessionID string) int {
@@ -3007,6 +3029,10 @@ func checkPeakHours(providerCfg config.ProviderConfig) error {
 // final error: from the retry if a retry was attempted, otherwise from
 // the original run. Callers that need to notify the user on persistent
 // failure should check isUnauthorized on the returned error.
+//
+// After credential refresh, the model cache is cleared via UpdateModels,
+// so subsequent resolveSessionModels calls rebuild models with fresh
+// credentials rather than reusing cached stale clients (task #341, P1-3).
 func (c *coordinator) runWithUnauthorizedRetry(ctx context.Context, providerCfg config.ProviderConfig, fn func() error) error {
 	err := fn()
 	if err != nil && c.isUnauthorized(err) {
@@ -3018,7 +3044,9 @@ func (c *coordinator) runWithUnauthorizedRetry(ctx context.Context, providerCfg 
 }
 
 // retryAfterUnauthorized attempts to refresh credentials after receiving a 401
-// and returns nil if retry should be attempted.
+// and returns nil if retry should be attempted. This calls UpdateModels which
+// clears the model cache and rebuilds the shared agent with fresh credentials
+// (task #341, P1-3).
 func (c *coordinator) retryAfterUnauthorized(ctx context.Context, providerCfg config.ProviderConfig) error {
 	switch {
 	case providerCfg.OAuthToken != nil:
