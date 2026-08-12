@@ -1289,7 +1289,7 @@ func (a *sessionAgent) restartOrphanedWithRetry(calls []SessionAgentCall) error 
 // timeout) and joins runWg so shutdown waits for it. Errors are logged at
 // ERROR level with full context to make failures visible to operators.
 func (a *sessionAgent) startBoundedDetachedRun(call SessionAgentCall) {
-	slog.Error("agent: durable enqueue failed, starting bounded detached run to prevent data loss",
+	slog.Error("agent: durable enqueue failed, starting bounded best-effort detached run",
 		"session_id", call.SessionID,
 		"prompt", call.Prompt,
 		"logical_call_id", call.LogicalCallID,

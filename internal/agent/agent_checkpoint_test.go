@@ -106,28 +106,12 @@ func TestCheckpointFencing_P0_4Regression(t *testing.T) {
 	require.Contains(t, finalRead.FullText(), "terminal state", "Terminal parts should persist")
 }
 
-// TestCheckpointContextCancellation_P0_4Regression verifies that the
-// checkpoint write context is cancelable and that stopCheckpoint can
-// cancel an in-flight write.
-func TestCheckpointContextCancellation_P0_4Regression(t *testing.T) {
-	t.Parallel()
-
-	// This test verifies the fencing mechanism in agent.go:
-	// - checkpointGeneration increments on each startCheckpoint
-	// - The goroutine captures myGeneration at launch
-	// - writeCtx is separate from genCtx and cancelable
-	// - runWg.Add(1) is called so timeout reflects in stillBusy
-
-	// The mechanism is verified by the code in agent.go itself:
-	// - checkpointGeneration++
-	// - myGeneration := checkpointGeneration
-	// - writeCtx, writeCancel := context.WithCancel(context.Background())
-	// - a.runWg.Add(1)
-	// - defer a.runWg.Done()
-	// - defer writeCancel()
-	// - if !errors.Is(err, context.Canceled) { slog.Debug(...) }
-
-	// A full integration test would require mocking the entire Run()
-	// execution, which is beyond the scope of a focused unit test.
-	// The code inspection above confirms the mechanism is in place.
-}
+// TestCheckpointContextCancellation_P0_4Regression: intentionally removed.
+// The original version of this test had an empty body (comments describing
+// the fencing mechanism "by code inspection", zero assertions or calls) —
+// it asserted nothing and would pass identically whether or not the P0-4
+// fix existed. Real, non-vacuous coverage for the same mechanism lives in
+// TestP0_4_StopCheckpointCancelsBlockedWrite (p0_4_checkpoint_cancel_test.go
+// / p0_4_shutdown_join_test.go), which genuinely blocks a checkpoint write,
+// calls CancelAll, and asserts cancellation is observed within milliseconds
+// rather than the 5s grace.
