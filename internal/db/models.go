@@ -36,6 +36,18 @@ type Message struct {
 	BackgroundJobNotice int64          `json:"background_job_notice"`
 }
 
+type OrphanCallOutbox struct {
+	ID          string         `json:"id"`
+	SessionID   string         `json:"session_id"`
+	CallData    string         `json:"call_data"`
+	Status      string         `json:"status"`
+	Attempts    int64          `json:"attempts"`
+	MaxAttempts int64          `json:"max_attempts"`
+	LastError   sql.NullString `json:"last_error"`
+	CreatedAt   int64          `json:"created_at"`
+	UpdatedAt   int64          `json:"updated_at"`
+}
+
 type PendingInject struct {
 	ID        string `json:"id"`
 	SessionID string `json:"session_id"`

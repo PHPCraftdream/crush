@@ -27,8 +27,14 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.ackRunQueueEntryStmt, err = db.PrepareContext(ctx, ackRunQueueEntry); err != nil {
 		return nil, fmt.Errorf("error preparing query AckRunQueueEntry: %w", err)
 	}
+	if q.claimOrphanOutboxEntryStmt, err = db.PrepareContext(ctx, claimOrphanOutboxEntry); err != nil {
+		return nil, fmt.Errorf("error preparing query ClaimOrphanOutboxEntry: %w", err)
+	}
 	if q.cleanupExpiredLeasesStmt, err = db.PrepareContext(ctx, cleanupExpiredLeases); err != nil {
 		return nil, fmt.Errorf("error preparing query CleanupExpiredLeases: %w", err)
+	}
+	if q.cleanupOldDoneOrphanOutboxEntriesStmt, err = db.PrepareContext(ctx, cleanupOldDoneOrphanOutboxEntries); err != nil {
+		return nil, fmt.Errorf("error preparing query CleanupOldDoneOrphanOutboxEntries: %w", err)
 	}
 	if q.countMessagesBySessionStmt, err = db.PrepareContext(ctx, countMessagesBySession); err != nil {
 		return nil, fmt.Errorf("error preparing query CountMessagesBySession: %w", err)
@@ -101,6 +107,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	}
 	if q.getOldestPendingRunQueueEntryForSessionStmt, err = db.PrepareContext(ctx, getOldestPendingRunQueueEntryForSession); err != nil {
 		return nil, fmt.Errorf("error preparing query GetOldestPendingRunQueueEntryForSession: %w", err)
+	}
+	if q.getOrphanOutboxEntryStmt, err = db.PrepareContext(ctx, getOrphanOutboxEntry); err != nil {
+		return nil, fmt.Errorf("error preparing query GetOrphanOutboxEntry: %w", err)
 	}
 	if q.getRecentActivityStmt, err = db.PrepareContext(ctx, getRecentActivity); err != nil {
 		return nil, fmt.Errorf("error preparing query GetRecentActivity: %w", err)
@@ -177,6 +186,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.listPendingInjectsBySessionStmt, err = db.PrepareContext(ctx, listPendingInjectsBySession); err != nil {
 		return nil, fmt.Errorf("error preparing query ListPendingInjectsBySession: %w", err)
 	}
+	if q.listPendingOrphanOutboxEntriesStmt, err = db.PrepareContext(ctx, listPendingOrphanOutboxEntries); err != nil {
+		return nil, fmt.Errorf("error preparing query ListPendingOrphanOutboxEntries: %w", err)
+	}
 	if q.listPendingRunQueueEntriesStmt, err = db.PrepareContext(ctx, listPendingRunQueueEntries); err != nil {
 		return nil, fmt.Errorf("error preparing query ListPendingRunQueueEntries: %w", err)
 	}
@@ -197,6 +209,12 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	}
 	if q.listUserMessagesBySessionStmt, err = db.PrepareContext(ctx, listUserMessagesBySession); err != nil {
 		return nil, fmt.Errorf("error preparing query ListUserMessagesBySession: %w", err)
+	}
+	if q.markOrphanOutboxEntryDoneStmt, err = db.PrepareContext(ctx, markOrphanOutboxEntryDone); err != nil {
+		return nil, fmt.Errorf("error preparing query MarkOrphanOutboxEntryDone: %w", err)
+	}
+	if q.markOrphanOutboxEntryFailedStmt, err = db.PrepareContext(ctx, markOrphanOutboxEntryFailed); err != nil {
+		return nil, fmt.Errorf("error preparing query MarkOrphanOutboxEntryFailed: %w", err)
 	}
 	if q.matchSessionPermissionStmt, err = db.PrepareContext(ctx, matchSessionPermission); err != nil {
 		return nil, fmt.Errorf("error preparing query MatchSessionPermission: %w", err)
@@ -243,6 +261,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.updateSessionSystemPromptStmt, err = db.PrepareContext(ctx, updateSessionSystemPrompt); err != nil {
 		return nil, fmt.Errorf("error preparing query UpdateSessionSystemPrompt: %w", err)
 	}
+	if q.writeToOrphanOutboxStmt, err = db.PrepareContext(ctx, writeToOrphanOutbox); err != nil {
+		return nil, fmt.Errorf("error preparing query WriteToOrphanOutbox: %w", err)
+	}
 	return &q, nil
 }
 
@@ -253,9 +274,19 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing ackRunQueueEntryStmt: %w", cerr)
 		}
 	}
+	if q.claimOrphanOutboxEntryStmt != nil {
+		if cerr := q.claimOrphanOutboxEntryStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing claimOrphanOutboxEntryStmt: %w", cerr)
+		}
+	}
 	if q.cleanupExpiredLeasesStmt != nil {
 		if cerr := q.cleanupExpiredLeasesStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing cleanupExpiredLeasesStmt: %w", cerr)
+		}
+	}
+	if q.cleanupOldDoneOrphanOutboxEntriesStmt != nil {
+		if cerr := q.cleanupOldDoneOrphanOutboxEntriesStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing cleanupOldDoneOrphanOutboxEntriesStmt: %w", cerr)
 		}
 	}
 	if q.countMessagesBySessionStmt != nil {
@@ -376,6 +407,11 @@ func (q *Queries) Close() error {
 	if q.getOldestPendingRunQueueEntryForSessionStmt != nil {
 		if cerr := q.getOldestPendingRunQueueEntryForSessionStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing getOldestPendingRunQueueEntryForSessionStmt: %w", cerr)
+		}
+	}
+	if q.getOrphanOutboxEntryStmt != nil {
+		if cerr := q.getOrphanOutboxEntryStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing getOrphanOutboxEntryStmt: %w", cerr)
 		}
 	}
 	if q.getRecentActivityStmt != nil {
@@ -503,6 +539,11 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing listPendingInjectsBySessionStmt: %w", cerr)
 		}
 	}
+	if q.listPendingOrphanOutboxEntriesStmt != nil {
+		if cerr := q.listPendingOrphanOutboxEntriesStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing listPendingOrphanOutboxEntriesStmt: %w", cerr)
+		}
+	}
 	if q.listPendingRunQueueEntriesStmt != nil {
 		if cerr := q.listPendingRunQueueEntriesStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing listPendingRunQueueEntriesStmt: %w", cerr)
@@ -536,6 +577,16 @@ func (q *Queries) Close() error {
 	if q.listUserMessagesBySessionStmt != nil {
 		if cerr := q.listUserMessagesBySessionStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing listUserMessagesBySessionStmt: %w", cerr)
+		}
+	}
+	if q.markOrphanOutboxEntryDoneStmt != nil {
+		if cerr := q.markOrphanOutboxEntryDoneStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing markOrphanOutboxEntryDoneStmt: %w", cerr)
+		}
+	}
+	if q.markOrphanOutboxEntryFailedStmt != nil {
+		if cerr := q.markOrphanOutboxEntryFailedStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing markOrphanOutboxEntryFailedStmt: %w", cerr)
 		}
 	}
 	if q.matchSessionPermissionStmt != nil {
@@ -613,6 +664,11 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing updateSessionSystemPromptStmt: %w", cerr)
 		}
 	}
+	if q.writeToOrphanOutboxStmt != nil {
+		if cerr := q.writeToOrphanOutboxStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing writeToOrphanOutboxStmt: %w", cerr)
+		}
+	}
 	return err
 }
 
@@ -653,7 +709,9 @@ type Queries struct {
 	db                                          DBTX
 	tx                                          *sql.Tx
 	ackRunQueueEntryStmt                        *sql.Stmt
+	claimOrphanOutboxEntryStmt                  *sql.Stmt
 	cleanupExpiredLeasesStmt                    *sql.Stmt
+	cleanupOldDoneOrphanOutboxEntriesStmt       *sql.Stmt
 	countMessagesBySessionStmt                  *sql.Stmt
 	createFileStmt                              *sql.Stmt
 	createMessageStmt                           *sql.Stmt
@@ -678,6 +736,7 @@ type Queries struct {
 	getLastSessionStmt                          *sql.Stmt
 	getMessageStmt                              *sql.Stmt
 	getOldestPendingRunQueueEntryForSessionStmt *sql.Stmt
+	getOrphanOutboxEntryStmt                    *sql.Stmt
 	getRecentActivityStmt                       *sql.Stmt
 	getRunQueueEntryStmt                        *sql.Stmt
 	getSessionByIDStmt                          *sql.Stmt
@@ -703,6 +762,7 @@ type Queries struct {
 	listMessagesBySessionPaginatedStmt          *sql.Stmt
 	listNewFilesStmt                            *sql.Stmt
 	listPendingInjectsBySessionStmt             *sql.Stmt
+	listPendingOrphanOutboxEntriesStmt          *sql.Stmt
 	listPendingRunQueueEntriesStmt              *sql.Stmt
 	listSessionPermissionsStmt                  *sql.Stmt
 	listSessionReadFilesStmt                    *sql.Stmt
@@ -710,6 +770,8 @@ type Queries struct {
 	listStaleLeasedRunQueueEntriesStmt          *sql.Stmt
 	listSubSessionsStmt                         *sql.Stmt
 	listUserMessagesBySessionStmt               *sql.Stmt
+	markOrphanOutboxEntryDoneStmt               *sql.Stmt
+	markOrphanOutboxEntryFailedStmt             *sql.Stmt
 	matchSessionPermissionStmt                  *sql.Stmt
 	nackRunQueueEntryStmt                       *sql.Stmt
 	nackRunQueueEntryNoAttemptPenaltyStmt       *sql.Stmt
@@ -725,38 +787,42 @@ type Queries struct {
 	updateSessionModelsStmt                     *sql.Stmt
 	updateSessionReasoningEffortStmt            *sql.Stmt
 	updateSessionSystemPromptStmt               *sql.Stmt
+	writeToOrphanOutboxStmt                     *sql.Stmt
 }
 
 func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 	return &Queries{
-		db:                           tx,
-		tx:                           tx,
-		ackRunQueueEntryStmt:         q.ackRunQueueEntryStmt,
-		cleanupExpiredLeasesStmt:     q.cleanupExpiredLeasesStmt,
-		countMessagesBySessionStmt:   q.countMessagesBySessionStmt,
-		createFileStmt:               q.createFileStmt,
-		createMessageStmt:            q.createMessageStmt,
-		createPendingInjectStmt:      q.createPendingInjectStmt,
-		createSessionStmt:            q.createSessionStmt,
-		createSessionPermissionStmt:  q.createSessionPermissionStmt,
-		deleteFileStmt:               q.deleteFileStmt,
-		deleteMessageStmt:            q.deleteMessageStmt,
-		deletePendingInjectStmt:      q.deletePendingInjectStmt,
-		deletePermissionStmt:         q.deletePermissionStmt,
-		deleteSessionStmt:            q.deleteSessionStmt,
-		deleteSessionFilesStmt:       q.deleteSessionFilesStmt,
-		deleteSessionMessagesStmt:    q.deleteSessionMessagesStmt,
-		enqueueRunQueueEntryStmt:     q.enqueueRunQueueEntryStmt,
-		getAverageResponseTimeStmt:   q.getAverageResponseTimeStmt,
-		getCallTreeActivityStmt:      q.getCallTreeActivityStmt,
-		getCallTreeActivityBatchStmt: q.getCallTreeActivityBatchStmt,
-		getFileStmt:                  q.getFileStmt,
-		getFileByPathAndSessionStmt:  q.getFileByPathAndSessionStmt,
-		getFileReadStmt:              q.getFileReadStmt,
-		getHourDayHeatmapStmt:        q.getHourDayHeatmapStmt,
-		getLastSessionStmt:           q.getLastSessionStmt,
-		getMessageStmt:               q.getMessageStmt,
+		db:                                          tx,
+		tx:                                          tx,
+		ackRunQueueEntryStmt:                        q.ackRunQueueEntryStmt,
+		claimOrphanOutboxEntryStmt:                  q.claimOrphanOutboxEntryStmt,
+		cleanupExpiredLeasesStmt:                    q.cleanupExpiredLeasesStmt,
+		cleanupOldDoneOrphanOutboxEntriesStmt:       q.cleanupOldDoneOrphanOutboxEntriesStmt,
+		countMessagesBySessionStmt:                  q.countMessagesBySessionStmt,
+		createFileStmt:                              q.createFileStmt,
+		createMessageStmt:                           q.createMessageStmt,
+		createPendingInjectStmt:                     q.createPendingInjectStmt,
+		createSessionStmt:                           q.createSessionStmt,
+		createSessionPermissionStmt:                 q.createSessionPermissionStmt,
+		deleteFileStmt:                              q.deleteFileStmt,
+		deleteMessageStmt:                           q.deleteMessageStmt,
+		deletePendingInjectStmt:                     q.deletePendingInjectStmt,
+		deletePermissionStmt:                        q.deletePermissionStmt,
+		deleteSessionStmt:                           q.deleteSessionStmt,
+		deleteSessionFilesStmt:                      q.deleteSessionFilesStmt,
+		deleteSessionMessagesStmt:                   q.deleteSessionMessagesStmt,
+		enqueueRunQueueEntryStmt:                    q.enqueueRunQueueEntryStmt,
+		getAverageResponseTimeStmt:                  q.getAverageResponseTimeStmt,
+		getCallTreeActivityStmt:                     q.getCallTreeActivityStmt,
+		getCallTreeActivityBatchStmt:                q.getCallTreeActivityBatchStmt,
+		getFileStmt:                                 q.getFileStmt,
+		getFileByPathAndSessionStmt:                 q.getFileByPathAndSessionStmt,
+		getFileReadStmt:                             q.getFileReadStmt,
+		getHourDayHeatmapStmt:                       q.getHourDayHeatmapStmt,
+		getLastSessionStmt:                          q.getLastSessionStmt,
+		getMessageStmt:                              q.getMessageStmt,
 		getOldestPendingRunQueueEntryForSessionStmt: q.getOldestPendingRunQueueEntryForSessionStmt,
+		getOrphanOutboxEntryStmt:                    q.getOrphanOutboxEntryStmt,
 		getRecentActivityStmt:                       q.getRecentActivityStmt,
 		getRunQueueEntryStmt:                        q.getRunQueueEntryStmt,
 		getSessionByIDStmt:                          q.getSessionByIDStmt,
@@ -782,6 +848,7 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		listMessagesBySessionPaginatedStmt:          q.listMessagesBySessionPaginatedStmt,
 		listNewFilesStmt:                            q.listNewFilesStmt,
 		listPendingInjectsBySessionStmt:             q.listPendingInjectsBySessionStmt,
+		listPendingOrphanOutboxEntriesStmt:          q.listPendingOrphanOutboxEntriesStmt,
 		listPendingRunQueueEntriesStmt:              q.listPendingRunQueueEntriesStmt,
 		listSessionPermissionsStmt:                  q.listSessionPermissionsStmt,
 		listSessionReadFilesStmt:                    q.listSessionReadFilesStmt,
@@ -789,6 +856,8 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		listStaleLeasedRunQueueEntriesStmt:          q.listStaleLeasedRunQueueEntriesStmt,
 		listSubSessionsStmt:                         q.listSubSessionsStmt,
 		listUserMessagesBySessionStmt:               q.listUserMessagesBySessionStmt,
+		markOrphanOutboxEntryDoneStmt:               q.markOrphanOutboxEntryDoneStmt,
+		markOrphanOutboxEntryFailedStmt:             q.markOrphanOutboxEntryFailedStmt,
 		matchSessionPermissionStmt:                  q.matchSessionPermissionStmt,
 		nackRunQueueEntryStmt:                       q.nackRunQueueEntryStmt,
 		nackRunQueueEntryNoAttemptPenaltyStmt:       q.nackRunQueueEntryNoAttemptPenaltyStmt,
@@ -804,5 +873,6 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		updateSessionModelsStmt:                     q.updateSessionModelsStmt,
 		updateSessionReasoningEffortStmt:            q.updateSessionReasoningEffortStmt,
 		updateSessionSystemPromptStmt:               q.updateSessionSystemPromptStmt,
+		writeToOrphanOutboxStmt:                     q.writeToOrphanOutboxStmt,
 	}
 }
