@@ -19,6 +19,9 @@ type Querier interface {
 	// under a pathological scheduling stall) could Ack a row a DIFFERENT,
 	// currently-live executor now owns, deleting work out from under it.
 	AckRunQueueEntry(ctx context.Context, arg AckRunQueueEntryParams) (string, error)
+	// Atomically claim a pending entry for processing (move to processing state).
+	// Used by pump when moving an entry to the main run queue.
+	ClaimOrphanOutboxEntry(ctx context.Context, arg ClaimOrphanOutboxEntryParams) (OrphanCallOutbox, error)
 	// Reset stale leased entries back to pending (lease expiry recovery).
 	// Run periodically to recover from crashed pump instances.
 	// Increments attempts: a lease that expired without a matching Ack/Nack
@@ -29,6 +32,8 @@ type Querier interface {
 	// forever and never reach RunQueueMaxAttempts, looping indefinitely
 	// instead of eventually being dead-lettered.
 	CleanupExpiredLeases(ctx context.Context, arg CleanupExpiredLeasesParams) error
+	// Clean up old done entries (optional, for housekeeping).
+	CleanupOldDoneOrphanOutboxEntries(ctx context.Context, updatedAt int64) error
 	CountMessagesBySession(ctx context.Context, sessionID string) (int64, error)
 	CreateFile(ctx context.Context, arg CreateFileParams) (File, error)
 	CreateMessage(ctx context.Context, arg CreateMessageParams) (Message, error)
@@ -99,6 +104,8 @@ type Querier interface {
 	GetMessage(ctx context.Context, id string) (Message, error)
 	// Get the oldest pending entry for a session (for transactional lease).
 	GetOldestPendingRunQueueEntryForSession(ctx context.Context, sessionID string) (SessionRunQueue, error)
+	// Get a single entry by ID.
+	GetOrphanOutboxEntry(ctx context.Context, id string) (OrphanCallOutbox, error)
 	GetRecentActivity(ctx context.Context) ([]GetRecentActivityRow, error)
 	// Get a single entry by ID.
 	GetRunQueueEntry(ctx context.Context, id string) (SessionRunQueue, error)
@@ -222,6 +229,8 @@ type Querier interface {
 	ListMessagesBySessionPaginated(ctx context.Context, arg ListMessagesBySessionPaginatedParams) ([]Message, error)
 	ListNewFiles(ctx context.Context) ([]File, error)
 	ListPendingInjectsBySession(ctx context.Context, sessionID string) ([]PendingInject, error)
+	// Get all pending outbox entries for recovery (scanned by pump).
+	ListPendingOrphanOutboxEntries(ctx context.Context) ([]OrphanCallOutbox, error)
 	// Get all pending entries (for pump scanning across all sessions).
 	ListPendingRunQueueEntries(ctx context.Context) ([]SessionRunQueue, error)
 	ListSessionPermissions(ctx context.Context, sessionID string) ([]SessionPermission, error)
@@ -241,6 +250,10 @@ type Querier interface {
 	// unsuitable as a tiebreaker), so (created_at DESC, rowid DESC) is a
 	// deterministic newest-first total order.
 	ListUserMessagesBySession(ctx context.Context, sessionID string) ([]Message, error)
+	// Mark an entry as done (successfully moved to main run queue).
+	MarkOrphanOutboxEntryDone(ctx context.Context, id string) (int64, error)
+	// Mark an entry as failed (exhausted retries or persistent error).
+	MarkOrphanOutboxEntryFailed(ctx context.Context, arg MarkOrphanOutboxEntryFailedParams) (OrphanCallOutbox, error)
 	// Returns the row id of an enabled "always allow" rule that matches the
 	// given (sessionID, toolName, action, path) tuple, or sql.ErrNoRows.
 	// session_id is empty for global rules; we accept either empty or the
@@ -292,6 +305,9 @@ type Querier interface {
 	UpdateSessionModels(ctx context.Context, arg UpdateSessionModelsParams) error
 	UpdateSessionReasoningEffort(ctx context.Context, arg UpdateSessionReasoningEffortParams) error
 	UpdateSessionSystemPrompt(ctx context.Context, arg UpdateSessionSystemPromptParams) error
+	// Write a call to the orphan outbox when main run queue enqueue fails.
+	// Returns the outbox row (or error on write failure).
+	WriteToOrphanOutbox(ctx context.Context, arg WriteToOrphanOutboxParams) (OrphanCallOutbox, error)
 }
 
 var _ Querier = (*Queries)(nil)

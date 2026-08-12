@@ -288,6 +288,14 @@ type Service interface {
 	ListPendingRunQueueEntries(ctx context.Context) ([]RunQueueEntry, error)
 	ListStaleLeasedRunQueueEntries(ctx context.Context, beforeTime int64) ([]RunQueueEntry, error)
 	CleanupExpiredLeases(ctx context.Context, beforeTime int64) error
+
+	// Orphan call outbox (P0-3 fix): durable fallback when main run queue enqueue fails
+	WriteToOrphanOutbox(ctx context.Context, id, sessionID string, callData []byte) error
+	ListPendingOrphanOutboxEntries(ctx context.Context) ([]db.OrphanCallOutbox, error)
+	ClaimOrphanOutboxEntry(ctx context.Context, id string) (*db.OrphanCallOutbox, error)
+	MarkOrphanOutboxEntryDone(ctx context.Context, id string) error
+	MarkOrphanOutboxEntryFailed(ctx context.Context, id, lastError string) error
+	GetOrphanOutboxEntry(ctx context.Context, id string) (*db.OrphanCallOutbox, error)
 }
 
 type service struct {
@@ -1704,6 +1712,74 @@ func (s *service) CleanupExpiredLeases(ctx context.Context, beforeTime int64) er
 		UpdatedAt:      now,
 		LeaseExpiresAt: sql.NullInt64{Int64: beforeTime, Valid: true},
 	})
+}
+
+// WriteToOrphanOutbox durably records a call that could not be enqueued to the
+// main run queue (P0-3 fix). This provides a minimal durability guarantee:
+// even when the main run queue is unavailable, we have a durable record that
+// can be recovered later. Returns error if even the outbox write fails.
+func (s *service) WriteToOrphanOutbox(ctx context.Context, id, sessionID string, callData []byte) error {
+	if id == "" {
+		id = uuid.NewString()
+	}
+	now := time.Now().Unix()
+	_, err := s.q.WriteToOrphanOutbox(ctx, db.WriteToOrphanOutboxParams{
+		ID:        id,
+		SessionID: sessionID,
+		CallData:  string(callData),
+		CreatedAt: now,
+		UpdatedAt: now,
+	})
+	return err
+}
+
+// ListPendingOrphanOutboxEntries returns all pending outbox entries for
+// recovery (scanned by pump).
+func (s *service) ListPendingOrphanOutboxEntries(ctx context.Context) ([]db.OrphanCallOutbox, error) {
+	return s.q.ListPendingOrphanOutboxEntries(ctx)
+}
+
+// ClaimOrphanOutboxEntry atomically claims a pending entry for processing
+// (moves to processing state). Used by pump when moving an entry to the
+// main run queue. Returns nil if the entry is no longer pending.
+func (s *service) ClaimOrphanOutboxEntry(ctx context.Context, id string) (*db.OrphanCallOutbox, error) {
+	now := time.Now().Unix()
+	entry, err := s.q.ClaimOrphanOutboxEntry(ctx, db.ClaimOrphanOutboxEntryParams{
+		UpdatedAt: now,
+		ID:        id,
+	})
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	return &entry, err
+}
+
+// MarkOrphanOutboxEntryDone marks an entry as done (successfully moved to
+// main run queue).
+func (s *service) MarkOrphanOutboxEntryDone(ctx context.Context, id string) error {
+	_, err := s.q.MarkOrphanOutboxEntryDone(ctx, id)
+	return err
+}
+
+// MarkOrphanOutboxEntryFailed marks an entry as failed (exhausted retries
+// or persistent error).
+func (s *service) MarkOrphanOutboxEntryFailed(ctx context.Context, id, lastError string) error {
+	now := time.Now().Unix()
+	_, err := s.q.MarkOrphanOutboxEntryFailed(ctx, db.MarkOrphanOutboxEntryFailedParams{
+		LastError: sql.NullString{String: lastError, Valid: lastError != ""},
+		UpdatedAt: now,
+		ID:        id,
+	})
+	return err
+}
+
+// GetOrphanOutboxEntry retrieves a single outbox entry by ID.
+func (s *service) GetOrphanOutboxEntry(ctx context.Context, id string) (*db.OrphanCallOutbox, error) {
+	entry, err := s.q.GetOrphanOutboxEntry(ctx, id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	return &entry, err
 }
 
 // Helper functions to convert between DB and domain types

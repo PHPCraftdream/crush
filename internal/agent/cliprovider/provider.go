@@ -1928,8 +1928,15 @@ func tailString(s string, n int) string {
 // via the CRUSH_CLIPROVIDER_LOG_RAW_PROMPT environment variable. This is an
 // opt-in diagnostic mode for debugging CLI invocation issues — it defaults to
 // false to avoid leaking sensitive data (system prompts, API keys, tokens) into logs.
-func logRawPromptEnabled() bool {
+//
+// Exported for use by agent.go's orphan outbox logging (SEC-1 fix).
+func LogRawPromptEnabled() bool {
 	return os.Getenv("CRUSH_CLIPROVIDER_LOG_RAW_PROMPT") == "1"
+}
+
+// logRawPromptEnabled is a convenience alias for the exported function.
+func logRawPromptEnabled() bool {
+	return LogRawPromptEnabled()
 }
 
 // sanitizeArgs returns a safe-to-log version of args by redacting values of

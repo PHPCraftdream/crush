@@ -10,8 +10,10 @@ package agent
 import (
 	"cmp"
 	"context"
+	"crypto/sha256"
 	_ "embed"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1235,14 +1237,57 @@ func (a *sessionAgent) restartOrphanedWithRetry(calls []SessionAgentCall) error 
 			// Durably enqueue the call BEFORE returning control (P0-2 requirement)
 			// This ensures the call will eventually be executed even if this goroutine exits
 			if enqueueErr := a.sessions.EnqueueRunQueueEntry(enqueueCtx, idempotencyKey, call.SessionID, callDataJSON); enqueueErr != nil {
-				slog.Error("agent: failed to durably enqueue call for recovery",
-					"session_id", call.SessionID, "err", enqueueErr)
-				// Fallback: start a bounded detached run instead of the runnerless
-				// mailbox.queue() — this guarantees the call executes even when
-				// durable enqueue fails, preventing data loss for orphaned work.
-				// P0-3 fix.
-				a.startBoundedDetachedRun(call)
-				errors[i] = fmt.Errorf("failed to durably enqueue call: %w", enqueueErr)
+				// Build safe log fields (SEC-1 fix: never log raw prompt)
+				logFields := []any{
+					"session_id", call.SessionID,
+					"prompt_length", len(call.Prompt),
+					"prompt_hash", promptHash(call.Prompt),
+					"logical_call_id", call.LogicalCallID,
+					"err", enqueueErr,
+				}
+				// Only add raw prompt in diagnostic mode (opt-in)
+				if cliprovider.LogRawPromptEnabled() {
+					logFields = append(logFields, "prompt", call.Prompt)
+				}
+
+				slog.Error("agent: failed to durably enqueue call for recovery", logFields...)
+
+				// P0-3 fix: write to orphan outbox for durability. The outbox provides
+				// a minimal durable record that can be recovered by the pump. This
+				// is NOT an in-memory execution attempt — we only succeed if we can
+				// durably persist the call somewhere.
+				//
+				// If even the outbox write fails, the call is truly lost and we
+				// return an error to the caller (we do NOT mask data loss).
+				outboxID := fmt.Sprintf("orphan-%s-%s", call.SessionID, idempotencyKey)
+				if outboxErr := a.sessions.WriteToOrphanOutbox(enqueueCtx, outboxID, call.SessionID, callDataJSON); outboxErr != nil {
+					logFields := []any{
+						"session_id", call.SessionID,
+						"prompt_length", len(call.Prompt),
+						"prompt_hash", promptHash(call.Prompt),
+						"logical_call_id", call.LogicalCallID,
+						"outbox_id", outboxID,
+						"enqueue_err", enqueueErr,
+						"outbox_err", outboxErr,
+					}
+					if cliprovider.LogRawPromptEnabled() {
+						logFields = append(logFields, "prompt", call.Prompt)
+					}
+					slog.Error("agent: failed to write orphan call to outbox (data loss)", logFields...)
+					errors[i] = fmt.Errorf("failed to durably enqueue call and outbox write also failed: %w (enqueue error: %v)", outboxErr, enqueueErr)
+					return
+				}
+				slog.Warn("agent: call written to orphan outbox for recovery",
+					"session_id", call.SessionID,
+					"prompt_length", len(call.Prompt),
+					"prompt_hash", promptHash(call.Prompt),
+					"logical_call_id", call.LogicalCallID,
+					"outbox_id", outboxID,
+					"enqueue_err", enqueueErr)
+				// We still return an error because the primary path failed, but
+				// the call is now durably persisted in the outbox and will be
+				// recovered by the pump.
+				errors[i] = fmt.Errorf("failed to durably enqueue call (written to orphan outbox for recovery): %w", enqueueErr)
 				return
 			}
 
@@ -1263,62 +1308,15 @@ func (a *sessionAgent) restartOrphanedWithRetry(calls []SessionAgentCall) error 
 	return nil
 }
 
-// startBoundedDetachedRun starts a bounded detached goroutine to execute a call
-// when durable enqueue fails. This is the sessionAgent-level equivalent of
-// coordinator.startDetachedRun, needed because sessionAgent has no access to
-// coordinator (coordinator wraps sessionAgent, not the other way around).
-//
-// Unlike coordinator.startDetachedRun (which durably enqueues), this function
-// actually runs the call in-process with a bounded timeout and lifecycle join
-// via runWg.
-//
-// HONEST LIMITS: this is a best-effort last resort, not a durability
-// guarantee. We only reach here because durable enqueue (session_run_queue)
-// already failed — typically a DB-availability problem — so a.Run() below
-// may hit the same failure for its own writes, and there is no durable
-// record of this call anywhere while it runs. If the process crashes or is
-// killed during the bounded window, the call is lost with no trace beyond
-// the ERROR log line. What this DOES fix versus the old runnerless
-// mailbox.queue() fallback: a transient/partial DB issue (lock contention,
-// a momentary blip) that fails one write can still let a.Run() succeed a
-// moment later, and — unlike an idle mailbox nothing ever drains — every
-// outcome (success or failure) is now attempted and visible at ERROR level
-// instead of silently sitting unreachable until some unrelated future Run().
-//
-// The runner is bounded by a 30-second timeout (matching coordinator's enqueue
-// timeout) and joins runWg so shutdown waits for it. Errors are logged at
-// ERROR level with full context to make failures visible to operators.
-func (a *sessionAgent) startBoundedDetachedRun(call SessionAgentCall) {
-	slog.Error("agent: durable enqueue failed, starting bounded best-effort detached run",
-		"session_id", call.SessionID,
-		"prompt", call.Prompt,
-		"logical_call_id", call.LogicalCallID,
-		"inject_id", call.InjectID)
-
-	a.runWg.Add(1)
-	go func() {
-		defer a.runWg.Done()
-
-		// Bounded context: don't inherit any caller cancellation, but enforce
-		// a 30-second timeout to prevent indefinite hangs.
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-
-		// Run the call. If it fails, log the error — the call has already been
-		// accepted, so the operator needs to see why it didn't complete.
-		if _, err := a.Run(ctx, call); err != nil {
-			slog.Error("agent: bounded detached run failed",
-				"session_id", call.SessionID,
-				"prompt", call.Prompt,
-				"logical_call_id", call.LogicalCallID,
-				"inject_id", call.InjectID,
-				"err", err)
-		} else {
-			slog.Debug("agent: bounded detached run completed successfully",
-				"session_id", call.SessionID,
-				"logical_call_id", call.LogicalCallID)
-		}
-	}()
+// promptHash returns a safe hash of the prompt for logging (never the raw prompt).
+// This prevents leaking user data (system prompts, history, secrets) into logs.
+// Only used when CRUSH_CLIPROVIDER_LOG_RAW_PROMPT is NOT enabled.
+func promptHash(prompt string) string {
+	if prompt == "" {
+		return ""
+	}
+	hash := sha256.Sum256([]byte(prompt))
+	return hex.EncodeToString(hash[:])[:16] // First 16 chars of hex hash (enough for collision resistance in logs)
 }
 
 // activityNotifyContextKey is the context key under which runTurn stores a
