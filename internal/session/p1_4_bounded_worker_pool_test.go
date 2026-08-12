@@ -101,7 +101,6 @@ func TestP1_4_BoundedWorkerPoolRespectsLimit(t *testing.T) {
 	// Create 10 sessions with different IDs to bypass per-session inFlight guard
 	const numSessions = 10
 	const maxConcurrent = 2 // Small limit to make the test deterministic
-	var sessionIDs []string
 
 	// Setup DB and service
 	conn, err := sql.Open("sqlite", ":memory:")
@@ -173,7 +172,6 @@ func TestP1_4_BoundedWorkerPoolRespectsLimit(t *testing.T) {
 	for i := 0; i < numSessions; i++ {
 		sess, err := svc.Create(ctx, "test-session-p1-4")
 		require.NoError(t, err)
-		sessionIDs = append(sessionIDs, sess.ID)
 
 		callData := map[string]any{"SessionID": sess.ID, "Prompt": "test prompt"}
 		callDataJSON, err := json.Marshal(callData)
