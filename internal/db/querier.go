@@ -281,6 +281,12 @@ type Querier interface {
 	// Scoped to the current lease owner, same as AckRunQueueEntry.
 	TerminalFailRunQueueEntry(ctx context.Context, arg TerminalFailRunQueueEntryParams) (string, error)
 	UpdateMessage(ctx context.Context, arg UpdateMessageParams) error
+	// P0-4 fix: Only update if the message does NOT already have a non-partial finish.
+	// This prevents a hung checkpoint from overwriting a terminal finish after unblocking.
+	// A checkpoint writes with Partial=true (finished_at NULL), so this condition rejects
+	// the update if finished_at is already non-NULL (real terminal finish).
+	// Returns number of rows affected (0 = skipped because already terminal, 1 = updated).
+	UpdateMessageIfNotTerminal(ctx context.Context, arg UpdateMessageIfNotTerminalParams) error
 	UpdateMessagePinned(ctx context.Context, arg UpdateMessagePinnedParams) error
 	UpdatePermissionEnabled(ctx context.Context, arg UpdatePermissionEnabledParams) error
 	UpdateSessionModels(ctx context.Context, arg UpdateSessionModelsParams) error
