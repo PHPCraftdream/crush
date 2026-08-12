@@ -2336,8 +2336,18 @@ func (c *coordinator) handleInterruptTick(ctx context.Context, sessionID string)
 		return false, fmt.Errorf("interrupt inject references missing message %q: %w", pi.MessageID, getErr)
 	}
 
+	// Resolve the session's model configuration from the DB or config
+	// defaults so this cross-process interrupt tick respects a persisted
+	// per-session model override instead of falling back to the shared/
+	// global model (same class of bug as requeueInterruptMessage/
+	// InterruptAndSend, closed for those two call sites separately).
+	pinned, resolveErr := c.resolveSessionModels(ctx, sessionID)
+	if resolveErr != nil {
+		return false, fmt.Errorf("failed to resolve session models for interrupt tick: %w", resolveErr)
+	}
+
 	// Build the call
-	call, buildErr := c.buildCall(ctx, sessionID, injMsg.FullText(), nil, nil)
+	call, buildErr := c.buildCall(ctx, sessionID, injMsg.FullText(), pinned, nil)
 	if buildErr != nil {
 		return false, buildErr
 	}
