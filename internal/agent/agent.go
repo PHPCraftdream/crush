@@ -1086,7 +1086,18 @@ func (a *sessionAgent) abandonOwnershipWithHandoff(sessionID string, epoch uint6
 		// submitted, cleared current.cancel/dispatcherCancel, and left the
 		// mailbox at mbIdle atomically, so the work we have here is exactly
 		// what belonged to this era and nothing from a later one.
-		a.restartOrphanedWithRetry(popped)
+		//
+		// P0-3 fix: check and surface the error from restartOrphanedWithRetry
+		// instead of silently discarding it. The finalizer cannot return
+		// the error to the original caller (Run's defer is already unwinding),
+		// so we log it at ERROR level with full context to make failures
+		// visible to operators.
+		if err := a.restartOrphanedWithRetry(popped); err != nil {
+			slog.Error("agent.Run: failed to restart orphaned calls during ownership handoff",
+				"session_id", sessionID,
+				"num_calls", len(popped),
+				"err", err)
+		}
 	}
 
 	// P2-1 fix: drain summarizeQueue after ownership is released and the session
@@ -1126,10 +1137,10 @@ func (a *sessionAgent) abandonOwnershipWithHandoff(sessionID string, epoch uint6
 // and tests rather than a blanket rename, but implemented as a thin alias
 // so the actual enqueue logic has exactly one copy. See
 // restartOrphanedWithRetry's doc comment for the full design rationale.
-func (a *sessionAgent) restartOrphaned(calls []SessionAgentCall) {
-	if err := a.restartOrphanedWithRetry(calls); err != nil {
-		slog.Error("agent: restartOrphaned failed", "err", err)
-	}
+//
+// P0-3 fix: now propagates the error instead of silently discarding it.
+func (a *sessionAgent) restartOrphaned(calls []SessionAgentCall) error {
+	return a.restartOrphanedWithRetry(calls)
 }
 
 // restartOrphanedWithRetry durably enqueues calls for recovery by the run queue pump
@@ -1226,10 +1237,11 @@ func (a *sessionAgent) restartOrphanedWithRetry(calls []SessionAgentCall) error 
 			if enqueueErr := a.sessions.EnqueueRunQueueEntry(enqueueCtx, idempotencyKey, call.SessionID, callDataJSON); enqueueErr != nil {
 				slog.Error("agent: failed to durably enqueue call for recovery",
 					"session_id", call.SessionID, "err", enqueueErr)
-				// Fallback: try in-memory queue (data loss risk, but better than nothing)
-				a.getMailbox(call.SessionID).queue(call)
-				slog.Error("agent: durable enqueue failed, using in-memory fallback (data loss risk)",
-					"session_id", call.SessionID)
+				// Fallback: start a bounded detached run instead of the runnerless
+				// mailbox.queue() — this guarantees the call executes even when
+				// durable enqueue fails, preventing data loss for orphaned work.
+				// P0-3 fix.
+				a.startBoundedDetachedRun(call)
 				errors[i] = fmt.Errorf("failed to durably enqueue call: %w", enqueueErr)
 				return
 			}
@@ -1249,6 +1261,52 @@ func (a *sessionAgent) restartOrphanedWithRetry(calls []SessionAgentCall) error 
 		}
 	}
 	return nil
+}
+
+// startBoundedDetachedRun starts a bounded detached goroutine to execute a call
+// when durable enqueue fails. This is the sessionAgent-level equivalent of
+// coordinator.startDetachedRun, needed because sessionAgent has no access to
+// coordinator (coordinator wraps sessionAgent, not the other way around).
+//
+// Unlike coordinator.startDetachedRun (which durably enqueues), this function
+// actually runs the call in-process with a bounded timeout and lifecycle join
+// via runWg. This ensures the call executes even when durable enqueue fails,
+// preventing data loss for orphaned work.
+//
+// The runner is bounded by a 30-second timeout (matching coordinator's enqueue
+// timeout) and joins runWg so shutdown waits for it. Errors are logged at
+// ERROR level with full context to make failures visible to operators.
+func (a *sessionAgent) startBoundedDetachedRun(call SessionAgentCall) {
+	slog.Error("agent: durable enqueue failed, starting bounded detached run to prevent data loss",
+		"session_id", call.SessionID,
+		"prompt", call.Prompt,
+		"logical_call_id", call.LogicalCallID,
+		"inject_id", call.InjectID)
+
+	a.runWg.Add(1)
+	go func() {
+		defer a.runWg.Done()
+
+		// Bounded context: don't inherit any caller cancellation, but enforce
+		// a 30-second timeout to prevent indefinite hangs.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		// Run the call. If it fails, log the error — the call has already been
+		// accepted, so the operator needs to see why it didn't complete.
+		if _, err := a.Run(ctx, call); err != nil {
+			slog.Error("agent: bounded detached run failed",
+				"session_id", call.SessionID,
+				"prompt", call.Prompt,
+				"logical_call_id", call.LogicalCallID,
+				"inject_id", call.InjectID,
+				"err", err)
+		} else {
+			slog.Debug("agent: bounded detached run completed successfully",
+				"session_id", call.SessionID,
+				"logical_call_id", call.LogicalCallID)
+		}
+	}()
 }
 
 // activityNotifyContextKey is the context key under which runTurn stores a
