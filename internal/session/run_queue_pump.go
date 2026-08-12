@@ -374,26 +374,54 @@ func (p *RunQueuePump) Stop() bool {
 	// This ensures tick() stops accepting new work BEFORE we wait for workers.
 	p.cancel()
 
-	// Step 2: Wait for all in-flight workers with a 5-second grace period.
-	// Workers must complete their DB writes (Ack/Nack/TerminalFail) before we
-	// consider shutdown complete.
+	// Step 2: Wait for all in-flight workers AND the main run() loop with a
+	// unified 5-second grace period. We use a single deadline for both to
+	// keep the total shutdown time bounded to 5s, not 10s (P1-1). Without this,
+	// a hung tick() DB call (stuck disk/filesystem) would make Stop() hang
+	// forever, breaking the "bounded shutdown" guarantee in App.Shutdown.
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+
 	workerDone := make(chan struct{})
 	go func() {
 		p.workerWg.Wait()
 		close(workerDone)
 	}()
 
+	mainLoopDone := make(chan struct{})
+	go func() {
+		p.wg.Wait()
+		close(mainLoopDone)
+	}()
+
 	select {
 	case <-workerDone:
-		// All workers finished. Now wait for the main run() loop to exit.
-		p.wg.Wait()
-		p.started = false
-		slog.Info("run_queue_pump: stopped gracefully", "instance_id", p.cfg.PumpInstanceID)
-		return false
-	case <-time.After(5 * time.Second):
-		// Grace period expired but workers are still running. Return true to
-		// signal forced shutdown. The caller (App.Shutdown) must not close the DB.
-		slog.Warn("run_queue_pump: forced shutdown (workers still running after 5s grace)", "instance_id", p.cfg.PumpInstanceID)
+		// Workers finished. Now wait for the main run() loop to exit.
+		select {
+		case <-mainLoopDone:
+			p.started = false
+			slog.Info("run_queue_pump: stopped gracefully", "instance_id", p.cfg.PumpInstanceID)
+			return false
+		case <-shutdownCtx.Done():
+			// Main loop didn't finish in time - forced shutdown
+			slog.Warn("run_queue_pump: forced shutdown (main loop still running after 5s grace)", "instance_id", p.cfg.PumpInstanceID)
+			return true
+		}
+	case <-mainLoopDone:
+		// Main loop finished. Now wait for workers.
+		select {
+		case <-workerDone:
+			p.started = false
+			slog.Info("run_queue_pump: stopped gracefully", "instance_id", p.cfg.PumpInstanceID)
+			return false
+		case <-shutdownCtx.Done():
+			// Workers didn't finish in time - forced shutdown
+			slog.Warn("run_queue_pump: forced shutdown (workers still running after 5s grace)", "instance_id", p.cfg.PumpInstanceID)
+			return true
+		}
+	case <-shutdownCtx.Done():
+		// Neither workers nor main loop finished in time - forced shutdown
+		slog.Warn("run_queue_pump: forced shutdown (workers and/or main loop still running after 5s grace)", "instance_id", p.cfg.PumpInstanceID)
 		return true
 	}
 }
@@ -425,7 +453,13 @@ func (p *RunQueuePump) run() {
 
 // tick performs one scan of the queue and attempts to execute pending work.
 func (p *RunQueuePump) tick() {
-	ctx := p.ctx
+	// Use a deadline-bound context for DB reads to prevent indefinite hangs
+	// on stuck disk/filesystem (P1-1). The 5s budget matches Stop()'s total
+	// grace period - if tick() itself hangs, Stop() will force-shutdown after
+	// the same deadline anyway, so this protects both the shutdown path and
+	// prevents a single stuck tick from blocking the pump indefinitely.
+	ctx, cancel := context.WithTimeout(p.ctx, 5*time.Second)
+	defer cancel()
 
 	// Step 1: Cleanup expired leases (recovery from crashed pumps)
 	expiredBefore := time.Now().Unix()
