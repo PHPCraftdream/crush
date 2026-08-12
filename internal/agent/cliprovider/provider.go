@@ -71,8 +71,76 @@ const ProviderType = "cli"
 const ProviderID = "local-cli"
 
 // maxPromptArgLen is the maximum prompt length (in bytes) that will be passed
-// as a CLI argument. Longer prompts are piped via stdin to avoid OS limits.
+// as a CLI argument when the target binary is executed directly (a native
+// .exe on Windows, or any binary on Unix). Longer prompts are piped via
+// stdin to avoid OS limits. Calibrated for the real argv ceiling in that
+// case (Windows CreateProcess ~32767 chars, Linux ARG_MAX / macOS typically
+// far larger) — see maxPromptArgLenWindowsCmdShim below for the much lower
+// threshold used when that assumption does not hold.
 const maxPromptArgLen = 30 * 1024
+
+// maxPromptArgLenWindowsCmdShim is the threshold used instead of
+// maxPromptArgLen when, on Windows, the resolved binary is a .cmd/.bat
+// shim (see isWindowsCmdShim) rather than a native .exe.
+//
+// Windows cannot exec a .cmd/.bat file directly the way it execs a .exe:
+// CreateProcess always routes it through `cmd.exe /c <shim> <args...>`, and
+// cmd.exe enforces its OWN command-line length ceiling — about 8191
+// characters, per Microsoft's own documented limit for CMD.EXE — entirely
+// independent of, and far below, the ~32767-character CreateProcess limit
+// maxPromptArgLen above was calibrated for.
+//
+// This is not a corner case: npm installs every Node-based CLI on Windows
+// this way (claude.cmd, gemini.cmd, qwen.cmd, grok.cmd, ...), so it is the
+// default shape of every CLI provider's binary on a Windows machine with
+// these tools installed via npm. A real system prompt is routinely ~10-15KB
+// once skills, MCP tool descriptions, and env/git context are folded in —
+// comfortably under maxPromptArgLen's 30KB, but well past cmd.exe's ~8191
+// character ceiling. Found via a smoke test of a real `crush run`
+// invocation on Windows: the underlying claude.cmd process exited with
+// status 1 and its only PTY output was cmd.exe's own
+// "The command line is too long." — before this fix, maxPromptArgLen's 30KB
+// threshold never triggered the stdin fallback because the ~12KB prompt in
+// question looked "short enough", when in fact it was already 50% past the
+// real, much lower limit for this specific binary shape.
+//
+// Set well under 8191 to leave headroom for the rest of the command line
+// this length check does not itself measure: the resolved binary's own
+// (possibly long) path, plus every other flag already on the argument list
+// by this point (--mcp-config's temp file path, --allowedTools's tool
+// list, etc.), which together can run to a few hundred bytes on their own.
+const maxPromptArgLenWindowsCmdShim = 4 * 1024
+
+// isWindowsCmdShim reports whether resolvedBinary is a Windows .cmd/.bat
+// script — the shape npm installs Node-based CLI wrappers as on Windows.
+// Always false on non-Windows platforms, where this distinction does not
+// apply (exec.Command execs the target directly, no intermediate shell).
+func isWindowsCmdShim(resolvedBinary string) bool {
+	if runtime.GOOS != "windows" {
+		return false
+	}
+	switch strings.ToLower(filepath.Ext(resolvedBinary)) {
+	case ".cmd", ".bat":
+		return true
+	default:
+		return false
+	}
+}
+
+// effectiveMaxPromptArgLen returns the byte threshold above which the
+// prompt is piped via stdin instead of passed as a CLI argument, for the
+// binary resolveBinary(rawBinary) resolves to. See maxPromptArgLen and
+// maxPromptArgLenWindowsCmdShim for why these two thresholds differ.
+func effectiveMaxPromptArgLen(rawBinary string) int {
+	resolved := rawBinary
+	if r, err := resolveBinary(rawBinary); err == nil {
+		resolved = r
+	}
+	if isWindowsCmdShim(resolved) {
+		return maxPromptArgLenWindowsCmdShim
+	}
+	return maxPromptArgLen
+}
 
 // ansiEscape matches ANSI/VT escape sequences injected by PTY drivers:
 //   - CSI sequences: ESC [ <params> <letter>  (e.g. \x1b[2J, \x1b[?25h)
@@ -1049,7 +1117,7 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 	}
 
 	noPTY := m.spec.NoPTY || testDisablePTY
-	useStdin := m.spec.AlwaysStdin || noPTY || len(prompt) > maxPromptArgLen
+	useStdin := m.spec.AlwaysStdin || noPTY || len(prompt) > effectiveMaxPromptArgLen(m.spec.Binary)
 	if !useStdin && m.spec.PromptFlag != "" {
 		args = append(args, m.spec.PromptFlag, prompt)
 	}

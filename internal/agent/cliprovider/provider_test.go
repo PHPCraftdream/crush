@@ -520,6 +520,53 @@ func TestMaxPromptArgLen(t *testing.T) {
 	}
 }
 
+// TestIsWindowsCmdShim covers the fix for a real `crush run` failure found
+// via a Windows smoke test: claude.cmd (npm's shim) invoked with a routine
+// ~12KB system prompt as a CLI argument hit cmd.exe's own ~8191-character
+// command-line ceiling ("The command line is too long.") well before
+// maxPromptArgLen's 30KB threshold ever triggered the stdin fallback.
+func TestIsWindowsCmdShim(t *testing.T) {
+	cases := []struct {
+		name        string
+		path        string
+		wantWindows bool // expected result when GOOS == "windows"
+	}{
+		{"cmd shim", `C:\Users\test\AppData\Roaming\npm\claude.cmd`, true},
+		{"bat shim", `C:\tools\gemini.bat`, true},
+		{"cmd shim uppercase extension", `C:\tools\claude.CMD`, true},
+		{"native exe", `C:\Program Files\claude\claude.exe`, false},
+		{"no extension (typical Unix binary)", `/usr/local/bin/claude`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			want := tc.wantWindows
+			if runtime.GOOS != "windows" {
+				want = false
+			}
+			if got := isWindowsCmdShim(tc.path); got != want {
+				t.Errorf("isWindowsCmdShim(%q) = %v, want %v (GOOS=%s)", tc.path, got, want, runtime.GOOS)
+			}
+		})
+	}
+}
+
+// TestEffectiveMaxPromptArgLen covers effectiveMaxPromptArgLen's fallback:
+// when resolveBinary can't resolve the given path (as here, a path that
+// doesn't exist on disk), it falls back to inspecting the raw path's own
+// extension directly.
+func TestEffectiveMaxPromptArgLen(t *testing.T) {
+	wantCmdThreshold := maxPromptArgLen
+	if runtime.GOOS == "windows" {
+		wantCmdThreshold = maxPromptArgLenWindowsCmdShim
+	}
+	if got := effectiveMaxPromptArgLen(`C:\does\not\exist\claude.cmd`); got != wantCmdThreshold {
+		t.Errorf("effectiveMaxPromptArgLen(claude.cmd) = %d, want %d (GOOS=%s)", got, wantCmdThreshold, runtime.GOOS)
+	}
+	if got := effectiveMaxPromptArgLen(`C:\does\not\exist\claude.exe`); got != maxPromptArgLen {
+		t.Errorf("effectiveMaxPromptArgLen(claude.exe) = %d, want %d", got, maxPromptArgLen)
+	}
+}
+
 func TestBuildArgsPromptFlag(t *testing.T) {
 	for _, spec := range All {
 		args := spec.BuildArgs(false)
