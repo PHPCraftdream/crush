@@ -91,6 +91,16 @@ func TestSetAllowPeakHours_BypassesRunInternal(t *testing.T) {
 		Provider: providerID,
 		Model:    "test-model",
 	}
+	// resolveSessionModels always resolves both large AND small — leaving
+	// small unset works accidentally on a dev machine whose real global
+	// config (always merged in by config.Load regardless of workingDir)
+	// happens to provide a fallback small model, but fails cleanly on a
+	// clean CI sandbox with "small model provider not configured". Set it
+	// explicitly so this test doesn't depend on the local environment.
+	cfg.Config().Models[config.SelectedModelTypeSmall] = config.SelectedModel{
+		Provider: providerID,
+		Model:    "test-model",
+	}
 	// runInternal's retry path calls lastAssistantMessage -> c.messages, so
 	// wire the real message service (matches appendAssistant's setup).
 	coord := &coordinator{

@@ -41,7 +41,13 @@ func TestQueueMessage_AppendsToSessionQueue(t *testing.T) {
 // integration test TestInterruptAndReplace_ReplacementReachesNextTurn_P0_2.
 func TestCoordinator_InterruptAndSend_UsesInterruptAndReplace(t *testing.T) {
 	const providerID = "anthropic"
-	providerCfg := config.ProviderConfig{ID: providerID}
+	providerCfg := config.ProviderConfig{
+		ID:   providerID,
+		Type: "anthropic",
+		Models: []catwalk.Model{
+			{ID: "claude-test", Name: "Claude Test", DefaultMaxTokens: 4096},
+		},
+	}
 
 	env := testEnv(t)
 	coord := newTestCoordinator(t, env, providerID, providerCfg)

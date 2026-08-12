@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"testing"
 
+	"charm.land/catwalk/pkg/catwalk"
 	"charm.land/fantasy"
 	"github.com/charmbracelet/crush/internal/config"
+	"github.com/charmbracelet/crush/internal/csync"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/session"
 	"github.com/stretchr/testify/require"
@@ -26,7 +28,27 @@ func TestP0_2_FaultInjection_InterruptTickAtomicTransaction(t *testing.T) {
 		env := testEnv(t)
 		cfg, err := config.Init(env.workingDir, "", false)
 		require.NoError(t, err)
-		cfg.Config().Providers.Set(providerID, config.ProviderConfig{ID: providerID})
+		// handleInterruptTick resolves session models before buildCall
+		// (P0-2's atomic-handoff rewrite), so a resolvable large+small model
+		// is required — a bare provider ID falls through to config.Load's
+		// own CLI-provider auto-discovery default (environment-dependent:
+		// works on a machine with claude/gemini CLIs on PATH, panics on a
+		// nil c.permissions in this minimal test coordinator otherwise).
+		cfg.Config().Providers.Set(providerID, config.ProviderConfig{
+			ID:   providerID,
+			Type: "openai",
+			Models: []catwalk.Model{
+				{ID: "test-model", Name: "Test Model", DefaultMaxTokens: 4096},
+			},
+		})
+		cfg.Config().Models[config.SelectedModelTypeLarge] = config.SelectedModel{
+			Provider: providerID,
+			Model:    "test-model",
+		}
+		cfg.Config().Models[config.SelectedModelTypeSmall] = config.SelectedModel{
+			Provider: providerID,
+			Model:    "test-model",
+		}
 
 		agent := newMockAgent(providerID, 4096, func(_ context.Context, _ SessionAgentCall) (*fantasy.AgentResult, error) {
 			return agentResultWithText("ok"), nil
@@ -36,6 +58,7 @@ func TestP0_2_FaultInjection_InterruptTickAtomicTransaction(t *testing.T) {
 			sessions:     env.sessions,
 			messages:     env.messages,
 			currentAgent: agent,
+			modelCache:   csync.NewMap[string, cachedModelPair](),
 		}
 
 		ctx := t.Context()

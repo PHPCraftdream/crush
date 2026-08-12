@@ -194,13 +194,20 @@ func TestP1_2_SingleRenewalErrorDoesNotTriggerTimeout(t *testing.T) {
 		firstRenewalOK:    true,
 	}
 
-	// Use a longer TTL to give execution time to attempt multiple renewals
+	// TTL=2s (tick interval TTL/3≈666ms) gives generous slack against
+	// scheduling jitter under load: even if a renewal tick is delayed by a
+	// few hundred ms (observed to happen under heavy parallel test-suite
+	// contention — this test flaked intermittently at TTL=500ms/interval
+	// ~166ms, where jitter of just ~150-200ms could push
+	// time.Since(lastSuccessfulRenewal) past the fail-closed threshold
+	// before the next renewal had a chance to refresh it), there's still
+	// well over a second of margin before a false-positive cancellation.
 	pump := session.NewRunQueuePump(session.RunQueuePumpConfig{
 		Sessions:       blockingSvc,
 		Coordinator:    coord,
 		PumpInstanceID: "p1-2-single-error-pump",
 		TestTick:       func() time.Duration { return 10 * time.Millisecond },
-		TestLeaseTTL:   500 * time.Millisecond, // Longer TTL to allow multiple renewal attempts
+		TestLeaseTTL:   2 * time.Second,
 	})
 	pump.Start()
 
@@ -215,8 +222,8 @@ func TestP1_2_SingleRenewalErrorDoesNotTriggerTimeout(t *testing.T) {
 	}, 5*time.Second, 20*time.Millisecond,
 		"at least 2 renewals should have been attempted")
 
-	// Wait a bit more to ensure no fail-closed timeout fires
-	// With TTL=500ms and renewal interval=166ms, we're well within the TTL window
+	// Wait a bit more to ensure no fail-closed timeout fires.
+	// With TTL=2s and renewal interval≈666ms, we're well within the TTL window.
 	time.Sleep(200 * time.Millisecond)
 
 	// The coordinator should NOT have observed cancellation
@@ -272,12 +279,24 @@ func TestP1_2_FailClosedTimeoutWindow(t *testing.T) {
 		firstRenewalOK:    true,
 	}
 
+	// TTL=2s (vs. an earlier 200ms) gives a much wider floor-check margin.
+	// At 200ms, this test flaked intermittently under heavy parallel
+	// test-suite load: startTime was captured after confirming
+	// coord.entryCount.Load() > 0, but the SUT's own lastSuccessfulRenewal
+	// clock actually starts ticking earlier (when the renewal goroutine
+	// launches, before the coordinator callback and its atomic counter
+	// become externally observable) — under scheduling jitter that gap
+	// could itself approach the 150ms floor, making a perfectly-correct
+	// fail-closed cancellation look like it fired "too early" relative to
+	// startTime. Capturing startTime right after the first renewal is
+	// confirmed (closer to the SUT's actual clock origin) plus a much
+	// bigger TTL closes the gap.
 	pump := session.NewRunQueuePump(session.RunQueuePumpConfig{
 		Sessions:       blockingSvc,
 		Coordinator:    coord,
 		PumpInstanceID: "p1-2-timeout-window-pump",
 		TestTick:       func() time.Duration { return 10 * time.Millisecond },
-		TestLeaseTTL:   200 * time.Millisecond, // Longer TTL to make the window observable
+		TestLeaseTTL:   2 * time.Second,
 	})
 	pump.Start()
 
@@ -286,28 +305,28 @@ func TestP1_2_FailClosedTimeoutWindow(t *testing.T) {
 		return coord.entryCount.Load() > 0
 	}, 5*time.Second, 20*time.Millisecond)
 
-	// Record the start time of the test
-	startTime := time.Now()
-
-	// Wait for the first renewal to succeed
+	// Wait for the first renewal to succeed, then start measuring from here
+	// — as close as achievable to the SUT's own lastSuccessfulRenewal
+	// timestamp.
 	require.Eventually(t, func() bool {
 		return blockingSvc.renewalsAttempted.Load() >= 1
 	}, 5*time.Second, 20*time.Millisecond)
+	startTime := time.Now()
 
 	// The coordinator should NOT observe cancellation within the first TTL window
 	// (renewals should still be succeeding during this time... wait, we're blocking them)
 	// Actually, since we're blocking renewals, the coordinator WILL observe cancellation
-	// after TTL. Let's just verify it doesn't cancel TOO early (e.g., after 50ms when TTL=200ms)
+	// after TTL. Let's just verify it doesn't cancel TOO early (e.g., well before the 2s TTL)
 	select {
 	case <-coord.canceledCh:
 		elapsed := time.Since(startTime)
-		if elapsed < 150*time.Millisecond {
-			t.Fatalf("coordinator observed cancellation too early (after %v), expected at least ~200ms (TTL)",
+		if elapsed < 1500*time.Millisecond {
+			t.Fatalf("coordinator observed cancellation too early (after %v), expected at least ~2s (TTL)",
 				elapsed)
 		}
 		// Expected: cancellation after TTL
-	case <-time.After(5 * time.Second):
-		t.Fatal("coordinator did not observe cancellation within 5s")
+	case <-time.After(8 * time.Second):
+		t.Fatal("coordinator did not observe cancellation within 8s")
 	}
 
 	// Stop the pump

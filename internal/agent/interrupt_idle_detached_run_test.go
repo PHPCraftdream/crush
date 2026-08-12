@@ -10,6 +10,7 @@ import (
 	"charm.land/fantasy"
 	"charm.land/fantasy/providers/openaicompat"
 	"github.com/charmbracelet/crush/internal/config"
+	"github.com/charmbracelet/crush/internal/csync"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/session"
 	"github.com/stretchr/testify/assert"
@@ -108,13 +109,36 @@ func TestCoordinator_InterruptAndSend_IdleSession_ActuallyRuns(t *testing.T) {
 
 	cfg, err := config.Init(env.workingDir, "", false)
 	require.NoError(t, err)
-	cfg.Config().Providers.Set(providerID, config.ProviderConfig{ID: providerID})
+	// InterruptAndSend's no-explicit-overrides branch resolves session
+	// models via resolveSessionModels before enqueuing (P1-4 fix), so cfg
+	// needs a genuinely resolvable large+small model — not just a bare
+	// provider ID. Point both slots at the same fake SSE server the
+	// SessionAgent itself already uses (srv), so resolution succeeds
+	// without depending on whatever provider config.Init's own CLI-provider
+	// auto-discovery might otherwise pick up from the host machine.
+	cfg.Config().Providers.Set(providerID, config.ProviderConfig{
+		ID:      providerID,
+		Type:    "openai",
+		BaseURL: srv.URL,
+		Models: []catwalk.Model{
+			{ID: "probe", Name: "Probe", DefaultMaxTokens: 1000},
+		},
+	})
+	cfg.Config().Models[config.SelectedModelTypeLarge] = config.SelectedModel{
+		Provider: providerID,
+		Model:    "probe",
+	}
+	cfg.Config().Models[config.SelectedModelTypeSmall] = config.SelectedModel{
+		Provider: providerID,
+		Model:    "probe",
+	}
 
 	coord := &coordinator{
 		cfg:          cfg,
 		sessions:     env.sessions,
 		messages:     env.messages,
 		currentAgent: sa,
+		modelCache:   csync.NewMap[string, cachedModelPair](),
 	}
 
 	// Since task #340 ROUND 3, startDetachedRun durably enqueues the call

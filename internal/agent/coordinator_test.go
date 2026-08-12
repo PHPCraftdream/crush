@@ -78,13 +78,32 @@ func (m *mockSessionAgent) SystemPrompt() string                  { return "" }
 func (m *mockSessionAgent) SetTimeoutOptions(bool, time.Duration) {}
 
 // newTestCoordinator creates a minimal coordinator for unit testing runSubAgent.
+//
+// Registers providerCfg under providerID AND wires it as both the large and
+// small model default (config.SelectedModelType{Large,Small}), so any test
+// path that reaches resolveSessionModels (e.g. InterruptAndSend/Run without
+// explicit overrides) resolves successfully instead of falling through to
+// config.Load's own CLI-provider auto-discovery default — which depends on
+// what's actually installed on the machine running the test (a dev
+// workstation with claude/gemini CLIs on PATH resolves a real provider
+// there; a clean CI sandbox does not), and, in a minimal test coordinator
+// that doesn't wire c.permissions, that path panics on a nil dereference.
+// providerCfg's first configured Model ID (if any) is used; callers that
+// pass a providerCfg with no Models can still use this coordinator for
+// tests that never reach resolveSessionModels.
 func newTestCoordinator(t *testing.T, env fakeEnv, providerID string, providerCfg config.ProviderConfig) *coordinator {
 	cfg, err := config.Init(env.workingDir, "", false)
 	require.NoError(t, err)
 	cfg.Config().Providers.Set(providerID, providerCfg)
+	if len(providerCfg.Models) > 0 {
+		selected := config.SelectedModel{Provider: providerID, Model: providerCfg.Models[0].ID}
+		cfg.Config().Models[config.SelectedModelTypeLarge] = selected
+		cfg.Config().Models[config.SelectedModelTypeSmall] = selected
+	}
 	return &coordinator{
-		cfg:      cfg,
-		sessions: env.sessions,
+		cfg:        cfg,
+		sessions:   env.sessions,
+		modelCache: csync.NewMap[string, cachedModelPair](),
 	}
 }
 
@@ -1566,7 +1585,27 @@ func TestHandleInterruptTick(t *testing.T) {
 	env := testEnv(t)
 	cfg, err := config.Init(env.workingDir, "", false)
 	require.NoError(t, err)
-	cfg.Config().Providers.Set(providerID, config.ProviderConfig{ID: providerID})
+	cfg.Config().Providers.Set(providerID, config.ProviderConfig{
+		ID:   providerID,
+		Type: "openai",
+		Models: []catwalk.Model{
+			{ID: "test-model", Name: "Test Model", DefaultMaxTokens: 4096},
+		},
+	})
+	// P0-2's atomic-handoff rewrite made handleInterruptTick call
+	// resolveSessionModels before buildCall (closing the same
+	// session-scoped-model bug P1-4 fixed elsewhere), so both large and
+	// small must be resolvable from config — the old nil-pinned buildCall
+	// fallback (c.currentAgent.Model()) that let this test skip config
+	// entirely no longer exists.
+	cfg.Config().Models[config.SelectedModelTypeLarge] = config.SelectedModel{
+		Provider: providerID,
+		Model:    "test-model",
+	}
+	cfg.Config().Models[config.SelectedModelTypeSmall] = config.SelectedModel{
+		Provider: providerID,
+		Model:    "test-model",
+	}
 
 	agent := newMockAgent(providerID, 4096, func(_ context.Context, _ SessionAgentCall) (*fantasy.AgentResult, error) {
 		return agentResultWithText("ok"), nil
@@ -1576,6 +1615,7 @@ func TestHandleInterruptTick(t *testing.T) {
 		sessions:     env.sessions,
 		messages:     env.messages,
 		currentAgent: agent,
+		modelCache:   csync.NewMap[string, cachedModelPair](),
 	}
 
 	ctx := t.Context()
