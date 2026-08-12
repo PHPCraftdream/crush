@@ -225,6 +225,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.updateMessageStmt, err = db.PrepareContext(ctx, updateMessage); err != nil {
 		return nil, fmt.Errorf("error preparing query UpdateMessage: %w", err)
 	}
+	if q.updateMessageIfNotTerminalStmt, err = db.PrepareContext(ctx, updateMessageIfNotTerminal); err != nil {
+		return nil, fmt.Errorf("error preparing query UpdateMessageIfNotTerminal: %w", err)
+	}
 	if q.updateMessagePinnedStmt, err = db.PrepareContext(ctx, updateMessagePinned); err != nil {
 		return nil, fmt.Errorf("error preparing query UpdateMessagePinned: %w", err)
 	}
@@ -580,6 +583,11 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing updateMessageStmt: %w", cerr)
 		}
 	}
+	if q.updateMessageIfNotTerminalStmt != nil {
+		if cerr := q.updateMessageIfNotTerminalStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing updateMessageIfNotTerminalStmt: %w", cerr)
+		}
+	}
 	if q.updateMessagePinnedStmt != nil {
 		if cerr := q.updateMessagePinnedStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing updateMessagePinnedStmt: %w", cerr)
@@ -711,6 +719,7 @@ type Queries struct {
 	setParentCostAccountedStmt                  *sql.Stmt
 	terminalFailRunQueueEntryStmt               *sql.Stmt
 	updateMessageStmt                           *sql.Stmt
+	updateMessageIfNotTerminalStmt              *sql.Stmt
 	updateMessagePinnedStmt                     *sql.Stmt
 	updatePermissionEnabledStmt                 *sql.Stmt
 	updateSessionModelsStmt                     *sql.Stmt
@@ -789,6 +798,7 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		setParentCostAccountedStmt:                  q.setParentCostAccountedStmt,
 		terminalFailRunQueueEntryStmt:               q.terminalFailRunQueueEntryStmt,
 		updateMessageStmt:                           q.updateMessageStmt,
+		updateMessageIfNotTerminalStmt:              q.updateMessageIfNotTerminalStmt,
 		updateMessagePinnedStmt:                     q.updateMessagePinnedStmt,
 		updatePermissionEnabledStmt:                 q.updatePermissionEnabledStmt,
 		updateSessionModelsStmt:                     q.updateSessionModelsStmt,

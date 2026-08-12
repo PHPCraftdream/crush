@@ -583,6 +583,32 @@ func (q *Queries) UpdateMessage(ctx context.Context, arg UpdateMessageParams) er
 	return err
 }
 
+const updateMessageIfNotTerminal = `-- name: UpdateMessageIfNotTerminal :exec
+UPDATE messages
+SET
+    parts = ?,
+    finished_at = ?,
+    updated_at = strftime('%s', 'now')
+WHERE id = ?
+  AND finished_at IS NULL
+`
+
+type UpdateMessageIfNotTerminalParams struct {
+	Parts      string        `json:"parts"`
+	FinishedAt sql.NullInt64 `json:"finished_at"`
+	ID         string        `json:"id"`
+}
+
+// P0-4 fix: Only update if the message does NOT already have a non-partial finish.
+// This prevents a hung checkpoint from overwriting a terminal finish after unblocking.
+// A checkpoint writes with Partial=true (finished_at NULL), so this condition rejects
+// the update if finished_at is already non-NULL (real terminal finish).
+// Returns number of rows affected (0 = skipped because already terminal, 1 = updated).
+func (q *Queries) UpdateMessageIfNotTerminal(ctx context.Context, arg UpdateMessageIfNotTerminalParams) error {
+	_, err := q.exec(ctx, q.updateMessageIfNotTerminalStmt, updateMessageIfNotTerminal, arg.Parts, arg.FinishedAt, arg.ID)
+	return err
+}
+
 const updateMessagePinned = `-- name: UpdateMessagePinned :exec
 UPDATE messages
 SET

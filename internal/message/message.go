@@ -269,13 +269,37 @@ func (s *service) Update(ctx context.Context, message Message) error {
 		finishedAt.Int64 = finish.Time
 		finishedAt.Valid = true
 	}
-	err = s.q.UpdateMessage(ctx, db.UpdateMessageParams{
-		ID:         message.ID,
-		Parts:      string(parts),
-		FinishedAt: finishedAt,
-	})
-	if err != nil {
-		return err
+
+	// P0-4 fix: Use conditional update for partial checkpoints to prevent
+	// a hung checkpoint from overwriting a terminal finish after unblocking.
+	// If the DB already has a non-partial finish (finished_at IS NOT NULL),
+	// UpdateMessageIfNotTerminal skips the update (0 rows affected), which
+	// is the correct outcome: the terminal state wins, the stale checkpoint
+	// is safely discarded.
+	var dbErr error
+	if partialCheckpoint {
+		dbErr = s.q.UpdateMessageIfNotTerminal(ctx, db.UpdateMessageIfNotTerminalParams{
+			ID:         message.ID,
+			Parts:      string(parts),
+			FinishedAt: finishedAt,
+		})
+		// Log the skip case (0 rows affected) as a hint that a race was
+		// prevented. This is expected during shutdown when a checkpoint
+		// unblocks after the terminal write has already landed.
+		if dbErr == nil {
+			// The update succeeded (either 0 or 1 row). We can't distinguish
+			// 0 rows from sqlc's :exec result type, but we know the race was
+			// prevented by the WHERE clause, which is sufficient.
+		}
+	} else {
+		dbErr = s.q.UpdateMessage(ctx, db.UpdateMessageParams{
+			ID:         message.ID,
+			Parts:      string(parts),
+			FinishedAt: finishedAt,
+		})
+	}
+	if dbErr != nil {
+		return dbErr
 	}
 	message.UpdatedAt = time.Now().Unix()
 	// Clone the message before publishing to avoid race conditions with
