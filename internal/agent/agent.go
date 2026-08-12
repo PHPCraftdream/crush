@@ -1270,8 +1270,20 @@ func (a *sessionAgent) restartOrphanedWithRetry(calls []SessionAgentCall) error 
 //
 // Unlike coordinator.startDetachedRun (which durably enqueues), this function
 // actually runs the call in-process with a bounded timeout and lifecycle join
-// via runWg. This ensures the call executes even when durable enqueue fails,
-// preventing data loss for orphaned work.
+// via runWg.
+//
+// HONEST LIMITS: this is a best-effort last resort, not a durability
+// guarantee. We only reach here because durable enqueue (session_run_queue)
+// already failed — typically a DB-availability problem — so a.Run() below
+// may hit the same failure for its own writes, and there is no durable
+// record of this call anywhere while it runs. If the process crashes or is
+// killed during the bounded window, the call is lost with no trace beyond
+// the ERROR log line. What this DOES fix versus the old runnerless
+// mailbox.queue() fallback: a transient/partial DB issue (lock contention,
+// a momentary blip) that fails one write can still let a.Run() succeed a
+// moment later, and — unlike an idle mailbox nothing ever drains — every
+// outcome (success or failure) is now attempted and visible at ERROR level
+// instead of silently sitting unreachable until some unrelated future Run().
 //
 // The runner is bounded by a 30-second timeout (matching coordinator's enqueue
 // timeout) and joins runWg so shutdown waits for it. Errors are logged at
