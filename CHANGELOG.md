@@ -1504,3 +1504,107 @@ finished the mailbox migration:
     original fix didn't touch — the manual-compaction success path
     that hands off to the next queued summarize request. Closed with
     the same atomic-pop pattern as the original fix.
+
+- **Ten findings from a 2026-08-12 post-fix release-readiness review,
+  closed and independently verified** (3 release blockers, 4
+  high-priority, 1 security, 1 medium-priority, plus one
+  cross-branch coordination gap found during the merge itself — see
+  `docs/reviews/2026-08-12-post-fix-release-readiness-review.md`).
+  Genuinely-independent work was parallelized across git worktrees
+  (one branch per finding) and merged back after each was individually
+  verified; every fix went through the same zero-trust process as the
+  prior round — diff read line by line, every new test checked for
+  whether it would actually fail without the fix, every
+  concurrency/correctness-critical fix personally revert-checked. Real,
+  non-trivial defects were found and closed in the majority of the
+  delegated diffs, listed inline below.
+  - **A durable-queue call's idempotency key (`LogicalCallID`) was
+    dropped across the JSON round-trip through the run-queue's
+    serialized call data**, so a retried call landed with a fresh,
+    non-idempotent key and could execute twice. `LogicalCallID` is now
+    carried through both directions of the conversion
+    (`ToSessionAgentCallData`/`FromSessionAgentCallData`) and
+    `RebuildSessionAgentCall`.
+  - **Cross-process interrupt handoff deleted the pending-inject row
+    before the durable enqueue that was supposed to replace it was
+    guaranteed to succeed** — any fallible step in between (message
+    read, model/call build, marshal, enqueue) lost the event
+    permanently once the row was gone, since the next tick had nothing
+    left to retry. `ConsumeInterruptInjectAndEnqueue` now deletes and
+    durably enqueues in one SQL transaction; failures before that point
+    simply leave the still-undeleted row for the next tick to retry
+    naturally. Verification found the delegated diff's own atomic
+    query re-selected "the oldest pending row" instead of matching the
+    specific row a caller had peeked and built its call data from — a
+    session with more than one queued interrupt could silently consume
+    and lose the wrong one if a concurrent path deleted the peeked row
+    in between. Fixed to match on the exact peeked row ID, returning a
+    safe no-op instead of a wrong-row substitution when it has vanished.
+  - **The checkpoint writer's cancellation was dead code** — the
+    per-cycle write context's cancel function was only ever invoked via
+    `defer` inside its own goroutine (a no-op against a hang, since the
+    goroutine that would call it is the one that's stuck), so
+    `stopCheckpoint` had no real way to interrupt a blocked write and
+    fell through to a 5-second grace wait every time regardless of
+    whether the write was actually still live. The cancel function is
+    now stored on the enclosing scope and called directly from
+    `stopCheckpoint`, immediately unblocking a genuinely stuck write.
+  - **Orphan recovery still had a runnerless fallback** — when durable
+    enqueue failed for a call recovered during ownership handoff, the
+    old fallback queued it into a (potentially idle) in-memory mailbox
+    that only a future, unrelated `Run()` would ever drain; if the
+    session was truly idle, the call was lost with no further trace.
+    Replaced with a bounded, lifecycle-joined detached run
+    (`startBoundedDetachedRun`, 30s timeout, tracked in the same
+    `runWg` `CancelAll` already joins) that actually attempts the call
+    in-process instead of merely queuing it, with all failures logged
+    at ERROR level. Documented as a best-effort improvement, not a
+    durability guarantee — a process crash during the bounded window
+    still loses the call, since durable enqueue (the actual durable
+    path) already failed to get there in the first place.
+  - **`RunQueuePump.executeEntry`'s lease-renewal loop only reacted to
+    an explicit "lease reassigned" response**, not to renewal calls
+    that simply stopped succeeding (a DB outage or network partition) —
+    execution could keep running real, non-idempotent work indefinitely
+    after another process had already taken over the same lease. Added
+    a fail-closed timeout: if no renewal has succeeded within a full
+    lease TTL, execution now cancels itself the same way an explicit
+    lease-loss response does. Documented the durable queue's
+    at-least-once (not exactly-once) semantics for persistent side
+    effects and the residual overlap window this timeout bounds but
+    does not eliminate.
+  - **The session-model cache had no invalidation path** — introduced
+    as a regression by an earlier round's per-session model-isolation
+    fix, a config change or credential refresh (401 retry) left
+    `resolveSessionModels`'s cache silently serving a stale
+    model/provider pairing. Cache keys now fold in a monotonic config
+    generation counter, and both `UpdateModels` and the 401-retry path
+    explicitly clear the cache.
+  - **Two cross-process interrupt call sites (`requeueInterruptMessage`,
+    `InterruptAndSend` without explicit overrides) still fell back to
+    the shared/global model instead of a session's own persisted
+    override** when handed a nil model snapshot — the exact isolation
+    gap an earlier round's fix was supposed to have closed everywhere.
+    `buildCall`/`runInternal` now reject a nil model snapshot outright
+    instead of silently substituting shared state, and both call sites
+    resolve session models first. Merging this fix's branch against
+    this round's separately-landed atomic interrupt-handoff rewrite
+    (above) surfaced a third call site with the identical bug,
+    introduced by that same rewrite after this fix's scope had already
+    been fixed — closed the same way before the merge landed.
+  - **The CLI provider logged the full prompt text and raw argv at INFO
+    level** by default, including any secrets embedded in a prompt.
+    Both are now redacted unless
+    `CRUSH_CLIPROVIDER_LOG_RAW_PROMPT=1` is explicitly set for
+    diagnostics.
+  - **The lock-metadata generation guard's residual gap** (a narrow
+    window where async cleanup can still race a brand-new owner despite
+    the generation check) is now documented as an explicit accepted
+    risk — citing the prior reverted architectural attempt and
+    `sessions kill`'s own re-probing safety net — rather than left as
+    an ambiguous "known gap" comment.
+  - **`RunQueuePump.Stop()`'s wait on the main polling loop was
+    unbounded** — only the worker-drain half of `Stop()` had a
+    deadline; a stuck main loop could hang shutdown indefinitely.
+    `Stop()` now bounds both halves to a single shared 5-second budget
+    (not 5+5=10s) via one timeout context and a three-way select.
