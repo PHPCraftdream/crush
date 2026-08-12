@@ -58,6 +58,19 @@ const RunQueueMaxAttempts = 10
 // even if the pool is not full.
 const RunQueueMaxConcurrentExecutions = 10
 
+// LeaseWatchdogSafetyMargin: the safety margin before lease expiry at which
+// the watchdog cancels execution. This margin accounts for:
+//   - Scheduling delays between watchdog timer firing and execCtx cancellation
+//   - Time for cancellation to propagate through Coordinator.Run to actual LLM/tool calls
+//   - Time for provider/tool code to respect cancellation (in-flight requests may complete)
+// Production: 5 seconds means we cancel at least 5s before the lease actually expires.
+// A separate pump instance therefore cannot legitimately take ownership until at least
+// 5s after this executor has stopped, providing a strong bound against double-execution.
+// The comment about "bounded to one TTL residual window" (P1-2 original fix) was too
+// optimistic: with a fixed 30s DB timeout per renewal, an executor could continue up to
+// 40s (TTL + full timeout) after the lease expired. The watchdog closes this gap.
+const LeaseWatchdogSafetyMargin = 5 * time.Second
+
 // Coordinator interface is a minimal subset for executing queued calls.
 // We use this instead of importing the full agent.Coordinator to avoid
 // import cycles (session → agent → session). The real app's AgentCoordinator
@@ -153,6 +166,12 @@ type RunQueuePumpConfig struct {
 	// this seam, exercising that bug needs a real Coordinator.Run call that
 	// blocks for 30+ real seconds.
 	TestDBWriteTimeout time.Duration
+
+	// TestLeaseWatchdogSafetyMargin is a test seam for overriding
+	// LeaseWatchdogSafetyMargin. 0 = use the production 5s. Allows tests
+	// to verify the watchdog fires at the right time even with very short
+	// TTLs (where a fixed 5s margin would be longer than the TTL itself).
+	TestLeaseWatchdogSafetyMargin time.Duration
 }
 
 // leaseTTL returns the effective lease TTL for this pump instance —
@@ -181,6 +200,26 @@ func (p *RunQueuePump) dbWriteTimeout() time.Duration {
 		return p.cfg.TestDBWriteTimeout
 	}
 	return 30 * time.Second
+}
+
+// leaseWatchdogSafetyMargin returns the effective safety margin for the
+// lease watchdog — cfg.TestLeaseWatchdogSafetyMargin if set, otherwise
+// the production LeaseWatchdogSafetyMargin (5s).
+//
+// The effective margin is clamped to at most TTL/2 to prevent the watchdog
+// from firing immediately in test configs where the margin would be larger
+// than the TTL itself.
+func (p *RunQueuePump) leaseWatchdogSafetyMargin() time.Duration {
+	margin := LeaseWatchdogSafetyMargin
+	if p.cfg.TestLeaseWatchdogSafetyMargin > 0 {
+		margin = p.cfg.TestLeaseWatchdogSafetyMargin
+	}
+	// Clamp margin to at most TTL/2 to prevent immediate firing
+	ttl := p.leaseTTL()
+	if margin > ttl/2 {
+		margin = ttl / 2
+	}
+	return margin
 }
 
 // RunQueuePump is a background pump for the durable run queue.
@@ -780,27 +819,92 @@ func (p *RunQueuePump) executeEntry(ctx context.Context, leased *RunQueueEntry) 
 	// stall between renewal ticks) — see the doc below on what happens if
 	// renewal itself ever loses the race.
 	//
+	// P1-1 watchdog fix: The original fail-closed timeout (tracking
+	// lastSuccessfulRenewal and checking time.Since(lastSuccessfulRenewal) >= TTL)
+	// had a critical flaw: if a RenewRunQueueLease call started at ~10s and
+	// hung until its own 30s timeout, the executor would continue running until
+	// ~40s even though the lease expired at ~30s. During those extra ~10s, another
+	// pump instance could legitimately take ownership and start a duplicate execution.
+	//
+	// The fix: introduce an INDEPENDENT watchdog timer (separate from the renewal
+	// loop) that cancels execCtx BEFORE lease expiry with a safety margin (production:
+	// 5s). The watchdog fires at TTL - safety_margin from the last successful renewal,
+	// regardless of whether the next renewal call is stuck or not. This provides a
+	// strong bound against double-execution even when the DB layer hangs.
+	//
+	// The watchdog is the sole lease-expiry enforcement mechanism. The old
+	// fail-closed timeout (timeSinceLastSuccess >= TTL) has been removed because
+	// the watchdog ALWAYS fires first at TTL - safety_margin (where safety_margin > 0
+	// in production and test configs). The watchdog provides a stricter guarantee
+	// (TTL - margin vs TTL), eliminating the double-execution window the old code
+	// could not catch when DB writes stalled.
+	//
+	// Additionally, each RenewRunQueueLease call now gets a timeout equal to the
+	// remaining safe lease budget (time until watchdog would fire), not a fixed 30s.
+	// This ensures a stalled renewal cannot outlive the safe window.
+	//
 	// SEMANTICS: The durable queue provides AT-LEAST-ONCE guarantees for
 	// persistent side effects (LLM calls, tool execution, message writes),
-	// not exactly-once. This fail-closed timeout mechanism (tracking
-	// lastSuccessfulRenewal and canceling execCtx if TTL elapses since the
-	// last successful renewal) MINIMIZES but does NOT GUARANTEE elimination
-	// of all duplicate-execution windows. The residual overlap window is:
-	//   - From "RenewRunQueueLease stops responding (err != nil)" until
-	//     "fail-closed timeout fires and execCancel() propagates to
-	//      Coordinator.Run", during which execution is still actively
-	//      performing real work while the lease has effectively expired.
-	//   - Even after execCancel() fires, the provider/tool may not stop
-	//     immediately (e.g., in-flight HTTP requests may complete).
+	// not exactly-once. The watchdog MINIMIZES but does NOT GUARANTEE
+	// elimination of all duplicate-execution windows. The residual overlap window is:
+	//   - From "watchdog fires and execCancel() propagates to Coordinator.Run"
+	//     until "provider/tool actually stops respecting cancellation"
+	//     (in-flight HTTP requests may complete).
 	//   - A full fencing token (checked before each persistent write) is
 	//     required for strict exactly-once semantics, which is an
-	//     architectural change beyond this fail-closed fix.
+	//     architectural change beyond this watchdog fix.
 	//
-	// Residual windows are bounded to a single TTL (production: 30s) and
-	// require a DB outage of that full duration, which is rare in production
-	// compared to the clear, explicit !ok lease-loss case already handled.
+	// Residual windows are bounded to the safety margin (production: 5s) plus
+	// provider/tool cancellation latency, not the full TTL.
 	renewCtx, stopRenewing := context.WithCancel(context.Background())
 	renewalsDone := make(chan struct{})
+
+	// P1-1 watchdog: an independent goroutine that cancels execCtx BEFORE
+	// lease expiry if renewal stalls.
+	//
+	// Design: Use atomic storage for last successful renewal time + ticker.
+	// This avoids timer.Reset() complexity and channel race conditions.
+	// The watchdog wakes every 10ms to check if we're past the safe deadline.
+	var lastSuccessfulRenewalAtomic atomic.Int64 // Unix nanoseconds
+	lastSuccessfulRenewalAtomic.Store(time.Now().UnixNano())
+
+	watchdogDone := make(chan struct{})
+	go func() {
+		defer close(watchdogDone)
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-renewCtx.Done():
+				// Renewal loop stopped
+				return
+			case <-ticker.C:
+				// Check if watchdog should fire
+				lastRenewalTime := time.Unix(0, lastSuccessfulRenewalAtomic.Load())
+				timeSinceRenewal := time.Since(lastRenewalTime)
+				safeBudget := p.leaseTTL() - p.leaseWatchdogSafetyMargin()
+				if safeBudget <= 0 {
+					safeBudget = time.Millisecond
+				}
+
+				if timeSinceRenewal >= safeBudget {
+					// Watchdog deadline passed: cancel execution
+					leaseLost.Store(true)
+					execCancel()
+					slog.Error("run_queue_pump: lease watchdog fired: canceling execution before expiry",
+						"id", leased.ID,
+						"session_id", leased.SessionID,
+						"ttl", p.leaseTTL(),
+						"safety_margin", p.leaseWatchdogSafetyMargin(),
+						"time_since_renewal", timeSinceRenewal,
+						"instance_id", p.cfg.PumpInstanceID)
+					return
+				}
+			}
+		}
+	}()
+
 	go func() {
 		defer close(renewalsDone)
 		// time.NewTicker panics on a non-positive interval — clamp so a
@@ -820,34 +924,31 @@ func (p *RunQueuePump) executeEntry(ctx context.Context, leased *RunQueueEntry) 
 		// This gives us a full TTL window from the start before we consider
 		// ourselves in "renewal failure" territory.
 		lastSuccessfulRenewal := time.Now()
+		lastSuccessfulRenewalAtomic.Store(lastSuccessfulRenewal.UnixNano())
 
 		for {
 			select {
 			case <-renewCtx.Done():
 				return
 			case <-ticker.C:
-				// P1-2 fail-closed timeout: if we haven't successfully renewed
-				// within the TTL window, assume lease is lost (even though we
-				// never got an explicit !ok response) and cancel execution.
-				// This prevents the case where repeated renewal errors (DB outage,
-				// network partition, etc.) cause the executor to continue running
-				// while the lease has already expired and another process has
-				// taken ownership.
 				timeSinceLastSuccess := time.Since(lastSuccessfulRenewal)
-				if timeSinceLastSuccess >= p.leaseTTL() {
-					leaseLost.Store(true)
-					execCancel()
-					slog.Error("run_queue_pump: fail-closed timeout: no successful lease renewal within TTL, canceling execution",
-						"id", leased.ID,
-						"session_id", leased.SessionID,
-						"ttl", p.leaseTTL(),
-						"time_since_last_success", timeSinceLastSuccess,
-						"instance_id", p.cfg.PumpInstanceID)
-					return
+
+				// P1-1: set DB timeout based on remaining safe lease budget.
+				// The watchdog will fire at TTL - safety_margin from the last
+				// successful renewal. If this renewal takes longer than that
+				// remaining budget, the watchdog will cancel execCtx while we're
+				// still stuck in RenewRunQueueLease. We ensure the DB call itself
+				// times out BEFORE the watchdog would fire, so we get a clean error
+				// path rather than a watchdog-triggered cancellation.
+				timeUntilWatchdog := p.leaseTTL() - p.leaseWatchdogSafetyMargin() - timeSinceLastSuccess
+				if timeUntilWatchdog <= 0 {
+					// We're already past the safe budget: watchdog is imminent.
+					// Don't even attempt renewal — let the watchdog fire.
+					continue
 				}
 
 				newExpiresAt := time.Now().Add(p.leaseTTL()).Unix()
-				renewDBCtx, renewDBCancel := newDBCtx()
+				renewDBCtx, renewDBCancel := context.WithTimeout(context.Background(), timeUntilWatchdog)
 				ok, err := p.cfg.Sessions.RenewRunQueueLease(renewDBCtx, leased.ID, p.cfg.PumpInstanceID, newExpiresAt)
 				renewDBCancel()
 				if err != nil {
@@ -858,6 +959,10 @@ func (p *RunQueuePump) executeEntry(ctx context.Context, leased *RunQueueEntry) 
 				// (including ok=false — the renewal call itself succeeded, we just
 				// lost ownership).
 				lastSuccessfulRenewal = time.Now()
+
+				// P1-1: update watchdog's last successful renewal time
+				lastSuccessfulRenewalAtomic.Store(lastSuccessfulRenewal.UnixNano())
+
 				if !ok {
 					// The lease was already reassigned to a different
 					// owner — this execution has lost the race and can no
@@ -897,8 +1002,11 @@ func (p *RunQueuePump) executeEntry(ctx context.Context, leased *RunQueueEntry) 
 	// goroutine could then fire and find `status != leased`, logging a
 	// spurious "lost lease ownership" — misleading, since nothing else
 	// actually took it; this execution's own Nack did.
+	//
+	// P1-1: also stop the watchdog goroutine.
 	stopRenewing()
 	<-renewalsDone
+	<-watchdogDone
 
 	// P1-2: If lease ownership was lost during the renewal loop, skip all
 	// outcome writes. The row no longer belongs to this executor (the new
