@@ -30,7 +30,7 @@ INSERT INTO pending_injects (
 -- name: ListPendingInjectsBySession :many
 SELECT * FROM pending_injects
 WHERE session_id = ?
-ORDER BY created_at ASC;
+ORDER BY created_at ASC, rowid ASC;
 
 -- name: DeletePendingInject :exec
 DELETE FROM pending_injects
