@@ -763,6 +763,7 @@ func (p *RunQueuePump) executeEntry(ctx context.Context, leased *RunQueueEntry) 
 	// ever timing out, and a single short-lived one reused across ticks
 	// would (as found in the closing review of this round) expire well
 	// before the loop's own natural lifetime ends.
+	//
 	// Found by the fourth @oh review pass over #337-349: RunQueueLeaseTTL
 	// (30s) is far shorter than a real LLM turn, and without renewal
 	// CleanupExpiredLeases would return this entry to pending — status
@@ -778,6 +779,26 @@ func (p *RunQueuePump) executeEntry(ctx context.Context, leased *RunQueueEntry) 
 	// a long turn under all but pathological scheduling delays (a >20s
 	// stall between renewal ticks) — see the doc below on what happens if
 	// renewal itself ever loses the race.
+	//
+	// SEMANTICS: The durable queue provides AT-LEAST-ONCE guarantees for
+	// persistent side effects (LLM calls, tool execution, message writes),
+	// not exactly-once. This fail-closed timeout mechanism (tracking
+	// lastSuccessfulRenewal and canceling execCtx if TTL elapses since the
+	// last successful renewal) MINIMIZES but does NOT GUARANTEE elimination
+	// of all duplicate-execution windows. The residual overlap window is:
+	//   - From "RenewRunQueueLease stops responding (err != nil)" until
+	//     "fail-closed timeout fires and execCancel() propagates to
+	//      Coordinator.Run", during which execution is still actively
+	//      performing real work while the lease has effectively expired.
+	//   - Even after execCancel() fires, the provider/tool may not stop
+	//     immediately (e.g., in-flight HTTP requests may complete).
+	//   - A full fencing token (checked before each persistent write) is
+	//     required for strict exactly-once semantics, which is an
+	//     architectural change beyond this fail-closed fix.
+	//
+	// Residual windows are bounded to a single TTL (production: 30s) and
+	// require a DB outage of that full duration, which is rare in production
+	// compared to the clear, explicit !ok lease-loss case already handled.
 	renewCtx, stopRenewing := context.WithCancel(context.Background())
 	renewalsDone := make(chan struct{})
 	go func() {
@@ -792,11 +813,39 @@ func (p *RunQueuePump) executeEntry(ctx context.Context, leased *RunQueueEntry) 
 		}
 		ticker := time.NewTicker(renewInterval)
 		defer ticker.Stop()
+
+		// Track the last successful renewal time for fail-closed timeout.
+		// Initialize to the time execution starts — the lease was just taken
+		// successfully by processEntry before launching this goroutine.
+		// This gives us a full TTL window from the start before we consider
+		// ourselves in "renewal failure" territory.
+		lastSuccessfulRenewal := time.Now()
+
 		for {
 			select {
 			case <-renewCtx.Done():
 				return
 			case <-ticker.C:
+				// P1-2 fail-closed timeout: if we haven't successfully renewed
+				// within the TTL window, assume lease is lost (even though we
+				// never got an explicit !ok response) and cancel execution.
+				// This prevents the case where repeated renewal errors (DB outage,
+				// network partition, etc.) cause the executor to continue running
+				// while the lease has already expired and another process has
+				// taken ownership.
+				timeSinceLastSuccess := time.Since(lastSuccessfulRenewal)
+				if timeSinceLastSuccess >= p.leaseTTL() {
+					leaseLost.Store(true)
+					execCancel()
+					slog.Error("run_queue_pump: fail-closed timeout: no successful lease renewal within TTL, canceling execution",
+						"id", leased.ID,
+						"session_id", leased.SessionID,
+						"ttl", p.leaseTTL(),
+						"time_since_last_success", timeSinceLastSuccess,
+						"instance_id", p.cfg.PumpInstanceID)
+					return
+				}
+
 				newExpiresAt := time.Now().Add(p.leaseTTL()).Unix()
 				renewDBCtx, renewDBCancel := newDBCtx()
 				ok, err := p.cfg.Sessions.RenewRunQueueLease(renewDBCtx, leased.ID, p.cfg.PumpInstanceID, newExpiresAt)
@@ -805,6 +854,10 @@ func (p *RunQueuePump) executeEntry(ctx context.Context, leased *RunQueueEntry) 
 					slog.Warn("run_queue_pump: lease renewal failed, will retry next interval", "id", leased.ID, "session_id", leased.SessionID, "err", err, "instance_id", p.cfg.PumpInstanceID)
 					continue
 				}
+				// Update lastSuccessfulRenewal on every successful renewal
+				// (including ok=false — the renewal call itself succeeded, we just
+				// lost ownership).
+				lastSuccessfulRenewal = time.Now()
 				if !ok {
 					// The lease was already reassigned to a different
 					// owner — this execution has lost the race and can no
