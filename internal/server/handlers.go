@@ -373,7 +373,12 @@ func handleInterruptAndSend(ctx context.Context, a *appPkg.App, c *Client, msg W
 		}
 	}
 
-	agentCtx := context.WithoutCancel(ctx)
+	// Use bounded context for idle-interrupt: WithoutCancel + timeout to ensure
+	// the operation can complete even if the WebSocket connection closes, but with
+	// a reasonable upper bound to prevent indefinite hangs (e.g., blocked SQLite write).
+	agentCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+
 	if err := a.AgentCoordinator.InterruptAndSend(agentCtx, p.SessionID, p.Content, largeOverride, smallOverride, attachments...); err != nil {
 		slog.Error("ws: interrupt-and-send failed", "err", err)
 		c.reply(msg.ID, EventError, nil, err.Error())

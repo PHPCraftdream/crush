@@ -232,6 +232,27 @@ type Service interface {
 	//
 	// Returns (nil, nil) when no interrupt row is pending.
 	ConsumeInterruptInject(ctx context.Context, sessionID string) (*PendingInject, error)
+	// PeekInterruptInject reads the OLDEST interrupt=true pending_injects row
+	// for sessionID WITHOUT deleting it. Used by handleInterruptTick to read
+	// the message reference before building call data, so it can call
+	// ConsumeInterruptInjectAndEnqueue atomically.
+	//
+	// Returns (nil, nil) when no interrupt row is pending.
+	PeekInterruptInject(ctx context.Context, sessionID string) (*PendingInject, error)
+	// ConsumeInterruptInjectAndEnqueue atomically consumes the pending inject
+	// row identified by injectID (as read via PeekInterruptInject) and
+	// enqueues it to the run queue in a single transaction. This eliminates
+	// the data loss window that existed when ConsumeInterruptInject deleted
+	// the row first, then a fallible enqueue could fail. Matching on the
+	// specific injectID (not "the oldest row") avoids silently consuming a
+	// different row than the one callData was built from when a session has
+	// more than one pending interrupt row.
+	//
+	// Returns (nil, nil) when injectID no longer refers to a pending row.
+	// Returns (pi, nil) when the row was successfully consumed and enqueued.
+	// Returns error on failure — the transaction is rolled back, so the row
+	// remains for retry.
+	ConsumeInterruptInjectAndEnqueue(ctx context.Context, sessionID, injectID, idempotencyKey string, callData []byte) (*PendingInject, error)
 	// DeleteInterruptInject removes a specific pending inject row by ID.
 	// Used by detached interrupt runs to delete the durable pending row AFTER
 	// they have confirmed execution (acquired OS lock). P0-2 fix.
@@ -1184,6 +1205,35 @@ func (s *service) ConsumeInterruptInject(ctx context.Context, sessionID string) 
 	return &pi, nil
 }
 
+// PeekInterruptInject reads the OLDEST interrupt=true pending_injects row
+// for sessionID WITHOUT deleting it. Used by handleInterruptTick to read
+// the message reference before building call data, so it can call
+// ConsumeInterruptInjectAndEnqueue atomically.
+//
+// Returns (nil, nil) when no interrupt row is pending.
+func (s *service) PeekInterruptInject(ctx context.Context, sessionID string) (*PendingInject, error) {
+	var (
+		pi        PendingInject
+		interrupt int64
+	)
+	row := s.db.QueryRowContext(ctx,
+		`SELECT id, session_id, message_id, content, interrupt, created_at
+		 FROM pending_injects
+		 WHERE session_id = ? AND interrupt = 1
+		 ORDER BY created_at ASC LIMIT 1`,
+		sessionID,
+	)
+	scanErr := row.Scan(&pi.ID, &pi.SessionID, &pi.MessageID, &pi.Content, &interrupt, &pi.CreatedAt)
+	if scanErr != nil {
+		if errors.Is(scanErr, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, scanErr
+	}
+	pi.Interrupt = interrupt != 0
+	return &pi, nil
+}
+
 // DeleteInterruptInject removes a specific pending inject row by ID.
 // Used by detached interrupt runs to delete the durable pending row AFTER
 // they have confirmed execution (acquired OS lock). P0-2 fix.
@@ -1201,6 +1251,84 @@ func (s *service) DeleteInterruptInject(ctx context.Context, injectID string) er
 		return err
 	}
 	return nil
+}
+
+// ConsumeInterruptInjectAndEnqueue atomically consumes the pending inject row
+// identified by injectID and enqueues it to the run queue in a single
+// transaction. This eliminates the data loss window that existed when
+// ConsumeInterruptInject deleted the row first, then a fallible enqueue
+// could fail.
+//
+// injectID must be the ID of a row the caller already read (e.g. via
+// PeekInterruptInject) and built callData from. Matching on that specific ID
+// — rather than re-selecting "the oldest pending row" — matters because a
+// session can have more than one interrupt=1 row queued: if some other
+// path (a concurrent tick, a foreign process) deletes the peeked row between
+// Peek and this call, re-selecting "oldest" would silently consume a
+// DIFFERENT row than the one callData was built from, losing that row's
+// content while the peeked row's own deletion goes unnoticed.
+//
+// Returns (nil, nil) when injectID no longer refers to a pending row (it
+// vanished between peek and consume — e.g. already handled by another
+// process); the caller should treat this as a no-op, not an error.
+// Returns (pi, nil) when the row was successfully consumed and enqueued.
+// Returns error on failure — the transaction is rolled back, so the row
+// remains for retry.
+func (s *service) ConsumeInterruptInjectAndEnqueue(ctx context.Context, sessionID, injectID, idempotencyKey string, callData []byte) (*PendingInject, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	var (
+		pi        PendingInject
+		interrupt int64
+	)
+	row := tx.QueryRowContext(ctx,
+		`SELECT id, session_id, message_id, content, interrupt, created_at
+		 FROM pending_injects
+		 WHERE id = ? AND session_id = ? AND interrupt = 1`,
+		injectID, sessionID,
+	)
+	if scanErr := row.Scan(&pi.ID, &pi.SessionID, &pi.MessageID, &pi.Content, &interrupt, &pi.CreatedAt); scanErr != nil {
+		if errors.Is(scanErr, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, scanErr
+	}
+	pi.Interrupt = interrupt != 0
+
+	// Delete the pending inject row first
+	if _, delErr := tx.ExecContext(ctx, `DELETE FROM pending_injects WHERE id = ?`, pi.ID); delErr != nil {
+		return nil, delErr
+	}
+
+	// Then enqueue to run queue in the same transaction
+	now := time.Now().Unix()
+	if idempotencyKey == "" {
+		idempotencyKey = uuid.NewString()
+	}
+	qtx := s.q.WithTx(tx)
+	_, enqueueErr := qtx.EnqueueRunQueueEntry(ctx, db.EnqueueRunQueueEntryParams{
+		ID:        idempotencyKey,
+		SessionID: sessionID,
+		CallData:  string(callData),
+		CreatedAt: now,
+		UpdatedAt: now,
+	})
+	if errors.Is(enqueueErr, sql.ErrNoRows) {
+		// Idempotency hit: entry already exists with this key, treat as success
+		enqueueErr = nil
+	}
+	if enqueueErr != nil {
+		return nil, enqueueErr
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return &pi, nil
 }
 
 func marshalTodos(todos []Todo) (string, error) {

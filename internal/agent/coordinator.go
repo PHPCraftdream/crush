@@ -2310,22 +2310,81 @@ func (c *coordinator) startInterruptTicker(ctx context.Context, sessionID string
 // message.Service, without a live provider. It is a no-op returning
 // (false, nil) when no interrupt row is pending.
 //
-// P0-2 fix: uses ConsumeInterruptInject (delete-after-read) for immediate
-// deletion to prevent duplicate processing, then recreates the row in
-// startDetachedRun if the detached run fails even after retries. This
-// ensures that once a row is consumed by one tick, it's not visible to
-// subsequent ticks, while still preventing data loss if the detached
-// run fails.
+// P0-2 fix (atomic): uses ConsumeInterruptInjectAndEnqueue to delete and
+// enqueue in a single transaction, eliminating the data loss window where
+// ConsumeInterruptInject deleted the row but the subsequent enqueue could fail.
+// This approach requires building the call data BEFORE the atomic transaction.
+// Every fallible step (messages.Get, buildCall, marshal) runs BEFORE the
+// atomic consume — PeekInterruptInject does not delete, so a failure there
+// simply leaves the row in place for the next tick to retry naturally; no
+// explicit recreation is needed. Once ConsumeInterruptInjectAndEnqueue
+// commits, the call is durably enqueued and nothing after that point
+// (Notify, InterruptAndReplace) can lose it.
 func (c *coordinator) handleInterruptTick(ctx context.Context, sessionID string) (bool, error) {
-	pi, err := c.sessions.ConsumeInterruptInject(ctx, sessionID)
+	// First, peek at the row to get the message reference (SELECT only, no delete)
+	pi, err := c.sessions.PeekInterruptInject(ctx, sessionID)
 	if err != nil {
 		return false, err
 	}
 	if pi == nil {
 		return false, nil
 	}
-	if err := c.requeueInterruptMessage(ctx, sessionID, pi.MessageID, pi.ID); err != nil {
-		return false, err
+
+	// Load the message to build call data
+	injMsg, getErr := c.messages.Get(ctx, pi.MessageID)
+	if getErr != nil {
+		return false, fmt.Errorf("interrupt inject references missing message %q: %w", pi.MessageID, getErr)
+	}
+
+	// Build the call
+	call, buildErr := c.buildCall(ctx, sessionID, injMsg.FullText(), nil, nil)
+	if buildErr != nil {
+		return false, buildErr
+	}
+
+	// Reference the existing row; the agent must not re-create it.
+	call.ExistingMessageID = pi.MessageID
+	call.InjectID = pi.ID
+
+	// Generate idempotency key
+	var idempotencyKey string
+	if call.LogicalCallID != "" {
+		idempotencyKey = fmt.Sprintf("%s-%s", call.SessionID, call.LogicalCallID)
+	} else {
+		idempotencyKey = fmt.Sprintf("%s-%s", call.SessionID, call.InjectID)
+	}
+
+	// Convert to SessionAgentCallData for serialization
+	callData := ToSessionAgentCallData(call)
+	callDataJSON, marshalErr := json.Marshal(callData)
+	if marshalErr != nil {
+		return false, fmt.Errorf("failed to serialize call data for interrupt inject: %w", marshalErr)
+	}
+
+	// Now atomically consume (delete) and enqueue in one transaction, matching
+	// the exact row peeked above so a concurrent deletion of that row (rather
+	// than a stale re-select of "the oldest row") can never cause us to
+	// consume a different row than the one callData was built from.
+	enqueuedPi, enqueueErr := c.sessions.ConsumeInterruptInjectAndEnqueue(ctx, sessionID, pi.ID, idempotencyKey, callDataJSON)
+	if enqueueErr != nil {
+		// Transaction rolled back, so row still exists for retry
+		return false, fmt.Errorf("failed to enqueue interrupt inject: %w", enqueueErr)
+	}
+	if enqueuedPi == nil {
+		// Row vanished between peek and enqueue — handled gracefully
+		return false, nil
+	}
+
+	// Notify the message so web UI renders it live
+	c.messages.Notify(injMsg)
+
+	// InterruptAndReplace atomically records call and cancels only the
+	// in-flight generation (design §4). Since we've already enqueued durably,
+	// we just need to cancel the in-flight generation if there is one.
+	if !c.currentAgent.InterruptAndReplace(sessionID, call) {
+		// No owner — session is idle, the durable enqueue already handles it
+		slog.Debug("coordinator: interrupt tick enqueued durable call for idle session",
+			"session_id", sessionID, "idempotency_key", idempotencyKey)
 	}
 	return true, nil
 }
@@ -2481,7 +2540,10 @@ func (c *coordinator) startDetachedRun(ctx context.Context, call SessionAgentCal
 			"session_id", call.SessionID, "err", err)
 		// For interrupt inject path, recreate the row to prevent data loss
 		if call.InjectID != "" && call.ExistingMessageID != "" {
-			c.recreatePendingInjectRow(ctx, call)
+			if recreateErr := c.recreatePendingInjectRow(ctx, call); recreateErr != nil {
+				slog.Error("coordinator: also failed to recreate pending_injects row during marshal recovery",
+					"inject_id", call.InjectID, "recreate_err", recreateErr, "marshal_err", err)
+			}
 		}
 		return fmt.Errorf("failed to serialize call data for durable enqueue: %w", err)
 	}
@@ -2493,7 +2555,10 @@ func (c *coordinator) startDetachedRun(ctx context.Context, call SessionAgentCal
 			"session_id", call.SessionID, "err", enqueueErr)
 		// For interrupt inject path, recreate the row so a future tick can retry
 		if call.InjectID != "" && call.ExistingMessageID != "" {
-			c.recreatePendingInjectRow(ctx, call)
+			if recreateErr := c.recreatePendingInjectRow(ctx, call); recreateErr != nil {
+				slog.Error("coordinator: also failed to recreate pending_injects row during enqueue recovery",
+					"inject_id", call.InjectID, "recreate_err", recreateErr, "enqueue_err", enqueueErr)
+			}
 		}
 		// For non-inject interrupts, there is no fallback — the call is lost.
 		// Return error so the caller can handle it (e.g., surface to HTTP response).
@@ -2507,16 +2572,24 @@ func (c *coordinator) startDetachedRun(ctx context.Context, call SessionAgentCal
 }
 
 // recreatePendingInjectRow recreates a pending_injects row for future retry
-// (helper for startDetachedRun error path, P0-2 fix).
-func (c *coordinator) recreatePendingInjectRow(ctx context.Context, call SessionAgentCall) {
+// (helper for startDetachedRun error path, P0-2 fix). Uses a bounded context
+// (WithoutCancel + timeout) to ensure recovery writes have a chance even if
+// the calling context is being canceled.
+//
+// Returns the error from recreation (or nil on success) so the caller can surface it.
+func (c *coordinator) recreatePendingInjectRow(originalCtx context.Context, call SessionAgentCall) error {
+	// Bounded context: disconnect from caller cancellation but enforce a timeout
+	recoveryCtx, cancel := context.WithTimeout(context.WithoutCancel(originalCtx), 10*time.Second)
+	defer cancel()
+
 	slog.Debug("coordinator: attempting to recreate pending_injects row",
 		"inject_id", call.InjectID, "session_id", call.SessionID, "message_id", call.ExistingMessageID)
 	// Get the message content to recreate the row.
-	msg, getErr := c.messages.Get(ctx, call.ExistingMessageID)
+	msg, getErr := c.messages.Get(recoveryCtx, call.ExistingMessageID)
 	if getErr != nil {
 		slog.Error("coordinator: failed to recreate pending_injects row (could not get message)",
 			"inject_id", call.InjectID, "message_id", call.ExistingMessageID, "err", getErr)
-		return
+		return fmt.Errorf("could not get message for recreation: %w", getErr)
 	}
 	inject := session.PendingInject{
 		ID:        uuid.New().String(), // Generate new ID to avoid UNIQUE constraint
@@ -2525,13 +2598,50 @@ func (c *coordinator) recreatePendingInjectRow(ctx context.Context, call Session
 		Content:   msg.FullText(),
 		Interrupt: true,
 	}
-	if createErr := c.sessions.CreatePendingInject(ctx, inject); createErr != nil {
+	createErr := c.sessions.CreatePendingInject(recoveryCtx, inject)
+	if createErr != nil {
 		slog.Error("coordinator: failed to recreate pending_injects row",
 			"inject_id", call.InjectID, "err", createErr)
-	} else {
-		slog.Debug("coordinator: successfully recreated pending_injects row for future retry",
-			"new_inject_id", inject.ID, "old_inject_id", call.InjectID)
+		return fmt.Errorf("failed to recreate pending_injects row: %w", createErr)
 	}
+	slog.Info("coordinator: successfully recreated pending_injects row for future retry",
+		"new_inject_id", inject.ID, "old_inject_id", call.InjectID)
+	return nil
+}
+
+// recreatePendingInjectRowPostAccept recreates a pending_injects row on a bounded
+// context for post-accept recovery. This is called after ConsumeInterruptInject
+// has already deleted the row, but before the atomic enqueue could complete.
+// Uses a bounded context (WithoutCancel + timeout) to ensure recovery writes
+// have a chance even if the calling context is being canceled.
+//
+// Returns the error from recreation (or nil on success) so the caller can surface it.
+func (c *coordinator) recreatePendingInjectRowPostAccept(originalCtx context.Context, pi *session.PendingInject) error {
+	// Bounded context: disconnect from caller cancellation but enforce a timeout
+	recoveryCtx, cancel := context.WithTimeout(context.WithoutCancel(originalCtx), 10*time.Second)
+	defer cancel()
+
+	slog.Debug("coordinator: attempting post-accept recreation of pending_injects row",
+		"inject_id", pi.ID, "session_id", pi.SessionID, "message_id", pi.MessageID)
+
+	inject := session.PendingInject{
+		ID:        uuid.New().String(), // Generate new ID to avoid UNIQUE constraint
+		SessionID: pi.SessionID,
+		MessageID: pi.MessageID,
+		Content:   pi.Content,
+		Interrupt: true,
+	}
+
+	createErr := c.sessions.CreatePendingInject(recoveryCtx, inject)
+	if createErr != nil {
+		slog.Error("coordinator: failed to recreate pending_injects row (post-accept recovery)",
+			"inject_id", pi.ID, "new_inject_id", inject.ID, "err", createErr)
+		return fmt.Errorf("failed to recreate pending_injects row: %w", createErr)
+	}
+
+	slog.Info("coordinator: successfully recreated pending_injects row for future retry (post-accept recovery)",
+		"new_inject_id", inject.ID, "old_inject_id", pi.ID, "session_id", pi.SessionID)
+	return nil
 }
 
 // RebuildSessionAgentCall reconstructs a full SessionAgentCall from SessionAgentCallData

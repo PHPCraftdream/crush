@@ -106,6 +106,21 @@ func newTestDB(t *testing.T) (*sql.DB, *db.Queries) {
 			created_at INTEGER NOT NULL
 		);
 
+		CREATE TABLE session_run_queue (
+			id TEXT PRIMARY KEY,
+			session_id TEXT NOT NULL,
+			call_data TEXT NOT NULL,
+			status TEXT NOT NULL DEFAULT 'pending',
+			leased_by TEXT,
+			leased_at INTEGER,
+			lease_expires_at INTEGER,
+			attempts INTEGER NOT NULL DEFAULT 0,
+			last_error TEXT,
+			terminal_failure INTEGER NOT NULL DEFAULT 0,
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL
+		);
+
 		CREATE INDEX idx_files_session_id ON files(session_id);
 		CREATE INDEX idx_files_path ON files(path);
 		CREATE INDEX idx_messages_session_id ON messages(session_id);
@@ -276,6 +291,84 @@ func TestConsumeInterruptInject(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, pi2)
 		assert.Equal(t, "int-new", pi2.MessageID)
+	})
+}
+
+// TestConsumeInterruptInjectAndEnqueue_MatchesPeekedRow is a P0-2 regression
+// test: ConsumeInterruptInjectAndEnqueue must match the exact injectID the
+// caller peeked (and built callData from), not silently re-select "the
+// oldest pending row". Before this fix, if the peeked row was deleted by a
+// concurrent path between Peek and Consume, the re-select-oldest query would
+// grab a DIFFERENT row — deleting and enqueuing it under callData that was
+// actually built from the (now-gone) peeked row's content, permanently
+// losing the second row's real content.
+func TestConsumeInterruptInjectAndEnqueue_MatchesPeekedRow(t *testing.T) {
+	sqlDB, q := newTestDB(t)
+	svc := NewService(q, sqlDB)
+	ctx := t.Context()
+
+	sess, err := svc.Create(ctx, "atomic consume sess")
+	require.NoError(t, err)
+
+	t.Run("vanished peeked row is a safe no-op, does not touch a different row", func(t *testing.T) {
+		require.NoError(t, svc.CreatePendingInject(ctx, PendingInject{
+			SessionID: sess.ID, MessageID: "int-old", Interrupt: true, CreatedAt: 1000,
+		}))
+		require.NoError(t, svc.CreatePendingInject(ctx, PendingInject{
+			SessionID: sess.ID, MessageID: "int-new", Interrupt: true, CreatedAt: 2000,
+		}))
+
+		peeked, err := svc.PeekInterruptInject(ctx, sess.ID)
+		require.NoError(t, err)
+		require.NotNil(t, peeked)
+		require.Equal(t, "int-old", peeked.MessageID, "peek must return the oldest row")
+
+		// Simulate a concurrent path consuming/deleting the peeked row between
+		// Peek and Consume (e.g. another tick, a foreign process).
+		require.NoError(t, svc.DeleteInterruptInject(ctx, peeked.ID))
+
+		// Consume, matching the now-vanished peeked ID. Before the fix, this
+		// would re-select "oldest" and silently consume "int-new" instead.
+		result, err := svc.ConsumeInterruptInjectAndEnqueue(ctx, sess.ID, peeked.ID, "idem-vanished", []byte(`{"ok":true}`))
+		require.NoError(t, err)
+		assert.Nil(t, result, "vanished injectID must be a no-op, not a fallback to a different row")
+
+		// The unrelated "int-new" row must be untouched.
+		stillPending, err := svc.PeekInterruptInject(ctx, sess.ID)
+		require.NoError(t, err)
+		require.NotNil(t, stillPending)
+		assert.Equal(t, "int-new", stillPending.MessageID, "the other row must survive untouched")
+
+		// And no run queue entry should have been created for the vanished row.
+		entries, err := svc.ListPendingRunQueueEntries(ctx)
+		require.NoError(t, err)
+		assert.Empty(t, entries, "no enqueue should happen for a vanished injectID")
+	})
+
+	t.Run("matching injectID atomically deletes and enqueues", func(t *testing.T) {
+		sess2, err := svc.Create(ctx, "atomic consume sess 2")
+		require.NoError(t, err)
+
+		require.NoError(t, svc.CreatePendingInject(ctx, PendingInject{
+			SessionID: sess2.ID, MessageID: "int-real", Interrupt: true, CreatedAt: 3000,
+		}))
+		peeked, err := svc.PeekInterruptInject(ctx, sess2.ID)
+		require.NoError(t, err)
+		require.NotNil(t, peeked)
+
+		result, err := svc.ConsumeInterruptInjectAndEnqueue(ctx, sess2.ID, peeked.ID, "idem-real", []byte(`{"ok":true}`))
+		require.NoError(t, err)
+		require.NotNil(t, result)
+		assert.Equal(t, peeked.ID, result.ID)
+
+		gone, err := svc.PeekInterruptInject(ctx, sess2.ID)
+		require.NoError(t, err)
+		assert.Nil(t, gone, "row must be deleted after successful consume")
+
+		entries, err := svc.ListPendingRunQueueEntries(ctx)
+		require.NoError(t, err)
+		require.Len(t, entries, 1, "only sess2's entry, sess's own vanished-injectID case must not have enqueued")
+		assert.Equal(t, "idem-real", entries[0].ID)
 	})
 }
 
