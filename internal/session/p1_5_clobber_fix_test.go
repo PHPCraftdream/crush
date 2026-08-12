@@ -15,11 +15,30 @@ import (
 // metadata. This is the fix for P1-5 from the 2026-08-11 review.
 //
 // The test forces the clobber scenario by:
-// 1. Injecting a slow cleanup function for the first holder (blocks >50ms)
-// 2. Releasing the first holder (returns quickly due to bound, but cleanup is still blocked)
-// 3. Immediately acquiring a second holder (succeeds since OS lock is free)
-// 4. Unblocking the first cleanup goroutine
-// 5. Verifying that the second holder's PID/generation are NOT clobbered
+//  1. Injecting a cleanup function for the first holder that blocks on a
+//     channel instead of a fixed sleep (see proceedCleanup below).
+//  2. Releasing the first holder (returns quickly due to
+//     releaseMetadataCleanupBound, but cleanup is still blocked).
+//  3. Acquiring a second holder (succeeds since the OS lock is already
+//     free) and confirming its generation differs from the first.
+//  4. ONLY THEN unblocking the first cleanup goroutine, deterministically
+//     guaranteeing it observes the second owner's already-written
+//     generation sidecar no matter how slow the machine is.
+//  5. Verifying that the second holder's PID/generation are NOT clobbered.
+//
+// A fixed time.Sleep(100ms) was used here originally, on the assumption
+// that acquiring the second lock and writing its generation sidecar would
+// always finish well within that window. That assumption broke on CI
+// (ubuntu-latest, `go test -race`): the added race-detector overhead
+// occasionally pushed the second acquire's own file I/O past the 100ms
+// mark, so the stale cleanup's generation-sidecar read raced ahead of the
+// second owner's write and legitimately saw only the first owner's
+// generation still on disk — reproducing the fix's own documented,
+// accepted residual TOCTOU gap (see clearHolderMetadata's doc comment)
+// rather than exposing an actual defect in the fix. The channel gate
+// below removes that race entirely: the stale cleanup cannot even begin
+// its generation-sidecar read until the test has already confirmed the
+// second owner's generation is on disk and different from the first.
 //
 // REVERT CHECK PROCEDURE:
 //  1. Temporarily disable the generation check in clearHolderMetadata by
@@ -32,13 +51,14 @@ func TestP1_5_GenerationCheckPreventsMetadataClobber(t *testing.T) {
 	sessionID := "test-session-p1-5-clobber"
 
 	var cleanupCompleted atomic.Bool
+	proceedCleanup := make(chan struct{})
 
-	// Acquire the first lock with a slow cleanup function.
+	// Acquire the first lock with a cleanup function that blocks until the
+	// test explicitly signals it to proceed, deterministically ordering it
+	// after the second owner's acquire has fully completed.
 	lk1, err := TryAcquireSessionLockWithOptions(tmpDir, sessionID,
 		WithClearHolderMetadataFn(func(path string, expectedGeneration string) {
-			// Block longer than releaseMetadataCleanupBound (50ms) to
-			// ensure Release() returns before cleanup runs.
-			time.Sleep(100 * time.Millisecond)
+			<-proceedCleanup
 			clearHolderMetadata(path, expectedGeneration)
 			cleanupCompleted.Store(true)
 		}))
@@ -48,18 +68,19 @@ func TestP1_5_GenerationCheckPreventsMetadataClobber(t *testing.T) {
 	// Store first holder's generation for later verification.
 	firstGeneration := lk1.generation
 
-	// Release the first lock. This should return quickly (within ~50ms)
-	// even though cleanup is blocked for 100ms.
+	// Release the first lock. This should return within
+	// releaseMetadataCleanupBound (50ms) even though cleanup is blocked
+	// indefinitely on proceedCleanup.
 	releaseStart := time.Now()
 	releaseErr := lk1.Release()
 	releaseDuration := time.Since(releaseStart)
 
 	require.NoError(t, releaseErr, "first Release should succeed")
-	require.Less(t, releaseDuration, 100*time.Millisecond,
-		"first Release should return within 100ms despite slow cleanup")
+	require.Less(t, releaseDuration, 500*time.Millisecond,
+		"first Release should return promptly (bounded by releaseMetadataCleanupBound) despite blocked cleanup")
 
-	// Immediately acquire the lock again as a second owner.
-	// This should succeed because the OS lock is already free.
+	// Acquire the lock again as a second owner. This should succeed
+	// because the OS lock is already free.
 	lk2, err := TryAcquireSessionLock(tmpDir, sessionID)
 	require.NoError(t, err, "second TryAcquireSessionLock should succeed immediately")
 	require.NotNil(t, lk2)
@@ -73,6 +94,11 @@ func TestP1_5_GenerationCheckPreventsMetadataClobber(t *testing.T) {
 	// Verify the two owners have different generations (critical invariant).
 	require.NotEqual(t, firstGeneration, secondGeneration,
 		"different acquire instances must have different generations")
+
+	// Only now let the first (stale) cleanup goroutine proceed — the
+	// second owner's generation sidecar is guaranteed to already be on
+	// disk at this point, so the cleanup's read cannot race ahead of it.
+	close(proceedCleanup)
 
 	// Wait for the first cleanup goroutine to complete.
 	require.Eventually(t, func() bool {

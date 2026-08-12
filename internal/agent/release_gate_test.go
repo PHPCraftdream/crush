@@ -372,6 +372,12 @@ type p0338PumpCoordinator struct {
 
 func (p *p0338PumpCoordinator) Run(ctx context.Context, callData session.SessionAgentCallData) (*any, error) {
 	call := FromSessionAgentCallData(callData)
+	// Mirror production's coordinator.RebuildSessionAgentCall (coordinator.go):
+	// mark this call as originating from the durable queue so mailbox.submit
+	// skips mb.submitted for it (P0-1, closing-review round). Without this,
+	// this test-only conversion path diverges from production behavior in a
+	// way that became relevant only once P0-1 landed.
+	call.FromDurableQueue = true
 	result, err := p.sessionAgent.Run(ctx, call)
 	if err != nil {
 		return nil, err
