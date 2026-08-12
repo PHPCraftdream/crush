@@ -517,7 +517,7 @@ func (l *SessionLock) RecordActivity() {
 // and performing the destructive operations) — a best-effort improvement
 // for diagnosability, not an absolute guarantee.
 //
-// ACCEPTED RISK (2026-08-12, docs/reviews/2026-08-09-release-concurrency-followup-review.md):
+// ACCEPTED RISK (2026-08-12, docs/reviews/2026-08-12-post-fix-release-readiness-review.md, P2-1):
 // The residual microsecond TOCTOU gap here is explicitly accepted as a
 // diagnostic-only risk. A new owner could theoretically acquire and write
 // its generation between our read and truncate/remove, briefly exposing
@@ -534,7 +534,7 @@ func (l *SessionLock) RecordActivity() {
 // microsecond gap is the optimal trade-off: it protects the fast-retry
 // invariant while making clobber astronomically unlikely.
 func clearHolderMetadata(path string, expectedGeneration string) {
-	// ACCEPTED RISK (2026-08-12, docs/reviews/2026-08-09-release-concurrency-followup-review.md):
+	// ACCEPTED RISK (2026-08-12, docs/reviews/2026-08-12-post-fix-release-readiness-review.md, P2-1):
 	// This is a TOCTOU check; see the function's doc comment for why this
 	// microsecond window is accepted as the optimal trade-off.
 	//
