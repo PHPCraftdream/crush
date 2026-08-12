@@ -1122,7 +1122,7 @@ func (s *service) DrainPendingInjects(ctx context.Context, sessionID string) ([]
 
 	rows, err := tx.QueryContext(ctx,
 		`SELECT id, session_id, message_id, content, interrupt, created_at
-		 FROM pending_injects WHERE session_id = ? ORDER BY created_at ASC`,
+		 FROM pending_injects WHERE session_id = ? ORDER BY created_at ASC, rowid ASC`,
 		sessionID,
 	)
 	if err != nil {
@@ -1220,7 +1220,7 @@ func (s *service) PeekInterruptInject(ctx context.Context, sessionID string) (*P
 		`SELECT id, session_id, message_id, content, interrupt, created_at
 		 FROM pending_injects
 		 WHERE session_id = ? AND interrupt = 1
-		 ORDER BY created_at ASC LIMIT 1`,
+		 ORDER BY created_at ASC, rowid ASC LIMIT 1`,
 		sessionID,
 	)
 	scanErr := row.Scan(&pi.ID, &pi.SessionID, &pi.MessageID, &pi.Content, &interrupt, &pi.CreatedAt)

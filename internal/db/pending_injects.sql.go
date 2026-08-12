@@ -73,7 +73,7 @@ func (q *Queries) DeletePendingInject(ctx context.Context, id string) error {
 const listPendingInjectsBySession = `-- name: ListPendingInjectsBySession :many
 SELECT id, session_id, message_id, content, interrupt, created_at FROM pending_injects
 WHERE session_id = ?
-ORDER BY created_at ASC
+ORDER BY created_at ASC, rowid ASC
 `
 
 func (q *Queries) ListPendingInjectsBySession(ctx context.Context, sessionID string) ([]PendingInject, error) {
