@@ -2147,13 +2147,16 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 	// the tail of Run() also calls stopCheckpoint() defensively before
 	// touching currentAssistant, in case agent.Stream returned before
 	// OnStepFinish ever ran (e.g. the very first provider call failed).
-	var checkpointPartsLen int // last-flushed len(Parts), for coalescing
+	//
 	// checkpointGeneration fences concurrent checkpoint writes across turns:
 	// each startCheckpoint increments it, the goroutine captures the current
 	// value at launch, and stopCheckpoint returns immediately only after
 	// observing the goroutine's done signal. This ensures a hung checkpoint
 	// from turn N cannot race with a new checkpoint from turn N+1, and that
 	// stopCheckpoint's 5s timeout is reflected in runWg (see P0-4 fix below).
+	// P0-2: checkpointGeneration and checkpointMu synchronize all access to
+	// the fencing state; the old checkpointPartsLen shared variable is gone
+	// (each generation now tracks its own lastPartsLen locally).
 	//
 	// checkpointStop and checkpointDone are reborn on every step.
 	// startCheckpoint allocates a fresh pair and launches the ticker
@@ -2172,18 +2175,12 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 	var checkpointGeneration int64
 	var checkpointStop chan struct{}
 	var checkpointDone chan struct{}
-	// checkpointWriteCancel cancels the in-flight checkpoint write's own
-	// context. Stored on the outer scope (unlike writeCancel's local defer,
-	// which only self-cancels once the goroutine's own function body
-	// returns — no help against a genuinely hung DB call) so stopCheckpoint
-	// can actually reach in and cancel it: see stopCheckpoint below, which
-	// calls this immediately on stop rather than waiting out its own 5s
-	// grace first. There is no reason to let a checkpoint write survive
-	// past the stop signal — it is best-effort UI-sync data nobody reads
-	// once the turn is stopping, and letting it run un-cancelled is exactly
-	// the P0-4 bug (a write that outlives its caller and can still touch
-	// the DB after Run()/CancelAll() consider the turn finished).
 	var checkpointWriteCancel context.CancelFunc
+	// P0-2: Synchronize checkpointGeneration access with a dedicated mutex.
+	// This prevents races between startCheckpoint (writes) and the goroutine
+	// (reads). The old checkpointPartsLen shared variable is now dead code;
+	// each generation tracks its own lastPartsLen locally for coalescing.
+	var checkpointMu sync.Mutex
 	startCheckpoint := func() {
 		if a.checkpointInterval <= 0 || checkpointStop != nil {
 			return
@@ -2196,12 +2193,16 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 		// cannot race with a new writer from turn N+1. The goroutine
 		// captures the current generation at launch; stopCheckpoint returns
 		// only after observing the goroutine's done signal.
+		// P0-2: Access checkpointGeneration under checkpointMu to prevent races.
+		checkpointMu.Lock()
 		checkpointGeneration++
 		myGeneration := checkpointGeneration
-		// Give the DB write its own cancelable context (not genCtx, which
-		// stays alive for the whole Run call). This allows stopCheckpoint
-		// to actually cancel an in-flight Update, not just wait forever.
-		writeCtx, writeCancel := context.WithCancel(context.Background())
+		checkpointMu.Unlock()
+		// Give the DB write its own cancelable context with a deadline (not genCtx, which
+		// stays alive for the whole Run call). This allows stopCheckpoint to actually
+		// cancel an in-flight Update, not just wait forever. The deadline (30s) bounds
+		// the maximum time a hung write can hold a DB connection even if cancel races.
+		writeCtx, writeCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		checkpointWriteCancel = writeCancel
 		// Register in runWg so a timeout reflects in stillBusy (P0-4).
 		a.runWg.Add(1)
@@ -2211,6 +2212,10 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 			defer writeCancel()
 			ticker := time.NewTicker(a.checkpointInterval)
 			defer ticker.Stop()
+			// P0-2: Keep coalescing state LOCAL to this generation to eliminate
+			// cross-generation races. Each writer tracks its own lastPartsLen and
+			// only writes if there's new content since its last write.
+			lastPartsLen := 0
 			for {
 				select {
 				case <-stop:
@@ -2221,33 +2226,39 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 					sessionLock.Lock()
 					var snap message.Message
 					haveSnap := false
-					newPartsLen := checkpointPartsLen
-					// Fencing: only write if we're still the current generation.
-					// If stopCheckpoint timed out and a new checkpoint started,
-					// checkpointGeneration will be > myGeneration, and we must
-					// no-op to avoid overwriting newer state with stale data.
+					var currentPartsLen int
+					// P0-2: Access checkpointGeneration under checkpointMu to prevent races.
+					checkpointMu.Lock()
 					isCurrentGen := myGeneration == checkpointGeneration
-					if currentAssistant != nil && len(currentAssistant.Parts) != checkpointPartsLen && isCurrentGen {
-						snap = currentAssistant.Clone()
-						snap.AddFinish(message.FinishReasonUnknown, "", "")
-						for i := len(snap.Parts) - 1; i >= 0; i-- {
-							if f, ok := snap.Parts[i].(message.Finish); ok {
-								f.Partial = true
-								snap.Parts[i] = f
-								break
+					checkpointMu.Unlock()
+					if currentAssistant != nil && isCurrentGen {
+						currentPartsLen = len(currentAssistant.Parts)
+						// Only write if we have new content since our last write.
+						// This is per-generation coalescing: each writer independently
+						// skips redundant DB writes, but doesn't interfere with other
+						// generations.
+						if currentPartsLen != lastPartsLen {
+							snap = currentAssistant.Clone()
+							snap.AddFinish(message.FinishReasonUnknown, "", "")
+							for i := len(snap.Parts) - 1; i >= 0; i-- {
+								if f, ok := snap.Parts[i].(message.Finish); ok {
+									f.Partial = true
+									snap.Parts[i] = f
+									break
+								}
 							}
+							haveSnap = true
 						}
-						newPartsLen = len(currentAssistant.Parts)
-						haveSnap = true
 					}
 					sessionLock.Unlock()
 					if haveSnap {
 						// P0-4: use writeCtx (cancelable) not genCtx, so
 						// stopCheckpoint can actually cancel a hung DB write.
+						// P0-2: writeCtx now has both cancel AND a 30s deadline.
 						if err := a.messages.Update(writeCtx, snap); err != nil {
 							// Don't log cancelled errors as failures — they're
 							// the expected outcome of stopCheckpoint fencing.
-							if !errors.Is(err, context.Canceled) {
+							if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 								slog.Debug(
 									"agent: checkpoint flush failed",
 									"session_id", call.SessionID,
@@ -2256,11 +2267,9 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 								)
 							}
 						} else {
-							// Only update checkpointPartsLen if we're still the
-							// current generation (no race with a new checkpoint).
-							if myGeneration == checkpointGeneration {
-								checkpointPartsLen = newPartsLen
-							}
+							// Update our local coalescing state on successful write.
+							// No shared state update: checkpointPartsLen is now dead code.
+							lastPartsLen = currentPartsLen
 						}
 					}
 				}

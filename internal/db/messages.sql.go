@@ -583,7 +583,7 @@ func (q *Queries) UpdateMessage(ctx context.Context, arg UpdateMessageParams) er
 	return err
 }
 
-const updateMessageIfNotTerminal = `-- name: UpdateMessageIfNotTerminal :exec
+const updateMessageIfNotTerminal = `-- name: UpdateMessageIfNotTerminal :execrows
 UPDATE messages
 SET
     parts = ?,
@@ -604,9 +604,12 @@ type UpdateMessageIfNotTerminalParams struct {
 // A checkpoint writes with Partial=true (finished_at NULL), so this condition rejects
 // the update if finished_at is already non-NULL (real terminal finish).
 // Returns number of rows affected (0 = skipped because already terminal, 1 = updated).
-func (q *Queries) UpdateMessageIfNotTerminal(ctx context.Context, arg UpdateMessageIfNotTerminalParams) error {
-	_, err := q.exec(ctx, q.updateMessageIfNotTerminalStmt, updateMessageIfNotTerminal, arg.Parts, arg.FinishedAt, arg.ID)
-	return err
+func (q *Queries) UpdateMessageIfNotTerminal(ctx context.Context, arg UpdateMessageIfNotTerminalParams) (int64, error) {
+	result, err := q.exec(ctx, q.updateMessageIfNotTerminalStmt, updateMessageIfNotTerminal, arg.Parts, arg.FinishedAt, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 const updateMessagePinned = `-- name: UpdateMessagePinned :exec
