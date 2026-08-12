@@ -812,7 +812,17 @@ func (mb *mailbox) interruptAndReplace(call SessionAgentCall) (context.CancelFun
 	// "replacement is recorded" and "current generation is cancelled" for
 	// an external observer to land in, because both happen before mu is
 	// released.
-	mb.replacement = &call
+	//
+	// P0-1 fix (docs/reviews/2026-08-12-post-fix-release-readiness-follow-up.md):
+	// calls FROM the durable queue (call.FromDurableQueue) do NOT set
+	// mb.replacement to avoid double-execution. The durable row itself is
+	// already the retry path, and the pump will execute it. Setting mb.replacement
+	// would create a live copy that runs immediately, leaving the durable row
+	// pending for a second execution by the pump. For non-durable calls, the
+	// mailbox replacement IS the only retry path, so they are recorded normally.
+	if !call.FromDurableQueue {
+		mb.replacement = &call
+	}
 	// #307 (P1-2 follow-up): mb.current.cancel == nil while mb.state ==
 	// mbOwned is NOT a special case restricted to "before the very first
 	// generation" — it is the inter-turn window too: Run's loop clears
