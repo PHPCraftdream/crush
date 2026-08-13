@@ -241,6 +241,24 @@ func TestAbandonOwnershipWithHandoff_ManualCompactionSuccess_UsesPlainAbandon(t 
 	}()
 
 	// Wait for ownership to be established.
+	//
+	// NOTE (investigated for CI failure on macos-latest run 31714546616,
+	// "must have 3 calls in submitted: expected 3, actual 0"): tried
+	// replacing this fixed sleep with a deterministic wait for the turn
+	// loop to begin a generation (require.Eventually on
+	// mb.current.cancel != nil before issuing Cancel below). That change
+	// made the failure reproduce on EVERY run locally (30/30), not just
+	// occasionally on CI -- the opposite of the intended fix. So whatever
+	// actually distinguishes the "queue preserved" case (this test's whole
+	// premise) from the "queue cleared" case (agent.go's Run defer calling
+	// abandonOwnershipWithHandoff, which pops+clears mb.submitted when the
+	// epoch still matches) is NOT simply "did Cancel land before or after
+	// beginGeneration" -- the real mechanism is not yet understood, and
+	// guessing further risks trading a rare CI flake for a deterministic
+	// break. Reverted to the original sleep pending a real investigation;
+	// left as a known, documented CI flake (same disposition as this
+	// session's other confirmed-but-unfixed timing flakes) rather than
+	// risk shipping a worse, confidently-wrong "fix".
 	time.Sleep(10 * time.Millisecond)
 
 	// Queue three calls while the first Run owns the session.

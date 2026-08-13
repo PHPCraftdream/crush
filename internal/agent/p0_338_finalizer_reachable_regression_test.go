@@ -34,8 +34,9 @@ import (
 //  2. Starts a Run() that acquires the OS lock.
 //  3. The first call to the provider returns an error via a custom context,
 //     causing Run() to error out quickly and trigger the finalizer.
-//  4. Verifies that Run() returns quickly (within 200ms) even though cleanup
-//     is blocked — this proves Release() defer doesn't block.
+//  4. Verifies that Run() returns quickly (within 1s, well below the 2s the
+//     injected hung cleanup blocks for) even though cleanup is blocked — this
+//     proves Release() defer doesn't block.
 //  5. Verifies that the cleanup goroutine actually started (proves it was spawned).
 //  6. Verifies that the OS lock is available even while cleanup is blocked.
 //  7. Verifies that the finalizer abandonOwnershipWithHandoff actually ran
@@ -200,8 +201,19 @@ func TestP0_338_FinalizerReachableDespiteHungCleanup(t *testing.T) {
 		runDuration := time.Since(runStart)
 		currentCalls := providerCalls.Load()
 		t.Logf("Run() returned in %v with error: %v, provider calls: %d", runDuration, runErr, currentCalls)
-		require.Less(t, runDuration, 200*time.Millisecond,
-			"Run() should return within 200ms even with hung cleanup, got %v", runDuration)
+		// The property under test is binary, not precise: with the #337 fix in
+		// place, Run() returns as soon as the local httptest round trip
+		// completes (a few tens of ms); with the fix reverted (see REVERT
+		// CHECK PROCEDURE above), Release() blocks synchronously on cleanupFn,
+		// which the injected hung cleanup holds for 2 full seconds. A margin
+		// just has to sit comfortably between those two regimes -- it doesn't
+		// need to be tight. The original 200ms bound flaked on CI (ubuntu-latest
+		// run 31714546616, actual 371.9ms -- ordinary shared-runner variance on
+		// a real HTTP round trip plus DB/session setup, not the 2s-scale hang
+		// this test exists to catch), so widened to 1s: still >5x below the 2s
+		// hang and comfortably above observed CI variance.
+		require.Less(t, runDuration, 1*time.Second,
+			"Run() should return quickly even with hung cleanup, got %v", runDuration)
 		require.Error(t, runErr, "Run should fail")
 		// The error message indicates Run() failed (expected since our provider returns HTTP 400).
 		// What matters is that Run() returned quickly, proving Release() defer didn't block.
