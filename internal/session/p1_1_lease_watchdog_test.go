@@ -205,11 +205,19 @@ func TestP1_1_FastRenewalNoFalsePositive(t *testing.T) {
 	coord.blockCh = blockCh
 	coord.mu.Unlock()
 
-	// TTL=500ms with safety_margin=100ms: renewal interval=166ms, watchdog fires at 400ms
-	// Execution runs for 250ms, which should trigger at least one renewal but NOT fire watchdog
+	// TTL=2s with safety_margin=500ms: renewal interval=666ms, watchdog fires at 1500ms.
+	// Execution runs for 800ms below (>1 renewal interval, so at least one renewal
+	// attempt is guaranteed) while leaving ~700ms of headroom before the watchdog
+	// would fire — matches the doc comment's stated scenario. The previous
+	// ttl=500ms/margin=100ms (400ms safe budget, only 150ms headroom against a
+	// 250ms sleep) was confirmed flaky under -race load: this is the only
+	// regression guard for the watchdog's false-positive-cancels-healthy-work
+	// failure mode, so tight margins here are worse than on an ordinary timing
+	// test (found and fixed after an independent review flagged the doc-vs-code
+	// mismatch and reproduced the flake).
 	const (
-		ttl          = 500 * time.Millisecond
-		safetyMargin = 100 * time.Millisecond
+		ttl          = 2 * time.Second
+		safetyMargin = 500 * time.Millisecond
 	)
 
 	// All renewals succeed immediately (no hang)
@@ -233,9 +241,9 @@ func TestP1_1_FastRenewalNoFalsePositive(t *testing.T) {
 		return coord.entryCount.Load() > 0
 	}, 5*time.Second, 20*time.Millisecond)
 
-	// Let execution run for 250ms (well within the 400ms safe window from TTL-margin)
-	// With renewal interval TTL/3=166ms, we should get at least one renewal attempt
-	time.Sleep(250 * time.Millisecond)
+	// Let execution run for 800ms (well within the 1500ms safe window from TTL-margin)
+	// With renewal interval TTL/3=666ms, we should get at least one renewal attempt
+	time.Sleep(800 * time.Millisecond)
 
 	// Verify coordinator did NOT observe cancellation
 	// The watchdog should NOT fire because renewals are working normally
