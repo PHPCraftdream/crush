@@ -1,13 +1,59 @@
-# Crush — this fork
+# Crush
 
-> **Heads-up:** this repository is a long-running fork of
-> [`charmbracelet/crush`](https://github.com/charmbracelet/crush). The
-> upstream is a terminal-UI coding agent for humans. **This fork
-> specialises in being a tool that other AI agents drive.** If you
-> want a polished TUI to chat with, go upstream. If you want a binary
-> that an orchestrator (Claude Code, your own LLM wrapper, a CI job,
-> a multi-agent fleet) can spawn 5+ times in parallel against the same
-> repo and reliably parse the result of, this fork is built for that.
+**Crush is a coding agent you run from the command line — but built
+to be driven by *other* AI agents, not by a human typing into a
+terminal.** Point an orchestrator (Claude Code, your own LLM wrapper,
+a CI pipeline, a multi-agent fleet) at `crush run`, and it gets a
+model-agnostic, wrapper-stable JSON envelope back: one process it can
+spawn any number of times in parallel against the same repository
+without the instances corrupting each other's state.
+
+- **npm package:** [`@phpcraftdream/crush`](https://www.npmjs.com/package/@phpcraftdream/crush)
+- **Source:** [github.com/PHPCraftdream/crush](https://github.com/PHPCraftdream/crush)
+
+```bash
+npm install -g @phpcraftdream/crush
+crush run --role smart "summarize what this repo does"
+```
+
+## What is this, and why
+
+Most coding-agent CLIs are built for a human sitting in a terminal,
+reading streamed output and clicking through permission prompts. This
+one is built for the opposite case: **something else is the operator**
+— another LLM, a script, a CI job — and it needs a subprocess it can
+call over and over, unattended, and trust the output of.
+
+Typical ways people actually use it:
+
+- **Claude Code (or any other agent) delegating sub-tasks.** The
+  top-level agent hits a chunk of work that's cheap, mechanical, or
+  just doesn't need its own context window — it shells out to
+  `crush run`, gets a JSON envelope back, and keeps going. See the
+  `/crush` skill shipped with this fork for the exact pattern.
+- **Fan-out over a codebase.** Five, ten, fifty `crush run` invocations
+  against the same `.crush/` directory at once — each one a separate
+  session, each one safe from the others' writes (SQLite, file locks,
+  cost accounting are all defended for exactly this).
+- **CI pipelines that need an LLM step.** A build step that asks a
+  model to review a diff, write a migration, or fix a failing test —
+  and needs a predictable exit code and a parseable result, not a
+  chat transcript to eyeball.
+- **Headless automation on a schedule.** Cron jobs, webhooks, queue
+  workers — anything that needs "run this prompt against this repo and
+  tell me what happened" as a function call, not an interactive
+  session.
+- **A human who still wants to look in.** The React/Tailwind web UI
+  covers that case, but it's the second-class entry point here — the
+  CLI and its JSON contract are what this project is actually built
+  around.
+
+If what you actually want is a polished terminal UI for a human to
+chat with an agent in, that's [upstream `charmbracelet/crush`](https://github.com/charmbracelet/crush)
+— this repository started as a fork of it and has since diverged
+substantially in that direction (no TUI, no upstream server model,
+different provider/session engine). See `CHANGELOG.fork.md` for the
+full list of what changed and why.
 
 ## What this fork actually is
 
@@ -536,153 +582,34 @@ either the text above or `CHANGELOG.fork.md` overrides.
 
 ## Installation
 
-Use a package manager:
+This fork ships as an npm package:
 
 ```bash
-# Homebrew
-brew install charmbracelet/tap/crush
-
-# NPM
-npm install -g @charmland/crush
-
-# Arch Linux (btw)
-yay -S crush-bin
-
-# Nix
-nix run github:numtide/nix-ai-tools#crush
-
-# FreeBSD
-pkg install crush
+npm install -g @phpcraftdream/crush
+crush run --role smart "your prompt here"
 ```
 
-Windows users:
+Or build from source (requires Go 1.26+):
 
 ```bash
-# Winget
-winget install charmbracelet.crush
-
-# Scoop
-scoop bucket add charm https://github.com/charmbracelet/scoop-bucket.git
-scoop install crush
+git clone https://github.com/PHPCraftdream/crush.git
+cd crush
+go build -o crush .
 ```
 
-<details>
-<summary><strong>Nix (NUR)</strong></summary>
-
-Crush is available via the official Charm [NUR](https://github.com/nix-community/NUR) in `nur.repos.charmbracelet.crush`, which is the most up-to-date way to get Crush in Nix.
-
-You can also try out Crush via the NUR with `nix-shell`:
-
-```bash
-# Add the NUR channel.
-nix-channel --add https://github.com/nix-community/NUR/archive/main.tar.gz nur
-nix-channel --update
-
-# Get Crush in a Nix shell.
-nix-shell -p '(import <nur> { pkgs = import <nixpkgs> {}; }).repos.charmbracelet.crush'
-```
-
-### NixOS & Home Manager Module Usage via NUR
-
-Crush provides NixOS and Home Manager modules via NUR.
-You can use these modules directly in your flake by importing them from NUR. Since it auto detects whether its a home manager or nixos context you can use the import the exact same way :)
-
-```nix
-{
-  inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    nur.url = "github:nix-community/NUR";
-  };
-
-  outputs = { self, nixpkgs, nur, ... }: {
-    nixosConfigurations.your-hostname = nixpkgs.lib.nixosSystem {
-      system = "x86_64-linux";
-      modules = [
-        nur.modules.nixos.default
-        nur.repos.charmbracelet.modules.crush
-        {
-          programs.crush = {
-            enable = true;
-            settings = {
-              providers = {
-                openai = {
-                  id = "openai";
-                  name = "OpenAI";
-                  base_url = "https://api.openai.com/v1";
-                  type = "openai";
-                  api_key = "sk-fake123456789abcdef...";
-                  models = [
-                    {
-                      id = "gpt-4";
-                      name = "GPT-4";
-                    }
-                  ];
-                };
-              };
-              lsp = {
-                go = { command = "gopls"; enabled = true; };
-                nix = { command = "nil"; enabled = true; };
-              };
-              options = {
-                context_paths = [ "/etc/nixos/configuration.nix" ];
-                tui = { compact_mode = true; };
-                debug = false;
-              };
-            };
-          };
-        }
-      ];
-    };
-  };
-}
-```
-
-</details>
-
-<details>
-<summary><strong>Debian/Ubuntu</strong></summary>
-
-```bash
-sudo mkdir -p /etc/apt/keyrings
-curl -fsSL https://repo.charm.sh/apt/gpg.key | sudo gpg --dearmor -o /etc/apt/keyrings/charm.gpg
-echo "deb [signed-by=/etc/apt/keyrings/charm.gpg] https://repo.charm.sh/apt/ * *" | sudo tee /etc/apt/sources.list.d/charm.list
-sudo apt update && sudo apt install crush
-```
-
-</details>
-
-<details>
-<summary><strong>Fedora/RHEL</strong></summary>
-
-```bash
-echo '[charm]
-name=Charm
-baseurl=https://repo.charm.sh/yum/
-enabled=1
-gpgcheck=1
-gpgkey=https://repo.charm.sh/yum/gpg.key' | sudo tee /etc/yum.repos.d/charm.repo
-sudo yum install crush
-```
-
-</details>
-
-Or, download it:
-
-- [Packages][releases] are available in Debian and RPM formats
-- [Binaries][releases] are available for Linux, macOS, Windows, FreeBSD, OpenBSD, and NetBSD
-
-[releases]: https://github.com/charmbracelet/crush/releases
-
-Or just install it with Go:
-
-```
-go install github.com/charmbracelet/crush@latest
-```
+> [!NOTE]
+> The package managers upstream `charmbracelet/crush` publishes through
+> (Homebrew, Winget, Scoop, apt/yum via `repo.charm.sh`, the Nix NUR
+> module, `go install github.com/charmbracelet/crush@latest`) install
+> **the upstream project, not this fork** — this fork's Go module path
+> is unchanged from upstream's on purpose (to keep merges tractable),
+> so `go install`-ing that path will not get you this fork's code. The
+> npm package above and building from [this repository](https://github.com/PHPCraftdream/crush)
+> directly are the two ways to get this fork specifically.
 
 > [!WARNING]
 > Productivity may increase when using Crush and you may find yourself nerd
-> sniped when first using the application. If the symptoms persist, join the
-> [Slack][slack] or [Discord][discord] and nerd snipe the rest of us.
+> sniped when first using the application.
 
 ## Getting Started
 
@@ -1536,8 +1463,9 @@ which maintainers rely on to inform development and support priorities. The
 metrics include solely usage metadata; prompts and responses are NEVER
 collected.
 
-Details on exactly what’s collected are in the source code ([here](https://github.com/charmbracelet/crush/tree/main/internal/event)
-and [here](https://github.com/charmbracelet/crush/blob/main/internal/llm/agent/event.go)).
+Details on exactly what’s collected are in the source code
+([here](https://github.com/PHPCraftdream/crush/tree/main/internal/event)
+and [here](https://github.com/PHPCraftdream/crush/blob/main/internal/config/config.go)).
 
 You can opt out of metrics collection at any time by setting the environment
 variable by setting the following in your environment:
@@ -1574,31 +1502,24 @@ Installing an extra tool might be needed on Unix-like environments.
 
 ## Contributing
 
-See the [contributing guide](https://github.com/charmbracelet/crush?tab=contributing-ov-file#contributing).
+Open an issue or pull request on [this fork's repository](https://github.com/PHPCraftdream/crush).
 
 ## Whatcha think?
 
-We’d love to hear your thoughts on this project. Need help? We gotchu. You can find us on:
-
-- [Twitter](https://twitter.com/charmcli)
-- [Slack][slack]
-- [Discord][discord]
-- [The Fediverse](https://mastodon.social/@charmcli)
-- [Bluesky](https://bsky.app/profile/charm.land)
-
-[slack]: https://charm.land/slack
-[discord]: https://charm.land/discord
+Questions or issues specific to this fork: use [GitHub Issues on
+this repository](https://github.com/PHPCraftdream/crush/issues).
 
 ## License
 
-[FSL-1.1-MIT](https://github.com/charmbracelet/crush/raw/main/LICENSE.md)
+[FSL-1.1-MIT](https://github.com/PHPCraftdream/crush/raw/main/LICENSE.md)
 
 ---
 
-Upstream is part of [Charm](https://charm.land). This fork is an
-independent project living under the same FSL-1.1-MIT license but
-with no affiliation to Charm Industries beyond the shared upstream
-codebase.
+This fork is an independent project maintained by
+[PHPCraftdream](https://github.com/PHPCraftdream), living under the
+same FSL-1.1-MIT license as upstream, with no affiliation to Charm
+Industries beyond the shared origin codebase (see the top of this
+document for the link to upstream).
 
 <!--prettier-ignore-->
 Charm热爱开源 • Charm loves open source
