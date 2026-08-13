@@ -293,8 +293,11 @@ func TestOrphanOutbox_ConcurrentExecution(t *testing.T) {
 	err = svc.WriteToOrphanOutbox(ctx, outboxID, sess.ID, orphanCallDataJSON)
 	require.NoError(t, err)
 
-	// Create pump and run it for a while
-	mockCoord := &mockCoordinator{}
+	// Create pump and run it for a while. Uses a local call-counting
+	// coordinator instead of the shared mockCoordinator: the completion
+	// signal below needs a count of ACTUALLY EXECUTED calls, not queue
+	// state (see the comment on the Eventually call for why).
+	mockCoord := &countingCoordinator{}
 	pump := session.NewRunQueuePump(session.RunQueuePumpConfig{
 		Sessions:       svc,
 		Coordinator:    mockCoord,
@@ -304,22 +307,67 @@ func TestOrphanOutbox_ConcurrentExecution(t *testing.T) {
 	})
 
 	pump.Start()
-	time.Sleep(500 * time.Millisecond) // Run for enough ticks for both paths
+
+	// Wait for BOTH paths to actually finish, rather than assuming a fixed
+	// sleep window is enough ticks for both. A fixed 500ms sleep here raced
+	// on CI (windows-latest run 31735302674, consistently the
+	// slowest/most-contended runner in this repo's matrix).
+	//
+	// The completion signal is the coordinator's OWN call counter reaching
+	// 2 (one for normal-test-1, one for the drained orphan entry), NOT
+	// "both pending lists are empty" -- an EARLIER version of this fix used
+	// the pending-lists-empty check and it flaked locally (2/15 under
+	// -race): a mid-flight lease (row status 'leased', not 'pending') reads
+	// identically to "already gone" through ListPendingRunQueueEntries, so
+	// the Eventually could return true the instant the drained orphan entry
+	// was LEASED for its first execution attempt, before that attempt
+	// actually completed. Stop() then raced the still-in-flight lease
+	// ("lease failed ... err=context canceled" in the failing run's log)
+	// and left the entry back in 'pending' with no more ticks left to
+	// retry it. This exact ambiguity is already documented and avoided by
+	// TestReleaseGate_P0_2_LockBusyNeverExhaustsRetries's call-counter
+	// design (see its comment) -- reused here for the same reason.
+	require.Eventually(t, func() bool {
+		return mockCoord.calls.Load() >= 2
+	}, 15*time.Second, 10*time.Millisecond,
+		"both the normal queue entry and the drained orphan entry should eventually execute")
+
 	forced := pump.Stop()
 
 	// Verify graceful shutdown (no forced shutdown)
 	require.False(t, forced, "pump should shut down gracefully")
 
-	// Verify the normal queue entry was processed
-	// (mockCoord.Run returns nil, so the entry should be acked/deleted)
-	pendingMain, err := svc.ListPendingRunQueueEntries(ctx)
-	require.NoError(t, err)
-	require.Empty(t, pendingMain, "normal queue entry should be processed")
+	// Confirm both queues are empty once the pump has fully stopped --
+	// wrapped in Eventually rather than a single check to allow for the
+	// (now much smaller, near-instant) gap between "coordinator.Run()
+	// returned" and "the ack commit lands", not because Stop() itself is
+	// expected to race here.
+	require.Eventually(t, func() bool {
+		pendingMain, err := svc.ListPendingRunQueueEntries(ctx)
+		if err != nil {
+			return false
+		}
+		pendingOutbox, err := svc.ListPendingOrphanOutboxEntries(ctx)
+		if err != nil {
+			return false
+		}
+		return len(pendingMain) == 0 && len(pendingOutbox) == 0
+	}, 2*time.Second, 10*time.Millisecond,
+		"both queues should be empty once both entries have executed and been acked")
+}
 
-	// Verify the orphan outbox entry was drained
-	pendingOutbox, err := svc.ListPendingOrphanOutboxEntries(ctx)
-	require.NoError(t, err)
-	require.Empty(t, pendingOutbox, "orphan outbox entry should be drained")
+// countingCoordinator is a session.Coordinator that succeeds immediately
+// (like mockCoordinator) while counting how many calls actually executed
+// -- used where the test needs to know real execution happened, not just
+// that a queue's pending-count transiently read zero (which a mid-flight
+// lease also produces).
+type countingCoordinator struct {
+	calls atomic.Int64
+}
+
+func (c *countingCoordinator) Run(ctx context.Context, callData session.SessionAgentCallData) (*any, error) {
+	c.calls.Add(1)
+	return nil, nil
 }
 
 // TestOrphanOutbox_CrashSafety verifies that the atomic drain operation
