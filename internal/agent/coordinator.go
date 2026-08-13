@@ -559,6 +559,18 @@ type resolvedOverrides struct {
 	small        Model
 	promptPrefix string
 	systemPrompt string
+	// providerCfg is the large model's provider config, resolved from the
+	// SAME Snapshot()/Config() call that built `large` above. Callers that
+	// need provider options/credentials for this same model later in one
+	// logical resolve/build operation (runInternal's 401 rebuildCall) MUST
+	// read this field instead of taking their own, separately-timed
+	// snapshot — otherwise a reload landing between "model resolved" and
+	// "provider options computed" can mix a model from one config
+	// generation with credentials/options from another (task #341, P1-1).
+	// Zero-value (config.ProviderConfig{}) when the resolving path never
+	// populated it (e.g. applyModelOverrides callers that don't need it);
+	// always populated by resolveSessionModels.
+	providerCfg config.ProviderConfig
 }
 
 // SummarizeSnapshot holds an immutable snapshot of all configuration needed
@@ -712,10 +724,23 @@ func (c *coordinator) resolveSessionModels(ctx context.Context, sessionID string
 	if largeProviderCfg.SystemPromptPrefix != "" {
 		resolved.promptPrefix = largeProviderCfg.SystemPromptPrefix
 	}
+	// Carry the provider config resolved from THIS SAME snapshot (cfg/gen
+	// above) so callers that need provider options/credentials later in the
+	// same logical operation (runInternal's 401 rebuildCall, in particular)
+	// don't have to take a second, independently-timed Snapshot() call that
+	// could observe a different generation than the model was built from
+	// (task #341, P1-1).
+	resolved.providerCfg = largeProviderCfg
 
-	// Build system prompt if a template is available.
+	// Build system prompt if a template is available. workerSubAgentActive
+	// takes the SAME pinned cfg used for largeModel/largeProviderCfg above
+	// (task #341, P1-1) — it used to read c.cfg.Config() live here, which
+	// meant a reload landing between the Snapshot() at the top of this
+	// function and this Build call could make the system prompt's
+	// WorkerAvailable flag disagree with the model/prefix this call already
+	// resolved from an earlier generation.
 	if c.prompt != nil {
-		newSystemPrompt, err := c.prompt.Build(ctx, largeModel.ModelCfg.Provider, largeModel.ModelCfg.Model, c.cfg, c.workerSubAgentActive())
+		newSystemPrompt, err := c.prompt.Build(ctx, largeModel.ModelCfg.Provider, largeModel.ModelCfg.Model, c.cfg, c.workerSubAgentActive(cfg))
 		if err != nil {
 			// Leave resolved.systemPrompt empty rather than guessing: the
 			// caller treats "" as "nothing to pin", so the turn falls back to
@@ -741,8 +766,17 @@ func (c *coordinator) resolveSessionModels(ctx context.Context, sessionID string
 // The returned snapshot is what makes a TURN immune to the shared state moving
 // underneath it — no turn reads shared state after this point.
 func (c *coordinator) applyModelOverrides(ctx context.Context, large, small *ModelOverride) (*resolvedOverrides, error) {
-	largeCfg := c.cfg.Config().Models[config.SelectedModelTypeLarge]
-	smallCfg := c.cfg.Config().Models[config.SelectedModelTypeSmall]
+	// Atomically capture config and generation up front (task #341, P1-1) so
+	// largeCfg/smallCfg below, the buildModelsFromCfg call further down, and
+	// the provider/prompt reads at the end of this function all agree on one
+	// generation. This function used to read Models[Large]/Models[Small] via
+	// a live c.cfg.Config() call here and take a SEPARATE Snapshot() call
+	// later just for buildModelsFromCfg's provider lookups — a reload
+	// landing between the two could hand back a large/small model selection
+	// from one generation built against provider config from another.
+	cfg, _ := c.cfg.Snapshot()
+	largeCfg := cfg.Models[config.SelectedModelTypeLarge]
+	smallCfg := cfg.Models[config.SelectedModelTypeSmall]
 
 	if large != nil {
 		if largeCfg.Provider != large.Provider || largeCfg.Model != large.Model {
@@ -773,7 +807,8 @@ func (c *coordinator) applyModelOverrides(ctx context.Context, large, small *Mod
 	// the config generation which we'd need to recompute here. The cost of
 	// building the fantasy.LanguageModel client is paid once per override use,
 	// which is acceptable since overrides are explicitly opt-in per-call.
-	cfg, _ := c.cfg.Snapshot()
+	// Reuse the cfg captured at the top of this function (task #341, P1-1)
+	// instead of taking a second, separately-timed Snapshot() here.
 	largeModel, smallModel, err := c.buildModelsFromCfg(ctx, cfg, largeCfg, smallCfg, false)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build override models: %w", err)
@@ -783,9 +818,12 @@ func (c *coordinator) applyModelOverrides(ctx context.Context, large, small *Mod
 
 	if largeProviderCfg, ok := cfg.Providers.Get(largeModel.ModelCfg.Provider); ok {
 		resolved.promptPrefix = largeProviderCfg.SystemPromptPrefix
+		resolved.providerCfg = largeProviderCfg
 	}
+	// workerSubAgentActive takes the SAME pinned cfg used for largeModel
+	// above (task #341, P1-1) rather than re-reading c.cfg.Config() live.
 	if c.prompt != nil {
-		newSystemPrompt, err := c.prompt.Build(ctx, largeModel.ModelCfg.Provider, largeModel.ModelCfg.Model, c.cfg, c.workerSubAgentActive())
+		newSystemPrompt, err := c.prompt.Build(ctx, largeModel.ModelCfg.Provider, largeModel.ModelCfg.Model, c.cfg, c.workerSubAgentActive(cfg))
 		if err != nil {
 			slog.Error("applyModelOverrides: failed to rebuild system prompt", "err", err)
 		} else {
@@ -839,8 +877,16 @@ func (c *coordinator) resolveSessionSystemPrompt(ctx context.Context, sessionID 
 		return ""
 	}
 
-	built, buildErr := c.prompt.Build(ctx, resolved.large.ModelCfg.Provider, resolved.large.ModelCfg.Model, c.cfg, c.workerSubAgentActive())
-	if buildErr != nil || built == "" {
+	// Reuse the system prompt resolveSessionModels already built from its
+	// OWN single pinned config snapshot (task #341, P1-1), instead of
+	// rebuilding it here from a second, separately-timed live cfg read
+	// (c.workerSubAgentActive() with no argument, and c.cfg.Config()
+	// implicitly via prompt.Build's store). A reload landing between the
+	// two builds could otherwise make this second build's WorkerAvailable
+	// flag disagree with resolved.large/resolved.promptPrefix, which were
+	// pinned from an earlier generation.
+	built := resolved.systemPrompt
+	if built == "" {
 		return ""
 	}
 	if saveErr := c.sessions.UpdateSystemPrompt(ctx, sessionID, built); saveErr != nil {
@@ -1045,12 +1091,18 @@ func (c *coordinator) runInternal(ctx context.Context, sessionID string, prompt 
 			attachments = filteredAttachments
 		}
 
-		// Get provider config again from a fresh atomic snapshot (task
-		// #341/P1-3 — consistent with resolveSessionModels above rather
-		// than a separate, potentially torn Config() read).
-		snapshotCfg, _ := c.cfg.Snapshot()
-		providerCfg, ok := snapshotCfg.Providers.Get(model.ModelCfg.Provider)
-		if !ok {
+		// Use the provider config resolveSessionModels already resolved from
+		// the SAME snapshot it built `model` from above (task #341, P1-1).
+		// This used to take a SEPARATE, freshly-timed c.cfg.Snapshot() here
+		// — despite the old comment claiming that was "consistent with
+		// resolveSessionModels above", a reload landing in the gap between
+		// resolveSessionModels returning and this second Snapshot() call
+		// could hand back provider options/credentials from a DIFFERENT
+		// generation than the model pinned.large was built from, i.e.
+		// exactly the torn-read this whole rebuildCall path exists to
+		// avoid. pinned.providerCfg removes the second snapshot entirely.
+		providerCfg := pinned.providerCfg
+		if providerCfg.ID == "" {
 			return errModelProviderNotConfigured
 		}
 
@@ -1721,7 +1773,7 @@ func (c *coordinator) buildAgent(ctx context.Context, prompt *prompt.Prompt, age
 		// taskPrompt, which doesn't reference WorkerAvailable, but guarding
 		// on !isSubAgent here keeps this call's intent explicit rather than
 		// relying on the template to ignore the field.
-		systemPrompt, err := prompt.Build(ctx, large.Model.Provider(), large.Model.Model(), c.cfg, !isSubAgent && c.workerSubAgentActive())
+		systemPrompt, err := prompt.Build(ctx, large.Model.Provider(), large.Model.Model(), c.cfg, !isSubAgent && c.workerSubAgentActive(c.cfg.Config()))
 		if err != nil {
 			return err
 		}
@@ -1768,7 +1820,11 @@ var workerToolNames = []string{"edit", "multiedit", "write", "bash", "todos", "d
 // no Worker is configured or the active role isn't smart — it returns agent
 // unchanged, so behavior is byte-identical to before this method existed.
 func (c *coordinator) buildToolsAgentConfig(agent config.Agent, isSubAgent bool) config.Agent {
-	if !isSubAgent || !c.workerSubAgentActive() {
+	// buildTools (this method's only caller) does not thread a pinned
+	// snapshot through its own many live c.cfg.Config() reads, so this call
+	// stays consistent with its caller's existing (out of scope for task
+	// #341/P1-1) behavior rather than pinning a snapshot only here.
+	if !isSubAgent || !c.workerSubAgentActive(c.cfg.Config()) {
 		return agent
 	}
 
@@ -1932,12 +1988,25 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubA
 // feature. isSubAgent must be checked by the caller first — this method
 // assumes it's already true and only re-checks the role/config gate.
 //
+// cfg MUST be the same *config.Config the caller already pinned via
+// Snapshot() for the rest of its build/resolve operation (task #341, P1-1).
+// This method used to take no cfg argument and read c.cfg.Config() live
+// instead — a torn read: buildAgentModels captured one generation via
+// Snapshot() for the large/small/worker model lookups, then this method
+// re-read Models[Worker] from whatever generation happened to be published
+// at the moment it ran. A reload landing in between could hand back a
+// worker slot from a DIFFERENT generation than the one buildAgentModels
+// otherwise built from, up to and including a zero-value model or a
+// provider lookup that no longer resolves. Threading the same *config.Config
+// through closes that gap: every reader of "is worker active" within one
+// resolve/build operation now agrees on exactly one generation.
+//
 // Mirrors the semantics documented on buildAgentModels below: falls through
 // to false (today's behavior) when Worker isn't configured, or when the
 // operator explicitly chose a non-large role (fast/worker/reviewer) for the
 // whole run — we don't second-guess that choice by force-upgrading/
 // downgrading sub-agents. Fork patch (reviewer/worker roles).
-func (c *coordinator) workerSubAgentActive() bool {
+func (c *coordinator) workerSubAgentActive(cfg *config.Config) bool {
 	c.activeModelRoleMu.Lock()
 	activeRole := c.activeModelRole
 	c.activeModelRoleMu.Unlock()
@@ -1946,7 +2015,7 @@ func (c *coordinator) workerSubAgentActive() bool {
 		return false
 	}
 
-	workerModelCfg, ok := c.cfg.Config().Models[config.SelectedModelTypeWorker]
+	workerModelCfg, ok := cfg.Models[config.SelectedModelTypeWorker]
 	return ok && workerModelCfg.Model != ""
 }
 
@@ -1974,7 +2043,7 @@ func (c *coordinator) buildAgentModels(ctx context.Context, isSubAgent bool) (Mo
 	// the sub-agent's large-model slot. This never touches the small-model
 	// slot, and falls through to today's behavior (Large for everything)
 	// otherwise.
-	if isSubAgent && c.workerSubAgentActive() {
+	if isSubAgent && c.workerSubAgentActive(cfg) {
 		largeModelCfg = cfg.Models[config.SelectedModelTypeWorker]
 	}
 
@@ -2987,7 +3056,9 @@ func (c *coordinator) BuildSystemPrompt(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("failed to build default large model: %w", err)
 	}
 
-	return c.prompt.Build(ctx, largeModel.ModelCfg.Provider, largeModel.ModelCfg.Model, c.cfg, c.workerSubAgentActive())
+	// Use the same pinned cfg captured above (task #341, P1-1) instead of
+	// re-reading c.cfg.Config() live inside workerSubAgentActive.
+	return c.prompt.Build(ctx, largeModel.ModelCfg.Provider, largeModel.ModelCfg.Model, c.cfg, c.workerSubAgentActive(cfg))
 }
 
 // BuildSystemPromptForSession builds a system prompt for a specific session,
@@ -3004,10 +3075,14 @@ func (c *coordinator) BuildSystemPromptForSession(ctx context.Context, sessionID
 		return "", fmt.Errorf("failed to resolve session models: %w", err)
 	}
 
-	// Use the resolved large model for prompt building.
-	largeModel := resolved.large
-
-	return c.prompt.Build(ctx, largeModel.ModelCfg.Provider, largeModel.ModelCfg.Model, c.cfg, c.workerSubAgentActive())
+	// Reuse the system prompt resolveSessionModels already built from its own
+	// single pinned config snapshot (task #341, P1-1), rather than rebuilding
+	// it here from a second, separately-timed live cfg read
+	// (c.workerSubAgentActive() with no argument). A reload landing between
+	// the two builds could otherwise make this second build's
+	// WorkerAvailable flag disagree with resolved.large, which was pinned
+	// from an earlier generation.
+	return resolved.systemPrompt, nil
 }
 
 func (c *coordinator) UpdateSessionSystemPrompt(ctx context.Context, sessionID, prompt string) error {

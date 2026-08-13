@@ -2148,7 +2148,7 @@ func TestBuildToolsAgentConfig_UnconditionalApplicationWouldBreakBackwardCompat(
 	env := testEnv(t)
 	coord := newWorkerToolTestCoordinator(t, env, false) // no Worker configured
 
-	require.False(t, coord.workerSubAgentActive(),
+	require.False(t, coord.workerSubAgentActive(coord.cfg.Config()),
 		"backward-compat scenario (no Worker configured) must not read as worker-active")
 
 	taskCfg, ok := coord.cfg.Config().Agents[config.AgentTask]
