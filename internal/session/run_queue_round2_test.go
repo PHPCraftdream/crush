@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -282,10 +283,13 @@ func (m *mockCoordinator) Run(ctx context.Context, callData session.SessionAgent
 
 // Helper: setup a test session and service
 func setupTestSession(t *testing.T, title string) (*session.Session, session.Service) {
-	// Use in-memory database for testing (following session_test.go pattern)
+	// Use file-based database in temp dir to avoid connection pool issues with :memory:
+	// Each connection to :memory: creates a separate database; when sql.Open recycles
+	// a connection (e.g., after ErrBadConn from context cancellation), data is lost.
 	t.Helper()
 
-	sqlDB, err := sql.Open("sqlite", ":memory:")
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	sqlDB, err := sql.Open("sqlite", dbPath)
 	require.NoError(t, err)
 	t.Cleanup(func() { sqlDB.Close() })
 

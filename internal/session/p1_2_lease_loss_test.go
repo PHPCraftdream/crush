@@ -27,6 +27,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -43,7 +44,11 @@ import (
 func setupTestSessionWithDB(t *testing.T, title string) (*session.Session, session.Service, *sql.DB) {
 	t.Helper()
 
-	sqlDB, err := sql.Open("sqlite", ":memory:")
+	// Use file-based database in temp dir to avoid connection pool issues with :memory:
+	// Each connection to :memory: creates a separate database; when sql.Open recycles
+	// a connection (e.g., after ErrBadConn from context cancellation), data is lost.
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	sqlDB, err := sql.Open("sqlite", dbPath)
 	require.NoError(t, err)
 	t.Cleanup(func() { sqlDB.Close() })
 
