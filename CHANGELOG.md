@@ -1608,3 +1608,79 @@ finished the mailbox migration:
     deadline; a stuck main loop could hang shutdown indefinitely.
     `Stop()` now bounds both halves to a single shared 5-second budget
     (not 5+5=10s) via one timeout context and a three-way select.
+
+- **Nine more release blockers from the 2026-08-12 post-fix
+  release-readiness follow-up review, closed, zero-trust reviewed, and
+  gated on a composite 9-property release verification** (see
+  `docs/reviews/2026-08-12-post-fix-release-readiness-follow-up.md` and
+  `docs/reviews/2026-08-13-release-gate.md`, verdict: GO). The review
+  re-audited the round above's fixes and found three of them had
+  reopened the same class of problem in a new shape:
+  - **A cross-process interrupt could execute twice** — the atomic
+    durable-enqueue fix from the round above still let the same call
+    also land in the live mailbox as an in-memory replacement, so the
+    live owner would run it once and the durable queue's pump would run
+    it again later. Calls originating from the durable queue no longer
+    set the in-memory replacement; only the durable row is retried.
+  - **A late checkpoint could publish a stale, incomplete snapshot as
+    the last event a client sees, after the real terminal message had
+    already been published** — the SQL update that's supposed to no-op
+    once a terminal finish has landed reported success either way, so
+    the service always published the checkpoint regardless. It's now
+    conditioned on the DB actually having changed a row. A related data
+    race — the generation counter that fences overlapping checkpoint
+    writers was read and written without a lock in some places — is
+    also fixed.
+  - **An orphaned call whose durable re-enqueue failed had no durability
+    guarantee at all** — the fallback ran the call in-process for up to
+    30 seconds and then gave up with nothing left to show for it on
+    crash or shutdown. It now writes to a durable retry outbox first;
+    only if that also fails does it return a clear error instead of
+    quietly losing the work. (Draining that outbox back into normal
+    execution is tracked separately, not yet wired up — see the "known
+    gaps" note below.)
+  - **The new orphan-recovery fallback logged the user's full prompt at
+    ERROR level** by default — the same class of leak the CLI provider
+    fix above had already closed, reopened in a different function.
+    Only length and a hash are logged by default now; raw prompt needs
+    the same explicit `CRUSH_CLIPROVIDER_LOG_RAW_PROMPT=1` opt-in.
+  - **A lease-renewal stall could let an executor keep running for up to
+    a full TTL past the point another pump instance could legitimately
+    take over the same row** — the existing fail-closed check ran in
+    the same goroutine as the renewal call itself, so a hung renewal
+    delayed the check that was supposed to catch it. An independent
+    watchdog now cancels execution at a fixed safety margin before
+    expiry regardless of what the renewal call is doing.
+  - **A 401 retry could reuse the exact same (now-invalid) provider
+    client that just failed** — credentials were refreshed, but the
+    retry replayed the original call object, built before the refresh.
+    The call is now rebuilt with fresh models after a successful
+    credential refresh, before the retry.
+  - **A config reload landing mid-request could mix fields from two
+    different config generations into one cache entry** — model
+    config, provider config, and generation were each read separately;
+    a reload between any two of those reads could produce an
+    internally inconsistent cache key. All three are now read from one
+    atomic snapshot. A related bug — one runtime provider-config update
+    path mutated config without bumping the generation counter at all,
+    silently breaking the cache's own invalidation contract — is also
+    fixed.
+  - **A second cross-process interrupt landing while a replacement turn
+    was already running would never fire** — the interrupt watcher
+    exited after handling the first interrupt instead of continuing to
+    watch for the session's whole lifetime. It's now continuous, and
+    its shutdown properly waits for any in-flight interrupt handling to
+    finish before returning (closing a real deadlock found during this
+    fix: two `defer` statements in the wrong order meant the wait could
+    block forever on a goroutine nobody had told to stop).
+  - Two smaller cleanups: same-second interrupt messages could process
+    in an unspecified order (now tie-broken by insertion order, matching
+    an existing pattern elsewhere in the codebase), and interrupt-recovery
+    code paths that had become unreachable dead weight — kept alive only
+    by their own tests, after the transactional rewrite above superseded
+    them — were removed.
+
+  **Known gap, not blocking**: the durable retry outbox added for the
+  orphan-recovery fix above isn't drained by anything yet — entries are
+  written durably (so nothing is silently lost) but nothing currently
+  picks them back up for execution. Tracked as follow-up work.
