@@ -1410,14 +1410,51 @@ func (s *ConfigStore) SetKeepAliveEnabled(scope Scope, enabled bool) error {
 	return s.SetConfigField(scope, "options.keep_alive_enabled", enabled)
 }
 
-// RemoveProviderAPIKey removes the API key for the given provider from disk and
-// removes it from the in-memory enabled providers list. Providers is a
-// *csync.Map (its own internal RWMutex), so Del is safe to call directly.
+// RemoveProviderAPIKey removes the API key for the given provider from disk
+// and removes it from the in-memory enabled providers list, publishing a new
+// snapshot with an incremented generation.
+//
+// Providers being a *csync.Map (its own internal RWMutex) only makes a
+// direct Del call MEMORY-safe — it does nothing to preserve the logical
+// immutability of an already-published snapshot. RemoveConfigField above
+// reloads from disk and publishes its own new snapshot; calling
+// loadSnapshot().config.Providers.Del(providerID) straight afterwards would
+// mutate that freshly published snapshot's Providers map in place, with no
+// generation bump and no cache invalidation, and would also retroactively
+// change what any snapshot captured earlier (e.g. via Snapshot()) sees for
+// providerID — exactly the torn-read hazard Snapshot() exists to prevent.
+// This mirrors the bug fixed in SetProviderRuntimeConfig (task #341, P1-3):
+// build an independent *Config with its own fresh Providers map (via
+// csync.NewMapFrom + Copy, NOT storeSnapshot.clone() alone — clone() is a
+// SHALLOW copy whose .config still points at the SAME *Config the current
+// snapshot uses) and publish it under publishMu so the old snapshot's
+// Providers map is never touched.
 func (s *ConfigStore) RemoveProviderAPIKey(scope Scope, providerID string) error {
 	if err := s.RemoveConfigField(scope, fmt.Sprintf("providers.%s.api_key", providerID)); err != nil {
 		return fmt.Errorf("failed to remove provider API key: %w", err)
 	}
-	s.loadSnapshot().config.Providers.Del(providerID)
+
+	s.publishMu.Lock()
+	defer s.publishMu.Unlock()
+	cur := s.loadSnapshot()
+	next := cur.clone()
+
+	var cfgCopy Config
+	if cur.config != nil {
+		cfgCopy = *cur.config
+	}
+	var providersCopy map[string]ProviderConfig
+	if cur.config != nil && cur.config.Providers != nil {
+		providersCopy = cur.config.Providers.Copy()
+	} else {
+		providersCopy = make(map[string]ProviderConfig)
+	}
+	newProviders := csync.NewMapFrom(providersCopy)
+	newProviders.Del(providerID)
+	cfgCopy.Providers = newProviders
+	next.config = &cfgCopy
+
+	s.publishLocked(next)
 	return nil
 }
 
