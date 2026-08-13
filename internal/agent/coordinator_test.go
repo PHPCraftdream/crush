@@ -26,12 +26,35 @@ import (
 )
 
 // mockSessionAgent is a minimal mock for the SessionAgent interface.
+//
+// mu guards interruptAndReplaced specifically: it's the only field written
+// from a background goroutine (coordinator.startInterruptTicker's ticker,
+// via handleInterruptTick -> InterruptAndReplace) while a test goroutine may
+// concurrently poll it (e.g. via require.Eventually) before the ticker has
+// been joined. Every other field is written synchronously on the test
+// goroutine's own call into the mock, so it doesn't need the same guard.
+// Callers that read interruptAndReplaced AFTER properly joining the ticker
+// (waiting on the <-tickerDone channel, which is itself a happens-before
+// edge) may keep reading the field directly; only callers that might race
+// with an in-flight ticker should go through interruptAndReplacedSnapshot.
 type mockSessionAgent struct {
 	model                Model
 	runFunc              func(ctx context.Context, call SessionAgentCall) (*fantasy.AgentResult, error)
 	cancelled            []string
 	queuedCalls          []SessionAgentCall
+	mu                   sync.Mutex
 	interruptAndReplaced []SessionAgentCall
+}
+
+// interruptAndReplacedSnapshot returns a thread-safe copy of
+// interruptAndReplaced. Use this (not the raw field) from any goroutine that
+// might read concurrently with a still-running interrupt ticker.
+func (m *mockSessionAgent) interruptAndReplacedSnapshot() []SessionAgentCall {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]SessionAgentCall, len(m.interruptAndReplaced))
+	copy(out, m.interruptAndReplaced)
+	return out
 }
 
 func (m *mockSessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy.AgentResult, error) {
@@ -56,7 +79,9 @@ func (m *mockSessionAgent) QueueMessage(call SessionAgentCall) {
 }
 
 func (m *mockSessionAgent) InterruptAndReplace(_ string, call SessionAgentCall) bool {
+	m.mu.Lock()
 	m.interruptAndReplaced = append(m.interruptAndReplaced, call)
+	m.mu.Unlock()
 	return true
 }
 
