@@ -3254,14 +3254,21 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 		if summarizeErr != nil {
 			return nil, SessionAgentCall{}, false, &ErrCallAlreadyAttempted{Err: summarizeErr}
 		}
-		mb := a.getMailbox(call.SessionID)
 		// If the agent wasn't done...
 		sessionLock.Lock()
 		hasPendingToolCalls := len(currentAssistant.ToolCalls()) > 0
 		sessionLock.Unlock()
 		if hasPendingToolCalls {
-			call.Prompt = fmt.Sprintf("The previous session was interrupted because it got too long, the initial user request was: `%s`", call.Prompt)
-			mb.submit(call, nil)
+			// P0-2 fix: create continuation call and return it directly as the
+			// next turn. This is INTERNAL continuation of the same logical execution,
+			// NOT a new external submit, so it bypasses the P0-1 durable guard in
+			// mailbox.submit. The continuation MUST execute before any Ack, and
+			// returning it here guarantees it runs in the same process/loop sequence.
+			// Returning early here means drainOrReleaseMerged below is never reached,
+			// which is correct: we're not releasing ownership yet, we're continuing.
+			continuationCall := call
+			continuationCall.Prompt = fmt.Sprintf("The previous session was interrupted because it got too long, the initial user request was: `%s`", call.Prompt)
+			return nil, continuationCall, true, nil
 		}
 	}
 
