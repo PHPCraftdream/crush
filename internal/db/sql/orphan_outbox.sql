@@ -44,6 +44,20 @@ SET status = 'failed',
 WHERE id = ? AND status = 'processing'
 RETURNING *;
 
+-- name: ReleaseOrphanOutboxEntryForRetry :one
+-- Release a claimed entry back to pending after a transient enqueue failure
+-- that hasn't exhausted attempts yet, so the next drain scan (which only
+-- looks at status='pending') can pick it up again. Without this, an entry
+-- left in 'processing' after a failed-but-not-exhausted attempt is
+-- permanently invisible to ListPendingOrphanOutboxEntries and never
+-- reaches either 'done' or 'failed'.
+UPDATE orphan_call_outbox
+SET status = 'pending',
+    last_error = ?,
+    updated_at = ?
+WHERE id = ? AND status = 'processing'
+RETURNING *;
+
 -- name: CleanupOldDoneOrphanOutboxEntries :exec
 -- Clean up old done entries (optional, for housekeeping).
 DELETE FROM orphan_call_outbox

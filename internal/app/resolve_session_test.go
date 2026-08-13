@@ -267,6 +267,10 @@ func (m *mockSessionService) GetOrphanOutboxEntry(context.Context, string) (*db.
 	return nil, nil
 }
 
+func (m *mockSessionService) ReleaseOrphanOutboxEntryForRetry(context.Context, string, string) error {
+	return nil
+}
+
 func newTestApp(sessions session.Service) *App {
 	return &App{Sessions: sessions}
 }

@@ -166,6 +166,44 @@ func (q *Queries) MarkOrphanOutboxEntryFailed(ctx context.Context, arg MarkOrpha
 	return i, err
 }
 
+const releaseOrphanOutboxEntryForRetry = `-- name: ReleaseOrphanOutboxEntryForRetry :one
+UPDATE orphan_call_outbox
+SET status = 'pending',
+    last_error = ?,
+    updated_at = ?
+WHERE id = ? AND status = 'processing'
+RETURNING id, session_id, call_data, status, attempts, max_attempts, last_error, created_at, updated_at
+`
+
+type ReleaseOrphanOutboxEntryForRetryParams struct {
+	LastError sql.NullString `json:"last_error"`
+	UpdatedAt int64          `json:"updated_at"`
+	ID        string         `json:"id"`
+}
+
+// Release a claimed entry back to pending after a transient enqueue failure
+// that hasn't exhausted attempts yet, so the next drain scan (which only
+// looks at status='pending') can pick it up again. Without this, an entry
+// left in 'processing' after a failed-but-not-exhausted attempt is
+// permanently invisible to ListPendingOrphanOutboxEntries and never
+// reaches either 'done' or 'failed'.
+func (q *Queries) ReleaseOrphanOutboxEntryForRetry(ctx context.Context, arg ReleaseOrphanOutboxEntryForRetryParams) (OrphanCallOutbox, error) {
+	row := q.queryRow(ctx, q.releaseOrphanOutboxEntryForRetryStmt, releaseOrphanOutboxEntryForRetry, arg.LastError, arg.UpdatedAt, arg.ID)
+	var i OrphanCallOutbox
+	err := row.Scan(
+		&i.ID,
+		&i.SessionID,
+		&i.CallData,
+		&i.Status,
+		&i.Attempts,
+		&i.MaxAttempts,
+		&i.LastError,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const writeToOrphanOutbox = `-- name: WriteToOrphanOutbox :one
 INSERT INTO orphan_call_outbox (
     id,

@@ -279,6 +279,7 @@ type Service interface {
 	MarkOrphanOutboxEntryDone(ctx context.Context, id string) error
 	MarkOrphanOutboxEntryFailed(ctx context.Context, id, lastError string) error
 	GetOrphanOutboxEntry(ctx context.Context, id string) (*db.OrphanCallOutbox, error)
+	ReleaseOrphanOutboxEntryForRetry(ctx context.Context, id, lastError string) error
 }
 
 type service struct {
@@ -1708,6 +1709,21 @@ func (s *service) MarkOrphanOutboxEntryDone(ctx context.Context, id string) erro
 func (s *service) MarkOrphanOutboxEntryFailed(ctx context.Context, id, lastError string) error {
 	now := time.Now().Unix()
 	_, err := s.q.MarkOrphanOutboxEntryFailed(ctx, db.MarkOrphanOutboxEntryFailedParams{
+		LastError: sql.NullString{String: lastError, Valid: lastError != ""},
+		UpdatedAt: now,
+		ID:        id,
+	})
+	return err
+}
+
+// ReleaseOrphanOutboxEntryForRetry releases a claimed (processing) entry
+// back to pending after a transient enqueue failure that hasn't exhausted
+// attempts yet, so a future ListPendingOrphanOutboxEntries scan picks it
+// up again. Without this, an entry left in 'processing' is invisible to
+// every future scan and never reaches 'done' or 'failed'.
+func (s *service) ReleaseOrphanOutboxEntryForRetry(ctx context.Context, id, lastError string) error {
+	now := time.Now().Unix()
+	_, err := s.q.ReleaseOrphanOutboxEntryForRetry(ctx, db.ReleaseOrphanOutboxEntryForRetryParams{
 		LastError: sql.NullString{String: lastError, Valid: lastError != ""},
 		UpdatedAt: now,
 		ID:        id,
