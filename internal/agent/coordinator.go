@@ -2421,7 +2421,7 @@ func (c *coordinator) startInterruptTicker(ctx context.Context, sessionID string
 //
 // P0-2 fix (atomic): uses ConsumeInterruptInjectAndEnqueue to delete and
 // enqueue in a single transaction, eliminating the data loss window where
-// ConsumeInterruptInject deleted the row but the subsequent enqueue could fail.
+// a separate delete-then-enqueue sequence could lose the row if enqueue failed.
 // This approach requires building the call data BEFORE the atomic transaction.
 // Every fallible step (messages.Get, buildCall, marshal) runs BEFORE the
 // atomic consume — PeekInterruptInject does not delete, so a failure there

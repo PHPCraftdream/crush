@@ -194,7 +194,7 @@ func TestMailbox_Invariant_NoStaleCancelHandleSurvivesAnyMutatorReturn(t *testin
 		//
 		// #307 (P1-2 follow-up) update: interruptAndReplace's OWNED branch
 		// (state == mbOwned && !stopped) is also not added here, even though
-		// it is no longer a pure early return — it durably records
+		// it is no longer a pure early return — it records
 		// mb.replacement and returns mb.current.cancel as-is (nil or
 		// non-nil, whichever it already was). It still never WRITES to
 		// state/current.cancel/dispatcherCancel, the three fields this

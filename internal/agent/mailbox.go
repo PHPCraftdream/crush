@@ -772,10 +772,10 @@ func (mb *mailbox) abandonOwnership(epoch uint64) (hadWork bool) {
 // point for "interrupt and replace", replacing QueueMessage+Cancel as one
 // atomic mailbox operation. When nobody owns the session, it returns
 // hadOwner=false and does nothing further (the caller should instead start
-// a fresh Run() with call directly). When a turn is in progress, it
-// durably records call as the replacement to be consumed by the NEXT
-// generation, and returns a cancel func the caller can invoke to interrupt
-// the in-flight generation (outside the mailbox lock).
+// a fresh Run() with call directly). When a turn is in progress, it records
+// call as the replacement to be consumed by the NEXT generation, and returns
+// a cancel func the caller can invoke to interrupt the in-flight generation
+// (outside the mailbox lock).
 func (mb *mailbox) interruptAndReplace(call SessionAgentCall) (context.CancelFunc, bool) {
 	mb.mu.Lock()
 	defer mb.mu.Unlock()
@@ -807,11 +807,17 @@ func (mb *mailbox) interruptAndReplace(call SessionAgentCall) (context.CancelFun
 		// starts, once release() returns.
 		return nil, false
 	}
-	// Durably record the replacement FIRST, under the same lock that is
-	// about to cancel the current generation. There is no window between
-	// "replacement is recorded" and "current generation is cancelled" for
-	// an external observer to land in, because both happen before mu is
-	// released.
+	// Record the replacement FIRST, under the same lock that is about to cancel
+	// the current generation. There is no window between "replacement is recorded"
+	// and "current generation is cancelled" for an external observer to land in,
+	// because both happen before mu is released.
+	//
+	// Owner: The replacement is owned by the current session's mailbox in-memory.
+	// Durable record: For calls originating from durable queue (FromDurableQueue=true),
+	// the durable row itself remains the authoritative record; the pump will execute it.
+	// For non-durable calls, the mailbox replacement is the only retry path.
+	// Cancellation authority: The returned cancel func interrupts the in-flight generation.
+	// Terminal transition: The replacement becomes the next generation's call after cancellation.
 	//
 	// P0-1 fix (docs/reviews/2026-08-12-post-fix-release-readiness-follow-up.md):
 	// calls FROM the durable queue (call.FromDurableQueue) do NOT set
@@ -852,7 +858,7 @@ func (mb *mailbox) interruptAndReplace(call SessionAgentCall) (context.CancelFun
 	// this whole mailbox exists to prevent. This was #307.
 	//
 	// The fix: return nil here instead of falling back to dispatcherCancel.
-	// mb.replacement is already durably recorded under this same lock, which
+	// mb.replacement is already recorded under this same lock, which
 	// is sufficient — nothing needs to be cancelled, because nothing is
 	// running. The loop's own testLoopRearmSeam window (agent.go) is where
 	// the replacement is reclaimed: see reclaimReplacementOrKeep, called

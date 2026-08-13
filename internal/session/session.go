@@ -1492,7 +1492,7 @@ func (s *service) EnqueueRunQueueEntry(ctx context.Context, idempotencyKey, sess
 
 // LeaseRunQueueEntry atomically claims the oldest pending entry for a session.
 // Returns nil, nil if no pending entry exists (not an error).
-// Uses the same transactional pattern as ConsumeInterruptInject:
+// Uses a transactional pattern similar to ConsumeInterruptInjectAndEnqueue:
 //  1. SELECT the oldest pending entry
 //  2. UPDATE it to leased status in the same transaction
 //  3. Return the leased entry
