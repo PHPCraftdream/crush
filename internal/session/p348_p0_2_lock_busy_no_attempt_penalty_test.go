@@ -123,9 +123,21 @@ func TestReleaseGate_P0_2_LockBusyNeverExhaustsRetries(t *testing.T) {
 	// past RunQueueMaxAttempts (10) — is only reachable if busy failures
 	// never counted as attempts and the entry survived to be retried this
 	// many times.
+	// This waits on an async count (25 successful pump-tick cycles at a
+	// nominal 20ms TestTick, ~500ms in the fast case), not a precise
+	// timing relationship -- unlike e.g. the P1-1 lease watchdog margin
+	// tests, widening this bound cannot mask the regression it exists to
+	// catch: if attempts were still (incorrectly) being counted, calls
+	// would plateau at RunQueueMaxAttempts and never reach busyUntilCall
+	// regardless of how long we wait. Widened from 5s to 20s after this
+	// failed on windows-latest CI (runs 31714546616 and 31718897797,
+	// "Condition never satisfied") -- windows-latest is consistently the
+	// slowest/most contended runner in this repo's CI matrix, and 25
+	// DB-backed lease+nack round trips can legitimately exceed 5s there
+	// under -race plus concurrent package load.
 	require.Eventually(t, func() bool {
 		return coord.calls.Load() > coord.busyUntilCall
-	}, 5*time.Second, 20*time.Millisecond,
+	}, 20*time.Second, 20*time.Millisecond,
 		"coordinator must eventually be called past busyUntilCall — if this times out, the entry "+
 			"was terminal-failed (deleted) before reaching that call count, meaning lock-busy "+
 			"failures are still counting toward RunQueueMaxAttempts")

@@ -503,9 +503,14 @@ func TestReleaseGate_P350_QueuedNotExecutedBacksOffWithoutAttemptPenalty(t *test
 	pump.Start()
 	defer pump.Stop()
 
+	// See TestReleaseGate_P0_2_LockBusyNeverExhaustsRetries (same shape,
+	// same 20s widening rationale): this waits on an async call count, not
+	// a precise timing relationship, so widening cannot mask the
+	// regression -- failed twice on windows-latest CI (runs 31714546616
+	// and 31718897797) at the original 5s bound.
 	require.Eventually(t, func() bool {
 		return coord.calls.Load() > coord.busyUntilCall
-	}, 5*time.Second, 20*time.Millisecond,
+	}, 20*time.Second, 20*time.Millisecond,
 		"coordinator must eventually be called past busyUntilCall — if this times out, the entry "+
 			"was dead-lettered (deleted) before reaching that call count, meaning ErrCallQueuedNotExecuted "+
 			"recoveries are still counting toward RunQueueMaxAttempts")
