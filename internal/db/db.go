@@ -228,6 +228,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.recordFileReadStmt, err = db.PrepareContext(ctx, recordFileRead); err != nil {
 		return nil, fmt.Errorf("error preparing query RecordFileRead: %w", err)
 	}
+	if q.releaseOrphanOutboxEntryForRetryStmt, err = db.PrepareContext(ctx, releaseOrphanOutboxEntryForRetry); err != nil {
+		return nil, fmt.Errorf("error preparing query ReleaseOrphanOutboxEntryForRetry: %w", err)
+	}
 	if q.renameSessionStmt, err = db.PrepareContext(ctx, renameSession); err != nil {
 		return nil, fmt.Errorf("error preparing query RenameSession: %w", err)
 	}
@@ -609,6 +612,11 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing recordFileReadStmt: %w", cerr)
 		}
 	}
+	if q.releaseOrphanOutboxEntryForRetryStmt != nil {
+		if cerr := q.releaseOrphanOutboxEntryForRetryStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing releaseOrphanOutboxEntryForRetryStmt: %w", cerr)
+		}
+	}
 	if q.renameSessionStmt != nil {
 		if cerr := q.renameSessionStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing renameSessionStmt: %w", cerr)
@@ -776,6 +784,7 @@ type Queries struct {
 	nackRunQueueEntryStmt                       *sql.Stmt
 	nackRunQueueEntryNoAttemptPenaltyStmt       *sql.Stmt
 	recordFileReadStmt                          *sql.Stmt
+	releaseOrphanOutboxEntryForRetryStmt        *sql.Stmt
 	renameSessionStmt                           *sql.Stmt
 	renewRunQueueLeaseStmt                      *sql.Stmt
 	setParentCostAccountedStmt                  *sql.Stmt
@@ -862,6 +871,7 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		nackRunQueueEntryStmt:                       q.nackRunQueueEntryStmt,
 		nackRunQueueEntryNoAttemptPenaltyStmt:       q.nackRunQueueEntryNoAttemptPenaltyStmt,
 		recordFileReadStmt:                          q.recordFileReadStmt,
+		releaseOrphanOutboxEntryForRetryStmt:        q.releaseOrphanOutboxEntryForRetryStmt,
 		renameSessionStmt:                           q.renameSessionStmt,
 		renewRunQueueLeaseStmt:                      q.renewRunQueueLeaseStmt,
 		setParentCostAccountedStmt:                  q.setParentCostAccountedStmt,

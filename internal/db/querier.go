@@ -274,6 +274,13 @@ type Querier interface {
 	// Scoped to the current lease owner, same as AckRunQueueEntry.
 	NackRunQueueEntryNoAttemptPenalty(ctx context.Context, arg NackRunQueueEntryNoAttemptPenaltyParams) (SessionRunQueue, error)
 	RecordFileRead(ctx context.Context, arg RecordFileReadParams) error
+	// Release a claimed entry back to pending after a transient enqueue failure
+	// that hasn't exhausted attempts yet, so the next drain scan (which only
+	// looks at status='pending') can pick it up again. Without this, an entry
+	// left in 'processing' after a failed-but-not-exhausted attempt is
+	// permanently invisible to ListPendingOrphanOutboxEntries and never
+	// reaches either 'done' or 'failed'.
+	ReleaseOrphanOutboxEntryForRetry(ctx context.Context, arg ReleaseOrphanOutboxEntryForRetryParams) (OrphanCallOutbox, error)
 	RenameSession(ctx context.Context, arg RenameSessionParams) error
 	// Extend a lease expiry while its owner is still genuinely working on it,
 	// or to back off a lease without counting a failed attempt. Scoped to
