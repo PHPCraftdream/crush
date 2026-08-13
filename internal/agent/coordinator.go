@@ -1045,8 +1045,11 @@ func (c *coordinator) runInternal(ctx context.Context, sessionID string, prompt 
 			attachments = filteredAttachments
 		}
 
-		// Get provider config again from fresh snapshot.
-		providerCfg, ok := c.cfg.Config().Providers.Get(model.ModelCfg.Provider)
+		// Get provider config again from a fresh atomic snapshot (task
+		// #341/P1-3 — consistent with resolveSessionModels above rather
+		// than a separate, potentially torn Config() read).
+		snapshotCfg, _ := c.cfg.Snapshot()
+		providerCfg, ok := snapshotCfg.Providers.Get(model.ModelCfg.Provider)
 		if !ok {
 			return errModelProviderNotConfigured
 		}
@@ -1949,11 +1952,19 @@ func (c *coordinator) workerSubAgentActive() bool {
 
 // TODO: when we support multiple agents we need to change this so that we pass in the agent specific model config
 func (c *coordinator) buildAgentModels(ctx context.Context, isSubAgent bool) (Model, Model, error) {
-	largeModelCfg, ok := c.cfg.Config().Models[config.SelectedModelTypeLarge]
+	// Single atomic snapshot for every config read below (task #341/P1-3;
+	// gap found by independent review — this function used to read
+	// large/small/worker each via a separate c.cfg.Config() call, then take
+	// a fourth, separate Snapshot() just for buildModelsFromCfg's provider
+	// lookups. A reload landing between any of those reads could produce a
+	// cross-generation mix, exactly what Snapshot() exists to prevent.
+	cfg, _ := c.cfg.Snapshot()
+
+	largeModelCfg, ok := cfg.Models[config.SelectedModelTypeLarge]
 	if !ok {
 		return Model{}, Model{}, errLargeModelNotSelected
 	}
-	smallModelCfg, ok := c.cfg.Config().Models[config.SelectedModelTypeSmall]
+	smallModelCfg, ok := cfg.Models[config.SelectedModelTypeSmall]
 	if !ok {
 		return Model{}, Model{}, errSmallModelNotSelected
 	}
@@ -1964,10 +1975,9 @@ func (c *coordinator) buildAgentModels(ctx context.Context, isSubAgent bool) (Mo
 	// slot, and falls through to today's behavior (Large for everything)
 	// otherwise.
 	if isSubAgent && c.workerSubAgentActive() {
-		largeModelCfg = c.cfg.Config().Models[config.SelectedModelTypeWorker]
+		largeModelCfg = cfg.Models[config.SelectedModelTypeWorker]
 	}
 
-	cfg, _ := c.cfg.Snapshot()
 	return c.buildModelsFromCfg(ctx, cfg, largeModelCfg, smallModelCfg, isSubAgent)
 }
 
