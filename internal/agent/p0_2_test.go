@@ -3,7 +3,6 @@ package agent
 import (
 	"context"
 	"errors"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -186,141 +185,16 @@ func (m *checkpointGenTrackingMessages) Update(ctx context.Context, msg message.
 	return m.Service.Update(ctx, msg)
 }
 
-// TestCheckpointLocalCoalescingNoSharedState verifies that each checkpoint generation
-// tracks its own coalescing state (lastPartsLen) locally, eliminating cross-generation
-// races. This is the P0-2 fix for the checkpointPartsLen shared variable.
-func TestCheckpointLocalCoalescingNoSharedState(t *testing.T) {
-	t.Parallel()
-
-	msgSvc := newMockCheckpointMsgSvc()
-	var sessionLock sync.Mutex
-	currentAssistant := &message.Message{
-		ID:        "test-msg-id",
-		SessionID: "test-session",
-		Role:      message.Assistant,
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// Start generation 1 with local coalescing state.
-	gen1Stop := make(chan struct{})
-	gen1Done := make(chan struct{})
-	var gen1LastPartsLen int
-	go func() {
-		defer close(gen1Done)
-		ticker := time.NewTicker(10 * time.Millisecond)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-gen1Stop:
-				return
-			case <-ticker.C:
-				sessionLock.Lock()
-				if currentAssistant != nil && len(currentAssistant.Parts) != gen1LastPartsLen {
-					// Only write if we have new content since OUR last write.
-					snap := currentAssistant.Clone()
-					snap.AddFinish(message.FinishReasonUnknown, "", "")
-					for i := len(snap.Parts) - 1; i >= 0; i-- {
-						if f, ok := snap.Parts[i].(message.Finish); ok {
-							f.Partial = true
-							snap.Parts[i] = f
-							break
-						}
-					}
-					_ = msgSvc.Update(ctx, snap)
-					gen1LastPartsLen = len(currentAssistant.Parts)
-					// Simulate slow write.
-					time.Sleep(20 * time.Millisecond)
-				}
-				sessionLock.Unlock()
-			}
-		}
-	}()
-
-	// Wait for gen1 to start, then add content.
-	time.Sleep(15 * time.Millisecond)
-	sessionLock.Lock()
-	currentAssistant.AppendContent("gen1 content")
-	sessionLock.Unlock()
-
-	// Wait for gen1 to write.
-	time.Sleep(30 * time.Millisecond)
-
-	// Start generation 2 with its OWN local coalescing state.
-	gen2Stop := make(chan struct{})
-	gen2Done := make(chan struct{})
-	var gen2LastPartsLen int
-	go func() {
-		defer close(gen2Done)
-		ticker := time.NewTicker(10 * time.Millisecond)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-gen2Stop:
-				return
-			case <-ticker.C:
-				sessionLock.Lock()
-				if currentAssistant != nil && len(currentAssistant.Parts) != gen2LastPartsLen {
-					snap := currentAssistant.Clone()
-					snap.AddFinish(message.FinishReasonUnknown, "", "")
-					for i := len(snap.Parts) - 1; i >= 0; i-- {
-						if f, ok := snap.Parts[i].(message.Finish); ok {
-							f.Partial = true
-							snap.Parts[i] = f
-							break
-						}
-					}
-					_ = msgSvc.Update(ctx, snap)
-					gen2LastPartsLen = len(currentAssistant.Parts)
-				}
-				sessionLock.Unlock()
-			}
-		}
-	}()
-
-	// Add more content while both generations are active.
-	sessionLock.Lock()
-	currentAssistant.AppendContent(" gen2 content")
-	sessionLock.Unlock()
-
-	time.Sleep(50 * time.Millisecond)
-
-	// Stop both generations.
-	close(gen1Stop)
-	close(gen2Stop)
-	<-gen1Done
-	<-gen2Done
-
-	// Verify both generations wrote independently.
-	count := msgSvc.updateCount.Load()
-	require.GreaterOrEqual(t, count, int64(2), "Both generations should have written independently")
-}
-
-// TestCheckpointDBWriteHasDeadline verifies that checkpoint DB writes have
-// both cancel AND a deadline (30s in the fix). This prevents a truly hung DB
-// driver from holding a connection forever even if the cancel races or is missed.
-func TestCheckpointDBWriteHasDeadline(t *testing.T) {
-	t.Parallel()
-
-	msgSvc := newMockCheckpointMsgSvc()
-
-	// Create a context with both cancel AND deadline (30s).
-	writeCtx, writeCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer writeCancel()
-
-	// Simulate a DB write that should respect the deadline.
-	start := time.Now()
-	err := msgSvc.Update(writeCtx, message.Message{})
-	duration := time.Since(start)
-
-	require.NoError(t, err)
-	require.Less(t, duration, 30*time.Second, "Write should complete well before deadline")
-
-	// Verify the context actually has a deadline.
-	deadline, ok := writeCtx.Deadline()
-	require.True(t, ok, "Context must have a deadline")
-	require.WithinDuration(t, time.Now().Add(30*time.Second), deadline, 100*time.Millisecond, "Deadline should be ~30s from now")
-}
+// TestCheckpointLocalCoalescingNoSharedState and TestCheckpointDBWriteHasDeadline
+// were removed (found vacuous by independent review, task #424): the former
+// re-implemented the checkpoint ticker loop inline with its own local
+// lastPartsLen variables instead of calling production code — it passed
+// identically even with agent.go reverted to the old shared
+// checkpointPartsLen. The latter created its own context.WithTimeout(30s)
+// in the test body and asserted on that context directly, testing the
+// context package rather than startCheckpoint — it could not fail for any
+// state of the repo. The real property both claimed to cover (no
+// cross-generation race, no hung write holding a connection forever) is
+// covered by TestCheckpointGenerationOverlap above, which drives the actual
+// production runTurn/startCheckpoint code through a real overlapping-generation
+// scenario.
