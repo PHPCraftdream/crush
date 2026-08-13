@@ -265,82 +265,12 @@ func (e *enqueueAndOutboxFailingSessions) WriteToOrphanOutbox(ctx context.Contex
 	return errSimulatedOutboxFailure
 }
 
-// TestP0_3_OutboxClaimAndRecovery verifies the pump can claim and recover
-// outbox entries.
-func TestP0_3_OutboxClaimAndRecovery(t *testing.T) {
-	t.Setenv("CRUSH_CLIPROVIDER_LOG_RAW_PROMPT", "")
-
-	env := testEnv(t)
-
-	// Write an entry to the outbox directly
-	sess, err := env.sessions.Create(t.Context(), "p0-3-claim-test")
-	require.NoError(t, err)
-
-	callData := `{"prompt":"test","logical_call_id":"claim-test-id"}`
-	outboxID := "test-outbox-entry"
-	err = env.sessions.WriteToOrphanOutbox(t.Context(), outboxID, sess.ID, []byte(callData))
-	require.NoError(t, err)
-
-	// List pending entries
-	pending, err := env.sessions.ListPendingOrphanOutboxEntries(t.Context())
-	require.NoError(t, err)
-	require.Len(t, pending, 1)
-	require.Equal(t, outboxID, pending[0].ID)
-	require.Equal(t, "pending", pending[0].Status)
-
-	// Claim the entry
-	claimed, err := env.sessions.ClaimOrphanOutboxEntry(t.Context(), outboxID)
-	require.NoError(t, err)
-	require.NotNil(t, claimed)
-	require.Equal(t, "processing", claimed.Status)
-	require.Equal(t, int64(1), claimed.Attempts)
-
-	// Claiming again should return nil (already claimed)
-	claimedAgain, err := env.sessions.ClaimOrphanOutboxEntry(t.Context(), outboxID)
-	require.NoError(t, err)
-	require.Nil(t, claimedAgain)
-
-	// Mark as done
-	err = env.sessions.MarkOrphanOutboxEntryDone(t.Context(), outboxID)
-	require.NoError(t, err)
-
-	// Pending list should now be empty
-	pending, err = env.sessions.ListPendingOrphanOutboxEntries(t.Context())
-	require.NoError(t, err)
-	require.Len(t, pending, 0)
-}
-
-// TestP0_3_OutboxMarkFailed verifies marking an entry as failed.
-func TestP0_3_OutboxMarkFailed(t *testing.T) {
-	t.Setenv("CRUSH_CLIPROVIDER_LOG_RAW_PROMPT", "")
-
-	env := testEnv(t)
-
-	sess, err := env.sessions.Create(t.Context(), "p0-3-failed-test")
-	require.NoError(t, err)
-
-	callData := `{"prompt":"test","logical_call_id":"failed-test-id"}`
-	outboxID := "test-failed-entry"
-	err = env.sessions.WriteToOrphanOutbox(t.Context(), outboxID, sess.ID, []byte(callData))
-	require.NoError(t, err)
-
-	// Claim the entry
-	claimed, err := env.sessions.ClaimOrphanOutboxEntry(t.Context(), outboxID)
-	require.NoError(t, err)
-	require.NotNil(t, claimed)
-
-	// Mark as failed
-	err = env.sessions.MarkOrphanOutboxEntryFailed(t.Context(), outboxID, "simulated failure")
-	require.NoError(t, err)
-
-	// Verify the entry is marked as failed
-	entry, err := env.sessions.GetOrphanOutboxEntry(t.Context(), outboxID)
-	require.NoError(t, err)
-	require.Equal(t, "failed", entry.Status)
-	require.Equal(t, int64(1), entry.Attempts)
-	require.True(t, entry.LastError.Valid)
-	require.Equal(t, "simulated failure", entry.LastError.String)
-}
+// TestP0_3_OutboxClaimAndRecovery and TestP0_3_OutboxMarkFailed (which
+// exercised ClaimOrphanOutboxEntry/MarkOrphanOutboxEntryDone/
+// MarkOrphanOutboxEntryFailed directly) were removed along with that dead
+// code -- see internal/db/sql/orphan_outbox.sql's header comment and task
+// #440's follow-up decision. The atomic DrainOrphanOutboxEntry model these
+// once predated is covered by internal/session/p0_3_orphan_outbox_drain_test.go.
 
 // Helper test: verify promptHash generates consistent hashes
 func TestPromptHash(t *testing.T) {

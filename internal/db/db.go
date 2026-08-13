@@ -27,14 +27,8 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.ackRunQueueEntryStmt, err = db.PrepareContext(ctx, ackRunQueueEntry); err != nil {
 		return nil, fmt.Errorf("error preparing query AckRunQueueEntry: %w", err)
 	}
-	if q.claimOrphanOutboxEntryStmt, err = db.PrepareContext(ctx, claimOrphanOutboxEntry); err != nil {
-		return nil, fmt.Errorf("error preparing query ClaimOrphanOutboxEntry: %w", err)
-	}
 	if q.cleanupExpiredLeasesStmt, err = db.PrepareContext(ctx, cleanupExpiredLeases); err != nil {
 		return nil, fmt.Errorf("error preparing query CleanupExpiredLeases: %w", err)
-	}
-	if q.cleanupOldDoneOrphanOutboxEntriesStmt, err = db.PrepareContext(ctx, cleanupOldDoneOrphanOutboxEntries); err != nil {
-		return nil, fmt.Errorf("error preparing query CleanupOldDoneOrphanOutboxEntries: %w", err)
 	}
 	if q.countMessagesBySessionStmt, err = db.PrepareContext(ctx, countMessagesBySession); err != nil {
 		return nil, fmt.Errorf("error preparing query CountMessagesBySession: %w", err)
@@ -213,12 +207,6 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.listUserMessagesBySessionStmt, err = db.PrepareContext(ctx, listUserMessagesBySession); err != nil {
 		return nil, fmt.Errorf("error preparing query ListUserMessagesBySession: %w", err)
 	}
-	if q.markOrphanOutboxEntryDoneStmt, err = db.PrepareContext(ctx, markOrphanOutboxEntryDone); err != nil {
-		return nil, fmt.Errorf("error preparing query MarkOrphanOutboxEntryDone: %w", err)
-	}
-	if q.markOrphanOutboxEntryFailedStmt, err = db.PrepareContext(ctx, markOrphanOutboxEntryFailed); err != nil {
-		return nil, fmt.Errorf("error preparing query MarkOrphanOutboxEntryFailed: %w", err)
-	}
 	if q.matchSessionPermissionStmt, err = db.PrepareContext(ctx, matchSessionPermission); err != nil {
 		return nil, fmt.Errorf("error preparing query MatchSessionPermission: %w", err)
 	}
@@ -230,9 +218,6 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	}
 	if q.recordFileReadStmt, err = db.PrepareContext(ctx, recordFileRead); err != nil {
 		return nil, fmt.Errorf("error preparing query RecordFileRead: %w", err)
-	}
-	if q.releaseOrphanOutboxEntryForRetryStmt, err = db.PrepareContext(ctx, releaseOrphanOutboxEntryForRetry); err != nil {
-		return nil, fmt.Errorf("error preparing query ReleaseOrphanOutboxEntryForRetry: %w", err)
 	}
 	if q.renameSessionStmt, err = db.PrepareContext(ctx, renameSession); err != nil {
 		return nil, fmt.Errorf("error preparing query RenameSession: %w", err)
@@ -280,19 +265,9 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing ackRunQueueEntryStmt: %w", cerr)
 		}
 	}
-	if q.claimOrphanOutboxEntryStmt != nil {
-		if cerr := q.claimOrphanOutboxEntryStmt.Close(); cerr != nil {
-			err = fmt.Errorf("error closing claimOrphanOutboxEntryStmt: %w", cerr)
-		}
-	}
 	if q.cleanupExpiredLeasesStmt != nil {
 		if cerr := q.cleanupExpiredLeasesStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing cleanupExpiredLeasesStmt: %w", cerr)
-		}
-	}
-	if q.cleanupOldDoneOrphanOutboxEntriesStmt != nil {
-		if cerr := q.cleanupOldDoneOrphanOutboxEntriesStmt.Close(); cerr != nil {
-			err = fmt.Errorf("error closing cleanupOldDoneOrphanOutboxEntriesStmt: %w", cerr)
 		}
 	}
 	if q.countMessagesBySessionStmt != nil {
@@ -590,16 +565,6 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing listUserMessagesBySessionStmt: %w", cerr)
 		}
 	}
-	if q.markOrphanOutboxEntryDoneStmt != nil {
-		if cerr := q.markOrphanOutboxEntryDoneStmt.Close(); cerr != nil {
-			err = fmt.Errorf("error closing markOrphanOutboxEntryDoneStmt: %w", cerr)
-		}
-	}
-	if q.markOrphanOutboxEntryFailedStmt != nil {
-		if cerr := q.markOrphanOutboxEntryFailedStmt.Close(); cerr != nil {
-			err = fmt.Errorf("error closing markOrphanOutboxEntryFailedStmt: %w", cerr)
-		}
-	}
 	if q.matchSessionPermissionStmt != nil {
 		if cerr := q.matchSessionPermissionStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing matchSessionPermissionStmt: %w", cerr)
@@ -618,11 +583,6 @@ func (q *Queries) Close() error {
 	if q.recordFileReadStmt != nil {
 		if cerr := q.recordFileReadStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing recordFileReadStmt: %w", cerr)
-		}
-	}
-	if q.releaseOrphanOutboxEntryForRetryStmt != nil {
-		if cerr := q.releaseOrphanOutboxEntryForRetryStmt.Close(); cerr != nil {
-			err = fmt.Errorf("error closing releaseOrphanOutboxEntryForRetryStmt: %w", cerr)
 		}
 	}
 	if q.renameSessionStmt != nil {
@@ -725,9 +685,7 @@ type Queries struct {
 	db                                          DBTX
 	tx                                          *sql.Tx
 	ackRunQueueEntryStmt                        *sql.Stmt
-	claimOrphanOutboxEntryStmt                  *sql.Stmt
 	cleanupExpiredLeasesStmt                    *sql.Stmt
-	cleanupOldDoneOrphanOutboxEntriesStmt       *sql.Stmt
 	countMessagesBySessionStmt                  *sql.Stmt
 	createFileStmt                              *sql.Stmt
 	createMessageStmt                           *sql.Stmt
@@ -787,13 +745,10 @@ type Queries struct {
 	listStaleLeasedRunQueueEntriesStmt          *sql.Stmt
 	listSubSessionsStmt                         *sql.Stmt
 	listUserMessagesBySessionStmt               *sql.Stmt
-	markOrphanOutboxEntryDoneStmt               *sql.Stmt
-	markOrphanOutboxEntryFailedStmt             *sql.Stmt
 	matchSessionPermissionStmt                  *sql.Stmt
 	nackRunQueueEntryStmt                       *sql.Stmt
 	nackRunQueueEntryNoAttemptPenaltyStmt       *sql.Stmt
 	recordFileReadStmt                          *sql.Stmt
-	releaseOrphanOutboxEntryForRetryStmt        *sql.Stmt
 	renameSessionStmt                           *sql.Stmt
 	renewRunQueueLeaseStmt                      *sql.Stmt
 	setParentCostAccountedStmt                  *sql.Stmt
@@ -813,9 +768,7 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		db:                                          tx,
 		tx:                                          tx,
 		ackRunQueueEntryStmt:                        q.ackRunQueueEntryStmt,
-		claimOrphanOutboxEntryStmt:                  q.claimOrphanOutboxEntryStmt,
 		cleanupExpiredLeasesStmt:                    q.cleanupExpiredLeasesStmt,
-		cleanupOldDoneOrphanOutboxEntriesStmt:       q.cleanupOldDoneOrphanOutboxEntriesStmt,
 		countMessagesBySessionStmt:                  q.countMessagesBySessionStmt,
 		createFileStmt:                              q.createFileStmt,
 		createMessageStmt:                           q.createMessageStmt,
@@ -875,13 +828,10 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		listStaleLeasedRunQueueEntriesStmt:          q.listStaleLeasedRunQueueEntriesStmt,
 		listSubSessionsStmt:                         q.listSubSessionsStmt,
 		listUserMessagesBySessionStmt:               q.listUserMessagesBySessionStmt,
-		markOrphanOutboxEntryDoneStmt:               q.markOrphanOutboxEntryDoneStmt,
-		markOrphanOutboxEntryFailedStmt:             q.markOrphanOutboxEntryFailedStmt,
 		matchSessionPermissionStmt:                  q.matchSessionPermissionStmt,
 		nackRunQueueEntryStmt:                       q.nackRunQueueEntryStmt,
 		nackRunQueueEntryNoAttemptPenaltyStmt:       q.nackRunQueueEntryNoAttemptPenaltyStmt,
 		recordFileReadStmt:                          q.recordFileReadStmt,
-		releaseOrphanOutboxEntryForRetryStmt:        q.releaseOrphanOutboxEntryForRetryStmt,
 		renameSessionStmt:                           q.renameSessionStmt,
 		renewRunQueueLeaseStmt:                      q.renewRunQueueLeaseStmt,
 		setParentCostAccountedStmt:                  q.setParentCostAccountedStmt,

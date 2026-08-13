@@ -655,6 +655,20 @@ func (p *RunQueuePump) processOrphanOutboxEntry(_ context.Context, entry db.Orph
 	// Atomically drain the entry (INSERT to main queue + DELETE from orphan outbox in one tx)
 	// This eliminates the vulnerable 'processing' intermediate state that could leave
 	// entries stranded after crashes (P0-4 fix).
+	//
+	// No attempts-counter/terminal-failed state on this path (task #440
+	// follow-up decision): an entry whose call_data is genuinely malformed
+	// -- the ONLY way DrainOrphanOutboxEntry's inner INSERT can keep
+	// failing forever, since the FK ON DELETE CASCADE on session_id
+	// already removes any entry whose session no longer exists -- retries
+	// on every drain tick indefinitely, logged at ERROR each time rather
+	// than silently dropped or auto-escalated to a terminal state. This
+	// was a deliberate choice to keep DrainOrphanOutboxEntry a single
+	// atomic transaction (insert-to-main-queue + delete-from-outbox) with
+	// no separate attempts-tracking write to race against; the older
+	// claim/mark-failed model this superseded (task #426) is gone. See
+	// internal/db/sql/orphan_outbox.sql's header comment for the full
+	// rationale.
 	drained, err := p.cfg.Sessions.DrainOrphanOutboxEntry(drainCtx, entry.ID)
 	if err != nil {
 		slog.Error("run_queue_pump: failed to drain orphan outbox entry", "id", entry.ID, "session_id", entry.SessionID, "err", err, "instance_id", p.cfg.PumpInstanceID)

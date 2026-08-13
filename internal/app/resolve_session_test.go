@@ -251,24 +251,8 @@ func (m *mockSessionService) ListPendingOrphanOutboxEntries(context.Context) ([]
 	return nil, nil
 }
 
-func (m *mockSessionService) ClaimOrphanOutboxEntry(context.Context, string) (*db.OrphanCallOutbox, error) {
-	return nil, nil
-}
-
-func (m *mockSessionService) MarkOrphanOutboxEntryDone(context.Context, string) error {
-	return nil
-}
-
-func (m *mockSessionService) MarkOrphanOutboxEntryFailed(context.Context, string, string) error {
-	return nil
-}
-
 func (m *mockSessionService) GetOrphanOutboxEntry(context.Context, string) (*db.OrphanCallOutbox, error) {
 	return nil, nil
-}
-
-func (m *mockSessionService) ReleaseOrphanOutboxEntryForRetry(context.Context, string, string) error {
-	return nil
 }
 
 func (m *mockSessionService) DrainOrphanOutboxEntry(context.Context, string) (bool, error) {

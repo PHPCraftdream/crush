@@ -19,9 +19,6 @@ type Querier interface {
 	// under a pathological scheduling stall) could Ack a row a DIFFERENT,
 	// currently-live executor now owns, deleting work out from under it.
 	AckRunQueueEntry(ctx context.Context, arg AckRunQueueEntryParams) (string, error)
-	// Atomically claim a pending entry for processing (move to processing state).
-	// Used by pump when moving an entry to the main run queue.
-	ClaimOrphanOutboxEntry(ctx context.Context, arg ClaimOrphanOutboxEntryParams) (OrphanCallOutbox, error)
 	// Reset stale leased entries back to pending (lease expiry recovery).
 	// Run periodically to recover from crashed pump instances.
 	// Increments attempts: a lease that expired without a matching Ack/Nack
@@ -32,8 +29,6 @@ type Querier interface {
 	// forever and never reach RunQueueMaxAttempts, looping indefinitely
 	// instead of eventually being dead-lettered.
 	CleanupExpiredLeases(ctx context.Context, arg CleanupExpiredLeasesParams) error
-	// Clean up old done entries (optional, for housekeeping).
-	CleanupOldDoneOrphanOutboxEntries(ctx context.Context, updatedAt int64) error
 	CountMessagesBySession(ctx context.Context, sessionID string) (int64, error)
 	CreateFile(ctx context.Context, arg CreateFileParams) (File, error)
 	CreateMessage(ctx context.Context, arg CreateMessageParams) (Message, error)
@@ -254,10 +249,6 @@ type Querier interface {
 	// unsuitable as a tiebreaker), so (created_at DESC, rowid DESC) is a
 	// deterministic newest-first total order.
 	ListUserMessagesBySession(ctx context.Context, sessionID string) ([]Message, error)
-	// Mark an entry as done (successfully moved to main run queue).
-	MarkOrphanOutboxEntryDone(ctx context.Context, id string) (int64, error)
-	// Mark an entry as failed (exhausted retries or persistent error).
-	MarkOrphanOutboxEntryFailed(ctx context.Context, arg MarkOrphanOutboxEntryFailedParams) (OrphanCallOutbox, error)
 	// Returns the row id of an enabled "always allow" rule that matches the
 	// given (sessionID, toolName, action, path) tuple, or sql.ErrNoRows.
 	// session_id is empty for global rules; we accept either empty or the
@@ -278,13 +269,6 @@ type Querier interface {
 	// Scoped to the current lease owner, same as AckRunQueueEntry.
 	NackRunQueueEntryNoAttemptPenalty(ctx context.Context, arg NackRunQueueEntryNoAttemptPenaltyParams) (SessionRunQueue, error)
 	RecordFileRead(ctx context.Context, arg RecordFileReadParams) error
-	// Release a claimed entry back to pending after a transient enqueue failure
-	// that hasn't exhausted attempts yet, so the next drain scan (which only
-	// looks at status='pending') can pick it up again. Without this, an entry
-	// left in 'processing' after a failed-but-not-exhausted attempt is
-	// permanently invisible to ListPendingOrphanOutboxEntries and never
-	// reaches either 'done' or 'failed'.
-	ReleaseOrphanOutboxEntryForRetry(ctx context.Context, arg ReleaseOrphanOutboxEntryForRetryParams) (OrphanCallOutbox, error)
 	RenameSession(ctx context.Context, arg RenameSessionParams) error
 	// Extend a lease expiry while its owner is still genuinely working on it,
 	// or to back off a lease without counting a failed attempt. Scoped to
@@ -316,6 +300,22 @@ type Querier interface {
 	UpdateSessionModels(ctx context.Context, arg UpdateSessionModelsParams) error
 	UpdateSessionReasoningEffort(ctx context.Context, arg UpdateSessionReasoningEffortParams) error
 	UpdateSessionSystemPrompt(ctx context.Context, arg UpdateSessionSystemPromptParams) error
+	// Task #340's original claim/mark-done/mark-failed/release-for-retry model
+	// (ClaimOrphanOutboxEntry, MarkOrphanOutboxEntryDone, MarkOrphanOutboxEntryFailed,
+	// ReleaseOrphanOutboxEntryForRetry, CleanupOldDoneOrphanOutboxEntries) was
+	// superseded by task #426's atomic DrainOrphanOutboxEntry (single
+	// insert-to-main-queue + delete-from-outbox transaction, no intermediate
+	// 'processing'/'done'/'failed' state to get stuck in). Removed as dead
+	// code -- task #440 follow-up decision: a genuinely malformed,
+	// never-enqueueable entry now retries every drain tick forever instead of
+	// reaching a terminal 'failed' state. Accepted deliberately rather than
+	// reintroducing attempts-tracking into the atomic transaction: the FK
+	// ON DELETE CASCADE on session_id already closes the realistic failure
+	// mode (session deleted -> row cascades away on its own); what's left is
+	// an operationally-visible (slog.Error per tick), not silent, edge case
+	// for data that was malformed from the start. `attempts`/`max_attempts`/
+	// `status` values other than 'pending' are consequently unreachable going
+	// forward but left in the schema rather than a migration for this.
 	// Write a call to the orphan outbox when main run queue enqueue fails.
 	// Returns the outbox row (or error on write failure).
 	WriteToOrphanOutbox(ctx context.Context, arg WriteToOrphanOutboxParams) (OrphanCallOutbox, error)

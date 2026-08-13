@@ -1,3 +1,20 @@
+-- Task #340's original claim/mark-done/mark-failed/release-for-retry model
+-- (ClaimOrphanOutboxEntry, MarkOrphanOutboxEntryDone, MarkOrphanOutboxEntryFailed,
+-- ReleaseOrphanOutboxEntryForRetry, CleanupOldDoneOrphanOutboxEntries) was
+-- superseded by task #426's atomic DrainOrphanOutboxEntry (single
+-- insert-to-main-queue + delete-from-outbox transaction, no intermediate
+-- 'processing'/'done'/'failed' state to get stuck in). Removed as dead
+-- code -- task #440 follow-up decision: a genuinely malformed,
+-- never-enqueueable entry now retries every drain tick forever instead of
+-- reaching a terminal 'failed' state. Accepted deliberately rather than
+-- reintroducing attempts-tracking into the atomic transaction: the FK
+-- ON DELETE CASCADE on session_id already closes the realistic failure
+-- mode (session deleted -> row cascades away on its own); what's left is
+-- an operationally-visible (slog.Error per tick), not silent, edge case
+-- for data that was malformed from the start. `attempts`/`max_attempts`/
+-- `status` values other than 'pending' are consequently unreachable going
+-- forward but left in the schema rather than a migration for this.
+
 -- name: WriteToOrphanOutbox :one
 -- Write a call to the orphan outbox when main run queue enqueue fails.
 -- Returns the outbox row (or error on write failure).
@@ -19,49 +36,6 @@ SELECT id, session_id, call_data, status, attempts, max_attempts, last_error, cr
 FROM orphan_call_outbox
 WHERE status = 'pending'
 ORDER BY created_at ASC;
-
--- name: ClaimOrphanOutboxEntry :one
--- Atomically claim a pending entry for processing (move to processing state).
--- Used by pump when moving an entry to the main run queue.
-UPDATE orphan_call_outbox
-SET status = 'processing',
-    attempts = attempts + 1,
-    updated_at = ?
-WHERE id = ? AND status = 'pending'
-RETURNING *;
-
--- name: MarkOrphanOutboxEntryDone :execrows
--- Mark an entry as done (successfully moved to main run queue).
-DELETE FROM orphan_call_outbox
-WHERE id = ? AND status = 'processing';
-
--- name: MarkOrphanOutboxEntryFailed :one
--- Mark an entry as failed (exhausted retries or persistent error).
-UPDATE orphan_call_outbox
-SET status = 'failed',
-    last_error = ?,
-    updated_at = ?
-WHERE id = ? AND status = 'processing'
-RETURNING *;
-
--- name: ReleaseOrphanOutboxEntryForRetry :one
--- Release a claimed entry back to pending after a transient enqueue failure
--- that hasn't exhausted attempts yet, so the next drain scan (which only
--- looks at status='pending') can pick it up again. Without this, an entry
--- left in 'processing' after a failed-but-not-exhausted attempt is
--- permanently invisible to ListPendingOrphanOutboxEntries and never
--- reaches either 'done' or 'failed'.
-UPDATE orphan_call_outbox
-SET status = 'pending',
-    last_error = ?,
-    updated_at = ?
-WHERE id = ? AND status = 'processing'
-RETURNING *;
-
--- name: CleanupOldDoneOrphanOutboxEntries :exec
--- Clean up old done entries (optional, for housekeeping).
-DELETE FROM orphan_call_outbox
-WHERE status = 'done' AND updated_at < ?;
 
 -- name: GetOrphanOutboxEntry :one
 -- Get a single entry by ID.
