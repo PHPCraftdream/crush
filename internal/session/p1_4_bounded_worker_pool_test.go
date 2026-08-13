@@ -103,6 +103,8 @@ func TestP1_4_BoundedWorkerPoolRespectsLimit(t *testing.T) {
 	const maxConcurrent = 2 // Small limit to make the test deterministic
 
 	// Setup DB and service
+	// Keep :memory: for speed (100ms TTL too slow for file I/O).
+	// This test doesn't hit the connection recycling bug that breaks TestP0_3.
 	conn, err := sql.Open("sqlite", ":memory:")
 	require.NoError(t, err)
 	t.Cleanup(func() { conn.Close() })
