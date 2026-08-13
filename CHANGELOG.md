@@ -1769,3 +1769,44 @@ finished the mailbox migration:
   its data is malformed) will now retry forever instead of eventually
   giving up and marking itself failed — safer than the bug it replaces
   (a stuck, invisible request), but noisier. Tracked as follow-up work.
+
+- **A follow-up round closing out a second, independent review of the
+  fixes directly above it, plus a series of pre-existing CI-only test
+  flakes surfaced while confirming the round on real CI.** None of the
+  test fixes below change runtime behavior — they only make the test
+  suite's *own* timing assumptions match how slow a real (especially
+  Windows) CI runner can legitimately be under contention.
+
+  - Two more places were still reading live configuration where they
+    should have used the same pinned snapshot as the rest of a request
+    (the same class of bug as several entries above), fixed the same
+    way, plus a corrected, narrower test for the interrupt-handler
+    time-budget fix above (it proves the fix bounds a slow dependency,
+    not one that ignores cancellation entirely — a small overclaim in
+    the original description). One test had gone stale after an
+    earlier fix in this same round changed which internal call it
+    needed to intercept — updated to match, restoring its regression
+    coverage.
+
+  - One review finding (a claimed ~10% flake on a specific test tied to
+    this round's CI-flake fix above) could not be reproduced after 85+
+    isolated attempts locally, nor on the actual CI run that shipped
+    this round's fixes — real CI's `internal/session` package passed
+    clean. Left as an open, documented disagreement rather than
+    resolved either way.
+
+  - Real CI subsequently surfaced five *different*, pre-existing test
+    timing issues unrelated to any change in this round — three were
+    simply too-tight wall-clock margins for a slower CI runner (widened
+    with a documented rationale for why widening doesn't weaken what
+    each test actually verifies); one was a genuine ambiguity bug in a
+    test's own completion check (a row that's actively being processed
+    reads identically to "already done" through a raw pending-count
+    query, so the test could stop waiting a moment too early); one
+    (macOS-only) was investigated but not fixed — an attempted fix was
+    tested empirically and found to make the failure deterministic
+    instead of occasionally flaky, so it was reverted with the
+    investigation notes kept in place rather than ship a confidently
+    wrong "fix". Windows CI runners remain the least reliable in this
+    repo's matrix under full-suite `-race` load; tracked as follow-up
+    work rather than chased indefinitely.
