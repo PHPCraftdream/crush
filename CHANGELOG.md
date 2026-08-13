@@ -1680,7 +1680,86 @@ finished the mailbox migration:
     by their own tests, after the transactional rewrite above superseded
     them — were removed.
 
-  **Known gap, not blocking**: the durable retry outbox added for the
-  orphan-recovery fix above isn't drained by anything yet — entries are
-  written durably (so nothing is silently lost) but nothing currently
-  picks them back up for execution. Tracked as follow-up work.
+  **Update**: the durable retry outbox's drain gap noted above is now
+  closed — see the 2026-08-13 entry below, which wires it into the main
+  run queue and makes the whole recovery path crash-safe.
+
+- **Four more release-blocking bugs from a second, independent static
+  audit, plus four related hardening fixes** (see
+  `docs/reviews/2026-08-13-release-readiness-static-audit.md`). This
+  audit reviewed the fixes above and found new gaps introduced or left
+  by them.
+
+  - **CI flake that was actually a real bug**: a background test
+    helper opened SQLite as `:memory:`; under load, Go's database
+    driver can silently recycle a "bad" connection into a brand-new,
+    empty in-memory database after a context cancellation. A test
+    could write data, have its connection recycled, then read back
+    from an empty database and see "table does not exist." Switched
+    the affected test helpers to file-backed temp databases.
+
+  - **A durable request's continuation after auto-summarization could
+    be silently dropped, and its DB record deleted as if the whole
+    request had succeeded.** When a long-running request needed to
+    auto-compact its history mid-turn, the follow-up turn was
+    resubmitted through the same guard that (correctly) blocks a
+    *different* class of duplicate-execution — which meant this
+    particular resubmission was silently discarded instead of queued.
+    The follow-up turn now runs directly as part of the same request,
+    the way it always should have.
+
+  - **A slow-but-successful lease renewal could let two workers pick up
+    the same durable request at once.** The safety timer that protects
+    against overrunning a request's time-box compared against when the
+    renewal call *returned*, not against the actual expiry time written
+    to the database — so an unusually slow (but successful) renewal
+    could make the timer believe it had more time left than it
+    actually did. It's now anchored to the real, persisted expiry.
+    (Fixing this surfaced a second, smaller bug: very short expiry
+    windows — only used internally by tests — could be recorded as
+    already expired due to a rounding error; expiry is now rounded in
+    the safe direction.)
+
+  - **A crash at exactly the wrong moment could leave a recovered
+    request stuck forever, invisible to any future recovery attempt.**
+    The orphan-request recovery path (added in the fix above) claimed a
+    request, then separately re-queued it, then separately marked it
+    done — a crash between any two of those steps left it stuck in an
+    intermediate state nothing ever looked at again. Recovery is now a
+    single atomic database step: either the request is fully re-queued,
+    or nothing happened at all. There's no window for a crash to land
+    in anymore.
+
+  - **Orphan-request recovery only ran on a slow timer**, so a
+    short-lived `crush run` invocation could start and finish without
+    ever attempting to recover a pending request that was waiting on
+    it. Recovery now also runs once immediately on startup, the same
+    way normal request dispatch already did.
+
+  - **Config changes made mid-session could very rarely leak into a
+    request that had already pinned an earlier configuration**, in two
+    places this round's earlier config-snapshot fix (2026-08-12/13,
+    above) didn't quite cover: worker-model selection, and provider
+    credentials used to retry after an auth failure. Both now
+    consistently use the same pinned configuration as the rest of the
+    request that's already using it.
+
+  - **Removing a provider's saved API key could, in rare timing,
+    revert a config change another part of the app had already
+    published**, for the same underlying reason as a fix from the
+    previous round (2026-08-12/13, above) — this was the same class of
+    bug in a second, separate method that hadn't been audited yet.
+    Fixed the same way.
+
+  - **Hardening, not a confirmed live bug**: the periodic check for a
+    stuck cross-process interrupt handler now has its own bounded
+    time budget, so a hypothetical future dependency that ignores
+    cancellation can't hang shutdown indefinitely. (No such hanging
+    dependency was found to exist today — this closes off the
+    possibility going forward.)
+
+  **Known gap, not blocking**: the atomic orphan-recovery fix above
+  means a request that can *never* successfully re-queue (e.g. because
+  its data is malformed) will now retry forever instead of eventually
+  giving up and marking itself failed — safer than the bug it replaces
+  (a stuck, invisible request), but noisier. Tracked as follow-up work.
