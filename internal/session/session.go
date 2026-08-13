@@ -1491,6 +1491,20 @@ func (s *service) EnqueueRunQueueEntry(ctx context.Context, idempotencyKey, sess
 	return err
 }
 
+// ceilUnixSeconds converts t to a whole-Unix-seconds timestamp, rounding UP
+// (ceiling) rather than truncating down. Used for lease_expires_at (an
+// INTEGER/whole-seconds DB column): rounding up guarantees the persisted
+// deadline is never earlier than the true, sub-second-precision intended
+// deadline (only ever up to ~1s later), which is the safe direction for a
+// "how long is this lease still valid" column — see the P0-3 fix note at
+// LeaseRunQueueEntry's call site for the full rationale.
+func ceilUnixSeconds(t time.Time) int64 {
+	if t.Nanosecond() == 0 {
+		return t.Unix()
+	}
+	return t.Unix() + 1
+}
+
 // LeaseRunQueueEntry atomically claims the oldest pending entry for a session.
 // Returns nil, nil if no pending entry exists (not an error).
 // Uses a transactional pattern similar to ConsumeInterruptInjectAndEnqueue:
@@ -1519,9 +1533,50 @@ func (s *service) LeaseRunQueueEntry(ctx context.Context, sessionID, leasedBy st
 	}
 
 	// Step 2: Lease it (atomic claim)
-	now := time.Now().Unix()
+	acquiredAt := time.Now()
+	now := acquiredAt.Unix()
 	leasedAt := now
-	leaseExpiresAt := now + int64(leaseTTL.Seconds())
+	// P0-3 fix: lease_expires_at is an INTEGER (whole Unix seconds) column,
+	// but the true deadline (acquiredAt + leaseTTL) is sub-second precision.
+	// The previous `now + int64(leaseTTL.Seconds())` computation FLOORED
+	// twice: once by truncating acquiredAt down to `now` (losing up to 1s),
+	// and again by truncating leaseTTL itself to whole seconds (for any
+	// leaseTTL under 1 full second — e.g. the 100-300ms TTLs this package's
+	// own test suite relies on for speed — int64(leaseTTL.Seconds()) is
+	// exactly 0, recording the lease as ALREADY EXPIRED at the moment it is
+	// created).
+	//
+	// A SINGLE floor (compute the full-precision deadline once, then
+	// `.Unix()`) fixes the double-truncation bug but is still not safe
+	// enough on its own: it can still lose up to ~1s depending on the
+	// arbitrary sub-second wall-clock phase the lease happened to be
+	// acquired at, and that loss is directly load-bearing for the
+	// executeEntry watchdog (which seeds its deadline from this exact
+	// persisted value, see run_queue_pump.go's P0-3 fix note) whenever the
+	// safety margin is itself on the order of ~1s or less — e.g. TTL=1s
+	// with margin clamped to 500ms, where "up to 1s of floor loss" can
+	// exceed the ENTIRE margin on an unlucky wall-clock phase, causing the
+	// watchdog to fire almost immediately (confirmed empirically: this
+	// flips a real test between reliably passing and reliably failing
+	// depending purely on which fraction of a second the test process
+	// happened to start at — a genuinely nondeterministic regression, not
+	// hypothetical).
+	//
+	// Round the true deadline UP (ceiling) to the next whole second
+	// instead: this can only make the persisted deadline later than (or
+	// equal to) the true intended deadline, NEVER earlier, so every
+	// consumer of this column (CleanupExpiredLeases' expiry check, and the
+	// executeEntry watchdog) sees a lease that is never reclaimed/treated-
+	// as-expired before its true, intended lifetime — only ever up to ~1s
+	// later, which is the safe direction for a "how long can this lease
+	// still be considered valid" deadline. The production TTL (30s) and
+	// safety margin (5s) make this ~1s of extra slack negligible; a few of
+	// this package's own short-TTL tests needed their timing tolerances
+	// widened to account for it (see p1_1_lease_watchdog_test.go and
+	// p1_1_watchdog_window_test.go's P0-3 notes) — an unavoidable
+	// consequence of anchoring the watchdog to a whole-seconds DB column at
+	// all, not something a smarter rounding scheme can avoid.
+	leaseExpiresAt := ceilUnixSeconds(acquiredAt.Add(leaseTTL))
 
 	leased, err := qtx.LeaseRunQueueEntryByID(ctx, db.LeaseRunQueueEntryByIDParams{
 		LeasedBy:       sql.NullString{String: leasedBy, Valid: leasedBy != ""},

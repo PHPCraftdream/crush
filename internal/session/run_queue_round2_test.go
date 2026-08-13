@@ -87,14 +87,26 @@ func TestRunQueue_LeaseTTLExpiration(t *testing.T) {
 	err = svc.EnqueueRunQueueEntry(ctx, "test-idempotency-key-2", sess.ID, callDataJSON)
 	require.NoError(t, err)
 
-	// Lease with a very short TTL
-	shortTTL := 100 * time.Millisecond
+	// Lease with a short TTL.
+	//
+	// P0-3 fix note: lease_expires_at is persisted as whole Unix seconds,
+	// and LeaseRunQueueEntry now rounds the true deadline UP (ceiling, via
+	// ceilUnixSeconds) rather than down — the only safe rounding direction
+	// once the executeEntry watchdog is correctly anchored to this same
+	// persisted value (see run_queue_pump.go's P0-3 fix note). That means
+	// the actual persisted expiry can land up to ~1s LATER than
+	// acquiredAt+TTL. shortTTL was bumped from 100ms to 1500ms, and the
+	// sleep below from TTL+100ms to TTL+1500ms, so the wait comfortably
+	// covers that worst-case ~1s of ceiling slack on top of the nominal
+	// TTL — otherwise this test could sleep past its OWN naive TTL+100ms
+	// expectation while the lease, correctly, has not actually expired yet.
+	shortTTL := 1500 * time.Millisecond
 	leased, err := svc.LeaseRunQueueEntry(ctx, sess.ID, "pump-instance-1", shortTTL)
 	require.NoError(t, err)
 	require.NotNil(t, leased)
 
 	// Wait for lease to expire
-	time.Sleep(shortTTL + 100*time.Millisecond)
+	time.Sleep(shortTTL + 1500*time.Millisecond)
 
 	// Verify the entry is not pending (still in leased state, expired but not cleaned up yet)
 	pending, err := svc.ListPendingRunQueueEntries(ctx)
