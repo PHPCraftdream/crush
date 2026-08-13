@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/charmbracelet/crush/internal/db"
 	"github.com/charmbracelet/crush/internal/pubsub"
 	"github.com/charmbracelet/crush/internal/session"
 	"github.com/stretchr/testify/require"
@@ -244,6 +245,30 @@ func (m *mockSessionService) ListStaleLeasedRunQueueEntries(context.Context, int
 
 func (m *mockSessionService) CleanupExpiredLeases(context.Context, int64) error {
 	return nil
+}
+
+func (m *mockSessionService) WriteToOrphanOutbox(context.Context, string, string, []byte) error {
+	return nil
+}
+
+func (m *mockSessionService) ListPendingOrphanOutboxEntries(context.Context) ([]db.OrphanCallOutbox, error) {
+	return nil, nil
+}
+
+func (m *mockSessionService) ClaimOrphanOutboxEntry(context.Context, string) (*db.OrphanCallOutbox, error) {
+	return nil, nil
+}
+
+func (m *mockSessionService) MarkOrphanOutboxEntryDone(context.Context, string) error {
+	return nil
+}
+
+func (m *mockSessionService) MarkOrphanOutboxEntryFailed(context.Context, string, string) error {
+	return nil
+}
+
+func (m *mockSessionService) GetOrphanOutboxEntry(context.Context, string) (*db.OrphanCallOutbox, error) {
+	return nil, nil
 }
 
 func newTestApp(sessions session.Service) *App {
