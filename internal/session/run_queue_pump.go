@@ -628,10 +628,28 @@ func (p *RunQueuePump) drainOrphanOutbox() {
 
 // processOrphanOutboxEntry attempts to move a single orphan
 // outbox entry to the main run queue atomically.
-func (p *RunQueuePump) processOrphanOutboxEntry(ctx context.Context, entry db.OrphanCallOutbox) {
-	// Create a fresh context for this specific drain operation with a longer timeout
-	// to avoid canceling the transaction mid-operation
-	drainCtx, drainCancel := context.WithTimeout(context.Background(), 10*time.Second)
+func (p *RunQueuePump) processOrphanOutboxEntry(_ context.Context, entry db.OrphanCallOutbox) {
+	// Derive from p.ctx, NOT context.Background() -- found by independent
+	// review (docs/reviews/2026-08-13-release-readiness-static-audit.md,
+	// finding M6): using context.Background() here detached this drain
+	// entirely from p.ctx/Stop(), so a slow drain could keep running for
+	// up to 10s past Stop() being called, well beyond Stop()'s own 5s
+	// shutdown grace period -- which would then report a forced
+	// (non-graceful) shutdown even though nothing was actually stuck, just
+	// running on a clock nothing else knew about.
+	//
+	// Also NOT the caller's ctx parameter (drainOrphanOutbox's own 5s-
+	// bound scan context, now unused here): chaining context.WithTimeout
+	// off an already-5s-bound parent still caps the effective deadline at
+	// 5s regardless of the timeout passed here (context.WithTimeout takes
+	// the EARLIER of the two deadlines) -- that 5s budget is sized for the
+	// list scan, not for this transaction, and cutting the transaction
+	// short at that boundary would be worse than giving it a longer, but
+	// still pump-shutdown-aware, budget. Deriving straight from p.ctx (not
+	// context.Background(), not the 5s-capped scan ctx) gives both:
+	// cancelled promptly on Stop(), with a real 10s budget in the
+	// meantime.
+	drainCtx, drainCancel := context.WithTimeout(p.ctx, 10*time.Second)
 	defer drainCancel()
 
 	// Atomically drain the entry (INSERT to main queue + DELETE from orphan outbox in one tx)

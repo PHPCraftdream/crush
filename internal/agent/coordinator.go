@@ -935,8 +935,13 @@ func (c *coordinator) buildCall(ctx context.Context, sessionID, prompt string, p
 		attachments = filteredAttachments
 	}
 
-	providerCfg, ok := c.cfg.Config().Providers.Get(model.ModelCfg.Provider)
-	if !ok {
+	// pinned.providerCfg was resolved from the SAME snapshot pinned.large
+	// came from (task #341/P1-1) -- a live c.cfg.Config() read here would
+	// reintroduce the torn-read this whole `pinned` threading exists to
+	// close, since buildCall may run well after resolveSessionModels did
+	// (e.g. for a queued replacement call, per the comment below).
+	providerCfg := pinned.providerCfg
+	if providerCfg.ID == "" {
 		return SessionAgentCall{}, errModelProviderNotConfigured
 	}
 	if err := checkPeakHours(providerCfg); err != nil {
@@ -1001,8 +1006,13 @@ func (c *coordinator) runInternal(ctx context.Context, sessionID string, prompt 
 		attachments = filteredAttachments
 	}
 
-	providerCfg, ok := c.cfg.Config().Providers.Get(model.ModelCfg.Provider)
-	if !ok {
+	// pinned.providerCfg was resolved from the SAME snapshot pinned.large
+	// came from (task #341/P1-1) -- reuse it rather than a second, live
+	// c.cfg.Config() read, which would reopen the exact torn-read gap the
+	// 401-rebuild path below already fixed, on the far more common
+	// (every-run, not just every-401) path.
+	providerCfg := pinned.providerCfg
+	if providerCfg.ID == "" {
 		return nil, errModelProviderNotConfigured
 	}
 	// Fork patch (peak-hours bypass): consume the one-shot allow flag

@@ -191,19 +191,37 @@ func TestP1_1_WatchdogCancelsBeforeExpiry(t *testing.T) {
 		// KEY INVARIANT: watchdog must cancel reasonably close to TTL, not
 		// run for the full TTL + a large DB timeout window (the old bug —
 		// with 5s TTL, that bug would show up as cancellation well past
-		// 5s + a much larger DB timeout). The bound is deliberately loose
-		// (TTL + 5s) rather than tight: it has to cover BOTH
+		// 5s + a much larger DB timeout). The bound covers BOTH
 		// lease_expires_at's ~1s whole-Unix-seconds ceiling-rounding slack
 		// (see this test's P0-3 fix note above — the only safe rounding
 		// direction once the watchdog is correctly DB-anchored) AND real
 		// scheduling/DB contention jitter observed when this whole package
-		// runs its many concurrent-pump tests together under -race (a
-		// single hangingRenewalsService renewal attempt competing for
-		// SQLite/CPU time with dozens of other simultaneously-running test
-		// pumps can itself take noticeably longer before even reaching its
-		// own hang). The invariant this test actually guards — cancel
-		// nowhere near the old bug's TTL+30s-ish window — still holds with
-		// plenty of margin at TTL+5s.
+		// runs its many concurrent-pump tests together under -race.
+		//
+		// TTL+5s margin, kept after an empirical investigation prompted by
+		// independent review (docs/reviews/2026-08-13-release-readiness-
+		// static-audit.md, finding M7): the review correctly points out
+		// that TTL+5s is loose enough to no longer distinguish "watchdog
+		// correctly DB-anchored" from "watchdog still computing its
+		// deadline from post-call time" (the exact P0-3 bug) for any
+		// renewal call slower than ~4s. Tightening was tried empirically
+		// rather than picked by feel: TTL+2s flaked ~5% (2/40 isolated
+		// -race runs on this machine), TTL+3s flaked ~7% (2/30) — BOTH
+		// from real scheduling/DB contention when this package's many
+		// concurrent-pump tests run together under -race, confirmed via
+		// the actual overshoot magnitudes (up to ~3s past the bound on the
+		// failing runs), not a marginal few-millisecond miss that a
+		// slightly wider margin would obviously fix. A materially tighter
+		// bound on THIS specific wall-clock-elapsed assertion trades a
+		// real, measurable CI flake rate for a theoretical regression-
+		// detection improvement that a separate, dedicated, non-flaky test
+		// (TestP0_3_WatchdogUsesAbsoluteDBExpiryNotPostCallTime, which
+		// compares against the actual DB-committed expiry directly instead
+		// of a wall-clock nominal bound) already covers precisely. Kept at
+		// TTL+5s on that basis — a genuinely tighter version of this
+		// specific test would need to compare against the real
+		// lease_expires_at the way that dedicated test does, not just a
+		// smaller constant added to wall-clock elapsed time.
 		require.Less(t, elapsed, ttl+5*time.Second,
 			"watchdog must cancel execution well before lease TTL + old-bug-sized jitter (canceled at %v, TTL=%v)",
 			elapsed, ttl)

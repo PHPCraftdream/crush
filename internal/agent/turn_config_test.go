@@ -228,8 +228,15 @@ func TestRunInternal_PinsResolvedOverridesOntoTheCall(t *testing.T) {
 	pinnedSmall := modelFor("pinned-small")
 
 	pinned := &resolvedOverrides{
-		large:        pinnedLarge,
-		small:        pinnedSmall,
+		large: pinnedLarge,
+		small: pinnedSmall,
+		// providerCfg must come from the same pinned snapshot as `large`
+		// (task #341/P1-1) -- both real producers of resolvedOverrides
+		// (resolveSessionModels, applyModelOverrides) always populate this
+		// alongside large/small, so a hand-built pinned value that omits it
+		// does not represent a real call and would trip runInternal's own
+		// pinned.providerCfg.ID == "" sentinel (task #436/H2).
+		providerCfg:  config.ProviderConfig{ID: pinnedProvider},
 		promptPrefix: "pinned-prefix",
 		systemPrompt: "pinned-system-prompt",
 	}

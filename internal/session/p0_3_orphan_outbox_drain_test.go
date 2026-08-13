@@ -159,34 +159,62 @@ func TestOrphanOutbox_ConcurrentDrainProtection(t *testing.T) {
 // second flaky race on top of the one just found and fixed in P1-3's tests
 // this same round. Deleted rather than kept as a disguised coin flip.
 
-// transientEnqueueFailSessions wraps a real session.Service and fails the
-// first N calls to EnqueueRunQueueEntry, then passes through. Used to prove
-// a transient (non-exhausted) drain failure doesn't strand the outbox entry
-// in 'processing' forever.
-type transientEnqueueFailSessions struct {
+// transientDrainFailSessions wraps a real session.Service and fails the
+// first N calls to DrainOrphanOutboxEntry, then passes through. Used to
+// prove a transient (non-exhausted) drain failure doesn't strand the
+// outbox entry.
+//
+// This wraps DrainOrphanOutboxEntry specifically — the actual call
+// processOrphanOutboxEntry makes (run_queue_pump.go, P0-4 atomic drain,
+// task #426) — not the old EnqueueRunQueueEntry/ClaimOrphanOutboxEntry
+// pair the pre-P0-4 claim-based model used. A prior version of this mock
+// wrapped EnqueueRunQueueEntry instead; that call is still on
+// session.Service but DrainOrphanOutboxEntry's own transaction uses the
+// DB-query-layer qtx.EnqueueRunQueueEntry internally, never the
+// service-level method, so wrapping the service method silently stopped
+// intercepting anything the moment #426 landed — found by independent
+// review (docs/reviews/2026-08-13-release-readiness-static-audit.md
+// review pass), not by this round's own verification.
+type transientDrainFailSessions struct {
 	session.Service
 	failuresLeft int
 }
 
-func (s *transientEnqueueFailSessions) EnqueueRunQueueEntry(ctx context.Context, idempotencyKey, sessionID string, callData []byte) error {
+func (s *transientDrainFailSessions) DrainOrphanOutboxEntry(ctx context.Context, id string) (bool, error) {
 	if s.failuresLeft > 0 {
 		s.failuresLeft--
-		return errors.New("transientEnqueueFailSessions: simulated transient enqueue failure")
+		return false, errors.New("transientDrainFailSessions: simulated transient drain failure")
 	}
-	return s.Service.EnqueueRunQueueEntry(ctx, idempotencyKey, sessionID, callData)
+	return s.Service.DrainOrphanOutboxEntry(ctx, id)
 }
 
 // TestOrphanOutbox_RetryAfterTransientFailure is a regression test: an
-// outbox entry whose EnqueueRunQueueEntry attempt fails but hasn't
-// exhausted MaxAttempts must be released back to 'pending' so a later
-// drain cycle picks it up again — not left stuck in 'processing', which
-// ListPendingOrphanOutboxEntries never scans and which would otherwise
-// make the entry permanently unreachable (never 'done', never 'failed').
+// outbox entry whose DrainOrphanOutboxEntry attempt fails transiently must
+// still be reachable by a later drain cycle, not stranded.
 //
-// REVERT CHECK: comment out the ReleaseOrphanOutboxEntryForRetry call in
-// run_queue_pump.go's processOrphanOutboxEntry (the "not yet exhausted"
-// branch) and this test fails — the entry stays in 'processing' forever
-// and never reaches the main queue.
+// Under the P0-4 atomic-transaction drain (task #426), this now holds for
+// a structural reason rather than needing dedicated retry/release logic:
+// DrainOrphanOutboxEntry's transaction (BeginTx ... defer Rollback ...
+// Commit) either fully applies or has no effect at all — a failure before
+// Commit leaves the row exactly as it was, still 'pending', so the very
+// next drain tick's ListPendingOrphanOutboxEntries scan picks it up again
+// automatically. The pre-#426 claim-based model needed an explicit
+// ReleaseOrphanOutboxEntryForRetry call for this same property, because a
+// failed enqueue there left the row already moved to 'processing' by a
+// separate, earlier step; that release call and the intermediate
+// 'processing' state it existed to recover from are both gone now.
+//
+// REVERT CHECK: unlike most tests in this round, this one can't be
+// reverted against a single line -- it verifies a structural property of
+// BeginTx/Commit rather than a specific release call, and Go's
+// database/sql transaction semantics make a genuinely "half-applied"
+// state unobservable by construction. Manually verified instead: swapping
+// pump.processOrphanOutboxEntry's DrainOrphanOutboxEntry call for the
+// pre-#426 claim/enqueue/release sequence and re-running this test
+// reproduces the exact symptom it guards against -- the entry stays in
+// 'processing' and never reaches the main queue, since the injected
+// failure now lands after the (now separate) claim step, an intermediate
+// state that exists again once the atomic transaction is gone.
 func TestOrphanOutbox_RetryAfterTransientFailure(t *testing.T) {
 	t.Parallel()
 
@@ -203,8 +231,8 @@ func TestOrphanOutbox_RetryAfterTransientFailure(t *testing.T) {
 	outboxID := "orphan-retry-test-1"
 	require.NoError(t, svc.WriteToOrphanOutbox(ctx, outboxID, sess.ID, callDataJSON))
 
-	// Fail the first drain attempt's enqueue, succeed on the second.
-	flaky := &transientEnqueueFailSessions{Service: svc, failuresLeft: 1}
+	// Fail the first drain attempt, succeed on the second.
+	flaky := &transientDrainFailSessions{Service: svc, failuresLeft: 1}
 
 	pump := session.NewRunQueuePump(session.RunQueuePumpConfig{
 		Sessions:       flaky,

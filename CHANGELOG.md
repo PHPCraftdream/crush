@@ -1753,10 +1753,16 @@ finished the mailbox migration:
 
   - **Hardening, not a confirmed live bug**: the periodic check for a
     stuck cross-process interrupt handler now has its own bounded
-    time budget, so a hypothetical future dependency that ignores
-    cancellation can't hang shutdown indefinitely. (No such hanging
-    dependency was found to exist today — this closes off the
-    possibility going forward.)
+    time budget, independent of how long the surrounding request has
+    been running. **Correction** (caught by a second-pass independent
+    review after this entry was first written): this bounds a
+    dependency that's slow but still honors cancellation — it cannot,
+    and does not claim to, force-stop a hypothetical future dependency
+    that never checks cancellation at all, which isn't something Go's
+    context package can do without a separate detached-goroutine
+    pattern that would reintroduce its own resource-safety risk. No
+    such fully cancellation-ignoring dependency was found to exist
+    today.
 
   **Known gap, not blocking**: the atomic orphan-recovery fix above
   means a request that can *never* successfully re-queue (e.g. because
