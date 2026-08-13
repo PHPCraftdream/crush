@@ -143,51 +143,21 @@ func TestOrphanOutbox_ConcurrentDrainProtection(t *testing.T) {
 	require.Equal(t, sess.ID, pendingMain[0].SessionID)
 }
 
-// TestOrphanOutbox_RevertCheck verifies that without drainage,
-// orphan outbox entries remain pending forever.
-func TestOrphanOutbox_RevertCheck(t *testing.T) {
-	t.Parallel()
-
-	sess, svc := setupTestSession(t, "test-revert-check")
-	ctx := t.Context()
-
-	// Write an entry to the orphan outbox
-	callData := map[string]any{
-		"SessionID": sess.ID,
-		"Prompt":    "revert check test",
-	}
-	callDataJSON, err := json.Marshal(callData)
-	require.NoError(t, err)
-
-	outboxID := "orphan-revert-test-1"
-	err = svc.WriteToOrphanOutbox(ctx, outboxID, sess.ID, callDataJSON)
-	require.NoError(t, err)
-
-	// Create pump WITHOUT drainage (TestDrainTick returns a huge duration)
-	mockCoord := &mockCoordinator{}
-	pump := session.NewRunQueuePump(session.RunQueuePumpConfig{
-		Sessions:       svc,
-		Coordinator:    mockCoord,
-		PumpInstanceID: "test-pump-no-drain",
-		TestTick:       func() time.Duration { return 10 * time.Millisecond },
-		TestDrainTick:  func() time.Duration { return 24 * time.Hour }, // Effectively disabled
-	})
-
-	pump.Start()
-	time.Sleep(200 * time.Millisecond)
-	pump.Stop()
-
-	// Verify the entry is STILL pending (was not drained)
-	pendingOutbox, err := svc.ListPendingOrphanOutboxEntries(ctx)
-	require.NoError(t, err)
-	require.Len(t, pendingOutbox, 1, "outbox entry should still be pending without drainage")
-	require.Equal(t, outboxID, pendingOutbox[0].ID)
-
-	// Verify the entry is NOT in the main run queue
-	pendingMain, err := svc.ListPendingRunQueueEntries(ctx)
-	require.NoError(t, err)
-	require.Empty(t, pendingMain, "entry should NOT be in main run queue without drainage")
-}
+// TestOrphanOutbox_RevertCheck used to verify that orphan outbox entries
+// remain pending forever with drainage "disabled" (a huge TestDrainTick).
+// That invariant is no longer true BY DESIGN as of the P1-4 fix (docs/
+// reviews/2026-08-13-release-readiness-static-audit.md §P1-4): every pump
+// now attempts one drain immediately on Start(), regardless of
+// TestDrainTick/OrphanOutboxDrainInterval -- a short-lived process must not
+// depend on a periodic tick ever firing to recover pending outbox work.
+// TestOrphanOutbox_InitialDrainOnStart directly covers that new invariant
+// (entry present at Start() is drained immediately, not just voluntarily
+// retested here). Rewriting this test to prove "an entry written strictly
+// after Start() and before the first periodic tick stays pending" would
+// require synchronizing with the Start()-time drain goroutine's completion
+// -- there is no such hook, and sleep-based synchronization would just be a
+// second flaky race on top of the one just found and fixed in P1-3's tests
+// this same round. Deleted rather than kept as a disguised coin flip.
 
 // transientEnqueueFailSessions wraps a real session.Service and fails the
 // first N calls to EnqueueRunQueueEntry, then passes through. Used to prove
@@ -403,3 +373,56 @@ func TestOrphanOutbox_CrashSafety(t *testing.T) {
 
 // REVERT CHECK: comment out DrainOrphanOutboxEntry in session.go and this test will fail
 // because the old claim-based model could leave entries in a stranded 'processing' state.
+
+// TestOrphanOutbox_InitialDrainOnStart verifies that a pump attempts an
+// orphan outbox drain immediately on Start(), not only on the first
+// drainTicker.C fire (P1-4, docs/reviews/2026-08-13-release-readiness-
+// static-audit.md §P1-4). Before the fix, a process living for less than
+// TestDrainTick's interval (15s in production, OrphanOutboxDrainInterval)
+// would start and exit without ever attempting to recover a pending outbox
+// entry -- this simulates exactly that: a drain interval long enough that
+// the test's own short lifetime would never observe a ticker fire.
+//
+// REVERT CHECK: remove the `if p.ctx.Err() == nil { p.drainOrphanOutbox() }`
+// line before the drain goroutine's for-select loop in run_queue_pump.go,
+// and this test fails (the entry stays pending the whole time, since the
+// 10-minute TestDrainTick never fires within the test's lifetime).
+func TestOrphanOutbox_InitialDrainOnStart(t *testing.T) {
+	t.Parallel()
+
+	sess, svc := setupTestSession(t, "test-initial-drain")
+
+	callData := map[string]any{
+		"SessionID": sess.ID,
+		"Prompt":    "initial drain test",
+	}
+	callDataJSON, err := json.Marshal(callData)
+	require.NoError(t, err)
+
+	outboxID := "orphan-initial-drain-test-1"
+	err = svc.WriteToOrphanOutbox(t.Context(), outboxID, sess.ID, callDataJSON)
+	require.NoError(t, err)
+
+	// Drain interval deliberately far longer than this test's own lifetime,
+	// so the only way the entry can be drained is via the initial,
+	// Start()-time drain -- not via any drainTicker.C fire.
+	pump := session.NewRunQueuePump(session.RunQueuePumpConfig{
+		Sessions:       svc,
+		Coordinator:    nil,
+		PumpInstanceID: "test-pump-initial-drain",
+		TestTick:       func() time.Duration { return 10 * time.Millisecond },
+		TestDrainTick:  func() time.Duration { return 10 * time.Minute },
+	})
+
+	pump.Start()
+	require.Eventually(t, func() bool {
+		pending, err := svc.ListPendingOrphanOutboxEntries(t.Context())
+		return err == nil && len(pending) == 0
+	}, 2*time.Second, 20*time.Millisecond, "entry should be drained by the initial Start()-time drain, not wait for drainTicker")
+	pump.Stop()
+
+	pendingMain, err := svc.ListPendingRunQueueEntries(t.Context())
+	require.NoError(t, err)
+	require.Len(t, pendingMain, 1, "entry should have been moved to the main run queue")
+	require.Equal(t, outboxID, pendingMain[0].ID)
+}

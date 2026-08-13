@@ -497,10 +497,18 @@ func (p *RunQueuePump) run() {
 	drainTicker := time.NewTicker(drainInterval)
 	defer drainTicker.Stop()
 
-	// Start orphan outbox drain goroutine
+	// Start orphan outbox drain goroutine. Runs an initial drain immediately
+	// (P1-4 fix, docs/reviews/2026-08-13-release-readiness-static-audit.md
+	// §P1-4), mirroring p.tick()'s own initial call below — otherwise the
+	// first drain wouldn't happen until drainInterval (15s in production)
+	// has elapsed, and a short-lived process (crush run) could start and
+	// exit without ever attempting to recover a pending outbox entry.
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
+		if p.ctx.Err() == nil {
+			p.drainOrphanOutbox()
+		}
 		for {
 			select {
 			case <-p.ctx.Done():
