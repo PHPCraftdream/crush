@@ -15,8 +15,10 @@ import (
 )
 
 // Guard imports for go vet.
-var _ context.Context = context.Background()
-var _ db.Querier = (*db.Queries)(nil)
+var (
+	_ context.Context = context.Background()
+	_ db.Querier      = (*db.Queries)(nil)
+)
 
 // TestLateCheckpointDoesNotPublishStalePartial is a regression test for P0-2:
 // verifies that a late checkpoint that races with a terminal finish does NOT

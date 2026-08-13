@@ -216,6 +216,7 @@ func TestPendingInjectsFIFOOrderingRevertCheck(t *testing.T) {
 			resultIDs = append(resultIDs, id)
 			rowids = append(rowids, rowid)
 		}
+		require.NoError(t, rows.Err())
 
 		require.Len(t, resultIDs, 5)
 
