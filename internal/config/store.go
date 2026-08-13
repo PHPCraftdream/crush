@@ -15,6 +15,7 @@ import (
 
 	"charm.land/catwalk/pkg/catwalk"
 	hyperp "github.com/charmbracelet/crush/internal/agent/hyper"
+	"github.com/charmbracelet/crush/internal/csync"
 	"github.com/charmbracelet/crush/internal/env"
 	"github.com/charmbracelet/crush/internal/oauth"
 	"github.com/charmbracelet/crush/internal/oauth/copilot"
@@ -1053,7 +1054,31 @@ func (s *ConfigStore) SetProviderRuntimeConfig(providerID string, pc ProviderCon
 	defer s.publishMu.Unlock()
 	cur := s.loadSnapshot()
 	next := cur.clone()
-	next.config.Providers.Set(providerID, pc)
+
+	// clone() is a SHALLOW copy of the snapshot struct — next.config is
+	// still the SAME *Config pointer cur.config is, so mutating its
+	// Providers map in place (the old behavior here) would also mutate
+	// what any older, already-loaded snapshot sees, defeating the whole
+	// point of a "new snapshot, new generation". Build a genuinely
+	// independent *Config with its own Providers map instead: copy the
+	// struct by value, then replace Providers with a fresh csync.Map
+	// seeded from the old one's contents plus this update, so the old
+	// snapshot's Providers map is never touched.
+	var cfgCopy Config
+	if cur.config != nil {
+		cfgCopy = *cur.config
+	}
+	var providersCopy map[string]ProviderConfig
+	if cur.config != nil && cur.config.Providers != nil {
+		providersCopy = cur.config.Providers.Copy()
+	} else {
+		providersCopy = make(map[string]ProviderConfig)
+	}
+	newProviders := csync.NewMapFrom(providersCopy)
+	newProviders.Set(providerID, pc)
+	cfgCopy.Providers = newProviders
+	next.config = &cfgCopy
+
 	s.publishLocked(next)
 }
 
