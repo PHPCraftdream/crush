@@ -217,7 +217,7 @@ func TestP0_3_WatchdogUsesAbsoluteDBExpiryNotPostCallTime(t *testing.T) {
 	// ground truth for when the lease actually expires, independent of any
 	// in-process watchdog bookkeeping.
 	var leaseExpiresAtUnix sql.NullInt64
-	require.NoError(t, sqlDB.QueryRow(
+	require.NoError(t, sqlDB.QueryRowContext(ctx,
 		`SELECT lease_expires_at FROM session_run_queue WHERE id = ?`, idempotencyKey,
 	).Scan(&leaseExpiresAtUnix))
 
