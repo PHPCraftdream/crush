@@ -68,3 +68,10 @@ WHERE status = 'done' AND updated_at < ?;
 SELECT id, session_id, call_data, status, attempts, max_attempts, last_error, created_at, updated_at
 FROM orphan_call_outbox
 WHERE id = ?;
+
+-- name: DeleteOrphanOutboxEntryIfPending :execrows
+-- Delete an orphan outbox entry only if it's still pending (for atomic drain).
+-- Returns the number of rows deleted (0 or 1).
+-- Used by DrainOrphanOutboxEntry to atomically move entries to the main queue.
+DELETE FROM orphan_call_outbox
+WHERE id = ? AND status = 'pending';
