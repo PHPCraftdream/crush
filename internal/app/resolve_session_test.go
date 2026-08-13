@@ -191,10 +191,6 @@ func (m *mockSessionService) DrainPendingInjects(context.Context, string) ([]ses
 	return nil, false, nil
 }
 
-func (m *mockSessionService) ConsumeInterruptInject(context.Context, string) (*session.PendingInject, error) {
-	return nil, nil
-}
-
 func (m *mockSessionService) PeekInterruptInject(context.Context, string) (*session.PendingInject, error) {
 	return nil, nil
 }

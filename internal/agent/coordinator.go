@@ -2448,8 +2448,8 @@ func (c *coordinator) handleInterruptTick(ctx context.Context, sessionID string)
 	// Resolve the session's model configuration from the DB or config
 	// defaults so this cross-process interrupt tick respects a persisted
 	// per-session model override instead of falling back to the shared/
-	// global model (same class of bug as requeueInterruptMessage/
-	// InterruptAndSend, closed for those two call sites separately).
+	// global model (same class of bug as InterruptAndSend,
+	// closed for that call site separately).
 	pinned, resolveErr := c.resolveSessionModels(ctx, sessionID)
 	if resolveErr != nil {
 		return false, fmt.Errorf("failed to resolve session models for interrupt tick: %w", resolveErr)
@@ -2513,56 +2513,6 @@ func (c *coordinator) handleInterruptTick(ctx context.Context, sessionID string)
 	return true, nil
 }
 
-// requeueInterruptMessage loads the already-persisted user message referenced
-// by messageID, queues a call that points at it (ExistingMessageID set, so the
-// agent splices it in WITHOUT creating a duplicate row), and cancels the
-// running turn — mirroring InterruptAndSend's cancel+requeue but for a message
-// the CLI already created. Notify is called so a web UI attached to THIS
-// process renders the foreign-created message live rather than on reload.
-//
-// injectID is the ID of the pending_injects row that must be deleted AFTER
-// successful OS lock acquisition. P0-2 fix.
-func (c *coordinator) requeueInterruptMessage(ctx context.Context, sessionID, messageID, injectID string) error {
-	injMsg, err := c.messages.Get(ctx, messageID)
-	if err != nil {
-		return fmt.Errorf("interrupt inject references missing message %q: %w", messageID, err)
-	}
-
-	// Resolve the session's model configuration from the DB or config defaults.
-	// This ensures that an interrupt requeue respects the session's persisted
-	// model override (if any) rather than falling back to the shared/global model.
-	pinned, err := c.resolveSessionModels(ctx, sessionID)
-	if err != nil {
-		return fmt.Errorf("failed to resolve session models for interrupt requeue: %w", err)
-	}
-
-	call, err := c.buildCall(ctx, sessionID, injMsg.FullText(), pinned, nil)
-	if err != nil {
-		return err
-	}
-	// Reference the existing row; the agent must not re-create it.
-	call.ExistingMessageID = messageID
-	// Store injectID so the detached run can delete the pending row AFTER
-	// successful OS lock acquisition. P0-2 fix.
-	call.InjectID = injectID
-	// InterruptAndReplace atomically records call and cancels only the
-	// in-flight generation (design §4) — same P0-2 fix as InterruptAndSend,
-	// and the same P0-B idle handling: with no owner there is nobody to
-	// drain a queued call, so start the run instead of stranding it.
-	if !c.currentAgent.InterruptAndReplace(sessionID, call) {
-		if err := c.startDetachedRun(ctx, call); err != nil {
-			return fmt.Errorf("failed to enqueue interrupt inject for idle session %s: %w", sessionID, err)
-		}
-	}
-
-	// The row was created by a foreign process (`crush sessions inject`), so
-	// its Create() never published through this process's message broker.
-	// Notify pushes the already-persisted message so an attached web UI
-	// renders it live. Idempotent — a redundant Notify does not harm the UI.
-	c.messages.Notify(injMsg)
-	return nil
-}
-
 // InterruptAndSend queues a user message and cancels the running turn.
 // agent.Run()'s cancel-handling branch drains the queue and the queued
 // message becomes the next Run() — with all assistant content produced so
@@ -2609,7 +2559,7 @@ func (c *coordinator) InterruptAndSend(ctx context.Context, sessionID, prompt st
 }
 
 // startDetachedRun durably enqueues call for the idle-session paths of
-// InterruptAndSend / requeueInterruptMessage (P0-B). Despite the name (kept
+// InterruptAndSend (P0-B). Despite the name (kept
 // for git-blame continuity with the pre-#340 version), it no longer runs
 // call itself, in a goroutine or otherwise — see the task #340 paragraph
 // below for what changed and why.
@@ -2747,41 +2697,6 @@ func (c *coordinator) recreatePendingInjectRow(originalCtx context.Context, call
 	}
 	slog.Info("coordinator: successfully recreated pending_injects row for future retry",
 		"new_inject_id", inject.ID, "old_inject_id", call.InjectID)
-	return nil
-}
-
-// recreatePendingInjectRowPostAccept recreates a pending_injects row on a bounded
-// context for post-accept recovery. This is called after ConsumeInterruptInject
-// has already deleted the row, but before the atomic enqueue could complete.
-// Uses a bounded context (WithoutCancel + timeout) to ensure recovery writes
-// have a chance even if the calling context is being canceled.
-//
-// Returns the error from recreation (or nil on success) so the caller can surface it.
-func (c *coordinator) recreatePendingInjectRowPostAccept(originalCtx context.Context, pi *session.PendingInject) error {
-	// Bounded context: disconnect from caller cancellation but enforce a timeout
-	recoveryCtx, cancel := context.WithTimeout(context.WithoutCancel(originalCtx), 10*time.Second)
-	defer cancel()
-
-	slog.Debug("coordinator: attempting post-accept recreation of pending_injects row",
-		"inject_id", pi.ID, "session_id", pi.SessionID, "message_id", pi.MessageID)
-
-	inject := session.PendingInject{
-		ID:        uuid.New().String(), // Generate new ID to avoid UNIQUE constraint
-		SessionID: pi.SessionID,
-		MessageID: pi.MessageID,
-		Content:   pi.Content,
-		Interrupt: true,
-	}
-
-	createErr := c.sessions.CreatePendingInject(recoveryCtx, inject)
-	if createErr != nil {
-		slog.Error("coordinator: failed to recreate pending_injects row (post-accept recovery)",
-			"inject_id", pi.ID, "new_inject_id", inject.ID, "err", createErr)
-		return fmt.Errorf("failed to recreate pending_injects row: %w", createErr)
-	}
-
-	slog.Info("coordinator: successfully recreated pending_injects row for future retry (post-accept recovery)",
-		"new_inject_id", inject.ID, "old_inject_id", pi.ID, "session_id", pi.SessionID)
 	return nil
 }
 

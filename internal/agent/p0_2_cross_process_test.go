@@ -21,8 +21,8 @@ import (
 
 // TestP0_2_CrossProcessInterrupt_RowRecreatedOnFailure is a regression test for Problem 2:
 // cross-process interrupt inject must not lose pending_injects rows when durable
-// enqueue fails. The row is deleted immediately by ConsumeInterruptInject (before
-// startDetachedRun), then recreated by startDetachedRun if enqueue fails.
+// enqueue fails. The row is deleted by startDetachedRun (after OS lock acquisition),
+// then recreated by startDetachedRun if enqueue fails.
 //
 // CRITICAL: This test proves BOTH persistence AND execution:
 //  1. Persistence (first phase): row is recreated after enqueue failure
@@ -134,14 +134,11 @@ func TestP0_2_CrossProcessInterrupt_RowRecreatedOnFailure(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verify the row exists before the interrupt.
-	pi, err := env.sessions.ConsumeInterruptInject(ctx, sess.ID)
+	pi, err := env.sessions.PeekInterruptInject(ctx, sess.ID)
 	require.NoError(t, err)
 	require.NotNil(t, pi, "pending_injects row should exist before interrupt")
-	// The row was deleted by ConsumeInterruptInject, so recreate it for the test.
-	err = env.sessions.CreatePendingInject(ctx, inject)
-	require.NoError(t, err)
 
-	// Build the call manually (simulating requeueInterruptMessage).
+	// Build the call manually (simulating the legacy interrupt path).
 	call := SessionAgentCall{
 		SessionID: sess.ID,
 		Prompt:    msg.FullText(),
@@ -187,7 +184,7 @@ func TestP0_2_CrossProcessInterrupt_RowRecreatedOnFailure(t *testing.T) {
 
 	// Verify the row does NOT exist (because recreation also failed)
 	// This is the expected behavior when DB is completely unavailable
-	pi, err = newEnv.sessions.ConsumeInterruptInject(ctx, sess.ID)
+	pi, err = newEnv.sessions.PeekInterruptInject(ctx, sess.ID)
 	if err == nil && pi != nil {
 		t.Logf("Row was recreated despite DB being closed. This is unexpected but not a test failure.")
 	}
@@ -228,12 +225,9 @@ func TestP0_2_CrossProcessInterrupt_RowRecreatedOnFailure(t *testing.T) {
 	require.NoError(t, err, "should create row for phase 2")
 
 	// Verify the row exists
-	pi, err = newEnv.sessions.ConsumeInterruptInject(ctx, sess.ID)
+	pi, err = newEnv.sessions.PeekInterruptInject(ctx, sess.ID)
 	require.NoError(t, err)
 	require.NotNil(t, pi, "pending_injects row should exist for phase 2")
-	// Recreate it since ConsumeInterruptInject deleted it
-	err = newEnv.sessions.CreatePendingInject(ctx, injectPhase2)
-	require.NoError(t, err)
 
 	// Build the call for phase 2
 	callPhase2 := SessionAgentCall{

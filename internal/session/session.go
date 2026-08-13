@@ -217,21 +217,6 @@ type Service interface {
 	// DrainPendingInjects is called from PrepareStep to consume those rows.
 	CreatePendingInject(ctx context.Context, inject PendingInject) error
 	DrainPendingInjects(ctx context.Context, sessionID string) ([]PendingInject, bool, error)
-	// ConsumeInterruptInject reads and deletes (delete-after-read, in one
-	// transaction) the OLDEST interrupt=true pending_injects row for
-	// sessionID, returning it. Used by P0-2 fix (cross-process interrupt
-	// inject) to immediately consume the row and prevent duplicate
-	// processing by subsequent ticks.
-	//
-	// The row is recreated in startDetachedRun ONLY for the idle-session
-	// inject path (requeueInterruptMessage in coordinator.go). In that path,
-	// ConsumeInterruptInject deletes the row BEFORE the interrupt turn starts
-	// execution, so if the turn fails, the row is recreated to allow a future
-	// retry. In the owned-session inject path (inject during an active turn),
-	// the row is deleted AFTER execution succeeds, and no recreation occurs.
-	//
-	// Returns (nil, nil) when no interrupt row is pending.
-	ConsumeInterruptInject(ctx context.Context, sessionID string) (*PendingInject, error)
 	// PeekInterruptInject reads the OLDEST interrupt=true pending_injects row
 	// for sessionID WITHOUT deleting it. Used by handleInterruptTick to read
 	// the message reference before building call data, so it can call
@@ -241,9 +226,7 @@ type Service interface {
 	PeekInterruptInject(ctx context.Context, sessionID string) (*PendingInject, error)
 	// ConsumeInterruptInjectAndEnqueue atomically consumes the pending inject
 	// row identified by injectID (as read via PeekInterruptInject) and
-	// enqueues it to the run queue in a single transaction. This eliminates
-	// the data loss window that existed when ConsumeInterruptInject deleted
-	// the row first, then a fallible enqueue could fail. Matching on the
+	// enqueues it to the run queue in a single transaction. Matching on the
 	// specific injectID (not "the oldest row") avoids silently consuming a
 	// different row than the one callData was built from when a session has
 	// more than one pending interrupt row.
@@ -1174,45 +1157,6 @@ func (s *service) DrainPendingInjects(ctx context.Context, sessionID string) ([]
 	return merge, hasInterrupt, nil
 }
 
-// ConsumeInterruptInject — see Service interface doc. It selects the oldest
-// interrupt row, deletes it in the same transaction, and returns it. One
-// interrupt event = one cancel+requeue by the caller; consuming a single row
-// per call keeps that mapping crisp even if several interrupt rows piled up.
-func (s *service) ConsumeInterruptInject(ctx context.Context, sessionID string) (*PendingInject, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback() //nolint:errcheck
-
-	var (
-		pi        PendingInject
-		interrupt int64
-	)
-	row := tx.QueryRowContext(ctx,
-		`SELECT id, session_id, message_id, content, interrupt, created_at
-		 FROM pending_injects
-		 WHERE session_id = ? AND interrupt = 1
-		 ORDER BY created_at ASC LIMIT 1`,
-		sessionID,
-	)
-	if scanErr := row.Scan(&pi.ID, &pi.SessionID, &pi.MessageID, &pi.Content, &interrupt, &pi.CreatedAt); scanErr != nil {
-		if errors.Is(scanErr, sql.ErrNoRows) {
-			return nil, nil
-		}
-		return nil, scanErr
-	}
-	pi.Interrupt = interrupt != 0
-
-	if _, delErr := tx.ExecContext(ctx, `DELETE FROM pending_injects WHERE id = ?`, pi.ID); delErr != nil {
-		return nil, delErr
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	return &pi, nil
-}
-
 // PeekInterruptInject reads the OLDEST interrupt=true pending_injects row
 // for sessionID WITHOUT deleting it. Used by handleInterruptTick to read
 // the message reference before building call data, so it can call
@@ -1263,9 +1207,7 @@ func (s *service) DeleteInterruptInject(ctx context.Context, injectID string) er
 
 // ConsumeInterruptInjectAndEnqueue atomically consumes the pending inject row
 // identified by injectID and enqueues it to the run queue in a single
-// transaction. This eliminates the data loss window that existed when
-// ConsumeInterruptInject deleted the row first, then a fallible enqueue
-// could fail.
+// transaction.
 //
 // injectID must be the ID of a row the caller already read (e.g. via
 // PeekInterruptInject) and built callData from. Matching on that specific ID
