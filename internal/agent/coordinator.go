@@ -221,6 +221,17 @@ const (
 // startInterruptTicker), so there is no idle-process polling.
 const interruptInjectTick = 3 * time.Second
 
+// interruptTickOperationTimeout is the per-tick deadline for the
+// handleInterruptTick operation. If a tick's DB operations or downstream
+// calls block longer than this, the tick is abandoned with a timeout error
+// and the goroutine returns to the select loop to observe ctx.Done().
+// P1-3 fix: prevents a single blocking tick from permanently hanging
+// coordinator shutdown when the parent ctx is cancelled.
+// 10s is chosen as ~3x the tick interval — long enough that normal operation
+// never times out (a healthy tick completes in <<1s), but short enough that
+// a genuinely stuck tick doesn't block shutdown for an unreasonable duration.
+const interruptTickOperationTimeout = 10 * time.Second
+
 // maxConsecutiveAutoResumes bounds Phase 4 autonomous idle-resumes per session
 // without human involvement (reset by any human message). Anti-runaway: an
 // agent that keeps backgrounding self-completing jobs cannot loop forever.
@@ -2475,10 +2486,27 @@ func (c *coordinator) startInterruptTicker(ctx context.Context, sessionID string
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				_, err := c.handleInterruptTick(ctx, sessionID)
+				// P1-3 fix: give each tick a bounded operation deadline so that
+				// even if handleInterruptTick blocks (e.g., on a DB call or
+				// downstream dependency that ignores parent ctx cancellation),
+				// the tick returns within interruptTickOperationTimeout and we
+				// can observe ctx.Done() on the next loop iteration.
+				tickCtx, tickCancel := context.WithTimeout(ctx, interruptTickOperationTimeout)
+				_, err := c.handleInterruptTick(tickCtx, sessionID)
+				tickCancel()
+
 				if err != nil {
-					slog.Warn("coordinator: interrupt-inject tick failed",
-						"session_id", sessionID, "err", err)
+					if errors.Is(err, context.DeadlineExceeded) {
+						// This is a signal that some operation inside handleInterruptTick
+						// blocked without respecting ctx cancellation. Log at warning level
+						// so it's visible in production and warrants investigation, but don't
+						// stop the ticker — subsequent ticks may succeed.
+						slog.Warn("coordinator: interrupt-inject tick timed out",
+							"session_id", sessionID, "timeout", interruptTickOperationTimeout)
+					} else {
+						slog.Warn("coordinator: interrupt-inject tick failed",
+							"session_id", sessionID, "err", err)
+					}
 					continue
 				}
 				// Continue ticking: a replacement turn (triggered by this
