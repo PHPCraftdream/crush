@@ -1,5 +1,87 @@
 # Release gate — 2026-08-12/13 follow-up round
 
+## AMENDMENT (2026-08-13, post-independent-review): verdict revised to NO-GO
+
+The original verdict below (**GO**) was reached before an independent `@oh`
+review of the full round's diff. That review found a P0-severity functional
+regression the orchestrator's own zero-trust pass missed, and the
+orchestrator has since independently reproduced/confirmed it by reading the
+actual call chain (not just trusting the review). **The verdict is revised
+to NO-GO pending a fix.** The rest of this document is left as originally
+written, below, as the record of what was checked and how — only this
+amendment and the verdict line change.
+
+**F1 (blocker, confirmed)**: P0-1's fix (`handleInterruptTick` marks the
+call `FromDurableQueue=true`; `mailbox.interruptAndReplace` skips
+`mb.replacement` for such calls) correctly closes double-execution, but it
+also removes the ONLY in-process continuation path for an interrupt that
+lands on a busy session in `crush run` (non-interactive, `persistentMode =
+false`). Confirmed by direct read of the call chain:
+`coordinator.Run` → `runInternal` is a single call, no retry loop.
+`sessionAgent.Run`'s turn loop exits when `runTurn` returns `hasNext=false`
+(`agent.go:1601-1603`); for a `FromDurableQueue` interrupt, `mb.replacement`
+was never set, so `drainAfterCancel` finds nothing and the loop ends.
+`abandonOwnershipWithHandoff`'s fallback (`agent.go:1079`) only picks up
+calls already sitting in `mb.submitted`/`mb.replacement` — nothing, for
+this call, since P0-1 deliberately keeps it out of the mailbox. The call's
+only remaining owner is the durable `session_run_queue` row. `crush run`
+DOES start its own `RunQueuePump` in-process (confirmed,
+`internal/app/app.go:295`, unconditional on `dataDir != ""`, not gated on
+`persistentMode`) — but `app.Shutdown()`'s `RunQueuePump.Stop()`
+(`run_queue_pump.go:398`) cancels the pump's context and waits only for
+ALREADY-IN-FLIGHT workers, not for new pending entries — it does not drain
+pending work before stopping. If the CLI process's own
+`RunNonInteractive` → `Shutdown()` sequence completes before the pump's
+next 3-second tick (`RunQueuePumpInterval`), the newly-durable row is never
+picked up in that process's lifetime; it sits `pending` until some future
+`crush` invocation happens to start against the same session/data
+directory. Before this round, `mb.replacement` being set meant the SAME
+process would continue the call one way or another. This is a genuine,
+user-visible regression on the fork's flagship non-interactive workflow
+(`crush run` + `crush sessions inject --interrupt` on a busy session), not
+a low-probability race — filed as follow-up task requiring a real fix
+(either keep `mb.replacement` and have its own execution ack/delete the
+durable row via the call's `LogicalCallID`/`InjectID`, or have
+`RunNonInteractive`/`Shutdown` drain pending run-queue entries for the
+active session before the process exits). Release-gate properties 1 and 2
+below should be read as "closed for the at-most-once half, NOT closed for
+the at-least-once/liveness half" — the original text below overstates
+closure on property 2 in particular, since it explicitly assumed the
+now-invalidated "replacement turn runs under the same coordinator Run
+call" model.
+
+**F5 (confirmed, lower severity)**: `TestP1_1_FastRenewalNoFalsePositive`
+(added THIS round by the P1-1 fix-back, commit `f036065f`) was
+misattributed in this document's "known pre-existing flaky tests" list
+below — it is new, not pre-existing. Independently reproduced 1 failure
+out of a handful of runs of `go test ./internal/session -race -run
+'TestP1_1|TestPendingInjectsFIFO'`. Root cause confirmed by reading the
+test: its own doc comment claims `TTL=2s, safety_margin=500ms`, but the
+actual constants in the test body are `ttl=500ms, safetyMargin=100ms`
+(watchdog fires at 400ms; the test's execution window is 250ms — under
+150ms of headroom under real `-race` scheduling jitter). This is the only
+regression guard against the P1-1 watchdog false-positive-cancelling-healthy-work
+failure mode, so a ~genuinely-flaky guard on that specific property is a
+real (if lower-severity) gap, not just noise. Needs the constants widened
+to match the comment's intent, not just re-labeling as "known flaky."
+
+See task list (`#421` and follow-ups) for what's filed to close this.
+Everything else in the original document below — properties 3-9, the two
+orchestrator-found bugs (nil panic, LIFO deadlock), the pre-existing
+`internal/app` mock gap and `gofmt` gap — stands as independently
+re-confirmed by the `@oh` review (it explicitly agreed with all of those).
+`@oh` additionally found F2 (orphan outbox regresses best-effort execution
+to write-only, sharper framing of the already-tracked task #420), F3
+(P1-3's atomicity claim has a live gap: `buildAgentModels` still does
+separate `Config()` reads, and `SetProviderRuntimeConfig`'s "snapshot" is a
+shallow clone sharing the same `*Config` pointer as older snapshots), and
+F4 (two of the new P0-2 tests, `TestCheckpointLocalCoalescingNoSharedState`
+and `TestCheckpointDBWriteHasDeadline`, are vacuous — don't exercise
+production code at all). These are real but not release-blocking on their
+own; tracked as follow-ups below F1/F5.
+
+---
+
 Verdict point: `6b9abad6` (main). Source: `docs/reviews/2026-08-12-post-fix-release-readiness-follow-up.md`
 ("Минимальный release gate", 9 properties). This document is the composite
 verification the review asked for explicitly — "После фиксов провести
@@ -226,7 +308,10 @@ faith).
   Windows scheduling jitter under this machine's full-package `-race`
   load, and all pass reliably alone. None of these are new to this round.
 
-## Verdict
+## Verdict (SUPERSEDED — see AMENDMENT at the top of this document)
+
+**Original text, kept for the record — DO NOT treat "GO" below as current.
+Current verdict is NO-GO, see amendment above.**
 
 **GO**, with one explicit, non-blocking follow-up:
 
