@@ -293,8 +293,8 @@ type mailbox struct {
 //
 // That is the accepted trade: losing an unstarted prompt is better than
 // starting a fresh provider turn while the process is tearing its
-// database down. The one case that does survive is
-// requeueInterruptMessage's, whose call carries an ExistingMessageID for
+// database down. The one case that does survive is interrupt tick's,
+// whose call carries an ExistingMessageID for
 // a row `crush sessions inject` already wrote.
 //
 // Making this genuinely lossless needs the queue to be durable, which is

@@ -229,70 +229,7 @@ func TestPendingInjects(t *testing.T) {
 	})
 }
 
-// TestConsumeInterruptInject verifies the interrupt-row half of the queue:
-// ConsumeInterruptInject must return AND delete the oldest interrupt=true row,
-// leave non-interrupt rows untouched, and report (nil, nil) when the queue has
-// no interrupt row.
-func TestConsumeInterruptInject(t *testing.T) {
-	sqlDB, q := newTestDB(t)
-	svc := NewService(q, sqlDB)
-	ctx := t.Context()
 
-	sess, err := svc.Create(ctx, "interrupt sess")
-	require.NoError(t, err)
-
-	t.Run("empty queue returns nil", func(t *testing.T) {
-		pi, err := svc.ConsumeInterruptInject(ctx, sess.ID)
-		require.NoError(t, err)
-		assert.Nil(t, pi)
-	})
-
-	t.Run("consumes and deletes interrupt row, leaves merge rows", func(t *testing.T) {
-		require.NoError(t, svc.CreatePendingInject(ctx, PendingInject{
-			SessionID: sess.ID, MessageID: "msg-merge", Content: "merge me",
-		}))
-		require.NoError(t, svc.CreatePendingInject(ctx, PendingInject{
-			SessionID: sess.ID, MessageID: "msg-int", Content: "stop now", Interrupt: true,
-		}))
-
-		pi, err := svc.ConsumeInterruptInject(ctx, sess.ID)
-		require.NoError(t, err)
-		require.NotNil(t, pi)
-		assert.Equal(t, "msg-int", pi.MessageID)
-		assert.True(t, pi.Interrupt)
-
-		// Second consume is empty (delete-after-read).
-		pi2, err := svc.ConsumeInterruptInject(ctx, sess.ID)
-		require.NoError(t, err)
-		assert.Nil(t, pi2)
-
-		// The non-interrupt row must still be drainable.
-		merge, hasInterrupt, err := svc.DrainPendingInjects(ctx, sess.ID)
-		require.NoError(t, err)
-		assert.False(t, hasInterrupt)
-		require.Len(t, merge, 1)
-		assert.Equal(t, "msg-merge", merge[0].MessageID)
-	})
-
-	t.Run("consumes oldest interrupt row first", func(t *testing.T) {
-		require.NoError(t, svc.CreatePendingInject(ctx, PendingInject{
-			SessionID: sess.ID, MessageID: "int-old", Interrupt: true, CreatedAt: 1000,
-		}))
-		require.NoError(t, svc.CreatePendingInject(ctx, PendingInject{
-			SessionID: sess.ID, MessageID: "int-new", Interrupt: true, CreatedAt: 2000,
-		}))
-
-		pi, err := svc.ConsumeInterruptInject(ctx, sess.ID)
-		require.NoError(t, err)
-		require.NotNil(t, pi)
-		assert.Equal(t, "int-old", pi.MessageID)
-
-		pi2, err := svc.ConsumeInterruptInject(ctx, sess.ID)
-		require.NoError(t, err)
-		require.NotNil(t, pi2)
-		assert.Equal(t, "int-new", pi2.MessageID)
-	})
-}
 
 // TestConsumeInterruptInjectAndEnqueue_MatchesPeekedRow is a P0-2 regression
 // test: ConsumeInterruptInjectAndEnqueue must match the exact injectID the

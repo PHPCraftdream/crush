@@ -305,7 +305,7 @@ type SessionAgentCall struct {
 
 	// InjectID, when non-empty, is the ID of a pending_injects row that
 	// must be deleted AFTER successful OS lock acquisition. Set by the
-	// cross-process interrupt inject path (requeueInterruptMessage) to
+	// cross-process interrupt inject path (startDetachedRun) to
 	// prevent data loss if the detached run loses the OS lock race.
 	// P0-2 fix.
 	InjectID string
@@ -351,8 +351,8 @@ type SessionAgentCall struct {
 	// its backoff expires) would execute the same logical request independently
 	// (P0-1 in docs/reviews/2026-08-11-release-readiness-concurrency-and-code-review.md).
 	//
-	// For non-durable calls (web/CLI turns, cross-process interrupt-inject via
-	// requeueInterruptMessage), FromDurableQueue is false and the mailbox queue
+	// For non-durable calls (web/CLI turns, interrupt-inject via
+	// handleInterruptTick → InterruptAndReplace), FromDurableQueue is false and the mailbox queue
 	// is the only retry path, so submit's normal mb.submitted behavior applies.
 	FromDurableQueue bool
 
@@ -1043,7 +1043,7 @@ func (a *sessionAgent) drainOrReleaseMerged(sessionID string, epoch uint64, lk *
 	// handed to the current (now lock-less) turn loop. Each orphaned call
 	// gets its own independent, detached restart — the SAME mechanism
 	// coordinator.startDetachedRun already uses for InterruptAndSend/
-	// requeueInterruptMessage's "session was idle" case, since that is
+	// idle-session interrupt case, since that is
 	// exactly what this now is: from orphaned's perspective the session is
 	// idle (mbIdle, no lk held) the instant drainOrReleaseFinal returned.
 	a.restartOrphaned(orphaned)
