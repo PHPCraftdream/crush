@@ -1085,10 +1085,19 @@ func (c *coordinator) runInternal(ctx context.Context, sessionID string, prompt 
 	// message so it picks up immediately. Bound to this turn's lifetime via
 	// tickerCtx — stopped by the defer as soon as run() returns, so no
 	// idle-process polling. Runs for BOTH the initial turn and every retry
-	// re-run below (each run() sees a fresh ticker via this closure).
+	// re-run below (each run() sees a fresh ticker via this closure). The
+	// defer ensures the ticker goroutine has joined before runInternal returns.
 	tickerCtx, stopTicker := context.WithCancel(ctx)
-	defer stopTicker()
-	c.startInterruptTicker(tickerCtx, sessionID)
+	tickerDone := c.startInterruptTicker(tickerCtx, sessionID)
+	// defers run LIFO: stopTicker (cancel tickerCtx) must fire before we
+	// wait on tickerDone, or the join blocks forever waiting for a
+	// goroutine that's still parked on <-ctx.Done(). Combine both into one
+	// deferred func so the order is explicit and can't be silently
+	// reordered by a future defer inserted between the two.
+	defer func() {
+		stopTicker()
+		<-tickerDone
+	}()
 
 	beforeLoaded := c.skillTracker.LoadedNames()
 	var result *fantasy.AgentResult
@@ -2361,15 +2370,25 @@ func (c *coordinator) ClearQueue(sessionID string) {
 
 // startInterruptTicker launches a goroutine that polls pending_injects for an
 // interrupt=true row for sessionID every interruptInjectTick, for as long as
-// ctx is live (i.e. the duration of the owning turn). On the first interrupt
-// row it consumes it, requeues the already-persisted message via
-// requeueInterruptMessage, and returns — one interrupt event maps to exactly
-// one cancel+requeue; the turn restarts with that message and, if a new
-// interrupt arrives, the fresh turn's ticker handles it. The goroutine also
-// exits when ctx is cancelled (turn finished/aborted), so it never outlives
-// the turn.
-func (c *coordinator) startInterruptTicker(ctx context.Context, sessionID string) {
+// ctx is live (i.e. the duration of the owning turn). On each interrupt row
+// it consumes it, requeues the already-persisted message via
+// ConsumeInterruptInjectAndEnqueue, and cancels the running generation. The
+// goroutine continues ticking until ctx is cancelled, handling sequential
+// interrupts (each interrupt maps to one cancel+requeue; a replacement turn
+// runs under the same coordinator-level Run, and subsequent interrupts are
+// handled by the same ticker). This ensures that after the first interrupt,
+// the replacement turn itself remains interruptible by a second cross-process
+// interrupt. The goroutine also exits when ctx is cancelled (turn finished/
+// aborted), so it never outlives the turn.
+//
+// Returns a channel that is closed when the ticker goroutine exits. Callers
+// should defer a receive from this channel to ensure the goroutine has fully
+// joined before returning, avoiding in-flight handleInterruptTick execution
+// after context cancellation and DB cleanup.
+func (c *coordinator) startInterruptTicker(ctx context.Context, sessionID string) <-chan struct{} {
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		ticker := time.NewTicker(interruptInjectTick)
 		defer ticker.Stop()
 		for {
@@ -2377,18 +2396,20 @@ func (c *coordinator) startInterruptTicker(ctx context.Context, sessionID string
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				fired, err := c.handleInterruptTick(ctx, sessionID)
+				_, err := c.handleInterruptTick(ctx, sessionID)
 				if err != nil {
 					slog.Warn("coordinator: interrupt-inject tick failed",
 						"session_id", sessionID, "err", err)
 					continue
 				}
-				if fired {
-					return
-				}
+				// Continue ticking: a replacement turn (triggered by this
+				// interrupt) runs under the same coordinator Run call and
+				// remains interruptible. Subsequent interrupts will be handled
+				// by the same ticker (the durable queue serves FIFO ordering).
 			}
 		}
 	}()
+	return done
 }
 
 // handleInterruptTick performs one poll of the interrupt-inject queue. It
@@ -2852,10 +2873,17 @@ func (c *coordinator) RunSessionAgentCall(ctx context.Context, call SessionAgent
 	// (on the first hit) cancels the running turn and requeues the referenced
 	// message so it picks up immediately. Bound to this turn's lifetime via
 	// tickerCtx — stopped by the defer as soon as run() returns, so no
-	// idle-process polling.
+	// idle-process polling. The defer ensures the ticker goroutine has joined
+	// before RunSessionAgentCall returns.
 	tickerCtx, stopTicker := context.WithCancel(ctx)
-	defer stopTicker()
-	c.startInterruptTicker(tickerCtx, sessionID)
+	tickerDone := c.startInterruptTicker(tickerCtx, sessionID)
+	// defers run LIFO: stopTicker (cancel tickerCtx) must fire before we
+	// wait on tickerDone, or the join blocks forever waiting for a
+	// goroutine that's still parked on <-ctx.Done().
+	defer func() {
+		stopTicker()
+		<-tickerDone
+	}()
 
 	return c.currentAgent.Run(ctx, call)
 }
