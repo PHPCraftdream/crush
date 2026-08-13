@@ -63,6 +63,7 @@ const RunQueueMaxConcurrentExecutions = 10
 //   - Scheduling delays between watchdog timer firing and execCtx cancellation
 //   - Time for cancellation to propagate through Coordinator.Run to actual LLM/tool calls
 //   - Time for provider/tool code to respect cancellation (in-flight requests may complete)
+//
 // Production: 5 seconds means we cancel at least 5s before the lease actually expires.
 // A separate pump instance therefore cannot legitimately take ownership until at least
 // 5s after this executor has stopped, providing a strong bound against double-execution.

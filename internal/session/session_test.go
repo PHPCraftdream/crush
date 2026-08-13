@@ -229,8 +229,6 @@ func TestPendingInjects(t *testing.T) {
 	})
 }
 
-
-
 // TestConsumeInterruptInjectAndEnqueue_MatchesPeekedRow is a P0-2 regression
 // test: ConsumeInterruptInjectAndEnqueue must match the exact injectID the
 // caller peeked (and built callData from), not silently re-select "the

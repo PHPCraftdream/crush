@@ -45,11 +45,11 @@ import (
 // to simulate DB stalls.
 type hangingRenewalsService struct {
 	session.Service
-	mu                   sync.Mutex
-	hangAfterAttemptNum  int64  // Hang on this specific renewal attempt (0 = never hang)
-	hangDuration         time.Duration
-	renewalsAttempted    atomic.Int64
-	firstRenewalOK       bool
+	mu                  sync.Mutex
+	hangAfterAttemptNum int64 // Hang on this specific renewal attempt (0 = never hang)
+	hangDuration        time.Duration
+	renewalsAttempted   atomic.Int64
+	firstRenewalOK      bool
 }
 
 // RenewRunQueueLease hangs on a specific attempt to simulate DB stall.
@@ -117,10 +117,10 @@ func TestP1_1_WatchdogCancelsBeforeExpiry(t *testing.T) {
 
 	// First renewal succeeds, second renewal hangs
 	hangingSvc := &hangingRenewalsService{
-		Service:              svc,
-		hangAfterAttemptNum:  2,
-		hangDuration:         100 * time.Millisecond, // Longer than remaining safe budget
-		firstRenewalOK:       true,
+		Service:             svc,
+		hangAfterAttemptNum: 2,
+		hangDuration:        100 * time.Millisecond, // Longer than remaining safe budget
+		firstRenewalOK:      true,
 	}
 
 	pump := session.NewRunQueuePump(session.RunQueuePumpConfig{
@@ -298,10 +298,10 @@ func TestP1_1_WatchdogWithVeryShortTTL(t *testing.T) {
 
 	// Let first renewal succeed, then hang
 	hangingSvc := &hangingRenewalsService{
-		Service:              svc,
-		hangAfterAttemptNum:  2,
-		hangDuration:         200 * time.Millisecond, // Longer than remaining budget
-		firstRenewalOK:       true,
+		Service:             svc,
+		hangAfterAttemptNum: 2,
+		hangDuration:        200 * time.Millisecond, // Longer than remaining budget
+		firstRenewalOK:      true,
 	}
 
 	pump := session.NewRunQueuePump(session.RunQueuePumpConfig{
@@ -388,10 +388,10 @@ func TestP1_1_DynamicRenewalTimeout(t *testing.T) {
 
 	// First renewal hangs for longer than the safe budget
 	hangingSvc := &hangingRenewalsService{
-		Service:              svc,
-		hangAfterAttemptNum:  1,  // Hang on first renewal
-		hangDuration:         250 * time.Millisecond, // Longer than TTL - margin = 200ms
-		firstRenewalOK:       false, // First renewal hangs (not succeeded immediately)
+		Service:             svc,
+		hangAfterAttemptNum: 1,                      // Hang on first renewal
+		hangDuration:        250 * time.Millisecond, // Longer than TTL - margin = 200ms
+		firstRenewalOK:      false,                  // First renewal hangs (not succeeded immediately)
 	}
 
 	pump := session.NewRunQueuePump(session.RunQueuePumpConfig{
