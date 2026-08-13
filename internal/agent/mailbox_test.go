@@ -295,7 +295,7 @@ func TestMailbox_InterruptAndReplace_OwnedRecordsReplacementAndReturnsCurrentCan
 	cancel, hadOwner := mb.interruptAndReplace(call)
 
 	require.True(t, hadOwner, "interruptAndReplace on an owned mailbox must report an owner existed")
-	require.NotNil(t, mb.replacement, "the replacement must be durably recorded")
+	require.NotNil(t, mb.replacement, "the replacement must be recorded")
 	require.Equal(t, call, *mb.replacement)
 	require.NotNil(t, cancel, "the current generation's cancel func must be returned")
 
@@ -336,7 +336,7 @@ func TestMailbox_InterruptAndReplace_OwnedButNoLiveGeneration_RecordsReplacement
 
 	require.True(t, hadOwner, "an owned mailbox must still report an owner existed, even with no live generation — "+
 		"the caller's contract is 'accepted, will run next', not 'a generation was actually interrupted'")
-	require.NotNil(t, mb.replacement, "the replacement must still be durably recorded")
+	require.NotNil(t, mb.replacement, "the replacement must still be recorded")
 	require.Equal(t, call, *mb.replacement)
 	require.Nil(t, cancel, "must NOT fall back to dispatcherCancel — firing it would cancel runCtx, the parent of "+
 		"every future turn's context, not just the (nonexistent) current generation")

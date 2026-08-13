@@ -513,7 +513,7 @@ func TestReleaseGate_3_CrossProcessInterruptAutoResumed(t *testing.T) {
 	err = env.sessions.CreatePendingInject(ctx, inject)
 	require.NoError(t, err)
 
-	// Build the call manually (simulating requeueInterruptMessage).
+	// Build the call manually (for testing purposes).
 	call := SessionAgentCall{
 		SessionID:         sess.ID,
 		Prompt:            msg.FullText(),
