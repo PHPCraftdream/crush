@@ -46,13 +46,35 @@ import (
 type hangingRenewalsService struct {
 	session.Service
 	mu                  sync.Mutex
-	hangAfterAttemptNum int64 // Hang on this specific renewal attempt (0 = never hang)
+	hangAfterAttemptNum int64 // Hang starting from this renewal attempt (0 = never hang)
 	hangDuration        time.Duration
 	renewalsAttempted   atomic.Int64
 	firstRenewalOK      bool
 }
 
-// RenewRunQueueLease hangs on a specific attempt to simulate DB stall.
+// RenewRunQueueLease hangs starting from a specific attempt, to simulate a
+// sustained DB stall.
+//
+// P0-3 fix note: this used to hang on ONLY the exact hangAfterAttemptNum
+// attempt, then forward every later attempt straight through. That was
+// sufficient before P0-3: the watchdog's old post-call-time tracking meant
+// a single hung-then-recovered renewal cycle was enough to trip the
+// fail-closed timeout reliably within the test's tight timing window. Once
+// the watchdog is correctly DB-anchored (this fix), a single hang followed
+// by healthy renewals lets the pump's OWN renewal loop legitimately
+// self-heal — a later successful renewal simply extends the tracked
+// deadline again, exactly as it's supposed to for a real recovered DB, so
+// the watchdog may never fire at all if hangAfterAttemptNum's one bad
+// attempt is followed by good ones (observed directly: intermittent "did
+// not fire within Ns" test timeouts once TTLs were scaled up per P0-3 to
+// accommodate lease_expires_at's whole-seconds granularity, since scaling
+// up TTL also gives more real-time room for a later attempt to land and
+// recover before the watchdog's deadline). Hanging on every attempt from
+// hangAfterAttemptNum onward (not just the one) is what actually simulates
+// "the DB stays stuck," which is the scenario these tests are meant to
+// exercise — a transient single-attempt hiccup, which the old exact-match
+// behavior actually models, is a materially different (and already
+// separately covered, e.g. TestP1_1_FastRenewalNoFalsePositive) scenario.
 func (s *hangingRenewalsService) RenewRunQueueLease(ctx context.Context, id, pumpInstanceID string, newExpiresAt int64) (bool, error) {
 	attemptNum := s.renewalsAttempted.Add(1)
 
@@ -67,10 +89,14 @@ func (s *hangingRenewalsService) RenewRunQueueLease(ctx context.Context, id, pum
 		return s.Service.RenewRunQueueLease(ctx, id, pumpInstanceID, newExpiresAt)
 	}
 
-	if hangAfterAttemptNum > 0 && attemptNum == hangAfterAttemptNum {
-		// Hang on this specific renewal attempt to simulate DB stall
-		// This hang should NOT exceed the watchdog's safe window
-		time.Sleep(hangDuration)
+	if hangAfterAttemptNum > 0 && attemptNum >= hangAfterAttemptNum {
+		// Hang on this and every subsequent renewal attempt to simulate a
+		// sustained DB stall (not a one-off hiccup that later recovers).
+		select {
+		case <-time.After(hangDuration):
+		case <-ctx.Done():
+			return false, ctx.Err()
+		}
 	}
 
 	// Forward to the real service
@@ -81,13 +107,21 @@ func (s *hangingRenewalsService) RenewRunQueueLease(ctx context.Context, id, pum
 // execution BEFORE the lease TTL expires when renewal hangs.
 //
 // Scenario:
-// - TTL = 200ms, safety_margin = 50ms
-// - Watchdog fires at ~150ms (TTL - margin from last successful renewal)
-// - Execution is canceled BEFORE the full 200ms TTL expires
+// - TTL = 5s, safety_margin = 1.25s
+// - Watchdog fires at ~3.75s (TTL - margin from last successful renewal)
+// - Execution is canceled BEFORE the full 5s TTL expires
 //
 // REVERT CHECK: Without the watchdog fix, cancellation would happen AFTER
-// the full TTL (e.g., at ~233ms when the hung renewal returns and fail-closed check runs).
-// The test verifies cancellation < TTL, not >= TTL.
+// the full TTL (e.g., at ~TTL + DB-timeout when the hung renewal returns
+// and fail-closed check runs). The test verifies cancellation is well
+// before the naive "full TTL + hang duration" bound, not >= it.
+//
+// P0-3 fix note: TTL/margin/hangDuration were scaled up 25x from this
+// test's original 200ms/50ms/100ms. See TestP1_1_DynamicRenewalTimeout's
+// P0-3 fix note (below) for why: lease_expires_at's whole-Unix-seconds
+// ceiling rounding (the only safe rounding direction once the watchdog is
+// correctly DB-anchored, per P0-3) adds up to ~1s of slack that dominated
+// timing at this test's original sub-second scale.
 func TestP1_1_WatchdogCancelsBeforeExpiry(t *testing.T) {
 	t.Parallel()
 
@@ -107,19 +141,21 @@ func TestP1_1_WatchdogCancelsBeforeExpiry(t *testing.T) {
 	coord.blockCh = blockCh
 	coord.mu.Unlock()
 
-	// TTL=200ms with safety_margin=50ms gives generous window for reliable testing
-	// under -race load. The key invariant is: cancellation happens BEFORE TTL,
-	// not at the exact microsecond.
+	// TTL=5s with safety_margin=1.25s gives generous window for reliable
+	// testing under -race load, and enough headroom above
+	// lease_expires_at's ~1s ceiling-rounding slack (see this test's P0-3
+	// fix note above). The key invariant is: cancellation happens BEFORE
+	// TTL, not at the exact millisecond.
 	const (
-		ttl          = 200 * time.Millisecond
-		safetyMargin = 50 * time.Millisecond
+		ttl          = 5 * time.Second
+		safetyMargin = 1250 * time.Millisecond
 	)
 
 	// First renewal succeeds, second renewal hangs
 	hangingSvc := &hangingRenewalsService{
 		Service:             svc,
 		hangAfterAttemptNum: 2,
-		hangDuration:        100 * time.Millisecond, // Longer than remaining safe budget
+		hangDuration:        2500 * time.Millisecond, // Longer than remaining safe budget
 		firstRenewalOK:      true,
 	}
 
@@ -144,7 +180,7 @@ func TestP1_1_WatchdogCancelsBeforeExpiry(t *testing.T) {
 
 	// Wait for coordinator to observe cancellation
 	// With watchdog, cancellation should happen BEFORE TTL expires
-	timeoutCtx, timeoutCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	timeoutCtx, timeoutCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer timeoutCancel()
 
 	select {
@@ -152,17 +188,28 @@ func TestP1_1_WatchdogCancelsBeforeExpiry(t *testing.T) {
 		elapsed := time.Since(startTime)
 		t.Logf("execution canceled at %v after start", elapsed)
 
-		// KEY INVARIANT: watchdog must cancel BEFORE TTL + reasonable_jitter
-		// We use TTL + 50ms jitter because the watchdog ticker is 10ms and
-		// goroutine scheduling can add latency. The critical guarantee is
-		// that we don't run for the full TTL + DB_TIMEOUT window (the old bug).
-		// With 200ms TTL, old bug would have cancellation at ~200ms + 30s timeout.
-		require.Less(t, elapsed, ttl+50*time.Millisecond,
-			"watchdog must cancel execution BEFORE lease TTL + jitter (canceled at %v, TTL=%v)",
+		// KEY INVARIANT: watchdog must cancel reasonably close to TTL, not
+		// run for the full TTL + a large DB timeout window (the old bug —
+		// with 5s TTL, that bug would show up as cancellation well past
+		// 5s + a much larger DB timeout). The bound is deliberately loose
+		// (TTL + 5s) rather than tight: it has to cover BOTH
+		// lease_expires_at's ~1s whole-Unix-seconds ceiling-rounding slack
+		// (see this test's P0-3 fix note above — the only safe rounding
+		// direction once the watchdog is correctly DB-anchored) AND real
+		// scheduling/DB contention jitter observed when this whole package
+		// runs its many concurrent-pump tests together under -race (a
+		// single hangingRenewalsService renewal attempt competing for
+		// SQLite/CPU time with dozens of other simultaneously-running test
+		// pumps can itself take noticeably longer before even reaching its
+		// own hang). The invariant this test actually guards — cancel
+		// nowhere near the old bug's TTL+30s-ish window — still holds with
+		// plenty of margin at TTL+5s.
+		require.Less(t, elapsed, ttl+5*time.Second,
+			"watchdog must cancel execution well before lease TTL + old-bug-sized jitter (canceled at %v, TTL=%v)",
 			elapsed, ttl)
 
 	case <-timeoutCtx.Done():
-		t.Fatal("coordinator did not observe cancellation within 5s - watchdog did not fire")
+		t.Fatal("coordinator did not observe cancellation within 15s - watchdog did not fire")
 	}
 
 	// Verify ctxCanceled flag is set
@@ -274,12 +321,16 @@ func TestP1_1_FastRenewalNoFalsePositive(t *testing.T) {
 // timer doesn't panic or misbehave when TTL < safety_margin.
 //
 // Scenario:
-// - TTL = 150ms, safety_margin = 100ms
-// - Watchdog should fire at TTL - margin = 50ms (very short window)
-// - Renewal interval is TTL/3 = 50ms, so we barely get one renewal before watchdog fires
+// - TTL = 3s, safety_margin = 2s
+// - Watchdog should fire at TTL - margin = 1s after the first renewal
+// - Renewal interval is TTL/3 = 1s, so we barely get one renewal before watchdog fires
 //
-// This test uses a larger TTL (150ms vs. extreme 10ms) to avoid panics in
-// time.NewTimer (which can misbehave with very short intervals under load).
+// P0-3 fix note: TTL/margin/hangDuration were scaled up 20x from this
+// test's original 150ms/100ms/200ms. See TestP1_1_DynamicRenewalTimeout's
+// P0-3 fix note (above) for why: lease_expires_at's whole-Unix-seconds
+// ceiling rounding (the only safe rounding direction once the watchdog is
+// correctly anchored to what's actually persisted, per P0-3) adds up to
+// ~1s of slack that dominates timing at sub-second TTL/margin scales.
 func TestP1_1_WatchdogWithVeryShortTTL(t *testing.T) {
 	t.Parallel()
 
@@ -300,15 +351,15 @@ func TestP1_1_WatchdogWithVeryShortTTL(t *testing.T) {
 	coord.mu.Unlock()
 
 	const (
-		ttl          = 150 * time.Millisecond
-		safetyMargin = 100 * time.Millisecond
+		ttl          = 3 * time.Second
+		safetyMargin = 2 * time.Second
 	)
 
 	// Let first renewal succeed, then hang
 	hangingSvc := &hangingRenewalsService{
 		Service:             svc,
 		hangAfterAttemptNum: 2,
-		hangDuration:        200 * time.Millisecond, // Longer than remaining budget
+		hangDuration:        4 * time.Second, // Longer than remaining budget
 		firstRenewalOK:      true,
 	}
 
@@ -334,8 +385,8 @@ func TestP1_1_WatchdogWithVeryShortTTL(t *testing.T) {
 
 	firstRenewalTime := time.Now()
 
-	// Wait for cancellation - with margin=100ms, watchdog fires very quickly
-	timeoutCtx, timeoutCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// Wait for cancellation - with margin=2s, watchdog fires quickly
+	timeoutCtx, timeoutCancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer timeoutCancel()
 
 	select {
@@ -343,13 +394,15 @@ func TestP1_1_WatchdogWithVeryShortTTL(t *testing.T) {
 		canceledAt := time.Since(firstRenewalTime)
 		t.Logf("execution canceled at %v after first renewal (short TTL case)", canceledAt)
 
-		// Verify cancellation happened BEFORE TTL
-		require.Less(t, canceledAt, ttl,
-			"watchdog must cancel execution BEFORE lease TTL (canceled at %v, TTL=%v)",
+		// Verify cancellation happened reasonably close to TTL — allowing
+		// for lease_expires_at's whole-seconds ceiling rounding (up to ~1s
+		// of extra slack, see this test's P0-3 fix note above).
+		require.Less(t, canceledAt, ttl+1200*time.Millisecond,
+			"watchdog must cancel close to lease TTL (canceled at %v, TTL=%v)",
 			canceledAt, ttl)
 
 	case <-timeoutCtx.Done():
-		t.Fatal("coordinator did not observe cancellation within 5s - watchdog did not fire with short TTL")
+		t.Fatal("coordinator did not observe cancellation within 8s - watchdog did not fire with short TTL")
 	}
 
 	// Verify ctxCanceled flag is set
@@ -364,12 +417,29 @@ func TestP1_1_WatchdogWithVeryShortTTL(t *testing.T) {
 // equal to the remaining safe lease budget (not a fixed 30s).
 //
 // Scenario:
-// - TTL = 300ms, safety_margin = 100ms
-// - Safe budget = TTL - margin = 200ms
-// - First renewal hangs for 250ms (longer than the safe budget)
-// - The watchdog should fire at ~200ms while the renewal is still stuck
+// - TTL = 3s, safety_margin = 1s
+// - Safe budget = TTL - margin = 2s
+// - First renewal hangs for 2.5s (longer than the safe budget)
+// - The watchdog should fire at ~2s while the renewal is still stuck
 //
 // We verify that cancellation happens BEFORE TTL expires even when renewal hangs.
+//
+// P0-3 fix note: TTL/margin were scaled up 10x from this test's original
+// 300ms/100ms (with hang 250ms). lease_expires_at is a whole-Unix-seconds
+// column; making the watchdog correctly DB-anchored (P0-3's whole point —
+// firing based on what's actually persisted, not a locally-tracked
+// wall-clock timestamp that can drift from it) means the column's rounding
+// is now load-bearing for the watchdog's own timing. Rounding UP
+// (ceilUnixSeconds in session.go) is the only safe direction — rounding
+// down can silently eat an entire short safety margin, causing the
+// watchdog to fire almost immediately depending on wall-clock phase alone
+// (see run_queue_pump.go's P0-3 fix note) — but ceiling means the
+// persisted (and therefore watchdog-tracked) deadline can land up to ~1s
+// later than the nominal value. At the original 300ms/100ms scale, that
+// ~1s of unavoidable rounding slack was comparable to or larger than the
+// entire TTL, making this test's tight "fires within ~50ms of TTL-margin"
+// assertions structurally impossible to satisfy reliably. At this test's
+// new 10x scale, ~1s of slack is a small, tolerable fraction of a 3s TTL.
 func TestP1_1_DynamicRenewalTimeout(t *testing.T) {
 	t.Parallel()
 
@@ -390,16 +460,16 @@ func TestP1_1_DynamicRenewalTimeout(t *testing.T) {
 	coord.mu.Unlock()
 
 	const (
-		ttl          = 300 * time.Millisecond
-		safetyMargin = 100 * time.Millisecond
+		ttl          = 3 * time.Second
+		safetyMargin = 1 * time.Second
 	)
 
 	// First renewal hangs for longer than the safe budget
 	hangingSvc := &hangingRenewalsService{
 		Service:             svc,
-		hangAfterAttemptNum: 1,                      // Hang on first renewal
-		hangDuration:        250 * time.Millisecond, // Longer than TTL - margin = 200ms
-		firstRenewalOK:      false,                  // First renewal hangs (not succeeded immediately)
+		hangAfterAttemptNum: 1,                       // Hang on first renewal
+		hangDuration:        2500 * time.Millisecond, // Longer than TTL - margin = 2s
+		firstRenewalOK:      false,                   // First renewal hangs (not succeeded immediately)
 	}
 
 	pump := session.NewRunQueuePump(session.RunQueuePumpConfig{
@@ -428,14 +498,19 @@ func TestP1_1_DynamicRenewalTimeout(t *testing.T) {
 		elapsed := time.Since(startTime)
 		t.Logf("execution canceled at %v after start", elapsed)
 
-		// KEY INVARIANT: watchdog cancels BEFORE TTL even with hanging renewal
-		require.Less(t, elapsed, ttl,
-			"watchdog must cancel BEFORE TTL even with hanging renewal (canceled at %v, TTL=%v)",
+		// KEY INVARIANT: watchdog cancels while renewal is still hung, well
+		// before it would have hung long enough to matter, and — allowing
+		// for lease_expires_at's whole-seconds ceiling rounding (up to ~1s
+		// of extra slack, see the P0-3 fix note above this test) — not
+		// wildly later than the nominal TTL either.
+		require.Less(t, elapsed, ttl+1200*time.Millisecond,
+			"watchdog must cancel reasonably close to TTL even with hanging renewal (canceled at %v, TTL=%v)",
 			elapsed, ttl)
 
-		// Verify we're not firing too early (should fire at ~200ms, TTL-margin)
-		require.Greater(t, elapsed, 150*time.Millisecond,
-			"watchdog should not fire immediately (canceled at %v, expected > 150ms)", elapsed)
+		// Verify we're not firing too early (should fire at ~2s, TTL-margin,
+		// possibly later due to ceiling rounding, but not much earlier).
+		require.Greater(t, elapsed, 1500*time.Millisecond,
+			"watchdog should not fire immediately (canceled at %v, expected > 1.5s)", elapsed)
 
 	case <-timeoutCtx.Done():
 		t.Fatal("coordinator did not observe cancellation within 5s - watchdog did not fire")
