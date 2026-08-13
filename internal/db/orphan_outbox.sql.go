@@ -54,6 +54,22 @@ func (q *Queries) CleanupOldDoneOrphanOutboxEntries(ctx context.Context, updated
 	return err
 }
 
+const deleteOrphanOutboxEntryIfPending = `-- name: DeleteOrphanOutboxEntryIfPending :execrows
+DELETE FROM orphan_call_outbox
+WHERE id = ? AND status = 'pending'
+`
+
+// Delete an orphan outbox entry only if it's still pending (for atomic drain).
+// Returns the number of rows deleted (0 or 1).
+// Used by DrainOrphanOutboxEntry to atomically move entries to the main queue.
+func (q *Queries) DeleteOrphanOutboxEntryIfPending(ctx context.Context, id string) (int64, error) {
+	result, err := q.exec(ctx, q.deleteOrphanOutboxEntryIfPendingStmt, deleteOrphanOutboxEntryIfPending, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const getOrphanOutboxEntry = `-- name: GetOrphanOutboxEntry :one
 SELECT id, session_id, call_data, status, attempts, max_attempts, last_error, created_at, updated_at
 FROM orphan_call_outbox

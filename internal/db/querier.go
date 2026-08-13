@@ -58,6 +58,10 @@ type Querier interface {
 	CreateSessionPermission(ctx context.Context, arg CreateSessionPermissionParams) error
 	DeleteFile(ctx context.Context, id string) error
 	DeleteMessage(ctx context.Context, id string) error
+	// Delete an orphan outbox entry only if it's still pending (for atomic drain).
+	// Returns the number of rows deleted (0 or 1).
+	// Used by DrainOrphanOutboxEntry to atomically move entries to the main queue.
+	DeleteOrphanOutboxEntryIfPending(ctx context.Context, id string) (int64, error)
 	DeletePendingInject(ctx context.Context, id string) error
 	DeletePermission(ctx context.Context, id string) error
 	DeleteSession(ctx context.Context, id string) error

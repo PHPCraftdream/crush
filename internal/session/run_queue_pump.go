@@ -618,72 +618,31 @@ func (p *RunQueuePump) drainOrphanOutbox() {
 	}
 }
 
-// processOrphanOutboxEntry attempts to claim and move a single orphan
-// outbox entry to the main run queue.
+// processOrphanOutboxEntry attempts to move a single orphan
+// outbox entry to the main run queue atomically.
 func (p *RunQueuePump) processOrphanOutboxEntry(ctx context.Context, entry db.OrphanCallOutbox) {
-	// Atomically claim the entry (pending -> processing, increment attempts)
-	claimed, err := p.cfg.Sessions.ClaimOrphanOutboxEntry(ctx, entry.ID)
+	// Create a fresh context for this specific drain operation with a longer timeout
+	// to avoid canceling the transaction mid-operation
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer drainCancel()
+
+	// Atomically drain the entry (INSERT to main queue + DELETE from orphan outbox in one tx)
+	// This eliminates the vulnerable 'processing' intermediate state that could leave
+	// entries stranded after crashes (P0-4 fix).
+	drained, err := p.cfg.Sessions.DrainOrphanOutboxEntry(drainCtx, entry.ID)
 	if err != nil {
-		slog.Error("run_queue_pump: failed to claim orphan outbox entry", "id", entry.ID, "session_id", entry.SessionID, "err", err, "instance_id", p.cfg.PumpInstanceID)
+		slog.Error("run_queue_pump: failed to drain orphan outbox entry", "id", entry.ID, "session_id", entry.SessionID, "err", err, "instance_id", p.cfg.PumpInstanceID)
 		return
 	}
-	if claimed == nil {
-		// Entry is no longer pending (claimed by another pump or already done/failed)
-		slog.Debug("run_queue_pump: orphan outbox entry no longer pending, skipping", "id", entry.ID, "instance_id", p.cfg.PumpInstanceID)
-		return
-	}
-
-	// Use the outbox entry ID as the idempotency key for the main queue
-	// (it's already unique and the same semantic work)
-	idempotencyKey := claimed.ID
-
-	// Attempt to enqueue to the main run queue
-	err = p.cfg.Sessions.EnqueueRunQueueEntry(ctx, idempotencyKey, claimed.SessionID, []byte(claimed.CallData))
-	if err != nil {
-		// Enqueue failed - check if we've exhausted attempts
-		if claimed.Attempts >= claimed.MaxAttempts {
-			slog.Error("run_queue_pump: orphan outbox entry exhausted attempts, marking failed",
-				"id", claimed.ID,
-				"session_id", claimed.SessionID,
-				"attempts", claimed.Attempts,
-				"max_attempts", claimed.MaxAttempts,
-				"last_error", err.Error(),
-				"instance_id", p.cfg.PumpInstanceID)
-			if failErr := p.cfg.Sessions.MarkOrphanOutboxEntryFailed(ctx, claimed.ID, err.Error()); failErr != nil {
-				slog.Error("run_queue_pump: failed to mark orphan outbox entry as failed", "id", claimed.ID, "err", failErr, "instance_id", p.cfg.PumpInstanceID)
-			}
-		} else {
-			// Release back to 'pending' so a future drain cycle's
-			// ListPendingOrphanOutboxEntries scan (status='pending' only)
-			// picks it up again. ClaimOrphanOutboxEntry already incremented
-			// attempts; leaving the row in 'processing' here would make it
-			// permanently invisible to every future scan since nothing
-			// queries 'processing' rows — it would never reach 'done' or
-			// 'failed'.
-			slog.Warn("run_queue_pump: failed to enqueue orphan outbox entry to main queue, will retry",
-				"id", claimed.ID,
-				"session_id", claimed.SessionID,
-				"attempts", claimed.Attempts,
-				"max_attempts", claimed.MaxAttempts,
-				"err", err.Error(),
-				"instance_id", p.cfg.PumpInstanceID)
-			if relErr := p.cfg.Sessions.ReleaseOrphanOutboxEntryForRetry(ctx, claimed.ID, err.Error()); relErr != nil {
-				slog.Error("run_queue_pump: failed to release orphan outbox entry for retry", "id", claimed.ID, "err", relErr, "instance_id", p.cfg.PumpInstanceID)
-			}
-		}
-		return
-	}
-
-	// Success: mark the outbox entry as done
-	if err := p.cfg.Sessions.MarkOrphanOutboxEntryDone(ctx, claimed.ID); err != nil {
-		slog.Error("run_queue_pump: failed to mark orphan outbox entry as done", "id", claimed.ID, "err", err, "instance_id", p.cfg.PumpInstanceID)
+	if !drained {
+		// Entry was already drained by another pump instance or not in pending state
+		slog.Debug("run_queue_pump: orphan outbox entry already drained, skipping", "id", entry.ID, "instance_id", p.cfg.PumpInstanceID)
 		return
 	}
 
 	slog.Info("run_queue_pump: successfully drained orphan outbox entry to main queue",
-		"id", claimed.ID,
-		"session_id", claimed.SessionID,
-		"attempts", claimed.Attempts,
+		"id", entry.ID,
+		"session_id", entry.SessionID,
 		"instance_id", p.cfg.PumpInstanceID)
 }
 
