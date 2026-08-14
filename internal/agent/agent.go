@@ -558,6 +558,22 @@ type sessionAgent struct {
 	// Run()/Summarize() on this agent. Set from SessionAgentOptions at
 	// construction. 0 = use the default (30s).
 	streamWatchdogTick time.Duration
+	// titleJoinGrace, when > 0, overrides the package-level titleJoinGrace
+	// const for every Run() on this agent. Set from
+	// SessionAgentOptions.TitleJoinGrace at construction. 0 = use the
+	// default (5s). Test-only seam (task #454, following up on task
+	// #450/#453's test-speed investigation): several tests assert on the
+	// grace period actually firing (a hung title provider must be
+	// abandoned, not joined forever) and had no way to observe that faster
+	// than the real 5s bound.
+	titleJoinGrace time.Duration
+	// cancelAllGrace, when > 0, overrides CancelAll's own 5s runWg.Wait
+	// grace period (a separate constant from titleJoinGrace, even though
+	// both happen to default to 5s). Set from
+	// SessionAgentOptions.CancelAllGrace at construction. 0 = use the
+	// default (5s). Test-only seam (task #454), same rationale as
+	// titleJoinGrace.
+	cancelAllGrace time.Duration
 	// dataDir is the absolute path to .crush/, used for the per-session
 	// inter-process file lock. Empty means locking is disabled (legacy
 	// callers / tests). Plumbed from SessionAgentOptions.DataDirectory.
@@ -662,6 +678,14 @@ type SessionAgentOptions struct {
 	// StreamIdleTimeout overrides streamIdleTimeoutDefault when > 0.
 	// Plumbed from Options.StreamIdleTimeoutSeconds in the coordinator.
 	StreamIdleTimeout time.Duration
+	// TitleJoinGrace overrides the package-level titleJoinGrace const (5s)
+	// when > 0. Test-only seam (task #454) — production callers leave this
+	// unset.
+	TitleJoinGrace time.Duration
+	// CancelAllGrace overrides CancelAll's own 5s runWg.Wait grace period
+	// when > 0. Test-only seam (task #454) — production callers leave this
+	// unset.
+	CancelAllGrace time.Duration
 	// DataDirectory is the absolute path to .crush/. Used by Run() to
 	// acquire an inter-process file lock per session (prevents two
 	// crush processes from accidentally working on the same session
@@ -756,6 +780,8 @@ func NewSessionAgent(
 		mailboxes:                  csync.NewMap[string, *mailbox](),
 		streamIdleTimeout:          opts.StreamIdleTimeout,
 		streamWatchdogTick:         opts.StreamWatchdogTick,
+		titleJoinGrace:             opts.TitleJoinGrace,
+		cancelAllGrace:             opts.CancelAllGrace,
 		dataDir:                    opts.DataDirectory,
 		lockOptions:                opts.LockOptions,
 		checkpointInterval:         opts.CheckpointInterval,
@@ -1967,13 +1993,17 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 		if titleDone == nil {
 			return
 		}
+		grace := titleJoinGrace
+		if a.titleJoinGrace > 0 {
+			grace = a.titleJoinGrace
+		}
 		select {
 		case <-titleDone:
-		case <-time.After(titleJoinGrace):
+		case <-time.After(grace):
 			slog.Warn(
 				"agent: abandoning title generation that outlived its deadline — the turn is not held open for it",
 				"session_id", call.SessionID,
-				"grace", titleJoinGrace,
+				"grace", grace,
 			)
 		}
 	}()
@@ -4679,6 +4709,10 @@ func (a *sessionAgent) CancelAll() (stillBusy bool) {
 	// "not busy" before the actual Run() goroutines had unwound (defer
 	// cleanup, final DB writes, etc.). Use a 5-second timeout to match the
 	// old grace period.
+	grace := 5 * time.Second
+	if a.cancelAllGrace > 0 {
+		grace = a.cancelAllGrace
+	}
 	waitDone := make(chan struct{})
 	go func() {
 		a.runWg.Wait()
@@ -4689,7 +4723,7 @@ func (a *sessionAgent) CancelAll() (stillBusy bool) {
 	case <-waitDone:
 		// All Run() goroutines have finished. Clean shutdown.
 		return false
-	case <-time.After(5 * time.Second):
+	case <-time.After(grace):
 		// Grace period expired but some Run() goroutines are still running.
 		// Return true to signal forced shutdown.
 		return true

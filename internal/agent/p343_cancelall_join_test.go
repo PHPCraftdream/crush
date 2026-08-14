@@ -62,6 +62,7 @@ func (b *blockingTool) SetProviderOptions(_ fantasy.ProviderOptions) {}
 //  3. Observe the timing/return-value assertions no longer hold the same way.
 //  4. Restore the fix.
 func TestP343_CancelAllTrueJoinWaitsForRealBlockedRun(t *testing.T) {
+	t.Parallel()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		fl, _ := w.(http.Flusher)
@@ -112,6 +113,10 @@ func TestP343_CancelAllTrueJoinWaitsForRealBlockedRun(t *testing.T) {
 		Messages:             env.messages,
 		Tools:                []fantasy.AgentTool{tool},
 		DisableAutoSummarize: true,
+		// testCancelAllGrace (task #454, defined in
+		// p0_4_shutdown_join_test.go — same package), not the production
+		// 5s default.
+		CancelAllGrace: testCancelAllGrace,
 	})
 
 	ctx := context.Background()
@@ -137,7 +142,7 @@ func TestP343_CancelAllTrueJoinWaitsForRealBlockedRun(t *testing.T) {
 		t.Fatal("blocking tool never started — test setup is broken, proves nothing")
 	}
 
-	// CancelAll must now genuinely wait close to its 5s grace period (the
+	// CancelAll must now genuinely wait close to its grace period (the
 	// tool call cannot be interrupted) and report stillBusy=true — NOT
 	// return almost instantly. This is the core assertion: a true
 	// runWg.Wait() join blocks on the real goroutine, not a mailbox-state
@@ -147,8 +152,8 @@ func TestP343_CancelAllTrueJoinWaitsForRealBlockedRun(t *testing.T) {
 	cancelElapsed := time.Since(cancelStart)
 
 	require.True(t, stillBusy, "CancelAll must report stillBusy=true while the tool call is still genuinely blocked")
-	require.GreaterOrEqual(t, cancelElapsed, 4*time.Second,
-		"CancelAll must have genuinely waited close to its 5s grace period for the real Run() goroutine, not returned early on a stale state read; got %v", cancelElapsed)
+	require.GreaterOrEqual(t, cancelElapsed, testCancelAllGraceLowerBound,
+		"CancelAll must have genuinely waited close to its grace period for the real Run() goroutine, not returned early on a stale state read; got %v", cancelElapsed)
 
 	// Now unblock the tool so the stuck Run() goroutine can finally finish
 	// and this test can clean up without leaking a goroutine.

@@ -50,6 +50,25 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// testTitleJoinGrace/testCancelAllGrace override the production 5s
+// titleJoinGrace/CancelAll-grace constants for this file's and
+// p343_cancelall_join_test.go's tests via SessionAgentOptions
+// (task #454, following up on task #450's test-speed investigation).
+// 1s is a genuine 5x speedup, not a "smallest value that still barely
+// passes" one — see task #445/M7's history in this codebase for why a
+// wide margin is deliberately preferred over the tightest one that
+// happens to pass locally.
+//
+// testCancelAllGraceLowerBound is the proportional equivalent of the
+// original "4 of 5 real seconds" lower-bound assertion (80% of grace),
+// rounded down slightly (700ms of 1s, not 800ms) to leave a bit more
+// slack for scheduling jitter at this much smaller absolute scale.
+const (
+	testTitleJoinGrace           = 1 * time.Second
+	testCancelAllGrace           = 1 * time.Second
+	testCancelAllGraceLowerBound = 700 * time.Millisecond
+)
+
 // blockingHTTPClient is an option.HTTPClient (Do(*http.Request)
 // (*http.Response, error)) that blocks on a channel the test controls,
 // WITHOUT selecting on req.Context() — the transport-layer equivalent of
@@ -129,6 +148,7 @@ func newFastSSEModel(t *testing.T, content string) Model {
 // waits for a real, still-in-flight Summarize() call before reporting
 // stillBusy — not merely until Run()-tracked work drains.
 func TestP0_4_CancelAllJoinsBlockedSummarize(t *testing.T) {
+	t.Parallel()
 	model, client := newBlockingHTTPClientModel(t)
 
 	env := testEnv(t)
@@ -140,6 +160,10 @@ func TestP0_4_CancelAllJoinsBlockedSummarize(t *testing.T) {
 		Sessions:             env.sessions,
 		Messages:             env.messages,
 		DisableAutoSummarize: true,
+		// testCancelAllGrace (task #454, following up on task #450's
+		// test-speed investigation), not the production 5s default — see
+		// the constant's own doc comment for the margin rationale.
+		CancelAllGrace: testCancelAllGrace,
 	})
 
 	ctx := context.Background()
@@ -171,8 +195,8 @@ func TestP0_4_CancelAllJoinsBlockedSummarize(t *testing.T) {
 	cancelElapsed := time.Since(cancelStart)
 
 	require.True(t, stillBusy, "CancelAll must report stillBusy=true while Summarize() is still genuinely blocked on its provider call")
-	require.GreaterOrEqual(t, cancelElapsed, 4*time.Second,
-		"CancelAll must have genuinely waited close to its 5s grace period for the real Summarize() goroutine, not returned early because it was never tracked in runWg; got %v", cancelElapsed)
+	require.GreaterOrEqual(t, cancelElapsed, testCancelAllGraceLowerBound,
+		"CancelAll must have genuinely waited close to its grace period for the real Summarize() goroutine, not returned early because it was never tracked in runWg; got %v", cancelElapsed)
 
 	close(client.unblock)
 	select {
@@ -187,6 +211,7 @@ func TestP0_4_CancelAllJoinsBlockedSummarize(t *testing.T) {
 // abandoned by Run() (Run() itself already returned) — not just work still
 // tracked by the Run() call that spawned it.
 func TestP0_4_CancelAllJoinsAbandonedTitleGoroutine(t *testing.T) {
+	t.Parallel()
 	titleModel, client := newBlockingHTTPClientModel(t)
 	turnModel := newFastSSEModel(t, "hello back")
 
@@ -199,6 +224,10 @@ func TestP0_4_CancelAllJoinsAbandonedTitleGoroutine(t *testing.T) {
 		Sessions:             env.sessions,
 		Messages:             env.messages,
 		DisableAutoSummarize: true,
+		// testTitleJoinGrace/testCancelAllGrace (task #454) — see their doc
+		// comments for the margin rationale.
+		TitleJoinGrace: testTitleJoinGrace,
+		CancelAllGrace: testCancelAllGrace,
 	})
 
 	ctx := context.Background()
@@ -219,13 +248,13 @@ func TestP0_4_CancelAllJoinsAbandonedTitleGoroutine(t *testing.T) {
 	}
 
 	// The main turn (fast SSE model) finishes quickly, but runTurn's own
-	// deferred join only waits up to titleJoinGrace (5s) for the still-blocked
+	// deferred join only waits up to testTitleJoinGrace for the still-blocked
 	// title goroutine before giving up and letting Run() return — Run()
 	// abandons it exactly as P0-4 describes.
 	select {
 	case <-runDone:
-	case <-time.After(8 * time.Second):
-		t.Fatal("Run() never returned — expected it to abandon the blocked title goroutine after titleJoinGrace")
+	case <-time.After(testTitleJoinGrace + 3*time.Second):
+		t.Fatal("Run() never returned — expected it to abandon the blocked title goroutine after testTitleJoinGrace")
 	}
 
 	// At this point Run()'s own runWg.Add/Done pair has already resolved.
@@ -236,8 +265,8 @@ func TestP0_4_CancelAllJoinsAbandonedTitleGoroutine(t *testing.T) {
 	cancelElapsed := time.Since(cancelStart)
 
 	require.True(t, stillBusy, "CancelAll must report stillBusy=true while the abandoned title goroutine is still genuinely blocked")
-	require.GreaterOrEqual(t, cancelElapsed, 4*time.Second,
-		"CancelAll must have genuinely waited close to its own 5s grace period for the abandoned title goroutine, not returned early because Run() had already finished; got %v", cancelElapsed)
+	require.GreaterOrEqual(t, cancelElapsed, testCancelAllGraceLowerBound,
+		"CancelAll must have genuinely waited close to its own grace period for the abandoned title goroutine, not returned early because Run() had already finished; got %v", cancelElapsed)
 
 	// Unblock so the goroutine can finish and the test doesn't leak it.
 	close(client.unblock)
