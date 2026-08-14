@@ -104,16 +104,18 @@ var atomRegistry = map[string]atom{
 	// Z.AI model uniformly, but only GLM-5.2 is documented by Z.AI as acting
 	// on it. See the SYNC WARNING on zaiReasoningLevels.
 	//
-	// UNVERIFIED (added 2026-08-14, by user request, ahead of confirmation):
-	// GLM-5.3 is not yet documented on docs.z.ai (only GLM-5, GLM-5.2 exist
-	// there as of this date; docs.z.ai/guides/llm/glm-5.3 404s). Model id
-	// "glm-5.3", CtxLabel "1M", and ReasoningLevels are copied from GLM-5.2
-	// on the assumption a .3 point release keeps the same capability tier
-	// as .2 rather than reverting to the 200k/boolean-only tier of 5/5.1/
-	// 5-turbo — NOT confirmed. Verify with `crush ping --model zai/glm-5.3`
-	// (see internal/cmd/ping.go's --model flag) once available and update
-	// this entry/comment with the real numbers, the same way the
-	// 204.8k/131.1k guesses above this were later corrected.
+	// PARTIALLY VERIFIED (2026-08-14): `crush ping --model zai/glm-5.3`
+	// confirms the model id "glm-5.3" is real and reachable — a live call
+	// succeeded (32 in / 48 out tokens, ~1.9s latency). GLM-5.3 is still
+	// not documented on docs.z.ai (only GLM-5, GLM-5.2 exist there as of
+	// this date; docs.z.ai/guides/llm/glm-5.3 404s), so CtxLabel "1M" and
+	// ReasoningLevels remain COPIED FROM GLM-5.2 on the assumption a .3
+	// point release keeps the same capability tier as .2 rather than
+	// reverting to the 200k/boolean-only tier of 5/5.1/5-turbo — the
+	// ping proves connectivity/basic function, not context window size or
+	// which reasoning_effort values it actually honors. Update this
+	// entry/comment with the real numbers once docs.z.ai publishes them,
+	// the same way the 204.8k/131.1k guesses above this were corrected.
 	"glm5_3":     {Provider: "zai", Model: "glm-5.3", DisplayName: "GLM 5.3", CtxLabel: "1M", Group: "zai", ReasoningLevels: zaiReasoningLevels},
 	"glm5_2":     {Provider: "zai", Model: "glm-5.2", DisplayName: "GLM 5.2", CtxLabel: "1M", Group: "zai", ReasoningLevels: zaiReasoningLevels},
 	"glm5_1":     {Provider: "zai", Model: "glm-5.1", DisplayName: "GLM 5.1", CtxLabel: "200k", Group: "zai", ReasoningLevels: zaiBooleanThinkingLevels},

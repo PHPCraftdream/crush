@@ -490,7 +490,12 @@ exposes only a boolean thinking toggle (`off`/`on`). Both forms are
 validated against the atom's real levels; `crush models efforts <model>`
 prints the exact list and commands for any specific model. (GLM-5.3's
 context window/levels are provisional — see the comment above its entry
-in `internal/cmd/models_atoms.go`.)
+in `internal/cmd/models_atoms.go`.) The web UI's model picker also shows
+GLM-5.3: since docs.z.ai and the upstream catwalk provider registry don't
+list it yet, `internal/config/load.go`'s `configureProviders` synthesizes
+the same provisional entry into the Z.AI provider's model list (skipped
+once catwalk or your own `providers.zai.models` config actually provides
+one), so both the CLI atom and the web picker agree.
 
 ```bash
 crush models use opus-high glm5_turbo                # mixed Anthropic large + Z.AI small

@@ -21,6 +21,15 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   them is rejected with a clear error, rather than silently preferring
   one).
 
+- **GLM-5.3 support** — added as a new `glm5_3` atom (`crush models use
+  glm5_3`, `crush ping --model zai/glm-5.3`) and, since neither docs.z.ai
+  nor the upstream catwalk provider registry list the model yet, the
+  Z.AI provider's model list is now supplemented with a provisional
+  GLM-5.3 entry so it also shows up in the web UI's model picker.
+  Verified live via `crush ping --model zai/glm-5.3`; context
+  window/reasoning-level numbers are copied from GLM-5.2 pending
+  official documentation.
+
 ### Fixed
 
 - **Nine release-blocking concurrency bugs from the 2026-08-07

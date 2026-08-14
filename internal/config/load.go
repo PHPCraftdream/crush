@@ -498,6 +498,53 @@ func (c *Config) configureProviders(ctx context.Context, store *ConfigStore, bas
 			}
 			// v != "" && err == nil: the primary key resolved — keep the
 			// template unchanged so ZAI_API_KEY wins.
+
+			// Fork patch (orchestrator UX): synthesize a GLM-5.3 model
+			// entry. Neither docs.z.ai nor the upstream catwalk provider
+			// registry lists "glm-5.3" yet (as of 2026-08-14;
+			// docs.z.ai/guides/llm/glm-5.3 404s), so prepared.Models
+			// built from catwalk above never contains it — even though
+			// the model itself is real and reachable, confirmed live via
+			// `crush ping --model zai/glm-5.3` (see models_atoms.go's
+			// glm5_3 atom entry for the full verification note and its
+			// own "provisional numbers" caveat, which this entry mirrors
+			// exactly for consistency between the two surfaces).
+			//
+			// Without this, `crush models use zai/glm-5.3` and `crush
+			// ping --model zai/glm-5.3` already work (they resolve
+			// provider/model directly, not through the catwalk catalog —
+			// see ping.go's resolvePingModel), but the WEB UI's model
+			// picker reads KnownProviders()/prepared.Models and would
+			// never show glm-5.3 as a choice. Values (context window,
+			// reasoning levels, default effort) are copied from zai's own
+			// real glm-5.2 catwalk entry, not guessed — the two models
+			// share the same 1M-context, high/xhigh-reasoning tier per
+			// models_atoms.go's zaiReasoningLevels comment.
+			//
+			// Never overwrites a real catwalk-sourced or user-configured
+			// entry: skipped entirely once catwalk (or the user's own
+			// providers.zai.models config) actually lists glm-5.3.
+			const glm53ModelID = "glm-5.3"
+			hasGLM53 := false
+			for _, m := range prepared.Models {
+				if m.ID == glm53ModelID {
+					hasGLM53 = true
+					break
+				}
+			}
+			if !hasGLM53 {
+				extended := make([]catwalk.Model, len(prepared.Models), len(prepared.Models)+1)
+				copy(extended, prepared.Models)
+				prepared.Models = append(extended, catwalk.Model{
+					ID:                     glm53ModelID,
+					Name:                   "GLM-5.3",
+					ContextWindow:          1_000_000,
+					DefaultMaxTokens:       131072,
+					CanReason:              true,
+					ReasoningLevels:        []string{"high", "xhigh"},
+					DefaultReasoningEffort: "xhigh",
+				})
+			}
 		default:
 			// if the provider api or endpoint are missing we skip them
 			v, err := resolver.ResolveValue(p.APIKey)
