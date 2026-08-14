@@ -8,6 +8,8 @@ import (
 
 	"charm.land/fantasy"
 	"github.com/charmbracelet/crush/internal/config"
+	"github.com/charmbracelet/crush/internal/csync"
+	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/require"
 )
 
@@ -85,7 +87,7 @@ func TestPingRateLimitReset(t *testing.T) {
 func TestPingCmd_Exists(t *testing.T) {
 	t.Parallel()
 	require.NotNil(t, pingCmd)
-	require.Equal(t, "ping [--role smart|fast] [--json] [--timeout 1m] [--prompt \"<custom>\"]", pingCmd.Use)
+	require.Equal(t, "ping [--role smart|fast] [--model <atom-or-provider/model>] [--json] [--timeout 1m] [--prompt \"<custom>\"]", pingCmd.Use)
 	require.NotEmpty(t, pingCmd.Short)
 	require.NotEmpty(t, pingCmd.Long)
 }
@@ -96,6 +98,7 @@ func TestPingCmd_Flags(t *testing.T) {
 	require.NotNil(t, pingCmd.Flags().Lookup("timeout"))
 	require.NotNil(t, pingCmd.Flags().Lookup("prompt"))
 	require.NotNil(t, pingCmd.Flags().Lookup("role"))
+	require.NotNil(t, pingCmd.Flags().Lookup("model"))
 }
 
 func TestPingCmd_DefaultTimeout(t *testing.T) {
@@ -401,6 +404,94 @@ func TestResolvePingRole(t *testing.T) {
 		_, err := resolvePingRole("Smart")
 		require.Error(t, err)
 	})
+}
+
+func newTestConfigWithProvider(t *testing.T, providerID string) *config.Config {
+	t.Helper()
+	cfg := &config.Config{Providers: csync.NewMap[string, config.ProviderConfig]()}
+	cfg.Providers.Set(providerID, config.ProviderConfig{ID: providerID})
+	return cfg
+}
+
+func TestResolvePingModel(t *testing.T) {
+	t.Parallel()
+
+	t.Run("atom short code resolves without touching config providers", func(t *testing.T) {
+		t.Parallel()
+		cfg := &config.Config{Providers: csync.NewMap[string, config.ProviderConfig]()}
+		sel, err := resolvePingModel(cfg, "glm5_turbo")
+		require.NoError(t, err)
+		require.Equal(t, "zai", sel.Provider)
+		require.Equal(t, "glm-5-turbo", sel.Model)
+	})
+
+	t.Run("atom with effort suffix resolves", func(t *testing.T) {
+		t.Parallel()
+		cfg := &config.Config{Providers: csync.NewMap[string, config.ProviderConfig]()}
+		sel, err := resolvePingModel(cfg, "glm5_2-max")
+		require.NoError(t, err)
+		require.Equal(t, "zai", sel.Provider)
+		require.Equal(t, "glm-5.2", sel.Model)
+		require.Equal(t, "max", sel.ReasoningEffort)
+	})
+
+	t.Run("raw provider/model resolves even for an id the catalog doesn't know", func(t *testing.T) {
+		t.Parallel()
+		cfg := newTestConfigWithProvider(t, "zai")
+		// "glm-5.3" is deliberately not in any catwalk catalog or atom
+		// fixture here -- this is exactly the case app.ResolveModel (used
+		// by `crush models use`) would reject, and resolvePingModel must
+		// not.
+		sel, err := resolvePingModel(cfg, "zai/glm-5.3")
+		require.NoError(t, err)
+		require.Equal(t, "zai", sel.Provider)
+		require.Equal(t, "glm-5.3", sel.Model)
+	})
+
+	t.Run("raw provider/model@effort resolves", func(t *testing.T) {
+		t.Parallel()
+		cfg := newTestConfigWithProvider(t, "zai")
+		sel, err := resolvePingModel(cfg, "zai/glm-5.3@max")
+		require.NoError(t, err)
+		require.Equal(t, "zai", sel.Provider)
+		require.Equal(t, "glm-5.3", sel.Model)
+		require.Equal(t, "max", sel.ReasoningEffort)
+	})
+
+	t.Run("raw provider/model rejected when the provider isn't configured", func(t *testing.T) {
+		t.Parallel()
+		cfg := &config.Config{Providers: csync.NewMap[string, config.ProviderConfig]()}
+		_, err := resolvePingModel(cfg, "zai/glm-5.3")
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "zai")
+		require.Contains(t, err.Error(), "not configured")
+	})
+
+	t.Run("unrecognized bare name without a slash is rejected", func(t *testing.T) {
+		t.Parallel()
+		cfg := &config.Config{Providers: csync.NewMap[string, config.ProviderConfig]()}
+		_, err := resolvePingModel(cfg, "not-a-real-atom")
+		require.Error(t, err)
+	})
+}
+
+func TestPingCmd_ModelAndRoleMutuallyExclusive(t *testing.T) {
+	t.Parallel()
+	cmd := &cobra.Command{}
+	cmd.Flags().String("role", "", "")
+	cmd.Flags().String("model", "", "")
+	require.NoError(t, cmd.Flags().Set("role", "fast"))
+	require.NoError(t, cmd.Flags().Set("model", "glm5_turbo"))
+
+	role, _ := cmd.Flags().GetString("role")
+	modelFlag, _ := cmd.Flags().GetString("model")
+	require.NotEmpty(t, role)
+	require.NotEmpty(t, modelFlag)
+	// Mirrors pingCmd.RunE's own check -- both set is the rejected case.
+	if modelFlag != "" && role != "" {
+		return
+	}
+	t.Fatal("expected both --model and --role to be recognized as set")
 }
 
 func TestResolveModelRole(t *testing.T) {

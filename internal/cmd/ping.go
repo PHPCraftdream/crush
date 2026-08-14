@@ -24,13 +24,14 @@ import (
 	"charm.land/fantasy/providers/vercel"
 	"github.com/charmbracelet/crush/internal/agent/cliprovider"
 	"github.com/charmbracelet/crush/internal/agent/hyper"
+	"github.com/charmbracelet/crush/internal/app"
 	"github.com/charmbracelet/crush/internal/config"
 	openaisdk "github.com/charmbracelet/openai-go/option"
 	"github.com/spf13/cobra"
 )
 
 var pingCmd = &cobra.Command{
-	Use:   "ping [--role smart|fast] [--json] [--timeout 1m] [--prompt \"<custom>\"]",
+	Use:   "ping [--role smart|fast] [--model <atom-or-provider/model>] [--json] [--timeout 1m] [--prompt \"<custom>\"]",
 	Short: "Ping a configured model to verify connectivity and API key",
 	Long: `Send a minimal request to the configured model to verify connectivity,
 API key validity, and measure latency. Works with any provider: API-based
@@ -48,7 +49,18 @@ Timeouts set status=timeout with exit code 2.
 optional cheap delegated-work slot) | reviewer (the optional strongest
 slot). worker/reviewer ping as "not configured" unless already set via
 "crush models use --worker/--reviewer <model>" (or the web UI /
-crush.json directly).`,
+crush.json directly).
+
+--model pings an ad-hoc model directly instead of a persisted slot — accepts
+an atom short code (glm5_turbo, oh, ox-high) or raw "provider/model[@effort]"
+(zai/glm-5.3, zai/glm-5.3@max). Nothing is written to config: the model
+selection lives only for this one ping. Unlike 'crush models use', the raw
+provider/model form does NOT require the model id to already be listed in
+the provider's known catalog — this is the way to test-probe a brand-new
+model id (e.g. one just announced, not yet added as an atom) before
+committing it anywhere. The provider prefix itself still has to be a
+configured provider, since real credentials come from there. Mutually
+exclusive with --role.`,
 	Example: `
 # Ping whichever large model is currently configured
 crush ping
@@ -75,6 +87,14 @@ crush models use fh hh && crush ping
 # Set Opus 4.8 via short code and ping
 crush models use ox hl && crush ping --timeout 60s
 
+# Ping a model directly without touching persisted config
+crush ping --model glm5_turbo
+crush ping --model zai/glm-5.2@max
+
+# Probe a brand-new model id not yet in the provider's known catalog
+# (and not yet an atom) — the raw form skips catalog validation entirely
+crush ping --model zai/glm-5.3
+
 # Machine-readable JSON
 crush ping --json
 
@@ -83,11 +103,31 @@ crush ping --timeout 30s --prompt "Reply with yes or no"
   `,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		role, _ := cmd.Flags().GetString("role")
-		modelType, err := resolvePingRole(role)
+		modelFlag, _ := cmd.Flags().GetString("model")
+
+		if modelFlag != "" && role != "" {
+			return fmt.Errorf("--model and --role are mutually exclusive — use one or the other")
+		}
+
+		a, err := setupApp(cmd)
 		if err != nil {
 			return err
 		}
-		return runPing(cmd, modelType)
+		defer a.Shutdown()
+
+		if modelFlag != "" {
+			sel, rerr := resolvePingModel(a.Config(), modelFlag)
+			if rerr != nil {
+				return rerr
+			}
+			return runPing(cmd, a, "", &sel)
+		}
+
+		modelType, rerr := resolvePingRole(role)
+		if rerr != nil {
+			return rerr
+		}
+		return runPing(cmd, a, modelType, nil)
 	},
 }
 
@@ -110,7 +150,12 @@ crush ping-fast --json
 crush ping-fast --timeout 30s
   `,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return runPing(cmd, config.SelectedModelTypeSmall)
+		a, err := setupApp(cmd)
+		if err != nil {
+			return err
+		}
+		defer a.Shutdown()
+		return runPing(cmd, a, config.SelectedModelTypeSmall, nil)
 	},
 }
 
@@ -129,7 +174,12 @@ type PingResult struct {
 	Error            *string `json:"error"`
 }
 
-func runPing(cmd *cobra.Command, modelType config.SelectedModelType) error {
+// runPing pings either a persisted model slot (modelType, when override is
+// nil) or an ad-hoc model (override, built by resolvePingModel from --model
+// — modelType is ignored in that case). override is never written back to
+// config; it only ever lives as a local config.SelectedModel value for the
+// duration of this one call.
+func runPing(cmd *cobra.Command, a *app.App, modelType config.SelectedModelType, override *config.SelectedModel) error {
 	asJSON, _ := cmd.Flags().GetBool("json")
 	timeout, _ := cmd.Flags().GetDuration("timeout")
 	customPrompt, _ := cmd.Flags().GetString("prompt")
@@ -138,27 +188,28 @@ func runPing(cmd *cobra.Command, modelType config.SelectedModelType) error {
 		timeout = time.Minute
 	}
 
-	a, err := setupApp(cmd)
-	if err != nil {
-		return err
-	}
-	defer a.Shutdown()
-
 	cfg := a.Config()
 	store := a.Store()
 
-	// Get effective model
-	modelCfg, ok := cfg.Models[modelType]
-	if !ok {
-		msg := fmt.Sprintf("%s model not configured", modelType)
-		result := PingResult{
-			Status: "error",
-			Error:  &msg,
+	// Get effective model — either the ad-hoc override (--model) or the
+	// resolved persisted slot.
+	var modelCfg config.SelectedModel
+	if override != nil {
+		modelCfg = *override
+	} else {
+		var ok bool
+		modelCfg, ok = cfg.Models[modelType]
+		if !ok {
+			msg := fmt.Sprintf("%s model not configured", modelType)
+			result := PingResult{
+				Status: "error",
+				Error:  &msg,
+			}
+			if asJSON {
+				return json.NewEncoder(os.Stdout).Encode(result)
+			}
+			return fmt.Errorf("%s", msg)
 		}
-		if asJSON {
-			return json.NewEncoder(os.Stdout).Encode(result)
-		}
-		return fmt.Errorf("%s", msg)
 	}
 
 	// Get provider config
@@ -725,6 +776,34 @@ func stringPtr(s string) *string {
 	return &s
 }
 
+// resolvePingModel parses --model's value into a config.SelectedModel for
+// an ad-hoc, one-shot ping — entirely independent of persisted config.
+// Accepts the same vocabulary as `crush models use`: atom short codes
+// (glm5_turbo, oh, ox-high) and raw "provider/model[@effort]" syntax
+// (zai/glm-5.3, zai/glm-5.3@max), both via the shared parseAtomOrRaw.
+//
+// Unlike `crush models use`'s raw-form resolution (app.ResolveModel, which
+// searches the provider's known catwalk catalog and rejects an unlisted
+// model id), the raw-form resolveFunc here only checks that the PROVIDER
+// prefix is configured — never the model id. That's the entire point:
+// letting an operator test-probe a model id the catalog doesn't know about
+// yet (e.g. a just-announced model, not yet added as an atom) via a real
+// API call, instead of failing before ever reaching the network the way
+// `crush models use zai/<brand-new-model>` would today.
+func resolvePingModel(cfg *config.Config, modelStr string) (config.SelectedModel, error) {
+	resolve := func(modelPart string) (string, string, error) {
+		provider, modelID, ok := strings.Cut(modelPart, "/")
+		if !ok || provider == "" || modelID == "" {
+			return "", "", fmt.Errorf("%q is not a recognized atom and not \"provider/model\" — see `crush models list`", modelPart)
+		}
+		if _, ok := cfg.Providers.Get(provider); !ok {
+			return "", "", fmt.Errorf("provider %q is not configured — see `crush providers list`", provider)
+		}
+		return provider, modelID, nil
+	}
+	return parseAtomOrRaw(modelStr, resolve)
+}
+
 // resolvePingRole maps a --role value to the model slot to ping. An empty
 // role keeps the historical `crush ping` default (the large/smart model);
 // any non-empty value goes through the shared resolveModelRole so ping and
@@ -767,6 +846,7 @@ func init() {
 	pingCmd.Flags().Duration("timeout", time.Minute, "Request timeout")
 	pingCmd.Flags().String("prompt", "", "Custom user prompt (default: \"ping\")")
 	pingCmd.Flags().String("role", "", "Which model slot to ping: smart|large (default) | fast|small | worker | reviewer (worker/reviewer are optional, set via `crush models use --worker/--reviewer`)")
+	pingCmd.Flags().String("model", "", "Ping an ad-hoc model directly (atom short code or provider/model[@effort]) instead of a persisted slot — nothing is written to config. Mutually exclusive with --role.")
 
 	pingFastCmd.Flags().Bool("json", false, "Emit JSON output instead of human-readable text")
 	pingFastCmd.Flags().Duration("timeout", time.Minute, "Request timeout")
