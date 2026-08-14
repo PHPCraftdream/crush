@@ -369,12 +369,25 @@ func TestReleaseGate_P350_LeaseRenewedDuringLongExecution(t *testing.T) {
 
 	coord := &slowCoordinator{release: make(chan struct{})}
 
+	// TestLeaseTTL widened from 1s to 3s (task #447, following up on this
+	// session's own windows-latest CI flake chase — see tasks #444/#445 for
+	// the same pattern): renewal fires every TTL/3 (run_queue_pump.go's
+	// renewInterval), so 1s gave the renewal goroutine only ~333ms of
+	// budget per attempt before the lease's real deadline — reproduced
+	// failing on windows-latest CI (run 31790768115, "expected: 1, actual:
+	// 2" — a genuine second dispatch, meaning renewal was actually missed,
+	// not just measured late). 3s triples that budget to ~1s per attempt,
+	// comfortably inside what a contended CI runner needs. This does NOT
+	// weaken what the test verifies (exactly-once dispatch across multiple
+	// TTL windows) — it only gives the renewal mechanism realistic room to
+	// actually succeed before judging whether it did.
+	const testLeaseTTL = 3 * time.Second
 	pump := session.NewRunQueuePump(session.RunQueuePumpConfig{
 		Sessions:       svc,
 		Coordinator:    coord,
 		PumpInstanceID: "lease-renewal-pump",
 		TestTick:       func() time.Duration { return 50 * time.Millisecond },
-		TestLeaseTTL:   1 * time.Second,
+		TestLeaseTTL:   testLeaseTTL,
 	})
 	pump.Start()
 	defer pump.Stop()
@@ -383,8 +396,8 @@ func TestReleaseGate_P350_LeaseRenewedDuringLongExecution(t *testing.T) {
 		return coord.calls.Load() >= 1
 	}, 2*time.Second, 10*time.Millisecond, "the entry must be leased and execution started")
 
-	// Hold the call in flight across several TTL windows (1s each). Note:
-	// this specific mid-hold assertion alone does NOT discriminate renewal
+	// Hold the call in flight across several TTL windows. Note: this
+	// specific mid-hold assertion alone does NOT discriminate renewal
 	// from no-renewal — the inFlight guard (third pass) already blocks a
 	// same-tick/self-race duplicate for as long as this goroutine is
 	// tracked as running, regardless of whether the DB lease itself has
@@ -395,7 +408,7 @@ func TestReleaseGate_P350_LeaseRenewedDuringLongExecution(t *testing.T) {
 	// goroutine finish while a SECOND, independently-leased goroutine gets
 	// to run too — see the revert-check procedure above, which fails at
 	// that later assertion, not this one.
-	time.Sleep(3500 * time.Millisecond) // ~3.5 TTL windows at 1s
+	time.Sleep(7 * testLeaseTTL / 2) // ~3.5 TTL windows
 	require.Equal(t, int64(1), coord.calls.Load(), "no second dispatch should have occurred while the first call is still genuinely in flight, across multiple TTL windows")
 
 	close(coord.release)
