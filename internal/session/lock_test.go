@@ -247,21 +247,29 @@ func TestTryAcquireSessionLock_FreshLockIsRespected(t *testing.T) {
 	assert.True(t, errors.As(err, &busyErr), "expected SessionLockBusyError, got %v", err)
 }
 
+// testHeartbeatInterval is the shortened interval these tests use via
+// WithHeartbeatInterval (task #453, following up on task #450's test-speed
+// investigation) instead of the production lockHeartbeatInterval (10s).
+// 1s keeps a still-generous margin over real scheduling jitter (unlike the
+// tighter values this session tried and reverted for other timing-sensitive
+// tests — see M7/task #445's history — 1s vs. production's 10s is a 10x
+// speedup, not a "smallest value that still barely passes" one) while
+// cutting each test's real wait from ~12s to ~4s.
+const testHeartbeatInterval = 1 * time.Second
+
 // The three heartbeat tests below each block for one full
-// lockHeartbeatInterval (10s) plus slack, because SessionLock exposes no
-// test seam for "was a tick observed" other than the mtime side effect.
-// They run in parallel with each other and with the rest of the package's
-// parallel tests: each owns a private t.TempDir() and its own lock file, so
-// there is no shared state, and the waiting itself is a sleeping goroutine
-// plus one Chtimes per tick — it adds no measurable CPU or I/O contention
-// for the tests it now overlaps with. Left serial, these three alone
-// accounted for 37s of internal/session's 41.8s sequential phase (and of
-// its 57.9s total `go test -short` runtime), while the package's parallel
-// phase only spans ~16s.
+// testHeartbeatInterval plus slack, because SessionLock exposes no test
+// seam for "was a tick observed" other than the mtime side effect — only
+// the INTERVAL itself is shortened via WithHeartbeatInterval, not that
+// requirement. They run in parallel with each other and with the rest of
+// the package's parallel tests: each owns a private t.TempDir() and its
+// own lock file, so there is no shared state, and the waiting itself is a
+// sleeping goroutine plus one Chtimes per tick — it adds no measurable
+// CPU or I/O contention for the tests it now overlaps with.
 func TestHeartbeatTouchesFile(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	lk, err := TryAcquireSessionLock(dir, "audit-A")
+	lk, err := TryAcquireSessionLockWithOptions(dir, "audit-A", WithHeartbeatInterval(testHeartbeatInterval))
 	require.NoError(t, err)
 
 	info1, err := os.Stat(lk.Path)
@@ -276,7 +284,7 @@ func TestHeartbeatTouchesFile(t *testing.T) {
 	lk.RecordActivity()
 
 	// Wait slightly longer than one heartbeat tick.
-	time.Sleep(lockHeartbeatInterval + 2*time.Second)
+	time.Sleep(testHeartbeatInterval + 3*time.Second)
 
 	info2, err := os.Stat(lk.Path)
 	require.NoError(t, err)
@@ -295,7 +303,7 @@ func TestHeartbeatTouchesFile(t *testing.T) {
 func TestHeartbeat_NoActivity_DoesNotTouchMtime(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	lk, err := TryAcquireSessionLock(dir, "audit-A")
+	lk, err := TryAcquireSessionLockWithOptions(dir, "audit-A", WithHeartbeatInterval(testHeartbeatInterval))
 	require.NoError(t, err)
 	defer lk.Release()
 
@@ -306,7 +314,7 @@ func TestHeartbeat_NoActivity_DoesNotTouchMtime(t *testing.T) {
 	// Deliberately do NOT call lk.RecordActivity(). Wait slightly longer
 	// than one heartbeat tick so the ticker branch has definitely fired
 	// at least once.
-	time.Sleep(lockHeartbeatInterval + 2*time.Second)
+	time.Sleep(testHeartbeatInterval + 3*time.Second)
 
 	info2, err := os.Stat(lk.Path)
 	require.NoError(t, err)
@@ -322,7 +330,7 @@ func TestHeartbeat_NoActivity_DoesNotTouchMtime(t *testing.T) {
 func TestHeartbeat_RecordActivity_TouchesMtimeOnNextTick(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	lk, err := TryAcquireSessionLock(dir, "audit-A")
+	lk, err := TryAcquireSessionLockWithOptions(dir, "audit-A", WithHeartbeatInterval(testHeartbeatInterval))
 	require.NoError(t, err)
 	defer lk.Release()
 
@@ -332,10 +340,10 @@ func TestHeartbeat_RecordActivity_TouchesMtimeOnNextTick(t *testing.T) {
 
 	// Record activity partway through the interval, simulating a turn
 	// loop calling RecordActivity() as it makes progress.
-	time.Sleep(1 * time.Second)
+	time.Sleep(testHeartbeatInterval / 2)
 	lk.RecordActivity()
 
-	time.Sleep(lockHeartbeatInterval + 2*time.Second)
+	time.Sleep(testHeartbeatInterval + 3*time.Second)
 
 	info2, err := os.Stat(lk.Path)
 	require.NoError(t, err)

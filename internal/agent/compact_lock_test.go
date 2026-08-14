@@ -565,6 +565,10 @@ func TestP312_ManualCompactionHeartbeatStaysAlive(t *testing.T) {
 		Messages:             env.messages,
 		Tools:                []fantasy.AgentTool{},
 		DisableAutoSummarize: true,
+		// testHeartbeatInterval (task #453), not the production 10s
+		// interval — see the sibling package's lock_test.go for the same
+		// constant/rationale.
+		LockOptions: []session.LockOption{session.WithHeartbeatInterval(testHeartbeatInterval)},
 	})
 	sa := a.(*sessionAgent)
 
@@ -616,7 +620,7 @@ func TestP312_ManualCompactionHeartbeatStaysAlive(t *testing.T) {
 	// The first chunk already landed (OnTextDelta fired, notifyActivity(ctx)
 	// was called) before `started` closed. Wait past one real heartbeat tick
 	// while the compaction is still parked on `proceed`, holding its lock.
-	time.Sleep(12 * time.Second)
+	time.Sleep(testHeartbeatInterval + 3*time.Second)
 
 	info2, err := os.Stat(lockPath)
 	require.NoError(t, err)

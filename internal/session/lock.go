@@ -112,6 +112,27 @@ func WithClearHolderMetadataFn(fn func(path string, expectedGeneration string)) 
 	}
 }
 
+// WithHeartbeatInterval overrides how often the heartbeat goroutine touches
+// the lock file's mtime, in place of the production lockHeartbeatInterval
+// (10s). Test-only seam (task #453, following up on task #450's test-speed
+// investigation): several tests across internal/agent and internal/session
+// exist only to observe one or more real heartbeat ticks and had no way to
+// do that faster than the production interval, costing ~10-12s of real
+// wall-clock sleep each. This is per-*SessionLock*, not a package-level
+// variable, deliberately — a global var would need a TestMain-enforced
+// "set once before any parallel test starts" discipline to avoid one
+// test's override leaking into another's concurrently-running acquire;
+// threading it through the existing LockOption mechanism instead means
+// each SessionLock gets its own interval with no cross-test coordination
+// needed at all, the same way WithClearHolderMetadataFn already works.
+// Zero/unset falls back to the production interval — see
+// acquireSessionLockFileWithOptions.
+func WithHeartbeatInterval(d time.Duration) LockOption {
+	return func(lk *SessionLock) {
+		lk.heartbeatInterval = d
+	}
+}
+
 // SessionLock is an inter-process exclusive lock for a single session ID.
 // Acquired around the entire `sessionAgent.Run()` call so two crush
 // processes can never write into the same session simultaneously.
@@ -162,6 +183,10 @@ type SessionLock struct {
 	// tests can inject blocking behavior via LockOption to prove unlock/close
 	// happen before metadata cleanup.
 	clearHolderMetadataFn func(path string, expectedGeneration string)
+	// heartbeatInterval overrides lockHeartbeatInterval for this instance's
+	// heartbeat goroutine. Zero means "use the production interval" — see
+	// WithHeartbeatInterval.
+	heartbeatInterval time.Duration
 }
 
 // SessionLockBusyError is returned by TryAcquireSessionLock when the
@@ -319,7 +344,10 @@ func acquireSessionLockFileWithOptions(path string, opts []LockOption) (*Session
 	for _, opt := range opts {
 		opt(lk)
 	}
-	go heartbeat(path, stop, &lk.active)
+	if lk.heartbeatInterval <= 0 {
+		lk.heartbeatInterval = lockHeartbeatInterval
+	}
+	go heartbeat(path, stop, &lk.active, lk.heartbeatInterval)
 
 	return lk, nil
 }
@@ -622,8 +650,8 @@ func clearHolderMetadata(path string, expectedGeneration string) {
 // can steal the session. Logging is throttled so a persistently-failing
 // filesystem doesn't spam the log once every tick for the lifetime of a
 // long session.
-func heartbeat(path string, done <-chan struct{}, active *atomic.Bool) {
-	t := time.NewTicker(lockHeartbeatInterval)
+func heartbeat(path string, done <-chan struct{}, active *atomic.Bool, interval time.Duration) {
+	t := time.NewTicker(interval)
 	defer t.Stop()
 	var failCount atomic.Int64
 	for {

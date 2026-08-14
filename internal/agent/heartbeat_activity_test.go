@@ -22,16 +22,27 @@ import (
 // agent OR its sub-agent(s) — see withActivityNotify/notifyActivity in
 // agent.go, and SessionLock.RecordActivity/the gated heartbeat goroutine in
 // internal/session/lock.go (task #213). heartbeatMtimeAdvances below waits
-// slightly longer than one real heartbeat tick (session.lockHeartbeatInterval
-// is 10s, unexported) to observe the mtime side effect, matching the
-// existing convention in internal/session/lock_test.go
+// slightly longer than one real heartbeat tick to observe the mtime side
+// effect, matching the existing convention in internal/session/lock_test.go
 // (TestHeartbeat_RecordActivity_TouchesMtimeOnNextTick et al.) since
-// SessionLock exposes no other test seam for "was activity recorded".
+// SessionLock exposes no other test seam for "was activity recorded" — but
+// via testHeartbeatInterval (session.WithHeartbeatInterval, task #453),
+// not the production 10s interval.
+
+// testHeartbeatInterval mirrors internal/session/lock_test.go's own
+// constant of the same name/value — kept as a separate local const rather
+// than exported from that package, since this is the only other file that
+// needs it and an exported constant would invite drift between the two
+// copies being the actual synchronization mechanism instead of each simply
+// being "1s, chosen for the same reason".
+const testHeartbeatInterval = 1 * time.Second
 
 // heartbeatMtimeAdvances reports whether lk's lock file mtime advances past
 // `before` within one heartbeat interval plus slack. Blocks for slightly
-// over session.lockHeartbeatInterval (10s) — same real-time cost the
-// existing session package tests already pay.
+// over testHeartbeatInterval — mustAcquireLock below is the only producer
+// of *session.SessionLock in this file, and it always sets that same
+// interval via WithHeartbeatInterval, so this and every lock it's called
+// against agree.
 //
 // Returns a plain (bool, error) instead of asserting internally: testify's
 // require.* calls t.FailNow(), which does runtime.Goexit() — safe only on
@@ -43,7 +54,7 @@ import (
 // assert on the returned error themselves, on the goroutine that actually
 // owns *testing.T assertions (the main test goroutine).
 func heartbeatMtimeAdvances(lk *session.SessionLock, before time.Time) (bool, error) {
-	time.Sleep(12 * time.Second) // lockHeartbeatInterval (10s, unexported) + slack
+	time.Sleep(testHeartbeatInterval + 3*time.Second)
 	info, err := os.Stat(lk.Path)
 	if err != nil {
 		return false, err
@@ -53,7 +64,7 @@ func heartbeatMtimeAdvances(lk *session.SessionLock, before time.Time) (bool, er
 
 func mustAcquireLock(t *testing.T, id string) *session.SessionLock {
 	t.Helper()
-	lk, err := session.TryAcquireSessionLock(t.TempDir(), id)
+	lk, err := session.TryAcquireSessionLockWithOptions(t.TempDir(), id, session.WithHeartbeatInterval(testHeartbeatInterval))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = lk.Release() })
 	return lk
@@ -309,7 +320,7 @@ func TestParentHeartbeat_StaysAliveFromSubAgentActivity(t *testing.T) {
 	parentSession, err := env.sessions.Create(t.Context(), "parent session")
 	require.NoError(t, err)
 
-	parentLk, err := session.TryAcquireSessionLock(parentDataDir, parentSession.ID)
+	parentLk, err := session.TryAcquireSessionLockWithOptions(parentDataDir, parentSession.ID, session.WithHeartbeatInterval(testHeartbeatInterval))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = parentLk.Release() })
 
@@ -324,14 +335,16 @@ func TestParentHeartbeat_StaysAliveFromSubAgentActivity(t *testing.T) {
 	parentCtx := withActivityNotify(t.Context(), parentLk)
 
 	// Child: streams several text-delta chunks spread out over more than
-	// one heartbeat interval (chunkDelay * chunkCount > 10s), so activity
-	// is spread across the whole window rather than one instant burst —
-	// the parent's heartbeat must still be alive at the end purely from
-	// this trickle, with the parent's OWN stream producing nothing at all
-	// (there isn't one — this goroutine's the only thing "blocked" is the
-	// runSubAgent call below).
+	// one heartbeat interval (chunkDelay * chunkCount > testHeartbeatInterval),
+	// so activity is spread across the whole window rather than one instant
+	// burst — the parent's heartbeat must still be alive at the end purely
+	// from this trickle, with the parent's OWN stream producing nothing at
+	// all (there isn't one — this goroutine's the only thing "blocked" is
+	// the runSubAgent call below). 4*400ms=1.6s > testHeartbeatInterval
+	// (1s), same shape as the original 4*3s=12s > the production 10s
+	// interval, just scaled down with it (task #453).
 	const providerID = "test-provider"
-	childAgent, callCount := newActivityTestChildAgent(t, env, providerID, 4, 3*time.Second)
+	childAgent, callCount := newActivityTestChildAgent(t, env, providerID, 4, 400*time.Millisecond)
 
 	coord := newTestCoordinator(t, env, providerID, config.ProviderConfig{ID: providerID})
 
