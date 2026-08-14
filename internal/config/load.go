@@ -79,7 +79,7 @@ func Load(workingDir, dataDir string, debug bool) (*ConfigStore, error) {
 	})
 
 	// Load workspace config last so it has highest priority.
-	if wsData, err := os.ReadFile(workspacePath); err == nil && len(wsData) > 0 {
+	if wsData, err := os.ReadFile(workspacePath); err == nil && len(wsData) > 0 && !pathAlreadyLoaded(loadedPaths, workspacePath) {
 		if !json.Valid(wsData) {
 			return nil, fmt.Errorf("invalid JSON in config file %s", workspacePath)
 		}
@@ -1013,6 +1013,35 @@ func lookupConfigs(cwd string) []string {
 	slices.Reverse(foundConfigs)
 
 	return append(configPaths, foundConfigs...)
+}
+
+// pathAlreadyLoaded reports whether path (typically the computed workspace
+// config path) is already present in loadedPaths (the paths loadFromConfigPaths
+// already merged into cfg).
+//
+// Load and buildAndPublishReload both merge the workspace config
+// (<DataDirectory>/crush.json) as a SEPARATE step after loadFromConfigPaths,
+// under the assumption that it's a distinct file loadFromConfigPaths didn't
+// already see. That assumption breaks when DataDirectory is configured (or,
+// as in several tests, passed directly) such that the workspace path
+// resolves to a path lookupConfigs already discovered and loaded — the file
+// then gets read and merged a SECOND time via mustMarshalConfig(cfg)+wsData.
+// jsons.Merge appends JSON arrays instead of overriding them (see
+// internal/merge/ordered.go in github.com/qjebbs/go-jsons), so re-merging
+// the same provider's "models" array against itself duplicates it, while
+// scalar fields like models.large.model are simply overwritten by the
+// second read — the two reads of the same file are not even guaranteed to
+// observe the same content if a concurrent writer lands between them,
+// producing a config whose Models selection and whose Providers model list
+// disagree (task #458). Skipping the second read/merge whenever the
+// workspace path was already loaded closes this both structurally (no more
+// double-processing of one file's content) and for the concurrent-write
+// case (no second, possibly-different read of the same path).
+func pathAlreadyLoaded(loadedPaths []string, path string) bool {
+	clean := filepath.Clean(path)
+	return slices.ContainsFunc(loadedPaths, func(p string) bool {
+		return filepath.Clean(p) == clean
+	})
 }
 
 func loadFromConfigPaths(configPaths []string) (*Config, []string, error) {

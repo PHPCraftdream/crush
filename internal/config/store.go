@@ -981,39 +981,34 @@ func (s *ConfigStore) SetProviderAPIKey(scope Scope, providerID string, apiKey a
 		}
 	}
 
-	// Take publishMu around the in-memory provider update so no concurrent
-	// reload can swap the Providers *csync.Map between loadSnapshot() and
-	// .Set(). Each reload creates a BRAND NEW *csync.Map (confirmed by
-	// reading the load chain: loadFromBytes → json.Unmarshal →
-	// Map.UnmarshalJSON allocates a fresh inner map, and setDefaults
-	// creates a fresh NewMap if unmarshal left it nil — the old map is
-	// never carried forward into the new snapshot). Without publishMu, a
-	// concurrent reload could publish a new snapshot between our
-	// loadSnapshot() and .Set(), leaving our write in an already-orphaned
-	// map invisible to new readers. The disk write above already persists
-	// the key, so a subsequent reload picks it up from disk regardless;
-	// publishMu just closes the narrow window where the in-memory update
-	// is silently lost before that reload runs.
+	// publishMu is held for the whole read-modify-publish cycle below, and
+	// the update is published as a genuinely new *Config/generation (via
+	// publishLocked) rather than mutated in place on the currently-published
+	// snapshot's Providers map. Mutating sn.config.Providers directly (the
+	// old behavior here) is memory-safe on its own (Providers has its own
+	// RWMutex) but breaks the immutable-snapshot contract: it silently
+	// changes what any snapshot captured earlier (e.g. via Snapshot(), or a
+	// *Config a concurrent reader is mid-read on) sees for providerID, with
+	// no generation bump and no cache invalidation — exactly the torn-read
+	// hazard Snapshot() exists to prevent. This mirrors the bug fixed in
+	// SetProviderRuntimeConfig (task #341, P1-3) and RemoveProviderAPIKey
+	// (task #437, P1-2); SetProviderAPIKey itself was missed by that pass.
 	s.publishMu.Lock()
 	defer s.publishMu.Unlock()
 
 	sn := s.loadSnapshot()
 	providerConfig, exists = sn.config.Providers.Get(providerID)
-	if exists {
-		setKeyOrToken()
-		sn.config.Providers.Set(providerID, providerConfig)
-		return nil
-	}
-
-	var foundProvider *catwalk.Provider
-	for _, p := range sn.knownProviders {
-		if string(p.ID) == providerID {
-			foundProvider = &p
-			break
+	if !exists {
+		var foundProvider *catwalk.Provider
+		for _, p := range sn.knownProviders {
+			if string(p.ID) == providerID {
+				foundProvider = &p
+				break
+			}
 		}
-	}
-
-	if foundProvider != nil {
+		if foundProvider == nil {
+			return fmt.Errorf("provider with ID %s not found in known providers", providerID)
+		}
 		providerConfig = ProviderConfig{
 			ID:           providerID,
 			Name:         foundProvider.Name,
@@ -1024,11 +1019,26 @@ func (s *ConfigStore) SetProviderAPIKey(scope Scope, providerID string, apiKey a
 			ExtraParams:  make(map[string]string),
 			Models:       foundProvider.Models,
 		}
-		setKeyOrToken()
-	} else {
-		return fmt.Errorf("provider with ID %s not found in known providers", providerID)
 	}
-	sn.config.Providers.Set(providerID, providerConfig)
+	setKeyOrToken()
+
+	next := sn.clone()
+	var cfgCopy Config
+	if sn.config != nil {
+		cfgCopy = *sn.config
+	}
+	var providersCopy map[string]ProviderConfig
+	if sn.config != nil && sn.config.Providers != nil {
+		providersCopy = sn.config.Providers.Copy()
+	} else {
+		providersCopy = make(map[string]ProviderConfig)
+	}
+	newProviders := csync.NewMapFrom(providersCopy)
+	newProviders.Set(providerID, providerConfig)
+	cfgCopy.Providers = newProviders
+	next.config = &cfgCopy
+
+	s.publishLocked(next)
 	return nil
 }
 
@@ -1736,7 +1746,7 @@ func (s *ConfigStore) buildAndPublishReload(ctx context.Context) error {
 	cfg.setDefaults(s.workingDir, dataDir)
 
 	workspacePath := filepath.Join(cfg.Options.DataDirectory, fmt.Sprintf("%s.json", appName))
-	if wsData, err := os.ReadFile(workspacePath); err == nil && len(wsData) > 0 {
+	if wsData, err := os.ReadFile(workspacePath); err == nil && len(wsData) > 0 && !pathAlreadyLoaded(loadedPaths, workspacePath) {
 		if !json.Valid(wsData) {
 			return fmt.Errorf("invalid JSON in config file %s", workspacePath)
 		}
