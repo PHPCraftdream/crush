@@ -79,6 +79,14 @@ const RunQueueMaxConcurrentExecutions = 10
 // 40s (TTL + full timeout) after the lease expired. The watchdog closes this gap.
 const LeaseWatchdogSafetyMargin = 5 * time.Second
 
+// DrainSessionNowPollInterval is the production poll granularity
+// DrainSessionNow uses while waiting for a same-pump in-flight execution it
+// lost the lease race against (see DrainSessionNow's own doc). Kept short:
+// the wait is bounded by an ordinary turn's remaining duration, not a full
+// lease TTL, and this is the loop's only source of added latency in that
+// branch.
+const DrainSessionNowPollInterval = 25 * time.Millisecond
+
 // Coordinator interface is a minimal subset for executing queued calls.
 // We use this instead of importing the full agent.Coordinator to avoid
 // import cycles (session → agent → session). The real app's AgentCoordinator
@@ -127,6 +135,13 @@ type Coordinator interface {
 // including why a naive lease-renewal-based backoff was tried first and
 // found not to work.
 var ErrCallQueuedNotExecuted = errors.New("run_queue_pump: call was queued into an already-owned session, not executed")
+
+// errLeaseLost is returned by executeEntrySync when the entry's lease was
+// reassigned to a different owner during the renewal loop (see leaseLost's
+// doc there). It carries no outcome for the row itself — the new owner
+// writes the eventual Ack/Nack/TerminalFail — callers just need to know
+// nothing further can be learned from this particular execution attempt.
+var errLeaseLost = errors.New("run_queue_pump: lost lease ownership mid-execution")
 
 // RunQueuePumpConfig configures a RunQueuePump instance.
 type RunQueuePumpConfig struct {
@@ -184,6 +199,14 @@ type RunQueuePumpConfig struct {
 	// TestDrainTick is a test seam for overriding the orphan outbox drain interval.
 	// nil = use production OrphanOutboxDrainInterval.
 	TestDrainTick func() time.Duration
+
+	// TestDrainSessionPollInterval is a test seam for overriding
+	// DrainSessionNowPollInterval, the poll granularity DrainSessionNow uses
+	// while waiting for a same-pump in-flight execution it lost the lease
+	// race against. 0 = use the production constant. Regression tests need
+	// this small (sub-millisecond) to observe the race deterministically
+	// without a real wall-clock wait.
+	TestDrainSessionPollInterval time.Duration
 }
 
 // leaseTTL returns the effective lease TTL for this pump instance —
@@ -232,6 +255,17 @@ func (p *RunQueuePump) leaseWatchdogSafetyMargin() time.Duration {
 		margin = ttl / 2
 	}
 	return margin
+}
+
+// drainSessionPollInterval returns the effective poll interval
+// DrainSessionNow uses while waiting on a same-pump in-flight execution —
+// cfg.TestDrainSessionPollInterval if set, otherwise the production
+// DrainSessionNowPollInterval.
+func (p *RunQueuePump) drainSessionPollInterval() time.Duration {
+	if p.cfg.TestDrainSessionPollInterval > 0 {
+		return p.cfg.TestDrainSessionPollInterval
+	}
+	return DrainSessionNowPollInterval
 }
 
 // RunQueuePump is a background pump for the durable run queue.
@@ -861,7 +895,12 @@ func (p *RunQueuePump) processEntry(ctx context.Context, entry *RunQueueEntry) {
 	go p.executeEntry(ctx, leased)
 }
 
-// executeEntry runs a leased entry and handles success/failure.
+// executeEntry runs a leased entry and handles success/failure. Called
+// detached (go executeEntry(...)) by the background tick's processEntry,
+// which has already reserved this call's execSem slot and workerWg
+// registration and marked the session inFlight before dispatching — this
+// releases all three via defer regardless of outcome, matching the
+// admission it assumes was already granted.
 func (p *RunQueuePump) executeEntry(ctx context.Context, leased *RunQueueEntry) {
 	defer p.workerWg.Done()
 
@@ -875,6 +914,31 @@ func (p *RunQueuePump) executeEntry(ctx context.Context, leased *RunQueueEntry) 
 		p.inFlightMu.Unlock()
 	}()
 
+	// The returned error is deliberately discarded here: the background
+	// tick's own outcome handling (Ack/Nack/TerminalFail) already happened
+	// inside executeEntrySync, and nothing on this detached path needs to
+	// inspect the result further. DrainSessionNow (task #421/P0-1) is the
+	// caller that DOES need it, to decide whether to keep draining or
+	// surface a failure — see there.
+	_ = p.executeEntrySync(ctx, leased)
+}
+
+// executeEntrySync is executeEntry's body, extracted (task #421/P0-1) so a
+// synchronous caller — DrainSessionNow — can invoke the exact same
+// lease/renew/watchdog/ack machinery without going through the async
+// worker-pool bookkeeping (workerWg/execSem/inFlight) that wraps every
+// executeEntry call site; each caller manages that bookkeeping itself, in
+// whatever shape fits its own concurrency model.
+//
+// Returns nil on ack'd success. On failure, returns the underlying error
+// (including the ErrCallQueuedNotExecuted sentinel, or an error matching
+// AlreadyAttempted/*SessionLockBusyError) after already performing the
+// matching Ack/Nack/TerminalFail write — callers never need to interpret
+// the error to decide what to persist for the row, only what to do next on
+// their own side (retry, stop, surface as a failure). Returns errLeaseLost
+// if the lease was reassigned mid-execution (see leaseLost's own doc) — no
+// outcome write happens in that case; the new owner is responsible for it.
+func (p *RunQueuePump) executeEntrySync(ctx context.Context, leased *RunQueueEntry) error {
 	// newDBCtx creates a fresh, short-lived (30s) context for a single DB
 	// write, deliberately rooted in context.Background() rather than p.ctx or
 	// execCtx: it must outlive both the pump's own lifecycle (Ack/Nack/
@@ -920,7 +984,7 @@ func (p *RunQueuePump) executeEntry(ctx context.Context, leased *RunQueueEntry) 
 		if termErr := p.cfg.Sessions.TerminalFailRunQueueEntry(parseDBCtx, leased.ID, p.cfg.PumpInstanceID); termErr != nil {
 			slog.Error("run_queue_pump: terminal fail failed", "id", leased.ID, "err", termErr, "instance_id", p.cfg.PumpInstanceID)
 		}
-		return
+		return err
 	}
 
 	// Renew this lease periodically while Coordinator.Run is in flight.
@@ -1221,7 +1285,7 @@ func (p *RunQueuePump) executeEntry(ctx context.Context, leased *RunQueueEntry) 
 	// to stop the in-flight Coordinator.Run as early as possible.
 	if leaseLost.Load() {
 		slog.Debug("run_queue_pump: execution aborted due to lease loss, skipping outcome write (reconciliation deferred to new owner)", "id", leased.ID, "session_id", leased.SessionID, "instance_id", p.cfg.PumpInstanceID)
-		return
+		return errLeaseLost
 	}
 
 	// Fresh 30s budget for the outcome write below, created only now —
@@ -1243,7 +1307,7 @@ func (p *RunQueuePump) executeEntry(ctx context.Context, leased *RunQueueEntry) 
 		} else {
 			slog.Info("run_queue_pump: executed entry successfully", "id", leased.ID, "session_id", leased.SessionID, "instance_id", p.cfg.PumpInstanceID)
 		}
-		return
+		return nil
 	}
 
 	// ErrCallQueuedNotExecuted means the call was appended to a genuinely
@@ -1287,7 +1351,7 @@ func (p *RunQueuePump) executeEntry(ctx context.Context, leased *RunQueueEntry) 
 		p.busyBackoffUntil[leased.SessionID] = time.Now().Add(p.leaseTTL())
 		p.busyBackoffMu.Unlock()
 		slog.Debug("run_queue_pump: call was queued into an externally-owned session, backed off locally without an attempt penalty", "id", leased.ID, "session_id", leased.SessionID, "instance_id", p.cfg.PumpInstanceID)
-		return
+		return err
 	}
 
 	// Failure: determine if it's retryable or terminal
@@ -1300,7 +1364,7 @@ func (p *RunQueuePump) executeEntry(ctx context.Context, leased *RunQueueEntry) 
 			slog.Error("run_queue_pump: terminal fail failed", "id", leased.ID, "err", termErr, "instance_id", p.cfg.PumpInstanceID)
 		}
 		slog.Warn("run_queue_pump: entry terminal failed (already attempted)", "id", leased.ID, "session_id", leased.SessionID, "err", err, "instance_id", p.cfg.PumpInstanceID)
-		return
+		return err
 	}
 
 	// SessionLockBusyError means another live process legitimately holds the
@@ -1316,7 +1380,7 @@ func (p *RunQueuePump) executeEntry(ctx context.Context, leased *RunQueueEntry) 
 			slog.Error("run_queue_pump: no-penalty nack failed", "id", leased.ID, "err", nackErr, "instance_id", p.cfg.PumpInstanceID)
 		}
 		slog.Debug("run_queue_pump: entry blocked by session lock contention, will retry without attempt penalty", "id", leased.ID, "session_id", leased.SessionID, "instance_id", p.cfg.PumpInstanceID)
-		return
+		return err
 	}
 
 	// Retryable failure: nack and let the pump retry on next tick
@@ -1324,4 +1388,160 @@ func (p *RunQueuePump) executeEntry(ctx context.Context, leased *RunQueueEntry) 
 		slog.Error("run_queue_pump: nack failed", "id", leased.ID, "err", nackErr, "instance_id", p.cfg.PumpInstanceID)
 	}
 	slog.Debug("run_queue_pump: entry failed, will retry", "id", leased.ID, "session_id", leased.SessionID, "err", err, "attempts", leased.Attempts+1, "instance_id", p.cfg.PumpInstanceID)
+	return err
+}
+
+// DrainSessionNow synchronously executes every currently-pending run-queue
+// entry for sessionID, blocking the caller until the session's durable
+// queue is empty and no execution of it is in flight in this pump instance
+// — or until ctx is done.
+//
+// It exists so a short-lived process (crush run) can finish a durable
+// continuation in the SAME process instead of leaving it for some future
+// invocation's background tick to eventually pick up (task #421/P0-1): a
+// cross-process interrupt landing on a busy session cancels the in-flight
+// generation and durably enqueues its replacement (handleInterruptTick,
+// mailbox.go's FromDurableQueue guard), deliberately WITHOUT a live
+// mb.replacement handoff — the durable row is the only remaining owner.
+// Without something calling this, that row sits pending until the
+// background pump's next tick (RunQueuePumpInterval, 3s in production)
+// happens to fire before the process exits — a race the process routinely
+// loses, since RunNonInteractive's own completion path runs in
+// milliseconds after the cancellation.
+//
+// Returns drained=true if at least one entry was observed to execute for
+// this session during the call — either leased and run by this call
+// directly, or (see below) by this pump's own background tick racing ahead
+// of it. drained=false, err=nil means nothing was pending; callers must
+// NOT treat that as having recovered anything (a plain user-initiated
+// cancel/timeout with no durable continuation looks identical to "nothing
+// to drain" and must be left as the caller's original outcome).
+//
+// Race against the background tick: LeaseRunQueueEntry is atomic at the DB
+// level, so two callers racing for the same row can never both execute it
+// — but if the background tick wins the race, THIS call's own lease
+// attempt simply finds nothing pending, even though the row is genuinely
+// being executed right now by a goroutine this call didn't start. Silently
+// returning "nothing to drain" in that case would reproduce the exact bug
+// this function exists to close, just via a race instead of a certainty.
+// The fix: check p.inFlight for this session before concluding there is
+// nothing left to wait for. If busy, that busy state was set either by
+// this call's own leasing branch below (mirroring processEntry) or by the
+// background tick's processEntry/executeEntry — either way, poll (bounded,
+// drainSessionPollInterval) until it clears, then loop back and check
+// again for anything newly pending, rather than trying to coordinate a
+// clean handoff between the two paths.
+//
+// Deliberately does NOT replicate processEntry's RunQueueMaxAttempts
+// pre-check, busyBackoffUntil dedup, or admitMu/stopping shutdown gate —
+// those exist for the long-running, many-tick background scenario. A
+// synchronous drain bounded by the caller's own ctx (crush run's --timeout)
+// does not need them: a genuinely stuck or poison entry hits ctx's
+// deadline (or, for attempts, the loop below still honors
+// RunQueueMaxAttempts directly so a truly poison entry terminal-fails
+// instead of being retried forever inside one call) and this call returns
+// with that error rather than looping unboundedly.
+func (p *RunQueuePump) DrainSessionNow(ctx context.Context, sessionID string) (drained bool, err error) {
+	for {
+		if ctx.Err() != nil {
+			return drained, ctx.Err()
+		}
+
+		leased, leaseErr := p.cfg.Sessions.LeaseRunQueueEntry(ctx, sessionID, p.cfg.PumpInstanceID, p.leaseTTL())
+		if leaseErr != nil {
+			return drained, leaseErr
+		}
+
+		if leased != nil {
+			drained = true
+
+			// Mirrors processEntry's own attempts-exhausted check (see
+			// there) — this call bypassed that check by leasing directly
+			// instead of scanning pending entries first, so it must be
+			// re-applied here or a poison entry that always fails would
+			// retry inside this loop until ctx's deadline instead of
+			// terminal-failing at RunQueueMaxAttempts like every other
+			// path does.
+			if leased.Attempts >= RunQueueMaxAttempts && !leased.TerminalFailure {
+				termCtx, termCancel := context.WithTimeout(context.Background(), p.dbWriteTimeout())
+				termErr := p.cfg.Sessions.TerminalFailRunQueueEntry(termCtx, leased.ID, p.cfg.PumpInstanceID)
+				termCancel()
+				if termErr != nil {
+					slog.Error("run_queue_pump: DrainSessionNow terminal fail failed", "id", leased.ID, "session_id", sessionID, "err", termErr, "instance_id", p.cfg.PumpInstanceID)
+				}
+				err = fmt.Errorf("run queue entry %q exceeded max attempts", leased.ID)
+				continue
+			}
+
+			p.inFlightMu.Lock()
+			p.inFlight[sessionID] = struct{}{}
+			p.inFlightMu.Unlock()
+
+			select {
+			case p.execSem <- struct{}{}:
+			case <-ctx.Done():
+				// Release the lease we just took rather than leaving it
+				// leased with nobody executing it. A later tick (this
+				// process or another) recovers it via the ordinary
+				// lease-expiry path regardless, but releasing promptly
+				// avoids waiting out a full TTL for no reason.
+				p.inFlightMu.Lock()
+				delete(p.inFlight, sessionID)
+				p.inFlightMu.Unlock()
+				nackCtx, nackCancel := context.WithTimeout(context.Background(), p.dbWriteTimeout())
+				if nackErr := p.cfg.Sessions.NackRunQueueEntryNoAttemptPenalty(nackCtx, leased.ID, p.cfg.PumpInstanceID, "run_queue_pump: DrainSessionNow's ctx ended before an execution slot was available"); nackErr != nil {
+					slog.Error("run_queue_pump: DrainSessionNow release-on-ctx-done nack failed", "id", leased.ID, "session_id", sessionID, "err", nackErr, "instance_id", p.cfg.PumpInstanceID)
+				}
+				nackCancel()
+				return drained, ctx.Err()
+			}
+
+			execErr := p.executeEntrySync(ctx, leased)
+
+			<-p.execSem
+			p.inFlightMu.Lock()
+			delete(p.inFlight, sessionID)
+			p.inFlightMu.Unlock()
+
+			if errors.Is(execErr, ErrCallQueuedNotExecuted) || isSessionLockBusyErr(execErr) {
+				// A genuinely different live owner has this session right
+				// now — not this call, not the background tick (see those
+				// errors' own docs on executeEntrySync). Waiting for a
+				// stranger's turn to finish is not this call's job: stop
+				// and let the caller's original outcome stand for
+				// whatever wasn't drained.
+				return drained, nil
+			}
+			err = execErr
+			continue // more may be pending (e.g. a second stacked interrupt) — loop and check again
+		}
+
+		// Nothing pending for THIS call to lease. Someone else in this
+		// pump instance — the background tick, racing ahead of us — might
+		// already be executing this session's entry; if so, wait for it
+		// to finish and re-check, since its outcome matters exactly as
+		// much as this call's own would (see the race note in the doc
+		// comment above).
+		p.inFlightMu.Lock()
+		_, busy := p.inFlight[sessionID]
+		p.inFlightMu.Unlock()
+		if !busy {
+			return drained, err
+		}
+		drained = true
+		select {
+		case <-ctx.Done():
+			return drained, ctx.Err()
+		case <-time.After(p.drainSessionPollInterval()):
+		}
+	}
+}
+
+// isSessionLockBusyErr reports whether err is (or wraps) a
+// *SessionLockBusyError — the same check executeEntrySync performs inline,
+// factored out so DrainSessionNow can use it without duplicating the
+// errors.As boilerplate.
+func isSessionLockBusyErr(err error) bool {
+	var busyErr *SessionLockBusyError
+	return errors.As(err, &busyErr)
 }

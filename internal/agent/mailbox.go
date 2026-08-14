@@ -826,6 +826,18 @@ func (mb *mailbox) interruptAndReplace(call SessionAgentCall) (context.CancelFun
 	// would create a live copy that runs immediately, leaving the durable row
 	// pending for a second execution by the pump. For non-durable calls, the
 	// mailbox replacement IS the only retry path, so they are recorded normally.
+	//
+	// "the pump will execute it" originally meant only the background
+	// RunQueuePump's own periodic tick (3s in production) — leaving a real
+	// liveness gap for short-lived processes (crush run), since the process
+	// routinely exits before that tick ever fires. Task #421/P0-1 closed
+	// that gap WITHOUT touching this guard: RunNonInteractive
+	// (internal/app/app.go) now calls RunQueuePump.DrainSessionNow
+	// synchronously in the same process once the cancelled generation
+	// returns, executing the row through the exact same lease/execute path
+	// the background tick uses. This function's guard above is still
+	// correct and unchanged — it only decides mailbox ownership, not who
+	// eventually runs the durable row.
 	if !call.FromDurableQueue {
 		mb.replacement = &call
 	}

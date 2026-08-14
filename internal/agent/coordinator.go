@@ -2472,14 +2472,26 @@ func (c *coordinator) ClearQueue(sessionID string) {
 // interrupt=true row for sessionID every interruptInjectTick, for as long as
 // ctx is live (i.e. the duration of the owning turn). On each interrupt row
 // it consumes it, requeues the already-persisted message via
-// ConsumeInterruptInjectAndEnqueue, and cancels the running generation. The
-// goroutine continues ticking until ctx is cancelled, handling sequential
-// interrupts (each interrupt maps to one cancel+requeue; a replacement turn
-// runs under the same coordinator-level Run, and subsequent interrupts are
-// handled by the same ticker). This ensures that after the first interrupt,
-// the replacement turn itself remains interruptible by a second cross-process
-// interrupt. The goroutine also exits when ctx is cancelled (turn finished/
-// aborted), so it never outlives the turn.
+// ConsumeInterruptInjectAndEnqueue, and cancels the running generation.
+//
+// CORRECTED (task #421/P0-1; the original text here claimed "a replacement
+// turn runs under the same coordinator-level Run", which stopped being true
+// once handleInterruptTick started marking calls FromDurableQueue=true —
+// see mailbox.go's guard on mb.replacement): for a durable-queue-originated
+// interrupt, cancelling the current generation does NOT hand this Run() call
+// a replacement turn to keep running — sessionAgent.Run's turn loop simply
+// ends (hasNext=false), and this ticker's own ctx (the owning Run call's)
+// is cancelled right along with it, so the ticker exits too. The durable row
+// is the only remaining owner of the interrupted work; it is executed
+// SEPARATELY, in the same OS process but outside this Run call, by
+// RunNonInteractive's DrainSessionNow call (internal/app/app.go) once this
+// Run() returns — not by this ticker continuing to poll for it. The one
+// case this ticker DOES keep ticking across is a NON-durable interrupt
+// (InterruptAndSend, still sets mb.replacement): that replacement genuinely
+// does run under this same Run call, and remains interruptible by a second
+// cross-process interrupt via this same ticker, exactly as originally
+// documented. The goroutine also exits when ctx is cancelled (turn finished/
+// aborted), so it never outlives the turn either way.
 //
 // Returns a channel that is closed when the ticker goroutine exits. Callers
 // should defer a receive from this channel to ensure the goroutine has fully
@@ -2519,10 +2531,19 @@ func (c *coordinator) startInterruptTicker(ctx context.Context, sessionID string
 					}
 					continue
 				}
-				// Continue ticking: a replacement turn (triggered by this
-				// interrupt) runs under the same coordinator Run call and
-				// remains interruptible. Subsequent interrupts will be handled
-				// by the same ticker (the durable queue serves FIFO ordering).
+				// Continue ticking. Whether a replacement turn "remains
+				// interruptible by this same ticker" depends on which path
+				// fired above — see startInterruptTicker's own doc for the
+				// distinction (task #421/P0-1 correction): a durable-queue
+				// interrupt has no replacement turn under THIS Run call at
+				// all (the row is executed separately, after Run returns),
+				// so this loop iteration is really just clearing the way for
+				// the ctx-cancellation exit that follows shortly. A
+				// non-durable interrupt's replacement genuinely does run
+				// here and stays covered by this same ticker. Either way,
+				// subsequent interrupts are handled correctly (the durable
+				// queue serves FIFO ordering regardless of which path
+				// consumes it).
 			}
 		}
 	}()

@@ -1338,6 +1338,190 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt 
 		}
 	}()
 
+	// finish builds the final envelope/error from runErr plus whatever
+	// finalText/finalReason/toolCallCounts have accumulated via messageEvents
+	// so far, and is the sole return point for a completed run. Extracted
+	// (task #421/P0-1) from the body of `case result := <-done:` below so
+	// BOTH that case AND drainDone's case (a durable continuation's outcome,
+	// possibly arriving well after the original done fired) can reach it —
+	// see the select loop's own doc for why this split exists.
+	finish := func(runErr error) error {
+		stopSpinner()
+		isCanceled := runErr != nil && (errors.Is(runErr, context.Canceled) || errors.Is(runErr, agent.ErrRequestCancelled))
+
+		if mode == RunModeJSON {
+			// Re-fetch the session row so the usage delta reflects
+			// the writes the agent made during the run.
+			freshSess, _ := app.Sessions.Get(ctx, sess.ID)
+			// Fork patch (orchestrator UX): when the caller asked
+			// for JSON, defang the persistent "model wrapped its
+			// final JSON in a ```json fence and added prose" case
+			// here so wrappers can pipe final_text straight into
+			// jq. The original is preserved in assistant_notes.
+			//
+			// Fork patch (orchestrator UX): stripAndExtractJSON handles
+			// the common small-model failure mode: prose preamble + JSON,
+			// or even multiple JSON values separated by prose (observed
+			// with GLM-5-turbo). Returns a wrapped JSON array when N≥2
+			// valid values are found, a single value for N=1, and
+			// ErrInvalidStripJSON for N=0 (original text preserved in
+			// final_text so the orchestrator can inspect what the model
+			// actually said).
+			finalTextOut := finalText
+			assistantNotes := ""
+			strippedBytes := 0
+			stripErr := ""
+			stripErrReason := ""
+			if overrides.StripJSONFences && finalReason != "error" && finalReason != "canceled" {
+				cleaned, notes, vErr := stripAndExtractJSON(finalText)
+				finalTextOut = cleaned
+				assistantNotes = notes
+				strippedBytes = len(finalText) - len(cleaned)
+				if strippedBytes < 0 {
+					strippedBytes = 0
+				}
+				if vErr != nil {
+					stripErr = vErr.Error()
+					stripErrReason = "invalid_json"
+				}
+			}
+			// Fork patch (orchestrator UX): sub-agent aggregation.
+			// session-#3 (2026-05-17) feedback measured a 7×
+			// reduction where parent collapsed sub-agent outputs
+			// into a one-paragraph wrap-up. Two responses:
+			//
+			// 1. ALWAYS-ON warning when reduction ratio is bad
+			//    (≥3 sub-agents emitted output AND final_text is
+			//    <40% of their combined chars). Operator sees it
+			//    in envelope.warnings without flipping a flag.
+			// 2. OPT-IN --aggregation=attach: collect each
+			//    sub-agent's last assistant text into
+			//    envelope.SubAgentOutputs so the orchestrator
+			//    recovers the lost detail.
+			var subOutputs []subAgentOutput
+			var reductionWarning string
+			subAgentCalls := toolCallCounts["agent"] + toolCallCounts["agentic_fetch"]
+			if subAgentCalls > 0 {
+				count, totalChars := app.subAgentSummaryStats(ctx, sess.ID)
+				if count >= 2 && totalChars > 0 {
+					parentChars := len(finalTextOut)
+					ratio := float64(parentChars) / float64(totalChars)
+					if ratio < 0.4 {
+						reductionWarning = fmt.Sprintf(
+							"reduction-loss: final_text is %d chars (%.0f%% of %d combined sub-agent chars across %d sub-session(s)). The parent likely summarised away detail. Re-run with --aggregation=attach or --aggregation=concat to recover; or query the sub-sessions directly.",
+							parentChars, ratio*100, totalChars, count,
+						)
+					}
+				}
+			}
+			if overrides.AggregationMode == "attach" {
+				subOutputs = app.collectSubAgentOutputs(ctx, sess.ID)
+			}
+			summary := buildRunResult(
+				sess.ID, finalTextOut, assistantNotes, finalReason, runErr, isCanceled,
+				toolCallCounts,
+				freshSess.PromptTokens+freshSess.CompletionTokens-tokensBefore,
+				freshSess.Cost-costBefore,
+				time.Since(runStart),
+				finalErrTitle, finalErrDetails,
+				strippedBytes, stripErr, stripErrReason,
+				subOutputs, reductionWarning,
+			)
+			// Fork patch: batch 8 — surface orphan partial text.
+			if partial := app.findOrphanPartial(ctx, sess.ID); partial != nil {
+				summary.RecoveredPartial = partial
+				summary.Warnings = append(summary.Warnings, fmt.Sprintf(
+					"recovered %d chars of partial assistant text from session %s — model run was interrupted",
+					partial.Chars, sess.ID,
+				))
+			}
+			hookExitReason = summary.ExitReason
+			enc := json.NewEncoder(output)
+			if encErr := enc.Encode(summary); encErr != nil {
+				return fmt.Errorf("failed to encode JSON result: %w", encErr)
+			}
+			// The envelope (incl. exit_reason + error) is already on
+			// stdout. Drive the PROCESS exit code off the outcome so
+			// orchestrators / CI branch on success without parsing stdout:
+			// a clean end_turn exits 0; an in-band error finish (stall,
+			// provider error, empty stream), a cancellation/timeout, or a
+			// max_tokens truncation exit non-zero.
+			if runFailed(finalReason, runErr, isCanceled) {
+				return &runIncompleteError{reason: summary.ExitReason, detail: summary.Error}
+			}
+			return nil
+		}
+
+		if runErr != nil {
+			if guidance := sessionBusyGuidance(sess.ID, runErr); guidance != "" {
+				slog.Warn("Non-interactive run rejected because session is already locked",
+					"session_id", sess.ID,
+					"guidance", guidance,
+					"err", runErr)
+				fmt.Fprintf(os.Stderr, "\n%s\n\n", guidance)
+			}
+			// Peak-hours refusal carries multiline orchestrator
+			// guidance (RESUME AT + don't-retry instructions) that
+			// fang's ERROR box truncates at the first newline. Print
+			// the guidance to stderr separately BEFORE the ERROR box
+			// so the operator / orchestrator actually sees it.
+			// Reuses agent.PeakHoursGuidance so the stderr text stays
+			// identical to the DB finish-message details recorded by
+			// peakHoursStoppedFinishText (sessions why / diff, etc.).
+			var peakErr *agent.PeakHoursError
+			if errors.As(runErr, &peakErr) {
+				fmt.Fprintf(os.Stderr, "\n%s\n\n", agent.PeakHoursGuidance(peakErr))
+			}
+			if isCanceled {
+				slog.Debug("Non-interactive: agent processing cancelled", "session_id", sess.ID)
+				hookExitReason = "cancelled"
+				return cancelledRunError(runErr, finalReason, finalErrTitle, finalErrDetails)
+			}
+			hookExitReason = "error"
+			return fmt.Errorf("agent processing failed: %w", runErr)
+		}
+		// runErr == nil, but the turn may still have ended in-band on an
+		// error / canceled / max_tokens finish — not a clean completion,
+		// so exit non-zero (the final text is already on stdout).
+		if runFailed(finalReason, runErr, isCanceled) {
+			reason := finalReason
+			if reason == "" {
+				reason = "error"
+			}
+			hookExitReason = reason
+			detail := finalErrTitle
+			if finalErrDetails != "" {
+				if detail != "" {
+					detail += ": "
+				}
+				detail += finalErrDetails
+			}
+			return &runIncompleteError{reason: reason, detail: detail}
+		}
+		hookExitReason = "stop"
+		return nil
+	}
+
+	// drainDone carries the outcome of a P0-1 durable-continuation drain
+	// (see the `case result := <-done` branch below) back into this same
+	// select loop, on its OWN turn through the loop rather than synchronously
+	// inside done's case body. This matters: DrainSessionNow can take
+	// seconds (a real second provider round-trip) and, while it runs, the
+	// continuation's OWN assistant messages are published to the same
+	// message broker messageEvents is subscribed to — those messages MUST
+	// still be read by `case event := <-messageEvents` (that's what updates
+	// finalText/finalReason/toolCallCounts, and what streams live output in
+	// RunModeStream/Terse) while the drain is in flight. Calling
+	// DrainSessionNow synchronously inside done's own case body would block
+	// this entire select for the drain's whole duration, starving
+	// messageEvents and leaving finalText/finalReason stuck at whatever the
+	// CANCELLED first generation had produced — confirmed directly: an
+	// earlier, synchronous-in-place version of this fix passed a superficial
+	// smoke test but failed a stricter end-to-end regression test
+	// (TestRunNonInteractive_P0_1_LiveContinuation) with the continuation's
+	// own content never reaching the envelope.
+	drainDone := make(chan error, 1)
+
 	for {
 		if progress && stderrTTY {
 			// HACK: Reinitialize the terminal progress bar on every iteration
@@ -1347,163 +1531,66 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt 
 
 		select {
 		case result := <-done:
-			stopSpinner()
 			runErr := result.err
 			isCanceled := runErr != nil && (errors.Is(runErr, context.Canceled) || errors.Is(runErr, agent.ErrRequestCancelled))
 
-			if mode == RunModeJSON {
-				// Re-fetch the session row so the usage delta reflects
-				// the writes the agent made during the run.
-				freshSess, _ := app.Sessions.Get(ctx, sess.ID)
-				// Fork patch (orchestrator UX): when the caller asked
-				// for JSON, defang the persistent "model wrapped its
-				// final JSON in a ```json fence and added prose" case
-				// here so wrappers can pipe final_text straight into
-				// jq. The original is preserved in assistant_notes.
-				//
-				// Fork patch (orchestrator UX): stripAndExtractJSON handles
-				// the common small-model failure mode: prose preamble + JSON,
-				// or even multiple JSON values separated by prose (observed
-				// with GLM-5-turbo). Returns a wrapped JSON array when N≥2
-				// valid values are found, a single value for N=1, and
-				// ErrInvalidStripJSON for N=0 (original text preserved in
-				// final_text so the orchestrator can inspect what the model
-				// actually said).
-				finalTextOut := finalText
-				assistantNotes := ""
-				strippedBytes := 0
-				stripErr := ""
-				stripErrReason := ""
-				if overrides.StripJSONFences && finalReason != "error" && finalReason != "canceled" {
-					cleaned, notes, vErr := stripAndExtractJSON(finalText)
-					finalTextOut = cleaned
-					assistantNotes = notes
-					strippedBytes = len(finalText) - len(cleaned)
-					if strippedBytes < 0 {
-						strippedBytes = 0
+			// P0-1 fix (task #421): a cross-process interrupt landing on a
+			// busy session (crush sessions inject --interrupt) cancels the
+			// in-flight generation and durably enqueues its replacement
+			// (handleInterruptTick), deliberately WITHOUT a live mailbox
+			// handoff — the durable run_queue row is the only remaining
+			// owner (see mailbox.go's FromDurableQueue guard). Without this,
+			// that row sits pending until the background RunQueuePump's
+			// next tick (3s in production) happens to fire before this
+			// process exits — a race this short-lived process routinely
+			// loses, since the rest of this select fires within
+			// milliseconds of the cancellation. DrainSessionNow runs any
+			// such pending continuation to completion, in THIS process,
+			// before the envelope is built from what would otherwise be a
+			// stale, cancelled-generation result.
+			//
+			// isCanceled gates this deliberately: DrainSessionNow itself is
+			// a no-op (drained=false) when nothing is pending, so a plain
+			// user/--timeout cancellation with no durable continuation is
+			// unaffected — the drainDone case below restores the ORIGINAL
+			// runErr in that case, rather than fabricating a success.
+			//
+			// Runs in its OWN goroutine (see drainDone's doc above for why
+			// synchronous-in-place doesn't work) — this select loop keeps
+			// servicing messageEvents (and ctx.Done()) the whole time.
+			if isCanceled && app.RunQueuePump != nil {
+				go func(originalErr error) {
+					drained, drainErr := app.RunQueuePump.DrainSessionNow(ctx, sess.ID)
+					switch {
+					case drainErr != nil:
+						// The drain itself failed (ctx expired, a poison
+						// entry exceeded max attempts, a DB error) —
+						// surface that as the run's outcome; it is more
+						// actionable than the stale cancellation it would
+						// otherwise replace.
+						drainDone <- drainErr
+					case drained:
+						// The durable continuation ran in this process.
+						// Its messages already updated finalText/
+						// finalReason/toolCallCounts via the SAME
+						// messageEvents subscription this loop keeps
+						// servicing — finish() just needs a nil error
+						// instead of the original interrupt-induced
+						// cancellation.
+						drainDone <- nil
+					default:
+						// Nothing was pending. Restore the original
+						// cancellation — it was real, not a P0-1 artifact.
+						drainDone <- originalErr
 					}
-					if vErr != nil {
-						stripErr = vErr.Error()
-						stripErrReason = "invalid_json"
-					}
-				}
-				// Fork patch (orchestrator UX): sub-agent aggregation.
-				// session-#3 (2026-05-17) feedback measured a 7×
-				// reduction where parent collapsed sub-agent outputs
-				// into a one-paragraph wrap-up. Two responses:
-				//
-				// 1. ALWAYS-ON warning when reduction ratio is bad
-				//    (≥3 sub-agents emitted output AND final_text is
-				//    <40% of their combined chars). Operator sees it
-				//    in envelope.warnings without flipping a flag.
-				// 2. OPT-IN --aggregation=attach: collect each
-				//    sub-agent's last assistant text into
-				//    envelope.SubAgentOutputs so the orchestrator
-				//    recovers the lost detail.
-				var subOutputs []subAgentOutput
-				var reductionWarning string
-				if mode == RunModeJSON {
-					subAgentCalls := toolCallCounts["agent"] + toolCallCounts["agentic_fetch"]
-					if subAgentCalls > 0 {
-						count, totalChars := app.subAgentSummaryStats(ctx, sess.ID)
-						if count >= 2 && totalChars > 0 {
-							parentChars := len(finalTextOut)
-							ratio := float64(parentChars) / float64(totalChars)
-							if ratio < 0.4 {
-								reductionWarning = fmt.Sprintf(
-									"reduction-loss: final_text is %d chars (%.0f%% of %d combined sub-agent chars across %d sub-session(s)). The parent likely summarised away detail. Re-run with --aggregation=attach or --aggregation=concat to recover; or query the sub-sessions directly.",
-									parentChars, ratio*100, totalChars, count,
-								)
-							}
-						}
-					}
-					if overrides.AggregationMode == "attach" {
-						subOutputs = app.collectSubAgentOutputs(ctx, sess.ID)
-					}
-				}
-				summary := buildRunResult(
-					sess.ID, finalTextOut, assistantNotes, finalReason, runErr, isCanceled,
-					toolCallCounts,
-					freshSess.PromptTokens+freshSess.CompletionTokens-tokensBefore,
-					freshSess.Cost-costBefore,
-					time.Since(runStart),
-					finalErrTitle, finalErrDetails,
-					strippedBytes, stripErr, stripErrReason,
-					subOutputs, reductionWarning,
-				)
-				// Fork patch: batch 8 — surface orphan partial text.
-				if partial := app.findOrphanPartial(ctx, sess.ID); partial != nil {
-					summary.RecoveredPartial = partial
-					summary.Warnings = append(summary.Warnings, fmt.Sprintf(
-						"recovered %d chars of partial assistant text from session %s — model run was interrupted",
-						partial.Chars, sess.ID,
-					))
-				}
-				hookExitReason = summary.ExitReason
-				enc := json.NewEncoder(output)
-				if encErr := enc.Encode(summary); encErr != nil {
-					return fmt.Errorf("failed to encode JSON result: %w", encErr)
-				}
-				// The envelope (incl. exit_reason + error) is already on
-				// stdout. Drive the PROCESS exit code off the outcome so
-				// orchestrators / CI branch on success without parsing stdout:
-				// a clean end_turn exits 0; an in-band error finish (stall,
-				// provider error, empty stream), a cancellation/timeout, or a
-				// max_tokens truncation exit non-zero.
-				if runFailed(finalReason, runErr, isCanceled) {
-					return &runIncompleteError{reason: summary.ExitReason, detail: summary.Error}
-				}
-				return nil
+				}(runErr)
+				continue
 			}
 
-			if runErr != nil {
-				if guidance := sessionBusyGuidance(sess.ID, runErr); guidance != "" {
-					slog.Warn("Non-interactive run rejected because session is already locked",
-						"session_id", sess.ID,
-						"guidance", guidance,
-						"err", runErr)
-					fmt.Fprintf(os.Stderr, "\n%s\n\n", guidance)
-				}
-				// Peak-hours refusal carries multiline orchestrator
-				// guidance (RESUME AT + don't-retry instructions) that
-				// fang's ERROR box truncates at the first newline. Print
-				// the guidance to stderr separately BEFORE the ERROR box
-				// so the operator / orchestrator actually sees it.
-				// Reuses agent.PeakHoursGuidance so the stderr text stays
-				// identical to the DB finish-message details recorded by
-				// peakHoursStoppedFinishText (sessions why / diff, etc.).
-				var peakErr *agent.PeakHoursError
-				if errors.As(runErr, &peakErr) {
-					fmt.Fprintf(os.Stderr, "\n%s\n\n", agent.PeakHoursGuidance(peakErr))
-				}
-				if isCanceled {
-					slog.Debug("Non-interactive: agent processing cancelled", "session_id", sess.ID)
-					hookExitReason = "cancelled"
-					return cancelledRunError(runErr, finalReason, finalErrTitle, finalErrDetails)
-				}
-				hookExitReason = "error"
-				return fmt.Errorf("agent processing failed: %w", runErr)
-			}
-			// runErr == nil, but the turn may still have ended in-band on an
-			// error / canceled / max_tokens finish — not a clean completion,
-			// so exit non-zero (the final text is already on stdout).
-			if runFailed(finalReason, runErr, isCanceled) {
-				reason := finalReason
-				if reason == "" {
-					reason = "error"
-				}
-				hookExitReason = reason
-				detail := finalErrTitle
-				if finalErrDetails != "" {
-					if detail != "" {
-						detail += ": "
-					}
-					detail += finalErrDetails
-				}
-				return &runIncompleteError{reason: reason, detail: detail}
-			}
-			hookExitReason = "stop"
-			return nil
+			return finish(runErr)
+
+		case drainErr := <-drainDone:
+			return finish(drainErr)
 
 		case event := <-messageEvents:
 			msg := event.Payload
