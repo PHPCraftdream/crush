@@ -470,6 +470,7 @@ ATOMS (combine as `crush models use <large> <small>`):
     haiku-low, haiku-medium, haiku-high, haiku-xhigh, haiku-max       Claude Haiku   (200k ctx)
 
   Zai:
+    glm5_3        GLM 5.3      (1M ctx)
     glm5_2        GLM 5.2      (1M ctx)
     glm5_1        GLM 5.1      (200k ctx)
     glm5          GLM 5        (200k ctx)
@@ -481,13 +482,15 @@ Anthropic atoms require a level suffix (`opus-high`, `sonnet-low`, etc.) —
 the level list comes from parsing `claude --help` at first use (falls back
 to a static `low/medium/high/xhigh/max` list if parsing fails).
 
-Z.AI atoms are **not** all effort-less: **GLM-5.2** (`glm5_2`) has 3 real
-wire states (`off`/`high`/`max`) settable via the long-form suffix
-(`glm5_2-max`) or raw `zai/glm-5.2@max` — one more than every *other*
-Z.AI/GLM model (5.1, 5, 5-turbo, 4.7, 4.6, ...), which exposes only a
-boolean thinking toggle (`off`/`on`). Both forms are validated against the
-atom's real levels; `crush models efforts <model>` prints the exact list
-and commands for any specific model.
+Z.AI atoms are **not** all effort-less: **GLM-5.3** and **GLM-5.2**
+(`glm5_3`, `glm5_2`) have 3 real wire states (`off`/`high`/`max`) settable
+via the long-form suffix (`glm5_2-max`) or raw `zai/glm-5.2@max` — one more
+than every *other* Z.AI/GLM model (5.1, 5, 5-turbo, 4.7, 4.6, ...), which
+exposes only a boolean thinking toggle (`off`/`on`). Both forms are
+validated against the atom's real levels; `crush models efforts <model>`
+prints the exact list and commands for any specific model. (GLM-5.3's
+context window/levels are provisional — see the comment above its entry
+in `internal/cmd/models_atoms.go`.)
 
 ```bash
 crush models use opus-high glm5_turbo                # mixed Anthropic large + Z.AI small

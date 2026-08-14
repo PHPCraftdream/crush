@@ -66,12 +66,12 @@ var providerEffortDocs = []providerEffortDoc{
 			"  xhigh, max, ultracode        -> reasoning_effort: \"max\"",
 			"Older GLM-4.x models ignore reasoning_effort harmlessly.",
 			"",
-			"GLM-5.2 (glm5_2) is the only Z.AI atom with 3 real states",
-			"(off/high/max — one more than the rest). Every other Z.AI atom",
-			"(glm5_1, glm5, glm5_turbo, glm4_7, glm4_7_flash, glm4_6, glm4_6v)",
-			"has 2 (off/on, a boolean thinking toggle). No letter short codes",
-			"exist for Z.AI (no `glm5_2xx`) — set with the long-form atom suffix",
-			"(`glm5_2-max`) or raw `zai/<model>@<level>` (`zai/glm-5.2@max`);",
+			"GLM-5.3 and GLM-5.2 (glm5_3, glm5_2) are the only Z.AI atoms with 3",
+			"real states (off/high/max — one more than the rest). Every other",
+			"Z.AI atom (glm5_1, glm5, glm5_turbo, glm4_7, glm4_7_flash, glm4_6,",
+			"glm4_6v) has 2 (off/on, a boolean thinking toggle). No letter short",
+			"codes exist for Z.AI (no `glm5_2xx`) — set with the long-form atom",
+			"suffix (`glm5_2-max`) or raw `zai/<model>@<level>` (`zai/glm-5.2@max`);",
 			"both are validated against the atom's list.",
 		},
 	},
@@ -388,8 +388,13 @@ func renderEffortsForModel(arg string) (string, error) {
 		if a, ok := atomRegistry[target.AtomKey]; ok && a.ReasoningLevels != nil {
 			levels = a.ReasoningLevels
 		}
-		if target.AtomKey == "glm5_2" {
-			b.WriteString("  GLM-5.2 is the only Z.AI atom with 3 real states (the rest have 2):\n")
+		// 3-state (off/high/max) vs boolean (off/on) is determined by which
+		// levels array the atom actually resolved to above, not a hardcoded
+		// atom-key check — GLM-5.3 was added on the same zaiReasoningLevels
+		// array as GLM-5.2 (task #448), so a name-based check here would
+		// have silently shown the wrong (boolean-only) message for it.
+		if len(levels) == len(zaiReasoningLevels) {
+			b.WriteString("  This Z.AI atom has 3 real states (most Z.AI models only have 2):\n")
 		} else {
 			b.WriteString("  This Z.AI model only exposes the boolean thinking toggle:\n")
 		}

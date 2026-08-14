@@ -98,11 +98,23 @@ var atomRegistry = map[string]atom{
 	// in `crush models efforts`) — effort is set via the raw
 	// `zai/glm-5.2@max` syntax instead.
 	//
-	// Only glm5_2 gets zaiReasoningLevels (off/high/max); glm5_1/glm5/
+	// Only glm5_2/glm5_3 get zaiReasoningLevels (off/high/max); glm5_1/glm5/
 	// glm5_turbo below get zaiBooleanThinkingLevels (off/on toggle) instead
 	// — coordinator.go sends the same reasoning_effort wire value to every
 	// Z.AI model uniformly, but only GLM-5.2 is documented by Z.AI as acting
 	// on it. See the SYNC WARNING on zaiReasoningLevels.
+	//
+	// UNVERIFIED (added 2026-08-14, by user request, ahead of confirmation):
+	// GLM-5.3 is not yet documented on docs.z.ai (only GLM-5, GLM-5.2 exist
+	// there as of this date; docs.z.ai/guides/llm/glm-5.3 404s). Model id
+	// "glm-5.3", CtxLabel "1M", and ReasoningLevels are copied from GLM-5.2
+	// on the assumption a .3 point release keeps the same capability tier
+	// as .2 rather than reverting to the 200k/boolean-only tier of 5/5.1/
+	// 5-turbo — NOT confirmed. Verify with `crush ping --model zai/glm-5.3`
+	// (see internal/cmd/ping.go's --model flag) once available and update
+	// this entry/comment with the real numbers, the same way the
+	// 204.8k/131.1k guesses above this were later corrected.
+	"glm5_3":     {Provider: "zai", Model: "glm-5.3", DisplayName: "GLM 5.3", CtxLabel: "1M", Group: "zai", ReasoningLevels: zaiReasoningLevels},
 	"glm5_2":     {Provider: "zai", Model: "glm-5.2", DisplayName: "GLM 5.2", CtxLabel: "1M", Group: "zai", ReasoningLevels: zaiReasoningLevels},
 	"glm5_1":     {Provider: "zai", Model: "glm-5.1", DisplayName: "GLM 5.1", CtxLabel: "200k", Group: "zai", ReasoningLevels: zaiBooleanThinkingLevels},
 	"glm5":       {Provider: "zai", Model: "glm-5", DisplayName: "GLM 5", CtxLabel: "200k", Group: "zai", ReasoningLevels: zaiBooleanThinkingLevels},
@@ -133,7 +145,7 @@ var atomGroupOrder = []string{"anthropic", "zai"}
 var atomDisplayOrder = map[string][]string{
 	"anthropic": {"opus", "opus48", "opus47", "opus46", "fable", "sonnet", "haiku"},
 	"zai": {
-		"glm5_2", "glm5_1", "glm5", "glm5_turbo",
+		"glm5_3", "glm5_2", "glm5_1", "glm5", "glm5_turbo",
 		"glm4_7", "glm4_7_flash",
 		"glm4_6", "glm4_6v",
 	},
