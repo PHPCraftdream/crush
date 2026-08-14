@@ -24,6 +24,14 @@
 # attempts, so this cannot mask real breakage, and the common case (no
 # flake) never pays for it.
 #
+# The retry is scoped to only the package(s) that actually failed (task
+# #455, following up on task #450's test-speed investigation), not the
+# whole `./...` suite — re-running everything used to mean a single flake
+# anywhere re-paid the full suite's time twice, which mattered a lot more
+# before task #450-#454 cut that time by ~50%+. If no failing package can
+# be parsed out of the first attempt's output, this falls back to
+# retrying the whole suite rather than silently skipping the retry.
+#
 # Bypass in an emergency with:  git push --no-verify
 set -uo pipefail
 
@@ -47,11 +55,22 @@ else
 fi
 
 step "go test -short -failfast ./..."
-if go test -short -failfast ./...; then
+test_log="$(mktemp)"
+trap 'rm -f "$test_log"' EXIT
+if go test -short -failfast ./... 2>&1 | tee "$test_log"; then
 	printf '\033[32m(tests passed on the first attempt)\033[0m\n'
 else
-	printf '\033[33m⚠ tests failed once — retrying (known rare Windows flakiness, see comment above)\033[0m\n'
-	go test -short -failfast ./... || fail "tests failed twice in a row — not the known flake, treat as real"
+	# Package(s) that actually reported FAIL, e.g.
+	# "FAIL	github.com/.../internal/session	3.45s" -> the package path.
+	failed_pkgs="$(grep -E '^FAIL[[:space:]]' "$test_log" | awk '{print $2}' | sort -u | tr '\n' ' ')"
+	if [ -z "${failed_pkgs// /}" ]; then
+		printf '\033[33m⚠ tests failed once — could not identify which package from the output, retrying the whole suite (known rare Windows flakiness, see comment above)\033[0m\n'
+		go test -short -failfast ./... || fail "tests failed twice in a row — not the known flake, treat as real"
+	else
+		printf '\033[33m⚠ tests failed once in: %s — retrying just that/those package(s) (known rare Windows flakiness, see comment above)\033[0m\n' "$failed_pkgs"
+		# shellcheck disable=SC2086
+		go test -short -failfast $failed_pkgs || fail "tests failed twice in a row in $failed_pkgs — not the known flake, treat as real"
+	fi
 	printf '\033[33m(tests passed on retry)\033[0m\n'
 fi
 
