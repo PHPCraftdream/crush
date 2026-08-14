@@ -247,7 +247,19 @@ func TestTryAcquireSessionLock_FreshLockIsRespected(t *testing.T) {
 	assert.True(t, errors.As(err, &busyErr), "expected SessionLockBusyError, got %v", err)
 }
 
+// The three heartbeat tests below each block for one full
+// lockHeartbeatInterval (10s) plus slack, because SessionLock exposes no
+// test seam for "was a tick observed" other than the mtime side effect.
+// They run in parallel with each other and with the rest of the package's
+// parallel tests: each owns a private t.TempDir() and its own lock file, so
+// there is no shared state, and the waiting itself is a sleeping goroutine
+// plus one Chtimes per tick — it adds no measurable CPU or I/O contention
+// for the tests it now overlaps with. Left serial, these three alone
+// accounted for 37s of internal/session's 41.8s sequential phase (and of
+// its 57.9s total `go test -short` runtime), while the package's parallel
+// phase only spans ~16s.
 func TestHeartbeatTouchesFile(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	lk, err := TryAcquireSessionLock(dir, "audit-A")
 	require.NoError(t, err)
@@ -281,6 +293,7 @@ func TestHeartbeatTouchesFile(t *testing.T) {
 // the old behavior where a plain ticker kept touching mtime forever
 // regardless of whether the process was making progress.
 func TestHeartbeat_NoActivity_DoesNotTouchMtime(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	lk, err := TryAcquireSessionLock(dir, "audit-A")
 	require.NoError(t, err)
@@ -307,6 +320,7 @@ func TestHeartbeat_NoActivity_DoesNotTouchMtime(t *testing.T) {
 // unconditional behavior did — the gate only removes updates during
 // genuinely idle intervals, it doesn't break the live/active case.
 func TestHeartbeat_RecordActivity_TouchesMtimeOnNextTick(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	lk, err := TryAcquireSessionLock(dir, "audit-A")
 	require.NoError(t, err)

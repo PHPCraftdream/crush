@@ -88,6 +88,23 @@ func TestCommandBlocking(t *testing.T) {
 
 			shell := NewShell(&Options{
 				WorkingDir: tmpDir,
+				// Run every case with PATH pointed at an empty directory.
+				// The blocking decision happens before the interpreter ever
+				// looks a binary up, so this does not weaken what is under
+				// test: the assertions below only ever check whether the
+				// security error was returned, and the allowed cases are
+				// explicitly expected to be free to fail for any other
+				// reason (see the comment on the else branch below).
+				//
+				// Without this, the shouldBlock:false rows ran for real
+				// against whatever happened to be installed on the machine
+				// — and "allow npm local install" performed an actual
+				// `npm install typescript`, downloading the package into
+				// t.TempDir(). Measured at 34.2s of this package's 39.3s
+				// total `go test -short` runtime, plus a hard dependency on
+				// npm and on outbound network access from every CI runner
+				// in the matrix.
+				Env:        []string{"PATH=" + t.TempDir()},
 				BlockFuncs: tt.blockFuncs,
 			})
 
