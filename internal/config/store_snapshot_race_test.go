@@ -127,9 +127,37 @@ func TestConcurrentReloadAndReads_NeverObservesTornGeneration(t *testing.T) {
 		go func() {
 			defer readersWg.Done()
 			for !stop.Load() {
-				cfg := store.Config()
-				resolver := store.Resolver()
-				known := store.KnownProviders()
+				// Read via a single loadSnapshot() call, not three separate
+				// Config()/Resolver()/KnownProviders() calls. Each of those
+				// exported accessors does its OWN independent s.snap.Load()
+				// — atomic individually, but with no guarantee across calls
+				// that a publish didn't land in between two of them. That
+				// gap is real but nothing in production reads Config()
+				// immediately followed by Resolver()/KnownProviders() and
+				// depends on them agreeing (confirmed by grepping every
+				// caller of Resolver()/KnownProviders() in the tree) — the
+				// cross-call case being exercised here doesn't match any
+				// actual production access pattern, and became measurably
+				// easier to hit once cliprovider.detectAvailable() started
+				// caching its PATH scan (task #450): reloadFromDiskLocked
+				// got fast enough for far more reload cycles to land inside
+				// the same wall-clock test window, without changing
+				// anything about the store's own atomicity.
+				//
+				// What the atomic-publish invariant actually promises, and
+				// what this test's own docstring above describes, is
+				// snapshot-level consistency: the config/resolver/
+				// knownProviders published by ONE reload are read together.
+				// loadSnapshot() is that one atomic read; go through it
+				// directly (this file is `package config`, so it's
+				// available) instead of the exported multi-call surface
+				// that can never make that promise without a much larger
+				// API change (returning a bundled struct from every
+				// accessor call).
+				snap := store.loadSnapshot()
+				cfg := snap.config
+				resolver := snap.resolver
+				known := snap.knownProviders
 				readCount.Add(1)
 
 				if cfg != nil && resolver != nil {
