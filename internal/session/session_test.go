@@ -45,6 +45,12 @@ func newTestDB(t *testing.T) (*sql.DB, *db.Queries) {
 			small_model_provider TEXT,
 			small_model_id TEXT,
 			small_model_reasoning_effort TEXT DEFAULT 'medium',
+			worker_model_provider TEXT,
+			worker_model_id TEXT,
+			worker_model_reasoning_effort TEXT,
+			reviewer_model_provider TEXT,
+			reviewer_model_id TEXT,
+			reviewer_model_reasoning_effort TEXT,
 			system_prompt TEXT DEFAULT '',
 			yolo_enabled INTEGER NOT NULL DEFAULT 0,
 			deleted_todos TEXT NOT NULL DEFAULT '[]',
@@ -861,7 +867,7 @@ func TestForkSession_HappyPath(t *testing.T) {
 
 	src, err := svc.Create(ctx, "source")
 	require.NoError(t, err)
-	require.NoError(t, svc.UpdateModels(ctx, src.ID, "provL", "modelL", "provS", "modelS"))
+	require.NoError(t, svc.UpdateModels(ctx, src.ID, &ModelSlotUpdate{Provider: "provL", Model: "modelL"}, &ModelSlotUpdate{Provider: "provS", Model: "modelS"}))
 	require.NoError(t, svc.UpdateReasoningEffort(ctx, src.ID, "high", "low"))
 	require.NoError(t, svc.UpdateSystemPrompt(ctx, src.ID, "be careful"))
 	require.NoError(t, svc.SetTodos(ctx, src.ID, []Todo{{Content: "do thing", Status: TodoStatusPending}}, nil))

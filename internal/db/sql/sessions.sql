@@ -34,12 +34,39 @@ INSERT INTO sessions (
 ) RETURNING *;
 
 -- name: UpdateSessionModels :exec
+-- Partial update: a NULL arg for a slot's provider/id pair leaves that slot
+-- untouched (COALESCE falls back to the current column value); a non-NULL
+-- arg (including an explicit empty string) overwrites it. This lets callers
+-- distinguish "don't touch this slot" from "clear this slot back to
+-- inheriting the folder/system default" (large_model_id = '' is the existing
+-- "no override" convention the app layer already reads via != "").
 UPDATE sessions
 SET
-    large_model_provider = ?,
-    large_model_id = ?,
-    small_model_provider = ?,
-    small_model_id = ?,
+    large_model_provider = COALESCE(sqlc.narg('large_model_provider'), large_model_provider),
+    large_model_id = COALESCE(sqlc.narg('large_model_id'), large_model_id),
+    small_model_provider = COALESCE(sqlc.narg('small_model_provider'), small_model_provider),
+    small_model_id = COALESCE(sqlc.narg('small_model_id'), small_model_id),
+    updated_at = strftime('%s', 'now')
+WHERE id = sqlc.arg('id');
+
+-- name: UpdateSessionWorkerReviewerModels :exec
+-- Same partial-update semantics as UpdateSessionModels: a NULL arg leaves
+-- that slot untouched, a non-NULL arg (including an explicit empty string)
+-- overwrites it.
+UPDATE sessions
+SET
+    worker_model_provider = COALESCE(sqlc.narg('worker_model_provider'), worker_model_provider),
+    worker_model_id = COALESCE(sqlc.narg('worker_model_id'), worker_model_id),
+    reviewer_model_provider = COALESCE(sqlc.narg('reviewer_model_provider'), reviewer_model_provider),
+    reviewer_model_id = COALESCE(sqlc.narg('reviewer_model_id'), reviewer_model_id),
+    updated_at = strftime('%s', 'now')
+WHERE id = sqlc.arg('id');
+
+-- name: UpdateSessionWorkerReviewerReasoningEffort :exec
+UPDATE sessions
+SET
+    worker_model_reasoning_effort = ?,
+    reviewer_model_reasoning_effort = ?,
     updated_at = strftime('%s', 'now')
 WHERE id = ?;
 

@@ -50,6 +50,12 @@ func newTestMessageDB(t *testing.T) (*sql.DB, *db.Queries) {
 			small_model_provider TEXT,
 			small_model_id TEXT,
 			small_model_reasoning_effort TEXT DEFAULT 'medium',
+			worker_model_provider TEXT,
+			worker_model_id TEXT,
+			worker_model_reasoning_effort TEXT,
+			reviewer_model_provider TEXT,
+			reviewer_model_id TEXT,
+			reviewer_model_reasoning_effort TEXT,
 			system_prompt TEXT DEFAULT '',
 			yolo_enabled INTEGER NOT NULL DEFAULT 0
 		);

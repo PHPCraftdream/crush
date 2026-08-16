@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useMemo } from "react";
 import { useStore } from "@nanostores/react";
-import { BrainCircuit, Zap, ChevronLeft, ChevronRight } from "lucide-react";
+import { BrainCircuit, Zap, ChevronLeft, ChevronRight, Undo2 } from "lucide-react";
 import {
   $config,
   $recentLargeModels,
@@ -10,6 +10,7 @@ import {
   getDefaultModelKey,
   setSessionModels,
   setSessionReasoningEffort,
+  clearSessionModelSlot,
 } from "../store";
 import type { ConfigPayload, Session } from "../types";
 
@@ -150,13 +151,12 @@ export function ModelSelector({ session, modelType }: { session: Session | null;
   const recentKeys = modelType === "large" ? recentLarge : recentSmall;
 
   // Get current key from session record if available, else use global default
+  const sessionProvider = modelType === "large" ? session?.LargeModelProvider : session?.SmallModelProvider;
+  const sessionModelID = modelType === "large" ? session?.LargeModelID : session?.SmallModelID;
+  const hasSessionOverride = !!(sessionProvider && sessionModelID);
   let currentKey = defaultKey;
-  if (session) {
-    const p = modelType === "large" ? session.LargeModelProvider : session.SmallModelProvider;
-    const m = modelType === "large" ? session.LargeModelID : session.SmallModelID;
-    if (p && m) {
-      currentKey = `${p}:::${m}`;
-    }
+  if (hasSessionOverride) {
+    currentKey = `${sessionProvider}:::${sessionModelID}`;
   }
 
   const currentEntry = allModels.find(m => m.key === currentKey);
@@ -249,16 +249,27 @@ export function ModelSelector({ session, modelType }: { session: Session | null;
   function onSelect(m: ModelItem) {
     if (!m.enabled) return; // CLI providers can't be selected without being enabled
     if (session) {
-      const currentLargeKey = session.LargeModelProvider ? `${session.LargeModelProvider}:::${session.LargeModelID}` : getDefaultModelKey("large", config);
-      const currentSmallKey = session.SmallModelProvider ? `${session.SmallModelProvider}:::${session.SmallModelID}` : getDefaultModelKey("small", config);
-
-      const largeKey = modelType === "large" ? m.key : currentLargeKey;
-      const smallKey = modelType === "small" ? m.key : currentSmallKey;
+      // Send ONLY the slot that was actually picked. setSessionModels treats
+      // a null key as "leave this slot alone" (task #461) — filling the
+      // other slot in from its current/default value here, like this used
+      // to do, would re-write it on every switch and freeze it against
+      // later folder/system default changes.
+      const largeKey = modelType === "large" ? m.key : null;
+      const smallKey = modelType === "small" ? m.key : null;
 
       setSessionModels(session.ID, largeKey, smallKey);
       trackModelUsage(modelType, m.key);
       setOpen(false);
     }
+  }
+
+  // Clears this session's override, falling back to inheriting the
+  // folder/system default (task #467). Only meaningful — and only shown —
+  // when the session currently HAS an explicit override for this slot.
+  function onInherit() {
+    if (!session) return;
+    clearSessionModelSlot(session.ID, modelType);
+    setOpen(false);
   }
 
   if (!session || allModels.length === 0) {
@@ -333,6 +344,19 @@ export function ModelSelector({ session, modelType }: { session: Session | null;
                 )
               ) : (
                 <>
+                  {hasSessionOverride && (
+                    <div className="py-1 border-b border-surface/40">
+                      <button
+                        onClick={onInherit}
+                        data-test-id={`model-inherit-${modelType}`}
+                        className="w-full text-left px-3 py-2 flex items-center gap-2 text-sm text-text-subtle hover:bg-base-overlay hover:text-text transition-colors"
+                        title="Clear this session's override — follow the folder/system default"
+                      >
+                        <Undo2 size={13} className="shrink-0" />
+                        Inherit (folder/system default)
+                      </button>
+                    </div>
+                  )}
                   {recentModels.length > 0 && (
                     <div className="py-1">
                       <div className="px-3 py-1.5 text-[10px] font-bold text-text-muted uppercase tracking-wider">Recent</div>

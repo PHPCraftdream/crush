@@ -317,6 +317,18 @@ func (s *ConfigStore) configPath(scope Scope) (string, error) {
 	}
 }
 
+// HasWorkspaceConfig reports whether a workspace config path is resolvable
+// at all — distinct from whether the workspace file has any explicit
+// content. Read/write calls at config.ScopeWorkspace fail with
+// ErrNoWorkspaceConfig when this is false (e.g. no .crush directory could be
+// resolved for the current working directory). Used by API consumers, such
+// as the web server's scoped-models UI, that need to grey out folder-scope
+// controls rather than surface a write error after the fact.
+func (s *ConfigStore) HasWorkspaceConfig() bool {
+	_, err := s.configPath(ScopeWorkspace)
+	return err == nil
+}
+
 // HasConfigField checks whether a key exists in the config file for the given
 // scope.
 func (s *ConfigStore) HasConfigField(scope Scope, key string) bool {

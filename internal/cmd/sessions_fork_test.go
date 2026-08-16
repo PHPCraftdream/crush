@@ -39,7 +39,7 @@ func TestForkSessionCLI_HappyPath(t *testing.T) {
 
 	src, err := s.Create(ctx, "source")
 	require.NoError(t, err)
-	require.NoError(t, s.UpdateModels(ctx, src.ID, "provL", "modelL", "provS", "modelS"))
+	require.NoError(t, s.UpdateModels(ctx, src.ID, &session.ModelSlotUpdate{Provider: "provL", Model: "modelL"}, &session.ModelSlotUpdate{Provider: "provS", Model: "modelS"}))
 	require.NoError(t, s.UpdateReasoningEffort(ctx, src.ID, "high", "low"))
 	require.NoError(t, s.UpdateSystemPrompt(ctx, src.ID, "be careful"))
 	require.NoError(t, s.SetTodos(ctx, src.ID, []session.Todo{{Content: "do thing", Status: session.TodoStatusPending}}, nil))

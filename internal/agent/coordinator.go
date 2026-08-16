@@ -766,6 +766,60 @@ func (c *coordinator) resolveSessionModels(ctx context.Context, sessionID string
 	return resolved, nil
 }
 
+// resolveSubAgentModelOverride resolves sessionID's explicit worker-slot
+// override (if any) into a ready-to-pin Model, for runSubAgent's per-call
+// LargeModel pin (task #466). sessionID is the PARENT session dispatching
+// the sub-agent, not the freshly created child sub-agent session.
+//
+// Returns (nil, nil) whenever there is nothing session-specific to apply —
+// including when the session never set a worker override — so callers can
+// cheaply fall back to the coordinator-wide default agent's own model
+// (already built from the merged system/folder config in buildAgentModels)
+// instead of rebuilding one. This mirrors resolveSessionModels' large/small
+// cascade (session DB override -> merged system/folder config) but is
+// intentionally a SEPARATE, lighter path: worker-slot resolution is only
+// needed when actually dispatching a sub-agent, not on every top-level turn,
+// so it isn't folded into the hot resolveSessionModels call.
+//
+// reviewer has no equivalent runtime hook: unlike large/small/worker, it is
+// consumed only as a `crush run --role reviewer` CLI selection (an entire
+// top-level run's model choice), never read at sub-agent dispatch time —
+// see internal/cmd/run.go's --role docs. A session-level ReviewerModelID is
+// stored (task #466's DB/API layer) for forward compatibility but currently
+// has no live runtime effect; this is a deliberate, documented scoping
+// decision, not an oversight.
+func (c *coordinator) resolveSubAgentModelOverride(ctx context.Context, sessionID string) (*Model, error) {
+	sess, err := c.sessions.Get(ctx, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load session %q: %w", sessionID, err)
+	}
+	if sess.WorkerModelID == "" {
+		return nil, nil
+	}
+
+	cfg, _ := c.cfg.Snapshot()
+	workerCfg := cfg.Models[config.SelectedModelTypeWorker]
+	if workerCfg.Provider != sess.WorkerModelProvider || workerCfg.Model != sess.WorkerModelID {
+		workerCfg.Think = false
+		workerCfg.ReasoningEffort = ""
+	}
+	workerCfg.Provider = sess.WorkerModelProvider
+	workerCfg.Model = sess.WorkerModelID
+	if sess.WorkerModelReasoningEffort != "" {
+		workerCfg.ReasoningEffort = sess.WorkerModelReasoningEffort
+	}
+
+	// buildModelsFromCfg builds a large+small PAIR; pass workerCfg for both
+	// slots and keep only the first result — there is no single-model
+	// variant, and building the (identical, discarded) second model is
+	// cheap relative to the provider round-trip this whole path exists for.
+	model, _, err := c.buildModelsFromCfg(ctx, cfg, workerCfg, workerCfg, true)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build session worker model override: %w", err)
+	}
+	return &model, nil
+}
+
 // applyModelOverrides builds a resolvedOverrides snapshot from explicit override parameters.
 // This is used by RunWithOverrides which receives overrides directly from the caller
 // (rather than from the session DB).
@@ -3518,8 +3572,21 @@ func (c *coordinator) runSubAgent(ctx context.Context, params subAgentParams) (f
 		params.SessionSetup(session.ID)
 	}
 
-	// Get model configuration
+	// Get model configuration. Defaults to the dispatch agent's own shared
+	// model (built once from the merged system/folder config); a session
+	// override on the PARENT session — params.SessionID, not the freshly
+	// created sub-agent session.ID above — replaces it for THIS call only,
+	// via the same immutable per-call pin SessionAgentCall.LargeModel
+	// already uses for top-level turns (task #341/P0-1). Never mutates
+	// params.Agent's own shared fields, so a session-scoped worker override
+	// cannot leak into a concurrent sub-agent dispatch from a different
+	// session sharing the same underlying agent object (task #466).
 	model := params.Agent.Model()
+	if override, err := c.resolveSubAgentModelOverride(ctx, params.SessionID); err != nil {
+		slog.Error("runSubAgent: failed to resolve session worker override, falling back to default", "sessionID", params.SessionID, "err", err)
+	} else if override != nil {
+		model = *override
+	}
 	maxTokens := model.CatwalkCfg.DefaultMaxTokens
 	if model.ModelCfg.MaxTokens != 0 {
 		maxTokens = model.ModelCfg.MaxTokens
@@ -3534,6 +3601,7 @@ func (c *coordinator) runSubAgent(ctx context.Context, params subAgentParams) (f
 	}
 
 	// Run the agent
+	pinnedModel := model
 	run := func() (*fantasy.AgentResult, error) {
 		return params.Agent.Run(ctx, SessionAgentCall{
 			SessionID:        session.ID,
@@ -3546,6 +3614,7 @@ func (c *coordinator) runSubAgent(ctx context.Context, params subAgentParams) (f
 			FrequencyPenalty: model.ModelCfg.FrequencyPenalty,
 			PresencePenalty:  model.ModelCfg.PresencePenalty,
 			NonInteractive:   true,
+			LargeModel:       &pinnedModel,
 		})
 	}
 	var result *fantasy.AgentResult

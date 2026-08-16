@@ -524,6 +524,20 @@ crush models bump worker down --local
 the per-scope breakdown so you always know whether your `--local` workspace
 overrides your global default or vice versa.
 
+**The cascade has a third level: session.** `--global`/`--local` (system/
+workspace) both live in a `crush.json` file and are what `models state`
+reports. On top of that, the **web UI** lets each open session pin its own
+large/small/worker/reviewer, stored in that session's DB row, not in any
+`crush.json` — so it's invisible to `models state` and to other sessions.
+Resolution order is always **system → folder → session**: a session with no
+override inherits whatever `models state` would show; setting one there
+wins for that session only, and clearing it (the model picker's "Inherit"
+entry, or the "Default models" modal's per-slot clear button) falls straight
+back to the folder/system value. The web UI's header **"Default models"**
+button opens a modal with three blocks — System, Folder, Session — each
+showing all four slots: what's explicitly set at that level, or, when
+unset, the inherited value and which level it's coming from.
+
 > **Removed in batch 11:** `crush models set --large X --small Y` and the
 > entire `crush models preset` subtree (save/use/list/delete). Both
 > commands now print a redirect notice pointing at `crush models use`.

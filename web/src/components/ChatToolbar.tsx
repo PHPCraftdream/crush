@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
 import { useStore } from "@nanostores/react";
-import { Minimize2, X, CheckCheck, ScrollText, Plug, Sun, Moon, Settings, ServerCog, FileText, Headphones, Eye, ChevronsDownUp } from "lucide-react";
+import { Minimize2, X, CheckCheck, ScrollText, Plug, Sun, Moon, Settings, ServerCog, FileText, Headphones, Eye, ChevronsDownUp, SlidersHorizontal } from "lucide-react";
 import { $sitter, stopSitter } from "../sitter";
 import {
   $sessions,
@@ -21,6 +21,7 @@ import { LogsModal } from "./LogsModal";
 import { MCPSettings } from "./MCPSettings";
 import { SettingsModal } from "./SettingsModal";
 import { ProvidersModal } from "./ProvidersModal";
+import { ScopedModelsModal } from "./ScopedModelsModal";
 import { ws } from "../ws";
 
 // ── System Prompt Modal ───────────────────────────────────────────────────────
@@ -143,6 +144,8 @@ export function ChatToolbar() {
   const closeSettings = useCallback(() => setShowSettings(false), []);
   const [showProviders, setShowProviders] = useState(false);
   const closeProviders = useCallback(() => setShowProviders(false), []);
+  const [showScopedModels, setShowScopedModels] = useState(false);
+  const closeScopedModels = useCallback(() => setShowScopedModels(false), []);
   const [showLogs, setShowLogs] = useState(false);
   const closeLogs = useCallback(() => setShowLogs(false), []);
 
@@ -306,6 +309,16 @@ export function ChatToolbar() {
         </button>
 
         <button
+          data-test-id="header-default-models-button"
+          onClick={() => setShowScopedModels(true)}
+          title="Default models — System / Folder / Session"
+          className="flex items-center gap-1.5 text-xs font-medium rounded-lg px-2.5 py-1.5 border transition-colors bg-base-overlay border-surface text-text-subtle hover:border-accent/50 hover:text-text"
+        >
+          <SlidersHorizontal size={13} />
+          <span>Default models</span>
+        </button>
+
+        <button
           data-test-id="header-settings-button"
           onClick={() => setShowSettings(true)}
           title="Settings"
@@ -394,6 +407,7 @@ export function ChatToolbar() {
       {showMCPSettings && <MCPSettings onClose={closeMCPSettings} />}
       {showSettings && <SettingsModal onClose={closeSettings} />}
       {showProviders && <ProvidersModal onClose={closeProviders} />}
+      {showScopedModels && <ScopedModelsModal onClose={closeScopedModels} activeSession={activeSession} />}
       {showLogs && <LogsModal onClose={closeLogs} />}
     </>
   );

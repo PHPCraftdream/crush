@@ -35,6 +35,7 @@ const (
 	// EventSummarizeQueued is sent when a manual summarise is queued (busy=true)
 	// or dequeued/completed (busy=false) for a session.
 	EventSummarizeQueued = "summarize_queued"
+	EventScopedModels    = "scoped_models"
 )
 
 // Inbound command types (client → server).
@@ -69,6 +70,9 @@ const (
 	CmdUpdateMessagePart     = "update_message_part"
 	CmdTogglePinMessage      = "toggle_pin_message"
 	CmdRerunMessage          = "rerun_message"
+	CmdGetScopedModels       = "get_scoped_models"
+	CmdSetScopedModel        = "set_scoped_model"
+	CmdClearScopedModel      = "clear_scoped_model"
 )
 
 // Payload structs for inbound commands.
@@ -86,6 +90,53 @@ type SetSessionModelsPayload struct {
 	SessionID  string             `json:"sessionID"`
 	LargeModel *ModelOverrideWire `json:"largeModel"`
 	SmallModel *ModelOverrideWire `json:"smallModel"`
+	// WorkerModel/ReviewerModel are optional (task #466) — omitted/nil means
+	// "don't touch", same convention as LargeModel/SmallModel above.
+	WorkerModel   *ModelOverrideWire `json:"workerModel,omitempty"`
+	ReviewerModel *ModelOverrideWire `json:"reviewerModel,omitempty"`
+}
+
+// ── Scoped (system/folder) default models ──────────────────────────────────
+//
+// These commands read/write the explicit per-scope model defaults —
+// config.ScopeGlobal ("system") and config.ScopeWorkspace ("folder") — that
+// the system -> folder -> session cascade resolves from. They are distinct
+// from set_session_models, which only ever touches one session's DB row.
+
+// ScopedModelSlotWire describes one model slot (large/small/worker/reviewer)
+// across both scopes plus the resolved effective value, mirroring the
+// vocabulary `crush models state` already established
+// (internal/cmd/models_state.go) so the CLI and the web UI never drift.
+type ScopedModelSlotWire struct {
+	Global         *ModelOverrideWire `json:"global"`         // explicit value at ScopeGlobal, nil if unset
+	Workspace      *ModelOverrideWire `json:"workspace"`      // explicit value at ScopeWorkspace, nil if unset
+	Effective      *ModelOverrideWire `json:"effective"`      // what actually resolves, nil if unset in both scopes
+	EffectiveScope string             `json:"effectiveScope"` // "global" | "workspace" | ""
+}
+
+// ScopedModelsWire is the full get_scoped_models response.
+type ScopedModelsWire struct {
+	Large        ScopedModelSlotWire `json:"large"`
+	Small        ScopedModelSlotWire `json:"small"`
+	Worker       ScopedModelSlotWire `json:"worker"`
+	Reviewer     ScopedModelSlotWire `json:"reviewer"`
+	HasWorkspace bool                `json:"hasWorkspace"` // false when no .crush workspace config path resolves
+}
+
+// SetScopedModelPayload writes one slot at one scope.
+type SetScopedModelPayload struct {
+	Scope           string `json:"scope"` // "global" | "workspace"
+	Slot            string `json:"slot"`  // "large" | "small" | "worker" | "reviewer"
+	Provider        string `json:"provider"`
+	Model           string `json:"model"`
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
+}
+
+// ClearScopedModelPayload removes one slot's explicit value at one scope,
+// falling back to the other scope (or "unset entirely" if neither has it).
+type ClearScopedModelPayload struct {
+	Scope string `json:"scope"`
+	Slot  string `json:"slot"`
 }
 
 type SendMessagePayload struct {

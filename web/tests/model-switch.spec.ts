@@ -331,3 +331,73 @@ test("model override persists for subsequent messages via DB", async ({ page }) 
     expect(msg.smallModel).toBeUndefined();
   }
 });
+
+// ── Inherit (task #467) ─────────────────────────────────────────────────────
+
+test("Inherit option is only shown when the session has an explicit override", async ({ page }) => {
+  await page.goto("/");
+  await sendMockWSMessage(page, {
+    type: "sessions_list",
+    payload: [makeSession({ ID: "sw-inherit-none", Title: "No Override Yet" })],
+  });
+  await sendMockWSMessage(page, {
+    type: "config",
+    payload: makeConfig({
+      providers: {
+        anthropic: {
+          enabled: true,
+          models: [
+            { id: "claude-opus-4", name: "claude-opus-4", contextWindow: 200000 },
+            { id: "claude-haiku-4", name: "claude-haiku-4", contextWindow: 200000 },
+          ],
+        },
+      },
+    }),
+  });
+  await expect(page.getByText("No Override Yet").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("No Override Yet").first().click();
+
+  await page.locator("button[title='Large (strong) model']").click();
+  await expect(page.locator('[data-testid="model-inherit-large"]')).toHaveCount(0);
+});
+
+test("selecting Inherit clears the session's override with an explicit empty model", async ({ page }) => {
+  await page.goto("/");
+  await sendMockWSMessage(page, {
+    type: "sessions_list",
+    payload: [makeSession({
+      ID: "sw-inherit",
+      Title: "Has Override",
+      LargeModelProvider: "anthropic",
+      LargeModelID: "claude-haiku-4",
+    })],
+  });
+  await sendMockWSMessage(page, {
+    type: "config",
+    payload: makeConfig({
+      providers: {
+        anthropic: {
+          enabled: true,
+          models: [
+            { id: "claude-opus-4", name: "claude-opus-4", contextWindow: 200000 },
+            { id: "claude-haiku-4", name: "claude-haiku-4", contextWindow: 200000 },
+          ],
+        },
+      },
+    }),
+  });
+  await expect(page.getByText("Has Override").first()).toBeVisible({ timeout: 3000 });
+  await page.getByText("Has Override").first().click();
+
+  await page.locator("button[title='Large (strong) model']").click();
+  await expect(page.locator('[data-testid="model-inherit-large"]')).toBeVisible({ timeout: 3000 });
+  await page.locator('[data-testid="model-inherit-large"]').click();
+
+  const cmd = await waitForWSSend(page, "set_session_models");
+  const p = cmd.payload as { sessionID: string; largeModel: { provider: string; model: string } };
+  expect(p.sessionID).toBe("sw-inherit");
+  // Explicit empty object — distinct from an omitted/null field, which the
+  // backend reads as "don't touch" rather than "clear" (see store.ts's
+  // clearSessionModelSlot doc comment).
+  expect(p.largeModel).toEqual({ provider: "", model: "" });
+});

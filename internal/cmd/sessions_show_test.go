@@ -24,7 +24,7 @@ func TestSessionsShow_TextOutput(t *testing.T) {
 	s := session.NewService(q, conn)
 	sess, err := s.Create(context.Background(), "test session")
 	require.NoError(t, err)
-	require.NoError(t, s.UpdateModels(context.Background(), sess.ID, "anthropic", "claude-3-5-sonnet", "anthropic", "claude-3-5-haiku"))
+	require.NoError(t, s.UpdateModels(context.Background(), sess.ID, &session.ModelSlotUpdate{Provider: "anthropic", Model: "claude-3-5-sonnet"}, &session.ModelSlotUpdate{Provider: "anthropic", Model: "claude-3-5-haiku"}))
 
 	// Verify session was created
 	retrieved, err := s.Get(context.Background(), sess.ID)
@@ -112,6 +112,12 @@ func newTestDB(t *testing.T) (*sql.DB, *db.Queries) {
 			small_model_provider TEXT,
 			small_model_id TEXT,
 			small_model_reasoning_effort TEXT DEFAULT 'medium',
+			worker_model_provider TEXT,
+			worker_model_id TEXT,
+			worker_model_reasoning_effort TEXT,
+			reviewer_model_provider TEXT,
+			reviewer_model_id TEXT,
+			reviewer_model_reasoning_effort TEXT,
 			system_prompt TEXT DEFAULT '',
 			yolo_enabled INTEGER NOT NULL DEFAULT 0,
 			cancel_requested INTEGER NOT NULL DEFAULT 0,

@@ -29,6 +29,15 @@ export interface Session {
   SmallModelID: string;
   SmallModelReasoningEffort: string; // "low", "medium", "high", or "max"
 
+  // Optional sub-agent model slots (task #466). Empty means "inherit the
+  // folder/system default" — same convention as large/small above.
+  WorkerModelProvider: string;
+  WorkerModelID: string;
+  WorkerModelReasoningEffort: string;
+  ReviewerModelProvider: string;
+  ReviewerModelID: string;
+  ReviewerModelReasoningEffort: string;
+
   SystemPrompt: string;
   YoloEnabled: boolean;
 

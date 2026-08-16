@@ -10,6 +10,47 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **Default-models modal (System / Folder / Session)** — the web UI's
+  header now has a "Default models" button opening a modal with three
+  blocks, one per level of the model cascade (system → folder →
+  session). Each block shows all four slots (large, small, worker,
+  reviewer): what's explicitly set at that level, or — when unset — the
+  inherited value and which level it came from. The Session block can
+  also set worker/reviewer per session for the first time (previously
+  only large/small were session-scoped). Every explicit override can be
+  cleared with one click, falling back to the level above.
+- **"Inherit" in the session model selector** — the large/small model
+  dropdowns in the chat toolbar now show an "Inherit" entry whenever the
+  session has an explicit override for that slot, clearing it back to
+  following the folder/system default instead of staying pinned forever.
+
+### Fixed
+
+- **Switching a session's model no longer changes the system-wide
+  default.** Picking a model in the chat toolbar (or, more subtly, just
+  sending a message) used to call the same code path as `crush models
+  use`, silently rewriting the global `crush.json`'s default model to
+  whatever the most recently active session happened to be running —
+  so every OTHER session, every other folder, and the next CLI
+  invocation would drift to a model nobody explicitly chose there. The
+  chat toolbar's model pickers are now session-scoped only; the global
+  default changes only through `crush models use` or the new
+  System/Folder blocks in the "Default models" modal above.
+- **Switching only the large (or only the small) model no longer
+  freezes the other slot.** The picker used to always send both
+  large+small together, re-pinning whichever one you didn't touch to
+  its then-current value — so a session that only ever had its large
+  model switched would stop following later changes to the folder/
+  system default for its small model. Each slot is now set (or cleared)
+  independently.
+- **A freshly created session no longer freezes its model at birth.**
+  New sessions used to have the then-effective large/small model
+  written into their own row immediately, which — same root cause as
+  above — silently opted every untouched session out of ever following
+  a later folder/system default change. New sessions now start with no
+  override and genuinely inherit, the same way `crush run` sessions
+  always have.
+
 - **`crush models use --large`/`--small`** — the two positional args
   (`crush models use <large> <small>`) always set large and small
   together, so there was no way to change just the fast/small model (or

@@ -91,6 +91,12 @@ func handleIncoming(ctx context.Context, a *appPkg.App, c *Client, raw []byte) {
 		c.dispatch("handleRemoveRecentModel", func() { handleRemoveRecentModel(a, c, msg) })
 	case CmdTrackModelUsage:
 		c.dispatch("handleTrackModelUsage", func() { handleTrackModelUsage(a, c, msg) })
+	case CmdGetScopedModels:
+		c.dispatch("handleGetScopedModels", func() { handleGetScopedModels(a, c, msg) })
+	case CmdSetScopedModel:
+		c.dispatch("handleSetScopedModel", func() { handleSetScopedModel(a, c, msg) })
+	case CmdClearScopedModel:
+		c.dispatch("handleClearScopedModel", func() { handleClearScopedModel(a, c, msg) })
 	case CmdSetProviderKey:
 		c.dispatch("handleSetProviderKey", func() { handleSetProviderKey(a, c, msg) })
 	case CmdRemoveProviderKey:
@@ -448,19 +454,63 @@ func handleSetSessionModels(ctx context.Context, a *appPkg.App, c *Client, msg W
 
 	slog.Info("ws: handleSetSessionModels", "sessionID", p.SessionID, "large", p.LargeModel, "small", p.SmallModel)
 
+	// p.LargeModel/p.SmallModel being nil means "the caller didn't touch this
+	// slot" (task #461) — pass that straight through to UpdateModels as a nil
+	// *ModelSlotUpdate so the OTHER, untouched slot's session override is
+	// left exactly as it was rather than being silently pinned or cleared.
 	var lp, lm, lre, sp, sm, sre string
+	var largeUpdate, smallUpdate *session.ModelSlotUpdate
 	if p.LargeModel != nil {
 		lp, lm = p.LargeModel.Provider, p.LargeModel.Model
 		lre = p.LargeModel.ReasoningEffort
+		largeUpdate = &session.ModelSlotUpdate{Provider: lp, Model: lm}
 	}
 	if p.SmallModel != nil {
 		sp, sm = p.SmallModel.Provider, p.SmallModel.Model
 		sre = p.SmallModel.ReasoningEffort
+		smallUpdate = &session.ModelSlotUpdate{Provider: sp, Model: sm}
 	}
 
-	if err := a.Sessions.UpdateModels(ctx, p.SessionID, lp, lm, sp, sm); err != nil {
+	if err := a.Sessions.UpdateModels(ctx, p.SessionID, largeUpdate, smallUpdate); err != nil {
 		c.reply(msg.ID, EventError, nil, err.Error())
 		return
+	}
+
+	// Worker/reviewer (task #466) — same nil-means-untouched partial update,
+	// via UpdateWorkerReviewerModels/UpdateWorkerReviewerReasoningEffort
+	// (UpdateModels/UpdateReasoningEffort's siblings for these optional slots).
+	var wp, wm, wre, rp, rm, rre string
+	var workerUpdate, reviewerUpdate *session.ModelSlotUpdate
+	if p.WorkerModel != nil {
+		wp, wm = p.WorkerModel.Provider, p.WorkerModel.Model
+		wre = p.WorkerModel.ReasoningEffort
+		workerUpdate = &session.ModelSlotUpdate{Provider: wp, Model: wm}
+	}
+	if p.ReviewerModel != nil {
+		rp, rm = p.ReviewerModel.Provider, p.ReviewerModel.Model
+		rre = p.ReviewerModel.ReasoningEffort
+		reviewerUpdate = &session.ModelSlotUpdate{Provider: rp, Model: rm}
+	}
+	if workerUpdate != nil || reviewerUpdate != nil {
+		if err := a.Sessions.UpdateWorkerReviewerModels(ctx, p.SessionID, workerUpdate, reviewerUpdate); err != nil {
+			c.reply(msg.ID, EventError, nil, err.Error())
+			return
+		}
+	}
+	if wre != "" || rre != "" {
+		if wre == "" || rre == "" {
+			if sess, sessErr := a.Sessions.Get(ctx, p.SessionID); sessErr == nil {
+				if wre == "" {
+					wre = sess.WorkerModelReasoningEffort
+				}
+				if rre == "" {
+					rre = sess.ReviewerModelReasoningEffort
+				}
+			}
+		}
+		if err := a.Sessions.UpdateWorkerReviewerReasoningEffort(ctx, p.SessionID, wre, rre); err != nil {
+			slog.Warn("ws: failed to update worker/reviewer reasoning effort", "err", err)
+		}
 	}
 
 	// Update reasoning effort for models that support it. CRITICAL: a single
@@ -542,12 +592,219 @@ func handleTrackModelUsage(a *appPkg.App, c *Client, msg WSMessage) {
 		return
 	}
 	modelType := config.SelectedModelType(p.ModelType)
-	// Use UpdatePreferredModel which handles both preferred model and recent models tracking
-	if err := store.UpdatePreferredModel(config.ScopeGlobal, modelType, config.SelectedModel{Provider: p.Provider, Model: p.Model}); err != nil {
+	// Recency ONLY — never the preferred/default model.
+	//
+	// This used to call UpdatePreferredModel(ScopeGlobal, ...), which writes
+	// models.<type> into the global crush.json. That made model selection
+	// leak out of the session it was made in: picking a model for one session
+	// silently changed the system-wide default for every other session, every
+	// other folder, and every subsequent CLI invocation. Worse, the web client
+	// fires this command on every assistant message (web/src/useWS.ts), not
+	// just on an explicit pick, so the global default drifted to whatever the
+	// most recently active session happened to be running.
+	//
+	// Model defaults are scoped deliberately and cascade system -> folder ->
+	// session: the system and folder levels are written only through the
+	// explicit scoped commands (and `crush models use`), and the session level
+	// only through set_session_models. "Recently used" is a UI convenience
+	// list and is the only thing this command may touch.
+	if err := store.RecordRecentModel(config.ScopeGlobal, modelType, config.SelectedModel{Provider: p.Provider, Model: p.Model}); err != nil {
 		slog.Warn("ws: failed to track model usage", "err", err)
 	}
 	if wire, ok := buildConfigWire(a); ok {
 		c.hub.Broadcast(EventConfig, wire)
+	}
+	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
+}
+
+// scopedModelSlots is the fixed slot set the scoped-models API exposes, in
+// display order. Matches internal/cmd/models_state.go's four slots.
+var scopedModelSlots = []config.SelectedModelType{
+	config.SelectedModelTypeLarge,
+	config.SelectedModelTypeSmall,
+	config.SelectedModelTypeWorker,
+	config.SelectedModelTypeReviewer,
+}
+
+func scopedModelSlotFromWire(s *config.SelectedModel) *ModelOverrideWire {
+	if s == nil {
+		return nil
+	}
+	return &ModelOverrideWire{Provider: s.Provider, Model: s.Model, ReasoningEffort: s.ReasoningEffort}
+}
+
+// scopedModelsScopeFromWire parses the "global"/"workspace" strings the web
+// client sends for the scoped-models API into a config.Scope. Deliberately
+// stricter than the sibling scopeFromWire (used by provider-config commands,
+// which silently defaults unrecognised values to ScopeGlobal): an unknown
+// scope here is surfaced as an error rather than silently landing in global,
+// since writing to the wrong scope is exactly the class of bug this whole
+// feature exists to prevent.
+func scopedModelsScopeFromWire(s string) (config.Scope, error) {
+	switch s {
+	case "global":
+		return config.ScopeGlobal, nil
+	case "workspace":
+		return config.ScopeWorkspace, nil
+	default:
+		return 0, fmt.Errorf("unknown scope %q", s)
+	}
+}
+
+func scopedModelsScopeToWire(scope config.Scope) string {
+	if scope == config.ScopeWorkspace {
+		return "workspace"
+	}
+	return "global"
+}
+
+// buildScopedModelsWire assembles the get_scoped_models response: for each
+// of the four slots, what global and workspace explicitly set (nil = unset
+// there) plus the resolved effective value and which scope it came from.
+// Reuses store.ReadAllModelsAtScope and store.Config().Models — the exact
+// same primitives `crush models state` (internal/cmd/models_state.go) reads
+// — so the CLI and the web UI can never disagree about what's effective.
+func buildScopedModelsWire(a *appPkg.App) (ScopedModelsWire, error) {
+	store := a.Store()
+	globalAll, err := store.ReadAllModelsAtScope(config.ScopeGlobal)
+	if err != nil {
+		return ScopedModelsWire{}, fmt.Errorf("read global scope: %w", err)
+	}
+	workspaceAll, err := store.ReadAllModelsAtScope(config.ScopeWorkspace)
+	if err != nil {
+		return ScopedModelsWire{}, fmt.Errorf("read workspace scope: %w", err)
+	}
+	effectiveAll := store.Config().Models
+
+	build := func(slot config.SelectedModelType) ScopedModelSlotWire {
+		g := globalAll[slot]
+		w := workspaceAll[slot]
+		out := ScopedModelSlotWire{
+			Global:    scopedModelSlotFromWire(g),
+			Workspace: scopedModelSlotFromWire(w),
+		}
+		if eff, ok := effectiveAll[slot]; ok {
+			effCopy := eff
+			out.Effective = scopedModelSlotFromWire(&effCopy)
+			switch {
+			case w != nil:
+				out.EffectiveScope = scopedModelsScopeToWire(config.ScopeWorkspace)
+			case g != nil:
+				out.EffectiveScope = scopedModelsScopeToWire(config.ScopeGlobal)
+			}
+		}
+		return out
+	}
+
+	return ScopedModelsWire{
+		Large:        build(config.SelectedModelTypeLarge),
+		Small:        build(config.SelectedModelTypeSmall),
+		Worker:       build(config.SelectedModelTypeWorker),
+		Reviewer:     build(config.SelectedModelTypeReviewer),
+		HasWorkspace: store.HasWorkspaceConfig(),
+	}, nil
+}
+
+func handleGetScopedModels(a *appPkg.App, c *Client, msg WSMessage) {
+	store := a.Store()
+	if store == nil {
+		c.reply(msg.ID, EventError, nil, "config not available")
+		return
+	}
+	wire, err := buildScopedModelsWire(a)
+	if err != nil {
+		c.reply(msg.ID, EventError, nil, err.Error())
+		return
+	}
+	c.reply(msg.ID, EventScopedModels, wire, "")
+}
+
+// handleSetScopedModel writes one slot at one scope (config.ScopeGlobal =
+// "system" or config.ScopeWorkspace = "folder"). Unlike set_session_models,
+// this never touches the session DB — it's the system/folder half of the
+// cascade, edited the same way `crush models use --global/--local` does.
+func handleSetScopedModel(a *appPkg.App, c *Client, msg WSMessage) {
+	var p SetScopedModelPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		c.reply(msg.ID, EventError, nil, "invalid payload")
+		return
+	}
+	store := a.Store()
+	if store == nil {
+		c.reply(msg.ID, EventError, nil, "config not available")
+		return
+	}
+	scope, err := scopedModelsScopeFromWire(p.Scope)
+	if err != nil {
+		c.reply(msg.ID, EventError, nil, err.Error())
+		return
+	}
+	slot := config.SelectedModelType(p.Slot)
+	if !slices.Contains(scopedModelSlots, slot) {
+		c.reply(msg.ID, EventError, nil, fmt.Sprintf("unknown slot %q", p.Slot))
+		return
+	}
+	if p.Provider == "" || p.Model == "" {
+		c.reply(msg.ID, EventError, nil, "provider and model are required")
+		return
+	}
+	if err := store.UpdatePreferredModel(scope, slot, config.SelectedModel{
+		Provider:        p.Provider,
+		Model:           p.Model,
+		ReasoningEffort: p.ReasoningEffort,
+	}); err != nil {
+		c.reply(msg.ID, EventError, nil, err.Error())
+		return
+	}
+	if wire, ok := buildConfigWire(a); ok {
+		c.hub.Broadcast(EventConfig, wire)
+	}
+	if wire, err := buildScopedModelsWire(a); err == nil {
+		c.hub.Broadcast(EventScopedModels, wire)
+	}
+	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
+}
+
+// handleClearScopedModel removes one slot's explicit value at one scope
+// (mirrors `crush models unset <slot> --global/--local`, internal/cmd/
+// models_unset.go), letting the other scope (or "no default at all") take
+// over. A missing key is treated as a no-op success, matching the CLI.
+func handleClearScopedModel(a *appPkg.App, c *Client, msg WSMessage) {
+	var p ClearScopedModelPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		c.reply(msg.ID, EventError, nil, "invalid payload")
+		return
+	}
+	store := a.Store()
+	if store == nil {
+		c.reply(msg.ID, EventError, nil, "config not available")
+		return
+	}
+	scope, err := scopedModelsScopeFromWire(p.Scope)
+	if err != nil {
+		c.reply(msg.ID, EventError, nil, err.Error())
+		return
+	}
+	slot := config.SelectedModelType(p.Slot)
+	if !slices.Contains(scopedModelSlots, slot) {
+		c.reply(msg.ID, EventError, nil, fmt.Sprintf("unknown slot %q", p.Slot))
+		return
+	}
+	if err := store.RemoveConfigField(scope, "models."+string(slot)); err != nil {
+		c.reply(msg.ID, EventError, nil, err.Error())
+		return
+	}
+	// Best-effort cleanup: if that was the last slot in this scope's
+	// "models" object, strip the now-empty object so the file stays clean —
+	// same behavior as `crush models unset` (internal/cmd/models_unset.go).
+	if remaining, rerr := store.ReadAllModelsAtScope(scope); rerr == nil && len(remaining) == 0 {
+		_ = store.RemoveConfigField(scope, "models")
+	}
+	if wire, ok := buildConfigWire(a); ok {
+		c.hub.Broadcast(EventConfig, wire)
+	}
+	if wire, err := buildScopedModelsWire(a); err == nil {
+		c.hub.Broadcast(EventScopedModels, wire)
 	}
 	c.reply(msg.ID, EventResponse, map[string]string{"status": "ok"}, "")
 }
@@ -585,24 +842,18 @@ func handleCreateSession(ctx context.Context, a *appPkg.App, c *Client, msg WSMe
 	// Web sessions never prompt for permissions — arm auto-approve at birth.
 	autoApproveWebSession(a, sess.ID)
 
-	// Set default models from config for the new session immediately
-	cfg := a.Config()
-	if cfg != nil {
-		var lp, lm, sp, sm string
-		if large, ok := cfg.Models[config.SelectedModelTypeLarge]; ok {
-			lp, lm = large.Provider, large.Model
-		}
-		if small, ok := cfg.Models[config.SelectedModelTypeSmall]; ok {
-			sp, sm = small.Provider, small.Model
-		}
-		if lp != "" || sp != "" {
-			_ = a.Sessions.UpdateModels(ctx, sess.ID, lp, lm, sp, sm)
-			// Re-fetch to get updated state with models
-			if updated, err := a.Sessions.Get(ctx, sess.ID); err == nil {
-				sess = updated
-			}
-		}
-	}
+	// Deliberately do NOT seed the new session's large/small model columns
+	// from config here. A session is created with no override
+	// (LargeModelID/SmallModelID == "") so it INHERITS the system/folder
+	// default and keeps following it if that default changes later —
+	// resolveSessionModels (internal/agent/coordinator.go) already falls
+	// back to cfg.Models on every call when the session has no override, and
+	// BuildSystemPromptForSession below goes through that same resolution.
+	// Writing the resolved default into the row at creation time used to
+	// freeze it permanently: any later change to the folder/system default
+	// would silently stop applying to that session, defeating the system ->
+	// folder -> session cascade for every session that never explicitly
+	// picked a model (task #461).
 
 	// Generate and save the system prompt for the new session.
 	if a.AgentCoordinator != nil {
@@ -1661,18 +1912,9 @@ func handleInitializeProject(ctx context.Context, a *appPkg.App, c *Client, msg 
 		return
 	}
 
-	// Set default models from config (both large and small).
-	cfg := store.Config()
-	var lp, lm, smallProvider, smallModel string
-	if large, ok := cfg.Models[config.SelectedModelTypeLarge]; ok {
-		lp, lm = large.Provider, large.Model
-	}
-	if small, ok := cfg.Models[config.SelectedModelTypeSmall]; ok {
-		smallProvider, smallModel = small.Provider, small.Model
-	}
-	if lp != "" || smallProvider != "" {
-		_ = a.Sessions.UpdateModels(ctx, sess.ID, lp, lm, smallProvider, smallModel)
-	}
+	// No explicit model seeding here either — see the identical comment in
+	// handleCreateSession. This session inherits the system/folder default
+	// via resolveSessionModels, same as any other freshly created session.
 
 	// Build and save the system prompt.
 	if sp, buildErr := a.AgentCoordinator.BuildSystemPromptForSession(ctx, sess.ID); buildErr == nil && sp != "" {

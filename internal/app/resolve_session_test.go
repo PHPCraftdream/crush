@@ -157,11 +157,19 @@ func (m *mockSessionService) IsAgentToolSession(sessionID string) bool {
 	return ok
 }
 
-func (m *mockSessionService) UpdateModels(context.Context, string, string, string, string, string) error {
+func (m *mockSessionService) UpdateModels(context.Context, string, *session.ModelSlotUpdate, *session.ModelSlotUpdate) error {
 	return nil
 }
 
 func (m *mockSessionService) UpdateReasoningEffort(context.Context, string, string, string) error {
+	return nil
+}
+
+func (m *mockSessionService) UpdateWorkerReviewerModels(context.Context, string, *session.ModelSlotUpdate, *session.ModelSlotUpdate) error {
+	return nil
+}
+
+func (m *mockSessionService) UpdateWorkerReviewerReasoningEffort(context.Context, string, string, string) error {
 	return nil
 }
 

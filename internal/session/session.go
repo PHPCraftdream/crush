@@ -68,6 +68,17 @@ type Session struct {
 	SmallModelID              string
 	SmallModelReasoningEffort string // "low", "medium", "high", or "max"
 
+	// Worker/reviewer overrides — empty means "inherit the folder/system
+	// default", same convention as the large/small fields above. Unlike
+	// large/small, most sessions never set these: worker/reviewer are
+	// optional sub-agent model slots (task #466).
+	WorkerModelProvider          string
+	WorkerModelID                string
+	WorkerModelReasoningEffort   string
+	ReviewerModelProvider        string
+	ReviewerModelID              string
+	ReviewerModelReasoningEffort string
+
 	SystemPrompt    string
 	YoloEnabled     bool
 	CancelRequested bool // Only populated by ListAll; use IsCancelRequested() for live checks.
@@ -90,6 +101,14 @@ type Session struct {
 	// foreign sessions read-only with a "Followed: PID N" banner.
 	OwnedExternal bool `json:",omitempty"` // a different live process holds the lock
 	OwnedByPID    int  `json:",omitempty"` // PID of the lock holder, 0 if free / stale
+}
+
+// ModelSlotUpdate is an explicit provider/model pair for one session model
+// slot (large or small), passed to Service.UpdateModels. See UpdateModels'
+// doc comment for the nil-vs-non-nil semantics.
+type ModelSlotUpdate struct {
+	Provider string
+	Model    string
 }
 
 type Service interface {
@@ -158,8 +177,13 @@ type Service interface {
 	// charges zero. Replaces the old in-memory baseline scheme that lost cost
 	// on sub-agent error paths, process restarts, and failed charges.
 	TransferChildCostToParent(ctx context.Context, childSessionID, parentSessionID string) error
-	UpdateModels(ctx context.Context, sessionID, largeProvider, largeModel, smallProvider, smallModel string) error
+	UpdateModels(ctx context.Context, sessionID string, large, small *ModelSlotUpdate) error
 	UpdateReasoningEffort(ctx context.Context, sessionID, largeEffort, smallEffort string) error
+	// UpdateWorkerReviewerModels and UpdateWorkerReviewerReasoningEffort are
+	// UpdateModels/UpdateReasoningEffort's siblings for the optional
+	// worker/reviewer slots (task #466).
+	UpdateWorkerReviewerModels(ctx context.Context, sessionID string, worker, reviewer *ModelSlotUpdate) error
+	UpdateWorkerReviewerReasoningEffort(ctx context.Context, sessionID, workerEffort, reviewerEffort string) error
 	UpdateSystemPrompt(ctx context.Context, sessionID, prompt string) error
 	Rename(ctx context.Context, id string, title string) error
 	Delete(ctx context.Context, id string) error
@@ -516,6 +540,15 @@ func (s *service) ForkSessionTx(ctx context.Context, srcID string, o ForkOptions
 	}); err != nil {
 		return Session{}, 0, fmt.Errorf("copy models into fork: %w", err)
 	}
+	if err := qtx.UpdateSessionWorkerReviewerModels(ctx, db.UpdateSessionWorkerReviewerModelsParams{
+		WorkerModelProvider:   src.WorkerModelProvider,
+		WorkerModelID:         src.WorkerModelID,
+		ReviewerModelProvider: src.ReviewerModelProvider,
+		ReviewerModelID:       src.ReviewerModelID,
+		ID:                    forkID,
+	}); err != nil {
+		return Session{}, 0, fmt.Errorf("copy worker/reviewer models into fork: %w", err)
+	}
 	if err := qtx.UpdateSessionSystemPrompt(ctx, db.UpdateSessionSystemPromptParams{
 		SystemPrompt: src.SystemPrompt,
 		ID:           forkID,
@@ -528,6 +561,13 @@ func (s *service) ForkSessionTx(ctx context.Context, srcID string, o ForkOptions
 		ID:                        forkID,
 	}); err != nil {
 		return Session{}, 0, fmt.Errorf("copy reasoning effort into fork: %w", err)
+	}
+	if err := qtx.UpdateSessionWorkerReviewerReasoningEffort(ctx, db.UpdateSessionWorkerReviewerReasoningEffortParams{
+		WorkerModelReasoningEffort:   src.WorkerModelReasoningEffort,
+		ReviewerModelReasoningEffort: src.ReviewerModelReasoningEffort,
+		ID:                           forkID,
+	}); err != nil {
+		return Session{}, 0, fmt.Errorf("copy worker/reviewer reasoning effort into fork: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE sessions SET todos = ?, deleted_todos = ?, updated_at = strftime('%s', 'now') WHERE id = ?`,
@@ -780,15 +820,31 @@ func (s *service) SetTodos(ctx context.Context, sessionID string, todos []Todo, 
 	return nil
 }
 
-// UpdateModels updates the models associated with a session.
-func (s *service) UpdateModels(ctx context.Context, sessionID, largeProvider, largeModel, smallProvider, smallModel string) error {
-	err := s.q.UpdateSessionModels(ctx, db.UpdateSessionModelsParams{
-		ID:                 sessionID,
-		LargeModelProvider: sql.NullString{String: largeProvider, Valid: largeProvider != ""},
-		LargeModelID:       sql.NullString{String: largeModel, Valid: largeModel != ""},
-		SmallModelProvider: sql.NullString{String: smallProvider, Valid: smallProvider != ""},
-		SmallModelID:       sql.NullString{String: smallModel, Valid: smallModel != ""},
-	})
+// UpdateModels writes explicit per-session model overrides. A nil large or
+// small argument leaves that slot completely untouched in the DB row —
+// neither sets nor clears it. A non-nil argument with an empty
+// Provider/Model clears the slot back to inheriting the folder/system
+// default (the "" = inherit convention resolveSessionModels already applies
+// when reading the row back); a non-nil argument with values sets an
+// explicit override.
+//
+// The nil-means-untouched distinction exists because a caller changing only
+// ONE slot (e.g. the web UI's per-slot model picker) must not silently wipe
+// the OTHER slot's override back to unset — before this signature, every
+// caller had to pass all four strings, so "leave the other slot alone" and
+// "no override" were indistinguishable at this layer, and the web UI ended
+// up pinning both large and small on every single-slot switch (task #461).
+func (s *service) UpdateModels(ctx context.Context, sessionID string, large, small *ModelSlotUpdate) error {
+	params := db.UpdateSessionModelsParams{ID: sessionID}
+	if large != nil {
+		params.LargeModelProvider = sql.NullString{String: large.Provider, Valid: true}
+		params.LargeModelID = sql.NullString{String: large.Model, Valid: true}
+	}
+	if small != nil {
+		params.SmallModelProvider = sql.NullString{String: small.Provider, Valid: true}
+		params.SmallModelID = sql.NullString{String: small.Model, Valid: true}
+	}
+	err := s.q.UpdateSessionModels(ctx, params)
 	if err != nil {
 		return err
 	}
@@ -796,6 +852,45 @@ func (s *service) UpdateModels(ctx context.Context, sessionID, largeProvider, la
 	// Publish an update event so the UI gets the new session state
 	sess, err := s.Get(ctx, sessionID)
 	if err == nil {
+		s.Publish(pubsub.UpdatedEvent, sess)
+	}
+	return nil
+}
+
+// UpdateWorkerReviewerModels is UpdateModels' sibling for the optional
+// worker/reviewer slots (task #466) — same nil-means-untouched semantics.
+func (s *service) UpdateWorkerReviewerModels(ctx context.Context, sessionID string, worker, reviewer *ModelSlotUpdate) error {
+	params := db.UpdateSessionWorkerReviewerModelsParams{ID: sessionID}
+	if worker != nil {
+		params.WorkerModelProvider = sql.NullString{String: worker.Provider, Valid: true}
+		params.WorkerModelID = sql.NullString{String: worker.Model, Valid: true}
+	}
+	if reviewer != nil {
+		params.ReviewerModelProvider = sql.NullString{String: reviewer.Provider, Valid: true}
+		params.ReviewerModelID = sql.NullString{String: reviewer.Model, Valid: true}
+	}
+	if err := s.q.UpdateSessionWorkerReviewerModels(ctx, params); err != nil {
+		return err
+	}
+	if sess, err := s.Get(ctx, sessionID); err == nil {
+		s.Publish(pubsub.UpdatedEvent, sess)
+	}
+	return nil
+}
+
+// UpdateWorkerReviewerReasoningEffort is UpdateReasoningEffort's sibling for
+// the worker/reviewer slots — same always-touch semantics (an empty string
+// clears the effort field) as the large/small original.
+func (s *service) UpdateWorkerReviewerReasoningEffort(ctx context.Context, sessionID, workerEffort, reviewerEffort string) error {
+	err := s.q.UpdateSessionWorkerReviewerReasoningEffort(ctx, db.UpdateSessionWorkerReviewerReasoningEffortParams{
+		ID:                           sessionID,
+		WorkerModelReasoningEffort:   sql.NullString{String: workerEffort, Valid: workerEffort != ""},
+		ReviewerModelReasoningEffort: sql.NullString{String: reviewerEffort, Valid: reviewerEffort != ""},
+	})
+	if err != nil {
+		return err
+	}
+	if sess, err := s.Get(ctx, sessionID); err == nil {
 		s.Publish(pubsub.UpdatedEvent, sess)
 	}
 	return nil
@@ -933,6 +1028,8 @@ func (s *service) ListAll(ctx context.Context) ([]Session, error) {
 		small_model_provider, small_model_id,
 		system_prompt, yolo_enabled,
 		large_model_reasoning_effort, small_model_reasoning_effort,
+		worker_model_provider, worker_model_id, worker_model_reasoning_effort,
+		reviewer_model_provider, reviewer_model_id, reviewer_model_reasoning_effort,
 		cancel_requested,
 		COALESCE(ended_reason, ''), COALESCE(budget_max_cost, 0),
 		COALESCE(budget_max_tokens, 0), COALESCE(budget_timeout_sec, 0)
@@ -956,6 +1053,8 @@ func (s *service) ListAll(ctx context.Context) ([]Session, error) {
 			&item.SmallModelProvider, &item.SmallModelID,
 			&item.SystemPrompt, &item.YoloEnabled,
 			&item.LargeModelReasoningEffort, &item.SmallModelReasoningEffort,
+			&item.WorkerModelProvider, &item.WorkerModelID, &item.WorkerModelReasoningEffort,
+			&item.ReviewerModelProvider, &item.ReviewerModelID, &item.ReviewerModelReasoningEffort,
 			&cancelRequested,
 			&endedReason, &budgetMaxCost, &budgetMaxTokens, &budgetTimeoutSec,
 		); err != nil {
@@ -1001,6 +1100,13 @@ func (s service) fromDBItem(item db.Session) Session {
 		SmallModelProvider:        item.SmallModelProvider.String,
 		SmallModelID:              item.SmallModelID.String,
 		SmallModelReasoningEffort: item.SmallModelReasoningEffort.String,
+
+		WorkerModelProvider:          item.WorkerModelProvider.String,
+		WorkerModelID:                item.WorkerModelID.String,
+		WorkerModelReasoningEffort:   item.WorkerModelReasoningEffort.String,
+		ReviewerModelProvider:        item.ReviewerModelProvider.String,
+		ReviewerModelID:              item.ReviewerModelID.String,
+		ReviewerModelReasoningEffort: item.ReviewerModelReasoningEffort.String,
 
 		SystemPrompt: item.SystemPrompt,
 		YoloEnabled:  item.YoloEnabled != 0,

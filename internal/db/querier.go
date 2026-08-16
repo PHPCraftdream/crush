@@ -297,9 +297,20 @@ type Querier interface {
 	UpdateMessageIfNotTerminal(ctx context.Context, arg UpdateMessageIfNotTerminalParams) (int64, error)
 	UpdateMessagePinned(ctx context.Context, arg UpdateMessagePinnedParams) error
 	UpdatePermissionEnabled(ctx context.Context, arg UpdatePermissionEnabledParams) error
+	// Partial update: a NULL arg for a slot's provider/id pair leaves that slot
+	// untouched (COALESCE falls back to the current column value); a non-NULL
+	// arg (including an explicit empty string) overwrites it. This lets callers
+	// distinguish "don't touch this slot" from "clear this slot back to
+	// inheriting the folder/system default" (large_model_id = '' is the existing
+	// "no override" convention the app layer already reads via != "").
 	UpdateSessionModels(ctx context.Context, arg UpdateSessionModelsParams) error
 	UpdateSessionReasoningEffort(ctx context.Context, arg UpdateSessionReasoningEffortParams) error
 	UpdateSessionSystemPrompt(ctx context.Context, arg UpdateSessionSystemPromptParams) error
+	// Same partial-update semantics as UpdateSessionModels: a NULL arg leaves
+	// that slot untouched, a non-NULL arg (including an explicit empty string)
+	// overwrites it.
+	UpdateSessionWorkerReviewerModels(ctx context.Context, arg UpdateSessionWorkerReviewerModelsParams) error
+	UpdateSessionWorkerReviewerReasoningEffort(ctx context.Context, arg UpdateSessionWorkerReviewerReasoningEffortParams) error
 	// Task #340's original claim/mark-done/mark-failed/release-for-retry model
 	// (ClaimOrphanOutboxEntry, MarkOrphanOutboxEntryDone, MarkOrphanOutboxEntryFailed,
 	// ReleaseOrphanOutboxEntryForRetry, CleanupOldDoneOrphanOutboxEntries) was

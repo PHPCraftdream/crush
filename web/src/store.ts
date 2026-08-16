@@ -363,6 +363,40 @@ export function setSessionModels(sessionID: string, largeKey: string | null, sma
   });
 }
 
+// clearSessionModelSlot removes the session's explicit override for ONE
+// slot, falling back to inheriting the folder/system default (task #467).
+//
+// This is NOT the same as calling setSessionModels with an empty key: an
+// empty/null key there means "don't touch this slot" (parse() maps both to
+// JS `null`, which is omitted from the WS payload and read as "leave alone"
+// server-side — see internal/server/handlers.go's handleSetSessionModels).
+// Clearing instead requires sending a NON-null object with an explicit empty
+// provider/model, which internal/session's UpdateModels reads as "wipe this
+// override" — distinct from a nil argument ("don't touch"). Only ONE of the
+// two commands is sent (the untouched slot key is omitted entirely), so the
+// other slot's override is left exactly as it was.
+export function clearSessionModelSlot(sessionID: string, modelType: "large" | "small" | "worker" | "reviewer") {
+  const sessions = $sessions.get();
+  const idx = sessions.findIndex((s) => s.ID === sessionID);
+  const clearedFields: Record<string, string> = {
+    large: "LargeModel",
+    small: "SmallModel",
+    worker: "WorkerModel",
+    reviewer: "ReviewerModel",
+  };
+  const prefix = clearedFields[modelType];
+  if (idx !== -1) {
+    const next = [...sessions];
+    next[idx] = { ...next[idx], [`${prefix}Provider`]: "", [`${prefix}ID`]: "" };
+    $sessions.set(next);
+  }
+
+  ws.send("set_session_models", {
+    sessionID,
+    [`${modelType}Model`]: { provider: "", model: "" },
+  });
+}
+
 export function setSessionReasoningEffort(
   sessionID: string,
   largeEffort: string | null,

@@ -8,6 +8,7 @@ package agent
 import (
 	"testing"
 
+	"github.com/charmbracelet/crush/internal/session"
 	"github.com/stretchr/testify/require"
 )
 
@@ -115,7 +116,7 @@ func TestBuildSystemPromptForSession_ResolvesFromSession(t *testing.T) {
 	require.NoError(t, err)
 	sessB, err := env.sessions.Create(t.Context(), "session B")
 	require.NoError(t, err)
-	require.NoError(t, env.sessions.UpdateModels(t.Context(), sessA.ID, "override-provider-a", "override-model-a", "", ""))
+	require.NoError(t, env.sessions.UpdateModels(t.Context(), sessA.ID, &session.ModelSlotUpdate{Provider: "override-provider-a", Model: "override-model-a"}, nil))
 
 	promptA, errA := coord.BuildSystemPromptForSession(t.Context(), sessA.ID)
 	require.NoError(t, errA)

@@ -7,6 +7,7 @@ import (
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/csync"
 	"github.com/charmbracelet/crush/internal/message"
+	"github.com/charmbracelet/crush/internal/session"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -102,7 +103,7 @@ func TestCoordinator_InterruptAndSend_UnknownProvider_Errors(t *testing.T) {
 
 	// Set up the session with an unknown provider override.
 	// This will cause resolveSessionModels to fail when building models.
-	err = env.sessions.UpdateModels(t.Context(), sess.ID, "ghost-provider", "ghost-model", "", "")
+	err = env.sessions.UpdateModels(t.Context(), sess.ID, &session.ModelSlotUpdate{Provider: "ghost-provider", Model: "ghost-model"}, nil)
 	require.NoError(t, err)
 
 	mock := &mockSessionAgent{

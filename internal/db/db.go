@@ -252,6 +252,12 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.updateSessionSystemPromptStmt, err = db.PrepareContext(ctx, updateSessionSystemPrompt); err != nil {
 		return nil, fmt.Errorf("error preparing query UpdateSessionSystemPrompt: %w", err)
 	}
+	if q.updateSessionWorkerReviewerModelsStmt, err = db.PrepareContext(ctx, updateSessionWorkerReviewerModels); err != nil {
+		return nil, fmt.Errorf("error preparing query UpdateSessionWorkerReviewerModels: %w", err)
+	}
+	if q.updateSessionWorkerReviewerReasoningEffortStmt, err = db.PrepareContext(ctx, updateSessionWorkerReviewerReasoningEffort); err != nil {
+		return nil, fmt.Errorf("error preparing query UpdateSessionWorkerReviewerReasoningEffort: %w", err)
+	}
 	if q.writeToOrphanOutboxStmt, err = db.PrepareContext(ctx, writeToOrphanOutbox); err != nil {
 		return nil, fmt.Errorf("error preparing query WriteToOrphanOutbox: %w", err)
 	}
@@ -640,6 +646,16 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing updateSessionSystemPromptStmt: %w", cerr)
 		}
 	}
+	if q.updateSessionWorkerReviewerModelsStmt != nil {
+		if cerr := q.updateSessionWorkerReviewerModelsStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing updateSessionWorkerReviewerModelsStmt: %w", cerr)
+		}
+	}
+	if q.updateSessionWorkerReviewerReasoningEffortStmt != nil {
+		if cerr := q.updateSessionWorkerReviewerReasoningEffortStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing updateSessionWorkerReviewerReasoningEffortStmt: %w", cerr)
+		}
+	}
 	if q.writeToOrphanOutboxStmt != nil {
 		if cerr := q.writeToOrphanOutboxStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing writeToOrphanOutboxStmt: %w", cerr)
@@ -682,167 +698,171 @@ func (q *Queries) queryRow(ctx context.Context, stmt *sql.Stmt, query string, ar
 }
 
 type Queries struct {
-	db                                          DBTX
-	tx                                          *sql.Tx
-	ackRunQueueEntryStmt                        *sql.Stmt
-	cleanupExpiredLeasesStmt                    *sql.Stmt
-	countMessagesBySessionStmt                  *sql.Stmt
-	createFileStmt                              *sql.Stmt
-	createMessageStmt                           *sql.Stmt
-	createPendingInjectStmt                     *sql.Stmt
-	createSessionStmt                           *sql.Stmt
-	createSessionPermissionStmt                 *sql.Stmt
-	deleteFileStmt                              *sql.Stmt
-	deleteMessageStmt                           *sql.Stmt
-	deleteOrphanOutboxEntryIfPendingStmt        *sql.Stmt
-	deletePendingInjectStmt                     *sql.Stmt
-	deletePermissionStmt                        *sql.Stmt
-	deleteSessionStmt                           *sql.Stmt
-	deleteSessionFilesStmt                      *sql.Stmt
-	deleteSessionMessagesStmt                   *sql.Stmt
-	enqueueRunQueueEntryStmt                    *sql.Stmt
-	getAverageResponseTimeStmt                  *sql.Stmt
-	getCallTreeActivityStmt                     *sql.Stmt
-	getCallTreeActivityBatchStmt                *sql.Stmt
-	getFileStmt                                 *sql.Stmt
-	getFileByPathAndSessionStmt                 *sql.Stmt
-	getFileReadStmt                             *sql.Stmt
-	getHourDayHeatmapStmt                       *sql.Stmt
-	getLastSessionStmt                          *sql.Stmt
-	getMessageStmt                              *sql.Stmt
-	getOldestPendingRunQueueEntryForSessionStmt *sql.Stmt
-	getOrphanOutboxEntryStmt                    *sql.Stmt
-	getRecentActivityStmt                       *sql.Stmt
-	getRunQueueEntryStmt                        *sql.Stmt
-	getSessionByIDStmt                          *sql.Stmt
-	getSessionCostAccountingStmt                *sql.Stmt
-	getToolUsageStmt                            *sql.Stmt
-	getTotalStatsStmt                           *sql.Stmt
-	getTranscriptWindowCursorStmt               *sql.Stmt
-	getUsageByDayStmt                           *sql.Stmt
-	getUsageByDayOfWeekStmt                     *sql.Stmt
-	getUsageByHourStmt                          *sql.Stmt
-	getUsageByModelStmt                         *sql.Stmt
-	incrementSessionCostStmt                    *sql.Stmt
-	leaseRunQueueEntryByIDStmt                  *sql.Stmt
-	listAllSessionPermissionsStmt               *sql.Stmt
-	listAllSessionsStmt                         *sql.Stmt
-	listAllUserMessagesStmt                     *sql.Stmt
-	listFilesByPathStmt                         *sql.Stmt
-	listFilesBySessionStmt                      *sql.Stmt
-	listLatestSessionFilesStmt                  *sql.Stmt
-	listMessagesBySessionStmt                   *sql.Stmt
-	listMessagesBySessionAtCreatedAtStmt        *sql.Stmt
-	listMessagesBySessionOlderThanCreatedAtStmt *sql.Stmt
-	listMessagesBySessionPaginatedStmt          *sql.Stmt
-	listNewFilesStmt                            *sql.Stmt
-	listPendingInjectsBySessionStmt             *sql.Stmt
-	listPendingOrphanOutboxEntriesStmt          *sql.Stmt
-	listPendingRunQueueEntriesStmt              *sql.Stmt
-	listSessionPermissionsStmt                  *sql.Stmt
-	listSessionReadFilesStmt                    *sql.Stmt
-	listSessionsStmt                            *sql.Stmt
-	listStaleLeasedRunQueueEntriesStmt          *sql.Stmt
-	listSubSessionsStmt                         *sql.Stmt
-	listUserMessagesBySessionStmt               *sql.Stmt
-	matchSessionPermissionStmt                  *sql.Stmt
-	nackRunQueueEntryStmt                       *sql.Stmt
-	nackRunQueueEntryNoAttemptPenaltyStmt       *sql.Stmt
-	recordFileReadStmt                          *sql.Stmt
-	renameSessionStmt                           *sql.Stmt
-	renewRunQueueLeaseStmt                      *sql.Stmt
-	setParentCostAccountedStmt                  *sql.Stmt
-	terminalFailRunQueueEntryStmt               *sql.Stmt
-	updateMessageStmt                           *sql.Stmt
-	updateMessageIfNotTerminalStmt              *sql.Stmt
-	updateMessagePinnedStmt                     *sql.Stmt
-	updatePermissionEnabledStmt                 *sql.Stmt
-	updateSessionModelsStmt                     *sql.Stmt
-	updateSessionReasoningEffortStmt            *sql.Stmt
-	updateSessionSystemPromptStmt               *sql.Stmt
-	writeToOrphanOutboxStmt                     *sql.Stmt
+	db                                             DBTX
+	tx                                             *sql.Tx
+	ackRunQueueEntryStmt                           *sql.Stmt
+	cleanupExpiredLeasesStmt                       *sql.Stmt
+	countMessagesBySessionStmt                     *sql.Stmt
+	createFileStmt                                 *sql.Stmt
+	createMessageStmt                              *sql.Stmt
+	createPendingInjectStmt                        *sql.Stmt
+	createSessionStmt                              *sql.Stmt
+	createSessionPermissionStmt                    *sql.Stmt
+	deleteFileStmt                                 *sql.Stmt
+	deleteMessageStmt                              *sql.Stmt
+	deleteOrphanOutboxEntryIfPendingStmt           *sql.Stmt
+	deletePendingInjectStmt                        *sql.Stmt
+	deletePermissionStmt                           *sql.Stmt
+	deleteSessionStmt                              *sql.Stmt
+	deleteSessionFilesStmt                         *sql.Stmt
+	deleteSessionMessagesStmt                      *sql.Stmt
+	enqueueRunQueueEntryStmt                       *sql.Stmt
+	getAverageResponseTimeStmt                     *sql.Stmt
+	getCallTreeActivityStmt                        *sql.Stmt
+	getCallTreeActivityBatchStmt                   *sql.Stmt
+	getFileStmt                                    *sql.Stmt
+	getFileByPathAndSessionStmt                    *sql.Stmt
+	getFileReadStmt                                *sql.Stmt
+	getHourDayHeatmapStmt                          *sql.Stmt
+	getLastSessionStmt                             *sql.Stmt
+	getMessageStmt                                 *sql.Stmt
+	getOldestPendingRunQueueEntryForSessionStmt    *sql.Stmt
+	getOrphanOutboxEntryStmt                       *sql.Stmt
+	getRecentActivityStmt                          *sql.Stmt
+	getRunQueueEntryStmt                           *sql.Stmt
+	getSessionByIDStmt                             *sql.Stmt
+	getSessionCostAccountingStmt                   *sql.Stmt
+	getToolUsageStmt                               *sql.Stmt
+	getTotalStatsStmt                              *sql.Stmt
+	getTranscriptWindowCursorStmt                  *sql.Stmt
+	getUsageByDayStmt                              *sql.Stmt
+	getUsageByDayOfWeekStmt                        *sql.Stmt
+	getUsageByHourStmt                             *sql.Stmt
+	getUsageByModelStmt                            *sql.Stmt
+	incrementSessionCostStmt                       *sql.Stmt
+	leaseRunQueueEntryByIDStmt                     *sql.Stmt
+	listAllSessionPermissionsStmt                  *sql.Stmt
+	listAllSessionsStmt                            *sql.Stmt
+	listAllUserMessagesStmt                        *sql.Stmt
+	listFilesByPathStmt                            *sql.Stmt
+	listFilesBySessionStmt                         *sql.Stmt
+	listLatestSessionFilesStmt                     *sql.Stmt
+	listMessagesBySessionStmt                      *sql.Stmt
+	listMessagesBySessionAtCreatedAtStmt           *sql.Stmt
+	listMessagesBySessionOlderThanCreatedAtStmt    *sql.Stmt
+	listMessagesBySessionPaginatedStmt             *sql.Stmt
+	listNewFilesStmt                               *sql.Stmt
+	listPendingInjectsBySessionStmt                *sql.Stmt
+	listPendingOrphanOutboxEntriesStmt             *sql.Stmt
+	listPendingRunQueueEntriesStmt                 *sql.Stmt
+	listSessionPermissionsStmt                     *sql.Stmt
+	listSessionReadFilesStmt                       *sql.Stmt
+	listSessionsStmt                               *sql.Stmt
+	listStaleLeasedRunQueueEntriesStmt             *sql.Stmt
+	listSubSessionsStmt                            *sql.Stmt
+	listUserMessagesBySessionStmt                  *sql.Stmt
+	matchSessionPermissionStmt                     *sql.Stmt
+	nackRunQueueEntryStmt                          *sql.Stmt
+	nackRunQueueEntryNoAttemptPenaltyStmt          *sql.Stmt
+	recordFileReadStmt                             *sql.Stmt
+	renameSessionStmt                              *sql.Stmt
+	renewRunQueueLeaseStmt                         *sql.Stmt
+	setParentCostAccountedStmt                     *sql.Stmt
+	terminalFailRunQueueEntryStmt                  *sql.Stmt
+	updateMessageStmt                              *sql.Stmt
+	updateMessageIfNotTerminalStmt                 *sql.Stmt
+	updateMessagePinnedStmt                        *sql.Stmt
+	updatePermissionEnabledStmt                    *sql.Stmt
+	updateSessionModelsStmt                        *sql.Stmt
+	updateSessionReasoningEffortStmt               *sql.Stmt
+	updateSessionSystemPromptStmt                  *sql.Stmt
+	updateSessionWorkerReviewerModelsStmt          *sql.Stmt
+	updateSessionWorkerReviewerReasoningEffortStmt *sql.Stmt
+	writeToOrphanOutboxStmt                        *sql.Stmt
 }
 
 func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 	return &Queries{
-		db:                                          tx,
-		tx:                                          tx,
-		ackRunQueueEntryStmt:                        q.ackRunQueueEntryStmt,
-		cleanupExpiredLeasesStmt:                    q.cleanupExpiredLeasesStmt,
-		countMessagesBySessionStmt:                  q.countMessagesBySessionStmt,
-		createFileStmt:                              q.createFileStmt,
-		createMessageStmt:                           q.createMessageStmt,
-		createPendingInjectStmt:                     q.createPendingInjectStmt,
-		createSessionStmt:                           q.createSessionStmt,
-		createSessionPermissionStmt:                 q.createSessionPermissionStmt,
-		deleteFileStmt:                              q.deleteFileStmt,
-		deleteMessageStmt:                           q.deleteMessageStmt,
-		deleteOrphanOutboxEntryIfPendingStmt:        q.deleteOrphanOutboxEntryIfPendingStmt,
-		deletePendingInjectStmt:                     q.deletePendingInjectStmt,
-		deletePermissionStmt:                        q.deletePermissionStmt,
-		deleteSessionStmt:                           q.deleteSessionStmt,
-		deleteSessionFilesStmt:                      q.deleteSessionFilesStmt,
-		deleteSessionMessagesStmt:                   q.deleteSessionMessagesStmt,
-		enqueueRunQueueEntryStmt:                    q.enqueueRunQueueEntryStmt,
-		getAverageResponseTimeStmt:                  q.getAverageResponseTimeStmt,
-		getCallTreeActivityStmt:                     q.getCallTreeActivityStmt,
-		getCallTreeActivityBatchStmt:                q.getCallTreeActivityBatchStmt,
-		getFileStmt:                                 q.getFileStmt,
-		getFileByPathAndSessionStmt:                 q.getFileByPathAndSessionStmt,
-		getFileReadStmt:                             q.getFileReadStmt,
-		getHourDayHeatmapStmt:                       q.getHourDayHeatmapStmt,
-		getLastSessionStmt:                          q.getLastSessionStmt,
-		getMessageStmt:                              q.getMessageStmt,
-		getOldestPendingRunQueueEntryForSessionStmt: q.getOldestPendingRunQueueEntryForSessionStmt,
-		getOrphanOutboxEntryStmt:                    q.getOrphanOutboxEntryStmt,
-		getRecentActivityStmt:                       q.getRecentActivityStmt,
-		getRunQueueEntryStmt:                        q.getRunQueueEntryStmt,
-		getSessionByIDStmt:                          q.getSessionByIDStmt,
-		getSessionCostAccountingStmt:                q.getSessionCostAccountingStmt,
-		getToolUsageStmt:                            q.getToolUsageStmt,
-		getTotalStatsStmt:                           q.getTotalStatsStmt,
-		getTranscriptWindowCursorStmt:               q.getTranscriptWindowCursorStmt,
-		getUsageByDayStmt:                           q.getUsageByDayStmt,
-		getUsageByDayOfWeekStmt:                     q.getUsageByDayOfWeekStmt,
-		getUsageByHourStmt:                          q.getUsageByHourStmt,
-		getUsageByModelStmt:                         q.getUsageByModelStmt,
-		incrementSessionCostStmt:                    q.incrementSessionCostStmt,
-		leaseRunQueueEntryByIDStmt:                  q.leaseRunQueueEntryByIDStmt,
-		listAllSessionPermissionsStmt:               q.listAllSessionPermissionsStmt,
-		listAllSessionsStmt:                         q.listAllSessionsStmt,
-		listAllUserMessagesStmt:                     q.listAllUserMessagesStmt,
-		listFilesByPathStmt:                         q.listFilesByPathStmt,
-		listFilesBySessionStmt:                      q.listFilesBySessionStmt,
-		listLatestSessionFilesStmt:                  q.listLatestSessionFilesStmt,
-		listMessagesBySessionStmt:                   q.listMessagesBySessionStmt,
-		listMessagesBySessionAtCreatedAtStmt:        q.listMessagesBySessionAtCreatedAtStmt,
-		listMessagesBySessionOlderThanCreatedAtStmt: q.listMessagesBySessionOlderThanCreatedAtStmt,
-		listMessagesBySessionPaginatedStmt:          q.listMessagesBySessionPaginatedStmt,
-		listNewFilesStmt:                            q.listNewFilesStmt,
-		listPendingInjectsBySessionStmt:             q.listPendingInjectsBySessionStmt,
-		listPendingOrphanOutboxEntriesStmt:          q.listPendingOrphanOutboxEntriesStmt,
-		listPendingRunQueueEntriesStmt:              q.listPendingRunQueueEntriesStmt,
-		listSessionPermissionsStmt:                  q.listSessionPermissionsStmt,
-		listSessionReadFilesStmt:                    q.listSessionReadFilesStmt,
-		listSessionsStmt:                            q.listSessionsStmt,
-		listStaleLeasedRunQueueEntriesStmt:          q.listStaleLeasedRunQueueEntriesStmt,
-		listSubSessionsStmt:                         q.listSubSessionsStmt,
-		listUserMessagesBySessionStmt:               q.listUserMessagesBySessionStmt,
-		matchSessionPermissionStmt:                  q.matchSessionPermissionStmt,
-		nackRunQueueEntryStmt:                       q.nackRunQueueEntryStmt,
-		nackRunQueueEntryNoAttemptPenaltyStmt:       q.nackRunQueueEntryNoAttemptPenaltyStmt,
-		recordFileReadStmt:                          q.recordFileReadStmt,
-		renameSessionStmt:                           q.renameSessionStmt,
-		renewRunQueueLeaseStmt:                      q.renewRunQueueLeaseStmt,
-		setParentCostAccountedStmt:                  q.setParentCostAccountedStmt,
-		terminalFailRunQueueEntryStmt:               q.terminalFailRunQueueEntryStmt,
-		updateMessageStmt:                           q.updateMessageStmt,
-		updateMessageIfNotTerminalStmt:              q.updateMessageIfNotTerminalStmt,
-		updateMessagePinnedStmt:                     q.updateMessagePinnedStmt,
-		updatePermissionEnabledStmt:                 q.updatePermissionEnabledStmt,
-		updateSessionModelsStmt:                     q.updateSessionModelsStmt,
-		updateSessionReasoningEffortStmt:            q.updateSessionReasoningEffortStmt,
-		updateSessionSystemPromptStmt:               q.updateSessionSystemPromptStmt,
-		writeToOrphanOutboxStmt:                     q.writeToOrphanOutboxStmt,
+		db:                                             tx,
+		tx:                                             tx,
+		ackRunQueueEntryStmt:                           q.ackRunQueueEntryStmt,
+		cleanupExpiredLeasesStmt:                       q.cleanupExpiredLeasesStmt,
+		countMessagesBySessionStmt:                     q.countMessagesBySessionStmt,
+		createFileStmt:                                 q.createFileStmt,
+		createMessageStmt:                              q.createMessageStmt,
+		createPendingInjectStmt:                        q.createPendingInjectStmt,
+		createSessionStmt:                              q.createSessionStmt,
+		createSessionPermissionStmt:                    q.createSessionPermissionStmt,
+		deleteFileStmt:                                 q.deleteFileStmt,
+		deleteMessageStmt:                              q.deleteMessageStmt,
+		deleteOrphanOutboxEntryIfPendingStmt:           q.deleteOrphanOutboxEntryIfPendingStmt,
+		deletePendingInjectStmt:                        q.deletePendingInjectStmt,
+		deletePermissionStmt:                           q.deletePermissionStmt,
+		deleteSessionStmt:                              q.deleteSessionStmt,
+		deleteSessionFilesStmt:                         q.deleteSessionFilesStmt,
+		deleteSessionMessagesStmt:                      q.deleteSessionMessagesStmt,
+		enqueueRunQueueEntryStmt:                       q.enqueueRunQueueEntryStmt,
+		getAverageResponseTimeStmt:                     q.getAverageResponseTimeStmt,
+		getCallTreeActivityStmt:                        q.getCallTreeActivityStmt,
+		getCallTreeActivityBatchStmt:                   q.getCallTreeActivityBatchStmt,
+		getFileStmt:                                    q.getFileStmt,
+		getFileByPathAndSessionStmt:                    q.getFileByPathAndSessionStmt,
+		getFileReadStmt:                                q.getFileReadStmt,
+		getHourDayHeatmapStmt:                          q.getHourDayHeatmapStmt,
+		getLastSessionStmt:                             q.getLastSessionStmt,
+		getMessageStmt:                                 q.getMessageStmt,
+		getOldestPendingRunQueueEntryForSessionStmt:    q.getOldestPendingRunQueueEntryForSessionStmt,
+		getOrphanOutboxEntryStmt:                       q.getOrphanOutboxEntryStmt,
+		getRecentActivityStmt:                          q.getRecentActivityStmt,
+		getRunQueueEntryStmt:                           q.getRunQueueEntryStmt,
+		getSessionByIDStmt:                             q.getSessionByIDStmt,
+		getSessionCostAccountingStmt:                   q.getSessionCostAccountingStmt,
+		getToolUsageStmt:                               q.getToolUsageStmt,
+		getTotalStatsStmt:                              q.getTotalStatsStmt,
+		getTranscriptWindowCursorStmt:                  q.getTranscriptWindowCursorStmt,
+		getUsageByDayStmt:                              q.getUsageByDayStmt,
+		getUsageByDayOfWeekStmt:                        q.getUsageByDayOfWeekStmt,
+		getUsageByHourStmt:                             q.getUsageByHourStmt,
+		getUsageByModelStmt:                            q.getUsageByModelStmt,
+		incrementSessionCostStmt:                       q.incrementSessionCostStmt,
+		leaseRunQueueEntryByIDStmt:                     q.leaseRunQueueEntryByIDStmt,
+		listAllSessionPermissionsStmt:                  q.listAllSessionPermissionsStmt,
+		listAllSessionsStmt:                            q.listAllSessionsStmt,
+		listAllUserMessagesStmt:                        q.listAllUserMessagesStmt,
+		listFilesByPathStmt:                            q.listFilesByPathStmt,
+		listFilesBySessionStmt:                         q.listFilesBySessionStmt,
+		listLatestSessionFilesStmt:                     q.listLatestSessionFilesStmt,
+		listMessagesBySessionStmt:                      q.listMessagesBySessionStmt,
+		listMessagesBySessionAtCreatedAtStmt:           q.listMessagesBySessionAtCreatedAtStmt,
+		listMessagesBySessionOlderThanCreatedAtStmt:    q.listMessagesBySessionOlderThanCreatedAtStmt,
+		listMessagesBySessionPaginatedStmt:             q.listMessagesBySessionPaginatedStmt,
+		listNewFilesStmt:                               q.listNewFilesStmt,
+		listPendingInjectsBySessionStmt:                q.listPendingInjectsBySessionStmt,
+		listPendingOrphanOutboxEntriesStmt:             q.listPendingOrphanOutboxEntriesStmt,
+		listPendingRunQueueEntriesStmt:                 q.listPendingRunQueueEntriesStmt,
+		listSessionPermissionsStmt:                     q.listSessionPermissionsStmt,
+		listSessionReadFilesStmt:                       q.listSessionReadFilesStmt,
+		listSessionsStmt:                               q.listSessionsStmt,
+		listStaleLeasedRunQueueEntriesStmt:             q.listStaleLeasedRunQueueEntriesStmt,
+		listSubSessionsStmt:                            q.listSubSessionsStmt,
+		listUserMessagesBySessionStmt:                  q.listUserMessagesBySessionStmt,
+		matchSessionPermissionStmt:                     q.matchSessionPermissionStmt,
+		nackRunQueueEntryStmt:                          q.nackRunQueueEntryStmt,
+		nackRunQueueEntryNoAttemptPenaltyStmt:          q.nackRunQueueEntryNoAttemptPenaltyStmt,
+		recordFileReadStmt:                             q.recordFileReadStmt,
+		renameSessionStmt:                              q.renameSessionStmt,
+		renewRunQueueLeaseStmt:                         q.renewRunQueueLeaseStmt,
+		setParentCostAccountedStmt:                     q.setParentCostAccountedStmt,
+		terminalFailRunQueueEntryStmt:                  q.terminalFailRunQueueEntryStmt,
+		updateMessageStmt:                              q.updateMessageStmt,
+		updateMessageIfNotTerminalStmt:                 q.updateMessageIfNotTerminalStmt,
+		updateMessagePinnedStmt:                        q.updateMessagePinnedStmt,
+		updatePermissionEnabledStmt:                    q.updatePermissionEnabledStmt,
+		updateSessionModelsStmt:                        q.updateSessionModelsStmt,
+		updateSessionReasoningEffortStmt:               q.updateSessionReasoningEffortStmt,
+		updateSessionSystemPromptStmt:                  q.updateSessionSystemPromptStmt,
+		updateSessionWorkerReviewerModelsStmt:          q.updateSessionWorkerReviewerModelsStmt,
+		updateSessionWorkerReviewerReasoningEffortStmt: q.updateSessionWorkerReviewerReasoningEffortStmt,
+		writeToOrphanOutboxStmt:                        q.writeToOrphanOutboxStmt,
 	}
 }
