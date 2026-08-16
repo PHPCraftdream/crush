@@ -19,6 +19,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -973,34 +974,61 @@ func TestReleaseGate_9_DoubleFailureNoDuplicate(t *testing.T) {
 	pump.Start()
 	defer pump.Stop()
 
-	// Wait for pump to process the call and delete the entry via TerminalFailRunQueueEntry.
-	require.Eventually(t, func() bool {
+	// Wait for pump to process the call and delete the entry via
+	// TerminalFailRunQueueEntry.
+	//
+	// len(pending)==0 alone is NOT a sufficient wait condition:
+	// ListPendingRunQueueEntries only scans status='pending', so an entry
+	// that is currently 'leased' — the pump has claimed it and is running it
+	// RIGHT NOW — reads as zero pending too. Waiting on that alone returns
+	// while the run is still mid-flight, and every message-service call the
+	// run is about to make lands AFTER the callCountAtTerminal snapshot
+	// below, i.e. gets misread as "a retry loop kept calling". That is a
+	// pure test-side race, and it is what failed on the macOS -race runner
+	// (callCountAtTerminal==0, then 3 calls arrived during the hold loop)
+	// while passing on faster machines that never observe the lease window.
+	//
+	// So wait for the row to be gone from BOTH states — that, and only that,
+	// is "terminally removed".
+	entryStillQueued := func() bool {
 		pending, checkErr := env.sessions.ListPendingRunQueueEntries(ctx)
 		if checkErr != nil {
-			return false
+			return true
 		}
-		return len(pending) == 0
-	}, 10*time.Second, 100*time.Millisecond,
+		for _, e := range pending {
+			if e.ID == entryID {
+				return true
+			}
+		}
+		// math.MaxInt64 as the cutoff makes this "all leased entries",
+		// not just the stale ones.
+		leased, checkErr := env.sessions.ListStaleLeasedRunQueueEntries(ctx, math.MaxInt64)
+		if checkErr != nil {
+			return true
+		}
+		for _, e := range leased {
+			if e.ID == entryID {
+				return true
+			}
+		}
+		return false
+	}
+	require.Eventually(t, func() bool { return !entryStillQueued() },
+		10*time.Second, 100*time.Millisecond,
 		"pump should delete the entry via ErrCallAlreadyAttempted path")
 
-	// len(pending)==0 alone is ambiguous: ListPendingRunQueueEntries only
-	// scans status='pending', so an entry that is transiently 'leased'
-	// (mid-retry, about to be Nacked back to pending on the NEXT tick) would
-	// ALSO read as zero pending at this exact instant — a false positive
-	// that doesn't distinguish "terminally removed" from "still retrying in
-	// the background". Hold past several more TestTick cycles (well beyond
-	// RunQueueMaxAttempts's worst case at this tick rate) and require it
-	// STAYS empty and mockMessages sees no further calls — that is the
-	// actual signature of terminal removal vs. an in-flight retry loop.
+	// Now hold past several more TestTick cycles (well beyond
+	// RunQueueMaxAttempts's worst case at this tick rate) and require the
+	// entry STAYS gone and mockMessages sees no further calls — that is the
+	// signature of terminal removal vs. an in-flight retry loop.
 	// (mockMessages.callCount, not providerCalls: the induced failure lands
 	// on a pre-provider call in this scenario, so the provider is never hit
 	// at all — 0 calls is the correct/expected count here, not a bug.)
 	callCountAtTerminal := mockMessages.callCount.Load()
 	for i := 0; i < 5; i++ {
 		time.Sleep(150 * time.Millisecond)
-		pending, checkErr := env.sessions.ListPendingRunQueueEntries(ctx)
-		require.NoError(t, checkErr)
-		require.Empty(t, pending, "entry must STAY deleted, not just transiently absent between retries")
+		require.False(t, entryStillQueued(),
+			"entry must STAY deleted, not just transiently absent between retries")
 		require.Equal(t, callCountAtTerminal, mockMessages.callCount.Load(),
 			"no further message-service calls should happen after terminal-fail — a retry loop would keep calling")
 	}
