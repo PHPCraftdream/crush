@@ -45,6 +45,18 @@ var (
 	// codexEffortLevelsStandard covers the models whose registry entry stops
 	// at xhigh (gpt-5.5, gpt-5.4, gpt-5.2, and the legacy slugs).
 	codexEffortLevelsStandard = []string{"low", "medium", "high", "xhigh"}
+
+	// codexEffortLevelsMax adds "max" (gpt-5.6-luna).
+	codexEffortLevelsMax = []string{"low", "medium", "high", "xhigh", "max"}
+
+	// codexEffortLevelsUltra adds "ultra" on top (gpt-5.6-sol, gpt-5.6-terra).
+	//
+	// "ultra" is NOT in the enum the API reports on a bad value
+	// (none|minimal|low|medium|high|xhigh|max), yet `-c
+	// model_reasoning_effort=ultra` completes a turn successfully against
+	// these two - the CLI translates it client-side. The registry, not the
+	// API error message, is the source of truth for what a model accepts.
+	codexEffortLevelsUltra = []string{"low", "medium", "high", "xhigh", "max", "ultra"}
 )
 
 // applyClaudeEffort sets --effort, replacing a value already placed there by

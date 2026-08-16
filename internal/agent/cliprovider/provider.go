@@ -626,6 +626,54 @@ func claudeSpec(modelID, modelName, modelArg string, ctxWindow int64) CLISpec {
 	}
 }
 
+// codexSpec builds a codex CLI entry.
+//
+// ContextWindow is fixed at 272_000 because codex's own embedded registry
+// reports that for every model it serves, including the fallback metadata it
+// applies to slugs it no longer knows. The previous per-entry 400_000 was a
+// 48% overstatement of a number that gates auto-summarization.
+//
+// effortLevels differs per MODEL, which is why it is a parameter rather than a
+// constant: sol/terra accept "ultra", luna stops at "max", the rest at
+// "xhigh". A level outside the set is dropped by applyEffort instead of
+// reaching the provider as a 400.
+func codexSpec(modelID, modelName, modelArg string, effortLevels []string) CLISpec {
+	return CLISpec{
+		ModelID:             modelID,
+		ModelName:           modelName,
+		ContextWindow:       272_000,
+		Binary:              "codex",
+		BuildArgs:           codexArgs(modelArg),
+		NewPartParser:       codexPartParser,
+		ParseUsageLine:      codexParseUsageLine,
+		AlwaysStdin:         true,
+		CodexMCPIntegration: true,
+		ApplyEffort:         applyCodexEffort,
+		EffortLevels:        effortLevels,
+	}
+}
+
+// geminiSpec builds a gemini CLI entry.
+//
+// ApplyEffort/EffortLevels are deliberately left nil: the gemini CLI has no
+// reasoning-effort option and aborts with "Unknown argument: effort" if one is
+// passed, so applyEffort must drop whatever the session stored.
+//
+// ContextWindow is 1M for every model currently exposed here.
+func geminiSpec(modelID, modelName, modelArg string) CLISpec {
+	return CLISpec{
+		ModelID:              modelID,
+		ModelName:            modelName,
+		ContextWindow:        1_000_000,
+		Binary:               "gemini",
+		BuildArgs:            geminiArgs(modelArg),
+		NewPartParser:        geminiPartParser,
+		ParseUsageLine:       geminiParseUsageLine,
+		AlwaysStdin:          true,
+		GeminiMCPIntegration: true,
+	}
+}
+
 // All is the list of hardcoded CLI model specs.
 // Add new entries here to register additional CLI-backed models.
 var All = []CLISpec{
@@ -664,28 +712,27 @@ var All = []CLISpec{
 	claudeSpec("cli-claude-opus-5-1m", "Claude Opus 5 1M (CLI)", "claude-opus-5[1m]", 1_000_000),
 	claudeSpec("cli-claude-sonnet-5-1m", "Claude Sonnet 5 1M (CLI)", "claude-sonnet-5[1m]", 1_000_000),
 	claudeSpec("cli-claude-fable-5", "Claude Fable 5 (CLI)", "claude-fable-5", 1_000_000),
-	{
-		ModelID:              "cli-gemini-flash",
-		ModelName:            "Gemini 3 Flash (CLI)",
-		ContextWindow:        1_000_000,
-		Binary:               "gemini",
-		BuildArgs:            geminiArgs("gemini-3-flash"),
-		NewPartParser:        geminiPartParser,
-		ParseUsageLine:       geminiParseUsageLine,
-		AlwaysStdin:          true,
-		GeminiMCPIntegration: true,
-	},
-	{
-		ModelID:              "cli-gemini-pro",
-		ModelName:            "Gemini 3.1 Pro (CLI)",
-		ContextWindow:        1_000_000,
-		Binary:               "gemini",
-		BuildArgs:            geminiArgs("gemini-3.1-pro-preview"),
-		NewPartParser:        geminiPartParser,
-		ParseUsageLine:       geminiParseUsageLine,
-		AlwaysStdin:          true,
-		GeminiMCPIntegration: true,
-	},
+	// NOT exposed: claude-mythos-5. The id and a `mythos` alias both exist in
+	// the CLI, but both return HTTP 404 model_not_found ("It may not exist or
+	// you may not have access to it") on this account. An earlier check
+	// appeared to pass only because it asserted that modelUsage was non-empty
+	// without printing WHICH model answered - a 404 yields an empty
+	// modelUsage, so the check was reading its own loop never running as
+	// success. Re-add once a ping actually resolves to claude-mythos-5.
+	// Google's `gemini` CLI. Model ids are taken from the CLI's own
+	// VALID_GEMINI_MODELS set. No effort knob: `gemini --effort high` aborts
+	// with "Unknown argument: effort", so these specs leave ApplyEffort nil
+	// and applyEffort drops any effort a session happens to carry.
+	//
+	// cli-gemini-flash is deliberately labelled without a version. It pins
+	// gemini-3-flash, but that id now REDIRECTS: the CLI's own response
+	// reports the resolved model as gemini-3.5-flash. The entry has been
+	// running 3.5 while advertising 3 — the same stale-label class fixed for
+	// cli-claude-sonnet. Use cli-gemini-flash-35 to pin 3.5 explicitly.
+	geminiSpec("cli-gemini-flash", "Gemini Flash (CLI, latest)", "gemini-3-flash"),
+	geminiSpec("cli-gemini-flash-35", "Gemini 3.5 Flash (CLI)", "gemini-3.5-flash"),
+	geminiSpec("cli-gemini-flash-lite", "Gemini 3.1 Flash-Lite (CLI)", "gemini-3.1-flash-lite"),
+	geminiSpec("cli-gemini-pro", "Gemini 3.1 Pro (CLI)", "gemini-3.1-pro-preview"),
 	{
 		ModelID:            "cli-qwen",
 		ModelName:          "Qwen 3.5 Plus (CLI)",
@@ -697,84 +744,44 @@ var All = []CLISpec{
 		AlwaysStdin:        true,
 		QwenMCPIntegration: true,
 	},
-	{
-		ModelID:             "cli-codex",
-		ModelName:           "Codex (gpt-5.3-codex, CLI)",
-		ContextWindow:       400_000,
-		Binary:              "codex",
-		BuildArgs:           codexArgs("gpt-5.3-codex"),
-		NewPartParser:       codexPartParser,
-		ParseUsageLine:      codexParseUsageLine,
-		AlwaysStdin:         true,
-		CodexMCPIntegration: true,
-		ApplyEffort:         applyCodexEffort,
-		EffortLevels:        codexEffortLevelsStandard,
-	},
-	{
-		ModelID:             "cli-codex-gpt-5-4",
-		ModelName:           "Codex (gpt-5.4, CLI)",
-		ContextWindow:       272_000,
-		Binary:              "codex",
-		BuildArgs:           codexArgs("gpt-5.4"),
-		NewPartParser:       codexPartParser,
-		ParseUsageLine:      codexParseUsageLine,
-		AlwaysStdin:         true,
-		CodexMCPIntegration: true,
-		ApplyEffort:         applyCodexEffort,
-		EffortLevels:        codexEffortLevelsStandard,
-	},
-	{
-		ModelID:             "cli-codex-gpt-5-2",
-		ModelName:           "Codex (gpt-5.2-codex, CLI)",
-		ContextWindow:       400_000,
-		Binary:              "codex",
-		BuildArgs:           codexArgs("gpt-5.2-codex"),
-		NewPartParser:       codexPartParser,
-		ParseUsageLine:      codexParseUsageLine,
-		AlwaysStdin:         true,
-		CodexMCPIntegration: true,
-		ApplyEffort:         applyCodexEffort,
-		EffortLevels:        codexEffortLevelsStandard,
-	},
-	{
-		ModelID:             "cli-codex-max",
-		ModelName:           "Codex Max (gpt-5.1-codex-max, CLI)",
-		ContextWindow:       400_000,
-		Binary:              "codex",
-		BuildArgs:           codexArgs("gpt-5.1-codex-max"),
-		NewPartParser:       codexPartParser,
-		ParseUsageLine:      codexParseUsageLine,
-		AlwaysStdin:         true,
-		CodexMCPIntegration: true,
-		ApplyEffort:         applyCodexEffort,
-		EffortLevels:        codexEffortLevelsStandard,
-	},
-	{
-		ModelID:             "cli-codex-gpt-5-2-base",
-		ModelName:           "Codex (gpt-5.2, CLI)",
-		ContextWindow:       400_000,
-		Binary:              "codex",
-		BuildArgs:           codexArgs("gpt-5.2"),
-		NewPartParser:       codexPartParser,
-		ParseUsageLine:      codexParseUsageLine,
-		AlwaysStdin:         true,
-		CodexMCPIntegration: true,
-		ApplyEffort:         applyCodexEffort,
-		EffortLevels:        codexEffortLevelsStandard,
-	},
-	{
-		ModelID:             "cli-codex-mini",
-		ModelName:           "Codex Mini (gpt-5.1-codex-mini, CLI)",
-		ContextWindow:       400_000,
-		Binary:              "codex",
-		BuildArgs:           codexArgs("gpt-5.1-codex-mini"),
-		NewPartParser:       codexPartParser,
-		ParseUsageLine:      codexParseUsageLine,
-		AlwaysStdin:         true,
-		CodexMCPIntegration: true,
-		ApplyEffort:         applyCodexEffort,
-		EffortLevels:        codexEffortLevelsStandard,
-	},
+	// OpenAI's `codex` CLI. Context windows and effort levels come from the
+	// model registry embedded in codex.exe itself (codex-cli 0.147.0), which
+	// is authoritative - it is what the binary consults at runtime.
+	//
+	// All codex models are 272_000, NOT the 400_000 these entries used to
+	// claim. ContextWindow drives the auto-summarization threshold, so a 48%
+	// overstatement let conversations run well past the real limit.
+	codexSpec("cli-codex-sol", "GPT-5.6-Sol (CLI)", "gpt-5.6-sol", codexEffortLevelsUltra),
+	codexSpec("cli-codex-terra", "GPT-5.6-Terra (CLI)", "gpt-5.6-terra", codexEffortLevelsUltra),
+	codexSpec("cli-codex-luna", "GPT-5.6-Luna (CLI)", "gpt-5.6-luna", codexEffortLevelsMax),
+	// gpt-5.5 stops at xhigh. Note the ceiling below only clamps efforts CRUSH
+	// sends; it says nothing about codex's own default. If the operator's
+	// ~/.codex/config.toml sets a higher model_reasoning_effort (e.g. "max",
+	// which is valid for sol/terra), the CLI applies it whenever crush passes
+	// none and the API rejects the turn:
+	//
+	//	Unsupported value: 'max' is not supported with the gpt-5.5 model.
+	//	Supported values are: 'none', 'low', 'medium', 'high', 'xhigh'.
+	//
+	// Reproduced on this machine; passing any supported level explicitly
+	// (`crush ping --model local-cli/cli-codex-gpt-5-5@xhigh`) succeeds. crush
+	// deliberately does not overwrite a codex config it did not write.
+	codexSpec("cli-codex-gpt-5-5", "GPT-5.5 (CLI)", "gpt-5.5", codexEffortLevelsStandard),
+	codexSpec("cli-codex-gpt-5-4", "GPT-5.4 (CLI)", "gpt-5.4", codexEffortLevelsStandard),
+	codexSpec("cli-codex-gpt-5-2-base", "GPT-5.2 (CLI)", "gpt-5.2", codexEffortLevelsStandard),
+
+	// Slugs that are NO LONGER in codex's registry. Kept rather than deleted
+	// so existing session rows and short codes referencing them do not
+	// dangle - the same reason the claude list keeps its alias entries.
+	//
+	// They do not hard-fail: codex warns "Model metadata for `X` not found.
+	// Defaulting to fallback metadata; this can degrade performance" and runs
+	// anyway, which is easy to miss. The display name says so, because an
+	// entry that silently degrades is worse than one that refuses.
+	codexSpec("cli-codex", "Codex gpt-5.3-codex (CLI, unsupported)", "gpt-5.3-codex", codexEffortLevelsStandard),
+	codexSpec("cli-codex-gpt-5-2", "Codex gpt-5.2-codex (CLI, unsupported)", "gpt-5.2-codex", codexEffortLevelsStandard),
+	codexSpec("cli-codex-max", "Codex gpt-5.1-codex-max (CLI, unsupported)", "gpt-5.1-codex-max", codexEffortLevelsStandard),
+	codexSpec("cli-codex-mini", "Codex gpt-5.1-codex-mini (CLI, unsupported)", "gpt-5.1-codex-mini", codexEffortLevelsStandard),
 }
 
 // Available returns the subset of All whose Binary is found in PATH.

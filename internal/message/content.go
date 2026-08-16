@@ -159,6 +159,14 @@ type Message struct {
 	// BackgroundJobNotice marks a system-injected background-job-completion
 	// notice so the web renders it as a notice, not a human message.
 	BackgroundJobNotice bool
+	// Usage is this message's own token accounting and prompt-cache
+	// breakdown, or nil when none was recorded (every message written before
+	// per-message tracking existed, and every non-assistant message).
+	//
+	// A POINTER on purpose: a zero-valued struct would be indistinguishable
+	// from a turn measured at zero, and the UI must be able to say "not
+	// measured" instead of rendering a confident 0% cache hit.
+	Usage *TokenUsage
 }
 
 func (m *Message) Content() TextContent {
@@ -464,6 +472,14 @@ func (m *Message) Clone() Message {
 	clone := *m
 	clone.Parts = make([]ContentPart, len(m.Parts))
 	copy(clone.Parts, m.Parts)
+	// Usage is a pointer, so the struct copy above would alias it. Nothing
+	// mutates a TokenUsage today, but Clone exists precisely to keep
+	// concurrent readers off shared state — leaving one aliased field would
+	// make the next mutation a race that looks unrelated to this line.
+	if m.Usage != nil {
+		u := *m.Usage
+		clone.Usage = &u
+	}
 	return clone
 }
 

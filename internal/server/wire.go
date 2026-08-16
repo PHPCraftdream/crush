@@ -31,6 +31,52 @@ type PartWire struct {
 	Details       string `json:"Details,omitempty"`
 }
 
+// UsageWire is the per-message token accounting sent to the browser.
+//
+// CacheHitRatio is a POINTER so it can be null: a provider that does not
+// report caching has no ratio, and emitting 0 there would be indistinguishable
+// from a genuine cache miss. The browser must render "n/a" on null rather than
+// substituting a number.
+type UsageWire struct {
+	InputTokens         int64    `json:"InputTokens"`
+	OutputTokens        int64    `json:"OutputTokens"`
+	ReasoningTokens     int64    `json:"ReasoningTokens,omitempty"`
+	CacheCreationTokens int64    `json:"CacheCreationTokens"`
+	CacheReadTokens     int64    `json:"CacheReadTokens"`
+	PromptTokens        int64    `json:"PromptTokens"`
+	TotalTokens         int64    `json:"TotalTokens"`
+	CostUSD             float64  `json:"CostUSD"`
+	Provider            string   `json:"Provider,omitempty"`
+	Model               string   `json:"Model,omitempty"`
+	CacheSupport        string   `json:"CacheSupport,omitempty"`
+	CacheHitRatio       *float64 `json:"CacheHitRatio"`
+	Estimated           bool     `json:"Estimated,omitempty"`
+}
+
+func toUsageWire(u *message.TokenUsage) *UsageWire {
+	if u == nil {
+		return nil
+	}
+	w := &UsageWire{
+		InputTokens:         u.InputTokens,
+		OutputTokens:        u.OutputTokens,
+		ReasoningTokens:     u.ReasoningTokens,
+		CacheCreationTokens: u.CacheCreationTokens,
+		CacheReadTokens:     u.CacheReadTokens,
+		PromptTokens:        u.PromptTokens(),
+		TotalTokens:         u.TotalTokens,
+		CostUSD:             u.CostUSD,
+		Provider:            u.Provider,
+		Model:               u.Model,
+		CacheSupport:        string(u.CacheSupport),
+		Estimated:           u.Estimated,
+	}
+	if ratio, ok := u.CacheHitRatio(); ok {
+		w.CacheHitRatio = &ratio
+	}
+	return w
+}
+
 // MessageWire is the JSON wire format for a Message sent to the browser.
 type MessageWire struct {
 	ID                  string     `json:"ID"`
@@ -46,6 +92,7 @@ type MessageWire struct {
 	Hidden              bool       `json:"Hidden"`
 	AutoResumed         bool       `json:"AutoResumed"`
 	BackgroundJobNotice bool       `json:"BackgroundJobNotice"`
+	Usage               *UsageWire `json:"Usage,omitempty"`
 }
 
 func toPartWire(part message.ContentPart) PartWire {
@@ -84,6 +131,7 @@ func toMessageWire(m message.Message) MessageWire {
 		Hidden:              m.Hidden,
 		AutoResumed:         m.AutoResumed,
 		BackgroundJobNotice: m.BackgroundJobNotice,
+		Usage:               toUsageWire(m.Usage),
 	}
 }
 

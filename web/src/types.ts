@@ -107,6 +107,34 @@ export interface Message {
   Hidden: boolean;
   AutoResumed: boolean;
   BackgroundJobNotice: boolean;
+  // Per-message token accounting. Absent on messages written before
+  // per-message tracking existed, and on non-assistant messages.
+  Usage?: MessageUsage;
+}
+
+// MessageUsage mirrors internal/server/wire.go's UsageWire.
+//
+// Tokens are split into three DISJOINT classes, so PromptTokens is their sum:
+// InputTokens (fresh, full price), CacheReadTokens (served from the provider's
+// prompt cache, much cheaper) and CacheCreationTokens (written into it).
+export interface MessageUsage {
+  InputTokens: number;
+  OutputTokens: number;
+  ReasoningTokens?: number;
+  CacheCreationTokens: number;
+  CacheReadTokens: number;
+  PromptTokens: number;
+  TotalTokens: number;
+  CostUSD: number;
+  Provider?: string;
+  Model?: string;
+  CacheSupport?: string;
+  // null when the provider does not report caching. Render "n/a" — a
+  // fabricated 0% is indistinguishable from a genuine cache miss.
+  CacheHitRatio: number | null;
+  // True when the provider sent no usage and the numbers were derived from
+  // message lengths. Approximate; must not be presented as measured.
+  Estimated?: boolean;
 }
 
 export interface ModelInfo {

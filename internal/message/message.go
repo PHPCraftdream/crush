@@ -555,7 +555,36 @@ func (s *service) fromDBItem(item db.Message) (Message, error) {
 		Hidden:              item.Hidden != 0,
 		AutoResumed:         item.AutoResumed != 0,
 		BackgroundJobNotice: item.BackgroundJobNotice != 0,
+		Usage:               usageFromDBItem(item),
 	}, nil
+}
+
+// usageFromDBItem lifts the per-message token accounting off a row, or returns
+// nil when none was recorded.
+//
+// total_tokens is the recorded/not-recorded marker (SetUsage always writes it
+// non-NULL, even when the derived value is 0), which is the same signal the
+// aggregate queries key on. Returning nil rather than a zero-valued struct
+// keeps "never measured" distinguishable from "measured as zero" all the way
+// out to the UI, so a message from before this feature cannot be rendered as
+// a confident 0% cache hit.
+func usageFromDBItem(item db.Message) *TokenUsage {
+	if !item.TotalTokens.Valid {
+		return nil
+	}
+	return &TokenUsage{
+		InputTokens:         item.InputTokens.Int64,
+		OutputTokens:        item.OutputTokens.Int64,
+		ReasoningTokens:     item.ReasoningTokens.Int64,
+		CacheCreationTokens: item.CacheCreationTokens.Int64,
+		CacheReadTokens:     item.CacheReadTokens.Int64,
+		TotalTokens:         item.TotalTokens.Int64,
+		CostUSD:             item.CostUsd.Float64,
+		Provider:            item.UsageProvider.String,
+		Model:               item.UsageModel.String,
+		CacheSupport:        CacheSupport(item.CacheSupport.String),
+		Estimated:           item.UsageEstimated.Int64 != 0,
+	}
 }
 
 func (s *service) SetPinned(ctx context.Context, id string, pinned bool) error {

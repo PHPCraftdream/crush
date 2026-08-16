@@ -546,6 +546,77 @@ type subAgentOutput struct {
 type usageInfo struct {
 	DeltaTokens  int64   `json:"delta_tokens"`
 	DeltaCostUSD float64 `json:"delta_cost_usd"`
+	// Session is the per-message token accounting for the WHOLE session,
+	// including prompt-cache efficiency. Nil when nothing was recorded.
+	//
+	// Kept in its own object rather than folded in beside delta_tokens
+	// because the two are NOT comparable: delta_tokens is a difference of the
+	// session's last-snapshot counters (which are overwritten each turn, so
+	// the "delta" reflects the final turn's prompt size, not everything the
+	// run consumed), while these figures are real sums over the message rows.
+	// Presenting them as adjacent fields of one flat object would invite
+	// exactly the arithmetic that mixes them.
+	Session *sessionUsageInfo `json:"session,omitempty"`
+}
+
+// sessionUsageInfo is the cache/token breakdown an orchestrator needs to judge
+// prompt-cache efficiency without opening the session database.
+//
+// Token classes are DISJOINT, so PromptTokens is their sum: InputTokens
+// (fresh, full price), CacheReadTokens (served from cache) and
+// CacheCreationTokens (written into it).
+type sessionUsageInfo struct {
+	InputTokens         int64   `json:"input_tokens"`
+	OutputTokens        int64   `json:"output_tokens"`
+	ReasoningTokens     int64   `json:"reasoning_tokens,omitempty"`
+	CacheReadTokens     int64   `json:"cache_read_tokens"`
+	CacheCreationTokens int64   `json:"cache_creation_tokens"`
+	PromptTokens        int64   `json:"prompt_tokens"`
+	TotalTokens         int64   `json:"total_tokens"`
+	CostUSD             float64 `json:"cost_usd"`
+	// CacheHitRatio is null when it cannot be stated: the provider does not
+	// report caching, or there was no prompt. Consumers MUST branch on null
+	// rather than reading 0 — a fabricated zero is indistinguishable from a
+	// genuine cache miss.
+	CacheHitRatio *float64 `json:"cache_hit_ratio"`
+	CacheSupport  string   `json:"cache_support,omitempty"`
+	// MessagesRecorded / MessagesMissingUsage state what the figures were
+	// computed over. Messages written before per-message tracking existed
+	// carry no usage and are EXCLUDED from the sums, not counted as zero, so
+	// a low ratio on a long-lived session may simply mean thin coverage.
+	MessagesRecorded     int64 `json:"messages_recorded"`
+	MessagesMissingUsage int64 `json:"messages_missing_usage"`
+	// Estimated is true when any contributing message's usage was synthesized
+	// from message lengths because the provider sent none.
+	Estimated bool `json:"estimated,omitempty"`
+}
+
+// buildSessionUsageInfo converts a message-layer usage report into the
+// envelope shape. Returns nil when the session has no recorded usage at all,
+// so `usage.session` is absent rather than a misleading all-zero object.
+func buildSessionUsageInfo(report message.UsageReport) *sessionUsageInfo {
+	if len(report.ByModel) == 0 {
+		return nil
+	}
+	total := report.Total()
+	out := &sessionUsageInfo{
+		InputTokens:          total.InputTokens,
+		OutputTokens:         total.OutputTokens,
+		ReasoningTokens:      total.ReasoningTokens,
+		CacheReadTokens:      total.CacheReadTokens,
+		CacheCreationTokens:  total.CacheCreationTokens,
+		PromptTokens:         total.PromptTokens(),
+		TotalTokens:          total.TotalTokens,
+		CostUSD:              total.CostUSD,
+		CacheSupport:         string(total.CacheSupport),
+		MessagesRecorded:     report.Messages(),
+		MessagesMissingUsage: report.MissingUsage,
+		Estimated:            total.Estimated,
+	}
+	if ratio, ok := total.CacheHitRatio(); ok {
+		out.CacheHitRatio = &ratio
+	}
+	return out
 }
 
 // buildRunResult assembles runResult from the bits collected during the
@@ -1427,6 +1498,14 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt 
 				strippedBytes, stripErr, stripErrReason,
 				subOutputs, reductionWarning,
 			)
+			// Per-message token/cache accounting for the session (task
+			// #480). Best-effort: an orchestrator losing statistics must
+			// never turn a successful run into a failed one.
+			if report, uErr := app.Messages.UsageBySession(ctx, sess.ID); uErr != nil {
+				slog.Warn("run: failed to read per-message usage for the JSON envelope", "session", sess.ID, "err", uErr)
+			} else {
+				summary.Usage.Session = buildSessionUsageInfo(report)
+			}
 			// Fork patch: batch 8 — surface orphan partial text.
 			if partial := app.findOrphanPartial(ctx, sess.ID); partial != nil {
 				summary.RecoveredPartial = partial

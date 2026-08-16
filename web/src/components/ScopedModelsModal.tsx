@@ -5,6 +5,7 @@ import { $config, clearSessionModelSlot } from "../store";
 import { ws } from "../ws";
 import { buildProviderGroups, buildModelList, type ModelItem } from "./ModelSelector";
 import type { Session, WSMessage } from "../types";
+import { effortLevelsFor, clampEffort } from "../effort";
 
 // ── Wire types (mirror internal/server/protocol.go) ─────────────────────────
 
@@ -87,6 +88,55 @@ function ModelPicker({
   );
 }
 
+// ── Reasoning-effort picker ──────────────────────────────────────────────────
+
+// Renders nothing at all when the model has no effort knob. That is a
+// correctness requirement, not a cosmetic one: gemini and qwen abort with
+// "Unknown argument: effort" and codex with "unexpected argument '--effort'",
+// so an effort stored against such a model is a broken run waiting to happen.
+// Worse here than in the per-session selector - a bad value written at SYSTEM
+// scope is inherited by every future session in every workspace.
+//
+// Capability rules come from ../effort, shared with ModelSelector, so the two
+// surfaces cannot disagree about which models take an effort.
+function EffortPicker({
+  provider,
+  model,
+  value,
+  onChange,
+  disabled,
+}: {
+  provider: string;
+  model: string;
+  value: string;
+  onChange: (effort: string) => void;
+  disabled?: boolean;
+}) {
+  const levels = effortLevelsFor(provider, model);
+  if (levels === null) return null;
+
+  // Show the level that would actually be used, not a stale one this model
+  // cannot accept (e.g. "medium" carried over from Claude onto a GLM-5 slot,
+  // which only exposes high/max).
+  const current = clampEffort(provider, model, value) ?? levels[0];
+
+  return (
+    <select
+      value={current}
+      disabled={disabled}
+      onChange={(e) => onChange(e.target.value)}
+      title="Reasoning effort"
+      aria-label="Reasoning effort"
+      data-test-id="scoped-effort-picker"
+      className="shrink-0 text-[11px] bg-canvas border border-surface rounded-lg px-1.5 py-1.5 outline-none focus:border-accent/50 text-text-subtle disabled:opacity-40 disabled:cursor-not-allowed"
+    >
+      {levels.map((l) => (
+        <option key={l} value={l}>{l}</option>
+      ))}
+    </select>
+  );
+}
+
 // ── One slot row within the System/Folder blocks ─────────────────────────────
 
 function ScopedSlotRow({
@@ -102,7 +152,7 @@ function ScopedSlotRow({
   models: ModelItem[];
   slotWire: ScopedModelSlotWire | undefined;
   scopeKey: "global" | "workspace";
-  onSet: (provider: string, model: string) => void;
+  onSet: (provider: string, model: string, effort: string) => void;
   onClear: () => void;
   disabled?: boolean;
 }) {
@@ -114,12 +164,30 @@ function ScopedSlotRow({
     <div className="flex items-center gap-2 py-1.5">
       <span className="text-xs text-text-subtle w-28 shrink-0">{label}</span>
       <div className="flex-1 min-w-0">
-        <ModelPicker
-          models={models}
-          value={explicit ? `${explicit.provider}:::${explicit.model}` : ""}
-          onChange={onSet}
-          disabled={disabled}
-        />
+        <div className="flex items-center gap-1.5">
+          <ModelPicker
+            models={models}
+            value={explicit ? `${explicit.provider}:::${explicit.model}` : ""}
+            onChange={(p, m) => {
+              // Clamp on model change and persist the clamp, so a level the
+              // NEW model cannot accept is never left behind. ModelSelector's
+              // equivalent effect bails out when its picker is hidden, which
+              // is how stale efforts survived a model switch; do not repeat
+              // that here.
+              onSet(p, m, clampEffort(p, m, explicit?.reasoning_effort ?? "") ?? "");
+            }}
+            disabled={disabled}
+          />
+          {explicit && (
+            <EffortPicker
+              provider={explicit.provider}
+              model={explicit.model}
+              value={explicit.reasoning_effort ?? ""}
+              onChange={(eff) => onSet(explicit.provider, explicit.model, eff)}
+              disabled={disabled}
+            />
+          )}
+        </div>
         {!explicit && (
           <p className="text-[10px] text-text-muted mt-0.5 truncate">
             {effective
@@ -159,8 +227,10 @@ function SessionSlotRow({
 }) {
   const providerField = `${slot[0].toUpperCase()}${slot.slice(1)}ModelProvider` as keyof Session;
   const idField = `${slot[0].toUpperCase()}${slot.slice(1)}ModelID` as keyof Session;
+  const effortField = `${slot[0].toUpperCase()}${slot.slice(1)}ModelReasoningEffort` as keyof Session;
   const provider = session[providerField] as string;
   const modelID = session[idField] as string;
+  const storedEffort = (session[effortField] as string) ?? "";
   const hasOverride = !!(provider && modelID);
 
   const inherited = scopedModels?.[slot]?.effective;
@@ -170,11 +240,23 @@ function SessionSlotRow({
     <div className="flex items-center gap-2 py-1.5">
       <span className="text-xs text-text-subtle w-28 shrink-0">{label}</span>
       <div className="flex-1 min-w-0">
-        <ModelPicker
-          models={models}
-          value={hasOverride ? `${provider}:::${modelID}` : ""}
-          onChange={(p, m) => setSessionModelSlot(session.ID, slot, p, m)}
-        />
+        <div className="flex items-center gap-1.5">
+          <ModelPicker
+            models={models}
+            value={hasOverride ? `${provider}:::${modelID}` : ""}
+            onChange={(p, m) =>
+              setSessionModelSlot(session.ID, slot, p, m, clampEffort(p, m, storedEffort) ?? "")
+            }
+          />
+          {hasOverride && (
+            <EffortPicker
+              provider={provider}
+              model={modelID}
+              value={storedEffort}
+              onChange={(eff) => setSessionModelSlot(session.ID, slot, provider, modelID, eff)}
+            />
+          )}
+        </div>
         {!hasOverride && (
           <p className="text-[10px] text-text-muted mt-0.5 truncate">
             {inherited
@@ -200,10 +282,10 @@ function SessionSlotRow({
 // reviewer), leaving every other slot untouched — same nil-means-untouched
 // wire convention as clearSessionModelSlot (task #467) and ModelSelector's
 // onSelect (task #461).
-function setSessionModelSlot(sessionID: string, slot: Slot, provider: string, model: string) {
+function setSessionModelSlot(sessionID: string, slot: Slot, provider: string, model: string, effort: string) {
   ws.send("set_session_models", {
     sessionID,
-    [`${slot}Model`]: { provider, model },
+    [`${slot}Model`]: { provider, model, reasoning_effort: effort },
   });
 }
 
@@ -240,8 +322,10 @@ export function ScopedModelsModal({ onClose, activeSession }: { onClose: () => v
     return () => document.removeEventListener("keydown", onKey);
   }, [onClose]);
 
-  function setScoped(scope: "global" | "workspace", slot: Slot, provider: string, model: string) {
-    ws.send("set_scoped_model", { scope, slot, provider, model });
+  // reasoning_effort is sent as "" for models with no effort knob, so the
+  // backend stores nothing rather than a value the CLI would reject.
+  function setScoped(scope: "global" | "workspace", slot: Slot, provider: string, model: string, effort: string) {
+    ws.send("set_scoped_model", { scope, slot, provider, model, reasoning_effort: effort });
   }
   function clearScoped(scope: "global" | "workspace", slot: Slot) {
     ws.send("clear_scoped_model", { scope, slot });
@@ -283,7 +367,7 @@ export function ScopedModelsModal({ onClose, activeSession }: { onClose: () => v
                   models={allModels}
                   slotWire={scopedModels?.[key]}
                   scopeKey="global"
-                  onSet={(p, m) => setScoped("global", key, p, m)}
+                  onSet={(p, m, eff) => setScoped("global", key, p, m, eff)}
                   onClear={() => clearScoped("global", key)}
                 />
               ))}
@@ -305,7 +389,7 @@ export function ScopedModelsModal({ onClose, activeSession }: { onClose: () => v
                   models={allModels}
                   slotWire={scopedModels?.[key]}
                   scopeKey="workspace"
-                  onSet={(p, m) => setScoped("workspace", key, p, m)}
+                  onSet={(p, m, eff) => setScoped("workspace", key, p, m, eff)}
                   onClear={() => clearScoped("workspace", key)}
                   disabled={!!scopedModels && !scopedModels.hasWorkspace}
                 />

@@ -4,7 +4,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkBreaks from "remark-breaks";
 import rehypeHighlight from "rehype-highlight";
-import type { Message as Msg, ContentPart } from "../types";
+import type { Message as Msg, ContentPart, MessageUsage } from "../types";
 import { BrainCircuit, Check, Copy, GitFork, Pencil, RotateCcw, Star, Trash2, BookMarked, ChevronDown, ChevronUp, HelpCircle, X } from "lucide-react";
 import { SubAgentBlock } from "./SubAgentBlock";
 import { ws } from "../ws";
@@ -170,6 +170,53 @@ function useCollapseAllSignal(collapse: () => void) {
 // too — operators routinely run GLM at high vs max and want to tell them apart
 // at a glance. Returns null when effort is unknown so the layout doesn't carry
 // an empty bracket.
+
+// formatTokens renders a token count compactly (12345 -> "12.3k").
+function formatTokens(n: number): string {
+  if (n < 1000) return String(n);
+  if (n < 1_000_000) return `${(n / 1000).toFixed(1)}k`;
+  return `${(n / 1_000_000).toFixed(2)}M`;
+}
+
+// UsageBadge shows this message's own token accounting and cache efficiency.
+//
+// Two rules it must not break, both inherited from the backend's design:
+//   * CacheHitRatio is null when the provider does not report caching. Show
+//     "cache n/a", never "cache 0%" - a fabricated zero is indistinguishable
+//     from a genuine cache miss.
+//   * Estimated usage was derived from message lengths because the provider
+//     sent none. Mark it, so an approximation is not read as a measurement.
+const UsageBadge = memo(function UsageBadge({ usage }: { usage: MessageUsage | undefined }) {
+  if (!usage) return null;
+
+  const cache =
+    usage.CacheHitRatio === null
+      ? "cache n/a"
+      : `cache ${(usage.CacheHitRatio * 100).toFixed(0)}%`;
+
+  const parts = [
+    `Prompt ${usage.PromptTokens.toLocaleString()} = ${usage.InputTokens.toLocaleString()} fresh + ${usage.CacheReadTokens.toLocaleString()} cache-read + ${usage.CacheCreationTokens.toLocaleString()} cache-write`,
+    `Output ${usage.OutputTokens.toLocaleString()}`,
+  ];
+  if (usage.CostUSD > 0) parts.push(`Cost $${usage.CostUSD.toFixed(4)}`);
+  if (usage.CacheHitRatio === null) parts.push("This provider does not report prompt caching.");
+  if (usage.Estimated) parts.push("ESTIMATED: the provider sent no usage; counts were derived from message lengths.");
+  const title = parts.join("\n");
+
+  return (
+    <span
+      className="text-[10px] text-text-muted font-mono flex items-center gap-1"
+      title={title}
+      data-test-id="message-usage-badge"
+    >
+      <span>{`↓${formatTokens(usage.PromptTokens)}`}</span>
+      <span>{`↑${formatTokens(usage.OutputTokens)}`}</span>
+      <span className={usage.CacheHitRatio === null ? "opacity-60" : ""}>{cache}</span>
+      {usage.Estimated && <span title="Estimated, not reported by the provider">~</span>}
+    </span>
+  );
+});
+
 const EffortBadge = memo(function EffortBadge({ effort, extraClass = "" }: { effort: string | undefined; extraClass?: string }) {
   if (!effort) return null;
   const letter = effort === "low" ? "L" : effort === "medium" ? "M" : effort === "high" ? "H" : effort === "xhigh" ? "X" : effort === "max" ? "XX" : "?";
@@ -311,6 +358,7 @@ const AssistantHoverActions = memo(function AssistantHoverActions({
       <div className="flex items-center gap-2 ml-auto">
         <TimeBadge epochSec={message.CreatedAt} />
         <DurationBadge message={message} />
+        <UsageBadge usage={message.Usage} />
         {message.Model && (
           <span className="text-xs text-text-subtle font-mono flex items-center gap-1">
             {message.Model}
