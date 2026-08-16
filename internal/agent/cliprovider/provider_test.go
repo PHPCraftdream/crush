@@ -18,7 +18,25 @@ import (
 	"charm.land/fantasy"
 )
 
+// fastExitHelperEnv turns this test binary into the fast-exiting child process
+// used by TestStreamFastExitNoLastLineLoss. See that test for why the child is
+// the test binary rather than a shell.
+const fastExitHelperEnv = "CRUSH_TEST_FAST_EXIT_FILE"
+
 func TestMain(m *testing.M) {
+	// Child-process mode: dump the fixture and exit before the testing
+	// framework emits anything of its own (no flag parsing, no "PASS" line),
+	// so the parent's scanner sees exactly the bytes of the file.
+	if path := os.Getenv(fastExitHelperEnv); path != "" {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "fast-exit helper:", err)
+			os.Exit(1)
+		}
+		os.Stdout.Write(data)
+		os.Exit(0)
+	}
+
 	// go-pty's Windows ConPTY path has an internal data race that the -race
 	// detector flags. Force pipe mode for the whole cliprovider suite on
 	// Windows so streaming tests stay race-clean; Unix keeps PTY coverage.
@@ -1299,13 +1317,29 @@ func TestStreamWithGeminiParser(t *testing.T) {
 //
 // The fix defers Wait()/Close() to proc.wait(), which is only called after
 // the scanner has drained stdout to natural EOF. This test reproduces the
-// scenario (cat of a 5-line file, fast exit) and asserts every line —
-// especially the last — is received. We run many iterations because the
-// race is timing-dependent; a single green iteration proves nothing.
+// scenario (a child that dumps a 5-line file and exits immediately) and
+// asserts every line — especially the last — is received. We run many
+// iterations because the race is timing-dependent; a single green iteration
+// proves nothing.
+//
+// The child is THIS TEST BINARY re-executed in helper mode (see TestMain and
+// fastExitHelperEnv), not `bash -c "cat ..."`. The original shell version
+// failed on the windows-latest runner with
+//
+//	bash failed: exit status 256
+//	bash.exe: *** fatal error - add_item ("\??\C:\Program Files\Git", "/", ...) failed, errno 1
+//
+// which is Git-for-Windows/MSYS failing to build its mount table while
+// spawning — the child never ran at all. That is noise: the property under
+// test is our reader draining the pipe/PTY to natural EOF, and it has nothing
+// to do with which program is on the other end. Re-executing the test binary
+// removes the POSIX-shell dependency entirely (so the test no longer skips on
+// shell-less machines either) while still being a genuine external process
+// that exits as fast as the OS allows.
 func TestStreamFastExitNoLastLineLoss(t *testing.T) {
-	shell, flag := "bash", "-c"
-	if _, err := exec.LookPath(shell); err != nil {
-		t.Skipf("shell %q not found", shell)
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatalf("locate test binary: %v", err)
 	}
 
 	// 5 lines: 3 text deltas + init + final result (usage). The last line
@@ -1324,13 +1358,16 @@ func TestStreamFastExitNoLastLineLoss(t *testing.T) {
 		t.Fatalf("write temp file: %v", err)
 	}
 
-	readCmd := "cat " + strings.ReplaceAll(tmpFile, "\\", "/")
+	// The child inherits the parent's environment (cmd.Env stays nil), which
+	// is how it learns it should run in helper mode and which file to dump.
+	t.Setenv(fastExitHelperEnv, tmpFile)
+
 	spec := CLISpec{
 		ModelID:        "test-fast-exit",
 		ModelName:      "Test Fast Exit",
-		Binary:         shell,
+		Binary:         self,
 		PromptFlag:     "-p",
-		BuildArgs:      func(bool) []string { return []string{flag, readCmd} },
+		BuildArgs:      func(bool) []string { return nil },
 		NewPartParser:  geminiPartParser,
 		ParseUsageLine: geminiParseUsageLine,
 	}
