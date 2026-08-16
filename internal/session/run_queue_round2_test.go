@@ -374,7 +374,18 @@ func setupTestSession(t *testing.T, title string) (*session.Session, session.Ser
 			pinned INTEGER NOT NULL DEFAULT 0,
 			hidden INTEGER NOT NULL DEFAULT 0,
 			auto_resumed INTEGER NOT NULL DEFAULT 0,
-			background_job_notice INTEGER NOT NULL DEFAULT 0
+			background_job_notice INTEGER NOT NULL DEFAULT 0,
+			input_tokens INTEGER,
+			output_tokens INTEGER,
+			reasoning_tokens INTEGER,
+			cache_creation_tokens INTEGER,
+			cache_read_tokens INTEGER,
+			total_tokens INTEGER,
+			cost_usd REAL,
+			usage_provider TEXT,
+			usage_model TEXT,
+			cache_support TEXT,
+			usage_estimated INTEGER
 		);
 
 		CREATE TABLE files (

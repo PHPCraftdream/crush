@@ -1018,14 +1018,21 @@ func TestCodexParseUsageLine(t *testing.T) {
 	if !ok {
 		t.Fatal("expected usage from turn.completed")
 	}
-	if usage.InputTokens != 8520+6528 {
-		t.Errorf("InputTokens = %d, want %d", usage.InputTokens, 8520+6528)
+	// codex's input_tokens (8520) ALREADY includes cached_input_tokens (6528).
+	// These assertions previously read 8520+6528, which counted the cached
+	// share twice; see codexParseUsageLine for the measurement that settles
+	// the convention.
+	if usage.InputTokens != 8520-6528 {
+		t.Errorf("InputTokens = %d, want %d (total minus cached)", usage.InputTokens, 8520-6528)
+	}
+	if usage.CacheReadTokens != 6528 {
+		t.Errorf("CacheReadTokens = %d, want %d", usage.CacheReadTokens, 6528)
 	}
 	if usage.OutputTokens != 9 {
 		t.Errorf("OutputTokens = %d, want %d", usage.OutputTokens, 9)
 	}
-	if usage.TotalTokens != 8520+6528+9 {
-		t.Errorf("TotalTokens = %d, want %d", usage.TotalTokens, 8520+6528+9)
+	if usage.TotalTokens != 8520+9 {
+		t.Errorf("TotalTokens = %d, want %d", usage.TotalTokens, 8520+9)
 	}
 
 	// non-turn.completed events are skipped
@@ -1063,8 +1070,18 @@ func TestClaudeParseUsageLine(t *testing.T) {
 	if !ok {
 		t.Fatal("expected usage from result event")
 	}
-	if usage.InputTokens != 100+200+300 {
-		t.Errorf("InputTokens = %d, want %d (sum of all input variants)", usage.InputTokens, 100+200+300)
+	// Claude's input_tokens is exclusive of both cache counters, so it is
+	// passed through as-is and the cache split is preserved. This used to
+	// assert the folded sum (100+200+300), which produced the right prompt
+	// total but made a cache-hit statistic impossible to recover.
+	if usage.InputTokens != 100 {
+		t.Errorf("InputTokens = %d, want 100 (claude reports it already exclusive)", usage.InputTokens)
+	}
+	if usage.CacheCreationTokens != 200 {
+		t.Errorf("CacheCreationTokens = %d, want 200", usage.CacheCreationTokens)
+	}
+	if usage.CacheReadTokens != 300 {
+		t.Errorf("CacheReadTokens = %d, want 300", usage.CacheReadTokens)
 	}
 	if usage.OutputTokens != 50 {
 		t.Errorf("OutputTokens = %d, want %d", usage.OutputTokens, 50)
@@ -1184,8 +1201,20 @@ func TestStreamWithCodexParser(t *testing.T) {
 	if text.String() != want {
 		t.Errorf("text = %q, want %q", text.String(), want)
 	}
-	if finalUsage.InputTokens != 150 {
-		t.Errorf("InputTokens = %d, want 150 (100+50)", finalUsage.InputTokens)
+	// This assertion used to read `want 150 (100+50)`, encoding the
+	// double-count bug: codex's input_tokens already CONTAINS
+	// cached_input_tokens (measured against codex 0.147.0 — see
+	// codexParseUsageLine), so summing them counted the cached share twice.
+	// InputTokens is now the uncached remainder, and the cached share is
+	// reported separately instead of being folded away.
+	if finalUsage.InputTokens != 50 {
+		t.Errorf("InputTokens = %d, want 50 (100 total - 50 cached)", finalUsage.InputTokens)
+	}
+	if finalUsage.CacheReadTokens != 50 {
+		t.Errorf("CacheReadTokens = %d, want 50", finalUsage.CacheReadTokens)
+	}
+	if got := finalUsage.InputTokens + finalUsage.CacheReadTokens + finalUsage.CacheCreationTokens; got != 100 {
+		t.Errorf("reconstructed prompt total = %d, want 100 (codex's own input_tokens)", got)
 	}
 	if finalUsage.OutputTokens != 20 {
 		t.Errorf("OutputTokens = %d, want 20", finalUsage.OutputTokens)

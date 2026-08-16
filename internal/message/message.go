@@ -100,6 +100,19 @@ type Service interface {
 	Delete(ctx context.Context, id string) error
 	DeleteSessionMessages(ctx context.Context, sessionID string) error
 	SetPinned(ctx context.Context, id string, pinned bool) error
+	// SetUsage records this message's token accounting and prompt-cache
+	// breakdown (task #469). Called by the agent right after the step's cost
+	// delta is computed; separate from Update because the Finish part is
+	// appended before usage is known.
+	//
+	// Callers should treat a failure as non-fatal: statistics must never
+	// abort a turn.
+	SetUsage(ctx context.Context, id string, usage TokenUsage) error
+	// UsageBySession returns per-model token/cache/cost aggregates for a
+	// session, together with the number of assistant messages that carry no
+	// usage at all, so a caller can state what its numbers were computed
+	// over instead of implying full coverage.
+	UsageBySession(ctx context.Context, sessionID string) (UsageReport, error)
 }
 
 type service struct {

@@ -2856,7 +2856,7 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 			// usage chunk, use upstream's token estimator so our sliding
 			// context window stays accurate. We drop the "estimated" flag
 			// (TUI marker — see CHANGELOG.fork.md Section 2).
-			usage, _ := fallbackStepUsage(stepMessages, stepResult)
+			usage, estimated := fallbackStepUsage(stepMessages, stepResult)
 			costDelta := a.updateSessionUsage(largeModel, &updatedSession, usage, a.openrouterCost(stepResult.ProviderMetadata))
 			if costDelta != 0 {
 				if _, costErr := a.sessions.IncrementCost(ctx, updatedSession.ID, costDelta); costErr != nil {
@@ -2866,6 +2866,16 @@ func (a *sessionAgent) runTurn(ctx context.Context, call SessionAgentCall, lk *s
 			if sessionErr := a.sessions.SetUsage(ctx, updatedSession.ID, updatedSession.PromptTokens, updatedSession.CompletionTokens); sessionErr != nil {
 				return sessionErr
 			}
+			// Per-message breakdown (task #469). The session-level figures
+			// above are a last-snapshot overwrite plus a running cost, which
+			// cannot answer "how well is the cache working" for a message, a
+			// model, or a day. currentAssistant.ID is read under sessionLock
+			// because the checkpoint ticker and peak-hours watcher also touch
+			// currentAssistant (same reason the AddFinish block above locks).
+			sessionLock.Lock()
+			assistantID := currentAssistant.ID
+			sessionLock.Unlock()
+			a.recordMessageUsage(ctx, assistantID, largeModel, usage, costDelta, estimated)
 			currentSession = updatedSession
 
 			// Fork patch: batch 30 — cancel + runaway protection.
@@ -3797,6 +3807,12 @@ func (a *sessionAgent) runSummarizeBody(ctx context.Context, sessionID string, o
 		}
 	}
 
+	// Per-message usage for the summary turn itself (task #469). Recorded
+	// against resp.TotalUsage — the same figure updateSessionUsage just billed
+	// — so the summarization's own token cost is visible in analytics instead
+	// of appearing as an unattributed jump in the session total.
+	a.recordMessageUsage(commitCtx, summaryMessage.ID, largeModel, resp.TotalUsage, costDelta, false)
+
 	usage := resp.Response.Usage
 	if err := a.sessions.SetSummaryAndUsage(commitCtx, freshSession.ID, summaryMessage.ID, 0, summaryCompletionTokens(usage, summaryMessage)); err != nil {
 		// Nothing has been deleted yet, so the session is still whole: the
@@ -3977,6 +3993,10 @@ func (a *sessionAgent) runSummarizeSilent(ctx context.Context, sessionID string,
 			return costErr
 		}
 	}
+	// Per-message usage for the silent-summarise turn (task #469), same
+	// rationale as the manual /compact path above.
+	a.recordMessageUsage(commitCtx, summaryMessage.ID, largeModel, resp.TotalUsage, costDelta, false)
+
 	if err := a.sessions.SetSummaryAndUsage(commitCtx, freshSession.ID, summaryMessage.ID, 0, resp.Response.Usage.OutputTokens); err != nil {
 		// Nothing has been deleted yet, so the session is still whole: the
 		// compaction simply did not happen, and the next turn retries it.
@@ -4537,11 +4557,28 @@ func (a *sessionAgent) updateSessionUsage(model Model, session *session.Session,
 // updateSessionTokenCounters writes a new usage snapshot into the session
 // without overwriting accumulated counters with zero. Fork merge note: from
 // origin/main 74e6e378 "fix(agent): harden fallback usage accounting".
+//
+// PromptTokens must be the FULL prompt: InputTokens, CacheReadTokens and
+// CacheCreationTokens are three disjoint classes (see
+// internal/agent/cliprovider/usage.go), so all three belong in the sum.
+//
+// This used to add only InputTokens + CacheReadTokens, silently dropping
+// cache-WRITE tokens. That understated the prompt for every provider that
+// reports the three separately — the Anthropic HTTP provider always did
+// (fantasy anthropic.go maps input_tokens exclusive of both cache counters),
+// and claude-cli joined it once its parser stopped folding cache into input.
+// A real measured turn had input=5842 / cache_creation=16984 / cache_read=0:
+// the prompt is 22826 tokens but was recorded as 5842, a 74% understatement.
+//
+// PromptTokens drives the auto-summarization trigger (the remaining-context
+// checks against CatwalkCfg.ContextWindow), so understating it delays
+// compaction and risks running the context window over instead of sliding it.
 func updateSessionTokenCounters(session *session.Session, usage fantasy.Usage) {
 	if usage.OutputTokens != 0 {
 		session.CompletionTokens = usage.OutputTokens
 	}
-	if promptTokens := usage.InputTokens + usage.CacheReadTokens; promptTokens != 0 {
+	promptTokens := usage.InputTokens + usage.CacheReadTokens + usage.CacheCreationTokens
+	if promptTokens != 0 {
 		session.PromptTokens = promptTokens
 	}
 }

@@ -270,6 +270,11 @@ type geminiCLIEvent struct {
 		TotalTokens  int64 `json:"total_tokens"`
 		InputTokens  int64 `json:"input_tokens"`
 		OutputTokens int64 `json:"output_tokens"`
+		// Cached is cache-read tokens; Input is the uncached remainder.
+		// InputTokens == Input + Cached (see geminiParseUsageLine). Both
+		// were missing here and silently discarded at unmarshal.
+		Cached int64 `json:"cached"`
+		Input  int64 `json:"input"`
 	} `json:"stats"`
 }
 
@@ -340,10 +345,13 @@ func geminiPartParser() func([]byte) (fantasy.StreamPart, bool) {
 }
 
 // claudeParseUsageLine extracts token usage from a Claude CLI "result" event.
-// Claude emits a final {"type":"result",...,"usage":{...}} line that includes
-// both direct and cached token counts. We sum all input variants so that
-// cached conversations report accurate totals rather than just the tiny
-// non-cached portion.
+//
+// Claude's input_tokens is EXCLUSIVE of both cache counters — verified by
+// running the CLI three times against a fixed prompt: input_tokens held at 10
+// while cache_creation/cache_read shifted between 6203+17298 and 0+23501. The
+// previous implementation summed all three into InputTokens, which produced
+// the right prompt total but destroyed the cache breakdown, making a cache-hit
+// statistic impossible downstream. See usage.go for the shared convention.
 func claudeParseUsageLine(line []byte) (fantasy.Usage, bool) {
 	var ev streamEvent
 	if json.Unmarshal(line, &ev) != nil {
@@ -352,51 +360,59 @@ func claudeParseUsageLine(line []byte) (fantasy.Usage, bool) {
 	if ev.Type != "result" {
 		return fantasy.Usage{}, false
 	}
-	// Total input = direct + cache-creation + cache-read tokens.
-	inputTotal := ev.Usage.InputTokens + ev.Usage.CacheCreationInputTokens + ev.Usage.CacheReadInputTokens
-	if inputTotal == 0 && ev.Usage.OutputTokens == 0 {
+	raw := rawUsage{
+		input:              ev.Usage.InputTokens,
+		output:             ev.Usage.OutputTokens,
+		cacheCreation:      ev.Usage.CacheCreationInputTokens,
+		cacheRead:          ev.Usage.CacheReadInputTokens,
+		inputIncludesCache: false,
+		reportsCache:       true,
+	}
+	if raw.isEmpty() {
 		return fantasy.Usage{}, false
 	}
-	// Log cache statistics for visibility.
-	if inputTotal > 0 {
-		cacheHitPct := float64(0)
-		if inputTotal > 0 {
-			cacheHitPct = float64(ev.Usage.CacheReadInputTokens) / float64(inputTotal) * 100
-		}
-		slog.Info(
-			"cliprovider: token usage",
-			"input", ev.Usage.InputTokens,
-			"cache_create", ev.Usage.CacheCreationInputTokens,
-			"cache_read", ev.Usage.CacheReadInputTokens,
-			"output", ev.Usage.OutputTokens,
-			"cache_hit_pct", fmt.Sprintf("%.1f%%", cacheHitPct),
-		)
-	}
-	return fantasy.Usage{
-		InputTokens:  inputTotal,
-		OutputTokens: ev.Usage.OutputTokens,
-		TotalTokens:  inputTotal + ev.Usage.OutputTokens,
-	}, true
+	u := raw.normalize()
+	logUsage("claude", raw, u)
+	return u, true
 }
 
 // geminiParseUsageLine extracts token usage from the Gemini CLI result event.
 //
-// The Gemini CLI emits a final event:
+// The Gemini CLI emits a final event (verified against gemini 0.55.1):
 //
-//	{"type":"result","status":"success","stats":{"total_tokens":N,"input_tokens":N,"output_tokens":N}}
+//	{"type":"result","status":"success","stats":{
+//	  "total_tokens":12898,"input_tokens":12601,"output_tokens":1,
+//	  "cached":8148,"input":4453,"duration_ms":25076,"tool_calls":0}}
+//
+// input_tokens INCLUDES cached — the event proves it itself by also emitting
+// the exclusive `input`: 4453 + 8148 == 12601. Both `cached` and `input` were
+// previously absent from geminiCLIEvent and therefore dropped at unmarshal,
+// which is why gemini looked like it reported no cache data at all.
 func geminiParseUsageLine(line []byte) (fantasy.Usage, bool) {
 	var ev geminiCLIEvent
 	if json.Unmarshal(line, &ev) != nil {
 		return fantasy.Usage{}, false
 	}
-	if ev.Type != "result" || ev.Stats.TotalTokens == 0 {
+	if ev.Type != "result" {
 		return fantasy.Usage{}, false
 	}
-	return fantasy.Usage{
-		InputTokens:  ev.Stats.InputTokens,
-		OutputTokens: ev.Stats.OutputTokens,
-		TotalTokens:  ev.Stats.TotalTokens,
-	}, true
+	raw := rawUsage{
+		input:              ev.Stats.InputTokens,
+		output:             ev.Stats.OutputTokens,
+		cacheRead:          ev.Stats.Cached,
+		inputIncludesCache: true,
+		reportsCache:       true,
+		// gemini's total_tokens exceeds input_tokens+output_tokens (12898 vs
+		// 12602 on a real run) because it also counts thinking tokens that
+		// the stats block does not itemize. Keep its number.
+		totalOverride: ev.Stats.TotalTokens,
+	}
+	if raw.isEmpty() {
+		return fantasy.Usage{}, false
+	}
+	u := raw.normalize()
+	logUsage("gemini", raw, u)
+	return u, true
 }
 
 // claudeArgs returns a BuildArgs func for a claude CLI model.
@@ -432,11 +448,15 @@ type codexEvent struct {
 		Command          string `json:"command"`           // command_execution: command string
 		AggregatedOutput string `json:"aggregated_output"` // command_execution: combined stdout+stderr
 	} `json:"item"`
-	// turn.completed usage
+	// turn.completed usage. input_tokens is the prompt TOTAL and already
+	// contains cached_input_tokens — see codexParseUsageLine for the
+	// measurement that establishes this.
 	Usage struct {
-		InputTokens       int64 `json:"input_tokens"`
-		CachedInputTokens int64 `json:"cached_input_tokens"`
-		OutputTokens      int64 `json:"output_tokens"`
+		InputTokens           int64 `json:"input_tokens"`
+		CachedInputTokens     int64 `json:"cached_input_tokens"`
+		CacheWriteInputTokens int64 `json:"cache_write_input_tokens"`
+		OutputTokens          int64 `json:"output_tokens"`
+		ReasoningOutputTokens int64 `json:"reasoning_output_tokens"`
 	} `json:"usage"`
 }
 
@@ -458,6 +478,24 @@ func codexPartParser() func([]byte) (fantasy.StreamPart, bool) {
 }
 
 // codexParseUsageLine extracts token usage from a Codex `turn.completed` event.
+//
+// Real event (codex 0.147.0):
+//
+//	{"type":"turn.completed","usage":{"input_tokens":16856,
+//	  "cached_input_tokens":6912,"cache_write_input_tokens":0,
+//	  "output_tokens":5,"reasoning_output_tokens":0}}
+//
+// codex's input_tokens INCLUDES cached_input_tokens, exactly like OpenAI's
+// prompt_tokens. Verified by three consecutive runs of a fixed prompt:
+// input_tokens stayed at 16856 while cached_input_tokens moved 6912 -> 5888.
+// Were it exclusive, it would have risen as the cache share fell.
+//
+// The previous implementation computed `input_tokens + cached_input_tokens`,
+// double-counting every cached token — 23768 instead of 16856 on the sample
+// above, a 41% overstatement of prompt size that inflated session.PromptTokens
+// and pulled auto-summarization forward. cache_write_input_tokens and
+// reasoning_output_tokens were not in codexEvent at all and were dropped at
+// unmarshal.
 func codexParseUsageLine(line []byte) (fantasy.Usage, bool) {
 	var ev codexEvent
 	if json.Unmarshal(line, &ev) != nil {
@@ -466,15 +504,21 @@ func codexParseUsageLine(line []byte) (fantasy.Usage, bool) {
 	if ev.Type != "turn.completed" {
 		return fantasy.Usage{}, false
 	}
-	inputTotal := ev.Usage.InputTokens + ev.Usage.CachedInputTokens
-	if inputTotal == 0 && ev.Usage.OutputTokens == 0 {
+	raw := rawUsage{
+		input:              ev.Usage.InputTokens,
+		output:             ev.Usage.OutputTokens,
+		cacheRead:          ev.Usage.CachedInputTokens,
+		cacheCreation:      ev.Usage.CacheWriteInputTokens,
+		reasoning:          ev.Usage.ReasoningOutputTokens,
+		inputIncludesCache: true,
+		reportsCache:       true,
+	}
+	if raw.isEmpty() {
 		return fantasy.Usage{}, false
 	}
-	return fantasy.Usage{
-		InputTokens:  inputTotal,
-		OutputTokens: ev.Usage.OutputTokens,
-		TotalTokens:  inputTotal + ev.Usage.OutputTokens,
-	}, true
+	u := raw.normalize()
+	logUsage("codex", raw, u)
+	return u, true
 }
 
 // codexMCPTokenEnvVar is the name of the environment variable crush sets on
@@ -573,8 +617,17 @@ var All = []CLISpec{
 	// pinned Opus versions because the operator usually wants a specific
 	// generation (4.6/4.7/4.8 differ meaningfully). Sonnet / Haiku /
 	// Fable use the aliases so each tab auto-tracks the latest.
-	claudeSpec("cli-claude-haiku", "Claude Haiku 4.5 (CLI)", "haiku", 200_000),
-	claudeSpec("cli-claude-sonnet", "Claude Sonnet 4.6 (CLI)", "sonnet", 1_000_000),
+	//
+	// Alias entries deliberately carry NO version number in their display
+	// name: the CLI resolves an alias to whatever it currently considers
+	// that family's default, so a hardcoded version goes stale silently.
+	// Measured 2026-08-16 against claude 2.1.197 (`--output-format json`
+	// reports the resolved id in modelUsage): opus -> claude-opus-4-8,
+	// sonnet -> claude-sonnet-5, haiku -> claude-haiku-4-5-20251001,
+	// fable -> claude-fable-5. The sonnet entry used to be labelled
+	// "Sonnet 4.6" while actually running Sonnet 5.
+	claudeSpec("cli-claude-haiku", "Claude Haiku (CLI, latest)", "haiku", 200_000),
+	claudeSpec("cli-claude-sonnet", "Claude Sonnet (CLI, latest)", "sonnet", 1_000_000),
 	// Opus: alias entry kept so DB rows / atoms (`opus`) referencing the
 	// classic ModelID don't dangle, plus three pinned variants the operator
 	// can pick explicitly.
@@ -582,7 +635,19 @@ var All = []CLISpec{
 	claudeSpec("cli-claude-opus-4-6", "Claude Opus 4.6 (CLI)", "claude-opus-4-6", 1_000_000),
 	claudeSpec("cli-claude-opus-4-7", "Claude Opus 4.7 (CLI)", "claude-opus-4-7", 1_000_000),
 	claudeSpec("cli-claude-opus-4-8", "Claude Opus 4.8 (CLI)", "claude-opus-4-8", 1_000_000),
-	claudeSpec("cli-claude-fable", "Claude Fable 5 (CLI)", "fable", 1_000_000),
+	claudeSpec("cli-claude-fable", "Claude Fable (CLI, latest)", "fable", 1_000_000),
+	// Claude 5 generation, pinned. The `[1m]` suffix is a real
+	// context-window switch the CLI understands, not cosmetic: measured
+	// 2026-08-16, claude-opus-5 reports contextWindow=200_000 while
+	// claude-opus-5[1m] reports 1_000_000. Note no alias reaches Opus 5 —
+	// `opus` still resolves to 4.8 — so these must be explicit.
+	//
+	// ModelID keeps our `cli-claude-*` slug convention and spells the
+	// suffix `-1m` rather than embedding brackets, which would otherwise
+	// end up inside `provider/model` strings in config, atoms and the DB.
+	claudeSpec("cli-claude-opus-5-1m", "Claude Opus 5 1M (CLI)", "claude-opus-5[1m]", 1_000_000),
+	claudeSpec("cli-claude-sonnet-5-1m", "Claude Sonnet 5 1M (CLI)", "claude-sonnet-5[1m]", 1_000_000),
+	claudeSpec("cli-claude-fable-5", "Claude Fable 5 (CLI)", "claude-fable-5", 1_000_000),
 	{
 		ModelID:              "cli-gemini-flash",
 		ModelName:            "Gemini 3 Flash (CLI)",

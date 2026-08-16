@@ -95,6 +95,14 @@ func (m *mockMessageService) SetPinned(ctx context.Context, id string, pinned bo
 	return m.inner.SetPinned(ctx, id, pinned)
 }
 
+func (m *mockMessageService) SetUsage(ctx context.Context, id string, usage message.TokenUsage) error {
+	return m.inner.SetUsage(ctx, id, usage)
+}
+
+func (m *mockMessageService) UsageBySession(ctx context.Context, sessionID string) (message.UsageReport, error) {
+	return m.inner.UsageBySession(ctx, sessionID)
+}
+
 func (m *mockMessageService) Notify(msg message.Message) {
 	m.inner.Notify(msg)
 }

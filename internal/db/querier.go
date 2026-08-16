@@ -30,6 +30,10 @@ type Querier interface {
 	// instead of eventually being dead-lettered.
 	CleanupExpiredLeases(ctx context.Context, arg CleanupExpiredLeasesParams) error
 	CountMessagesBySession(ctx context.Context, sessionID string) (int64, error)
+	// Assistant rows in a session that carry no usage at all. Reported alongside
+	// any aggregate so "12% cache hit" is never presented without saying how many
+	// messages it was computed over.
+	CountMessagesMissingUsage(ctx context.Context, sessionID string) (int64, error)
 	CreateFile(ctx context.Context, arg CreateFileParams) (File, error)
 	CreateMessage(ctx context.Context, arg CreateMessageParams) (Message, error)
 	// pending_injects is the cross-process inject queue for `crush sessions
@@ -284,6 +288,17 @@ type Querier interface {
 	// IncrementSessionCost so a crash between the two cannot leave the parent
 	// charged but the child's accounting lagging (or vice versa).
 	SetParentCostAccounted(ctx context.Context, arg SetParentCostAccountedParams) error
+	// Cache/token/cost aggregate for one session, grouped by the model that
+	// actually produced each message (a session can switch models mid-run, and
+	// averaging their cache behaviour into one number describes neither).
+	//
+	// recorded/estimated are returned so a caller can state its coverage rather
+	// than implying a total was computed over everything: rows written before this
+	// feature existed have NULL usage and are excluded by the WHERE clause.
+	//
+	// Every SUM is wrapped in CAST: without it sqlc infers interface{} for an
+	// aggregate over a nullable column and the generated struct is unusable.
+	SumMessageUsageBySession(ctx context.Context, sessionID string) ([]SumMessageUsageBySessionRow, error)
 	// Mark a leased entry as terminal failure (no retry, even if attempts < max).
 	// Used for ErrCallAlreadyAttempted-type errors where retry would cause duplicates.
 	// Scoped to the current lease owner, same as AckRunQueueEntry.
@@ -296,6 +311,18 @@ type Querier interface {
 	// Returns number of rows affected (0 = skipped because already terminal, 1 = updated).
 	UpdateMessageIfNotTerminal(ctx context.Context, arg UpdateMessageIfNotTerminalParams) (int64, error)
 	UpdateMessagePinned(ctx context.Context, arg UpdateMessagePinnedParams) error
+	// Per-message token usage and prompt-cache accounting (task #469).
+	//
+	// Written by a separate statement rather than folded into UpdateMessage on
+	// purpose: the agent appends the Finish part BEFORE the step's usage is
+	// resolved (internal/agent/agent.go - AddFinish precedes fallbackStepUsage),
+	// so there is no single moment where both are in hand. Keeping usage separate
+	// avoids reordering that finish chain.
+	//
+	// All placeholders are bare `?` in binding order. Do NOT mix bare `?` with
+	// numbered/named args here: SQLite numbers a bare `?` from the highest
+	// explicit index already used, which silently shifts positional binding.
+	UpdateMessageUsage(ctx context.Context, arg UpdateMessageUsageParams) error
 	UpdatePermissionEnabled(ctx context.Context, arg UpdatePermissionEnabledParams) error
 	// Partial update: a NULL arg for a slot's provider/id pair leaves that slot
 	// untouched (COALESCE falls back to the current column value); a non-NULL

@@ -83,9 +83,20 @@ var atomRegistry = map[string]atom{
 	"opus46": {Provider: "local-cli", Model: "cli-claude-opus-4-6", DisplayName: "Claude Opus 4.6", CtxLabel: "1M", Group: "anthropic", GroupNote: "via local `claude` CLI", EffortSource: claudeEffortSource},
 	"opus47": {Provider: "local-cli", Model: "cli-claude-opus-4-7", DisplayName: "Claude Opus 4.7", CtxLabel: "1M", Group: "anthropic", GroupNote: "via local `claude` CLI", EffortSource: claudeEffortSource},
 	"opus48": {Provider: "local-cli", Model: "cli-claude-opus-4-8", DisplayName: "Claude Opus 4.8", CtxLabel: "1M", Group: "anthropic", GroupNote: "via local `claude` CLI", EffortSource: claudeEffortSource},
-	"sonnet": {Provider: "local-cli", Model: "cli-claude-sonnet", DisplayName: "Claude Sonnet 4.6", CtxLabel: "1M", Group: "anthropic", GroupNote: "via local `claude` CLI", EffortSource: claudeEffortSource},
-	"haiku":  {Provider: "local-cli", Model: "cli-claude-haiku", DisplayName: "Claude Haiku 4.5", CtxLabel: "200k", Group: "anthropic", GroupNote: "via local `claude` CLI", EffortSource: claudeEffortSource},
-	"fable":  {Provider: "local-cli", Model: "cli-claude-fable", DisplayName: "Claude Fable 5", CtxLabel: "1M", Group: "anthropic", EffortSource: claudeEffortSource},
+	// `sonnet`/`haiku`/`fable` map to CLI specs that pass a moving alias, so
+	// their DisplayName must not name a version — the CLI decides which one
+	// runs. Measured 2026-08-16 (claude 2.1.197): the `sonnet` alias resolves
+	// to claude-sonnet-5, though this atom used to claim "Claude Sonnet 4.6".
+	// Use the pinned atoms below when a specific generation is required.
+	"sonnet": {Provider: "local-cli", Model: "cli-claude-sonnet", DisplayName: "Claude Sonnet (latest)", CtxLabel: "1M", Group: "anthropic", GroupNote: "via local `claude` CLI", EffortSource: claudeEffortSource},
+	"haiku":  {Provider: "local-cli", Model: "cli-claude-haiku", DisplayName: "Claude Haiku (latest)", CtxLabel: "200k", Group: "anthropic", GroupNote: "via local `claude` CLI", EffortSource: claudeEffortSource},
+	"fable":  {Provider: "local-cli", Model: "cli-claude-fable", DisplayName: "Claude Fable (latest)", CtxLabel: "1M", Group: "anthropic", EffortSource: claudeEffortSource},
+	// Pinned Claude 5 entries. `opus5`/`sonnet5` use the CLI's `[1m]`
+	// context-window form (verified 1M vs 200k for the bare id); no alias
+	// reaches Opus 5 at all, `opus` still resolves to 4.8.
+	"opus5":   {Provider: "local-cli", Model: "cli-claude-opus-5-1m", DisplayName: "Claude Opus 5 (1M)", CtxLabel: "1M", Group: "anthropic", GroupNote: "via local `claude` CLI", EffortSource: claudeEffortSource},
+	"sonnet5": {Provider: "local-cli", Model: "cli-claude-sonnet-5-1m", DisplayName: "Claude Sonnet 5 (1M)", CtxLabel: "1M", Group: "anthropic", GroupNote: "via local `claude` CLI", EffortSource: claudeEffortSource},
+	"fable5":  {Provider: "local-cli", Model: "cli-claude-fable-5", DisplayName: "Claude Fable 5", CtxLabel: "1M", Group: "anthropic", EffortSource: claudeEffortSource},
 	// CtxLabel values below are from docs.z.ai/guides/llm/<model> (fetched
 	// 2026-07-26): every current-generation GLM model (4.6, 4.7, 4.7-flash,
 	// 4.7-flashx, 5, 5-turbo, 5.1) has a 200K context / 128K max-output

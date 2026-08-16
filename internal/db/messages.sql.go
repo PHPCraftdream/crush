@@ -23,6 +23,21 @@ func (q *Queries) CountMessagesBySession(ctx context.Context, sessionID string) 
 	return count, err
 }
 
+const countMessagesMissingUsage = `-- name: CountMessagesMissingUsage :one
+SELECT COUNT(*) FROM messages
+WHERE session_id = ? AND role = 'assistant' AND total_tokens IS NULL
+`
+
+// Assistant rows in a session that carry no usage at all. Reported alongside
+// any aggregate so "12% cache hit" is never presented without saying how many
+// messages it was computed over.
+func (q *Queries) CountMessagesMissingUsage(ctx context.Context, sessionID string) (int64, error) {
+	row := q.queryRow(ctx, q.countMessagesMissingUsageStmt, countMessagesMissingUsage, sessionID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const createMessage = `-- name: CreateMessage :one
 INSERT INTO messages (
     id,
@@ -41,7 +56,7 @@ INSERT INTO messages (
 ) VALUES (
     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'), strftime('%s', 'now')
 )
-RETURNING id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden, reasoning_effort, auto_resumed, background_job_notice
+RETURNING id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden, reasoning_effort, auto_resumed, background_job_notice, input_tokens, output_tokens, reasoning_tokens, cache_creation_tokens, cache_read_tokens, total_tokens, cost_usd, usage_provider, usage_model, cache_support, usage_estimated
 `
 
 type CreateMessageParams struct {
@@ -89,6 +104,17 @@ func (q *Queries) CreateMessage(ctx context.Context, arg CreateMessageParams) (M
 		&i.ReasoningEffort,
 		&i.AutoResumed,
 		&i.BackgroundJobNotice,
+		&i.InputTokens,
+		&i.OutputTokens,
+		&i.ReasoningTokens,
+		&i.CacheCreationTokens,
+		&i.CacheReadTokens,
+		&i.TotalTokens,
+		&i.CostUsd,
+		&i.UsageProvider,
+		&i.UsageModel,
+		&i.CacheSupport,
+		&i.UsageEstimated,
 	)
 	return i, err
 }
@@ -114,7 +140,7 @@ func (q *Queries) DeleteSessionMessages(ctx context.Context, sessionID string) e
 }
 
 const getMessage = `-- name: GetMessage :one
-SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden, reasoning_effort, auto_resumed, background_job_notice
+SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden, reasoning_effort, auto_resumed, background_job_notice, input_tokens, output_tokens, reasoning_tokens, cache_creation_tokens, cache_read_tokens, total_tokens, cost_usd, usage_provider, usage_model, cache_support, usage_estimated
 FROM messages
 WHERE id = ? LIMIT 1
 `
@@ -138,6 +164,17 @@ func (q *Queries) GetMessage(ctx context.Context, id string) (Message, error) {
 		&i.ReasoningEffort,
 		&i.AutoResumed,
 		&i.BackgroundJobNotice,
+		&i.InputTokens,
+		&i.OutputTokens,
+		&i.ReasoningTokens,
+		&i.CacheCreationTokens,
+		&i.CacheReadTokens,
+		&i.TotalTokens,
+		&i.CostUsd,
+		&i.UsageProvider,
+		&i.UsageModel,
+		&i.CacheSupport,
+		&i.UsageEstimated,
 	)
 	return i, err
 }
@@ -205,7 +242,7 @@ func (q *Queries) GetTranscriptWindowCursor(ctx context.Context, arg GetTranscri
 }
 
 const listAllUserMessages = `-- name: ListAllUserMessages :many
-SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden, reasoning_effort, auto_resumed, background_job_notice
+SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden, reasoning_effort, auto_resumed, background_job_notice, input_tokens, output_tokens, reasoning_tokens, cache_creation_tokens, cache_read_tokens, total_tokens, cost_usd, usage_provider, usage_model, cache_support, usage_estimated
 FROM messages
 WHERE role = 'user'
 ORDER BY created_at DESC, rowid DESC
@@ -238,6 +275,17 @@ func (q *Queries) ListAllUserMessages(ctx context.Context) ([]Message, error) {
 			&i.ReasoningEffort,
 			&i.AutoResumed,
 			&i.BackgroundJobNotice,
+			&i.InputTokens,
+			&i.OutputTokens,
+			&i.ReasoningTokens,
+			&i.CacheCreationTokens,
+			&i.CacheReadTokens,
+			&i.TotalTokens,
+			&i.CostUsd,
+			&i.UsageProvider,
+			&i.UsageModel,
+			&i.CacheSupport,
+			&i.UsageEstimated,
 		); err != nil {
 			return nil, err
 		}
@@ -253,7 +301,7 @@ func (q *Queries) ListAllUserMessages(ctx context.Context) ([]Message, error) {
 }
 
 const listMessagesBySession = `-- name: ListMessagesBySession :many
-SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden, reasoning_effort, auto_resumed, background_job_notice
+SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden, reasoning_effort, auto_resumed, background_job_notice, input_tokens, output_tokens, reasoning_tokens, cache_creation_tokens, cache_read_tokens, total_tokens, cost_usd, usage_provider, usage_model, cache_support, usage_estimated
 FROM messages
 WHERE session_id = ?
 ORDER BY created_at ASC, rowid ASC
@@ -292,6 +340,17 @@ func (q *Queries) ListMessagesBySession(ctx context.Context, sessionID string) (
 			&i.ReasoningEffort,
 			&i.AutoResumed,
 			&i.BackgroundJobNotice,
+			&i.InputTokens,
+			&i.OutputTokens,
+			&i.ReasoningTokens,
+			&i.CacheCreationTokens,
+			&i.CacheReadTokens,
+			&i.TotalTokens,
+			&i.CostUsd,
+			&i.UsageProvider,
+			&i.UsageModel,
+			&i.CacheSupport,
+			&i.UsageEstimated,
 		); err != nil {
 			return nil, err
 		}
@@ -308,7 +367,7 @@ func (q *Queries) ListMessagesBySession(ctx context.Context, sessionID string) (
 
 const listMessagesBySessionAtCreatedAt = `-- name: ListMessagesBySessionAtCreatedAt :many
 SELECT
-    messages.id, messages.session_id, messages.role, messages.parts, messages.model, messages.created_at, messages.updated_at, messages.finished_at, messages.provider, messages.is_summary_message, messages.pinned, messages.hidden, messages.reasoning_effort, messages.auto_resumed, messages.background_job_notice,
+    messages.id, messages.session_id, messages.role, messages.parts, messages.model, messages.created_at, messages.updated_at, messages.finished_at, messages.provider, messages.is_summary_message, messages.pinned, messages.hidden, messages.reasoning_effort, messages.auto_resumed, messages.background_job_notice, messages.input_tokens, messages.output_tokens, messages.reasoning_tokens, messages.cache_creation_tokens, messages.cache_read_tokens, messages.total_tokens, messages.cost_usd, messages.usage_provider, messages.usage_model, messages.cache_support, messages.usage_estimated,
     CAST(rowid AS INTEGER) AS row_id
 FROM messages
 WHERE session_id = ?
@@ -359,6 +418,17 @@ func (q *Queries) ListMessagesBySessionAtCreatedAt(ctx context.Context, arg List
 			&i.Message.ReasoningEffort,
 			&i.Message.AutoResumed,
 			&i.Message.BackgroundJobNotice,
+			&i.Message.InputTokens,
+			&i.Message.OutputTokens,
+			&i.Message.ReasoningTokens,
+			&i.Message.CacheCreationTokens,
+			&i.Message.CacheReadTokens,
+			&i.Message.TotalTokens,
+			&i.Message.CostUsd,
+			&i.Message.UsageProvider,
+			&i.Message.UsageModel,
+			&i.Message.CacheSupport,
+			&i.Message.UsageEstimated,
 			&i.RowID,
 		); err != nil {
 			return nil, err
@@ -375,7 +445,7 @@ func (q *Queries) ListMessagesBySessionAtCreatedAt(ctx context.Context, arg List
 }
 
 const listMessagesBySessionOlderThanCreatedAt = `-- name: ListMessagesBySessionOlderThanCreatedAt :many
-SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden, reasoning_effort, auto_resumed, background_job_notice
+SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden, reasoning_effort, auto_resumed, background_job_notice, input_tokens, output_tokens, reasoning_tokens, cache_creation_tokens, cache_read_tokens, total_tokens, cost_usd, usage_provider, usage_model, cache_support, usage_estimated
 FROM messages
 WHERE session_id = ?
   AND created_at < ?
@@ -426,6 +496,17 @@ func (q *Queries) ListMessagesBySessionOlderThanCreatedAt(ctx context.Context, a
 			&i.ReasoningEffort,
 			&i.AutoResumed,
 			&i.BackgroundJobNotice,
+			&i.InputTokens,
+			&i.OutputTokens,
+			&i.ReasoningTokens,
+			&i.CacheCreationTokens,
+			&i.CacheReadTokens,
+			&i.TotalTokens,
+			&i.CostUsd,
+			&i.UsageProvider,
+			&i.UsageModel,
+			&i.CacheSupport,
+			&i.UsageEstimated,
 		); err != nil {
 			return nil, err
 		}
@@ -441,7 +522,7 @@ func (q *Queries) ListMessagesBySessionOlderThanCreatedAt(ctx context.Context, a
 }
 
 const listMessagesBySessionPaginated = `-- name: ListMessagesBySessionPaginated :many
-SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden, reasoning_effort, auto_resumed, background_job_notice
+SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden, reasoning_effort, auto_resumed, background_job_notice, input_tokens, output_tokens, reasoning_tokens, cache_creation_tokens, cache_read_tokens, total_tokens, cost_usd, usage_provider, usage_model, cache_support, usage_estimated
 FROM messages
 WHERE session_id = ?
 ORDER BY created_at DESC, rowid DESC
@@ -496,6 +577,17 @@ func (q *Queries) ListMessagesBySessionPaginated(ctx context.Context, arg ListMe
 			&i.ReasoningEffort,
 			&i.AutoResumed,
 			&i.BackgroundJobNotice,
+			&i.InputTokens,
+			&i.OutputTokens,
+			&i.ReasoningTokens,
+			&i.CacheCreationTokens,
+			&i.CacheReadTokens,
+			&i.TotalTokens,
+			&i.CostUsd,
+			&i.UsageProvider,
+			&i.UsageModel,
+			&i.CacheSupport,
+			&i.UsageEstimated,
 		); err != nil {
 			return nil, err
 		}
@@ -511,7 +603,7 @@ func (q *Queries) ListMessagesBySessionPaginated(ctx context.Context, arg ListMe
 }
 
 const listUserMessagesBySession = `-- name: ListUserMessagesBySession :many
-SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden, reasoning_effort, auto_resumed, background_job_notice
+SELECT id, session_id, role, parts, model, created_at, updated_at, finished_at, provider, is_summary_message, pinned, hidden, reasoning_effort, auto_resumed, background_job_notice, input_tokens, output_tokens, reasoning_tokens, cache_creation_tokens, cache_read_tokens, total_tokens, cost_usd, usage_provider, usage_model, cache_support, usage_estimated
 FROM messages
 WHERE session_id = ? AND role = 'user'
 ORDER BY created_at DESC, rowid DESC
@@ -549,6 +641,97 @@ func (q *Queries) ListUserMessagesBySession(ctx context.Context, sessionID strin
 			&i.ReasoningEffort,
 			&i.AutoResumed,
 			&i.BackgroundJobNotice,
+			&i.InputTokens,
+			&i.OutputTokens,
+			&i.ReasoningTokens,
+			&i.CacheCreationTokens,
+			&i.CacheReadTokens,
+			&i.TotalTokens,
+			&i.CostUsd,
+			&i.UsageProvider,
+			&i.UsageModel,
+			&i.CacheSupport,
+			&i.UsageEstimated,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const sumMessageUsageBySession = `-- name: SumMessageUsageBySession :many
+SELECT
+    COALESCE(usage_provider, '') AS provider,
+    COALESCE(usage_model, '') AS model,
+    COALESCE(cache_support, '') AS cache_support,
+    CAST(COUNT(*) AS INTEGER) AS recorded,
+    CAST(COALESCE(SUM(usage_estimated), 0) AS INTEGER) AS estimated,
+    CAST(COALESCE(SUM(input_tokens), 0) AS INTEGER) AS input_tokens,
+    CAST(COALESCE(SUM(output_tokens), 0) AS INTEGER) AS output_tokens,
+    CAST(COALESCE(SUM(reasoning_tokens), 0) AS INTEGER) AS reasoning_tokens,
+    CAST(COALESCE(SUM(cache_creation_tokens), 0) AS INTEGER) AS cache_creation_tokens,
+    CAST(COALESCE(SUM(cache_read_tokens), 0) AS INTEGER) AS cache_read_tokens,
+    CAST(COALESCE(SUM(total_tokens), 0) AS INTEGER) AS total_tokens,
+    CAST(COALESCE(SUM(cost_usd), 0) AS REAL) AS cost_usd
+FROM messages
+WHERE session_id = ? AND total_tokens IS NOT NULL
+GROUP BY usage_provider, usage_model, cache_support
+`
+
+type SumMessageUsageBySessionRow struct {
+	Provider            string  `json:"provider"`
+	Model               string  `json:"model"`
+	CacheSupport        string  `json:"cache_support"`
+	Recorded            int64   `json:"recorded"`
+	Estimated           int64   `json:"estimated"`
+	InputTokens         int64   `json:"input_tokens"`
+	OutputTokens        int64   `json:"output_tokens"`
+	ReasoningTokens     int64   `json:"reasoning_tokens"`
+	CacheCreationTokens int64   `json:"cache_creation_tokens"`
+	CacheReadTokens     int64   `json:"cache_read_tokens"`
+	TotalTokens         int64   `json:"total_tokens"`
+	CostUsd             float64 `json:"cost_usd"`
+}
+
+// Cache/token/cost aggregate for one session, grouped by the model that
+// actually produced each message (a session can switch models mid-run, and
+// averaging their cache behaviour into one number describes neither).
+//
+// recorded/estimated are returned so a caller can state its coverage rather
+// than implying a total was computed over everything: rows written before this
+// feature existed have NULL usage and are excluded by the WHERE clause.
+//
+// Every SUM is wrapped in CAST: without it sqlc infers interface{} for an
+// aggregate over a nullable column and the generated struct is unusable.
+func (q *Queries) SumMessageUsageBySession(ctx context.Context, sessionID string) ([]SumMessageUsageBySessionRow, error) {
+	rows, err := q.query(ctx, q.sumMessageUsageBySessionStmt, sumMessageUsageBySession, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []SumMessageUsageBySessionRow{}
+	for rows.Next() {
+		var i SumMessageUsageBySessionRow
+		if err := rows.Scan(
+			&i.Provider,
+			&i.Model,
+			&i.CacheSupport,
+			&i.Recorded,
+			&i.Estimated,
+			&i.InputTokens,
+			&i.OutputTokens,
+			&i.ReasoningTokens,
+			&i.CacheCreationTokens,
+			&i.CacheReadTokens,
+			&i.TotalTokens,
+			&i.CostUsd,
 		); err != nil {
 			return nil, err
 		}
@@ -627,5 +810,67 @@ type UpdateMessagePinnedParams struct {
 
 func (q *Queries) UpdateMessagePinned(ctx context.Context, arg UpdateMessagePinnedParams) error {
 	_, err := q.exec(ctx, q.updateMessagePinnedStmt, updateMessagePinned, arg.Pinned, arg.ID)
+	return err
+}
+
+const updateMessageUsage = `-- name: UpdateMessageUsage :exec
+UPDATE messages
+SET
+    input_tokens = ?,
+    output_tokens = ?,
+    reasoning_tokens = ?,
+    cache_creation_tokens = ?,
+    cache_read_tokens = ?,
+    total_tokens = ?,
+    cost_usd = ?,
+    usage_provider = ?,
+    usage_model = ?,
+    cache_support = ?,
+    usage_estimated = ?,
+    updated_at = strftime('%s', 'now')
+WHERE id = ?
+`
+
+type UpdateMessageUsageParams struct {
+	InputTokens         sql.NullInt64   `json:"input_tokens"`
+	OutputTokens        sql.NullInt64   `json:"output_tokens"`
+	ReasoningTokens     sql.NullInt64   `json:"reasoning_tokens"`
+	CacheCreationTokens sql.NullInt64   `json:"cache_creation_tokens"`
+	CacheReadTokens     sql.NullInt64   `json:"cache_read_tokens"`
+	TotalTokens         sql.NullInt64   `json:"total_tokens"`
+	CostUsd             sql.NullFloat64 `json:"cost_usd"`
+	UsageProvider       sql.NullString  `json:"usage_provider"`
+	UsageModel          sql.NullString  `json:"usage_model"`
+	CacheSupport        sql.NullString  `json:"cache_support"`
+	UsageEstimated      sql.NullInt64   `json:"usage_estimated"`
+	ID                  string          `json:"id"`
+}
+
+// Per-message token usage and prompt-cache accounting (task #469).
+//
+// Written by a separate statement rather than folded into UpdateMessage on
+// purpose: the agent appends the Finish part BEFORE the step's usage is
+// resolved (internal/agent/agent.go - AddFinish precedes fallbackStepUsage),
+// so there is no single moment where both are in hand. Keeping usage separate
+// avoids reordering that finish chain.
+//
+// All placeholders are bare `?` in binding order. Do NOT mix bare `?` with
+// numbered/named args here: SQLite numbers a bare `?` from the highest
+// explicit index already used, which silently shifts positional binding.
+func (q *Queries) UpdateMessageUsage(ctx context.Context, arg UpdateMessageUsageParams) error {
+	_, err := q.exec(ctx, q.updateMessageUsageStmt, updateMessageUsage,
+		arg.InputTokens,
+		arg.OutputTokens,
+		arg.ReasoningTokens,
+		arg.CacheCreationTokens,
+		arg.CacheReadTokens,
+		arg.TotalTokens,
+		arg.CostUsd,
+		arg.UsageProvider,
+		arg.UsageModel,
+		arg.CacheSupport,
+		arg.UsageEstimated,
+		arg.ID,
+	)
 	return err
 }

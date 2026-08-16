@@ -204,3 +204,66 @@ FROM messages
 WHERE session_id = ?
   AND created_at = ?
 ORDER BY rowid DESC;
+
+-- name: UpdateMessageUsage :exec
+-- Per-message token usage and prompt-cache accounting (task #469).
+--
+-- Written by a separate statement rather than folded into UpdateMessage on
+-- purpose: the agent appends the Finish part BEFORE the step's usage is
+-- resolved (internal/agent/agent.go - AddFinish precedes fallbackStepUsage),
+-- so there is no single moment where both are in hand. Keeping usage separate
+-- avoids reordering that finish chain.
+--
+-- All placeholders are bare `?` in binding order. Do NOT mix bare `?` with
+-- numbered/named args here: SQLite numbers a bare `?` from the highest
+-- explicit index already used, which silently shifts positional binding.
+UPDATE messages
+SET
+    input_tokens = ?,
+    output_tokens = ?,
+    reasoning_tokens = ?,
+    cache_creation_tokens = ?,
+    cache_read_tokens = ?,
+    total_tokens = ?,
+    cost_usd = ?,
+    usage_provider = ?,
+    usage_model = ?,
+    cache_support = ?,
+    usage_estimated = ?,
+    updated_at = strftime('%s', 'now')
+WHERE id = ?;
+
+-- name: SumMessageUsageBySession :many
+-- Cache/token/cost aggregate for one session, grouped by the model that
+-- actually produced each message (a session can switch models mid-run, and
+-- averaging their cache behaviour into one number describes neither).
+--
+-- recorded/estimated are returned so a caller can state its coverage rather
+-- than implying a total was computed over everything: rows written before this
+-- feature existed have NULL usage and are excluded by the WHERE clause.
+--
+-- Every SUM is wrapped in CAST: without it sqlc infers interface{} for an
+-- aggregate over a nullable column and the generated struct is unusable.
+SELECT
+    COALESCE(usage_provider, '') AS provider,
+    COALESCE(usage_model, '') AS model,
+    COALESCE(cache_support, '') AS cache_support,
+    CAST(COUNT(*) AS INTEGER) AS recorded,
+    CAST(COALESCE(SUM(usage_estimated), 0) AS INTEGER) AS estimated,
+    CAST(COALESCE(SUM(input_tokens), 0) AS INTEGER) AS input_tokens,
+    CAST(COALESCE(SUM(output_tokens), 0) AS INTEGER) AS output_tokens,
+    CAST(COALESCE(SUM(reasoning_tokens), 0) AS INTEGER) AS reasoning_tokens,
+    CAST(COALESCE(SUM(cache_creation_tokens), 0) AS INTEGER) AS cache_creation_tokens,
+    CAST(COALESCE(SUM(cache_read_tokens), 0) AS INTEGER) AS cache_read_tokens,
+    CAST(COALESCE(SUM(total_tokens), 0) AS INTEGER) AS total_tokens,
+    CAST(COALESCE(SUM(cost_usd), 0) AS REAL) AS cost_usd
+FROM messages
+WHERE session_id = ? AND total_tokens IS NOT NULL
+GROUP BY usage_provider, usage_model, cache_support;
+
+-- name: CountMessagesMissingUsage :one
+-- Assistant rows in a session that carry no usage at all. Reported alongside
+-- any aggregate so "12% cache hit" is never presented without saying how many
+-- messages it was computed over.
+SELECT COUNT(*) FROM messages
+WHERE session_id = ? AND role = 'assistant' AND total_tokens IS NULL;

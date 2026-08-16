@@ -33,6 +33,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.countMessagesBySessionStmt, err = db.PrepareContext(ctx, countMessagesBySession); err != nil {
 		return nil, fmt.Errorf("error preparing query CountMessagesBySession: %w", err)
 	}
+	if q.countMessagesMissingUsageStmt, err = db.PrepareContext(ctx, countMessagesMissingUsage); err != nil {
+		return nil, fmt.Errorf("error preparing query CountMessagesMissingUsage: %w", err)
+	}
 	if q.createFileStmt, err = db.PrepareContext(ctx, createFile); err != nil {
 		return nil, fmt.Errorf("error preparing query CreateFile: %w", err)
 	}
@@ -228,6 +231,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.setParentCostAccountedStmt, err = db.PrepareContext(ctx, setParentCostAccounted); err != nil {
 		return nil, fmt.Errorf("error preparing query SetParentCostAccounted: %w", err)
 	}
+	if q.sumMessageUsageBySessionStmt, err = db.PrepareContext(ctx, sumMessageUsageBySession); err != nil {
+		return nil, fmt.Errorf("error preparing query SumMessageUsageBySession: %w", err)
+	}
 	if q.terminalFailRunQueueEntryStmt, err = db.PrepareContext(ctx, terminalFailRunQueueEntry); err != nil {
 		return nil, fmt.Errorf("error preparing query TerminalFailRunQueueEntry: %w", err)
 	}
@@ -239,6 +245,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	}
 	if q.updateMessagePinnedStmt, err = db.PrepareContext(ctx, updateMessagePinned); err != nil {
 		return nil, fmt.Errorf("error preparing query UpdateMessagePinned: %w", err)
+	}
+	if q.updateMessageUsageStmt, err = db.PrepareContext(ctx, updateMessageUsage); err != nil {
+		return nil, fmt.Errorf("error preparing query UpdateMessageUsage: %w", err)
 	}
 	if q.updatePermissionEnabledStmt, err = db.PrepareContext(ctx, updatePermissionEnabled); err != nil {
 		return nil, fmt.Errorf("error preparing query UpdatePermissionEnabled: %w", err)
@@ -279,6 +288,11 @@ func (q *Queries) Close() error {
 	if q.countMessagesBySessionStmt != nil {
 		if cerr := q.countMessagesBySessionStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing countMessagesBySessionStmt: %w", cerr)
+		}
+	}
+	if q.countMessagesMissingUsageStmt != nil {
+		if cerr := q.countMessagesMissingUsageStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing countMessagesMissingUsageStmt: %w", cerr)
 		}
 	}
 	if q.createFileStmt != nil {
@@ -606,6 +620,11 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing setParentCostAccountedStmt: %w", cerr)
 		}
 	}
+	if q.sumMessageUsageBySessionStmt != nil {
+		if cerr := q.sumMessageUsageBySessionStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing sumMessageUsageBySessionStmt: %w", cerr)
+		}
+	}
 	if q.terminalFailRunQueueEntryStmt != nil {
 		if cerr := q.terminalFailRunQueueEntryStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing terminalFailRunQueueEntryStmt: %w", cerr)
@@ -624,6 +643,11 @@ func (q *Queries) Close() error {
 	if q.updateMessagePinnedStmt != nil {
 		if cerr := q.updateMessagePinnedStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing updateMessagePinnedStmt: %w", cerr)
+		}
+	}
+	if q.updateMessageUsageStmt != nil {
+		if cerr := q.updateMessageUsageStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing updateMessageUsageStmt: %w", cerr)
 		}
 	}
 	if q.updatePermissionEnabledStmt != nil {
@@ -703,6 +727,7 @@ type Queries struct {
 	ackRunQueueEntryStmt                           *sql.Stmt
 	cleanupExpiredLeasesStmt                       *sql.Stmt
 	countMessagesBySessionStmt                     *sql.Stmt
+	countMessagesMissingUsageStmt                  *sql.Stmt
 	createFileStmt                                 *sql.Stmt
 	createMessageStmt                              *sql.Stmt
 	createPendingInjectStmt                        *sql.Stmt
@@ -768,10 +793,12 @@ type Queries struct {
 	renameSessionStmt                              *sql.Stmt
 	renewRunQueueLeaseStmt                         *sql.Stmt
 	setParentCostAccountedStmt                     *sql.Stmt
+	sumMessageUsageBySessionStmt                   *sql.Stmt
 	terminalFailRunQueueEntryStmt                  *sql.Stmt
 	updateMessageStmt                              *sql.Stmt
 	updateMessageIfNotTerminalStmt                 *sql.Stmt
 	updateMessagePinnedStmt                        *sql.Stmt
+	updateMessageUsageStmt                         *sql.Stmt
 	updatePermissionEnabledStmt                    *sql.Stmt
 	updateSessionModelsStmt                        *sql.Stmt
 	updateSessionReasoningEffortStmt               *sql.Stmt
@@ -788,6 +815,7 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		ackRunQueueEntryStmt:                           q.ackRunQueueEntryStmt,
 		cleanupExpiredLeasesStmt:                       q.cleanupExpiredLeasesStmt,
 		countMessagesBySessionStmt:                     q.countMessagesBySessionStmt,
+		countMessagesMissingUsageStmt:                  q.countMessagesMissingUsageStmt,
 		createFileStmt:                                 q.createFileStmt,
 		createMessageStmt:                              q.createMessageStmt,
 		createPendingInjectStmt:                        q.createPendingInjectStmt,
@@ -853,10 +881,12 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		renameSessionStmt:                              q.renameSessionStmt,
 		renewRunQueueLeaseStmt:                         q.renewRunQueueLeaseStmt,
 		setParentCostAccountedStmt:                     q.setParentCostAccountedStmt,
+		sumMessageUsageBySessionStmt:                   q.sumMessageUsageBySessionStmt,
 		terminalFailRunQueueEntryStmt:                  q.terminalFailRunQueueEntryStmt,
 		updateMessageStmt:                              q.updateMessageStmt,
 		updateMessageIfNotTerminalStmt:                 q.updateMessageIfNotTerminalStmt,
 		updateMessagePinnedStmt:                        q.updateMessagePinnedStmt,
+		updateMessageUsageStmt:                         q.updateMessageUsageStmt,
 		updatePermissionEnabledStmt:                    q.updatePermissionEnabledStmt,
 		updateSessionModelsStmt:                        q.updateSessionModelsStmt,
 		updateSessionReasoningEffortStmt:               q.updateSessionReasoningEffortStmt,

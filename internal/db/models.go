@@ -19,21 +19,32 @@ type File struct {
 }
 
 type Message struct {
-	ID                  string         `json:"id"`
-	SessionID           string         `json:"session_id"`
-	Role                string         `json:"role"`
-	Parts               string         `json:"parts"`
-	Model               sql.NullString `json:"model"`
-	CreatedAt           int64          `json:"created_at"`
-	UpdatedAt           int64          `json:"updated_at"`
-	FinishedAt          sql.NullInt64  `json:"finished_at"`
-	Provider            sql.NullString `json:"provider"`
-	IsSummaryMessage    int64          `json:"is_summary_message"`
-	Pinned              int64          `json:"pinned"`
-	Hidden              int64          `json:"hidden"`
-	ReasoningEffort     sql.NullString `json:"reasoning_effort"`
-	AutoResumed         int64          `json:"auto_resumed"`
-	BackgroundJobNotice int64          `json:"background_job_notice"`
+	ID                  string          `json:"id"`
+	SessionID           string          `json:"session_id"`
+	Role                string          `json:"role"`
+	Parts               string          `json:"parts"`
+	Model               sql.NullString  `json:"model"`
+	CreatedAt           int64           `json:"created_at"`
+	UpdatedAt           int64           `json:"updated_at"`
+	FinishedAt          sql.NullInt64   `json:"finished_at"`
+	Provider            sql.NullString  `json:"provider"`
+	IsSummaryMessage    int64           `json:"is_summary_message"`
+	Pinned              int64           `json:"pinned"`
+	Hidden              int64           `json:"hidden"`
+	ReasoningEffort     sql.NullString  `json:"reasoning_effort"`
+	AutoResumed         int64           `json:"auto_resumed"`
+	BackgroundJobNotice int64           `json:"background_job_notice"`
+	InputTokens         sql.NullInt64   `json:"input_tokens"`
+	OutputTokens        sql.NullInt64   `json:"output_tokens"`
+	ReasoningTokens     sql.NullInt64   `json:"reasoning_tokens"`
+	CacheCreationTokens sql.NullInt64   `json:"cache_creation_tokens"`
+	CacheReadTokens     sql.NullInt64   `json:"cache_read_tokens"`
+	TotalTokens         sql.NullInt64   `json:"total_tokens"`
+	CostUsd             sql.NullFloat64 `json:"cost_usd"`
+	UsageProvider       sql.NullString  `json:"usage_provider"`
+	UsageModel          sql.NullString  `json:"usage_model"`
+	CacheSupport        sql.NullString  `json:"cache_support"`
+	UsageEstimated      sql.NullInt64   `json:"usage_estimated"`
 }
 
 type OrphanCallOutbox struct {
