@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -26,7 +27,20 @@ By default groups by model. Use --by to change the grouping:
 
 Use --since to filter to sessions updated within the given duration.
 Supports Go durations (30m, 24h), day suffix (7d), or plain integers
-(interpreted as days). Default: show all sessions.`,
+(interpreted as days). Default: show all sessions.
+
+CAVEAT on the TOKENS column: it sums each session's prompt_tokens and
+completion_tokens, and those are LAST-SNAPSHOT values - they are overwritten
+on every turn, while only cost accumulates. So TOKENS reflects each session's
+final turn, not everything it consumed. Grouping is also by the session's
+CURRENT model, so a session that switched models attributes all of it to
+whichever model it ended on.
+
+For accurate per-message token totals, correct per-model attribution and
+prompt-cache statistics, use "crush sessions cache" instead - it reads the
+per-message usage table rather than these session snapshots. The two are
+deliberately NOT merged into one table here: they come from different sources
+and presenting them in adjacent columns would imply they are comparable.`,
 	Example: `
 # Cost grouped by model
 crush sessions cost
@@ -125,10 +139,19 @@ func parseSinceDuration(s string) (time.Duration, error) {
 	return time.ParseDuration(s)
 }
 
+// parsePlainInt accepts ONLY a bare integer, e.g. "7".
+//
+// It used to use fmt.Sscanf(s, "%d", &n), which parses the leading digits and
+// reports no error for the trailing remainder. Since parseSinceDuration tries
+// this branch before time.ParseDuration, every Go duration was silently
+// swallowed as a day count: "2h" became 2 days, "30m" became 30 DAYS, "45s"
+// became 45 days, "1h30m" became 1 day. The help text has advertised
+// "Go durations (30m, 24h)" the whole time, so --since has been off by orders
+// of magnitude for anything but the "7d" and bare-integer forms.
+//
+// strconv.Atoi rejects trailing characters, which is the whole point here.
 func parsePlainInt(s string) (int, error) {
-	var n int
-	_, err := fmt.Sscanf(s, "%d", &n)
-	return n, err
+	return strconv.Atoi(s)
 }
 
 type costRow struct {

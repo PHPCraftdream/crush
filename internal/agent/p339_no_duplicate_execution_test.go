@@ -103,6 +103,14 @@ func (m *mockMessageService) UsageBySession(ctx context.Context, sessionID strin
 	return m.inner.UsageBySession(ctx, sessionID)
 }
 
+func (m *mockMessageService) UsageByModelInRange(ctx context.Context, since, until int64) (message.UsageReport, error) {
+	return m.inner.UsageByModelInRange(ctx, since, until)
+}
+
+func (m *mockMessageService) UsageByDayInRange(ctx context.Context, since, until int64) ([]message.DayUsage, error) {
+	return m.inner.UsageByDayInRange(ctx, since, until)
+}
+
 func (m *mockMessageService) Notify(msg message.Message) {
 	m.inner.Notify(msg)
 }

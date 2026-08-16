@@ -24,6 +24,16 @@ type UsageReport struct {
 	MissingUsage int64
 }
 
+// DayUsage is one calendar day's totals, for the period view.
+type DayUsage struct {
+	// Day is a local-time "YYYY-MM-DD" string, matching the format
+	// `sessions cost --by day` already prints.
+	Day       string
+	Usage     TokenUsage
+	Messages  int64
+	Estimated int64
+}
+
 // ModelUsage is one (provider, model) group's totals.
 type ModelUsage struct {
 	Usage TokenUsage
@@ -101,6 +111,90 @@ func (s *service) SetUsage(ctx context.Context, id string, usage TokenUsage) err
 		return fmt.Errorf("record usage for message %s: %w", id, err)
 	}
 	return nil
+}
+
+// UsageByModelInRange aggregates recorded usage across ALL sessions whose
+// messages fall in [since, until], grouped by the model that produced them.
+//
+// since/until are Unix seconds; pass 0 and math.MaxInt64 for "everything".
+func (s *service) UsageByModelInRange(ctx context.Context, since, until int64) (UsageReport, error) {
+	rows, err := s.qRead.SumMessageUsageByModelInRange(ctx, db.SumMessageUsageByModelInRangeParams{
+		CreatedAt:   since,
+		CreatedAt_2: until,
+	})
+	if err != nil {
+		return UsageReport{}, fmt.Errorf("aggregate usage by model: %w", err)
+	}
+
+	report := UsageReport{ByModel: make([]ModelUsage, 0, len(rows))}
+	for _, r := range rows {
+		report.ByModel = append(report.ByModel, ModelUsage{
+			Messages:  r.Recorded,
+			Estimated: r.Estimated,
+			Usage: TokenUsage{
+				InputTokens:         r.InputTokens,
+				OutputTokens:        r.OutputTokens,
+				ReasoningTokens:     r.ReasoningTokens,
+				CacheCreationTokens: r.CacheCreationTokens,
+				CacheReadTokens:     r.CacheReadTokens,
+				TotalTokens:         r.TotalTokens,
+				CostUSD:             r.CostUsd,
+				Provider:            r.Provider,
+				Model:               r.Model,
+				CacheSupport:        CacheSupport(r.CacheSupport),
+				Estimated:           r.Estimated > 0,
+			},
+		})
+	}
+
+	missing, err := s.qRead.CountMessagesMissingUsageInRange(ctx, db.CountMessagesMissingUsageInRangeParams{
+		CreatedAt:   since,
+		CreatedAt_2: until,
+	})
+	if err != nil {
+		return UsageReport{}, fmt.Errorf("count messages missing usage: %w", err)
+	}
+	report.MissingUsage = missing
+
+	return report, nil
+}
+
+// UsageByDayInRange is UsageByModelInRange bucketed by local calendar day.
+//
+// The per-day rows carry no Provider/Model: a day can span several models, and
+// labelling the bucket with one of them would be a lie. CacheSupport is left
+// unset for the same reason, which makes CacheHitRatio decline to answer —
+// deliberately, since a day's blended cache ratio across providers with
+// different cache visibility is not a meaningful number. Use the by-model
+// view when the ratio is what matters.
+func (s *service) UsageByDayInRange(ctx context.Context, since, until int64) ([]DayUsage, error) {
+	rows, err := s.qRead.SumMessageUsageByDayInRange(ctx, db.SumMessageUsageByDayInRangeParams{
+		CreatedAt:   since,
+		CreatedAt_2: until,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("aggregate usage by day: %w", err)
+	}
+
+	out := make([]DayUsage, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, DayUsage{
+			Day:       r.Day,
+			Messages:  r.Recorded,
+			Estimated: r.Estimated,
+			Usage: TokenUsage{
+				InputTokens:         r.InputTokens,
+				OutputTokens:        r.OutputTokens,
+				ReasoningTokens:     r.ReasoningTokens,
+				CacheCreationTokens: r.CacheCreationTokens,
+				CacheReadTokens:     r.CacheReadTokens,
+				TotalTokens:         r.TotalTokens,
+				CostUSD:             r.CostUsd,
+				Estimated:           r.Estimated > 0,
+			},
+		})
+	}
+	return out, nil
 }
 
 func (s *service) UsageBySession(ctx context.Context, sessionID string) (UsageReport, error) {

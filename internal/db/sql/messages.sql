@@ -267,3 +267,70 @@ GROUP BY usage_provider, usage_model, cache_support;
 -- messages it was computed over.
 SELECT COUNT(*) FROM messages
 WHERE session_id = ? AND role = 'assistant' AND total_tokens IS NULL;
+
+-- name: SumMessageUsageByModelInRange :many
+-- Per-model token/cache/cost totals across ALL sessions in a time window.
+--
+-- Grouped by the model that actually PRODUCED each message, not by the
+-- session's current model. `sessions cost` groups by sessions.large_model_id,
+-- so a session that switched models attributes every token to whichever model
+-- it happened to end on; this does not.
+--
+-- Child (sub-agent) sessions are deliberately INCLUDED and this does NOT
+-- double-count. TransferChildCostToParent moves a child's cost into the
+-- PARENT'S sessions.cost column and never touches message rows, so each
+-- message's cost_usd is counted exactly once here. (`sessions cost` must
+-- exclude child sessions for precisely the opposite reason.)
+--
+-- Every SUM is wrapped in CAST or sqlc infers interface{} for an aggregate
+-- over a nullable column and the generated struct is unusable.
+SELECT
+    COALESCE(usage_provider, '') AS provider,
+    COALESCE(usage_model, '') AS model,
+    COALESCE(cache_support, '') AS cache_support,
+    CAST(COUNT(*) AS INTEGER) AS recorded,
+    CAST(COALESCE(SUM(usage_estimated), 0) AS INTEGER) AS estimated,
+    CAST(COALESCE(SUM(input_tokens), 0) AS INTEGER) AS input_tokens,
+    CAST(COALESCE(SUM(output_tokens), 0) AS INTEGER) AS output_tokens,
+    CAST(COALESCE(SUM(reasoning_tokens), 0) AS INTEGER) AS reasoning_tokens,
+    CAST(COALESCE(SUM(cache_creation_tokens), 0) AS INTEGER) AS cache_creation_tokens,
+    CAST(COALESCE(SUM(cache_read_tokens), 0) AS INTEGER) AS cache_read_tokens,
+    CAST(COALESCE(SUM(total_tokens), 0) AS INTEGER) AS total_tokens,
+    CAST(COALESCE(SUM(cost_usd), 0) AS REAL) AS cost_usd
+FROM messages
+WHERE total_tokens IS NOT NULL
+  AND created_at >= ?
+  AND created_at <= ?
+GROUP BY usage_provider, usage_model, cache_support;
+
+-- name: SumMessageUsageByDayInRange :many
+-- Same window and semantics as SumMessageUsageByModelInRange, bucketed by
+-- local calendar day so it lines up with `sessions cost --by day`, which
+-- formats with time.Unix(...).Format("2006-01-02") in local time.
+SELECT
+    CAST(strftime('%Y-%m-%d', created_at, 'unixepoch', 'localtime') AS TEXT) AS day,
+    CAST(COUNT(*) AS INTEGER) AS recorded,
+    CAST(COALESCE(SUM(usage_estimated), 0) AS INTEGER) AS estimated,
+    CAST(COALESCE(SUM(input_tokens), 0) AS INTEGER) AS input_tokens,
+    CAST(COALESCE(SUM(output_tokens), 0) AS INTEGER) AS output_tokens,
+    CAST(COALESCE(SUM(reasoning_tokens), 0) AS INTEGER) AS reasoning_tokens,
+    CAST(COALESCE(SUM(cache_creation_tokens), 0) AS INTEGER) AS cache_creation_tokens,
+    CAST(COALESCE(SUM(cache_read_tokens), 0) AS INTEGER) AS cache_read_tokens,
+    CAST(COALESCE(SUM(total_tokens), 0) AS INTEGER) AS total_tokens,
+    CAST(COALESCE(SUM(cost_usd), 0) AS REAL) AS cost_usd
+FROM messages
+WHERE total_tokens IS NOT NULL
+  AND created_at >= ?
+  AND created_at <= ?
+GROUP BY day
+ORDER BY day;
+
+-- name: CountMessagesMissingUsageInRange :one
+-- Assistant messages in the window with no usage recorded. Reported next to
+-- any aggregate so a ratio is never presented as the period's when it was
+-- computed over a fraction of it.
+SELECT CAST(COUNT(*) AS INTEGER) FROM messages
+WHERE role = 'assistant'
+  AND total_tokens IS NULL
+  AND created_at >= ?
+  AND created_at <= ?;

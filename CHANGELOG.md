@@ -10,6 +10,28 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **Per-message token & prompt-cache statistics** — every assistant
+  message now records its own token accounting, split into three
+  disjoint classes (fresh input / served from cache / written to cache)
+  plus reasoning tokens, cost, and the model that actually produced it.
+  New `crush sessions cache` reports it per session, per model or per
+  day, with `--since` to bound the period and `--json` for machines.
+  Grouping is by the *producing* model, so a session that switched
+  models mid-conversation is attributed correctly — something `sessions
+  cost` cannot do, as it groups by the session's current model.
+  The output declines to state numbers it cannot back up: the hit rate
+  prints `n/a` rather than `0%` for providers that don't report caching
+  (a fabricated zero is indistinguishable from a real miss), every
+  table states its coverage when some messages have no usage recorded,
+  and the per-day view omits the hit rate entirely because a day can
+  span providers whose cache visibility differs.
+- **Reasoning effort is now dispatched per CLI**, and validated against
+  what each model actually accepts — codex's own registry stops
+  `gpt-5.5` at `xhigh` while `gpt-5.6-sol` accepts `ultra`.
+- **Claude 5 CLI models** — `claude-opus-5[1m]`, `claude-sonnet-5[1m]`
+  and pinned `claude-fable-5`, with matching `opus5` / `sonnet5` /
+  `fable5` short codes. The `[1m]` suffix is a real context-window
+  switch: `claude-opus-5` reports 200k, `claude-opus-5[1m]` reports 1M.
 - **Default-models modal (System / Folder / Session)** — the web UI's
   header now has a "Default models" button opening a modal with three
   blocks, one per level of the model cascade (system → folder →
@@ -26,6 +48,34 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **Reasoning effort no longer breaks non-Claude CLI runs.** The
+  session's stored effort was appended as `--effort <level>` to
+  whatever CLI was launched, but only `claude` has that flag: codex
+  aborts with `unexpected argument '--effort'`, gemini and qwen with
+  `Unknown argument: effort`. That is 9 of the 19 registered CLI model
+  specs. Because the effort is a persisted session column, the live
+  path was "set an effort on a Claude model, switch that session to
+  codex/gemini/qwen, every turn dies". Effort is now dispatched per
+  CLI, and a level the target model doesn't accept is dropped (falling
+  back to the model's own default) rather than forwarded into a
+  provider error.
+- **Codex no longer double-counts cached prompt tokens.** Its
+  `input_tokens` already includes `cached_input_tokens`, but the two
+  were summed — a measured turn reported 23 768 prompt tokens where the
+  real total was 16 856, a 41% overstatement that inflated the session's
+  token counter and pulled auto-summarization forward.
+- **Gemini's cache statistics are no longer discarded.** The CLI emits
+  `cached` and an exclusive `input` alongside `input_tokens`, but
+  neither field was declared in the parser struct, so both were dropped
+  at unmarshal and gemini appeared not to support caching at all.
+- **Prompt-token accounting no longer omits cache-write tokens.** The
+  session's prompt counter summed only fresh input plus cache reads,
+  ignoring tokens written *into* the cache. Since the three classes are
+  disjoint this understated the prompt for every provider reporting
+  them separately: a measured turn recorded 5 842 tokens where the real
+  prompt was 22 826, a 74% understatement — and in the dangerous
+  direction, since the counter drives auto-summarization and
+  understating it delays compaction until the context window overruns.
 - **Switching a session's model no longer changes the system-wide
   default.** Picking a model in the chat toolbar (or, more subtly, just
   sending a message) used to call the same code path as `crush models

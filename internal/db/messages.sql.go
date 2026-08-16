@@ -38,6 +38,29 @@ func (q *Queries) CountMessagesMissingUsage(ctx context.Context, sessionID strin
 	return count, err
 }
 
+const countMessagesMissingUsageInRange = `-- name: CountMessagesMissingUsageInRange :one
+SELECT CAST(COUNT(*) AS INTEGER) FROM messages
+WHERE role = 'assistant'
+  AND total_tokens IS NULL
+  AND created_at >= ?
+  AND created_at <= ?
+`
+
+type CountMessagesMissingUsageInRangeParams struct {
+	CreatedAt   int64 `json:"created_at"`
+	CreatedAt_2 int64 `json:"created_at_2"`
+}
+
+// Assistant messages in the window with no usage recorded. Reported next to
+// any aggregate so a ratio is never presented as the period's when it was
+// computed over a fraction of it.
+func (q *Queries) CountMessagesMissingUsageInRange(ctx context.Context, arg CountMessagesMissingUsageInRangeParams) (int64, error) {
+	row := q.queryRow(ctx, q.countMessagesMissingUsageInRangeStmt, countMessagesMissingUsageInRange, arg.CreatedAt, arg.CreatedAt_2)
+	var column_1 int64
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
 const createMessage = `-- name: CreateMessage :one
 INSERT INTO messages (
     id,
@@ -652,6 +675,173 @@ func (q *Queries) ListUserMessagesBySession(ctx context.Context, sessionID strin
 			&i.UsageModel,
 			&i.CacheSupport,
 			&i.UsageEstimated,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const sumMessageUsageByDayInRange = `-- name: SumMessageUsageByDayInRange :many
+SELECT
+    CAST(strftime('%Y-%m-%d', created_at, 'unixepoch', 'localtime') AS TEXT) AS day,
+    CAST(COUNT(*) AS INTEGER) AS recorded,
+    CAST(COALESCE(SUM(usage_estimated), 0) AS INTEGER) AS estimated,
+    CAST(COALESCE(SUM(input_tokens), 0) AS INTEGER) AS input_tokens,
+    CAST(COALESCE(SUM(output_tokens), 0) AS INTEGER) AS output_tokens,
+    CAST(COALESCE(SUM(reasoning_tokens), 0) AS INTEGER) AS reasoning_tokens,
+    CAST(COALESCE(SUM(cache_creation_tokens), 0) AS INTEGER) AS cache_creation_tokens,
+    CAST(COALESCE(SUM(cache_read_tokens), 0) AS INTEGER) AS cache_read_tokens,
+    CAST(COALESCE(SUM(total_tokens), 0) AS INTEGER) AS total_tokens,
+    CAST(COALESCE(SUM(cost_usd), 0) AS REAL) AS cost_usd
+FROM messages
+WHERE total_tokens IS NOT NULL
+  AND created_at >= ?
+  AND created_at <= ?
+GROUP BY day
+ORDER BY day
+`
+
+type SumMessageUsageByDayInRangeParams struct {
+	CreatedAt   int64 `json:"created_at"`
+	CreatedAt_2 int64 `json:"created_at_2"`
+}
+
+type SumMessageUsageByDayInRangeRow struct {
+	Day                 string  `json:"day"`
+	Recorded            int64   `json:"recorded"`
+	Estimated           int64   `json:"estimated"`
+	InputTokens         int64   `json:"input_tokens"`
+	OutputTokens        int64   `json:"output_tokens"`
+	ReasoningTokens     int64   `json:"reasoning_tokens"`
+	CacheCreationTokens int64   `json:"cache_creation_tokens"`
+	CacheReadTokens     int64   `json:"cache_read_tokens"`
+	TotalTokens         int64   `json:"total_tokens"`
+	CostUsd             float64 `json:"cost_usd"`
+}
+
+// Same window and semantics as SumMessageUsageByModelInRange, bucketed by
+// local calendar day so it lines up with `sessions cost --by day`, which
+// formats with time.Unix(...).Format("2006-01-02") in local time.
+func (q *Queries) SumMessageUsageByDayInRange(ctx context.Context, arg SumMessageUsageByDayInRangeParams) ([]SumMessageUsageByDayInRangeRow, error) {
+	rows, err := q.query(ctx, q.sumMessageUsageByDayInRangeStmt, sumMessageUsageByDayInRange, arg.CreatedAt, arg.CreatedAt_2)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []SumMessageUsageByDayInRangeRow{}
+	for rows.Next() {
+		var i SumMessageUsageByDayInRangeRow
+		if err := rows.Scan(
+			&i.Day,
+			&i.Recorded,
+			&i.Estimated,
+			&i.InputTokens,
+			&i.OutputTokens,
+			&i.ReasoningTokens,
+			&i.CacheCreationTokens,
+			&i.CacheReadTokens,
+			&i.TotalTokens,
+			&i.CostUsd,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const sumMessageUsageByModelInRange = `-- name: SumMessageUsageByModelInRange :many
+SELECT
+    COALESCE(usage_provider, '') AS provider,
+    COALESCE(usage_model, '') AS model,
+    COALESCE(cache_support, '') AS cache_support,
+    CAST(COUNT(*) AS INTEGER) AS recorded,
+    CAST(COALESCE(SUM(usage_estimated), 0) AS INTEGER) AS estimated,
+    CAST(COALESCE(SUM(input_tokens), 0) AS INTEGER) AS input_tokens,
+    CAST(COALESCE(SUM(output_tokens), 0) AS INTEGER) AS output_tokens,
+    CAST(COALESCE(SUM(reasoning_tokens), 0) AS INTEGER) AS reasoning_tokens,
+    CAST(COALESCE(SUM(cache_creation_tokens), 0) AS INTEGER) AS cache_creation_tokens,
+    CAST(COALESCE(SUM(cache_read_tokens), 0) AS INTEGER) AS cache_read_tokens,
+    CAST(COALESCE(SUM(total_tokens), 0) AS INTEGER) AS total_tokens,
+    CAST(COALESCE(SUM(cost_usd), 0) AS REAL) AS cost_usd
+FROM messages
+WHERE total_tokens IS NOT NULL
+  AND created_at >= ?
+  AND created_at <= ?
+GROUP BY usage_provider, usage_model, cache_support
+`
+
+type SumMessageUsageByModelInRangeParams struct {
+	CreatedAt   int64 `json:"created_at"`
+	CreatedAt_2 int64 `json:"created_at_2"`
+}
+
+type SumMessageUsageByModelInRangeRow struct {
+	Provider            string  `json:"provider"`
+	Model               string  `json:"model"`
+	CacheSupport        string  `json:"cache_support"`
+	Recorded            int64   `json:"recorded"`
+	Estimated           int64   `json:"estimated"`
+	InputTokens         int64   `json:"input_tokens"`
+	OutputTokens        int64   `json:"output_tokens"`
+	ReasoningTokens     int64   `json:"reasoning_tokens"`
+	CacheCreationTokens int64   `json:"cache_creation_tokens"`
+	CacheReadTokens     int64   `json:"cache_read_tokens"`
+	TotalTokens         int64   `json:"total_tokens"`
+	CostUsd             float64 `json:"cost_usd"`
+}
+
+// Per-model token/cache/cost totals across ALL sessions in a time window.
+//
+// Grouped by the model that actually PRODUCED each message, not by the
+// session's current model. `sessions cost` groups by sessions.large_model_id,
+// so a session that switched models attributes every token to whichever model
+// it happened to end on; this does not.
+//
+// Child (sub-agent) sessions are deliberately INCLUDED and this does NOT
+// double-count. TransferChildCostToParent moves a child's cost into the
+// PARENT'S sessions.cost column and never touches message rows, so each
+// message's cost_usd is counted exactly once here. (`sessions cost` must
+// exclude child sessions for precisely the opposite reason.)
+//
+// Every SUM is wrapped in CAST or sqlc infers interface{} for an aggregate
+// over a nullable column and the generated struct is unusable.
+func (q *Queries) SumMessageUsageByModelInRange(ctx context.Context, arg SumMessageUsageByModelInRangeParams) ([]SumMessageUsageByModelInRangeRow, error) {
+	rows, err := q.query(ctx, q.sumMessageUsageByModelInRangeStmt, sumMessageUsageByModelInRange, arg.CreatedAt, arg.CreatedAt_2)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []SumMessageUsageByModelInRangeRow{}
+	for rows.Next() {
+		var i SumMessageUsageByModelInRangeRow
+		if err := rows.Scan(
+			&i.Provider,
+			&i.Model,
+			&i.CacheSupport,
+			&i.Recorded,
+			&i.Estimated,
+			&i.InputTokens,
+			&i.OutputTokens,
+			&i.ReasoningTokens,
+			&i.CacheCreationTokens,
+			&i.CacheReadTokens,
+			&i.TotalTokens,
+			&i.CostUsd,
 		); err != nil {
 			return nil, err
 		}

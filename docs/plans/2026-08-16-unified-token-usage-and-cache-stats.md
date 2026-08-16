@@ -1,6 +1,7 @@
 # Unified per-message token usage & cache statistics
 
-Status: **plan / not started**
+Status: **CLI feature complete (stats, periods, help, docs); web UI display and
+run-envelope surfacing still open**
 Date: 2026-08-16
 Scope: `zai` (HTTP, via fantasy) + `claude-cli` / `codex-cli` / `gemini-cli`
 (local CLI, via `internal/agent/cliprovider`)
@@ -365,32 +366,54 @@ parent's message row.
 
 ## 3. Task breakdown
 
-| # | Task | Notes |
+| # | Task | Status |
 |---|---|---|
-| 1 | `message.TokenUsage` + `CacheSupport` + helpers + unit tests | pure type, no deps |
-| 2 | Capture one real `result` / `turn.completed` / gemini `result` line per CLI; assert the inclusive-vs-exclusive assumption | **gate for #3** — do not implement #3 on assumption |
-| 3 | `cliprovider/usage.go` normalizer; port all 3 parsers; `UsageCacheSupport` on `CLISpec`; golden-file tests | the double-count trap lives here |
-| 4 | DB migration + `UpdateMessageUsage` + `message.Service.SetUsage` + `Message.Usage` + `fromDBItem`/`ListAll` mapping | mirror the `UpdateSessionModels` sqlc pattern |
-| 5 | `usage_normalize.go` + wire into `agent.go` (main turn + 2 summarization paths) | non-fatal writes |
-| 6 | Sub-agent attribution test | child tokens stay in child session |
-| 7 | `MessageWire.Usage` + `web/src/types.ts` + message-component rendering | honour `cache n/a` |
-| 8 | `sessions cost` cache columns + new `sessions cache` subcommand | real SQL aggregation |
-| 9 | `crush run --json` envelope `usage` object | orchestrator-facing |
-| 10 | CHANGELOG + README + this plan marked done | |
+| 1 | `message.TokenUsage` + `CacheSupport` + helpers + tests | **DONE** |
+| 2 | Capture a real usage line per CLI and settle the inclusive-vs-exclusive question | **DONE** - see section 1.2; all three measured by running the binaries repeatedly against a fixed prompt |
+| 3 | `cliprovider/usage.go` normalizer; all 3 parsers ported; golden tests on captured lines | **DONE** |
+| 4 | DB migration + `UpdateMessageUsage` + `SetUsage` + aggregate queries | **DONE** |
+| 5 | Wire into `agent.go` (main turn + both summarization paths) | **DONE** |
+| 6 | Sub-agent attribution test (child tokens stay in the child session) | **OPEN** |
+| 7 | `MessageWire.Usage` + `web/src/types.ts` + per-message display | **OPEN** |
+| 8 | `sessions cache` command, incl. `--since` / `--by model|day` across sessions | **DONE** |
+| 8b | `sessions cost` cache columns | **DONE (as a documented pointer, not merged columns)** - `sessions cost` reads session-level last-snapshot counters while the cache view reads per-message rows. Putting both in one table would imply they are comparable, so its help now states the caveat and directs to `sessions cache` instead. |
+| 9 | `usage` object in the `crush run --json` envelope | **OPEN** |
+| 10 | CHANGELOG + README + command help | **DONE** |
 
-Verification bar (same as the model-cascade round): every behavioural fix gets
-a revert-check — reintroduce the old fold, confirm the new test fails, restore,
-confirm the diff is byte-identical.
+### Bugs found and fixed while implementing
 
----
+Three, none of which were in the original plan as *existing* defects:
+
+1. **codex double-counted cached tokens.** Its `input_tokens` already contains
+   `cached_input_tokens`; the parser summed them. A captured turn reported
+   23768 where the true prompt was 16856 - a 41% overstatement that inflated
+   `session.PromptTokens` and pulled auto-summarization forward.
+2. **gemini's cache data was discarded at unmarshal.** `geminiCLIEvent` never
+   declared the `cached`/`input` fields the CLI actually emits, which is why
+   the first draft of this document wrongly recorded gemini as reporting no
+   cache at all.
+3. **`PromptTokens` omitted cache-WRITE tokens.** `updateSessionTokenCounters`
+   summed `InputTokens + CacheReadTokens` only. Because the three classes are
+   disjoint, this understated the prompt for every provider reporting them
+   separately - the Anthropic HTTP provider always did, and claude-cli joined
+   it the moment its own fold was removed. A measured turn (input 5842,
+   cache_creation 16984) recorded 5842 instead of 22826: a 74% understatement,
+   and in the dangerous direction, since it delays compaction and risks
+   overrunning the context window rather than merely wasting a summarize.
+
+Item 3 was introduced *by this work* and caught only because the operator
+asked "is the bug fixed?", prompting an end-to-end recheck rather than a
+re-read of the diff. Worth remembering as an argument for tracing the whole
+path after a convention change, not just the code that was edited.
 
 ## 4. Explicit non-goals / honest gaps
 
-- **gemini-cli will report `cache_support: none`.** The Gemini CLI's
-  `--output-format stream-json` result event carries only
-  `total_tokens / input_tokens / output_tokens`
-  (`cliprovider/provider.go:263-274`). We will not fabricate a cache
-  statistic for it, and the UI must show "n/a" rather than "0%".
+- ~~**gemini-cli will report `cache_support: none`**~~ - **retracted.** That
+  claim was read off our own struct, not the CLI. gemini does report `cached`
+  and an exclusive `input`; it is now classified `native` like the rest. The
+  `CacheSupportNone` path is retained anyway, because an older CLI build or a
+  future provider can still be silent, and a fabricated 0% must never stand in
+  for "unknown".
 - **codex-cli reports cache reads only.** Its `turn.completed` usage has
   `cached_input_tokens` but no cache-creation counter
   (`provider.go:436-441`), so `CacheCreationTokens` stays 0 for codex — which

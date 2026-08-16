@@ -113,6 +113,12 @@ type Service interface {
 	// usage at all, so a caller can state what its numbers were computed
 	// over instead of implying full coverage.
 	UsageBySession(ctx context.Context, sessionID string) (UsageReport, error)
+	// UsageByModelInRange aggregates usage across ALL sessions in a time
+	// window (Unix seconds), grouped by the model that produced each message
+	// rather than by the session's current model.
+	UsageByModelInRange(ctx context.Context, since, until int64) (UsageReport, error)
+	// UsageByDayInRange is the same window bucketed by local calendar day.
+	UsageByDayInRange(ctx context.Context, since, until int64) ([]DayUsage, error)
 }
 
 type service struct {

@@ -13,12 +13,17 @@ import {
   clearSessionModelSlot,
 } from "../store";
 import type { ConfigPayload, Session } from "../types";
+import {
+  EFFORT_LEVELS,
+  EFFORT_LEVELS_ZAI,
+  isZAIReasoningModel,
+  isCLIClaudeModel,
+} from "../effort";
 
 // Effort levels in cycle order: left arrow decrements, right arrow increments
-// Five effort tiers — same names the Claude CLI accepts on `--effort`
-// (and what `defaultEffortLevels` in internal/cmd/models_effort.go ships).
-// Labels mirror our short-code convention: oh / ox / oxx → high / xhigh / max.
-const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
+// Effort tiers and the model-capability rules now live in ../effort so the
+// Default-models modal cannot drift from this selector. Labels mirror our
+// short-code convention: oh / ox / oxx -> high / xhigh / max.
 const EFFORT_LABELS: Record<string, string> = {
   low: "L",
   medium: "M",
@@ -27,26 +32,6 @@ const EFFORT_LABELS: Record<string, string> = {
   max: "XX",
 };
 
-// z.ai GLM-5.x only exposes High / Max natively (see docs.z.ai/devpack/
-// latest-model and the MarkTechPost launch coverage). The chevron selector
-// cycles through just these two; the backend mirrors them onto the
-// provider's reasoning_effort field.
-const EFFORT_LEVELS_ZAI = ["high", "max"] as const;
-
-// Returns true for any GLM-5.x model regardless of which provider key
-// it lives under — users sometimes wire z.ai via a custom OpenAI-compat
-// provider (id "z-ai" / "zhipu" / etc.), so matching the model id is
-// the robust signal. The "[1m]" suffix variant (glm-5.2[1m]) is also
-// covered. Older GLM-4.x families fall through to the binary thinking
-// on/off in the coordinator and don't get the selector.
-function isZAIReasoningModel(_provider: string, model: string): boolean {
-  return /^glm-5(\.|-|\[|$)/i.test(model);
-}
-
-// Returns true if the model is a CLI Claude model (supports reasoning_effort)
-function isCLIClaudeModel(provider: string, model: string): boolean {
-  return provider === "local-cli" && (model.startsWith("cli-claude-") || model.startsWith("cli-npx-claude-"));
-}
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 

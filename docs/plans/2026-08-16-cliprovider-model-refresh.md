@@ -1,6 +1,7 @@
 # CLI-provider model refresh + reasoning-effort correctness
 
-Status: **research done / implementation not started**
+Status: **Claude additions shipped (commit d9a394f6); codex/gemini refresh and
+the effort-dispatch fix still open**
 Date: 2026-08-16
 Scope: `internal/agent/cliprovider/provider.go`, `internal/cmd/models_atoms.go`,
 `internal/cmd/ping.go`
@@ -26,7 +27,7 @@ Installed versions: `claude` 2.1.197, `codex-cli` 0.147.0, `gemini` 0.55.1,
 
 ---
 
-## 0. P1 BUG FOUND: `--effort` is injected into CLIs that reject it
+## 0. P1 BUG: `--effort` is injected into CLIs that reject it
 
 `cliprovider/provider.go:943-957` applies the session's reasoning effort by
 appending `--effort <level>` to **whatever** CLI is being launched:
@@ -38,30 +39,91 @@ if effort, ok := ctx.Value(ReasoningEffortContextKey).(string); ok && effort != 
 }
 ```
 
-Only `claude` has that flag. Verified by running the real binaries:
+Only `claude` has that flag.
+
+### Blast radius: 3 of 4 CLI families, 9 of 19 specs
+
+An earlier revision of this document scoped the bug to codex. That was too
+narrow. Verified by running each real binary:
 
 ```
 $ codex exec --effort high --help
 error: unexpected argument '--effort' found
+
+$ gemini --skip-trust --effort high -m gemini-3.5-flash -p "hi"
+Unknown argument: effort
+
+$ qwen --effort high -p "hi"
+Unknown argument: effort
 ```
 
-`codex` takes reasoning effort as `-c model_reasoning_effort=<level>`
-(confirmed: `model_reasoning_effort = "low"` appears in its config schema).
-`gemini` and `qwen` have no effort flag at all.
+Every non-claude spec in `All` breaks the moment a session carries an effort:
+gemini (2 specs), qwen (1), codex (6) - 9 of the 19 currently registered.
+Only the 10 claude specs are safe. Note qwen is easy to miss: it reuses
+`claudePartParser`/`claudeParseUsageLine` and so *looks* Claude-shaped, but it
+is a different binary with a different flag set.
 
-**Reachability.** `agent.go:1916` sets the context value unconditionally from
-`currentSession.LargeModelReasoningEffort` for every session, with no
-per-provider guard. `LargeModelReasoningEffort` is a persisted session column,
-so the realistic path is: operator sets an effort while the session is on a
-Claude model → switches the same session to a codex model → every subsequent
-turn dies instantly with an unknown-flag error. `ping.go:293-294` has the same
-shape.
+### Codex does support effort - via a different mechanism
 
-**Fix**: effort application must become a per-spec concern —
-`CLISpec.ApplyEffort func(args []string, effort string) []string` (nil = this
-CLI has no effort knob, silently ignore), replacing the hardcoded `--effort`
-splice. Claude keeps the flag form; codex gets
-`-c model_reasoning_effort=<level>`; gemini/qwen get nil.
+`codex` takes it as `-c model_reasoning_effort=<level>`. Confirmed working end
+to end (`turn.completed`) for both `high` and `ultra`.
+
+An invalid value is rejected by the API, which helpfully enumerates the set:
+
+```
+[ReasoningEffortParam] [reasoning.effort] [invalid_enum_value]
+Invalid value: 'bogus'. Supported values are:
+'none', 'minimal', 'low', 'medium', 'high', 'xhigh', and 'max'.
+```
+
+Note `ultra` is absent from that API list yet succeeds through the CLI, and
+codex's embedded registry lists `ultra` only for `gpt-5.6-sol`/`-terra` - so
+the CLI is translating it client-side. Treat the **registry** as the source of
+truth for which levels a given codex model accepts.
+
+### Why the fix needs TWO pieces, not one
+
+Levels are per-MODEL, not per-CLI (from the embedded registry, section 1):
+
+| model | accepted efforts |
+|---|---|
+| `gpt-5.6-sol`, `gpt-5.6-terra` | low, medium, high, xhigh, max, ultra |
+| `gpt-5.6-luna` | low, medium, high, xhigh, max |
+| `gpt-5.5`, `gpt-5.4`, `gpt-5.2` | low, medium, high, xhigh |
+| claude family | low, medium, high, xhigh, max |
+
+So merely switching codex to the correct `-c` form is NOT sufficient: a
+session carrying `max` from a Claude model would then reach `gpt-5.5` in a
+*valid-looking* flag and fail with a 400 at the API instead of at argv parse.
+The fix therefore needs both:
+
+- `CLISpec.ApplyEffort func(args []string, effort string) []string` - HOW this
+  CLI receives an effort. nil means "no effort knob"; gemini/qwen get nil.
+- `CLISpec.EffortLevels []string` - WHICH values this model accepts. An effort
+  outside the set is skipped and logged rather than passed through.
+
+### Reachability
+
+`agent.go:1916` sets the context value unconditionally from
+`currentSession.LargeModelReasoningEffort`, with no per-provider guard;
+`ping.go:293-294` has the same shape.
+
+The web UI *does* gate the effort picker
+(`ModelSelector.tsx: showEffortPicker = isCLIClaudeModel || isZAIReasoningModel`),
+so an effort cannot be dialled onto a codex/gemini/qwen model directly. But it
+does NOT clear a stored effort when the session moves to a model without one -
+the clamping `useEffect` bails out first:
+
+```ts
+if (!session || !showEffortPicker) return;
+```
+
+`LargeModelReasoningEffort` is a persisted session column, so the live path is:
+set an effort on a Claude model, switch that same session to codex/gemini/qwen,
+and every subsequent turn dies. Clearing the stale value is a genuine part of
+the fix (see task #473's note - the same trap must not be rebuilt in the
+Default-models modal, where a bad value written at *global* scope would be
+inherited by every future session).
 
 This is independent of, and more urgent than, the model-list refresh below.
 
@@ -216,92 +278,47 @@ per CLI model from the spec rather than only from `atomRegistry`.
 
 ## 5. Implementation order
 
-1. **§0 effort-dispatch fix** (`CLISpec.ApplyEffort`) — standalone bug, ship
-   first, with a test per CLI asserting the produced argv.
-2. Correct codex `ContextWindow` 400 000 → 272 000 on existing entries.
-3. Refresh the spec list: add `gpt-5.6-sol/terra/luna`, `gpt-5.5`,
-   `claude-sonnet-5`, `claude-mythos-5`, `gemini-3.5-flash`,
-   `gemini-3.1-flash-lite`; retire the four codex slugs missing from the
-   registry.
-4. Fix the stale `cli-claude-sonnet` / `cli-claude-opus` display names.
-5. Add `ultra` to the effort vocabulary, gated to models that declare it.
-6. Matching atoms in `models_atoms.go` for anything the operator wants a short
-   code for.
-7. **Ping every added model** (`crush ping --model local-cli/<id>[@effort]`)
-   and record the result table here. Retire anything that fails.
+| # | Work | Status |
+|---|---|---|
+| 1 | **Effort dispatch fix** (section 0): `CLISpec.ApplyEffort` + `CLISpec.EffortLevels`, plus clearing a stale session effort when the model has no effort knob. Test asserting the produced argv per CLI family. | **open - task #471, do first** |
+| 2 | Correct codex `ContextWindow` 400 000 -> 272 000 on existing entries | open - task #470 |
+| 3 | Add `gpt-5.6-sol` / `-terra` / `-luna`, `gpt-5.5` (all ping OK) | open - task #470 |
+| 4 | Decide retire-vs-alias for the four codex slugs missing from the registry | open - task #470 |
+| 5 | Add `gemini-3.5-flash`, `gemini-3.1-flash-lite` (both ping OK); relabel `cli-gemini-flash`, which silently runs 3.5 | open - task #470 |
+| 6 | Claude 5 pinned entries + stale alias labels | **DONE - commit d9a394f6** |
+| 7 | Matching atoms for anything needing a short code | partly done (opus5/sonnet5/fable5 added) |
+| 8 | Web UI effort control in the Default-models modal | open - tasks #472 -> #473 |
 
-## 5a. Ping matrix — measured, not assumed (2026-08-16)
+Item 1 gates items 3 and 5 in practice: adding more non-claude models widens
+the blast radius of the effort bug before it is fixed.
 
-Every row below was executed against the real CLI on this machine.
-
-### Claude (`claude` 2.1.197) — all OK
-
-| argument passed | resolves to | ctx | max out |
-|---|---|---|---|
-| `claude-opus-5` | `claude-opus-5` | 200 000 | 32 000 |
-| `claude-opus-5[1m]` | `claude-opus-5[1m]` | **1 000 000** | 32 000 |
-| `claude-sonnet-5` | `claude-sonnet-5` | 1 000 000 | 64 000 |
-| `claude-mythos-5` | `claude-mythos-5` | 1 000 000 | 64 000 |
-| `claude-opus-4-8` | `claude-opus-4-8` | 1 000 000 | 64 000 |
-| `claude-fable-5` | `claude-fable-5` | 1 000 000 | 64 000 |
-| alias `opus` | `claude-opus-4-8` | 1 000 000 | 64 000 |
-| alias `sonnet` | **`claude-sonnet-5`** | 1 000 000 | 64 000 |
-| alias `haiku` | `claude-haiku-4-5-20251001` | 200 000 | 32 000 |
-| alias `fable` | `claude-fable-5` | 1 000 000 | 64 000 |
-| alias `fable[1m]` | `claude-fable-5` (no change) | 1 000 000 | 64 000 |
-
-**Stale-label bug now proven, not inferred**: our `cli-claude-sonnet` passes
-the alias `sonnet` and is displayed as *"Claude Sonnet 4.6 (CLI)"*, but the
-alias actually resolves to **Sonnet 5**. The UI has been naming the wrong
-model.
-
-Note `opus` resolves to 4.8, **not** to Opus 5 — so Opus 5 is unreachable
-through any alias and needs its own explicit spec entries (both the 200k and
-the `[1m]` form).
-
-### Codex (`codex-cli` 0.147.0)
-
-Invocation needs `--skip-git-repo-check` outside a trusted repo.
-
-| model | result |
-|---|---|
-| `gpt-5.6-sol` | OK (`turn.completed`) |
-| `gpt-5.6-terra` | OK |
-| `gpt-5.6-luna` | OK |
-| `gpt-5.5` | OK |
-| `gpt-5.3-codex` | **`Model metadata for 'gpt-5.3-codex' not found. Defaulting to fallback metadata; this can degrade performance`** |
-| `gpt-5.1-codex-max` | same error |
-
-Confirms the registry: our four legacy codex slugs are unsupported. They do
-not hard-fail — they silently run on fallback metadata with degraded
-performance, which is arguably worse than failing.
-
-### Gemini (`gemini` 0.55.1)
-
-Needs `--skip-trust`; the JSON body is preceded by a Windows-10 warning line
-that must be stripped before parsing.
-
-| model | result |
-|---|---|
-| `gemini-3.5-flash` | OK |
-| `gemini-3.1-flash-lite` | OK |
-| `gemini-3-flash` | OK, but **the response reports the model as `gemini-3.5-flash`** — it is now a redirect |
-| `gemini-3.1-pro-preview` | inconclusive — `You exceeded your current quota` (account limit, not a model-existence failure); retest later |
-
-Because `gemini-3-flash` silently redirects, our `cli-gemini-flash` entry is
-already running 3.5 while advertising 3.
-
-**Bonus finding (feeds task #469):** gemini's result event carries
-`"cached": 8148` and `"input": 4453` alongside `"input_tokens": 12601` —
-cache data we currently discard. See the cache-stats plan.
+Verification bar: each behavioural fix gets a revert-check (reintroduce the
+bug, confirm the new test fails, restore, confirm the diff is unchanged), and
+every new model is pinged before being added - `crush ping --model
+local-cli/<id>[@effort]`, or the CLI directly.
 
 ## 6. Open questions
 
 - Retire the four dead codex entries outright, or keep them as hidden aliases
-  so existing DB rows / atoms referencing them do not dangle? (The claude spec
-  list already uses the "keep the alias entry so old rows don't dangle"
-  pattern — worth mirroring.)
-- Expose `gemini-2.5-pro` / `gemini-3-pro-preview` / the Gemma entries at all,
-  or keep the gemini list to the two newest?
-- `claude-mythos-5`: expose as its own spec, and does it need different
-  effort levels than the rest of the Claude family?
+  so existing DB rows / atoms referencing them do not dangle? They do not
+  hard-fail today - they warn `Model metadata not found. Defaulting to
+  fallback metadata; this can degrade performance` and run anyway, which is
+  arguably worse than failing. The claude spec list already uses the
+  "keep the alias so old rows don't dangle" pattern, worth mirroring.
+- Expose `gemini-2.5-pro` / the Gemma entries at all, or keep the gemini list
+  to the newest two?
+- `claude-mythos-5` is confirmed working (ping OK, 1M ctx) but is not yet
+  exposed as a spec. Add it, and does it want different effort levels than the
+  rest of the Claude family?
+- Once #471 lands and codex accepts an effort, should the Default-models modal
+  and `ModelSelector` offer it for codex models? That needs the per-model level
+  sets from the registry to reach the frontend rather than being hardcoded a
+  third time (see task #472).
+
+## 7. Resolved since the first draft
+
+- ~~"there is no `claude-opus-5`"~~ - **wrong**, retracted in section 2. It
+  exists (200k; `[1m]` form gives 1M). Absence from a binary's string table is
+  not evidence of absence when the CLI forwards unknown model ids to the API.
+- ~~"`gpt-5.6-pro`"~~ - **does not exist**, was a regex artifact (section 1).
+- ~~"the bug is codex-only"~~ - it is codex + gemini + qwen (section 0).

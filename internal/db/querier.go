@@ -34,6 +34,10 @@ type Querier interface {
 	// any aggregate so "12% cache hit" is never presented without saying how many
 	// messages it was computed over.
 	CountMessagesMissingUsage(ctx context.Context, sessionID string) (int64, error)
+	// Assistant messages in the window with no usage recorded. Reported next to
+	// any aggregate so a ratio is never presented as the period's when it was
+	// computed over a fraction of it.
+	CountMessagesMissingUsageInRange(ctx context.Context, arg CountMessagesMissingUsageInRangeParams) (int64, error)
 	CreateFile(ctx context.Context, arg CreateFileParams) (File, error)
 	CreateMessage(ctx context.Context, arg CreateMessageParams) (Message, error)
 	// pending_injects is the cross-process inject queue for `crush sessions
@@ -288,6 +292,26 @@ type Querier interface {
 	// IncrementSessionCost so a crash between the two cannot leave the parent
 	// charged but the child's accounting lagging (or vice versa).
 	SetParentCostAccounted(ctx context.Context, arg SetParentCostAccountedParams) error
+	// Same window and semantics as SumMessageUsageByModelInRange, bucketed by
+	// local calendar day so it lines up with `sessions cost --by day`, which
+	// formats with time.Unix(...).Format("2006-01-02") in local time.
+	SumMessageUsageByDayInRange(ctx context.Context, arg SumMessageUsageByDayInRangeParams) ([]SumMessageUsageByDayInRangeRow, error)
+	// Per-model token/cache/cost totals across ALL sessions in a time window.
+	//
+	// Grouped by the model that actually PRODUCED each message, not by the
+	// session's current model. `sessions cost` groups by sessions.large_model_id,
+	// so a session that switched models attributes every token to whichever model
+	// it happened to end on; this does not.
+	//
+	// Child (sub-agent) sessions are deliberately INCLUDED and this does NOT
+	// double-count. TransferChildCostToParent moves a child's cost into the
+	// PARENT'S sessions.cost column and never touches message rows, so each
+	// message's cost_usd is counted exactly once here. (`sessions cost` must
+	// exclude child sessions for precisely the opposite reason.)
+	//
+	// Every SUM is wrapped in CAST or sqlc infers interface{} for an aggregate
+	// over a nullable column and the generated struct is unusable.
+	SumMessageUsageByModelInRange(ctx context.Context, arg SumMessageUsageByModelInRangeParams) ([]SumMessageUsageByModelInRangeRow, error)
 	// Cache/token/cost aggregate for one session, grouped by the model that
 	// actually produced each message (a session can switch models mid-run, and
 	// averaging their cache behaviour into one number describes neither).

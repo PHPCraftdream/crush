@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -172,8 +173,12 @@ func parseDurationDays(s string) (time.Duration, error) {
 	}
 	if strings.HasSuffix(s, "d") {
 		days := strings.TrimSuffix(s, "d")
-		var d int
-		if _, err := fmt.Sscanf(days, "%d", &d); err != nil {
+		// strconv.Atoi, not fmt.Sscanf: Sscanf parses the leading digits and
+		// reports no error for the remainder, so "7dd" trimmed to "7d" parsed
+		// as 7 and was silently accepted as a week. Same partial-parse class
+		// as the --since bug fixed in parsePlainInt.
+		d, err := strconv.Atoi(days)
+		if err != nil {
 			return 0, fmt.Errorf("invalid duration %q: %w", s, err)
 		}
 		return time.Duration(d) * 24 * time.Hour, nil

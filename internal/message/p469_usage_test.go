@@ -1,6 +1,7 @@
 package message
 
 import (
+	"math"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -289,4 +290,235 @@ func TestSetUsage_StoresMeasuredZeroCacheAsRecorded(t *testing.T) {
 	ratio, ok := report.ByModel[0].Usage.CacheHitRatio()
 	require.True(t, ok, "a measured zero IS answerable — unlike an unsupported provider")
 	require.Zero(t, ratio)
+}
+
+// ── Period / cross-session aggregation (task #474) ───────────────────────────
+
+// TestUsageByModelInRange_GroupsByProducingModelAcrossSessions is the property
+// `sessions cost` cannot provide: it groups by sessions.large_model_id, so a
+// session that switched models attributes every token to whichever model it
+// ended on. Per-message provenance fixes that.
+func TestUsageByModelInRange_GroupsByProducingModelAcrossSessions(t *testing.T) {
+	_, q := newTestMessageDB(t)
+	svc := NewService(q)
+	ctx := t.Context()
+
+	write := func(sessionID, model string, in, cacheRead int64, cost float64) {
+		m, err := svc.Create(ctx, sessionID, CreateMessageParams{
+			Role: Assistant, Parts: []ContentPart{TextContent{Text: "x"}},
+		})
+		require.NoError(t, err)
+		require.NoError(t, svc.SetUsage(ctx, m.ID, TokenUsage{
+			InputTokens: in, CacheReadTokens: cacheRead, TotalTokens: in + cacheRead,
+			CostUSD: cost, Provider: "local-cli", Model: model, CacheSupport: CacheSupportNative,
+		}))
+	}
+
+	// One session that switched models mid-conversation, plus a second
+	// session on one of the same models.
+	write("sess-a", "model-x", 10, 90, 0.1)
+	write("sess-a", "model-y", 20, 80, 0.2)
+	write("sess-b", "model-x", 30, 70, 0.3)
+
+	report, err := svc.UsageByModelInRange(ctx, 0, math.MaxInt64)
+	require.NoError(t, err)
+	require.Len(t, report.ByModel, 2)
+
+	got := map[string]ModelUsage{}
+	for _, m := range report.ByModel {
+		got[m.Usage.Model] = m
+	}
+
+	// model-x spans TWO sessions and must be summed across them.
+	require.Equal(t, int64(2), got["model-x"].Messages)
+	require.Equal(t, int64(40), got["model-x"].Usage.InputTokens)
+	require.Equal(t, int64(160), got["model-x"].Usage.CacheReadTokens)
+	require.InDelta(t, 0.4, got["model-x"].Usage.CostUSD, 1e-9)
+
+	// model-y stays its own row even though it shares a session with model-x.
+	require.Equal(t, int64(1), got["model-y"].Messages)
+	require.Equal(t, int64(20), got["model-y"].Usage.InputTokens)
+}
+
+// TestUsageByModelInRange_ChildSessionCostIsNotDoubleCounted pins the reason
+// child sessions are deliberately INCLUDED here while `sessions cost` must
+// exclude them: TransferChildCostToParent moves a child's cost into the
+// PARENT'S sessions.cost column and never rewrites message rows, so each
+// message's cost_usd appears exactly once in this aggregate.
+func TestUsageByModelInRange_ChildSessionCostIsNotDoubleCounted(t *testing.T) {
+	_, q := newTestMessageDB(t)
+	svc := NewService(q)
+	ctx := t.Context()
+
+	for _, sessionID := range []string{"parent", "child"} {
+		m, err := svc.Create(ctx, sessionID, CreateMessageParams{
+			Role: Assistant, Parts: []ContentPart{TextContent{Text: "x"}},
+		})
+		require.NoError(t, err)
+		require.NoError(t, svc.SetUsage(ctx, m.ID, TokenUsage{
+			InputTokens: 100, TotalTokens: 100, CostUSD: 1.0,
+			Provider: "zai", Model: "glm-5.3", CacheSupport: CacheSupportNative,
+		}))
+	}
+
+	report, err := svc.UsageByModelInRange(ctx, 0, math.MaxInt64)
+	require.NoError(t, err)
+	require.InDelta(t, 2.0, report.Total().CostUSD, 1e-9,
+		"parent + child each contribute their own message cost exactly once")
+}
+
+// TestUsageByModelInRange_WindowExcludesOutsideMessages proves the period
+// filter actually filters — without this the "over a period" feature could
+// silently report all-time numbers.
+func TestUsageByModelInRange_WindowExcludesOutsideMessages(t *testing.T) {
+	sqlDB, q := newTestMessageDB(t)
+	svc := NewService(q)
+	ctx := t.Context()
+
+	m, err := svc.Create(ctx, "sess", CreateMessageParams{
+		Role: Assistant, Parts: []ContentPart{TextContent{Text: "x"}},
+	})
+	require.NoError(t, err)
+	require.NoError(t, svc.SetUsage(ctx, m.ID, TokenUsage{
+		InputTokens: 500, TotalTokens: 500, Provider: "zai", Model: "glm-5.3",
+		CacheSupport: CacheSupportNative,
+	}))
+
+	// Backdate the row well outside any window we then query.
+	_, err = sqlDB.ExecContext(ctx, `UPDATE messages SET created_at = 1000 WHERE id = ?`, m.ID)
+	require.NoError(t, err)
+
+	inside, err := svc.UsageByModelInRange(ctx, 0, 2000)
+	require.NoError(t, err)
+	require.Len(t, inside.ByModel, 1, "the row is inside [0,2000]")
+
+	outside, err := svc.UsageByModelInRange(ctx, 5000, math.MaxInt64)
+	require.NoError(t, err)
+	require.Empty(t, outside.ByModel, "the row is outside [5000,inf) and must not be counted")
+}
+
+// TestUsageByDayInRange_BucketsAndDeclinesToBlendCacheRatios covers the day
+// view. A day can span several providers with different cache visibility, so
+// the bucket carries no provider/model identity and must NOT offer a ratio.
+func TestUsageByDayInRange_BucketsAndDeclinesToBlendCacheRatios(t *testing.T) {
+	_, q := newTestMessageDB(t)
+	svc := NewService(q)
+	ctx := t.Context()
+
+	for range 3 {
+		m, err := svc.Create(ctx, "sess", CreateMessageParams{
+			Role: Assistant, Parts: []ContentPart{TextContent{Text: "x"}},
+		})
+		require.NoError(t, err)
+		require.NoError(t, svc.SetUsage(ctx, m.ID, TokenUsage{
+			InputTokens: 10, CacheReadTokens: 90, TotalTokens: 100, CostUSD: 0.5,
+			Provider: "zai", Model: "glm-5.3", CacheSupport: CacheSupportNative,
+		}))
+	}
+
+	days, err := svc.UsageByDayInRange(ctx, 0, math.MaxInt64)
+	require.NoError(t, err)
+	require.Len(t, days, 1, "all three messages land on the same day")
+	require.Equal(t, int64(3), days[0].Messages)
+	require.Equal(t, int64(30), days[0].Usage.InputTokens)
+	require.InDelta(t, 1.5, days[0].Usage.CostUSD, 1e-9)
+	require.Regexp(t, `^\d{4}-\d{2}-\d{2}$`, days[0].Day)
+
+	_, ok := days[0].Usage.CacheHitRatio()
+	require.False(t, ok,
+		"a day bucket spans models with differing cache visibility; it must not state a blended ratio")
+}
+
+// TestNullUsageRowsNeverDiluteTheCacheRatio is the explicit statement of a
+// property the WHERE clauses give us: rows with no usage recorded (every
+// message written before this feature existed, plus any turn whose usage
+// write failed) carry NULL in the token columns and must be excluded from the
+// aggregate entirely.
+//
+// The danger is not just a wrong total: if a NULL row were folded in as a
+// zero, it would enlarge the ratio's DENOMINATOR without contributing cache
+// reads, silently dragging the reported hit rate toward zero. On a database
+// with thousands of pre-feature messages that would make a perfectly healthy
+// cache look broken.
+func TestNullUsageRowsNeverDiluteTheCacheRatio(t *testing.T) {
+	_, q := newTestMessageDB(t)
+	svc := NewService(q)
+	ctx := t.Context()
+	const sessionID = "p469-null-dilution"
+
+	// One measured message: 900 of a 1000-token prompt served from cache.
+	measured, err := svc.Create(ctx, sessionID, CreateMessageParams{
+		Role: Assistant, Parts: []ContentPart{TextContent{Text: "m"}},
+	})
+	require.NoError(t, err)
+	require.NoError(t, svc.SetUsage(ctx, measured.ID, TokenUsage{
+		InputTokens: 100, CacheReadTokens: 900, OutputTokens: 10, TotalTokens: 1010,
+		Provider: "zai", Model: "glm-5.3", CacheSupport: CacheSupportNative,
+	}))
+
+	// Fifty assistant messages with NO usage at all, as a pre-feature history
+	// would look.
+	for range 50 {
+		_, err := svc.Create(ctx, sessionID, CreateMessageParams{
+			Role: Assistant, Parts: []ContentPart{TextContent{Text: "old"}},
+		})
+		require.NoError(t, err)
+	}
+
+	report, err := svc.UsageBySession(ctx, sessionID)
+	require.NoError(t, err)
+
+	require.Len(t, report.ByModel, 1, "NULL rows must not form groups of their own")
+	require.Equal(t, int64(1), report.Messages(), "only the measured message counts")
+	require.Equal(t, int64(50), report.MissingUsage, "the rest are reported as missing, not as zeros")
+
+	ratio, ok := report.ByModel[0].Usage.CacheHitRatio()
+	require.True(t, ok)
+	require.InDelta(t, 0.9, ratio, 1e-9,
+		"90%% must stay 90%%; folding 50 empty rows in as zeros would crush it toward 0")
+
+	// And the coverage figure must expose how thin the sample is.
+	cov, ok := report.Coverage()
+	require.True(t, ok)
+	require.InDelta(t, 1.0/51.0, cov, 1e-9,
+		"the caller must be able to say this ratio came from 1 of 51 messages")
+}
+
+// TestNullUsageRowsExcludedFromPeriodAggregates is the same property for the
+// cross-session views that back `sessions cache --by model|day`.
+func TestNullUsageRowsExcludedFromPeriodAggregates(t *testing.T) {
+	_, q := newTestMessageDB(t)
+	svc := NewService(q)
+	ctx := t.Context()
+
+	m, err := svc.Create(ctx, "s1", CreateMessageParams{
+		Role: Assistant, Parts: []ContentPart{TextContent{Text: "m"}},
+	})
+	require.NoError(t, err)
+	require.NoError(t, svc.SetUsage(ctx, m.ID, TokenUsage{
+		InputTokens: 100, CacheReadTokens: 900, TotalTokens: 1000,
+		Provider: "zai", Model: "glm-5.3", CacheSupport: CacheSupportNative,
+	}))
+	for range 20 {
+		_, err := svc.Create(ctx, "s2", CreateMessageParams{
+			Role: Assistant, Parts: []ContentPart{TextContent{Text: "old"}},
+		})
+		require.NoError(t, err)
+	}
+
+	byModel, err := svc.UsageByModelInRange(ctx, 0, math.MaxInt64)
+	require.NoError(t, err)
+	require.Len(t, byModel.ByModel, 1)
+	require.Equal(t, int64(1), byModel.Messages())
+	require.Equal(t, int64(20), byModel.MissingUsage)
+	ratio, ok := byModel.ByModel[0].Usage.CacheHitRatio()
+	require.True(t, ok)
+	require.InDelta(t, 0.9, ratio, 1e-9)
+
+	days, err := svc.UsageByDayInRange(ctx, 0, math.MaxInt64)
+	require.NoError(t, err)
+	require.Len(t, days, 1)
+	require.Equal(t, int64(1), days[0].Messages,
+		"the day bucket must count only the message that actually has usage")
+	require.Equal(t, int64(1000), days[0].Usage.InputTokens+days[0].Usage.CacheReadTokens)
 }

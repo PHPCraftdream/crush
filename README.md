@@ -405,7 +405,38 @@ checks it at points it already visits on every turn (next provider
 step for the merge case, a lightweight 3s ticker bound to the active
 turn for `--interrupt`) — no standing poll loop, no open port.
 
-### 4. Bootstrap helpers for an orchestrator
+### 4. Token & prompt-cache statistics
+
+Every assistant message records its own token accounting, so you can ask
+how much a model actually cost and how well the prompt cache is working:
+
+```bash
+crush sessions cache <session-id>          # one session, per model
+crush sessions cache --by model            # every session, per model
+crush sessions cache --since 7d --by day   # last week, day by day
+crush sessions cache --since 30d --json    # machine-readable
+```
+
+Tokens are split into three **disjoint** classes, so the prompt size is
+their sum: `INPUT` (fresh, full price), `READ` (served from the
+provider's prompt cache, much cheaper) and `WRITE` (written into the
+cache). `HIT` is `read / (input + read + write)`.
+
+Grouping is by the model that **actually produced** each message, so a
+session that switched models mid-conversation is split correctly. That
+is the difference from `crush sessions cost`, which groups by the
+session's *current* model and whose `TOKENS` column sums last-snapshot
+session counters rather than real totals — the two read different
+sources and are deliberately not merged into one table.
+
+The output refuses to state numbers it cannot back up: `HIT` prints
+`n/a` rather than `0%` when a provider does not report caching (a
+fabricated zero is indistinguishable from a real miss), every table
+reports its **coverage** when some messages have no usage recorded, and
+`--by day` omits `HIT` entirely because a day can span providers whose
+cache visibility differs.
+
+### 5. Bootstrap helpers for an orchestrator
 
 If you drive Crush from another LLM (e.g. Claude Code), run once:
 
@@ -431,7 +462,7 @@ entirely if stripping leaves it empty. Re-run `claude-init` at any time
 To uninstall completely: `crush claude-del` removes the slash-command
 file and strips any remaining legacy `CLAUDE.md` block.
 
-### 5. `crush models` — picking and inspecting models
+### 6. `crush models` — picking and inspecting models
 
 Four model slots exist: `large`/`small` (the smart/fast pair every
 `crush run` uses by default) plus two optional ones, `worker` (cheap

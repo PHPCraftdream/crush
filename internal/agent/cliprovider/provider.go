@@ -214,6 +214,20 @@ type CLISpec struct {
 	// history from its local DB, enabling API-level prompt caching across
 	// multiple messages in the same crush session.
 	SupportsResume bool
+	// ApplyEffort adds a reasoning-effort setting to the CLI arguments.
+	//
+	// nil means this CLI has NO effort option, and the session's stored effort
+	// must be silently dropped rather than passed along: gemini and qwen abort
+	// with "Unknown argument: effort" and codex with "unexpected argument
+	// '--effort'". Only claude takes a --effort flag; codex takes the same
+	// idea as `-c model_reasoning_effort=<level>`. See effort.go.
+	ApplyEffort func(args []string, effort string) []string
+	// EffortLevels lists the values THIS model accepts. Empty means "not
+	// validated". Levels are per-model, not per-CLI — codex's gpt-5.6-sol
+	// accepts "ultra" while gpt-5.5 stops at "xhigh" — so a stale effort that
+	// is legal on another model is dropped here instead of being forwarded
+	// into a 400 from the provider.
+	EffortLevels []string
 }
 
 // streamEvent is the JSON envelope for Claude CLI stream-json output.
@@ -607,6 +621,8 @@ func claudeSpec(modelID, modelName, modelArg string, ctxWindow int64) CLISpec {
 		ParseUsageLine: claudeParseUsageLine,
 		UseCrushMCP:    true,
 		SupportsResume: true,
+		ApplyEffort:    applyClaudeEffort,
+		EffortLevels:   claudeEffortLevels,
 	}
 }
 
@@ -691,6 +707,8 @@ var All = []CLISpec{
 		ParseUsageLine:      codexParseUsageLine,
 		AlwaysStdin:         true,
 		CodexMCPIntegration: true,
+		ApplyEffort:         applyCodexEffort,
+		EffortLevels:        codexEffortLevelsStandard,
 	},
 	{
 		ModelID:             "cli-codex-gpt-5-4",
@@ -702,6 +720,8 @@ var All = []CLISpec{
 		ParseUsageLine:      codexParseUsageLine,
 		AlwaysStdin:         true,
 		CodexMCPIntegration: true,
+		ApplyEffort:         applyCodexEffort,
+		EffortLevels:        codexEffortLevelsStandard,
 	},
 	{
 		ModelID:             "cli-codex-gpt-5-2",
@@ -713,6 +733,8 @@ var All = []CLISpec{
 		ParseUsageLine:      codexParseUsageLine,
 		AlwaysStdin:         true,
 		CodexMCPIntegration: true,
+		ApplyEffort:         applyCodexEffort,
+		EffortLevels:        codexEffortLevelsStandard,
 	},
 	{
 		ModelID:             "cli-codex-max",
@@ -724,6 +746,8 @@ var All = []CLISpec{
 		ParseUsageLine:      codexParseUsageLine,
 		AlwaysStdin:         true,
 		CodexMCPIntegration: true,
+		ApplyEffort:         applyCodexEffort,
+		EffortLevels:        codexEffortLevelsStandard,
 	},
 	{
 		ModelID:             "cli-codex-gpt-5-2-base",
@@ -735,6 +759,8 @@ var All = []CLISpec{
 		ParseUsageLine:      codexParseUsageLine,
 		AlwaysStdin:         true,
 		CodexMCPIntegration: true,
+		ApplyEffort:         applyCodexEffort,
+		EffortLevels:        codexEffortLevelsStandard,
 	},
 	{
 		ModelID:             "cli-codex-mini",
@@ -746,6 +772,8 @@ var All = []CLISpec{
 		ParseUsageLine:      codexParseUsageLine,
 		AlwaysStdin:         true,
 		CodexMCPIntegration: true,
+		ApplyEffort:         applyCodexEffort,
+		EffortLevels:        codexEffortLevelsStandard,
 	},
 }
 
@@ -1005,20 +1033,12 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 
 	args := m.spec.BuildArgs(yolo)
 
-	// Apply dynamic reasoning effort from context, replacing any hardcoded
-	// --effort value from BuildArgs so the UI toggle actually takes effect.
-	if effort, ok := ctx.Value(ReasoningEffortContextKey).(string); ok && effort != "" {
-		replaced := false
-		for i, a := range args {
-			if a == "--effort" && i+1 < len(args) {
-				args[i+1] = effort
-				replaced = true
-				break
-			}
-		}
-		if !replaced {
-			args = append(args, "--effort", effort)
-		}
+	// Apply dynamic reasoning effort from context so the UI toggle takes
+	// effect. Dispatch is per-spec: this used to append `--effort <level>` to
+	// whatever binary was being launched, which killed every non-claude run
+	// the moment a session carried an effort. See effort.go.
+	if effort, ok := ctx.Value(ReasoningEffortContextKey).(string); ok {
+		args = m.spec.applyEffort(args, effort)
 	}
 
 	// Extract session ID from context (set by agent.go before calling Stream).

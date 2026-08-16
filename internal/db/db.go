@@ -36,6 +36,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.countMessagesMissingUsageStmt, err = db.PrepareContext(ctx, countMessagesMissingUsage); err != nil {
 		return nil, fmt.Errorf("error preparing query CountMessagesMissingUsage: %w", err)
 	}
+	if q.countMessagesMissingUsageInRangeStmt, err = db.PrepareContext(ctx, countMessagesMissingUsageInRange); err != nil {
+		return nil, fmt.Errorf("error preparing query CountMessagesMissingUsageInRange: %w", err)
+	}
 	if q.createFileStmt, err = db.PrepareContext(ctx, createFile); err != nil {
 		return nil, fmt.Errorf("error preparing query CreateFile: %w", err)
 	}
@@ -231,6 +234,12 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.setParentCostAccountedStmt, err = db.PrepareContext(ctx, setParentCostAccounted); err != nil {
 		return nil, fmt.Errorf("error preparing query SetParentCostAccounted: %w", err)
 	}
+	if q.sumMessageUsageByDayInRangeStmt, err = db.PrepareContext(ctx, sumMessageUsageByDayInRange); err != nil {
+		return nil, fmt.Errorf("error preparing query SumMessageUsageByDayInRange: %w", err)
+	}
+	if q.sumMessageUsageByModelInRangeStmt, err = db.PrepareContext(ctx, sumMessageUsageByModelInRange); err != nil {
+		return nil, fmt.Errorf("error preparing query SumMessageUsageByModelInRange: %w", err)
+	}
 	if q.sumMessageUsageBySessionStmt, err = db.PrepareContext(ctx, sumMessageUsageBySession); err != nil {
 		return nil, fmt.Errorf("error preparing query SumMessageUsageBySession: %w", err)
 	}
@@ -293,6 +302,11 @@ func (q *Queries) Close() error {
 	if q.countMessagesMissingUsageStmt != nil {
 		if cerr := q.countMessagesMissingUsageStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing countMessagesMissingUsageStmt: %w", cerr)
+		}
+	}
+	if q.countMessagesMissingUsageInRangeStmt != nil {
+		if cerr := q.countMessagesMissingUsageInRangeStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing countMessagesMissingUsageInRangeStmt: %w", cerr)
 		}
 	}
 	if q.createFileStmt != nil {
@@ -620,6 +634,16 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing setParentCostAccountedStmt: %w", cerr)
 		}
 	}
+	if q.sumMessageUsageByDayInRangeStmt != nil {
+		if cerr := q.sumMessageUsageByDayInRangeStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing sumMessageUsageByDayInRangeStmt: %w", cerr)
+		}
+	}
+	if q.sumMessageUsageByModelInRangeStmt != nil {
+		if cerr := q.sumMessageUsageByModelInRangeStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing sumMessageUsageByModelInRangeStmt: %w", cerr)
+		}
+	}
 	if q.sumMessageUsageBySessionStmt != nil {
 		if cerr := q.sumMessageUsageBySessionStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing sumMessageUsageBySessionStmt: %w", cerr)
@@ -728,6 +752,7 @@ type Queries struct {
 	cleanupExpiredLeasesStmt                       *sql.Stmt
 	countMessagesBySessionStmt                     *sql.Stmt
 	countMessagesMissingUsageStmt                  *sql.Stmt
+	countMessagesMissingUsageInRangeStmt           *sql.Stmt
 	createFileStmt                                 *sql.Stmt
 	createMessageStmt                              *sql.Stmt
 	createPendingInjectStmt                        *sql.Stmt
@@ -793,6 +818,8 @@ type Queries struct {
 	renameSessionStmt                              *sql.Stmt
 	renewRunQueueLeaseStmt                         *sql.Stmt
 	setParentCostAccountedStmt                     *sql.Stmt
+	sumMessageUsageByDayInRangeStmt                *sql.Stmt
+	sumMessageUsageByModelInRangeStmt              *sql.Stmt
 	sumMessageUsageBySessionStmt                   *sql.Stmt
 	terminalFailRunQueueEntryStmt                  *sql.Stmt
 	updateMessageStmt                              *sql.Stmt
@@ -816,6 +843,7 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		cleanupExpiredLeasesStmt:                       q.cleanupExpiredLeasesStmt,
 		countMessagesBySessionStmt:                     q.countMessagesBySessionStmt,
 		countMessagesMissingUsageStmt:                  q.countMessagesMissingUsageStmt,
+		countMessagesMissingUsageInRangeStmt:           q.countMessagesMissingUsageInRangeStmt,
 		createFileStmt:                                 q.createFileStmt,
 		createMessageStmt:                              q.createMessageStmt,
 		createPendingInjectStmt:                        q.createPendingInjectStmt,
@@ -881,6 +909,8 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		renameSessionStmt:                              q.renameSessionStmt,
 		renewRunQueueLeaseStmt:                         q.renewRunQueueLeaseStmt,
 		setParentCostAccountedStmt:                     q.setParentCostAccountedStmt,
+		sumMessageUsageByDayInRangeStmt:                q.sumMessageUsageByDayInRangeStmt,
+		sumMessageUsageByModelInRangeStmt:              q.sumMessageUsageByModelInRangeStmt,
 		sumMessageUsageBySessionStmt:                   q.sumMessageUsageBySessionStmt,
 		terminalFailRunQueueEntryStmt:                  q.terminalFailRunQueueEntryStmt,
 		updateMessageStmt:                              q.updateMessageStmt,
