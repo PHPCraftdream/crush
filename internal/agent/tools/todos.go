@@ -20,8 +20,14 @@ type TodosParams struct {
 }
 
 type TodoItem struct {
-	Content    string `json:"content" description:"What needs to be done (imperative form)"`
-	Status     string `json:"status" description:"Task status: pending, in_progress, or completed"`
+	Content string `json:"content" description:"What needs to be done (imperative form)"`
+	// The enum tag reaches the JSON schema handed to the provider (see
+	// fantasy's schema.Generate), so a model is told which values are legal
+	// instead of having to infer them from the description. That is defence
+	// in depth, not the fix: schema enforcement varies by provider, so the
+	// runtime check in NewTodosTool still has to hold — and it answers with a
+	// correctable tool error rather than killing the run.
+	Status     string `json:"status" description:"Task status: pending, in_progress, or completed" enum:"pending,in_progress,completed"`
 	ActiveForm string `json:"active_form" description:"Present continuous form (e.g., 'Running tests')"`
 }
 
@@ -140,11 +146,34 @@ func NewTodosTool(sessions session.Service) fantasy.AgentTool {
 				return fantasy.ToolResponse{}, fmt.Errorf("failed to get session: %w", err)
 			}
 
+			// A bad status is the model's mistake to correct, so it comes back
+			// as a tool-error RESPONSE, not as a returned error. fantasy
+			// treats the two very differently: a returned error sets
+			// executeSingleTool's isCriticalError flag and executeTools then
+			// aborts the whole agent loop, ending the run outright — one
+			// mistyped enum value would kill a session that had been working
+			// for many minutes, and the model would never see why. A response
+			// carrying IsError is fed back as an ordinary tool result it can
+			// react to.
+			//
+			// The three returned errors elsewhere in this function stay as
+			// they are: a missing session ID or a failed DB read/write is not
+			// something the model can retry its way out of.
+			//
+			// The message names the offending item and spells out the legal
+			// values, because the likeliest way to get here is omitting the
+			// field entirely (which unmarshals to "") rather than deliberately
+			// choosing a wrong value.
 			for _, item := range params.Todos {
 				switch item.Status {
 				case "pending", "in_progress", "completed":
 				default:
-					return fantasy.ToolResponse{}, fmt.Errorf("invalid status %q for todo %q", item.Status, item.Content)
+					return fantasy.NewTextErrorResponse(fmt.Sprintf(
+						"invalid status %q for todo %q: status must be exactly one of "+
+							`"pending", "in_progress" or "completed". No todos were saved; `+
+							"resend the whole list with a valid status on every item.",
+						item.Status, item.Content,
+					)), nil
 				}
 			}
 
