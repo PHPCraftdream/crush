@@ -200,13 +200,22 @@ func TestReleaseGate_P0_2_GenuineFailureStillExhaustsAfterMaxAttempts(t *testing
 	// Now confirm the entry is actually gone (dead-lettered), sustained
 	// across several more ticks — the max-attempts branch terminal-fails
 	// without calling the coordinator again, so once calls stops
-	// increasing, pending should settle to 0 and stay there.
+	// increasing, the row should be deleted and stay deleted.
+	//
+	// The predicate checks pending-OR-leased (runQueueGoneEverywhere), not
+	// pending alone: the preceding wait returns when the 10th Run STARTS —
+	// the row is leased at that instant — and a leased row is invisible to
+	// ListPendingRunQueueEntries, so a pending-only wait would return on its
+	// first poll, before the terminal-fail write. The 100ms sustained loop
+	// below happened to cover that gap only because this coordinator's Run
+	// is instantaneous; with a slower coordinator both the wait and the
+	// loop would pass vacuously while the row was still leased, and the
+	// final calls-count assertions would lose their ordering anchor.
+	// TerminalFailRunQueueEntry runs only after Run returns, so "gone from
+	// both states" is what "dead-lettered" actually means here.
 	require.Eventually(t, func() bool {
-		pending, checkErr := svc.ListPendingRunQueueEntries(ctx)
-		if checkErr != nil {
-			return false
-		}
-		return len(pending) == 0
+		gone, checkErr := runQueueGoneEverywhere(ctx, svc)
+		return checkErr == nil && gone
 	}, 5*time.Second, 20*time.Millisecond, "entry should eventually be dead-lettered (deleted) after exhausting real attempts")
 	for range 5 {
 		time.Sleep(20 * time.Millisecond)

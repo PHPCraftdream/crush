@@ -222,13 +222,21 @@ func TestReleaseGate_P350_NoDuplicateDispatchForSameSession(t *testing.T) {
 		return coord.calls.Load() >= 2
 	}, 2*time.Second, 10*time.Millisecond, "second call must eventually start once the first releases")
 
+	// Wait for BOTH entries to be Acked (deleted) — not merely leased.
+	//
+	// A pending-only predicate ("len(pending) == 0") is satisfied the moment
+	// the SECOND entry is leased, while its Run is still executing: a leased
+	// row is invisible to ListPendingRunQueueEntries. The wait would then
+	// return before the second run finished, and a hypothetical THIRD
+	// dispatch — exactly the duplicate this test exists to catch — landing
+	// after that snapshot would go unnoticed by the "start to finish" and
+	// exactly-two-calls assertions below. AckRunQueueEntry runs only after
+	// Run returns, so "gone from pending AND leased" (runQueueGoneEverywhere)
+	// orders those assertions after every outcome write of both runs.
 	require.Eventually(t, func() bool {
-		pending, err := svc.ListPendingRunQueueEntries(ctx)
-		if err != nil {
-			return false
-		}
-		return len(pending) == 0
-	}, 2*time.Second, 10*time.Millisecond, "both entries must eventually be acked")
+		gone, err := runQueueGoneEverywhere(ctx, svc)
+		return err == nil && gone
+	}, 2*time.Second, 10*time.Millisecond, "both entries must eventually be acked (deleted, not merely leased)")
 
 	coord.mu.Lock()
 	defer coord.mu.Unlock()
@@ -413,12 +421,22 @@ func TestReleaseGate_P350_LeaseRenewedDuringLongExecution(t *testing.T) {
 
 	close(coord.release)
 
+	// Wait for the row to be Acked (deleted) — not merely leased.
+	//
+	// A pending-only predicate here is weak in this test's specific shape:
+	// after close(coord.release) the first poll already finds pending empty
+	// (the row is leased), so the wait degenerates to a no-op and the
+	// "acked" claim is actually verified only by the 100ms sustained loop
+	// below — which itself passes vacuously while the row is still leased.
+	// That accidental coverage relies on the coordinator's Run returning
+	// (and the Ack landing) within ~100ms of release; a slower coordinator
+	// would silently turn both the wait and the loop into no-ops and the
+	// final calls==1 assertion would lose its ordering anchor. Waiting for
+	// "gone from pending AND leased" makes the wait mean what its message
+	// says and re-anchors the sustained loop as a genuine durability check.
 	require.Eventually(t, func() bool {
-		pending, checkErr := svc.ListPendingRunQueueEntries(ctx)
-		if checkErr != nil {
-			return false
-		}
-		return len(pending) == 0
+		gone, checkErr := runQueueGoneEverywhere(ctx, svc)
+		return checkErr == nil && gone
 	}, 2*time.Second, 10*time.Millisecond, "entry should be acked once the long call finally completes")
 
 	// Sustained check, matching this file's established pattern for

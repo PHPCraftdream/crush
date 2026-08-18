@@ -131,6 +131,19 @@ func TestReleaseGate_P0_1_DurableCallExecutesExactlyOnce(t *testing.T) {
 
 	// Fast tick and lease TTL for test speed: tick every 20ms, lease expires
 	// after 30ms (same as TestReleaseGate_P350_QueuedNotExecutedBacksOffWithoutAttemptPenalty).
+	//
+	// Note on the 30ms TTL vs the whole-seconds lease_expires_at column:
+	// LeaseRunQueueEntry CEILS the deadline to the next whole Unix second
+	// (session.go ceilUnixSeconds, the P0-3 fix), so this "30ms" lease
+	// actually survives until the next second boundary — up to ~1s. For
+	// CleanupExpiredLeases to steal the row out from under the 6th
+	// (successful) execution, a tick would have to fire with
+	// now.Unix() > lease_expires_at INSIDE the few-millisecond lease→Ack
+	// window of that instant coordinator — i.e. a >1s scheduling stall
+	// mid-execution. That is the same fast-round-trip caveat already
+	// documented on the sibling test named above; not worth trading ~5s of
+	// test runtime (a ≥1s TTL also widens every busy-backoff cycle) to
+	// defend against it.
 	pump := session.NewRunQueuePump(session.RunQueuePumpConfig{
 		Sessions:       svc,
 		Coordinator:    counter,
@@ -152,12 +165,21 @@ func TestReleaseGate_P0_1_DurableCallExecutesExactlyOnce(t *testing.T) {
 
 	// Wait for the durable row to be acked (deleted) — this proves the pump
 	// eventually succeeded and committed the outcome to the database.
+	//
+	// The predicate must check pending-OR-leased (runQueueGoneEverywhere),
+	// not pending alone: ListPendingRunQueueEntries only scans
+	// status='pending', so a row the pump has leased and is executing reads
+	// as zero pending too. The preceding wait (callCount > busyCycles)
+	// returns at the ENTRY of the 6th Run — the row is leased at that
+	// instant — so a pending-only follow-up would be satisfied by its very
+	// first poll, long before any Ack. The executions==1 assertion below
+	// would then be unordered relative to the run's completion, despite the
+	// wait's message claiming "acked and deleted". AckRunQueueEntry runs
+	// only after Run returns, so "gone from both states" orders that
+	// assertion after the outcome write.
 	require.Eventually(t, func() bool {
-		pending, checkErr := svc.ListPendingRunQueueEntries(ctx)
-		if checkErr != nil {
-			return false
-		}
-		return len(pending) == 0
+		gone, checkErr := runQueueGoneEverywhere(ctx, svc)
+		return checkErr == nil && gone
 	}, 5*time.Second, 20*time.Millisecond,
 		"durable row should eventually be acked and deleted after successful execution")
 

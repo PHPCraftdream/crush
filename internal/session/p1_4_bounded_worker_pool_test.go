@@ -234,13 +234,27 @@ func TestP1_4_BoundedWorkerPoolRespectsLimit(t *testing.T) {
 	// Unblock all workers and let them complete
 	close(blockCh)
 
-	// Verify all entries were eventually processed
+	// Verify all entries were eventually processed.
+	//
+	// The predicate must ALSO require entryCount == numSessions, not just
+	// pending emptiness: a row leaves 'pending' synchronously inside
+	// processEntry (LeaseRunQueueEntry), but entryCount is only incremented
+	// at the ENTRY of the coordinator's Run — after goroutine startup, the
+	// call_data unmarshal, and the renewal/watchdog goroutine launches in
+	// executeEntrySync. A 100ms poll landing in that window of the LAST
+	// entry sees pending empty with entryCount still numSessions-1, and the
+	// equality below then flakes (observed as expected: 10, actual: 9).
+	// Folding the counter into the predicate makes the wait itself express
+	// "every enqueued entry reached Run" — the exact claim the follow-up
+	// asserts. (A pending-OR-leased predicate would also close this window,
+	// since acks happen only after Run returns, but the counter form states
+	// the intent directly and does not depend on lease lifecycle timing.)
 	require.Eventually(t, func() bool {
 		pending, err := svc.ListPendingRunQueueEntries(ctx)
 		if err != nil {
 			return false
 		}
-		return len(pending) == 0
+		return len(pending) == 0 && coord.entryCount.Load() == int64(numSessions)
 	}, 10*time.Second, 100*time.Millisecond,
 		"all pending entries should be processed after unblock")
 

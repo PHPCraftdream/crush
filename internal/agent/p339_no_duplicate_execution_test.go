@@ -20,15 +20,42 @@ import (
 )
 
 // mockMessageService wraps a real message.Service and can be configured to
-// fail after a certain number of calls, simulating errors that occur AFTER
-// user message creation (task #339 test requirement).
+// fail calls, simulating errors that occur AFTER user message creation
+// (task #339 test requirement).
+//
+// Two failure modes (mutually exclusive):
+//   - failAfterCalls>0: PERMANENTLY fail every call with count > N. Used by
+//     TestReleaseGate_9_DoubleFailureNoDuplicate.
+//   - failOnlyCallNum>0: fail EXACTLY the Nth call, then recover — a
+//     TRANSIENT blip. Used by TestP339_NoDuplicateExecutionAfterHandoff,
+//     because a duplicate user message on retry is only reachable when the
+//     retry turn gets past its own DB preamble: with a permanent failure,
+//     every retry dies at its first List() call, before createUserMessage,
+//     and no duplicate can ever materialize (observed directly during the
+//     p339 revert-check: the retry loop ran 10 turns, each failing at the
+//     preamble List, and the duplicate-count verify stayed vacuously
+//     green). #339's real-world trigger is a transient DB error after the
+//     user message was already persisted — the next attempt then re-runs
+//     createUserMessage unless the error is wrapped in
+//     ErrCallAlreadyAttempted.
 type mockMessageService struct {
 	inner               message.Service
 	failAfterCalls      int64
+	failOnlyCallNum     int64
 	callCount           atomic.Int64
 	failWith            error
 	userMessageTracking bool // Track if a user message was created
 	userMessageCreated  atomic.Bool
+}
+
+func (m *mockMessageService) shouldFail(count int64) bool {
+	if m.failWith == nil {
+		return false
+	}
+	if m.failOnlyCallNum > 0 {
+		return count == m.failOnlyCallNum
+	}
+	return m.failAfterCalls > 0 && count > m.failAfterCalls
 }
 
 func (m *mockMessageService) Create(ctx context.Context, sessionID string, params message.CreateMessageParams) (message.Message, error) {
@@ -37,7 +64,7 @@ func (m *mockMessageService) Create(ctx context.Context, sessionID string, param
 		// Can't use t.Logf here because we don't have *testing.T
 	}
 	count := m.callCount.Add(1)
-	if m.failAfterCalls > 0 && count > m.failAfterCalls && m.failWith != nil {
+	if m.shouldFail(count) {
 		return message.Message{}, m.failWith
 	}
 	return m.inner.Create(ctx, sessionID, params)
@@ -45,7 +72,7 @@ func (m *mockMessageService) Create(ctx context.Context, sessionID string, param
 
 func (m *mockMessageService) Update(ctx context.Context, msg message.Message) error {
 	count := m.callCount.Add(1)
-	if m.failAfterCalls > 0 && count > m.failAfterCalls && m.failWith != nil {
+	if m.shouldFail(count) {
 		return m.failWith
 	}
 	return m.inner.Update(ctx, msg)
@@ -53,7 +80,7 @@ func (m *mockMessageService) Update(ctx context.Context, msg message.Message) er
 
 func (m *mockMessageService) List(ctx context.Context, sessionID string) ([]message.Message, error) {
 	count := m.callCount.Add(1)
-	if m.failAfterCalls > 0 && count > m.failAfterCalls && m.failWith != nil {
+	if m.shouldFail(count) {
 		return nil, m.failWith
 	}
 	return m.inner.List(ctx, sessionID)
@@ -125,35 +152,43 @@ func (m *mockMessageService) Subscribe(ctx context.Context) <-chan pubsub.Event[
 // call must NOT be requeued or retried — doing so would cause duplicate
 // execution, duplicate provider calls, and duplicate user messages in history.
 //
-// This test uses a mock message service that fails AFTER user message creation,
-// simulating errors like DB write failures, checksum mismatches, or other
-// issues that occur in the error-handling path AFTER streaming completes.
+// This test uses a mock message service that fails TRANSIENTLY after user
+// message creation, simulating a DB blip in the error-handling path. The
+// failure must be transient (mockMessageService.failOnlyCallNum) for the
+// duplicate check below to have teeth: with a PERMANENT failure
+// (failAfterCalls), every pump retry dies at its own preamble List() call —
+// before createUserMessage — so no duplicate user message can ever appear
+// and VERIFY 2 passes with the #339 mechanism fully reverted (observed
+// directly during this test's revert-check; see the mock's doc comment).
+// #339's real hazard is specifically a TRANSIENT error after the user
+// message was persisted: the retry then succeeds and duplicates it.
 //
-// Sequence:
-//  1. Turn A fails with a non-cancel error AFTER doing real work
-//     (not immediately at startup).
-//  2. abandonOwnershipWithHandoff → restartOrphanedWithRetry([B]) executes.
-//  3. restartOrphanedWithRetry enqueues the call to the durable run queue.
-//  4. Pump processes the queued call.
-//  5. Detached Run(B) successfully creates user message for B.
-//  6. Provider streams a response (assistant message created).
-//  7. Error-handling path tries to write a final finish part, but mock DB fails.
-//  8. Error is wrapped in ErrCallAlreadyAttempted.
-//  9. Pump recognizes ErrCallAlreadyAttempted as terminal and does NOT retry.
-//  10. Verify: No pending entry in run queue and exactly ONE user message with B's content in history.
+// Sequence (call numbers are the mock's shared counter; observed by
+// instrumenting the mock):
+//  1. restartOrphanedWithRetry([B]) enqueues the call to the durable run queue.
+//  2. Pump leases the entry and runs coordinator.Run → sessionAgent.Run(B).
+//  3. Turn preamble: List (#1, succeeds).
+//  4. createUserMessage for B (#2, succeeds — the "already attempted" point).
+//  5. PrepareStep's assistant-message Create (#3) fails ONCE, transiently.
+//  6. The error is wrapped in ErrCallAlreadyAttempted (agent.go's
+//     userMessageCreated wrap) because the user message is already persisted.
+//  7. Pump recognizes ErrCallAlreadyAttempted as terminal and does NOT retry.
+//  8. Verify: row terminally removed (gone from pending AND leased) and
+//     exactly ONE user message with B's content in history.
 //
-// REVERT CHECK PROCEDURE:
-//  1. In run_queue_pump.go executeEntry (~line 264-273), disable the AlreadyAttempted check:
-//     ```
-//     // BUG: Disable the AlreadyAttempted check (P339 revert check)
-//     var alreadyAttempted AlreadyAttempted
-//     if false && errors.As(err, &alreadyAttempted) && alreadyAttempted.AlreadyAttempted() {
-//     ```
+// REVERT CHECK PROCEDURE (performed 2026-08-17, on this exact shape):
+//  1. In agent.go runTurn's post-stream error handling, disable the
+//     userMessageCreated wrap:
+//     `if userMessageCreated && false {`
 //  2. Run: go test ./internal/agent -run TestP339_NoDuplicateExecutionAfterHandoff -v
-//  3. The test will FAIL on:
-//     - "call should be terminal-failed (not pending for retry)" - entry would be retried
-//     - "exactly one user message with message B in history" - duplicates would appear
-//  4. Restore the check and the test will PASS.
+//  3. FAIL on VERIFY 2: "exactly one user message with message B in history
+//     (not two, not zero); found 2" — the unwrapped error goes down the
+//     pump's generic Nack path, the retry turn's preamble now SUCCEEDS (the
+//     blip was transient), and createUserMessage runs a second time.
+//     Note: reverting the PUMP-side AlreadyAttempted check alone is NOT
+//     enough to redden this test when the mock failure is permanent — see
+//     the failOnlyCallNum rationale above.
+//  4. Restore the wrap and the test will PASS.
 func TestP339_NoDuplicateExecutionAfterHandoff(t *testing.T) {
 	t.Parallel()
 
@@ -193,11 +228,18 @@ func TestP339_NoDuplicateExecutionAfterHandoff(t *testing.T) {
 
 	env := testEnv(t)
 
-	// Wrap the message service with our mock that fails after user message creation.
+	// Wrap the message service with our mock: fail EXACTLY call #3 — the
+	// PrepareStep assistant-message Create, i.e. right AFTER the user
+	// message for B was persisted — and recover for every later call.
+	// (Call order observed with instrumentation: #1 preamble List, #2
+	// Create:user B, #3 Create:assistant.) Why transient and not
+	// fail-everything-after-2: see the mock's doc comment — a permanent
+	// failure lets every pump retry die at its own preamble List before
+	// createUserMessage, so VERIFY 2 cannot detect the #339 regression.
 	mockMessages := &mockMessageService{
 		inner:               env.messages,
-		failAfterCalls:      2, // Fail after 2 calls: (1) B user msg, (2) assistant msg creation. Then (3) List() call in error path fails.
-		failWith:            fmt.Errorf("simulated DB failure in error-handling path"),
+		failOnlyCallNum:     3,
+		failWith:            fmt.Errorf("simulated transient DB failure after user message creation"),
 		userMessageTracking: true,
 	}
 
@@ -249,6 +291,7 @@ func TestP339_NoDuplicateExecutionAfterHandoff(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, pendingEntries, 1, "call should be enqueued in durable run queue")
 	require.Equal(t, sessionID, pendingEntries[0].SessionID)
+	entryID := pendingEntries[0].ID
 
 	// Verify the queued call data contains the expected prompt.
 	var callData session.SessionAgentCallData
@@ -274,26 +317,39 @@ func TestP339_NoDuplicateExecutionAfterHandoff(t *testing.T) {
 	pump.Start()
 	defer pump.Stop()
 
-	// Wait for the pump to process the queued call.
+	// Wait for the pump to terminally remove the queued call.
 	// The sequence is:
-	// 1. createUserMessage for B (call #1, succeeds)
-	// 2. PrepareStep creates assistant message (call #2, succeeds)
-	// 3. Provider streams successfully
-	// 4. Error-handling path: List() call (call #3, FAILS because failAfterCalls=2)
-	// 5. Error is wrapped in ErrCallAlreadyAttempted
-	// 6. Pump sees ErrCallAlreadyAttempted, does terminal fail (no retry)
+	// 1. createUserMessage for B (call #2, succeeds; sets userMessageCreated)
+	// 2. PrepareStep's assistant-message Create (call #3, fails ONCE —
+	//    failOnlyCallNum=3, transiently)
+	// 3. Error is wrapped in ErrCallAlreadyAttempted (userMessageCreated is
+	//    already true — agent.go's wrap right after agent.Stream returns)
+	// 4. Pump sees ErrCallAlreadyAttempted, does terminal fail (no retry)
+	//
+	// WHY THE PREDICATE MUST CHECK pending-OR-leased, not pending alone:
+	// ListPendingRunQueueEntries only scans status='pending', so a row the
+	// pump has leased and is executing RIGHT NOW also reads as zero pending.
+	// userMessageCreated flips at step 1 of 4, so the old predicate
+	// `len(pending)==0 && userMessageCreated` returned between steps 1 and 2
+	// — with the row leased mid-run — making both verifies below vacuous:
+	// VERIFY 1 "passed" because a leased row is invisible to the pending
+	// query, and VERIFY 2 saw exactly one B message only because any
+	// duplicate-creating retry tail had not run yet. Ack/TerminalFail writes
+	// happen only AFTER the coordinator's Run returns (executeEntrySync's
+	// outcome branches), so "row gone from both states" is the earliest
+	// point that is ordered after every call the run makes. Same fix as
+	// c4c2f17c applied to TestReleaseGate_9_DoubleFailureNoDuplicate; see
+	// entryQueuedAnywhere (p482_run_queue_terminal_probe_test.go).
 	require.Eventually(t, func() bool {
-		pending, checkErr := env.sessions.ListPendingRunQueueEntries(ctx)
-		if checkErr != nil {
-			return false
-		}
-		return len(pending) == 0 && mockMessages.userMessageCreated.Load()
+		return !entryQueuedAnywhere(t, env, entryID) && mockMessages.userMessageCreated.Load()
 	}, 10*time.Second, 100*time.Millisecond, "pump should process and terminal-fail the queued call")
 
-	// VERIFY 1: No pending entry in run queue (terminal failure, not retry).
-	pendingEntries, err = env.sessions.ListPendingRunQueueEntries(ctx)
-	require.NoError(t, err)
-	require.Equal(t, 0, len(pendingEntries), "call should be terminal-failed (not pending for retry)")
+	// VERIFY 1: the entry is terminally removed — gone from pending AND
+	// leased. The old form (assert on ListPendingRunQueueEntries only) was
+	// satisfied vacuously by the leased state; it could never distinguish
+	// "terminal-failed" from "mid-flight in a lease".
+	require.False(t, entryQueuedAnywhere(t, env, entryID),
+		"call should be terminal-failed (row absent from pending AND leased), not leased mid-run or pending for retry")
 
 	// VERIFY 2: Exactly one user message with message B's content in history.
 	// The detached run should have created the user message, and no second

@@ -203,6 +203,29 @@ func TestAppNew_RunQueuePump_OrderingRace(t *testing.T) {
 		}
 	})
 
+	// VERIFIED ASSUMPTION (pending-wait audit, 2026-08-17): the
+	// providerCalls term of this predicate is incremented ONLY by the
+	// coder turn's own agent.Stream, which is what makes it a valid
+	// ordering signal for the history assertion below (the user message is
+	// persisted in the turn preamble, before the stream starts). Two other
+	// potential callers of the same httptest server were checked and
+	// cannot fire here:
+	//   - generateTitle: needsTitle is `len(msgs)==0 || Title=="" ||
+	//     Title==DefaultSessionName` (agent.go), and this session was
+	//     created with the explicit non-default title
+	//     "p0-1-ordering-race-probe" AND already holds the seed message —
+	//     both conditions false. The seed message and the explicit title
+	//     are therefore LOAD-BEARING for this predicate: dropping either
+	//     would let the title goroutine hit the probe server and satisfy
+	//     providerCalls>=1 before the turn's user message exists,
+	//     collapsing the ordering argument (the final found-assertion
+	//     would then flake, not falsely pass).
+	//   - auto-summarize: token-gated (contextWindow 200000 minus a tiny
+	//     session vs a large threshold) — unreachable in this test.
+	// The pending==0 term alone would also be satisfied by a merely
+	// leased row (ListPendingRunQueueEntries scans only status='pending');
+	// providerCalls>=1 is the term that proves the pump-driven turn
+	// actually ran.
 	require.Eventually(t, func() bool {
 		pending, checkErr := sessions.ListPendingRunQueueEntries(context.Background())
 		if checkErr != nil {

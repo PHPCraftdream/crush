@@ -238,6 +238,20 @@ func TestAppNew_RunQueuePump_ExecutesRealEnqueuedCall(t *testing.T) {
 	// Production tick is 3s (session.RunQueuePumpInterval) — this is
 	// intentionally NOT sped up (see doc comment above), so give it
 	// several real ticks' worth of headroom.
+	//
+	// VERIFIED ASSUMPTION (pending-wait audit, 2026-08-17): providerCalls
+	// is incremented ONLY by the coder turn's own agent.Stream, so
+	// providerCalls>=1 implies the turn's user message (written in the
+	// preamble, before the stream) is already persisted — that is what
+	// orders the history assertion below. generateTitle cannot hit the
+	// probe server here: needsTitle is `len(msgs)==0 || Title=="" ||
+	// Title==DefaultSessionName`, and this session has BOTH the explicit
+	// non-default title "p0-1-wiring-probe" AND the seed message — both
+	// load-bearing; auto-summarize is token-gated far out of reach (200k
+	// context window, tiny session). The pending==0 term alone would also
+	// be satisfied by a merely leased row (ListPendingRunQueueEntries
+	// scans only status='pending'); providerCalls>=1 is the term that
+	// proves the pump-driven turn actually ran.
 	require.Eventually(t, func() bool {
 		pending, checkErr := application.Sessions.ListPendingRunQueueEntries(context.Background())
 		if checkErr != nil {
