@@ -112,7 +112,12 @@ func createNewFile(edit editContext, filePath, content string, call fantasy.Tool
 		}
 		return fantasy.NewTextErrorResponse(fmt.Sprintf("file already exists: %s", filePath)), nil
 	} else if !os.IsNotExist(err) {
-		return fantasy.ToolResponse{}, fmt.Errorf("failed to access file: %w", err)
+		if osFailureIsFatal(err) {
+			return fantasy.ToolResponse{}, fmt.Errorf("failed to access file: %w", err)
+		}
+		return fantasy.NewTextErrorResponse(fmt.Sprintf(
+			"Cannot access %s: %v. The OS rejected this path — common causes are no permission somewhere along the path, a path component that is a file rather than a directory, a name too long for the filesystem, or an invalid character in the name. The file was not created and nothing was written. Try a different path or a corrected form of this one.",
+			filePath, err)), nil
 	}
 
 	dir := filepath.Dir(filePath)
@@ -262,7 +267,12 @@ func loadExistingFile(edit editContext, filePath, sessionError string) (sessionI
 		if os.IsNotExist(err) {
 			return "", "", false, fantasy.NewTextErrorResponse(fmt.Sprintf("file not found: %s", filePath)), nil
 		}
-		return "", "", false, fantasy.ToolResponse{}, fmt.Errorf("failed to access file: %w", err)
+		if osFailureIsFatal(err) {
+			return "", "", false, fantasy.ToolResponse{}, fmt.Errorf("failed to access file: %w", err)
+		}
+		return "", "", false, fantasy.NewTextErrorResponse(fmt.Sprintf(
+			"Cannot access %s: %v. The OS rejected this path — common causes are no permission somewhere along the path, a path component that is a file rather than a directory, or a name too long for the filesystem. Nothing was read or modified. Try a different path or a corrected form of this one.",
+			filePath, err)), nil
 	}
 
 	if fileInfo.IsDir() {
@@ -287,7 +297,12 @@ func loadExistingFile(edit editContext, filePath, sessionError string) (sessionI
 
 	content, err := os.ReadFile(filePath)
 	if err != nil {
-		return "", "", false, fantasy.ToolResponse{}, fmt.Errorf("failed to read file: %w", err)
+		if osFailureIsFatal(err) {
+			return "", "", false, fantasy.ToolResponse{}, fmt.Errorf("failed to read file: %w", err)
+		}
+		return "", "", false, fantasy.NewTextErrorResponse(fmt.Sprintf(
+			"Cannot read %s: %v. The file was found but could not be read — it may have been locked by another process, or the storage failed mid-read. Nothing was modified. Try the edit again or on a different file.",
+			filePath, err)), nil
 	}
 
 	oldContent, isCrlf = fsext.ToUnixLineEndings(string(content))

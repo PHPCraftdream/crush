@@ -126,14 +126,30 @@ func NewDownloadTool(permissions permission.Service, workingDir string, client *
 
 			req, err := http.NewRequestWithContext(requestCtx, "GET", params.URL, nil)
 			if err != nil {
-				return fantasy.ToolResponse{}, fmt.Errorf("failed to create request: %w", err)
+				return fantasy.NewTextErrorResponse(fmt.Sprintf(
+					"malformed URL %q: %v. The URL could not be parsed into a valid "+
+						"HTTP request, so retrying it unchanged will fail the same "+
+						"way — fix the url parameter (a well-formed absolute "+
+						"http:// or https:// URL: no spaces, valid percent-escapes, "+
+						"intact host) and call again. Nothing was downloaded and no "+
+						"file was created.",
+					params.URL, err,
+				)), nil
 			}
 
 			req.Header.Set("User-Agent", "crush/1.0")
 
 			resp, err := client.Do(req)
 			if err != nil {
-				return fantasy.ToolResponse{}, fmt.Errorf("failed to download from URL: %w", err)
+				return fantasy.NewTextErrorResponse(fmt.Sprintf(
+					"download from %s failed at the network level: %v. The URL "+
+						"itself is well-formed; the request just never completed — "+
+						"unreachable host, DNS failure, connection refused or reset, "+
+						"TLS error, timeout, or a blocked destination. That may be "+
+						"transient: retry the same URL later, or try a different "+
+						"one. Nothing was downloaded and no file was created.",
+					params.URL, err,
+				)), nil
 			}
 			defer resp.Body.Close()
 

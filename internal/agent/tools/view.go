@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"unicode/utf8"
 
 	"charm.land/fantasy"
@@ -93,6 +94,42 @@ func (e contentTooLargeError) Error() string {
 	return fmt.Sprintf("content section is too large (%d bytes). Maximum size is %d bytes", e.Size, e.Max)
 }
 
+// osFailureIsFatal splits the residual OS errors of the stat/read sites in
+// this package (view.go, edit.go, write.go, multiedit.go) by the
+// retry-invariance criterion of the tool error contract in tools.go: fatal
+// if and only if no resent path and no passage of time would make the call
+// succeed. EIO, EROFS, ENOSPC and ENOMEM are failures of the storage or
+// of the process itself — every path fails identically, so they stay at
+// contract level 3 and end the run. Everything else the OS can say about
+// a model-chosen path — EACCES/EPERM (no rights on that path), ENOTDIR
+// (a component is a file), ELOOP, ENAMETOOLONG, EINVAL (e.g. a NUL byte
+// in the path), ENOENT from a file that vanished between stat and read, a
+// file locked by another process — is correctable by the model sending a
+// different path, so those sites answer with a text-error response (level
+// 1) instead of killing the run.
+//
+// Unknown errnos default to recoverable on purpose: the contract requires
+// proof of retry-invariance before a failure may end the run, and an
+// unclassified errno proves nothing. The consciously accepted price: on
+// Windows a genuine carrier failure whose native error code does not
+// compare equal to the Go errno constants below (Go translates only some
+// Windows codes to them) is demoted along with the rest — the operator
+// then sees it as repeated tool errors in the session history instead of
+// in the run's fatal-error envelope. That is the lesser evil by the
+// contract's radius asymmetry: a demoted carrier failure costs turns that
+// are still visible in the transcript; a promoted path error costs the
+// whole session.
+func osFailureIsFatal(err error) bool {
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		switch errno {
+		case syscall.EIO, syscall.EROFS, syscall.ENOSPC, syscall.ENOMEM:
+			return true
+		}
+	}
+	return false
+}
+
 func NewViewTool(
 	permissions permission.Service,
 	filetracker filetracker.Service,
@@ -120,12 +157,24 @@ func NewViewTool(
 			// Check if file is outside working directory and request permission if needed
 			absWorkingDir, err := filepath.Abs(workingDir)
 			if err != nil {
-				return fantasy.ToolResponse{}, fmt.Errorf("error resolving working directory: %w", err)
+				// workingDir is tool wiring, not model input, so strictly
+				// this failure is retry-invariant. It still answers as a
+				// response, matching ls.go's identical site, because the
+				// likeliest cause — the process cwd having been deleted or
+				// unmounted — is something the operator can repair while
+				// the session stays alive.
+				return fantasy.NewTextErrorResponse(fmt.Sprintf(
+					"Error resolving the working directory %q: %v. The session's working directory cannot be resolved to an absolute path — it may have been deleted or unmounted. No file was read. This is an environment problem for the operator, not a path problem.",
+					workingDir, err)), nil
 			}
 
 			absFilePath, err := filepath.Abs(filePath)
 			if err != nil {
-				return fantasy.ToolResponse{}, fmt.Errorf("error resolving file path: %w", err)
+				// The model's own path string made the OS refuse to even
+				// resolve it; that is correctable input, so level 1.
+				return fantasy.NewTextErrorResponse(fmt.Sprintf(
+					"The OS rejected the file path %q: %v. The path string itself is invalid — common causes are an embedded NUL or other control character, a name too long for the filesystem, or a malformed path component. Nothing was read. Resend the path built from regular characters and valid separators.",
+					params.FilePath, err)), nil
 			}
 
 			relPath, err := filepath.Rel(absWorkingDir, absFilePath)
@@ -134,7 +183,14 @@ func NewViewTool(
 
 			sessionID := GetSessionFromContext(ctx)
 			if sessionID == "" {
-				return fantasy.ToolResponse{}, fmt.Errorf("session ID is required for accessing files outside working directory")
+				// Deliberately unconditional, unlike ls.go where the check
+				// lives inside the outside-workdir branch: a successful read
+				// records the file in the session's file tracker at the
+				// bottom of this function, so the session ID is needed on
+				// the common path too, not only for the permission request.
+				// A missing session ID is wiring, invariant to retry, so it
+				// stays fatal (level 3).
+				return fantasy.ToolResponse{}, fmt.Errorf("session ID is required for recording file reads and for accessing files outside the working directory")
 			}
 
 			// Request permission for files outside working directory, unless it's a skill file.
@@ -188,7 +244,12 @@ func NewViewTool(
 
 					return fantasy.NewTextErrorResponse(fmt.Sprintf("File not found: %s", filePath)), nil
 				}
-				return fantasy.ToolResponse{}, fmt.Errorf("error accessing file: %w", err)
+				if osFailureIsFatal(err) {
+					return fantasy.ToolResponse{}, fmt.Errorf("error accessing file: %w", err)
+				}
+				return fantasy.NewTextErrorResponse(fmt.Sprintf(
+					"Cannot access %s: %v. The OS rejected this path — common causes are no read permission somewhere along the path, a path component that is a file rather than a directory, a symlink loop, or a name too long for the filesystem. Nothing was read. Try a different path or a corrected form of this one.",
+					filePath, err)), nil
 			}
 
 			// Check if it's a directory
@@ -218,7 +279,12 @@ func NewViewTool(
 
 				imageData, readErr := os.ReadFile(filePath)
 				if readErr != nil {
-					return fantasy.ToolResponse{}, fmt.Errorf("error reading image file: %w", readErr)
+					if osFailureIsFatal(readErr) {
+						return fantasy.ToolResponse{}, fmt.Errorf("error reading image file: %w", readErr)
+					}
+					return fantasy.NewTextErrorResponse(fmt.Sprintf(
+						"Cannot read image file %s: %v. The file was found but could not be read — it may have been deleted or locked by another process since it was found, or the path lacks read permission. No image content was returned. Try viewing it again or use a different path.",
+						filePath, readErr)), nil
 				}
 
 				// Some tools save files with a mismatched extension
@@ -244,7 +310,12 @@ func NewViewTool(
 					return fantasy.NewTextErrorResponse(fmt.Sprintf("Content section is too large (%d bytes). Maximum size is %d bytes",
 						tooLarge.Size, tooLarge.Max)), nil
 				}
-				return fantasy.ToolResponse{}, fmt.Errorf("error reading file: %w", err)
+				if osFailureIsFatal(err) {
+					return fantasy.ToolResponse{}, fmt.Errorf("error reading file: %w", err)
+				}
+				return fantasy.NewTextErrorResponse(fmt.Sprintf(
+					"Cannot read %s: %v. The file was found but could not be read — it may have been deleted or locked by another process since it was found, or the path lacks read permission. No file content was returned. Try viewing it again or use a different path.",
+					filePath, err)), nil
 			}
 			if !utf8.ValidString(content) {
 				return fantasy.NewTextErrorResponse("File content is not valid UTF-8"), nil

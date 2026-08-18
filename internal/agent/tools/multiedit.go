@@ -158,7 +158,12 @@ func processMultiEditWithCreation(edit editContext, params MultiEditParams, call
 	if _, err := os.Stat(params.FilePath); err == nil {
 		return fantasy.NewTextErrorResponse(fmt.Sprintf("file already exists: %s", params.FilePath)), nil
 	} else if !os.IsNotExist(err) {
-		return fantasy.ToolResponse{}, fmt.Errorf("failed to access file: %w", err)
+		if osFailureIsFatal(err) {
+			return fantasy.ToolResponse{}, fmt.Errorf("failed to access file: %w", err)
+		}
+		return fantasy.NewTextErrorResponse(fmt.Sprintf(
+			"Cannot access %s: %v. The OS rejected this path — common causes are no permission somewhere along the path, a path component that is a file rather than a directory, a name too long for the filesystem, or an invalid character in the name. The file was not created and nothing was written. Try a different path or a corrected form of this one.",
+			params.FilePath, err)), nil
 	}
 
 	// Create parent directories

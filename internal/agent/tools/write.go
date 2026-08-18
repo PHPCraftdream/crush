@@ -90,7 +90,12 @@ func NewWriteTool(
 					return fantasy.NewTextErrorResponse(fmt.Sprintf("File %s already contains the exact content. No changes made.", filePath)), nil
 				}
 			} else if !os.IsNotExist(err) {
-				return fantasy.ToolResponse{}, fmt.Errorf("error checking file: %w", err)
+				if osFailureIsFatal(err) {
+					return fantasy.ToolResponse{}, fmt.Errorf("error checking file: %w", err)
+				}
+				return fantasy.NewTextErrorResponse(fmt.Sprintf(
+					"Cannot access %s: %v. The OS rejected this path — common causes are no permission somewhere along the path, a path component that is a file rather than a directory, or an invalid character in the name. Nothing was written. Try a different path or a corrected form of this one.",
+					filePath, err)), nil
 			}
 
 			dir := filepath.Dir(filePath)

@@ -135,7 +135,14 @@ func NewSourcegraphTool(client *http.Client) fantasy.AgentTool {
 
 			resp, err := client.Do(req)
 			if err != nil {
-				return fantasy.ToolResponse{}, fmt.Errorf("failed to fetch URL: %w", err)
+				return fantasy.NewTextErrorResponse(fmt.Sprintf(
+					"Sourcegraph search failed at the network level: could not "+
+						"reach https://sourcegraph.com/.api/graphql: %v. This is "+
+						"not a problem with the query — it was never executed and "+
+						"nothing was returned. The failure may be transient: retry "+
+						"later, or fall back to local search (grep/glob).",
+					err,
+				)), nil
 			}
 			defer resp.Body.Close()
 

@@ -246,7 +246,10 @@ func TestSSRFGuardedClient_AllowPrivateReachesLoopback(t *testing.T) {
 
 // TestDownloadTool_SSRFBlockedOnLoopback checks the tool end-to-end:
 // with the default (nil → guarded) client, a download targeting a
-// 127.0.0.1 httptest.Server must fail before any body is written to disk.
+// 127.0.0.1 httptest.Server must be refused before any body is written
+// to disk. The refusal reaches the MODEL as an error response (the
+// loopback URL is model input, correctable per the tool error contract),
+// so Run's error must be nil.
 func TestDownloadTool_SSRFBlockedOnLoopback(t *testing.T) {
 	t.Parallel()
 
@@ -263,14 +266,17 @@ func TestDownloadTool_SSRFBlockedOnLoopback(t *testing.T) {
 	input, err := json.Marshal(DownloadParams{URL: srv.URL, FilePath: "leaked.bin"})
 	require.NoError(t, err)
 
-	_, runErr := tool.Run(ctx, fantasy.ToolCall{
+	resp, runErr := tool.Run(ctx, fantasy.ToolCall{
 		ID:    "test-call",
 		Name:  DownloadToolName,
 		Input: string(input),
 	})
-	require.Error(t, runErr, "guarded download must refuse a loopback URL")
-	require.True(t, errors.Is(runErr, errSSRFBlocked),
-		"download error must wrap errSSRFBlocked, got: %v", runErr)
+	require.NoError(t, runErr,
+		"a returned error is level 3 and would abort the whole run; the "+
+			"refusal must be a response the model can learn from")
+	require.True(t, resp.IsError, "a blocked download must be an error response")
+	require.Contains(t, resp.Content, "blocked by SSRF guard",
+		"the model must be told WHY the download was refused, got: %s", resp.Content)
 
 	// Nothing reached disk.
 	entries, err := os.ReadDir(workingDir)
@@ -279,8 +285,9 @@ func TestDownloadTool_SSRFBlockedOnLoopback(t *testing.T) {
 }
 
 // TestFetchTool_SSRFBlockedOnLoopback checks the fetch tool: with the
-// default (nil → guarded) client, fetching a 127.0.0.1 URL must fail and
-// must NOT return the body in the tool response.
+// default (nil → guarded) client, fetching a 127.0.0.1 URL must be
+// refused as an error response (model input, level 1 per the tool error
+// contract) and must NOT return the body in the tool response.
 func TestFetchTool_SSRFBlockedOnLoopback(t *testing.T) {
 	t.Parallel()
 
@@ -303,9 +310,12 @@ func TestFetchTool_SSRFBlockedOnLoopback(t *testing.T) {
 		Name:  FetchToolName,
 		Input: string(input),
 	})
-	require.Error(t, runErr, "guarded fetch must refuse a loopback URL")
-	require.True(t, errors.Is(runErr, errSSRFBlocked),
-		"fetch error must wrap errSSRFBlocked, got: %v", runErr)
+	require.NoError(t, runErr,
+		"a returned error is level 3 and would abort the whole run; the "+
+			"refusal must be a response the model can learn from")
+	require.True(t, resp.IsError, "a blocked fetch must be an error response")
+	require.Contains(t, resp.Content, "blocked by SSRF guard",
+		"the model must be told WHY the fetch was refused, got: %s", resp.Content)
 
 	// Even defensively: no response content may contain the secret body.
 	require.NotContains(t, resp.Content, secret, "blocked fetch must not leak body text")
