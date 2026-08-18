@@ -48,6 +48,17 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **`crush sessions reap` no longer abandons a lock because something
+  held the file open for a moment.** On Windows a file cannot be
+  unlinked while any handle to it is open, and reap tried exactly once:
+  if the handle let go a millisecond later, the operator was still told
+  `failed to remove (… used by another process) … reclaimed 0 lock(s)`
+  and had to delete the file by hand — the one chore the command exists
+  to spare them. The likeliest holder was reap's own probe, since
+  releasing a lock clears the holder's metadata in the background and
+  reopens the file to do it, so the command could lose the race to
+  itself. It now retries the unlink for up to three seconds, exactly as
+  `crush sessions kill` already did.
 - **A tool refusing your input no longer kills the whole run.** A
   handful of ordinary, correctable situations used to end the session
   outright, with nothing written to the log — the operator saw a run

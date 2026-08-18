@@ -44,6 +44,13 @@ crush sessions reap --all      # also nuke locks with unreadable PIDs
 	RunE: sessionsReapCmdRun,
 }
 
+// reapRemoveRetryWindow bounds how long reap keeps retrying the unlink of a
+// lock it has already proven dead. It only has to outlast a handle that is
+// on its way out (see the call site), so seconds, not tens of seconds — a
+// handle still open after this is held by something that is not going to
+// let go, and reporting the failure beats hanging the sweep.
+const reapRemoveRetryWindow = 3 * time.Second
+
 type reapItem struct {
 	Path   string
 	PID    int
@@ -170,7 +177,24 @@ func sessionsReapCmdRun(cmd *cobra.Command, args []string) error {
 		case "remove-dead":
 			action := "would remove"
 			if !dryRun {
-				if err := os.Remove(it.Path); err == nil || os.IsNotExist(err) {
+				// Not a bare os.Remove: on Windows the unlink fails with
+				// ERROR_SHARING_VIOLATION while ANY handle to the file is
+				// still open, and at this point one plausibly is. Release()
+				// above closes the lock handle synchronously but then clears
+				// the holder metadata in a goroutine that reopens the file,
+				// and it only waits releaseMetadataCleanupBound (50ms) for
+				// that goroutine before returning — on a loaded machine the
+				// reopened handle outlives the wait. An indexer or scanner
+				// touching a freshly written file does the same thing.
+				//
+				// Either way the condition clears on its own in
+				// milliseconds, so giving up after one attempt turns a
+				// transient handle into "reclaimed 0 lock(s)" and leaves the
+				// orphan for the operator to delete by hand — which is the
+				// one thing this command exists to avoid. `sessions kill`
+				// already removes locks through this same helper for the
+				// same reason.
+				if err := removeLockWithRetry(it.Path, reapRemoveRetryWindow); err == nil {
 					action = "removed"
 					removed++
 				} else {
