@@ -62,8 +62,20 @@ func TestBuildTools_AllowPrivateNetworkFetchEscapeHatch(t *testing.T) {
 		coord := newWorkerToolTestCoordinator(t, env, false)
 		require.False(t, coord.cfg.Config().Options.AllowPrivateNetworkFetch, "must default to false")
 
-		_, err := runDownload(t, coord)
-		require.Error(t, err, "download to a loopback httptest.Server must be blocked by default")
+		resp, err := runDownload(t, coord)
+		// The refusal reaches the MODEL, not the agent loop: a loopback URL
+		// is model input like any other bad URL, so per the tool error
+		// contract (internal/agent/tools/tools.go) it is a level-1 response.
+		// A returned error would be level 3 and would end the whole run.
+		// This test used to require exactly that error; the assertion moved
+		// with the behaviour, and the pair still separates the two cases —
+		// blocked is IsError, allowed is not.
+		require.NoError(t, err,
+			"a returned error would abort the run; the refusal must be a response")
+		require.True(t, resp.IsError,
+			"download to a loopback httptest.Server must be blocked by default")
+		require.Contains(t, resp.Content, "blocked by SSRF guard",
+			"the model must be told why it was refused, got: %s", resp.Content)
 	})
 
 	t.Run("option on, loopback download succeeds", func(t *testing.T) {
