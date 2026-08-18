@@ -63,9 +63,15 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   - a malformed or unreachable URL passed to `download`, `fetch` or
     `sourcegraph` — an HTTP 404 was already recoverable while a DNS
     failure was fatal, though both mean "the model gave a bad URL";
-  - a path the OS rejects in `view`, `edit`, `write` or `multiedit` —
-    permission denied, a path component that is a file, a name too
-    long, or a file that vanished between two syscalls;
+  - a path the OS rejects in `view`, `edit`, `write` or `multiedit`
+    while the file is being *examined* — permission denied, a name too
+    long, an embedded NUL, or a file that vanished between two
+    syscalls. Note the limit: this covers the stat/read step only.
+    Directory creation and the final write are a separate, still-open
+    class, so a path whose parent is a file (`notes.txt/child.md`)
+    still ends the run — on Windows always, since `os.Stat` reports
+    that case as plain "not found" and the check above never sees it;
+
   - a full background-job table. This one hurt most: because crush
     auto-backgrounds long commands, an ordinary `ls` ended the session
     whenever 50 jobs happened to be alive — a normal state for a

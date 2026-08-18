@@ -110,15 +110,26 @@ func (e contentTooLargeError) Error() string {
 //
 // Unknown errnos default to recoverable on purpose: the contract requires
 // proof of retry-invariance before a failure may end the run, and an
-// unclassified errno proves nothing. The consciously accepted price: on
-// Windows a genuine carrier failure whose native error code does not
-// compare equal to the Go errno constants below (Go translates only some
-// Windows codes to them) is demoted along with the rest — the operator
-// then sees it as repeated tool errors in the session history instead of
-// in the run's fatal-error envelope. That is the lesser evil by the
-// contract's radius asymmetry: a demoted carrier failure costs turns that
-// are still visible in the transcript; a promoted path error costs the
-// whole session.
+// unclassified errno proves nothing.
+//
+// ON WINDOWS THIS FUNCTION ALWAYS RETURNS FALSE, which is worse than the
+// earlier wording here admitted. EIO, EROFS, ENOSPC and ENOMEM are not
+// Windows error codes at all; Go defines them there as synthetic
+// APPLICATION_ERROR+n values (measured: 536870952, 536871024, 536870996,
+// 536870991) that no native code can equal. ERROR_DISK_FULL(112),
+// ERROR_HANDLE_DISK_FULL(39), ERROR_CRC(23), ERROR_IO_DEVICE(1117) and
+// ERROR_WRITE_PROTECT(19) were all checked and all compare unequal. So
+// this is a Unix-only split; on Windows it degenerates into demoting
+// everything, including a full disk.
+//
+// Said plainly, because the contract in tools.go promises the opposite:
+// on Windows an infrastructure failure that stays broken for the rest of
+// the session reaches the operator only as repeated tool errors in the
+// transcript, never through the run's fatal envelope. Closing this needs
+// a windows-tagged classifier over the native codes above. Until then the
+// demotion is still the lesser evil by the radius asymmetry — a demoted
+// carrier failure costs turns that remain visible, a promoted path error
+// costs the whole session — but it is a gap, not a rare edge case.
 func osFailureIsFatal(err error) bool {
 	var errno syscall.Errno
 	if errors.As(err, &errno) {
