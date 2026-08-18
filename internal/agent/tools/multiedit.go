@@ -169,7 +169,12 @@ func processMultiEditWithCreation(edit editContext, params MultiEditParams, call
 	// Create parent directories
 	dir := filepath.Dir(params.FilePath)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fantasy.ToolResponse{}, fmt.Errorf("failed to create parent directories: %w", err)
+		if osFailureIsFatal(err) {
+			return fantasy.ToolResponse{}, fmt.Errorf("failed to create parent directories: %w", err)
+		}
+		return fantasy.NewTextErrorResponse(fmt.Sprintf(
+			"Cannot create the parent directory for %s: %v. A path component is a file rather than a directory, the target exists with different permissions, or the OS refused to create it. The file was not created and nothing was written. Try a different path or a corrected form of this one.",
+			params.FilePath, err)), nil
 	}
 
 	// Start with the content from the first edit, then apply the remaining
@@ -224,7 +229,12 @@ func processMultiEditWithCreation(edit editContext, params MultiEditParams, call
 	// Write the file
 	err = fsext.AtomicWriteFile(params.FilePath, []byte(currentContent), 0o644)
 	if err != nil {
-		return fantasy.ToolResponse{}, fmt.Errorf("failed to write file: %w", err)
+		if osFailureIsFatal(err) {
+			return fantasy.ToolResponse{}, fmt.Errorf("failed to write file: %w", err)
+		}
+		return fantasy.NewTextErrorResponse(fmt.Sprintf(
+			"Cannot write %s: %v. The OS refused the final write or rename — the file or a directory along its path is read-only, the target is a directory, or another process holds it. Nothing was changed and the temporary file was cleaned up. Try a different path, or fix the permissions and retry.",
+			params.FilePath, err)), nil
 	}
 
 	// Update file history
@@ -330,8 +340,10 @@ func processMultiEditExistingFile(edit editContext, params MultiEditParams, call
 		writeContent, _ = fsext.ToWindowsLineEndings(writeContent)
 	}
 
-	if err := commitFileChange(edit, sessionID, params.FilePath, oldContent, writeContent); err != nil {
+	if resp, err := commitFileChange(edit, sessionID, params.FilePath, oldContent, writeContent); err != nil {
 		return fantasy.ToolResponse{}, err
+	} else if resp.IsError {
+		return resp, nil
 	}
 
 	var message string

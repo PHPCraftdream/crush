@@ -100,7 +100,12 @@ func NewWriteTool(
 
 			dir := filepath.Dir(filePath)
 			if err = os.MkdirAll(dir, 0o755); err != nil {
-				return fantasy.ToolResponse{}, fmt.Errorf("error creating directory: %w", err)
+				if osFailureIsFatal(err) {
+					return fantasy.ToolResponse{}, fmt.Errorf("error creating directory: %w", err)
+				}
+				return fantasy.NewTextErrorResponse(fmt.Sprintf(
+					"Cannot create the parent directory for %s: %v. A path component is a file rather than a directory, the target exists with different permissions, or the OS refused to create it. Nothing was written. Try a different path or a corrected form of this one.",
+					filePath, err)), nil
 			}
 
 			oldContent := ""
@@ -148,7 +153,12 @@ func NewWriteTool(
 
 			err = fsext.AtomicWriteFile(filePath, []byte(params.Content), 0o644)
 			if err != nil {
-				return fantasy.ToolResponse{}, fmt.Errorf("error writing file: %w", err)
+				if osFailureIsFatal(err) {
+					return fantasy.ToolResponse{}, fmt.Errorf("error writing file: %w", err)
+				}
+				return fantasy.NewTextErrorResponse(fmt.Sprintf(
+					"Cannot write %s: %v. The OS refused the final write or rename — the file or a directory along its path is read-only, the target is a directory, or another process holds it. Nothing was changed and the temporary file was cleaned up. Try a different path, or fix the permissions and retry.",
+					filePath, err)), nil
 			}
 
 			// Check if file exists in history

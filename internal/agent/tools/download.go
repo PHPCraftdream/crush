@@ -159,7 +159,12 @@ func NewDownloadTool(permissions permission.Service, workingDir string, client *
 
 			// Create parent directories if they don't exist
 			if err := os.MkdirAll(filepath.Dir(filePath), 0o755); err != nil {
-				return fantasy.ToolResponse{}, fmt.Errorf("failed to create parent directories: %w", err)
+				if osFailureIsFatal(err) {
+					return fantasy.ToolResponse{}, fmt.Errorf("failed to create parent directories: %w", err)
+				}
+				return fantasy.NewTextErrorResponse(fmt.Sprintf(
+					"The download itself succeeded, but the parent directory for %s could not be created: %v. A path component of the file_path is a file rather than a directory, or the OS refused to create it. Nothing was saved. Retry with a corrected file_path.",
+					filePath, err)), nil
 			}
 
 			// Write to a temp file in the same directory, then rename over
@@ -171,7 +176,12 @@ func NewDownloadTool(permissions permission.Service, workingDir string, client *
 			// enough that buffering the whole body first would be wasteful.
 			tmpFile, err := os.CreateTemp(filepath.Dir(filePath), filepath.Base(filePath)+".*.tmp")
 			if err != nil {
-				return fantasy.ToolResponse{}, fmt.Errorf("failed to create output file: %w", err)
+				if osFailureIsFatal(err) {
+					return fantasy.ToolResponse{}, fmt.Errorf("failed to create output file: %w", err)
+				}
+				return fantasy.NewTextErrorResponse(fmt.Sprintf(
+					"Cannot create a temporary file next to %s: %v. The directory likely denies file creation to this process — a permission setting or a lock on it. Nothing was saved. Retry with a different path.",
+					filePath, err)), nil
 			}
 			tmpPath := tmpFile.Name()
 			cleanupTmp := func() { _ = os.Remove(tmpPath) }
@@ -184,7 +194,12 @@ func NewDownloadTool(permissions permission.Service, workingDir string, client *
 			if err != nil {
 				tmpFile.Close()
 				cleanupTmp()
-				return fantasy.ToolResponse{}, fmt.Errorf("failed to write file: %w", err)
+				if osFailureIsFatal(err) {
+					return fantasy.ToolResponse{}, fmt.Errorf("failed to write file: %w", err)
+				}
+				return fantasy.NewTextErrorResponse(fmt.Sprintf(
+					"The copy to %s stopped midway: %v. The connection broke, or the disk or OS refused the write. The partial temporary file was cleaned up and nothing was saved. Retry the download or use a different path.",
+					filePath, err)), nil
 			}
 			if bytesWritten > MaxDownloadBytes {
 				tmpFile.Close()
@@ -199,20 +214,40 @@ func NewDownloadTool(permissions permission.Service, workingDir string, client *
 			if err := tmpFile.Chmod(0o644); err != nil {
 				tmpFile.Close()
 				cleanupTmp()
-				return fantasy.ToolResponse{}, fmt.Errorf("failed to set output file permissions: %w", err)
+				if osFailureIsFatal(err) {
+					return fantasy.ToolResponse{}, fmt.Errorf("failed to set output file permissions: %w", err)
+				}
+				return fantasy.NewTextErrorResponse(fmt.Sprintf(
+					"Could not set permissions on the temporary file for %s: %v. The temporary file was cleaned up and nothing was saved. Retry the download or use a different path.",
+					filePath, err)), nil
 			}
 			if err := tmpFile.Sync(); err != nil {
 				tmpFile.Close()
 				cleanupTmp()
-				return fantasy.ToolResponse{}, fmt.Errorf("failed to flush output file: %w", err)
+				if osFailureIsFatal(err) {
+					return fantasy.ToolResponse{}, fmt.Errorf("failed to flush output file: %w", err)
+				}
+				return fantasy.NewTextErrorResponse(fmt.Sprintf(
+					"Could not flush the temporary file for %s: %v. The temporary file was cleaned up and nothing was saved. Retry the download or use a different path.",
+					filePath, err)), nil
 			}
 			if err := tmpFile.Close(); err != nil {
 				cleanupTmp()
-				return fantasy.ToolResponse{}, fmt.Errorf("failed to close output file: %w", err)
+				if osFailureIsFatal(err) {
+					return fantasy.ToolResponse{}, fmt.Errorf("failed to close output file: %w", err)
+				}
+				return fantasy.NewTextErrorResponse(fmt.Sprintf(
+					"Could not close the temporary file for %s: %v. The temporary file was cleaned up and nothing was saved. Retry the download or use a different path.",
+					filePath, err)), nil
 			}
 			if err := os.Rename(tmpPath, filePath); err != nil {
 				cleanupTmp()
-				return fantasy.ToolResponse{}, fmt.Errorf("failed to finalize downloaded file: %w", err)
+				if osFailureIsFatal(err) {
+					return fantasy.ToolResponse{}, fmt.Errorf("failed to finalize downloaded file: %w", err)
+				}
+				return fantasy.NewTextErrorResponse(fmt.Sprintf(
+					"Cannot finalize the download at %s: %v. The target may be an existing directory, a read-only file, or held by another process. The downloaded bytes were removed with the temporary file. Retry with a corrected file_path.",
+					filePath, err)), nil
 			}
 
 			contentType := resp.Header.Get("Content-Type")

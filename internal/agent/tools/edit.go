@@ -122,7 +122,12 @@ func createNewFile(edit editContext, filePath, content string, call fantasy.Tool
 
 	dir := filepath.Dir(filePath)
 	if err = os.MkdirAll(dir, 0o755); err != nil {
-		return fantasy.ToolResponse{}, fmt.Errorf("failed to create parent directories: %w", err)
+		if osFailureIsFatal(err) {
+			return fantasy.ToolResponse{}, fmt.Errorf("failed to create parent directories: %w", err)
+		}
+		return fantasy.NewTextErrorResponse(fmt.Sprintf(
+			"Cannot create the parent directory for %s: %v. A path component is a file rather than a directory, the target exists with different permissions, or the OS refused to create it. The file was not created and nothing was written. Try a different path or a corrected form of this one.",
+			filePath, err)), nil
 	}
 
 	sessionID := GetSessionFromContext(edit.ctx)
@@ -167,7 +172,12 @@ func createNewFile(edit editContext, filePath, content string, call fantasy.Tool
 
 	err = fsext.AtomicWriteFile(filePath, []byte(content), 0o644)
 	if err != nil {
-		return fantasy.ToolResponse{}, fmt.Errorf("failed to write file: %w", err)
+		if osFailureIsFatal(err) {
+			return fantasy.ToolResponse{}, fmt.Errorf("failed to write file: %w", err)
+		}
+		return fantasy.NewTextErrorResponse(fmt.Sprintf(
+			"Cannot write %s: %v. The OS refused the final write or rename — the file or a directory along its path is read-only, the target is a directory, or another process holds it. Nothing was changed and the temporary file was cleaned up. Try a different path, or fix the permissions and retry.",
+			filePath, err)), nil
 	}
 
 	// File can't be in the history so we create a new file history
@@ -223,21 +233,31 @@ func findAndReplace(content, old, new string, replaceAll bool) (string, error) {
 
 // commitFileChange writes newContent to filePath, updates the file history,
 // and records the read in the file tracker. Callers must convert line
-// endings before calling this function.
+// endings before calling this function. It returns a Go error only for
+// contract-level-3 failures — media/resource write errors per
+// osFailureIsFatal, or a history-service failure; any other write or
+// rename refusal comes back as a level-1 text-error response with a nil
+// error, so the model can correct the path and retry. Callers must check
+// both returns and hand an error response straight back to the model.
 //
 // Fork patch (concurrency): uses fsext.AtomicWriteFile (write-to-tmp +
 // rename) instead of os.WriteFile so a kill -9 / OOM mid-write cannot leave
 // the user's file half-truncated. See CHANGELOG.fork.md (Section 4.I).
-func commitFileChange(edit editContext, sessionID, filePath, oldContent, newContent string) error {
+func commitFileChange(edit editContext, sessionID, filePath, oldContent, newContent string) (fantasy.ToolResponse, error) {
 	if err := fsext.AtomicWriteFile(filePath, []byte(newContent), 0o644); err != nil {
-		return fmt.Errorf("failed to write file: %w", err)
+		if osFailureIsFatal(err) {
+			return fantasy.ToolResponse{}, fmt.Errorf("failed to write file: %w", err)
+		}
+		return fantasy.NewTextErrorResponse(fmt.Sprintf(
+			"Cannot write %s: %v. The OS refused the final write or rename — the file or a directory along its path is read-only, the target is a directory, or another process holds it. Nothing was changed and the temporary file was cleaned up. Try a different path, or fix the permissions and retry.",
+			filePath, err)), nil
 	}
 
 	file, err := edit.files.GetByPathAndSession(edit.ctx, filePath, sessionID)
 	if err != nil {
 		_, err = edit.files.Create(edit.ctx, sessionID, filePath, oldContent)
 		if err != nil {
-			return fmt.Errorf("error creating file history: %w", err)
+			return fantasy.ToolResponse{}, fmt.Errorf("error creating file history: %w", err)
 		}
 	}
 	if file.Content != oldContent {
@@ -251,7 +271,7 @@ func commitFileChange(edit editContext, sessionID, filePath, oldContent, newCont
 	}
 
 	edit.filetracker.RecordRead(edit.ctx, sessionID, filePath)
-	return nil
+	return fantasy.ToolResponse{}, nil
 }
 
 // loadExistingFile stats and reads filePath, validating that it has been
@@ -364,8 +384,10 @@ func deleteContent(edit editContext, filePath, oldString string, replaceAll bool
 		writeContent, _ = fsext.ToWindowsLineEndings(writeContent)
 	}
 
-	if err := commitFileChange(edit, sessionID, filePath, oldContent, writeContent); err != nil {
+	if resp, err := commitFileChange(edit, sessionID, filePath, oldContent, writeContent); err != nil {
 		return fantasy.ToolResponse{}, err
+	} else if resp.IsError {
+		return resp, nil
 	}
 
 	return fantasy.WithResponseMetadata(
@@ -437,8 +459,10 @@ func replaceContent(edit editContext, filePath, oldString, newString string, rep
 		writeContent, _ = fsext.ToWindowsLineEndings(writeContent)
 	}
 
-	if err := commitFileChange(edit, sessionID, filePath, oldContent, writeContent); err != nil {
+	if resp, err := commitFileChange(edit, sessionID, filePath, oldContent, writeContent); err != nil {
 		return fantasy.ToolResponse{}, err
+	} else if resp.IsError {
+		return resp, nil
 	}
 
 	return fantasy.WithResponseMetadata(

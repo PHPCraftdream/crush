@@ -31,25 +31,44 @@ package tools
 //   - Covered: download, fetch, sourcegraph (malformed URL / dead
 //     network), view, edit, write, multiedit (OS-rejected path), todos
 //     (invalid enum, fixed by f51baaca), glob, grep, ls (bad pattern /
-//     missing path) as compliant controls.
-//   - NOT covered, on purpose: bash (separate work on this branch, and
-//     its input space is the command string, not JSON params);
-//     askquestion (its one Go error is the deliberate control-flow
-//     AskQuestionError that surfaces the question to the operator);
-//     webfetch, websearch, crushinfo, crushlogs, jobkill, joboutput (no
-//     returned-error sites at all, grep-verified — nothing for this
-//     guard to catch); listmcpresources and readmcpresource (fatal
-//     sites sit behind MCP client wiring this test does not have);
-//     readdelegationtranscript (its fatal sites are session/DB
-//     infrastructure, correctly fatal per the contract, and its
-//     model-input refusal path is already pinned by
-//     read_delegation_transcript_test.go).
+//     missing path) as compliant controls; the MkdirAll / final-write
+//     class — parent-path-component-is-a-file for write, edit,
+//     multiedit and download, download file_path naming an existing
+//     directory, and write/edit onto a read-only file (the final
+//     rename); view's residual branches — a file that cannot be opened
+//     for reading (share-locked on Windows, unreadable mode elsewhere)
+//     and, on Windows, the ERROR_INVALID_NAME stat residual.
+//   - NOT covered, on purpose: bash (its input space is the command
+//     string, not JSON params — separate work); askquestion (its one
+//     Go error is the deliberate control-flow AskQuestionError that
+//     surfaces the question to the operator); webfetch, websearch,
+//     crushinfo, crushlogs, jobkill, joboutput (no returned-error
+//     sites, grep-verified — nothing for this guard to catch);
+//     mcp-tools.go, list_mcp_resources.go and read_mcp_resource.go
+//     (their level-3 sites are missing session IDs and MCP client
+//     wiring, which is session infrastructure, correctly fatal per
+//     the contract, and unreachable in this harness without an MCP
+//     server); readdelegationtranscript (its fatal sites are
+//     session/DB infrastructure, correctly fatal per the contract,
+//     and its model-input refusal path is already pinned by
+//     read_delegation_transcript_test.go); the deliberately-fatal
+//     residual of the errno split itself — media and resource
+//     failures (full disk, I/O device errors, write-protected media,
+//     out-of-memory) are SUPPOSED to stay level 3; this guard cannot
+//     construct them without a genuinely broken disk, so that half
+//     is pinned by the classifier unit tests (os_failure_*_test.go)
+//     instead; download's temp-file create/chmod/sync/close sites
+//     and MkdirAll under an unwritable parent (constructing those
+//     needs ACL-level permission setup that plain Go cannot do on
+//     Windows — measured: a directory's read-only attribute does NOT
+//     block child creation, MkdirAll and CreateTemp both succeed —
+//     so those sites share the classifier but have no direct guard
+//     input on this platform).
 //
-// The guard pins the boundary per tool, not per line: view.go also has
-// fatal errno returns at the image-read and text-read sites, but
-// reaching those deterministically requires a stat-succeeds-then-read-
-// fails filesystem state (corruption or a race), which is not model
-// input. The fix pattern for them is the same as for the sites below.
+// The guard pins the boundary per tool, not per line: view.go's
+// text-read residual is now reached deterministically (a share-
+// locked or unreadable file); the image-read site shares the
+// identical call shape and classifier.
 
 import (
 	"context"
@@ -59,6 +78,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -130,11 +150,13 @@ func TestErrorContract_BadModelInputIsAResponseNotAnError(t *testing.T) {
 		return runContractTool(t, ctx, tool, name, params)
 	}
 
-	cases := []struct {
+	type contractCase struct {
 		tool string
 		desc string
 		run  func() (fantasy.ToolResponse, error)
-	}{
+	}
+
+	cases := []contractCase{
 		{
 			tool: "download",
 			desc: `malformed URL "http://exa mple.com/x"`,
@@ -219,6 +241,117 @@ func TestErrorContract_BadModelInputIsAResponseNotAnError(t *testing.T) {
 					MultiEditParams{FilePath: nulPath, Edits: []MultiEditOperation{{NewString: "x"}}})
 			},
 		},
+		{
+			// write.go MkdirAll: os.Stat of notes.txt/child.md fails
+			// with ENOTDIR but os.IsNotExist is TRUE (measured), so the
+			// demoted `!os.IsNotExist` branch is skipped and control
+			// reaches the unconditionally fatal MkdirAll.
+			tool: "write",
+			desc: `parent path component is a file (notes.txt/child.md)`,
+			run: func() (fantasy.ToolResponse, error) {
+				dir := t.TempDir()
+				require.NoError(t, os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("x"), 0o644))
+				return run(NewWriteTool(&mockPermissionService{}, &mockHistoryService{}, mockFileTrackerService{}, dir),
+					WriteToolName,
+					WriteParams{FilePath: "notes.txt/child.md", Content: "x"})
+			},
+		},
+		{
+			// edit.go MkdirAll in file-creation mode: same ENOTDIR-but-
+			// IsNotExist stat, same fall-through to a fatal MkdirAll.
+			tool: "edit",
+			desc: `parent path component is a file (notes.txt/child.md), file-creation mode`,
+			run: func() (fantasy.ToolResponse, error) {
+				dir := t.TempDir()
+				require.NoError(t, os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("x"), 0o644))
+				return run(NewEditTool(&mockPermissionService{}, &mockHistoryService{}, mockFileTrackerService{}, dir),
+					EditToolName,
+					EditParams{FilePath: "notes.txt/child.md", NewString: "x"})
+			},
+		},
+		{
+			// multiedit.go MkdirAll in file-creation mode: same
+			// fall-through as edit.
+			tool: "multiedit",
+			desc: `parent path component is a file (notes.txt/child.md), file-creation mode`,
+			run: func() (fantasy.ToolResponse, error) {
+				dir := t.TempDir()
+				require.NoError(t, os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("x"), 0o644))
+				return run(NewMultiEditTool(&mockPermissionService{}, &mockHistoryService{}, mockFileTrackerService{}, dir),
+					MultiEditToolName,
+					MultiEditParams{FilePath: "notes.txt/child.md", Edits: []MultiEditOperation{{NewString: "x"}}})
+			},
+		},
+		{
+			// download.go MkdirAll: the fetch already succeeded when the
+			// parent of the target turns out to live under the file
+			// notes.txt, and the fatal MkdirAll kills the run anyway.
+			tool: "download",
+			desc: `parent path component is a file (notes.txt/child.md)`,
+			run: func() (fantasy.ToolResponse, error) {
+				dir := t.TempDir()
+				require.NoError(t, os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("x"), 0o644))
+				return run(NewDownloadTool(&mockPermissionService{}, dir, cannedClient(http.StatusOK, "payload")),
+					DownloadToolName,
+					DownloadParams{URL: "https://example.com/ok.bin", FilePath: "notes.txt/child.md"})
+			},
+		},
+		{
+			// download.go rename: MkdirAll of the parent succeeds (it is
+			// the working dir itself) and the temp file is fully written,
+			// but renaming a file over an existing directory is refused
+			// by the OS.
+			tool: "download",
+			desc: `file_path names an existing directory`,
+			run: func() (fantasy.ToolResponse, error) {
+				dir := t.TempDir()
+				require.NoError(t, os.Mkdir(filepath.Join(dir, "somedir"), 0o755))
+				return run(NewDownloadTool(&mockPermissionService{}, dir, cannedClient(http.StatusOK, "payload")),
+					DownloadToolName,
+					DownloadParams{URL: "https://example.com/ok.bin", FilePath: "somedir"})
+			},
+		},
+		{
+			// write.go final AtomicWriteFile rename: the temp file is
+			// written next to the read-only target, then the rename
+			// over it is refused.
+			tool: "write",
+			desc: `target file is read-only (rename refused)`,
+			run: func() (fantasy.ToolResponse, error) {
+				dir := t.TempDir()
+				roPath := filepath.Join(dir, "ro.txt")
+				require.NoError(t, os.WriteFile(roPath, []byte("old"), 0o644))
+				require.NoError(t, os.Chmod(roPath, 0o444))
+				t.Cleanup(func() { _ = os.Chmod(roPath, 0o644) })
+				return run(NewWriteTool(&mockPermissionService{}, &mockHistoryService{}, mockFileTrackerService{}, dir),
+					WriteToolName,
+					WriteParams{FilePath: "ro.txt", Content: "new content"})
+			},
+			// On Windows the atomic-write rename over a read-only file
+			// fails with ERROR_ACCESS_DENIED(5); on Linux rename
+			// ignores the target's write bit, so the case is vacuous
+			// there by design.
+		},
+		{
+			// edit.go final AtomicWriteFile rename via
+			// commitFileChange: same refusal on the read-only target.
+			tool: "edit",
+			desc: `target file is read-only (rename refused)`,
+			run: func() (fantasy.ToolResponse, error) {
+				dir := t.TempDir()
+				roPath := filepath.Join(dir, "ro.txt")
+				require.NoError(t, os.WriteFile(roPath, []byte("old"), 0o644))
+				require.NoError(t, os.Chmod(roPath, 0o444))
+				t.Cleanup(func() { _ = os.Chmod(roPath, 0o644) })
+				return run(NewEditTool(&mockPermissionService{}, &mockHistoryService{}, mockFileTrackerService{}, dir),
+					EditToolName,
+					EditParams{FilePath: "ro.txt", OldString: "old", NewString: "new"})
+			},
+			// On Windows the atomic-write rename over a read-only file
+			// fails with ERROR_ACCESS_DENIED(5); on Linux rename
+			// ignores the target's write bit, so the case is vacuous
+			// there by design.
+		},
 
 		// Compliant controls: the same bad-input diet on tools that
 		// already honour the contract. They must NOT appear in the
@@ -277,6 +410,59 @@ func TestErrorContract_BadModelInputIsAResponseNotAnError(t *testing.T) {
 					LSParams{Path: "no-such-dir"})
 			},
 		},
+	}
+
+	// A file that exists but cannot be opened: on Windows a shareMode-0
+	// CreateFile lock (os.Stat succeeds, os.Open fails errno 32), on
+	// Unix mode 000. It exercises view's residual osFailureIsFatal read
+	// branch, which is already compliant — this entry guards correct
+	// code and must stay green. Root (euid 0 on Unix) bypasses mode
+	// bits entirely, so the case is skipped there: root cannot be handed
+	// an unreadable file this way.
+	if !(runtime.GOOS != "windows" && os.Geteuid() == 0) {
+		cases = append(cases, contractCase{
+			tool: "view",
+			desc: `existing file that cannot be opened for reading (share-locked on Windows, unreadable mode elsewhere)`,
+			run: func() (fantasy.ToolResponse, error) {
+				dir := t.TempDir()
+				makeUnreadableFileForTest(t, dir, "unreadable.txt")
+				resp, err := run(NewViewTool(&mockPermissionService{}, mockFileTracker{}, nil, dir),
+					ViewToolName,
+					ViewParams{FilePath: "unreadable.txt"})
+				// A reachability proof, not a message pin (which the
+				// header forbids): err == nil alone would also pass if
+				// some earlier friendly branch handled the input, in
+				// which case the residual read branch was never
+				// exercised. Only the "Cannot read" response proves the
+				// stat-succeeded-open-failed path was actually taken.
+				require.NoError(t, err)
+				require.Contains(t, resp.Content, "Cannot read")
+				return resp, err
+			},
+		})
+	}
+
+	// Windows-only: '<' is an illegal filename character here, so
+	// os.Stat fails with ERROR_INVALID_NAME(123), and — measured —
+	// os.IsNotExist is FALSE, so it slips past the friendly not-found
+	// branch into view's residual Stat branch. On Unix '<' is a legal
+	// filename character, hence the windows-only build of this case.
+	if runtime.GOOS == "windows" {
+		cases = append(cases, contractCase{
+			tool: "view",
+			desc: `path with an invalid character "bad<name.txt" (ERROR_INVALID_NAME)`,
+			run: func() (fantasy.ToolResponse, error) {
+				dir := t.TempDir()
+				resp, err := run(NewViewTool(&mockPermissionService{}, mockFileTracker{}, nil, dir),
+					ViewToolName,
+					ViewParams{FilePath: "bad<name.txt"})
+				// Same reachability proof as above: the "Cannot access"
+				// response is what the residual Stat branch returns.
+				require.NoError(t, err)
+				require.Contains(t, resp.Content, "Cannot access")
+				return resp, err
+			},
+		})
 	}
 
 	var violations []string

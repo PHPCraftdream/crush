@@ -13,7 +13,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"unicode/utf8"
 
 	"charm.land/fantasy"
@@ -92,53 +91,6 @@ type contentTooLargeError struct {
 
 func (e contentTooLargeError) Error() string {
 	return fmt.Sprintf("content section is too large (%d bytes). Maximum size is %d bytes", e.Size, e.Max)
-}
-
-// osFailureIsFatal splits the residual OS errors of the stat/read sites in
-// this package (view.go, edit.go, write.go, multiedit.go) by the
-// retry-invariance criterion of the tool error contract in tools.go: fatal
-// if and only if no resent path and no passage of time would make the call
-// succeed. EIO, EROFS, ENOSPC and ENOMEM are failures of the storage or
-// of the process itself — every path fails identically, so they stay at
-// contract level 3 and end the run. Everything else the OS can say about
-// a model-chosen path — EACCES/EPERM (no rights on that path), ENOTDIR
-// (a component is a file), ELOOP, ENAMETOOLONG, EINVAL (e.g. a NUL byte
-// in the path), ENOENT from a file that vanished between stat and read, a
-// file locked by another process — is correctable by the model sending a
-// different path, so those sites answer with a text-error response (level
-// 1) instead of killing the run.
-//
-// Unknown errnos default to recoverable on purpose: the contract requires
-// proof of retry-invariance before a failure may end the run, and an
-// unclassified errno proves nothing.
-//
-// ON WINDOWS THIS FUNCTION ALWAYS RETURNS FALSE, which is worse than the
-// earlier wording here admitted. EIO, EROFS, ENOSPC and ENOMEM are not
-// Windows error codes at all; Go defines them there as synthetic
-// APPLICATION_ERROR+n values (measured: 536870952, 536871024, 536870996,
-// 536870991) that no native code can equal. ERROR_DISK_FULL(112),
-// ERROR_HANDLE_DISK_FULL(39), ERROR_CRC(23), ERROR_IO_DEVICE(1117) and
-// ERROR_WRITE_PROTECT(19) were all checked and all compare unequal. So
-// this is a Unix-only split; on Windows it degenerates into demoting
-// everything, including a full disk.
-//
-// Said plainly, because the contract in tools.go promises the opposite:
-// on Windows an infrastructure failure that stays broken for the rest of
-// the session reaches the operator only as repeated tool errors in the
-// transcript, never through the run's fatal envelope. Closing this needs
-// a windows-tagged classifier over the native codes above. Until then the
-// demotion is still the lesser evil by the radius asymmetry — a demoted
-// carrier failure costs turns that remain visible, a promoted path error
-// costs the whole session — but it is a gap, not a rare edge case.
-func osFailureIsFatal(err error) bool {
-	var errno syscall.Errno
-	if errors.As(err, &errno) {
-		switch errno {
-		case syscall.EIO, syscall.EROFS, syscall.ENOSPC, syscall.ENOMEM:
-			return true
-		}
-	}
-	return false
 }
 
 func NewViewTool(
