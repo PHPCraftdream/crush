@@ -96,9 +96,19 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   already gone, so the grandchild could never be found. Children are
   now started as process-group leaders and killed as a group on Unix,
   and enclosed in a kill-on-close Job Object on Windows, which does not
-  depend on the parent chain and also cleans up if crush itself dies.
-  The same leak had already been fixed once for stdio MCP servers,
-  where it had accumulated 15+ orphaned processes over two days.
+  depend on the parent chain. The same leak had already been fixed once
+  for stdio MCP servers, where it had accumulated 15+ orphaned
+  processes over two days.
+
+  Two limits worth knowing, both Unix-only. The Windows Job Object
+  doubles as a safety net — if crush itself is killed, the OS closes
+  the handle and the tree goes with it — and Unix has no equivalent, so
+  `crush sessions kill`, which targets crush's own pid, does not reach
+  a CLI child that now sits in its own process group. For the same
+  reason a second Ctrl-C (the first is handled; the second gets Go's
+  default handler and kills crush outright) no longer reaches the CLI
+  through the terminal's foreground group. Both are being tracked; the
+  ordinary cancel, watchdog and timeout paths are unaffected.
 
 - **Reasoning effort no longer breaks non-Claude CLI runs.** The
   session's stored effort was appended as `--effort <level>` to
