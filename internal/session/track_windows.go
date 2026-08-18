@@ -182,3 +182,34 @@ func pidIsSameProcess(pid int, createdAt windows.Filetime) bool {
 	}
 	return creation == createdAt
 }
+
+// KillAllTrackedTrees terminates every tracked job and forgets them. It is
+// the counterpart of the Unix sweep of the same name, and exists so a
+// last-resort exit path can be written once for both platforms.
+//
+// On Windows this is belt-and-braces rather than the only safety net: the
+// jobs are KILL_ON_JOB_CLOSE, so the OS already tears their trees down when
+// the dying process drops the last handle. Calling it explicitly makes the
+// teardown happen before exit rather than during it, and makes the two
+// platforms behave alike from the caller's point of view.
+//
+// Returns how many jobs it terminated. No identity check here, unlike
+// terminateTrackedJob: this runs when the process is going away, so every
+// tracked handle must be released regardless of whether its pid has been
+// recycled, and terminating a job we no longer own is not possible — the
+// handle IS the ownership.
+func KillAllTrackedTrees() int {
+	trackedJobsMu.Lock()
+	jobs := make([]windows.Handle, 0, len(trackedJobs))
+	for _, tj := range trackedJobs {
+		jobs = append(jobs, tj.handle)
+	}
+	trackedJobs = make(map[int]trackedJob)
+	trackedJobsMu.Unlock()
+
+	for _, h := range jobs {
+		_ = windows.TerminateJobObject(h, 1)
+		windows.CloseHandle(h)
+	}
+	return len(jobs)
+}

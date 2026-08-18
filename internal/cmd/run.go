@@ -582,6 +582,41 @@ crush run --restrict-run --role fast \
 		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, os.Kill)
 		defer cancel()
 
+		// Last-resort teardown for the SECOND interrupt.
+		//
+		// NotifyContext restores the default disposition after the signal it
+		// acts on, so a user who presses Ctrl-C again — the normal reaction
+		// when the first one appears to do nothing — kills crush outright,
+		// with none of its cleanup running. That used to be survivable: the
+		// terminal delivers the signal to its whole foreground process group,
+		// which the CLI child was part of, so the child died with us. It is
+		// not survivable since CLI children were given their own process
+		// groups; measured on Ubuntu 24.04, a SIGINT to the parent's group
+		// reaches a child spawned without Setpgid and does NOT reach one
+		// spawned with it (see internal/session/track_unix.go for the
+		// numbers). The child and its own descendants would simply keep
+		// running.
+		//
+		// So the second interrupt is caught rather than left to the default:
+		// sweep the process groups (Unix) or jobs (Windows) this process
+		// registered, then exit. Registering a handler means the second
+		// Ctrl-C no longer kills us instantly, so the sweep must be
+		// unconditionally followed by os.Exit — a hang here would take away
+		// the user's ability to stop crush at all, which is worse than the
+		// leak it prevents. 130 is the conventional status for
+		// SIGINT-terminated.
+		hardStop := make(chan os.Signal, 2)
+		signal.Notify(hardStop, os.Interrupt)
+		defer signal.Stop(hardStop)
+		go func() {
+			<-hardStop // first: NotifyContext is cancelling the run
+			<-hardStop // second: the user means it
+			if n := session.KillAllTrackedTrees(); n > 0 {
+				fmt.Fprintf(os.Stderr, "\ncrush: interrupted — killed %d CLI process tree(s)\n", n)
+			}
+			os.Exit(130)
+		}()
+
 		// Optional hard deadline. The agent run gets context.DeadlineExceeded
 		// instead of context.Canceled; agent.go's Run() distinguishes the two
 		// (see isRunTimeout there) so the in-flight assistant message finishes
