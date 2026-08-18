@@ -2049,6 +2049,12 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubA
 	// itself is still wrapped from the coder's side.
 	filteredTools = wrapToolsWithHooks(filteredTools, hookRunner, isSubAgent)
 
+	// Outermost, and unconditional: every tool failure must reach the log,
+	// including the ones wrapToolsWithHooks skips (no runner configured, or
+	// a sub-agent). See logged_tool.go — the incident that motivated it fell
+	// into exactly those gaps.
+	filteredTools = wrapToolsWithErrorLogging(filteredTools)
+
 	return filteredTools, nil
 }
 
