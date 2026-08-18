@@ -27,7 +27,10 @@ func spawnGroupChild(t *testing.T, ownGroup bool) (*exec.Cmd, <-chan error) {
 	// Deliberately not a round duration: other packages' tests run
 	// concurrently under the pre-push hook and also sleep, and a cleanup
 	// that matches on command line must not catch theirs.
-	cmd := exec.Command("sleep", "43.17")
+	// CommandContext, not Command: the linter forbids the context-less form,
+	// and the test context is the right one — if the test ends early the
+	// child dies with it instead of outliving the run for 43 seconds.
+	cmd := exec.CommandContext(t.Context(), "sleep", "43.17")
 	if ownGroup {
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	}

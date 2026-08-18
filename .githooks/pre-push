@@ -3,7 +3,9 @@
 #
 # Runs the same checks as .github/workflows/{build,lint}.yml:
 #   1. go build ./...                 — compile + //go:embed all:dist
-#   2. golangci-lint run              — v2.10, same as lint.yml (covers gofumpt)
+#   2. golangci-lint run              — v2.10, same as lint.yml (covers gofumpt),
+#                                       once per GOOS in the CI matrix so
+#                                       build-tagged files aren't skipped
 #   3. go test -short -failfast ./... — like build.yml, minus -race (that needs
 #                                       a local gcc/cgo that isn't guaranteed)
 #
@@ -47,11 +49,43 @@ step "go build ./..."
 go build ./... || fail "build failed"
 
 step "golangci-lint run ($GOLANGCI_VERSION)"
+gcl=""
 if command -v golangci-lint >/dev/null 2>&1; then
-	golangci-lint run || fail "lint failed"
+	gcl="golangci-lint"
+elif [ -x "$(go env GOPATH)/bin/golangci-lint" ]; then
+	gcl="$(go env GOPATH)/bin/golangci-lint"
+elif [ -x "$(go env GOPATH)/bin/golangci-lint.exe" ]; then
+	gcl="$(go env GOPATH)/bin/golangci-lint.exe"
+fi
+
+if [ -n "$gcl" ]; then
+	"$gcl" run || fail "lint failed"
 else
 	go run "github.com/golangci/golangci-lint/v2/cmd/golangci-lint@${GOLANGCI_VERSION}" run \
 		|| fail "lint failed (ran via 'go run'; install golangci-lint for speed)"
+fi
+
+# Cross-GOOS lint. lint.yml runs on ubuntu, macos AND windows, but the pass
+# above only ever sees the HOST's build tags — a file behind //go:build
+# !windows is invisible from Windows, and vice versa. That is not
+# hypothetical: a noctx finding in internal/session/track_unix_test.go
+# sailed through a green pre-push here and turned the lint workflow red,
+# which is the one thing this hook exists to prevent.
+#
+# `go run` cannot do this pass: with GOOS set it builds a foreign
+# golangci-lint binary and then cannot exec it. So when no native binary is
+# available this is skipped LOUDLY — silently covering only the host would
+# read as "lint is green" while saying nothing about two thirds of the CI
+# matrix.
+if [ -n "$gcl" ]; then
+	host_goos="$(go env GOHOSTOS)"
+	for goos in linux darwin windows; do
+		[ "$goos" = "$host_goos" ] && continue
+		step "golangci-lint run — GOOS=$goos"
+		GOOS="$goos" "$gcl" run || fail "lint failed for GOOS=$goos (CI lints all three)"
+	done
+else
+	printf '\033[33m⚠ skipping the cross-GOOS lint passes — they need a native golangci-lint (go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@%s); CI still lints linux/macos/windows\033[0m\n' "$GOLANGCI_VERSION"
 fi
 
 step "go test -short -failfast ./..."
