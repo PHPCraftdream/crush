@@ -1293,6 +1293,12 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 
 	var proc procHandle
 
+	// childPid is the direct CLI child's pid (0 when no start
+	// succeeded). It feeds the stream closure's deferred
+	// UntrackProcessTree, which releases Windows tree-teardown state
+	// on every exit path of the stream.
+	var childPid int
+
 	if !useStdin && !noPTY {
 		// Use a PTY so the subprocess (e.g. Node.js claude CLI) sees a TTY on
 		// stdout and does not buffer output internally. go-pty supports both
@@ -1322,6 +1328,16 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 			ptycmd := p.CommandContext(ctx, binaryPath, args...)
 			ptycmd.Dir = m.workingDir
 			if startErr := ptycmd.Start(); startErr == nil {
+				// Track the child's tree for teardown. On Windows this
+				// assigns a KILL_ON_JOB_CLOSE Job Object that
+				// KillProcess terminates (go-pty's ConPTY spawn
+				// hand-rolls CreateProcess, so post-Start tracking is
+				// the only hook we get). On Unix it is a no-op:
+				// go-pty's start() sets SysProcAttr{Setsid: true}, and
+				// a session leader is by definition a process-group
+				// leader, so KillProcess's group-kill path already
+				// applies.
+				childPid = trackChildTree(ptycmd.Process)
 				// Log command-line diagnostics. In production mode, args are sanitized
 				// to remove sensitive values (prompts, tokens). In diagnostic mode
 				// (CRUSH_CLIPROVIDER_LOG_RAW_PROMPT=1), the full args are logged.
@@ -1467,6 +1483,11 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 		}
 		cmd := platform.Command(ctx, binaryPath, args...)
 		cmd.Dir = m.workingDir
+		// Make the child a process-group leader so KillProcess can
+		// kill its whole tree (grandchildren included) with one
+		// killpg. No-op on Windows, where tree teardown is the Job
+		// Object assigned by trackChildTree below.
+		configureChildProcessGroup(cmd)
 		if useStdin {
 			cmd.Stdin = strings.NewReader(prompt)
 		}
@@ -1546,6 +1567,7 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 			}
 			reader = pipe
 		}
+		childPid = trackChildTree(cmd.Process)
 		slog.Info("cliprovider: process started", "binary", m.spec.Binary, "pid", cmd.Process.Pid)
 		// Do NOT start cmd.Wait() eagerly. Per Go docs on StdoutPipe:
 		//   "it is incorrect to call Wait before all reads from the pipe have
@@ -1678,6 +1700,12 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 			defer deregisterGeminiMCP(geminiMCPName, mcpSrv.addr)
 		}
 
+		// Release tree-teardown state on every exit path. On Windows
+		// this closes the KILL_ON_JOB_CLOSE job handle, killing any
+		// straggler descendants still inside the job; it must run
+		// after the wait below, hence the registration order (defers
+		// are LIFO).
+		defer func() { session.UntrackProcessTree(childPid) }()
 		// Ensure the child process is reaped and its output fds are cleaned up
 		// on EVERY exit path — including early returns from ctx-cancel and
 		// yield-false. proc.wait() is idempotent (sync.Once internally), so

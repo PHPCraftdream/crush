@@ -13,6 +13,16 @@ import (
 
 // KillProcess forcibly terminates the process tree rooted at pid.
 //
+// Preferred path: if the pid was registered via TrackProcessTree at
+// spawn time, its whole tree sits in a kill-on-close Job Object and is
+// terminated with one TerminateJobObject call — the only mechanism
+// that reliably reaches grandchildren under MSYS2/Git-Bash, where the
+// OS-recorded parent of an externally spawned binary is a transient
+// intermediary that is already gone by inspection time. The taskkill
+// and TerminateProcess paths below remain the fallback for pids with
+// no tracked job (notably foreign pids such as `crush sessions kill`
+// targets).
+//
 // On Windows os.Process.Kill() goes through OpenProcess(PROCESS_TERMINATE)
 // which can fail with "Access is denied" for processes spawned under a
 // different shell (Git Bash / MSYS, elevated console host, etc.). We
@@ -30,6 +40,11 @@ import (
 func KillProcess(pid int) error {
 	if pid <= 0 {
 		return fmt.Errorf("KillProcess: invalid pid %d", pid)
+	}
+	// Tracked Job Object: one TerminateJobObject call takes down the
+	// whole tree, grandchildren included, regardless of the PPID chain.
+	if terminateTrackedJob(pid) {
+		return nil
 	}
 	if !isProcessAlive(pid) {
 		return nil
