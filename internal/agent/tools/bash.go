@@ -262,7 +262,13 @@ func NewBashTool(permissions permission.Service, workingDir string, attribution 
 				// Use background context so it continues after tool returns
 				bgShell, err := bgManager.Start(context.Background(), execWorkingDir, blockFuncs(), params.Command, params.Description)
 				if err != nil {
-					return fantasy.ToolResponse{}, fmt.Errorf("error starting background shell: %w", err)
+					// Start's only failure mode today is the MaxBackgroundJobs
+					// cap (internal/shell/background.go). That cap is session
+					// state the model can act on — slots free themselves as
+					// jobs finish, and job_kill frees them on demand — so the
+					// refusal is not invariant to a retry and must reach the
+					// model as a tool result rather than end the run.
+					return fantasy.NewTextErrorResponse(fmt.Sprintf("error starting background shell: %s", err)), nil
 				}
 
 				// Wait a short time to detect fast failures (blocked commands, syntax errors, etc.)
@@ -322,7 +328,12 @@ func NewBashTool(permissions permission.Service, workingDir string, attribution 
 			bgManager.Cleanup()
 			bgShell, err := bgManager.Start(context.Background(), execWorkingDir, blockFuncs(), params.Command, params.Description)
 			if err != nil {
-				return fantasy.ToolResponse{}, fmt.Errorf("error starting shell: %w", err)
+				// Same MaxBackgroundJobs cap as the explicit-background
+				// branch above, here hit by a plain foreground command: the
+				// model can free slots with job_kill or wait for jobs to
+				// finish, so this must be a model-visible tool result, not
+				// a fatal error that kills the run over an ordinary `ls`.
+				return fantasy.NewTextErrorResponse(fmt.Sprintf("error starting shell: %s", err)), nil
 			}
 
 			// Wait for either completion, auto-background threshold, or context cancellation
