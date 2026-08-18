@@ -48,6 +48,52 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **A tool refusing your input no longer kills the whole run.** A
+  handful of ordinary, correctable situations used to end the session
+  outright, with nothing written to the log — the operator saw a run
+  that simply stopped. The cause was one shared with every tool: in the
+  agent library a tool that *returns* a Go error unwinds the entire
+  agent loop, while a tool that returns an error *response* hands the
+  message to the model, which can then fix its input and carry on. The
+  two forms differ by a reflex-level edit in Go, so the dangerous one
+  had accumulated. Now fixed where it was reachable:
+
+  - a todo item whose `status` was misspelled or omitted — one bad
+    enum value ended a run 42 seconds into a 75 000-character prompt;
+  - a malformed or unreachable URL passed to `download`, `fetch` or
+    `sourcegraph` — an HTTP 404 was already recoverable while a DNS
+    failure was fatal, though both mean "the model gave a bad URL";
+  - a path the OS rejects in `view`, `edit`, `write` or `multiedit` —
+    permission denied, a path component that is a file, a name too
+    long, or a file that vanished between two syscalls;
+  - a full background-job table. This one hurt most: because crush
+    auto-backgrounds long commands, an ordinary `ls` ended the session
+    whenever 50 jobs happened to be alive — a normal state for a
+    session running dev servers or watchers. The refusal even carries
+    the text "Please terminate or wait for some jobs to complete",
+    advice the model was structurally prevented from ever reading.
+
+  Genuine infrastructure failures still end the run, and deliberately:
+  a missing session ID or an unusable database fails identically on
+  every retry, so continuing would only loop. The rule separating the
+  two is now written down in `internal/agent/tools/tools.go` and
+  enforced by a test that feeds every tool the kind of input a model
+  actually sends.
+
+- **Killing a CLI provider no longer leaves its grandchildren
+  running.** `crush sessions kill`, a cancelled turn and a watchdog
+  timeout all terminated only the direct child, so the processes it had
+  spawned — `claude.cmd` → `cmd.exe` → `node.exe`, plus any MCP servers
+  the CLI started itself — survived and kept running. On Unix there was
+  no tree kill at all; on Windows `taskkill /T` walks the parent chain,
+  which under Git-Bash/MSYS leads to a transient helper process that is
+  already gone, so the grandchild could never be found. Children are
+  now started as process-group leaders and killed as a group on Unix,
+  and enclosed in a kill-on-close Job Object on Windows, which does not
+  depend on the parent chain and also cleans up if crush itself dies.
+  The same leak had already been fixed once for stdio MCP servers,
+  where it had accumulated 15+ orphaned processes over two days.
+
 - **Reasoning effort no longer breaks non-Claude CLI runs.** The
   session's stored effort was appended as `--effort <level>` to
   whatever CLI was launched, but only `claude` has that flag: codex
