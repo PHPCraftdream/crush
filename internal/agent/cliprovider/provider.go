@@ -1676,7 +1676,43 @@ func (m *cliModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.Strea
 		}
 	}()
 
+	// Abandonment watchdog for the tree-teardown state registered by
+	// trackChildTree above. Everything else that releases it — the
+	// deferred session.UntrackProcessTree inside the closure below —
+	// lives INSIDE the iterator, and an iter.Seq carries no guarantee
+	// that a consumer ever starts the range: a caller error between
+	// Stream() returning and the loop beginning, or a lazy wrapper
+	// whose own consumer disappears (fantasy's object.StreamWithTool
+	// returns exactly such a lazy wrapper around this stream), would
+	// leave the trackedJobs entry and its Job Object handle registered
+	// forever — and after the child exits, a stale entry keyed by a pid
+	// the OS is free to recycle. The watchdog arms here, in Stream's
+	// synchronous part, stands down the moment iteration starts, and on
+	// ctx cancellation — which every real abandon path funnels through —
+	// performs the same kill the closure's own ctx watcher would have
+	// (proc.kill races the closure safely: on Windows the tracked entry
+	// is consumed exactly once under trackedJobsMu, on Unix a second
+	// kill targets an already-dead process group). Residual gap,
+	// accepted: a caller that neither iterates nor cancels leaks the
+	// child process itself, which no fix inside this function survives.
+	iterStarted := make(chan struct{})
+	var iterStartedOnce sync.Once
+	if childPid != 0 {
+		go func() {
+			select {
+			case <-iterStarted:
+			case <-ctx.Done():
+				proc.kill()
+			}
+		}()
+	}
+
 	return func(yield func(fantasy.StreamPart) bool) {
+		// Signal the abandonment watchdog (see above) that the closure
+		// has taken ownership of cleanup: from here on every exit path
+		// runs the deferred UntrackProcessTree/wait below. The Once
+		// guards against a legal second iteration of the same Seq.
+		iterStartedOnce.Do(func() { close(iterStarted) })
 		// Cleanup MCP resources when the stream ends (cannot use defer in
 		// Stream() because that fires before the closure executes).
 		if mcpSrv != nil {

@@ -546,6 +546,32 @@ func TestReleaseGate_P350_QueuedNotExecutedBacksOffWithoutAttemptPenalty(t *test
 			"was dead-lettered (deleted) before reaching that call count, meaning ErrCallQueuedNotExecuted "+
 			"recoveries are still counting toward RunQueueMaxAttempts")
 
+	// Weak predicate, kept deliberately — this is the third
+	// `len(pending) == 0` site in this file and the only one 5c160413
+	// did not convert to runQueueGoneEverywhere. It is safe here, and
+	// only here, because of three facts specific to this test:
+	//
+	//   1. It is the LAST statement — nothing after it is ordered by
+	//      the wait, so the wait cannot mis-order any assertion.
+	//   2. The test's teeth live entirely in the preceding wait:
+	//      `calls > busyUntilCall` proves the entry survived 25 busy
+	//      cycles without dead-lettering AND that the 26th (successful)
+	//      dispatch already ran. What this wait adds is a drain hint,
+	//      not a proof.
+	//   3. As an "acked" proof this predicate is close to vacuous
+	//      anyway: a leased row is invisible to
+	//      ListPendingRunQueueEntries, and during the busy phase the
+	//      entry oscillates pending→leased→pending on every 20ms tick,
+	//      so "pending empty" first becomes true within the FIRST
+	//      lease — long before the successful call this message
+	//      describes. Converting it to runQueueGoneEverywhere would
+	//      make it mean what it says at zero cost, and MUST be done if
+	//      any of the three facts above changes: the moment an
+	//      assertion is added after this wait, or the coordinator's Run
+	//      stops being instant (a slow 26th Run would let the wait
+	//      return at the lease, before the Ack/dead-letter writes
+	//      land), the pending-only form silently unorders whatever
+	//      follows it.
 	require.Eventually(t, func() bool {
 		pending, checkErr := svc.ListPendingRunQueueEntries(ctx)
 		if checkErr != nil {

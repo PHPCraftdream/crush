@@ -13,15 +13,22 @@ import (
 
 // KillProcess forcibly terminates the process tree rooted at pid.
 //
-// Preferred path: if the pid was registered via TrackProcessTree at
-// spawn time, its whole tree sits in a kill-on-close Job Object and is
-// terminated with one TerminateJobObject call — the only mechanism
-// that reliably reaches grandchildren under MSYS2/Git-Bash, where the
-// OS-recorded parent of an externally spawned binary is a transient
-// intermediary that is already gone by inspection time. The taskkill
-// and TerminateProcess paths below remain the fallback for pids with
-// no tracked job (notably foreign pids such as `crush sessions kill`
-// targets).
+// Tracked pids (registered via TrackProcessTree at spawn time) are killed
+// by BOTH mechanisms below, deliberately not short-circuited: taskkill
+// /F /T first, then the Job Object. The two mechanisms have disjoint
+// blind spots — taskkill /T walks the PPID chain and so cannot see past
+// the MSYS2/Git-Bash transient intermediary parent (job membership
+// reaches those), while the job cannot see a process that escaped in the
+// Start→AssignProcessToJobObject micro-gap and IS PPID-reachable when
+// crush itself does not run under MSYS (taskkill reaches those).
+// Returning early on a successful TerminateJobObject — the shape this
+// function had after 68f9c65f — silently dropped that second case: the
+// job terminated "successfully", KillProcess reported nil, and the
+// escapee survived with its fallback explicitly disabled. taskkill runs
+// BEFORE the job pass because /T needs the root alive to walk from and
+// the job termination kills the root. Cost: one taskkill spawn per kill
+// of a tracked child; kill paths only run on stream cancellation, never
+// per-stream, so this is not hot.
 //
 // On Windows os.Process.Kill() goes through OpenProcess(PROCESS_TERMINATE)
 // which can fail with "Access is denied" for processes spawned under a
@@ -41,24 +48,28 @@ func KillProcess(pid int) error {
 	if pid <= 0 {
 		return fmt.Errorf("KillProcess: invalid pid %d", pid)
 	}
-	// Tracked Job Object: one TerminateJobObject call takes down the
-	// whole tree, grandchildren included, regardless of the PPID chain.
-	if terminateTrackedJob(pid) {
-		return nil
-	}
 	if !isProcessAlive(pid) {
+		// Already gone. Still consume any tracked entry so it cannot
+		// later collide with a recycled pid (see terminateTrackedJob);
+		// closing its KILL_ON_JOB_CLOSE handle also tears down any
+		// straggler descendant still inside the job.
+		terminateTrackedJob(pid)
 		return nil
 	}
 	if path, lookErr := exec.LookPath("taskkill"); lookErr == nil {
 		cmd := platform.Command(context.Background(), path, "/F", "/T", "/PID", fmt.Sprintf("%d", pid))
-		out, err := cmd.CombinedOutput()
-		if err == nil {
-			return nil
-		}
-		if !isProcessAlive(pid) {
-			return nil
-		}
-		_ = out
+		_, _ = cmd.CombinedOutput()
+		// taskkill errors are not surfaced directly: the pid-based
+		// aliveness checks below decide the outcome, which also covers
+		// taskkill /T missing an MSYS-broken chain it cannot walk.
+	}
+	// Job pass: one TerminateJobObject takes down the tracked tree,
+	// MSYS-broken chains included. Identity-checked inside, so a stale
+	// entry whose pid the OS has since recycled is closed without
+	// faking success.
+	terminateTrackedJob(pid)
+	if !isProcessAlive(pid) {
+		return nil
 	}
 	h, err := windows.OpenProcess(windows.PROCESS_TERMINATE, false, uint32(pid))
 	if err != nil {
