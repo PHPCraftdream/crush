@@ -419,7 +419,7 @@ func TestErrorContract_BadModelInputIsAResponseNotAnError(t *testing.T) {
 	// code and must stay green. Root (euid 0 on Unix) bypasses mode
 	// bits entirely, so the case is skipped there: root cannot be handed
 	// an unreadable file this way.
-	if !(runtime.GOOS != "windows" && os.Geteuid() == 0) {
+	if runtime.GOOS == "windows" || os.Geteuid() != 0 {
 		cases = append(cases, contractCase{
 			tool: "view",
 			desc: `existing file that cannot be opened for reading (share-locked on Windows, unreadable mode elsewhere)`,

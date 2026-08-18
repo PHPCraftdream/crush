@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"charm.land/fantasy"
+	"github.com/charmbracelet/crush/internal/session"
 	"github.com/stretchr/testify/require"
 )
 
@@ -36,27 +37,34 @@ import (
 func TestTodosTool_InvalidStatusIsRecoverableNotFatal(t *testing.T) {
 	t.Parallel()
 
-	sessions, _ := newTranscriptTestDB(t)
-	sess, err := sessions.Create(context.Background(), "todos-status")
-	require.NoError(t, err)
-
-	run := func(t *testing.T, status string) (fantasy.ToolResponse, error) {
+	// Every subtest gets its own session and its own in-memory DB. They run
+	// in parallel, and "rejected call saves nothing" reads session state
+	// that the "valid status" sibling writes to — sharing one session would
+	// make the pair order-dependent.
+	newRun := func(t *testing.T) (session.Service, string, func(status string) (fantasy.ToolResponse, error)) {
 		t.Helper()
-		input, mErr := json.Marshal(TodosParams{Todos: []TodoItem{{
-			Content:    "do the thing",
-			Status:     status,
-			ActiveForm: "Doing the thing",
-		}}})
-		require.NoError(t, mErr)
-		ctx := context.WithValue(context.Background(), SessionIDContextKey, sess.ID)
-		return NewTodosTool(sessions).Run(ctx, fantasy.ToolCall{
-			ID: "c1", Name: TodosToolName, Input: string(input),
-		})
+		sessions, _ := newTranscriptTestDB(t)
+		sess, err := sessions.Create(context.Background(), "todos-status")
+		require.NoError(t, err)
+
+		return sessions, sess.ID, func(status string) (fantasy.ToolResponse, error) {
+			input, mErr := json.Marshal(TodosParams{Todos: []TodoItem{{
+				Content:    "do the thing",
+				Status:     status,
+				ActiveForm: "Doing the thing",
+			}}})
+			require.NoError(t, mErr)
+			ctx := context.WithValue(context.Background(), SessionIDContextKey, sess.ID)
+			return NewTodosTool(sessions).Run(ctx, fantasy.ToolCall{
+				ID: "c1", Name: TodosToolName, Input: string(input),
+			})
+		}
 	}
 
 	assertRecoverable := func(t *testing.T, status string) {
 		t.Helper()
-		resp, runErr := run(t, status)
+		_, _, run := newRun(t)
+		resp, runErr := run(status)
 		require.NoError(t, runErr,
 			"a returned error is what fantasy escalates to isCriticalError — it would "+
 				"abort the whole agent loop instead of letting the model fix its input")
@@ -68,15 +76,27 @@ func TestTodosTool_InvalidStatusIsRecoverableNotFatal(t *testing.T) {
 	}
 
 	// The likeliest shape in practice: the field omitted entirely.
-	t.Run("empty status", func(t *testing.T) { assertRecoverable(t, "") })
+	t.Run("empty status", func(t *testing.T) {
+		t.Parallel()
+		assertRecoverable(t, "")
+	})
 	// A near-miss spelling of a real value.
-	t.Run("misspelled status", func(t *testing.T) { assertRecoverable(t, "in-progress") })
+	t.Run("misspelled status", func(t *testing.T) {
+		t.Parallel()
+		assertRecoverable(t, "in-progress")
+	})
 
 	// Nothing may be persisted from a rejected call — a partially applied
 	// list would be worse than a rejected one, because the model would have
 	// no way to tell which items landed.
 	t.Run("rejected call saves nothing", func(t *testing.T) {
-		fresh, getErr := sessions.Get(context.Background(), sess.ID)
+		t.Parallel()
+		sessions, id, run := newRun(t)
+		resp, runErr := run("in-progress")
+		require.NoError(t, runErr)
+		require.True(t, resp.IsError)
+
+		fresh, getErr := sessions.Get(context.Background(), id)
 		require.NoError(t, getErr)
 		require.Empty(t, fresh.Todos)
 	})
@@ -84,7 +104,9 @@ func TestTodosTool_InvalidStatusIsRecoverableNotFatal(t *testing.T) {
 	// Control: a valid status still works, so the assertions above pin the
 	// status check specifically rather than some unrelated setup failure.
 	t.Run("valid status succeeds", func(t *testing.T) {
-		resp, runErr := run(t, "pending")
+		t.Parallel()
+		_, _, run := newRun(t)
+		resp, runErr := run("pending")
 		require.NoError(t, runErr)
 		require.False(t, resp.IsError)
 	})
