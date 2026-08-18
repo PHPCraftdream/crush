@@ -154,14 +154,29 @@ func NewSourcegraphTool(client *http.Client) fantasy.AgentTool {
 
 				return fantasy.NewTextErrorResponse(fmt.Sprintf("Request failed with status code: %d", resp.StatusCode)), nil
 			}
+			// A truncated or unparseable response is the remote service
+			// misbehaving, not the model misusing the tool and not this
+			// machine being broken. By the retry-invariance criterion in
+			// tools.go it is not fatal: the next call may well succeed, and
+			// there is nothing about it that makes the rest of the session
+			// pointless. The non-200 branch immediately above already
+			// answers with a response for the same reason.
+			//
+			// The model cannot fix the response, so the message tells it
+			// what it CAN do — retry, or fall back to local search — rather
+			// than implying its query was wrong.
 			body, err := io.ReadAll(io.LimitReader(resp.Body, maxSourcegraphBodyBytes))
 			if err != nil {
-				return fantasy.ToolResponse{}, fmt.Errorf("failed to read response body: %w", err)
+				return fantasy.NewTextErrorResponse(fmt.Sprintf(
+					"Sourcegraph replied but the response could not be read: %v. The query was not at fault and may not have been executed at all. Retry it, or fall back to local search (grep/glob).",
+					err)), nil
 			}
 
 			var result map[string]any
 			if err = json.Unmarshal(body, &result); err != nil {
-				return fantasy.ToolResponse{}, fmt.Errorf("failed to unmarshal response: %w", err)
+				return fantasy.NewTextErrorResponse(fmt.Sprintf(
+					"Sourcegraph returned a response that is not valid JSON: %v. This is a problem with the service, not with the query. Retry it, or fall back to local search (grep/glob).",
+					err)), nil
 			}
 
 			formattedResults, err := formatSourcegraphResults(result, params.ContextWindow, params.Count)
